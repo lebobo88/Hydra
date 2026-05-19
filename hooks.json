@@ -27,6 +27,22 @@
         "timeoutSec": 10,
         "matcher": "mcp__hydra-memory__.*",
         "_comment": "Verify memory server reachable before resolving handles."
+      },
+      {
+        "type": "command",
+        "powershell": "python -m hydra_core.cli doctor",
+        "bash": "python -m hydra_core.cli doctor",
+        "timeoutSec": 10,
+        "matcher": "mcp__executive-suite__.*",
+        "_comment": "Verify ExecutiveSuite MCP shim reachable before roster/output calls."
+      },
+      {
+        "type": "command",
+        "powershell": "python -m hydra_core.cli doctor",
+        "bash": "python -m hydra_core.cli doctor",
+        "timeoutSec": 10,
+        "matcher": "mcp__rlm-creative__.*",
+        "_comment": "Verify RLM creative MCP shim reachable before skill/output calls."
       }
     ],
     "PostToolUse": [
@@ -37,6 +53,14 @@
         "timeoutSec": 5,
         "matcher": "mcp__hydra-memory__write.*",
         "_comment": "Placeholder: hash-and-record audit trail."
+      },
+      {
+        "type": "command",
+        "powershell": "echo postcheck",
+        "bash": "echo postcheck",
+        "timeoutSec": 5,
+        "matcher": "mcp__(executive-suite|rlm-creative)__.*output\\.write.*",
+        "_comment": "Placeholder: hash-and-record audit trail for pack output writes."
       }
     ],
     "Stop": [

@@ -56,6 +56,37 @@ def _cmd_doctor(args) -> int:
     except ImportError:
         print("FAIL: pydantic missing")
         return 1
+
+    # Probe known MCP shims. Reachability is best-effort: failures warn but do
+    # not fail the doctor (the dispatchers degrade gracefully).
+    project = Path(args.project) if args.project else Path.cwd()
+    try:
+        from .dispatcher import MCPStdioDispatcher, _load_mcp_config
+    except ImportError:
+        return 0
+    servers = _load_mcp_config(project)
+    probes = [
+        ("pp-daemon", "ping", {}),
+        ("hydra-memory", "list_tools", {}),
+        ("executive-suite", "es.ping", {}),
+        ("rlm-creative", "rlm.ping", {}),
+    ]
+    dispatcher = MCPStdioDispatcher(project)
+    for server, tool, tool_args in probes:
+        if server not in servers:
+            print(f"WARN: {server} not in .mcp.json")
+            continue
+        try:
+            res = dispatcher.call_mcp(server, tool, tool_args)
+        except Exception as e:
+            print(f"WARN: {server} probe raised {type(e).__name__}: {e}")
+            continue
+        status = (res or {}).get("status", "unknown") if isinstance(res, dict) else "unknown"
+        if status == "done":
+            print(f"OK:   {server} reachable")
+        else:
+            err = (res or {}).get("error", "(no error field)") if isinstance(res, dict) else str(res)
+            print(f"WARN: {server} unreachable — {err}")
     return 0
 
 

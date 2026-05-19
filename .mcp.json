@@ -18,16 +18,20 @@
       "_comment": "Hydra memory fabric — episodic + semantic store as MCP resources."
     },
     "executive-suite": {
-      "command": "node",
-      "args": ["${MCP_FILESYSTEM_SERVER:-@modelcontextprotocol/server-filesystem}",
-               "C:/AiAppDeployments/ExecutiveSuite"],
-      "_comment": "Read-only filesystem MCP for ExecutiveSuite agents/skills/output. The executive squad uses agent-impersonation; this server is for resource lookup only."
+      "command": "python",
+      "args": ["-m", "mcp_servers.executive_suite"],
+      "env": {
+        "HYDRA_ES_ROOT": "C:/AiAppDeployments/ExecutiveSuite"
+      },
+      "_comment": "Executive squad — thin MCP over the ExecutiveSuite pack (roster, skills, commands, output persistence)."
     },
     "rlm-creative": {
-      "command": "node",
-      "args": ["${MCP_FILESYSTEM_SERVER:-@modelcontextprotocol/server-filesystem}",
-               "C:/AiAppDeployments/RLM-CLI-Starter"],
-      "_comment": "Read-only filesystem MCP for the RLM creative pack."
+      "command": "python",
+      "args": ["-m", "mcp_servers.rlm_creative"],
+      "env": {
+        "HYDRA_RLM_ROOT": "C:/AiAppDeployments/RLM-CLI-Starter"
+      },
+      "_comment": "Creative squad — thin MCP over the RLM-CLI-Starter pack (skills, commands, agents, output persistence)."
     }
   }
 }

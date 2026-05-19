@@ -180,12 +180,20 @@ def _via_impersonation(
 ) -> SquadResult:
     """ExecutiveSuite pattern — Claude Code impersonates the roster IN PROCESS.
 
-    We hand a structured prompt to the supervisor's host Claude (via dispatcher),
-    which then sequentially adopts each relevant executive persona. No process spawn.
+    Enrichment pass: consult the `executive-suite` MCP for the live roster, then
+    after the host-pickup envelope, persist the prompt to the pack's `output/`
+    tree via `es.output.write`. The returned `MemoryRef.key` points at the real
+    on-disk path so downstream consumers can resolve it.
     """
-    roster = ", ".join(
-        f"{a.slug} ({a.role})" for a in pack.agents if a.authority != "advisory"
-    ) or ", ".join(a.slug for a in pack.agents[:4])
+    # Pre-call: pull live roster from the MCP shim (falls back to pack.agents).
+    live_roster = _mcp_call_safe(dispatcher, "executive-suite", "es.roster.list", {})
+    roster_list = (live_roster or {}).get("agents", []) if isinstance(live_roster, dict) else []
+    if roster_list:
+        roster = ", ".join(r["name"] for r in roster_list[:8])
+    else:
+        roster = ", ".join(
+            f"{a.slug} ({a.role})" for a in pack.agents if a.authority != "advisory"
+        ) or ", ".join(a.slug for a in pack.agents[:4])
 
     objective = getattr(inbound, "objective", None) or getattr(inbound, "summary", None) or "(see envelope)"
     prompt = (
@@ -206,6 +214,25 @@ def _via_impersonation(
             rationale=f"impersonation dispatch failed: {e!r}",
         )
 
+    # Post-call: persist the prompt + host-pickup envelope under ExecutiveSuite/output/.
+    domain = _domain_for(pack, inbound)
+    topic = (objective or "boardroom")[:80]
+    write_result = _mcp_call_safe(
+        dispatcher, "executive-suite", "es.output.write",
+        {"domain": domain, "topic": topic,
+         "content": _render_session_md("Boardroom Session", prompt, result)},
+    )
+    artifacts_refs: list[MemoryRef] = []
+    rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
+    if rel_path:
+        artifacts_refs.append(MemoryRef(
+            tier="episodic",
+            key=f"es:output:{rel_path}",
+            summary=f"Boardroom session for {topic}",
+        ))
+    else:
+        artifacts_refs.append(MemoryRef(tier="episodic", key=f"es:boardroom:{uuid4()}"))
+
     decision = DecisionRecord(
         workflow_id=inbound.workflow_id,
         parent_id=inbound.id,
@@ -213,11 +240,11 @@ def _via_impersonation(
         target_squad=inbound.origin_squad,
         decision="Boardroom session run",
         rationale=str(result.get("summary", "(see artifact)"))[:1000],
-        artifacts=[MemoryRef(tier="episodic", key=f"es:boardroom:{uuid4()}")],
+        artifacts=artifacts_refs,
     )
     return SquadResult(
         envelopes=[decision],
-        artifacts=[{"kind": "boardroom_minutes", "raw": result}],
+        artifacts=[{"kind": "boardroom_minutes", "raw": result, "persisted": write_result}],
         status="done",
     )
 
@@ -228,18 +255,50 @@ def _via_claude_skill(
     inbound: HydraEnvelope,
     dispatcher: Dispatcher,
 ) -> SquadResult:
-    """RLM-style — invoke a Claude Code skill (e.g. /rlm-team)."""
+    """RLM-style — invoke a Claude Code skill (e.g. /rlm-team).
+
+    Enrichment: consult the `rlm-creative` MCP for the live skill catalogue, then
+    persist the resulting host-pickup envelope under `RLM/output/{phase}/` via
+    `rlm.output.write`. The returned `MemoryRef.key` points at the real path.
+    """
     invoke = pack.invoke or {}
     cmd = invoke.get("command_hint", "/rlm-team")
+
+    catalogue = _mcp_call_safe(dispatcher, "rlm-creative", "rlm.command.list", {})
+    available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
     try:
         result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), {
             "envelope": inbound.model_dump(mode="json"),
+            "available_commands": available_cmds,
         })
     except Exception as e:
         return SquadResult(
             envelopes=[], artifacts=[], status="failed",
             rationale=f"claude-skill {cmd} failed: {e!r}",
         )
+
+    phase = _phase_for(inbound)
+    topic = (getattr(inbound, "objective", None)
+             or getattr(inbound, "summary", None)
+             or cmd.lstrip("/"))[:80]
+    write_result = _mcp_call_safe(
+        dispatcher, "rlm-creative", "rlm.output.write",
+        {"phase": phase, "topic": topic,
+         "content": _render_session_md(f"Creative dispatch via {cmd}",
+                                       f"command_hint={cmd}\navailable={available_cmds}",
+                                       result)},
+    )
+    artifacts_refs: list[MemoryRef] = []
+    rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
+    if rel_path:
+        artifacts_refs.append(MemoryRef(
+            tier="episodic",
+            key=f"rlm:output:{rel_path}",
+            summary=f"Creative dispatch: {topic}",
+        ))
+    else:
+        artifacts_refs.append(MemoryRef(tier="episodic", key=f"rlm:{uuid4()}"))
+
     decision = DecisionRecord(
         workflow_id=inbound.workflow_id,
         parent_id=inbound.id,
@@ -247,12 +306,59 @@ def _via_claude_skill(
         target_squad=inbound.origin_squad,
         decision=f"Creative work dispatched via {cmd}",
         rationale=str(result.get("summary", ""))[:1000],
-        artifacts=[MemoryRef(tier="episodic", key=f"rlm:{uuid4()}")],
+        artifacts=artifacts_refs,
     )
     return SquadResult(
         envelopes=[decision],
-        artifacts=[{"kind": "creative_output", "raw": result}],
+        artifacts=[{"kind": "creative_output", "raw": result, "persisted": write_result}],
         status=result.get("status", "done"),
+    )
+
+
+# ---------- enrichment helpers ----------
+
+def _mcp_call_safe(dispatcher: Dispatcher, server: str, tool: str,
+                   args: dict[str, Any]) -> dict[str, Any] | None:
+    """Best-effort MCP call. Returns the inner result dict, or None on any failure.
+
+    The dispatchers wrap the daemon response as
+    `{"status": "done", "tool": ..., "result": {...}}`; we unwrap that here.
+    """
+    try:
+        envelope = dispatcher.call_mcp(server, tool, args)
+    except Exception:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("status") not in ("done", None):
+        return None
+    inner = envelope.get("result", envelope)
+    return inner if isinstance(inner, dict) else None
+
+
+def _domain_for(pack: SquadPack, inbound: HydraEnvelope) -> str:
+    industries = getattr(inbound.constraints, "industries", []) or []
+    if industries:
+        return industries[0]
+    if pack.industries:
+        return pack.industries[0]
+    return "general"
+
+
+def _phase_for(inbound: HydraEnvelope) -> str:
+    # CreativeBrief envelopes carry a `phase` field; default to "draft".
+    return getattr(inbound, "phase", None) or "draft"
+
+
+def _render_session_md(title: str, prompt: str, result: dict[str, Any]) -> str:
+    summary = (result or {}).get("summary", "")
+    return (
+        f"# {title}\n\n"
+        f"## Prompt\n\n```\n{prompt}\n```\n\n"
+        f"## Host-pickup result\n\n"
+        f"- status: {(result or {}).get('status', 'unknown')}\n"
+        f"- summary: {summary}\n\n"
+        f"## Raw\n\n```json\n{result}\n```\n"
     )
 
 

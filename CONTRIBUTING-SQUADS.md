@@ -302,3 +302,56 @@ Before flipping `entrypoint:` away from `stub`, confirm:
 
 When all boxes are checked, change `entrypoint: stub` to the real
 adapter name and update the status table in `HYDRA.md` section 1.
+
+## g) Adding a Python MCP shim for a markdown-only squad
+
+`agent-impersonation` and `claude-skill` packs (ExecutiveSuite, RLM,
+etc.) are pure Claude-Code markdown — no Python daemon to wrap.
+Hydra still exposes them through an MCP server so the dispatcher can
+fetch live roster/skill metadata and persist outputs as
+`MemoryRef` handles. Use this template:
+
+```
+mcp_servers/<slug>/
+  __init__.py        # empty
+  __main__.py        # from .server import main; main()
+  server.py          # tool handlers; calls run_server(...)
+```
+
+`server.py` defers all stdio plumbing to
+`mcp_servers/_pack_shim.py`, which provides:
+
+- `resolve_root(env_var, default)` — sandbox path (override via
+  `HYDRA_<SQUAD>_ROOT` so tests are hermetic).
+- `list_dir(root, relative, suffix=…, only_dirs=…)` and
+  `read_markdown(root, relative)` — read-only pack introspection
+  with path-trust enforcement.
+- `write_output(root, relative_dir, topic, content)` /
+  `read_output(...)` — sandboxed writer that emits
+  `{path, relative, bytes}` so dispatchers can synthesize a
+  `MemoryRef(key=f"<slug>:output:{relative}")`.
+- `run_server(name, handlers)` — preferred MCP SDK runner, with a
+  bare-stdio JSON-RPC fallback when `mcp` is not installed or when
+  `HYDRA_MCP_BARE=1` (used by `tests/test_pack_shims.py`).
+
+Naming convention for tools: `<short-slug>.<resource>.<verb>`
+(e.g. `es.roster.list`, `rlm.output.write`). Every shim must
+expose a `<short-slug>.ping` no-arg tool — `hydra doctor` calls it
+to verify reachability alongside `pp-daemon` and `hydra-memory`.
+
+Register the new server in three places:
+
+1. **`.mcp.json`** — add a stanza with
+   `"command": "python", "args": ["-m", "mcp_servers.<slug>"]`
+   and a `HYDRA_<SLUG>_ROOT` env var pointing at the source pack.
+2. **`hooks.json`** — add a `PreToolUse` doctor matcher for
+   `mcp__<slug>__.*` (and a `PostToolUse` audit stub for
+   `*.output.write` if the shim writes anything).
+3. **`hydra_core/squad_node.py`** — in the squad's dispatcher
+   branch, call the shim via `_mcp_call_safe(...)` so the run
+   degrades cleanly when the server is offline (synthetic
+   `MemoryRef` fallback) instead of failing the workflow.
+
+Reference shims: `mcp_servers/executive_suite/`,
+`mcp_servers/rlm_creative/`. Reference tests:
+`tests/test_pack_shims.py`.
