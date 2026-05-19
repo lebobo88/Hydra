@@ -32,9 +32,9 @@
       "args": ["-m", "mcp_servers.rlm_creative"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
-        "HYDRA_RLM_ROOT": "C:/AiAppDeployments/RLM-CLI-Starter"
+        "HYDRA_RLM_ROOT": "C:/AiAppDeployments/RLM-Creative"
       },
-      "_comment": "Creative squad — thin MCP over the RLM-CLI-Starter pack (skills, commands, agents, output persistence)."
+      "_comment": "Garland Crown — Eight Garland Heads studio. Thin MCP over RLM-Creative (skills, commands, agents, output persistence). Repointed from RLM-CLI-Starter on 2026-05-19 when the Garland Crown source pack shipped."
     }
   }
 }

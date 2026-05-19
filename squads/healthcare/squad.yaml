@@ -1,4 +1,6 @@
 name: Healthcare & Clinical
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Clinical decision support, perioperative care, HIPAA-bound workflows,
   cardiovascular / oncology / perioperative agent specializations per the

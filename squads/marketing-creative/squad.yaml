@@ -1,0 +1,63 @@
+name: Marketing Creative
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
+description: >
+  Copy, brand voice, aesthetic-archetype selection, narrative arc, microsite
+  specs. Hands ShotList / AssetJob envelopes to Hydra's creative squad for
+  binary asset generation — never produces image / video binaries in MarketBliss.
+source_pack: C:\AiAppDeployments\MarketBliss
+entrypoint: claude-skill
+industries: [marketing, advertising, b2b-saas, dtc-ecommerce, professional-services, regulated-health-finance, creative-production, advertising-commercial]
+
+agents:
+  - slug: contextual-copywriter
+    role: "Long / short-form copy, ad variants, DCO components"
+    authority: execute
+  - slug: brand-narrative
+    role: "Brand voice, story arc, aesthetic-archetype selection"
+    authority: advisory
+  - slug: brand-safety-compliance
+    role: "Brand-consistency + regulated-claims gate"
+    authority: gatekeeper
+  - slug: marketing-supervisor
+    role: "Squad coordinator + handoff to Hydra creative"
+    authority: gatekeeper
+
+tools:
+  - name: marketing-expertise
+    privilege: read
+  - name: aesthetic-archetypes
+    privilege: read
+  - name: creative-brief-protocol
+    privilege: read
+  - name: brand-safety
+    privilege: read
+  - name: marketing-governance
+    privilege: read
+
+accepts:
+  - CREATIVE_BRIEF
+  - HANDOFF
+
+emits:
+  - CREATIVE_BRIEF
+  - SHOT_LIST
+  - ASSET_JOB
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: brand-consistency
+  - rubric_id: regulated-claims-review
+    hitl_required: true
+    when: "industry == 'regulated-health-finance' or industry == 'professional-services'"
+  - rubric_id: ip-clearance
+    hitl_required: true
+    when: "constraints.risk_tolerance == 'low'"
+
+invoke:
+  command_hint: "/campaign-landing"
+  fallback_commands:
+    - "/brand-audit"
+    - "/campaign-brief"
+    - "/launch-playbook"
+  output_dir: "output/campaigns/{topic}/assets/{date}.md"

@@ -1,4 +1,6 @@
 name: Executive C-Suite
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Strategic decision support, capital allocation, M&A, risk, crisis. Wired to
   the ExecutiveSuite pack — Hydra dispatches Executive work as boardroom /

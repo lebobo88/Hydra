@@ -1,12 +1,16 @@
 """hydra — local CLI for the Enterprise Agent Mesh.
 
 Subcommands:
-  hydra doctor                       — health check (squads, langgraph, mcp)
-  hydra squads                       — list discovered squad packs
+  hydra doctor                       — health check (constitution, squads,
+                                       venom, overlays, eights, langgraph, mcp)
+  hydra verify                       — print constitution hash + refusal count
+  hydra squads                       — list discovered squad packs (JSON)
   hydra run "<goal>" [--squad slug]  — start a workflow
   hydra status [<workflow_id>]       — list runs / show a run
   hydra approve <workflow_id>        — resume an HITL-paused run
   hydra trace <workflow_id>          — tail the JSONL trace
+  hydra memory query <cell>          — query TheEights by cell
+  hydra memory tag <key> --cells …   — attach cells to an episodic row
 """
 from __future__ import annotations
 
@@ -36,34 +40,100 @@ class _NullDispatcher:
 
 
 def _cmd_doctor(args) -> int:
-    packs = discover_squads(Path(args.project) if args.project else None)
+    project = Path(args.project) if args.project else Path.cwd()
+    fail_count = 0
+
+    # --- Stage 1: constitution ----------------------------------------------
+    try:
+        from .immortal_head import load_constitution
+        snap = load_constitution(project)
+        print(f"OK:   constitution loaded  sha256={snap.sha256[:12]} "
+              f"refusals={len(snap.refusals)} bytes={len(snap.text)}")
+    except Exception as e:
+        print(f"FAIL: constitution missing or unparseable — {e}")
+        fail_count += 1
+
+    # --- Stage 2: squad registry + deprecation ------------------------------
+    packs = discover_squads(project)
     if not packs:
         print("FAIL: no squads discovered. Expected squads/<name>/squad.yaml.")
         return 1
-    print(f"OK: {len(packs)} squad(s) discovered:")
+    print(f"OK:   {len(packs)} squad(s) discovered:")
+    from .version import is_deprecated
     for slug, p in packs.items():
         status = p.entrypoint
         marker = "[active]" if status != "stub" else "[ stub ]"
-        print(f"  {marker} {slug:20s}  entrypoint={status:22s}  agents={len(p.agents)}  industries={list(p.industries)[:3]}")
+        dep_flag = ""
+        if p.deprecated_after is not None:
+            dep_flag = " [DEPRECATED]" if is_deprecated(p.deprecated_after) else f" [deprecates {p.deprecated_after}]"
+        print(f"  {marker} {slug:20s}  v{p.version}  entrypoint={status:22s}  "
+              f"agents={len(p.agents)}{dep_flag}")
+
+    # --- Stage 4: cathedral overlays ----------------------------------------
+    try:
+        from .heads import load_aliases
+        aliases = load_aliases(project)
+        crowns = sorted({a.crown for a in aliases.values()})
+        print(f"OK:   {len(aliases)} cathedral alias(es) across crowns: {crowns}")
+    except Exception as e:
+        print(f"WARN: cathedral overlay loader raised {type(e).__name__}: {e}")
+
+    # --- Stage 3: TheEights vocabulary --------------------------------------
+    try:
+        from .eights import ALL_CELLS, CELL_SPECS
+        if len(ALL_CELLS) == 8 and len(CELL_SPECS) == 8:
+            print(f"OK:   TheEights vocabulary intact — {list(ALL_CELLS)}")
+        else:
+            print(f"FAIL: TheEights cell count off — {ALL_CELLS}")
+            fail_count += 1
+    except Exception as e:
+        print(f"FAIL: TheEights import — {e}")
+        fail_count += 1
+
+    # --- Stage 3: episodic db reachable -------------------------------------
+    try:
+        from .memory import EPISODIC_DB, _ensure_episodic
+        with _ensure_episodic(EPISODIC_DB) as conn:
+            n = conn.execute("SELECT COUNT(*) FROM episodic").fetchone()[0]
+        print(f"OK:   episodic db reachable  path={EPISODIC_DB} rows={n}")
+    except Exception as e:
+        print(f"WARN: episodic db — {e}")
+
+    # --- Stage 5: Cerberus venom registry -----------------------------------
+    try:
+        from .venom import clear_registry, load_cerberus_venoms
+        clear_registry()
+        registered = load_cerberus_venoms(project)
+        names = sorted(c.name for c in registered)
+        if registered:
+            print(f"OK:   Cerberus venom registry  count={len(registered)} names={names}")
+        else:
+            print("WARN: Cerberus venom registry empty — no venom is callable. "
+                  "Check squads/engineering/cerberus.yaml.")
+    except Exception as e:
+        print(f"FAIL: Cerberus venom load — {e}")
+        fail_count += 1
+
+    # --- runtime deps -------------------------------------------------------
     try:
         import langgraph  # type: ignore  # noqa
-        print("OK: langgraph installed")
+        print("OK:   langgraph installed")
     except ImportError:
         print("WARN: langgraph not installed — supervisor will use pure-python fallback")
     try:
         import pydantic  # type: ignore  # noqa
-        print(f"OK: pydantic available")
+        print(f"OK:   pydantic available")
     except ImportError:
         print("FAIL: pydantic missing")
-        return 1
+        fail_count += 1
 
+    # --- MCP shim reachability ----------------------------------------------
     # Probe known MCP shims. Reachability is best-effort: failures warn but do
     # not fail the doctor (the dispatchers degrade gracefully).
-    project = Path(args.project) if args.project else Path.cwd()
     try:
         from .dispatcher import MCPStdioDispatcher, _load_mcp_config
     except ImportError:
-        return 0
+        return 0 if fail_count == 0 else 1
     servers = _load_mcp_config(project)
     probes = [
         ("pp-daemon", "ping", {}),
@@ -87,6 +157,51 @@ def _cmd_doctor(args) -> int:
         else:
             err = (res or {}).get("error", "(no error field)") if isinstance(res, dict) else str(res)
             print(f"WARN: {server} unreachable — {err}")
+    return 0 if fail_count == 0 else 1
+
+
+def _cmd_verify(args) -> int:
+    from .immortal_head import load_constitution
+
+    project = Path(args.project) if args.project else None
+    try:
+        snap = load_constitution(project)
+    except FileNotFoundError as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "path": str(snap.path),
+        "sha256": snap.sha256,
+        "refusals": len(snap.refusals),
+        "bytes": len(snap.text),
+    }, indent=2))
+    return 0
+
+
+def _cmd_memory_query(args) -> int:
+    from .eights import ALL_CELLS
+    from .memory import query_by_cell
+
+    if args.cell not in ALL_CELLS:
+        print(json.dumps({"error": f"invalid cell {args.cell!r}",
+                          "valid": list(ALL_CELLS)}), file=sys.stderr)
+        return 1
+    rows = query_by_cell(args.cell, limit=int(args.limit),
+                         workflow_id=args.workflow_id)
+    print(json.dumps({"cell": args.cell, "count": len(rows), "rows": rows},
+                     default=str, indent=2))
+    return 0
+
+
+def _cmd_memory_tag(args) -> int:
+    from .memory import tag_episodic
+
+    cells = [c.strip() for c in (args.cells or "").split(",") if c.strip()]
+    if not cells:
+        print(json.dumps({"error": "no cells supplied"}), file=sys.stderr)
+        return 1
+    merged = tag_episodic(args.key, cells, replace=bool(args.replace))
+    print(json.dumps({"key": args.key, "cells": merged}, indent=2))
     return 0
 
 
@@ -176,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor")
+    sub.add_parser("verify")
     sub.add_parser("squads")
     r = sub.add_parser("run")
     r.add_argument("goal")
@@ -188,9 +304,27 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("workflow_id")
     sub.add_parser("approve").add_argument("workflow_id")
 
+    # `memory query <cell>` and `memory tag <key> --cells …`
+    mem = sub.add_parser("memory")
+    msub = mem.add_subparsers(dest="memcmd", required=True)
+    mq = msub.add_parser("query")
+    mq.add_argument("cell", help="One of qian|kun|zhen|xun|kan|li|gen|dui")
+    mq.add_argument("--limit", type=int, default=50)
+    mq.add_argument("--workflow-id", dest="workflow_id", default=None)
+    mt = msub.add_parser("tag")
+    mt.add_argument("key")
+    mt.add_argument("--cells", required=True, help="Comma-separated cell slugs")
+    mt.add_argument("--replace", action="store_true")
+
     args = ap.parse_args(argv)
+
+    if args.cmd == "memory":
+        memcmds = {"query": _cmd_memory_query, "tag": _cmd_memory_tag}
+        return memcmds[args.memcmd](args)
+
     return {
         "doctor": _cmd_doctor,
+        "verify": _cmd_verify,
         "squads": _cmd_squads,
         "run": _cmd_run,
         "status": _cmd_status,

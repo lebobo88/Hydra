@@ -28,8 +28,10 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 
 from hydra_core.memory import (  # noqa: E402
-    EPISODIC_DB, append_episodic, get_index, list_episodic, resolve_episodic,
+    EPISODIC_DB, append_episodic, get_index, list_episodic, query_by_cell,
+    resolve_episodic, tag_episodic,
 )
+from hydra_core.eights import ALL_CELLS  # noqa: E402
 
 
 def _tool_handlers() -> dict[str, callable]:
@@ -39,6 +41,8 @@ def _tool_handlers() -> dict[str, callable]:
             kind=args.get("kind", "note"),
             payload=args.get("payload", {}),
             key=args.get("key"),
+            cells=args.get("cells"),
+            origin_squad=args.get("origin_squad"),
         )
         return {"ref": ref.model_dump(mode="json")}
 
@@ -58,11 +62,32 @@ def _tool_handlers() -> dict[str, callable]:
         refs = index.search(emb, k=int(args.get("k", 5)))
         return {"refs": [r.model_dump(mode="json") for r in refs]}
 
+    def query_eights(args: dict[str, Any]) -> dict[str, Any]:
+        cell = (args.get("cell") or "").strip().lower()
+        if cell not in ALL_CELLS:
+            return {"error": "invalid_cell", "cell": cell, "valid": list(ALL_CELLS)}
+        rows = query_by_cell(
+            cell,
+            limit=int(args.get("limit", 50)),
+            workflow_id=args.get("workflow_id"),
+        )
+        return {"cell": cell, "rows": rows, "count": len(rows)}
+
+    def tag_memory(args: dict[str, Any]) -> dict[str, Any]:
+        merged = tag_episodic(
+            key=args["key"],
+            cells=args.get("cells", []),
+            replace=bool(args.get("replace", False)),
+        )
+        return {"key": args["key"], "cells": merged}
+
     return {
         "hydra-mem.write_episodic": write_episodic,
         "hydra-mem.read_episodic": read_episodic,
         "hydra-mem.list_workflow": list_workflow,
         "hydra-mem.semantic_search": semantic_search,
+        "hydra-mem.query_eights": query_eights,
+        "hydra-mem.tag_memory": tag_memory,
     }
 
 

@@ -1,4 +1,6 @@
 name: Customer Service & Support
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Tier-1/2/3 support triage, knowledge-base RAG, escalation routing, SLA
   enforcement, voice-of-customer synthesis. STUB.

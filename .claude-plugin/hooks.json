@@ -1,0 +1,24 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Task",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python ./.claude-plugin/hooks/iolaus_check.py"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Task",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python ./.claude-plugin/hooks/iolaus_log.py"
+        }
+      ]
+    }
+  ]
+}

@@ -6,11 +6,14 @@ construction time. No code change required to add a squad.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import yaml
+
+from .version import Version, parse_deprecated_after
 
 
 SQUAD_DIR_NAMES = ("squads",)
@@ -20,16 +23,29 @@ USER_SQUAD_DIR = Path.home() / ".hydra" / "squads"
 @dataclass(frozen=True)
 class AgentSpec:
     slug: str
-    role: str
+    role: str = ""
     authority: str = "advisory"          # advisory | execute | gatekeeper
     model_hint: Optional[str] = None
+    # Optional inline cathedral overlay (Stage 4 heads.yaml has the canonical
+    # path; this lets a squad.yaml declare the alias directly when there is
+    # no separate overlay file).
+    mythic: Optional[str] = None
+    model_tier: Optional[str] = None     # "opus" | "sonnet" | "haiku" | None
+    agent_file: Optional[str] = None     # relative path to the Claude Code agent definition
+    parent: Optional[str] = None         # slug of the parent head (for sub-agents)
+    hitl_trigger: bool = False           # True → this agent's gate always surfaces HITL
+    notes: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
     mcp_server: Optional[str] = None
-    privilege: Literal["read", "write", "execute", "destructive"] = "read"
+    # Privilege is conventionally one of read | write | execute | destructive
+    # but the Garland Crown declares composite values like "read+write" for
+    # the eights-memory tool; we accept any string and let consumers parse.
+    privilege: str = "read"
+    notes: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +70,8 @@ class SquadPack:
     emits: tuple[str, ...] = ()
     gates: tuple[GateSpec, ...] = ()
     invoke: dict[str, Any] = None            # entrypoint-specific config
+    version: Version = field(default_factory=lambda: Version(1, 0, 0))
+    deprecated_after: Optional[date] = None
 
     def can_accept(self, envelope_type: str) -> bool:
         return envelope_type in self.accepts or "*" in self.accepts
@@ -76,6 +94,8 @@ def _coerce_pack(slug: str, data: dict[str, Any]) -> SquadPack:
         emits=tuple(data.get("emits", [])),
         gates=gates,
         invoke=data.get("invoke", {}) or {},
+        version=Version.parse(str(data.get("version", "1.0.0"))),
+        deprecated_after=parse_deprecated_after(data.get("deprecated_after")),
     )
 
 

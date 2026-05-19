@@ -37,6 +37,8 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "campaign", "brand", "logo", "video", "shot", "script", "copy",
         "press kit", "social", "thumbnail", "voiceover", "music", "image",
         "render", "scene", "storyboard", "cinematic", "youtube", "tiktok",
+        "calliope", "erato", "polyhymnia", "terpsichore", "euterpe", "clio",
+        "urania", "helios", "garland", "muse", "muses", "creative crew",
     ),
     "legal-compliance": (
         "gdpr", "ccpa", "hipaa", "contract", "nda", "msa", "privacy",
@@ -58,6 +60,35 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
     "customer-support": (
         "ticket", "support", "complaint", "outage", "downtime", "sla",
         "p1 incident", "escalation", "knowledge base", "kb", "tier 1",
+    ),
+    "marketing-research": (
+        "market research", "competitor", "competitive intel", "tam", "sam", "som",
+        "persona", "audience", "segment", "icp", "serp", "keyword", "topic cluster",
+        "trends", "industry analysis",
+    ),
+    "marketing-strategy": (
+        "campaign strategy", "go-to-market", "gtm", "positioning", "channel mix",
+        "marketing plan", "campaign brief", "okr", "marketing okr",
+        "marketing budget", "demand generation", "demand gen", "abm",
+        "funnel strategy",
+    ),
+    "marketing-creative": (
+        "copywriting", "creative", "brand voice", "tagline", "headline", "ad copy",
+        "landing page copy", "marketing copy", "brand narrative", "aesthetic",
+        "tone of voice", "messaging framework", "creative brief",
+    ),
+    "marketing-ops": (
+        "media buying", "bid", "ppc", "paid media", "budget allocation",
+        "media plan", "mmm", "mta", "attribution", "lifecycle marketing",
+        "email marketing", "crm", "marketing automation", "a/b test",
+        "conversion rate optimization", "cro",
+    ),
+    "marketing-production": (
+        "shoot", "shot list", "production plan", "shoot day", "location scout",
+        "talent release", "model release", "music license", "stock footage",
+        "ip clearance", "post-production", "cinematographer", "dp",
+        "director of photography", "storyboard", "scheduling", "production budget",
+        "production schedule", "permit", "crew", "gaffer", "grip",
     ),
 }
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .iolaus import post_dispatch, pre_dispatch
 from .schemas import (
     DecisionRecord,
     Handoff,
@@ -32,6 +33,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
+from .version import DoubleSpawnRefused, SquadDeprecated
 
 
 class Dispatcher(Protocol):
@@ -56,30 +58,61 @@ def execute_squad(
     pack: SquadPack,
     inbound: HydraEnvelope,
     dispatcher: Dispatcher,
+    *,
+    allow_archived: bool = False,
 ) -> SquadResult:
-    """Single entry point. Selects strategy by `pack.entrypoint`."""
+    """Single entry point. Selects strategy by `pack.entrypoint`.
+
+    Iolaus is wrapped around the strategy call: `pre_dispatch` enforces
+    deprecation and refuses duplicate spawns, `post_dispatch` records the
+    close of the lifecycle. Refused dispatches are returned as a `failed`
+    SquadResult with the Iolaus rationale, not raised — so the supervisor
+    can surface them to HITL rather than crash.
+    """
+    try:
+        verdict = pre_dispatch(pack, inbound, allow_archived=allow_archived)
+    except SquadDeprecated as e:
+        return SquadResult(
+            envelopes=[], artifacts=[{"kind": "lifecycle_event",
+                                       "data": {"kind": "refused_deprecated",
+                                                "slug": e.slug,
+                                                "deprecated_after": e.deprecated_after.isoformat()}}],
+            status="failed",
+            rationale=f"iolaus: {e}",
+        )
+    except DoubleSpawnRefused as e:
+        return SquadResult(
+            envelopes=[], artifacts=[{"kind": "lifecycle_event",
+                                       "data": {"kind": "refused_duplicate",
+                                                "slug": e.slug,
+                                                "envelope_id": e.envelope_id}}],
+            status="failed",
+            rationale=f"iolaus: {e}",
+        )
 
     if pack.entrypoint == "stub":
-        return _stub(pack, inbound)
+        result = _stub(pack, inbound)
+    elif pack.entrypoint == "mcp":
+        result = _via_mcp(state, pack, inbound, dispatcher)
+    elif pack.entrypoint == "agent-impersonation":
+        result = _via_impersonation(state, pack, inbound, dispatcher)
+    elif pack.entrypoint == "claude-skill":
+        result = _via_claude_skill(state, pack, inbound, dispatcher)
+    elif pack.entrypoint == "subprocess":
+        result = _via_subprocess(state, pack, inbound, dispatcher)
+    else:
+        result = SquadResult(
+            envelopes=[],
+            artifacts=[],
+            status="failed",
+            rationale=f"unknown entrypoint {pack.entrypoint!r}",
+        )
 
-    if pack.entrypoint == "mcp":
-        return _via_mcp(state, pack, inbound, dispatcher)
-
-    if pack.entrypoint == "agent-impersonation":
-        return _via_impersonation(state, pack, inbound, dispatcher)
-
-    if pack.entrypoint == "claude-skill":
-        return _via_claude_skill(state, pack, inbound, dispatcher)
-
-    if pack.entrypoint == "subprocess":
-        return _via_subprocess(state, pack, inbound, dispatcher)
-
-    return SquadResult(
-        envelopes=[],
-        artifacts=[],
-        status="failed",
-        rationale=f"unknown entrypoint {pack.entrypoint!r}",
-    )
+    post_evt = post_dispatch(pack, inbound, status=result.status, detail=result.rationale[:200])
+    result.artifacts.append({"kind": "lifecycle_event", "data": post_evt.to_dict()})
+    # Tuck pre_dispatch event at the head so the trace reads chronologically.
+    result.artifacts.insert(0, {"kind": "lifecycle_event", "data": verdict.event.to_dict()})
+    return result
 
 
 # ---------- strategies ----------

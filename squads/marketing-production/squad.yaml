@@ -1,0 +1,72 @@
+name: Marketing Production
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
+description: >
+  Production planning bridge between marketing-creative and Hydra's creative squad.
+  Owns shot lists, talent and IP releases, locations, scheduling, budgets, post-production briefs.
+  Converts an approved CreativeBrief into a fully-clearance-checked, schedule-bound ShotList + AssetJob
+  envelope pair that Hydra's creative squad (RLM) can execute against. Does not generate assets itself.
+source_pack: C:\AiAppDeployments\MarketBliss
+entrypoint: claude-skill
+industries: [media, film, photography, cinematography, advertising, broadcast, OOH, production, marketing]
+
+agents:
+  - slug: executive-producer
+    role: "Production planning, scheduling, budget, crew, on-set logistics, post oversight"
+    authority: execute
+  - slug: shot-list-designer
+    role: "Translates CreativeBrief + locked aesthetic into per-shot tech specs; emits ShotList envelope"
+    authority: execute
+  - slug: talent-ip-coordinator
+    role: "Talent releases, music licensing, stock-asset rights, location permits, chain-of-title"
+    authority: gatekeeper
+  - slug: marketing-supervisor
+    role: "Cross-squad orchestrator and arbitration"
+    authority: gatekeeper
+  - slug: brand-safety-compliance
+    role: "Brand-consistency and regulated-claims gate (shared across squads)"
+    authority: gatekeeper
+
+tools:
+  - name: production-planning
+    privilege: read
+  - name: talent-ip-clearance
+    privilege: read
+  - name: creative-brief-protocol
+    privilege: read
+  - name: aesthetic-archetypes
+    privilege: read
+  - name: marketing-governance
+    privilege: read
+
+accepts:
+  - CREATIVE_BRIEF
+  - HANDOFF
+  - HITL_REQUEST
+
+emits:
+  - SHOT_LIST
+  - ASSET_JOB
+  - DECISION_RECORD
+  - HITL_REQUEST
+
+gates:
+  - rubric_id: ip-clearance
+    hitl_required: true
+    when: "constraints.risk_tolerance == 'low' or production.has_unreleased_talent or production.has_unlicensed_music"
+  - rubric_id: budget-cap
+    hitl_required: true
+    when: "production.proposed_spend > campaign.budget * 1.05"
+  - rubric_id: brand-consistency
+    hitl_required: false
+  - rubric_id: regulated-claims-review
+    hitl_required: true
+    when: "constraints.industry == 'regulated-health-finance'"
+
+invoke:
+  command_hint: "/production-brief"
+  fallback_commands:
+    - "/campaign-landing"
+    - "/brand-audit"
+    - "/campaign-brief"
+  output_dir: "output/campaigns/{campaign_id}/production/{topic}-{date}.md"

@@ -1,0 +1,82 @@
+name: Garland Crown (Creative & Marketing) — RETIRED STUB
+version: 1.0.0
+deprecated_after: 2026-05-19   # Retired: the Garland Crown now lives at squads/creative/ (RLM-Creative shipped). Iolaus refuses dispatch via this slug.
+description: >
+  RETIRED. This was the Stage-4 stub for the Garland Crown pending the
+  sibling RLM-Creative project. RLM-Creative shipped on 2026-05-19 and
+  the Garland Crown now lives at `squads/creative/squad.yaml` (the
+  Creative & Production "Eight Garland Heads" pack). Iolaus refuses
+  dispatch via this slug as of the deprecated_after date; the directory
+  is preserved so the cathedral-name overlay history remains in version
+  control. To revive this slug for a different purpose, change the
+  `name`, clear `deprecated_after`, and bump `version`.
+source_pack: C:\AiAppDeployments\RLM-Creative
+entrypoint: stub
+industries:
+  - marketing
+  - brand
+  - creative
+  - photography
+  - cinematography
+  - content
+  - social-community
+  - performance-marketing
+  - pr-earned-media
+  - seo
+
+agents:
+  - slug: brand-strategist
+    role: "Calliope — narrative architecture, positioning, voice"
+    authority: advisory
+  - slug: copywriter
+    role: "Erato — long-form, short-form, headline craft"
+    authority: advisory
+  - slug: content-strategist
+    role: "Polyhymnia — editorial calendar, pillar content, repurposing"
+    authority: advisory
+  - slug: social-community
+    role: "Terpsichore — platform-native voice, community rhythm"
+    authority: advisory
+  - slug: paid-acquisition
+    role: "Euterpe — performance creative, channel arbitrage"
+    authority: advisory
+  - slug: pr-earned
+    role: "Clio — story angles, press kits, reporter relationships"
+    authority: advisory
+  - slug: seo-discovery
+    role: "Urania — schema, technical SEO, semantic clustering"
+    authority: advisory
+  - slug: photo-cinema
+    role: "Helios — visual direction, shot lists, color science"
+    authority: gatekeeper
+
+tools: []
+
+accepts:
+  - CREATIVE_BRIEF
+  - HANDOFF
+
+emits:
+  - CREATIVE_BRIEF
+  - SHOT_LIST
+  - ASSET_JOB
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: brand-voice-consistency
+    hitl_required: true
+  - rubric_id: visual-direction-color-science
+    hitl_required: true
+
+invoke:
+  # Stub mode — surface with a pointer until RLM-Creative ships.
+  command_hint: "/creative-campaign"
+  fallback_commands:
+    - "/photo-direction"
+    - "/brand-refresh"
+  output_dir: "output/garland/{phase}/{topic-kebab}-{date}.md"
+  pending_project: "C:\\AiAppDeployments\\RLM-Creative"
+  pending_message: >
+    The Garland Crown is scaffolded but its source pack (RLM-Creative) has not
+    shipped yet. Surface this work to the user for manual routing or implement
+    the sibling project per docs/ROADMAP-MANIFESTO.md (parallel track).

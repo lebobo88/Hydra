@@ -1,4 +1,6 @@
 name: Legal & Compliance
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Contract review, regulatory mapping (GDPR/CCPA/HIPAA/EU AI Act/SOX), IP &
   trademark, privacy impact assessments, litigation triage, vendor MSA review.

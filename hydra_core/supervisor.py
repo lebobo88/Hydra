@@ -16,7 +16,10 @@ from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from .governance import enforce_governance, GovernanceVerdict
+from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
+from .immortal_head import load_constitution
 from .router import classify_intent
+from .venom import load_cerberus_venoms
 from .schemas import (
     CSuiteDecisionPacket,
     DecisionRecord,
@@ -55,6 +58,17 @@ def build_supervisor(
     packs = discover_squads(project_root)
     if not packs:
         raise RuntimeError("No squads discovered. Expected `squads/<name>/squad.yaml`.")
+
+    # The immortal head is loaded once per supervisor build. Every postcheck
+    # uses this snapshot; a hash change means the law changed and the
+    # supervisor must be rebuilt (typically on next workflow run).
+    constitution = load_constitution(project_root)
+
+    # Cerberus' venom registry is hydrated from cerberus.yaml at boot.
+    # Capabilities not pre-registered raise VenomUnregistered when invoked
+    # through `require_cerberus_pass`, so a missing file means *no* venom
+    # is callable — the safe default per the manifesto.
+    load_cerberus_venoms(project_root)
 
     # ----- node implementations -----
 
@@ -175,13 +189,20 @@ def build_supervisor(
         }
 
     def node_synthesis(state: HydraState) -> dict:
+        # Cathedral voice for user-facing output; plaza slugs remain in the
+        # envelope's structured fields. Per the manifesto: "no head speaks
+        # to the user without Hydra's synthesis."
+        cathedral_roster = ", ".join(
+            crown_label_for_squad(s) for s in state.selected_squads
+        ) or "(no heads convened)"
         record = DecisionRecord(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
             target_squad="human",
             decision=f"Workflow synthesis for: {state.root_goal}",
             rationale=(
-                f"Selected squads: {state.selected_squads}. "
+                f"Council: {cathedral_roster}. "
+                f"Plaza slugs: {state.selected_squads}. "
                 f"Tasks: {[t.status for t in state.tasks]}. "
                 f"Budget spent ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f}."
             ),
@@ -193,7 +214,7 @@ def build_supervisor(
         }
 
     def node_postcheck(state: HydraState) -> dict:
-        verdict = enforce_governance(state, packs)
+        verdict = enforce_governance(state, packs, constitution=constitution)
         if verdict.surfaced:
             state.phase = "surfaced"
         else:

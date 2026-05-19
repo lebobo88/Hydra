@@ -18,14 +18,22 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from .eights import Cell
+
 
 # ---------- shared primitives ----------
 
 class MemoryRef(BaseModel):
-    """A handle, not a blob. Agents resolve via the memory MCP server."""
+    """A handle, not a blob. Agents resolve via the memory MCP server.
+
+    `cells` is the TheEights tag vocabulary (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui).
+    Empty list means untagged — backwards compatible with pre-Stage-3 writes.
+    See `hydra_core.eights` for the cell vocabulary.
+    """
     tier: Literal["ephemeral", "episodic", "semantic", "profile"]
     key: str
     summary: Optional[str] = None
+    cells: list[Cell] = Field(default_factory=list)
 
 
 class Constraints(BaseModel):
@@ -162,7 +170,8 @@ class AssetJob(HydraEnvelope):
 class HITLRequest(HydraEnvelope):
     type: Literal["HITL_REQUEST"] = "HITL_REQUEST"
     reason: Literal["budget_approval", "prod_deploy", "high_risk", "policy_breach",
-                    "campaign_signoff", "schema_conflict", "loop_ceiling"]
+                    "campaign_signoff", "schema_conflict", "loop_ceiling",
+                    "constitution_breach"]
     summary: str
     options: list[str]
     default_option: Optional[str] = None

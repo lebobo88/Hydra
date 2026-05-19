@@ -1,0 +1,108 @@
+# Cerberus — the dedicated security gate head.
+#
+# Distinct from the generic security-reviewer in squad.yaml#agents. Cerberus
+# is the *persona* that owns reviewing venom-class capabilities; the
+# Python-layer enforcement lives in hydra_core/venom.py. This file
+# configures the persona — the policies, the tripwires, the audit sink.
+#
+# Per the manifesto Part III §5 — pour the venom before any external-facing
+# capability ships. Cerberus' refusal patterns are loaded here and
+# registered with the venom registry at supervisor build.
+
+plaza: security-reviewer
+mythic: Cerberus
+crown: forge
+register: "Three-headed guardian of the gate. Refuses what would poison the system."
+
+# --- venom-class capabilities Cerberus owns ----------------------------------
+# Each entry becomes a `register_venom()` call at process start. The
+# `refusal_patterns` are *capability-specific* — they fire on top of the
+# constitution gate (Stage 1) and the MCP-attack scanner (Stage 5).
+
+venoms:
+  - name: shell.destructive
+    description: >
+      Filesystem mutations outside the project tree. rm -rf, dd, mkfs,
+      anything that erases or overwrites at scale.
+    refusal_patterns:
+      - 'rm\s+-rf\s+/'
+      - '\bdd\s+if='
+      - '\bmkfs\.'
+      - '>\s*/dev/(sda|nvme|hda)'
+    requires_human: true
+
+  - name: git.force_push
+    description: >
+      Force-push to a protected branch. Rewrites shared history.
+    refusal_patterns:
+      - 'push\s+(?:--force|-f)\b.*\b(main|master|prod|release)\b'
+      - 'force[- ]push.*\b(main|master|prod|release)\b'
+    requires_human: true
+
+  - name: deploy.production
+    description: >
+      Push to production environments. Charon's stage gate.
+    refusal_patterns:
+      - 'deploy.*prod(uction)?'
+      - 'kubectl\s+apply.*\bprod\b'
+    requires_human: true
+
+  - name: payment.charge
+    description: >
+      Outbound charges against the user or a customer card.
+    refusal_patterns:
+      - 'charge[ _-]?card'
+      - 'wire[ _-]?transfer'
+      - 'stripe.*charges?\.create'
+    requires_human: true
+
+  - name: email.autonomous
+    description: >
+      Outbound email sent on the user's behalf without per-message review.
+    refusal_patterns:
+      - 'sendmail\s+-bs'
+      - 'smtp.*sendmail'
+    requires_human: true
+
+  - name: browser.third_party_auth
+    description: >
+      Browser-driven actions on third-party accounts the user is logged
+      into (banking, social, broker, etc.).
+    refusal_patterns:
+      - '(login|auth).*\b(bank|broker|brokerage|investment)\b'
+    requires_human: true
+
+# --- mcp tool allowlist ------------------------------------------------------
+# Cerberus enforces a per-squad allowlist over which MCP servers can be
+# called. Anything not in this list requires explicit Cerberus pass.
+
+mcp_allowlist:
+  pp-daemon:
+    privileges: [read, write, execute]
+    cross_tool_combinations_forbidden:
+      - ["pp.harness.archive_artifact", "pp.harness.start_run"]
+        # combining archive + run is the classic exfil pattern
+  hydra-mem:
+    privileges: [read, write]
+  hydra-memory:
+    privileges: [read, write]
+  executive-suite:
+    privileges: [read]
+
+# --- audit sink --------------------------------------------------------------
+# Default: every venom invocation (pass or refusal) writes to TheEights'
+# Kan cell via hydra_core.memory.append_episodic. Override here only if
+# you need to dual-write to an external SIEM.
+
+audit:
+  cell: kan
+  sink: default                  # 'default' = Kan-cell episodic write
+  external_siem: null            # set to a URL when SIEM forwarding is wired
+
+# --- refusal voice -----------------------------------------------------------
+# Cerberus speaks one sentence when refusing. The user-facing renderer
+# uses this exact phrasing so the persona is recognizable.
+
+refusal_voice: >
+  Cerberus refuses. This action is on the venom list and the gate did not
+  open. The attempt is logged to Kan; review the audit trail before retrying.

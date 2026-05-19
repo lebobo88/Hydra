@@ -14,7 +14,7 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 |---|---|---|
 | executive | `C:\AiAppDeployments\ExecutiveSuite` | agent-impersonation |
 | engineering | `C:\AiAppDeployments\pair-programmer` | mcp |
-| creative | `C:\AiAppDeployments\RLM-CLI-Starter` | claude-skill |
+| creative | `C:\AiAppDeployments\RLM-Creative` | claude-skill |
 | legal-compliance | (stub) | stub |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |
@@ -23,11 +23,13 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
 ## Hard Rules
 
-1. **Never bypass HITL.** A paused workflow resumes only via `/hydra:approve` or `/hydra:resume`.
-2. **Never cross a squad boundary with a raw blob.** Use `MemoryRef` handles.
-3. **Never modify the squad registry inline.** Use `/hydra:add-squad` or edit `squads/<slug>/squad.yaml`.
-4. **Always validate envelopes** with `hydra_core.schemas.validate_envelope` at squad boundaries.
-5. **Always log** to the per-workflow trace via `hydra_core.telemetry.emit`.
+1. **Never edit `CONSTITUTION.md`.** It is the immortal head — the cryptographically hashed rule of faith. The user authors it; agents read it; the SHA-256 must be stable across a session. Proposed edits surface as HITL with reason=`constitution_breach`. See `hydra_core/immortal_head.py`.
+2. **Never bypass HITL.** A paused workflow resumes only via `/hydra:approve` or `/hydra:resume`.
+3. **Never cross a squad boundary with a raw blob.** Use `MemoryRef` handles.
+4. **Never modify the squad registry inline.** Use `/hydra:add-squad` or edit `squads/<slug>/squad.yaml`.
+5. **Always validate envelopes** with `hydra_core.schemas.validate_envelope` at squad boundaries.
+6. **Always log** to the per-workflow trace via `hydra_core.telemetry.emit`.
+7. **Always gate procedural-memory updates and venom-class capabilities** through `hydra_core.governance.enforce_constitution` before commit/execute.
 
 ## Engineering Standards
 
@@ -44,6 +46,9 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
 ## Where To Read More
 
+- `CONSTITUTION.md` — **the immortal head.** Rule of faith. Read this first; everything else is downstream.
+- `docs/MANIFESTO.md` — the Hydra Manifesto (Pentecost-not-Legion frame, Three Crowns, TheEights).
+- `docs/ROADMAP-MANIFESTO.md` — six-stage ingestion roadmap (Stage 1 shipped; 2–6 specified).
 - `HYDRA.md` — top-level architecture
 - `ARCHITECTURE.md` — engineer-facing detailed design
 - `CONTRIBUTING-SQUADS.md` — how to add a squad pack

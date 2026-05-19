@@ -1,0 +1,58 @@
+name: Marketing Ops
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
+description: >
+  Media buying, budget allocation, bid optimization, channel mix, lifecycle
+  cadence, measurement plan. Consumes CreativeBrief + DecisionRecord; emits
+  DecisionRecord envelopes back to ExecutiveSuite CMO.
+source_pack: C:\AiAppDeployments\MarketBliss
+entrypoint: claude-skill
+industries: [marketing, advertising, b2b-saas, dtc-ecommerce, professional-services, regulated-health-finance, creative-production, advertising-commercial]
+
+agents:
+  - slug: media-buyer-bidder
+    role: "Channel mix, budget split, bid strategy, pacing"
+    authority: execute
+  - slug: lifecycle-crm
+    role: "Onboarding / retention / winback cadence"
+    authority: execute
+  - slug: analytics-experimentation
+    role: "Measurement plan, attribution method, lift design"
+    authority: execute
+  - slug: marketing-supervisor
+    role: "Squad coordinator + escalation"
+    authority: gatekeeper
+
+tools:
+  - name: media-mix-modeling
+    privilege: read
+  - name: marketing-attribution
+    privilege: read
+  - name: experimentation-design
+    privilege: read
+  - name: lifecycle-marketing
+    privilege: read
+  - name: audience-segmentation
+    privilege: read
+  - name: campaign-playbook
+    privilege: read
+
+accepts:
+  - HANDOFF
+  - DECISION_RECORD
+  - CREATIVE_BRIEF
+
+emits:
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: budget-cap
+    when: "proposed_spend > constraints.budget_usd * 1.05"
+  - rubric_id: attribution-soundness
+
+invoke:
+  command_hint: "/media-plan"
+  fallback_commands:
+    - "/launch-playbook"
+    - "/marketing-retro"
+  output_dir: "output/campaigns/{topic}/measurement/{date}.md"

@@ -1,4 +1,6 @@
 name: Engineering & Product
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Software engineering, product management, architecture, QA, DevOps. Wired to
   the pair-programmer harness — Hydra dispatches Engineering work as PP runs
