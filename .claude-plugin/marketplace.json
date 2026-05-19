@@ -1,0 +1,12 @@
+{
+  "name": "hydra-local",
+  "owner": { "name": "rob" },
+  "description": "Local marketplace wrapping the Hydra enterprise agent mesh plugin.",
+  "plugins": [
+    {
+      "name": "hydra",
+      "source": "./",
+      "description": "Hydra — supervisor that routes work across executive/engineering/creative squads."
+    }
+  ]
+}

@@ -11,15 +11,17 @@
     "hydra-memory": {
       "command": "python",
       "args": ["-m", "mcp_servers.hydra_memory"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
-        "HYDRA_EPISODIC_DB": "${HOME}/.hydra/episodic.db",
-        "HYDRA_VECTOR_DIR": "${HOME}/.hydra/vectors"
+        "HYDRA_EPISODIC_DB": "${USERPROFILE}/.hydra/episodic.db",
+        "HYDRA_VECTOR_DIR": "${USERPROFILE}/.hydra/vectors"
       },
       "_comment": "Hydra memory fabric — episodic + semantic store as MCP resources."
     },
     "executive-suite": {
       "command": "python",
       "args": ["-m", "mcp_servers.executive_suite"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "HYDRA_ES_ROOT": "C:/AiAppDeployments/ExecutiveSuite"
       },
@@ -28,6 +30,7 @@
     "rlm-creative": {
       "command": "python",
       "args": ["-m", "mcp_servers.rlm_creative"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "HYDRA_RLM_ROOT": "C:/AiAppDeployments/RLM-CLI-Starter"
       },

@@ -28,18 +28,65 @@ architecture spec and `ARCHITECTURE.md` for the engineering view.
 
 ## Quick install
 
+Hydra ships as a Claude Code plugin distributed via a **local marketplace** that
+lives in the repo itself (`.claude-plugin/marketplace.json`). Installation is a
+two-part process: install the Python runtime, then register the plugin with
+Claude Code so its slash commands, agents, skills, and MCP servers are
+available in any project session.
+
+### 1. Install the Python runtime
+
 ```powershell
 # clone or sit at the existing checkout
 cd C:\AiAppDeployments\Hydra
 
-# install python deps
-python -m pip install -e .
+# install python deps + create %USERPROFILE%\.hydra state dir
+.\scripts\install.ps1
+```
 
-# verify squads + runtime
-python -m hydra_core.cli doctor
+This pip-installs `hydra-core` in editable mode and runs
+`python -m hydra_core.cli doctor` to confirm squads are discovered.
 
-# register the Claude Code plugin (one-time)
-claude plugin add .
+### 2. Install the plugin into Claude Code (user scope)
+
+Inside any Claude Code session, from any directory:
+
+```
+/plugin marketplace add C:\AiAppDeployments\Hydra
+/plugin install hydra@hydra-local
+/reload-plugins
+```
+
+This registers the local marketplace, copies the plugin into
+`%USERPROFILE%\.claude\plugins\cache\hydra-local\hydra\<version>\`, and enables
+it in `%USERPROFILE%\.claude\settings.json`. Slash commands are now available
+in every Claude Code session, not just sessions opened from the Hydra repo.
+
+Verify with:
+
+```
+/mcp                   # expect 4 servers connected: pp-daemon, hydra-memory, executive-suite, rlm-creative
+/hydra:hydra-squads    # expect 8 squads listed
+/doctor                # expect 0 plugin errors
+```
+
+### Updating after edits
+
+Because Claude Code copies the plugin into its cache, edits to the repo do not
+auto-propagate. After bumping the `version` field in
+`.claude-plugin/plugin.json`:
+
+```
+/plugin marketplace update hydra-local
+/plugin install hydra@hydra-local       # or /plugin update hydra@hydra-local
+/reload-plugins
+```
+
+For active development with live edits, launch Claude Code with `--plugin-dir`
+instead of relying on the installed copy:
+
+```powershell
+claude --plugin-dir C:\AiAppDeployments\Hydra
 ```
 
 `hydra doctor` lists every discovered squad pack, confirms `pydantic` is

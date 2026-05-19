@@ -1,0 +1,17 @@
+{
+  "name": "hydra",
+  "description": "Hydra — Enterprise Agent Mesh supervisor (routes work across executive / engineering / creative / legal / healthcare / sales / research / customer-support squads).",
+  "version": "0.1.2",
+  "agents": [
+    "./.claude/agents/hydra-cfo-gate.md",
+    "./.claude/agents/hydra-hitl-gate.md",
+    "./.claude/agents/hydra-planner.md",
+    "./.claude/agents/hydra-router.md",
+    "./.claude/agents/hydra-supervisor.md",
+    "./.claude/agents/hydra-synthesizer.md"
+  ],
+  "skills": "./.claude/skills",
+  "commands": "./.claude/commands",
+  "hooks": "./hooks.json",
+  "mcpServers": "./.mcp.json"
+}
