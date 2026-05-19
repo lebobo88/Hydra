@@ -8,6 +8,16 @@
       },
       "_comment": "Engineering squad. Wired to the pair-programmer harness daemon."
     },
+    "pp-codex": {
+      "command": "node",
+      "args": ["C:/AiAppDeployments/pair-programmer/daemon/dist/index.js", "mcp-codex"],
+      "_comment": "Hydra judge plane: cross-vendor critique via PP's pp_codex MCP server. Wraps the `codex` CLI."
+    },
+    "pp-gemini": {
+      "command": "node",
+      "args": ["C:/AiAppDeployments/pair-programmer/daemon/dist/index.js", "mcp-gemini"],
+      "_comment": "Hydra judge plane: cross-vendor critique via PP's pp_gemini MCP server. Wraps the `gemini` CLI."
+    },
     "hydra-memory": {
       "command": "python",
       "args": ["-m", "mcp_servers.hydra_memory"],

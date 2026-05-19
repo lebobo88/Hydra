@@ -8,6 +8,7 @@ description: >
   Code's sub-agent impersonation pattern (no spawned sub-processes).
 source_pack: C:\AiAppDeployments\ExecutiveSuite
 entrypoint: agent-impersonation
+best_of_n: 3   # produce 3 candidate boardroom drafts, judge each, Borda-rank
 industries:
   - cross-industry-strategic
   - finance

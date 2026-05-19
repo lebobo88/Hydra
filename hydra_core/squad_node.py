@@ -51,6 +51,11 @@ class SquadResult:
     rationale: str = ""
     requires_hitl: bool = False
     hitl_request: HITLRequest | None = None
+    # True when the squad's "output" is actually a host-pickup placeholder
+    # (impersonation / claude-skill in headless mode). The judge plane must
+    # NOT score these — there's no substance yet. The host (Claude Code)
+    # fulfils the prompt out-of-band and a follow-up envelope arrives later.
+    host_pickup_pending: bool = False
 
 
 def execute_squad(
@@ -275,10 +280,15 @@ def _via_impersonation(
         rationale=str(result.get("summary", "(see artifact)"))[:1000],
         artifacts=artifacts_refs,
     )
+    host_pickup = (
+        isinstance(result, dict)
+        and result.get("status") == "host_pickup_required"
+    )
     return SquadResult(
         envelopes=[decision],
         artifacts=[{"kind": "boardroom_minutes", "raw": result, "persisted": write_result}],
         status="done",
+        host_pickup_pending=host_pickup,
     )
 
 
@@ -341,10 +351,15 @@ def _via_claude_skill(
         rationale=str(result.get("summary", ""))[:1000],
         artifacts=artifacts_refs,
     )
+    host_pickup = (
+        isinstance(result, dict)
+        and result.get("status") == "host_pickup_required"
+    )
     return SquadResult(
         envelopes=[decision],
         artifacts=[{"kind": "creative_output", "raw": result, "persisted": write_result}],
         status=result.get("status", "done"),
+        host_pickup_pending=host_pickup,
     )
 
 

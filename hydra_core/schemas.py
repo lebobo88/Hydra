@@ -220,6 +220,15 @@ SCHEMA_REGISTRY: dict[str, type[HydraEnvelope]] = {
 }
 
 
+def _register_judge_verdict() -> None:
+    """Register the JudgeVerdict envelope. Called by `hydra_core.judge` at
+    package init to avoid the schemas ↔ judge import cycle (judge.schemas
+    imports HydraEnvelope from this module).
+    """
+    from .judge.schemas import JudgeVerdict  # local import
+    SCHEMA_REGISTRY["JUDGE_VERDICT"] = JudgeVerdict
+
+
 def validate_envelope(obj: dict[str, Any]) -> HydraEnvelope:
     """Validate any envelope dict. Raises pydantic.ValidationError on failure."""
     t = obj.get("type")

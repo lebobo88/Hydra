@@ -72,6 +72,10 @@ class SquadPack:
     invoke: dict[str, Any] = None            # entrypoint-specific config
     version: Version = field(default_factory=lambda: Version(1, 0, 0))
     deprecated_after: Optional[date] = None
+    # Best-of-N opt-in. 0 / None / 1 → no best-of-N. N≥2 → produce N candidate
+    # outputs, judge each, Borda-rank, return the winner. See
+    # `hydra_core.judge.best_of_n`.
+    best_of_n: int = 0
 
     def can_accept(self, envelope_type: str) -> bool:
         return envelope_type in self.accepts or "*" in self.accepts
@@ -96,6 +100,7 @@ def _coerce_pack(slug: str, data: dict[str, Any]) -> SquadPack:
         invoke=data.get("invoke", {}) or {},
         version=Version.parse(str(data.get("version", "1.0.0"))),
         deprecated_after=parse_deprecated_after(data.get("deprecated_after")),
+        best_of_n=int(data.get("best_of_n", 0) or 0),
     )
 
 

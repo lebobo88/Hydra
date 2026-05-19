@@ -30,6 +30,7 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 5. **Always validate envelopes** with `hydra_core.schemas.validate_envelope` at squad boundaries.
 6. **Always log** to the per-workflow trace via `hydra_core.telemetry.emit`.
 7. **Always gate procedural-memory updates and venom-class capabilities** through `hydra_core.governance.enforce_constitution` before commit/execute.
+8. **Never modify a rubric's `@<version>` body in `hydra_core/judge/registry.py`.** Past verdicts pin `rubric_id@N` for replay determinism. To change a rubric, register `@N+1` and update consumers to opt in.
 
 ## Engineering Standards
 

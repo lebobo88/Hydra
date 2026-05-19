@@ -9,6 +9,7 @@ description: >
   this file is the Hydra-side copy kept in sync with it.
 source_pack: C:\AiAppDeployments\RLM-Creative
 entrypoint: claude-skill
+best_of_n: 3   # produce 3 candidate creative drafts, judge each, Borda-rank
 industries:
   - media
   - marketing

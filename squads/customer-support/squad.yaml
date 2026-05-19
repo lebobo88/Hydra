@@ -47,6 +47,9 @@ emits:
 gates:
   - rubric_id: sla-p1-1hour
   - rubric_id: empathy-tone-required
+  # Cross-model judge rubric (hydra_core.judge.registry). Auto-applied by the
+  # router whenever an envelope crosses the customer-support boundary.
+  - rubric_id: support-deflection-quality@1
 
 invoke:
   notes: "Stub. Add ticket-system + KB RAG MCP when activated."

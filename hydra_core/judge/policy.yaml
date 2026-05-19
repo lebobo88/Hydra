@@ -1,0 +1,53 @@
+# Hydra judge policy (built-in defaults).
+#
+# Override per-project by placing a `.hydra/judge_policy.yaml` at the workflow
+# project root. Unknown keys are ignored; missing keys fall back to these defaults.
+
+default_tier_by_envelope:
+  C_SUITE_DECISION_PACKET: cross_vendor
+  CREATIVE_BRIEF: same_vendor
+  SHOT_LIST: same_vendor
+  ASSET_JOB: same_vendor
+  PRD: skip_if_pp_judged
+  ARCH_RFC: skip_if_pp_judged
+  DEV_TASK: skip_if_pp_judged
+  HITL_REQUEST: cross_vendor
+  DECISION_RECORD: same_vendor
+  HANDOFF: same_vendor
+
+escalation_keywords:
+  - capital_allocation
+  - merger
+  - acquisition
+  - crisis
+  - black_swan
+  - phi
+  - hipaa
+  - gdpr
+  - constitution
+  - production_deploy
+
+vendor_pairs:
+  # (generator, judge) — judge must differ from generator for cross_vendor.
+  - [codex, gemini]
+  - [gemini, codex]
+  - [claude, gemini]
+  - [claude, codex]
+
+# Per-workflow tripwire. When the running judge cost exceeds this, the
+# dispatcher downgrades cross_vendor → single_vendor (Phase-2 hook).
+budget_cap_per_workflow_usd: 2.50
+
+# Phase gating: turn judges on only for these squads in Phase 1/2. Other squads
+# get the supervisor wiring but no real judge call.
+enabled_squads:
+  - executive
+  - creative
+  - healthcare
+  - legal-compliance
+
+# Severity escalation: rubrics that trigger HITL on `fail` outcome.
+hitl_on_fail:
+  - constitution-alignment@1
+  - phi-redaction-completeness@1
+  - financial-hardcoding@1

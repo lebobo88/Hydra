@@ -227,14 +227,21 @@ def _cmd_run(args) -> int:
     initial = HydraState(workflow_id=workflow_id, root_goal=args.goal)
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
+    critique_client = None
     if args.live:
         from .dispatcher import MCPStdioDispatcher
+        from .judge import MCPCritiqueClient
         dispatcher = MCPStdioDispatcher(project, verbose=args.verbose)
+        # Reuse the same dispatcher for cross-vendor judge calls; pp-codex /
+        # pp-gemini servers must be registered in .mcp.json.
+        critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
     else:
         dispatcher = _NullDispatcher()
     sup = build_supervisor(
         project_root=project,
         dispatcher=dispatcher,
+        critique_client=critique_client,
+        force_pure_python=getattr(args, "no_checkpoint", False),
     )
     emit(project, workflow_id, "workflow_start", {"goal": args.goal})
     from .supervisor import _PurePythonRunner
@@ -298,6 +305,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--squad", help="Comma-separated squad slugs to force-select")
     r.add_argument("--live", action="store_true", help="Use the live MCP dispatcher (talks to pp-daemon etc.)")
     r.add_argument("--verbose", action="store_true", help="Verbose MCP tool list / errors")
+    r.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help=(
+            "Force the pure-Python supervisor runner (no LangGraph checkpoints, "
+            "no HITL interrupts). Use for smoke tests / dev loops; production "
+            "runs should let LangGraph pause at HITL gates."
+        ),
+    )
     s = sub.add_parser("status")
     s.add_argument("workflow_id", nargs="?")
     t = sub.add_parser("trace")
