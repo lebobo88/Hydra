@@ -1,0 +1,55 @@
+name: Healthcare & Clinical
+description: >
+  Clinical decision support, perioperative care, HIPAA-bound workflows,
+  cardiovascular / oncology / perioperative agent specializations per the
+  CardioAgent / perioperative-MAS literature in the architecture doc.
+  STUB — implement agents + tools when activated.
+source_pack: null
+entrypoint: stub
+industries: [healthcare, clinical, hipaa, pharma, medtech]
+
+agents:
+  - slug: clinical-supervisor
+    role: "Coordinates clinical sub-agents; enforces patient-safety guardrails"
+    authority: gatekeeper
+  - slug: triage-agent
+    role: "Severity classification, ED-flow staging"
+    authority: advisory
+  - slug: diagnostic-reasoner
+    role: "Differential-diagnosis synthesis (advisory-only, not clinical decision)"
+    authority: advisory
+  - slug: pharmacology-agent
+    role: "Drug-drug interactions, dosing, contraindications"
+    authority: advisory
+  - slug: perioperative-agent
+    role: "Pre-/peri-/post-op planning per MDPI 2025 perioperative MAS"
+    authority: advisory
+  - slug: phi-redactor
+    role: "Strips/masks PHI on every cross-squad boundary"
+    authority: gatekeeper
+
+tools:
+  - name: snomed-ct-rag
+    privilege: read
+  - name: drug-interaction-api
+    privilege: read
+  - name: hl7-fhir-bridge
+    privilege: read
+
+accepts:
+  - HANDOFF
+  - HITL_REQUEST
+
+emits:
+  - DECISION_RECORD
+  - HITL_REQUEST
+
+gates:
+  - rubric_id: hipaa-minimum-necessary
+    hitl_required: true
+  - rubric_id: clinical-advisory-disclaimer
+    hitl_required: true              # never autonomous clinical decisioning
+  - rubric_id: phi-egress-zero
+
+invoke:
+  notes: "Clinical use requires HITL on every output. Never autonomous."

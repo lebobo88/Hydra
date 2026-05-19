@@ -1,0 +1,70 @@
+name: Creative & Production
+description: >
+  Brand, narrative, copywriting, cinematography, multimodal asset generation
+  (ComfyUI, gemini-image, gemini-content, video, DaVinci Resolve via RLM
+  pipeline). Wired to the RLM-CLI-Starter pack.
+source_pack: C:\AiAppDeployments\RLM-CLI-Starter
+entrypoint: claude-skill
+industries: [media, marketing, advertising, film, livestream, creator-economy]
+
+agents:
+  - slug: rlmcco
+    role: "Chief Creative Officer (RLM)"
+    authority: gatekeeper
+  - slug: rlmcmo
+    role: "Chief Marketing Officer (RLM)"
+    authority: advisory
+  - slug: gemini-content
+    role: "Long-form copywriter"
+    authority: execute
+  - slug: gemini-image
+    role: "Image-generation specialist"
+    authority: execute
+  - slug: gemini-frontend-designer
+    role: "Distinctive UI design"
+    authority: execute
+  - slug: comfyui
+    role: "Diffusion / video asset generation"
+    authority: execute
+  - slug: rlmboard
+    role: "RLM executive board (multi-perspective)"
+    authority: advisory
+
+tools:
+  - name: comfyui
+    privilege: execute
+  - name: frontend-design
+    privilege: execute
+  - name: marketing-expertise
+    privilege: read
+  - name: media-business
+    privilege: read
+
+accepts:
+  - CREATIVE_BRIEF
+  - SHOT_LIST
+  - ASSET_JOB
+  - HANDOFF
+
+emits:
+  - SHOT_LIST
+  - ASSET_JOB
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: brand-consistency
+  - rubric_id: ip-clearance
+    hitl_required: true
+    when: "constraints.risk_tolerance == 'low'"
+  - rubric_id: media-cost-cap
+    when: "asset_job.max_render_cost_usd > 200"
+
+invoke:
+  command_hint: "/rlm-team"
+  fallback_commands:
+    - "/rlm-exec-creative-brief"
+    - "/rlm-feature-design"
+    - "/rlm-video"
+    - "/rlm-design"
+    - "/cinematic-landing"
+  output_dir: "RLM/output/{phase}/{topic}-{date}.md"

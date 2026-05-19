@@ -1,0 +1,48 @@
+name: Sales & GTM
+description: >
+  Pipeline, prospecting, RevOps automation, deal-desk review, pricing-exception
+  handling, competitive intel synthesis. STUB.
+source_pack: null
+entrypoint: stub
+industries: [sales, gtm, revops, deal-desk]
+
+agents:
+  - slug: gtm-supervisor
+    role: "Coordinates prospecting/qual/proposal flow"
+    authority: gatekeeper
+  - slug: prospector
+    role: "ICP-fit research, account prioritization"
+    authority: advisory
+  - slug: deal-desk
+    role: "Pricing exceptions, MSA negotiations, approval routing"
+    authority: gatekeeper
+  - slug: competitive-intel
+    role: "Win/loss + battlecards"
+    authority: advisory
+  - slug: revops-analyst
+    role: "Pipeline hygiene, forecast accuracy, leakage analysis"
+    authority: advisory
+
+tools:
+  - name: crm-bridge
+    privilege: read
+  - name: data-enrichment
+    privilege: read
+  - name: cpq
+    privilege: write
+
+accepts:
+  - HANDOFF
+  - C_SUITE_DECISION_PACKET
+  - CREATIVE_BRIEF
+
+emits:
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: revenue-recognition-asc-606
+    hitl_required: true
+    when: "phase == 'deal-close'"
+
+invoke:
+  notes: "Stub. Add prospecting + CPQ MCP servers when activated."

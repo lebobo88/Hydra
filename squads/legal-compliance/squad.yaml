@@ -1,0 +1,57 @@
+name: Legal & Compliance
+description: >
+  Contract review, regulatory mapping (GDPR/CCPA/HIPAA/EU AI Act/SOX), IP &
+  trademark, privacy impact assessments, litigation triage, vendor MSA review.
+  STUB — implement agents + tools when activated.
+source_pack: null
+entrypoint: stub
+industries: [legal, compliance, governance, privacy, ip]
+
+agents:
+  - slug: general-counsel
+    role: "Top of legal stack — go/no-go on legal-sensitive moves"
+    authority: gatekeeper
+  - slug: privacy-officer
+    role: "DPIA, data-subject rights, cross-border transfer review"
+    authority: gatekeeper
+  - slug: contract-reviewer
+    role: "MSA/SOW/NDA redline + risk extraction"
+    authority: advisory
+  - slug: regulatory-mapper
+    role: "Maps proposed feature/change to applicable regulation"
+    authority: advisory
+  - slug: ip-counsel
+    role: "Trademark, patent, copyright, open-source license review"
+    authority: gatekeeper
+  - slug: litigation-triage
+    role: "Incoming-claim triage + privilege-handling"
+    authority: advisory
+
+tools:
+  - name: regulatory-corpus-rag
+    privilege: read
+  - name: contract-clause-library
+    privilege: read
+  - name: dpia-template
+    privilege: write
+
+accepts:
+  - HANDOFF
+  - C_SUITE_DECISION_PACKET
+  - PRD
+  - CREATIVE_BRIEF
+
+emits:
+  - DECISION_RECORD
+  - HITL_REQUEST
+
+gates:
+  - rubric_id: gdpr-art-25-privacy-by-design
+    hitl_required: true
+  - rubric_id: eu-ai-act-classification
+    hitl_required: true
+    when: "'ai' in constraints.industries or 'ai-platform' in constraints.industries"
+  - rubric_id: open-source-license-compatibility
+
+invoke:
+  notes: "Activate by adding implementing agents + MCP server + commands."

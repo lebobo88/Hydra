@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydra-core"
+version = "0.1.0"
+description = "Hydra — central supervisor / state engine for the Enterprise Agent Mesh"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+  "pydantic>=2.6",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+langgraph = [
+  "langgraph>=0.2",
+  "langgraph-checkpoint-sqlite>=2.0",
+]
+mcp = [
+  "mcp>=1.0",
+]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+hydra = "hydra_core.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hydra_core*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

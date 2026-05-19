@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "pp-daemon": {
+      "command": "node",
+      "args": ["C:/AiAppDeployments/pair-programmer/daemon/dist/index.js", "mcp"],
+      "env": {
+        "PP_HARNESS_MCP": "1"
+      },
+      "_comment": "Engineering squad. Wired to the pair-programmer harness daemon."
+    },
+    "hydra-memory": {
+      "command": "python",
+      "args": ["-m", "mcp_servers.hydra_memory"],
+      "env": {
+        "HYDRA_EPISODIC_DB": "${HOME}/.hydra/episodic.db",
+        "HYDRA_VECTOR_DIR": "${HOME}/.hydra/vectors"
+      },
+      "_comment": "Hydra memory fabric — episodic + semantic store as MCP resources."
+    },
+    "executive-suite": {
+      "command": "node",
+      "args": ["${MCP_FILESYSTEM_SERVER:-@modelcontextprotocol/server-filesystem}",
+               "C:/AiAppDeployments/ExecutiveSuite"],
+      "_comment": "Read-only filesystem MCP for ExecutiveSuite agents/skills/output. The executive squad uses agent-impersonation; this server is for resource lookup only."
+    },
+    "rlm-creative": {
+      "command": "node",
+      "args": ["${MCP_FILESYSTEM_SERVER:-@modelcontextprotocol/server-filesystem}",
+               "C:/AiAppDeployments/RLM-CLI-Starter"],
+      "_comment": "Read-only filesystem MCP for the RLM creative pack."
+    }
+  }
+}

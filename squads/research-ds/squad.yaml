@@ -1,0 +1,50 @@
+name: Research & Data-Science
+description: >
+  Hypothesis design, experiment running, paper / literature review,
+  statistical analysis, ML model evaluation, reproducibility audits. STUB.
+source_pack: null
+entrypoint: stub
+industries: [research, data-science, ml-research, academia]
+
+agents:
+  - slug: research-supervisor
+    role: "Plans literature review + experiment chain"
+    authority: gatekeeper
+  - slug: literature-scanner
+    role: "Reads / summarizes papers; tracks citations"
+    authority: advisory
+  - slug: experiment-designer
+    role: "Power analysis, factorial design, pre-registration"
+    authority: advisory
+  - slug: statistician
+    role: "Runs analyses, multiple-comparison correction, effect sizes"
+    authority: advisory
+  - slug: reproducibility-auditor
+    role: "Re-runs experiments from frozen seeds + envs"
+    authority: gatekeeper
+  - slug: paper-writer
+    role: "Drafts manuscripts in target venue format"
+    authority: advisory
+
+tools:
+  - name: arxiv-rag
+    privilege: read
+  - name: jupyter-runner
+    privilege: execute
+  - name: dvc-bridge
+    privilege: write
+
+accepts:
+  - HANDOFF
+  - PRD
+
+emits:
+  - ARCH_RFC
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: preregistration-required
+  - rubric_id: reproducibility-bundle-complete
+
+invoke:
+  notes: "Stub. Add jupyter MCP + paper-corpus RAG when activated."

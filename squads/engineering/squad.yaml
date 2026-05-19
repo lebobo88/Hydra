@@ -1,0 +1,70 @@
+name: Engineering & Product
+description: >
+  Software engineering, product management, architecture, QA, DevOps. Wired to
+  the pair-programmer harness — Hydra dispatches Engineering work as PP runs
+  (single, best-of, team-mode, or governance-forum review).
+source_pack: C:\AiAppDeployments\pair-programmer
+entrypoint: mcp
+industries: [software, saas, ai-platform, devtools, fintech-eng, healthtech-eng]
+
+agents:
+  - slug: pm-agent
+    role: "Product manager — turns CSuiteDecisionPacket into PRD"
+    authority: advisory
+  - slug: architect
+    role: "System architect — produces ARCH_RFC, C4 sketches"
+    authority: advisory
+  - slug: engineer
+    role: "Implementation engineer — feature-branch PRs only"
+    authority: execute
+  - slug: qa-reviewer
+    role: "QA + code reviewer — tests, lint, security scans"
+    authority: gatekeeper
+  - slug: devops-sre
+    role: "DevOps & SRE — proposes infra/CI; prod deploy requires HITL"
+    authority: gatekeeper
+
+tools:
+  - name: pp.harness.start_run
+    mcp_server: pp-daemon
+    privilege: execute
+  - name: pp.harness.start_stage
+    mcp_server: pp-daemon
+    privilege: execute
+  - name: pp.harness.archive_artifact
+    mcp_server: pp-daemon
+    privilege: write
+  - name: pp.codex.generate
+    mcp_server: pp-daemon
+    privilege: execute
+  - name: pp.gemini.critique
+    mcp_server: pp-daemon
+    privilege: execute
+
+accepts:
+  - PRD
+  - ARCH_RFC
+  - DEV_TASK
+  - HANDOFF
+
+emits:
+  - PRD
+  - ARCH_RFC
+  - DEV_TASK
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: owasp-asvs-l1
+    hitl_required: false
+  - rubric_id: rfc-2119-normative
+  - rubric_id: openapi-3.1-stability
+  - rubric_id: slsa-l2
+    hitl_required: false
+    when: "phase == 'release'"
+
+invoke:
+  mode: pp_run                       # one of: pp_run | pp_team | pp_best_of | pp_review
+  default_team: feature-team
+  forum_for_review: change-advisory-board
+  project_path: "${project_root}"
+  command_hint: "/pp:run"

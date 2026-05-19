@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "powershell": "python -m hydra_core.cli doctor",
+        "bash": "python -m hydra_core.cli doctor",
+        "timeoutSec": 20,
+        "_comment": "Health check: discover squads, verify langgraph, surface waiting HITLs."
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "powershell": "python -m hydra_core.cli squads",
+        "bash": "python -m hydra_core.cli squads",
+        "timeoutSec": 10,
+        "_comment": "Cheap suggestion: print squad roster so router has fresh registry."
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "powershell": "python -m hydra_core.cli doctor",
+        "bash": "python -m hydra_core.cli doctor",
+        "timeoutSec": 10,
+        "matcher": "mcp__hydra-memory__.*",
+        "_comment": "Verify memory server reachable before resolving handles."
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "powershell": "echo postcheck",
+        "bash": "echo postcheck",
+        "timeoutSec": 5,
+        "matcher": "mcp__hydra-memory__write.*",
+        "_comment": "Placeholder: hash-and-record audit trail."
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "powershell": "echo checkpoint-flush",
+        "bash": "echo checkpoint-flush",
+        "timeoutSec": 5,
+        "_comment": "Flush LangGraph checkpoints. The actual flush is automatic; this is a marker."
+      }
+    ]
+  }
+}

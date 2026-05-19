@@ -1,0 +1,129 @@
+name: Executive C-Suite
+description: >
+  Strategic decision support, capital allocation, M&A, risk, crisis. Wired to
+  the ExecutiveSuite pack — Hydra dispatches Executive work as boardroom /
+  capital-allocation / crisis-warroom / mna-cockpit sessions through Claude
+  Code's sub-agent impersonation pattern (no spawned sub-processes).
+source_pack: C:\AiAppDeployments\ExecutiveSuite
+entrypoint: agent-impersonation
+industries:
+  - cross-industry-strategic
+  - finance
+  - mna
+  - risk
+  - crisis-management
+
+agents:
+  - slug: ceo
+    role: "Chief Executive Officer"
+    authority: gatekeeper
+  - slug: cfo
+    role: "Chief Financial Officer — owns budget gates"
+    authority: gatekeeper
+  - slug: cmo
+    role: "Chief Marketing Officer"
+    authority: advisory
+  - slug: cto
+    role: "Chief Technology Officer"
+    authority: advisory
+  - slug: chief-risk-officer
+    role: "Enterprise risk"
+    authority: gatekeeper
+  - slug: clo
+    role: "Chief Legal Officer"
+    authority: gatekeeper
+  - slug: ciso
+    role: "Chief Information Security Officer"
+    authority: gatekeeper
+  - slug: caio
+    role: "Chief AI Officer — EU AI Act alignment"
+    authority: gatekeeper
+  - slug: cdo
+    role: "Chief Data Officer"
+    authority: advisory
+  - slug: cpo
+    role: "Chief Product Officer"
+    authority: advisory
+  - slug: cro
+    role: "Chief Revenue Officer"
+    authority: advisory
+  - slug: coo
+    role: "Chief Operating Officer"
+    authority: advisory
+  - slug: cio
+    role: "Chief Information Officer"
+    authority: advisory
+  - slug: cxo
+    role: "Chief Customer Experience Officer"
+    authority: advisory
+  - slug: chro
+    role: "Chief Human Resources Officer"
+    authority: advisory
+  - slug: cso
+    role: "Chief Strategy Officer"
+    authority: advisory
+  - slug: csco
+    role: "Chief Supply Chain Officer"
+    authority: advisory
+  - slug: chief-compliance-officer
+    role: "Chief Compliance Officer"
+    authority: gatekeeper
+  - slug: chief-sustainability-officer
+    role: "Chief Sustainability Officer"
+    authority: advisory
+  - slug: chief-communications-officer
+    role: "Chief Communications Officer"
+    authority: advisory
+  # orchestrators
+  - slug: boardroom
+    role: "Synthetic boardroom facilitator"
+    authority: advisory
+  - slug: capital-allocation
+    role: "Capital allocation committee"
+    authority: gatekeeper
+  - slug: crisis-warroom
+    role: "Black-swan war-room"
+    authority: gatekeeper
+  - slug: mna-cockpit
+    role: "M&A triangulation cockpit"
+    authority: gatekeeper
+
+tools:
+  - name: financial-frameworks
+    privilege: execute
+  - name: ai-governance
+    privilege: execute
+  - name: enterprise-risk
+    privilege: execute
+  - name: scenario-planning
+    privilege: execute
+
+accepts:
+  - "*"                     # executive can be asked about anything
+  - HITL_REQUEST
+
+emits:
+  - C_SUITE_DECISION_PACKET
+  - DECISION_RECORD
+  - HITL_REQUEST
+
+gates:
+  - rubric_id: eu-ai-act-article-9
+    hitl_required: true
+    when: "phase == 'planning' and constraints.risk_tolerance != 'high'"
+  - rubric_id: financial-frameworks-wacc-irr
+    hitl_required: false
+  - rubric_id: capital-allocation-discipline
+
+invoke:
+  command_hint: "/board-meeting"
+  fallback_commands:
+    - "/capital-decision"
+    - "/exec-brief"
+    - "/crisis-mode"
+    - "/mna-review"
+    - "/quarterly-review"
+    - "/risk-stress"
+    - "/decision-memo"
+    - "/executive-team"
+  output_dir: "output/{domain}/{topic-kebab}-{date}.md"

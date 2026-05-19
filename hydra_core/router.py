@@ -1,0 +1,141 @@
+"""Intent router.
+
+Two layers, mirroring `Enterprise Master AI Orchestration System Architecture.md`
+§ "Graph-driven routing" + "LLM-assisted intent routing":
+
+1. **Deterministic edges** — pure-function checks (envelope type, phase, industries,
+   keyword-trip).
+2. **LLM-assisted fallback** — when the deterministic layer returns no high-confidence
+   squad, fall back to an LLM classifier with the squad descriptions as context.
+
+The LLM call is pluggable (`classify_callable`) so this module has no runtime
+dependency on any specific provider — Claude Code, Codex, Gemini, or a local
+classifier can all satisfy the protocol.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+from .squad_loader import SquadPack
+
+
+# Keyword fingerprints per domain. Hand-tuned, not learned. Add as you scaffold.
+_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "engineering": (
+        "code", "bug", "refactor", "deploy", "ci/cd", "pull request", "pr ",
+        "feature", "api", "endpoint", "schema", "migration", "test", "lint",
+        "openapi", "kubernetes", "docker", "github", "gitlab",
+    ),
+    "executive": (
+        "strategy", "roadmap", "budget", "p&l", "okr", "board", "investor",
+        "m&a", "acquisition", "merger", "capex", "opex", "wacc", "irr", "npv",
+        "risk appetite", "earnings", "shareholder", "crisis", "succession",
+    ),
+    "creative": (
+        "campaign", "brand", "logo", "video", "shot", "script", "copy",
+        "press kit", "social", "thumbnail", "voiceover", "music", "image",
+        "render", "scene", "storyboard", "cinematic", "youtube", "tiktok",
+    ),
+    "legal-compliance": (
+        "gdpr", "ccpa", "hipaa", "contract", "nda", "msa", "privacy",
+        "license", "trademark", "patent", "regulatory", "lawsuit", "dmca",
+        "eu ai act", "sox", "data subject", "litigation",
+    ),
+    "healthcare": (
+        "patient", "diagnosis", "clinical", "ehr", "icd-10", "snomed", "fhir",
+        "drug interaction", "perioperative", "phi", "hl7", "differential",
+    ),
+    "sales-gtm": (
+        "lead", "pipeline", "prospect", "deal", "quote", "cpq", "pricing",
+        "renewal", "churn", "icp", "battlecard", "competitive intel",
+    ),
+    "research-ds": (
+        "experiment", "hypothesis", "paper", "arxiv", "p-value", "ablation",
+        "preregister", "literature review", "factorial", "regression",
+    ),
+    "customer-support": (
+        "ticket", "support", "complaint", "outage", "downtime", "sla",
+        "p1 incident", "escalation", "knowledge base", "kb", "tier 1",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    squads: list[str]
+    confidence: float                # 0..1, max across selected squads
+    rationale: str
+    used_fallback: bool = False
+
+
+ClassifyCallable = Callable[[str, dict[str, SquadPack]], list[str]]
+
+
+def classify_intent(
+    text: str,
+    packs: dict[str, SquadPack],
+    *,
+    industries: tuple[str, ...] = (),
+    classify_callable: Optional[ClassifyCallable] = None,
+    min_confidence: float = 0.25,
+) -> RoutingDecision:
+    text_l = text.lower()
+    scores: dict[str, float] = {}
+
+    # Deterministic keyword pass
+    for slug, kws in _KEYWORDS.items():
+        if slug not in packs:
+            continue
+        hits = sum(1 for k in kws if re.search(rf"\b{re.escape(k)}\b", text_l))
+        if hits:
+            scores[slug] = min(1.0, 0.2 + 0.15 * hits)
+
+    # Industry-tag boost
+    for slug, pack in packs.items():
+        overlap = set(industries) & set(pack.industries)
+        if overlap:
+            scores[slug] = max(scores.get(slug, 0.0), 0.4 + 0.2 * len(overlap))
+
+    if scores:
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        top_score = ranked[0][1]
+        seen: set[str] = set()
+        chosen = [s for s, sc in ranked
+                  if sc >= max(min_confidence, top_score * 0.6)
+                  and not (s in seen or seen.add(s))]
+        if chosen and top_score >= min_confidence:
+            return RoutingDecision(
+                squads=chosen,
+                confidence=top_score,
+                rationale=f"keyword+industry match: {dict(ranked[:3])}",
+            )
+
+    # LLM fallback
+    if classify_callable is not None:
+        try:
+            squads = classify_callable(text, packs) or []
+            squads = [s for s in squads if s in packs]
+            if squads:
+                return RoutingDecision(
+                    squads=squads,
+                    confidence=0.6,
+                    rationale="llm-fallback classifier",
+                    used_fallback=True,
+                )
+        except Exception as e:
+            return RoutingDecision(
+                squads=["executive"] if "executive" in packs else list(packs)[:1],
+                confidence=0.1,
+                rationale=f"llm-fallback failed ({e!r}); default to executive triage",
+                used_fallback=True,
+            )
+
+    # Last resort: send to executive for human-triage
+    default = "executive" if "executive" in packs else next(iter(packs), "")
+    return RoutingDecision(
+        squads=[default] if default else [],
+        confidence=0.1,
+        rationale="no signal; default to executive for triage",
+    )
