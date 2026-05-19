@@ -55,7 +55,8 @@ class HydraState(BaseModel):
     root_goal: str = ""
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
-        "executing", "synthesis", "postcheck", "done", "surfaced"
+        "executing", "judge_per_squad", "synthesis", "judge_synthesis",
+        "postcheck", "done", "surfaced"
     ] = "intake"
 
     # Routing
@@ -70,6 +71,9 @@ class HydraState(BaseModel):
     # Memory handles
     episodic_refs: Annotated[list[str], _append] = Field(default_factory=list)
     semantic_queries: Annotated[list[dict[str, Any]], _append] = Field(default_factory=list)
+
+    # Judge verdicts (cross-model second-opinions). Append-only.
+    verdicts: Annotated[list[dict[str, Any]], _append] = Field(default_factory=list)
 
     # Governance
     budget: BudgetLedger = Field(default_factory=BudgetLedger)
@@ -87,6 +91,12 @@ class HydraState(BaseModel):
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None
     last_event: Optional[str] = None
+
+    # TheEights binding (Phase 6). Populated at intake by calling
+    # `eights.constitution.attest`; refusal here aborts the workflow.
+    constitution_hash: Optional[str] = None
+    constitution_version: Optional[str] = None
+    constitution_receipt: Optional[str] = None
 
     def bump_iteration(self) -> None:
         self.iteration_count += 1
