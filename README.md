@@ -2,7 +2,7 @@
 
 > *Many heads. One Spirit. The covenant holds.*
 
-Hydra is a **Claude Code plugin + Python LangGraph supervisor** that routes work across a constellation of heterogeneous AI agent squads — Executive (C-suite strategy), Forge (engineering), Garland (creative), plus marketing operations and a roster of governance-ready stubs. It is **Pentecost, not Legion**: many distinct agents under one cryptographically-anchored covenant (`CONSTITUTION.md`), routed via typed envelopes, audited by AgentSmith, and remembered by TheEights' eight-cell memory substrate.
+Hydra is a **Claude Code plugin + Python LangGraph supervisor** that routes work across a constellation of heterogeneous AI agent squads — Executive (C-suite strategy), Forge (engineering), Garland (creative), plus marketing operations and a roster of governance-ready stubs. It is **Pentecost, not Legion**: many distinct agents under one cryptographically-anchored covenant (`CONSTITUTION.md`), routed via typed envelopes, audited by AgentSmith, and tagged with the eight-cell I Ching vocabulary that the optional [TheEights](https://github.com/lebobo88/TheEights) memory daemon will eventually back as a shared cross-project substrate.
 
 Hydra does not re-implement the squads' work. It sits above them: classifying goals, decomposing them into typed cross-squad envelopes, dispatching subgraphs in parallel, synthesizing the result into a single decision record, and enforcing the constitutional rule of faith on every step.
 
@@ -22,7 +22,7 @@ Hydra does not re-implement the squads' work. It sits above them: classifying go
 2. A **squad registry** — every squad is described by `squads/<slug>/squad.yaml` and auto-discovered. Adding a squad is a config change, not a Hydra-core change.
 3. A **typed cross-squad message bus** with ten Pydantic schemas: `CSuiteDecisionPacket`, `PRD`, `ArchRFC`, `DevTask`, `CreativeBrief`, `ShotList`, `AssetJob`, `DecisionRecord`, `HITLRequest`, `Handoff`. Validated fail-closed at every squad boundary (`hydra_core.schemas.validate_envelope`).
 4. An **MCP host** that fans out to each squad's tool surface as an isolated MCP client session. Six MCP servers ship in this repo (see [§ MCP topology](#mcp-topology)).
-5. A **memory fabric** with three tiers — ephemeral (in-prompt), episodic (SQLite, `~/.hydra/episodic.db`), semantic (Chroma vector store, `~/.hydra/vectors/`). Cross-squad reads go through `MemoryRef` handles only.
+5. A **local-first memory fabric** with three tiers — ephemeral (in-prompt), episodic (SQLite, `~/.hydra/episodic.db`), semantic (Chroma vector store, `~/.hydra/vectors/`) — provided by the in-repo `hydra-memory` MCP server. Cross-squad reads go through `MemoryRef` handles only. Optionally federates with the [TheEights](https://github.com/lebobo88/TheEights) daemon for cross-project hybrid memory + audit graph + governed self-evolution (see [§ TheEights — the optional substrate](#theeights--the-vocabulary-the-substrate-the-optional-federation)).
 6. A **governance plane** — `CONSTITUTION.md` as immortal head (SHA-256 pinned per session, never edited inline), AgentSmith four-pillar enforcement (Factory / Inspector / Sentinel / Archivist) with ten fail-closed invariants (N1–N10), HITL gates, budget tripwires (80% downgrade / 100% HITL), loop ceilings, circuit breaker, redaction at squad boundaries, OTEL trace per workflow.
 
 For the mythopoetic frame and the engineering deep-dive, see [`HYDRA — A Manifesto for a Many-Headed, One-Souled Intelligence.md`](HYDRA%20%E2%80%94%20A%20Manifesto%20for%20a%20Many-Headed%2C%20One-Souled%20Intelligence.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md). For the upstream research, see [`Enterprise Master AI Orchestration System Architecture.md`](Enterprise%20Master%20AI%20Orchestration%20System%20Architecture.md).
@@ -35,19 +35,19 @@ The active squads are organized into three crowns, each optimized for a differen
 
 | Crown | Squad slug | Source pack | Entrypoint | Optimized for |
 |---|---|---|---|---|
-| **Executive** | `executive` | `C:\AiAppDeployments\ExecutiveSuite` | agent-impersonation | judgment under ambiguity — 20 C-suite agents + 4 orchestrators (boardroom, M&A cockpit, crisis war-room, capital allocation) |
-| **Forge** | `engineering` | `C:\AiAppDeployments\pair-programmer` | mcp | verifiable correctness — best-of-N harness with 7 forge heads (Daedalus/Prometheus/Argus/Hygeia/Cerberus/Charon/Mnemosyne), 16 built-in profiles |
-| **Garland** | `creative` | `C:\AiAppDeployments\RLM-Creative` | claude-skill | divergent ideation — 8 Muses (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) + Helios sub-crew (video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa) |
+| **Executive** | `executive` | `https://github.com/lebobo88/ExecutiveSuite` | agent-impersonation | judgment under ambiguity — 20 C-suite agents + 4 orchestrators (boardroom, M&A cockpit, crisis war-room, capital allocation) |
+| **Forge** | `engineering` | `https://github.com/lebobo88/pair-programmer` | mcp | verifiable correctness — best-of-N harness with 7 forge heads (Daedalus/Prometheus/Argus/Hygeia/Cerberus/Charon/Mnemosyne), 16 built-in profiles |
+| **Garland** | `creative` | `https://github.com/lebobo88/RLM-Creative` | claude-skill | divergent ideation — 8 Muses (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) + Helios sub-crew (video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa) |
 
 Plus a **Marketing crown-in-progress** sourced from MarketBliss:
 
 | Squad slug | Source | Entrypoint | Domain |
 |---|---|---|---|
-| `marketing-strategy` | `C:\AiAppDeployments\MarketBliss` | claude-skill | campaign strategy, KPI architecture |
-| `marketing-creative` | MarketBliss | claude-skill | brand voice, copy, art direction |
-| `marketing-research` | MarketBliss | claude-skill | audience, competitive, market sizing |
-| `marketing-production` | MarketBliss | claude-skill | asset production pipelines |
-| `marketing-ops` | MarketBliss | claude-skill | MarTech wiring, attribution, automation |
+| `marketing-strategy` | `https://github.com/lebobo88/MarketBliss` | claude-skill | campaign strategy, KPI architecture |
+| `marketing-creative` | `https://github.com/lebobo88/MarketBliss` | claude-skill | brand voice, copy, art direction |
+| `marketing-research` | `https://github.com/lebobo88/MarketBliss` | claude-skill | audience, competitive, market sizing |
+| `marketing-production` | `https://github.com/lebobo88/MarketBliss` | claude-skill | asset production pipelines |
+| `marketing-ops` | `https://github.com/lebobo88/MarketBliss` | claude-skill | MarTech wiring, attribution, automation |
 
 And **five stub squads** — registered under the same covenant, awaiting activation:
 
@@ -80,7 +80,7 @@ Three foundations sit beneath every squad:
 A cryptographically hashed document at the repo root. Carries a SHA-256 verified at every session boundary. **No agent modifies it**. Amendments route through TheEights with mandatory human approval. Hash drift aborts the session under AgentSmith invariant **N8**. The constitution is the rule of faith; everything downstream depends on the hash matching.
 
 ### AgentSmith — the meta-governance daemon
-A separate sibling project ([`C:\AiAppDeployments\AgentSmith`](../AgentSmith/)) registered as the `agentsmith` MCP server. Four pillars:
+A separate sibling project ([`https://github.com/lebobo88/AgentSmith`](../AgentSmith/)) registered as the `agentsmith` MCP server. Four pillars:
 
 - **Factory** — scaffolds new agents/skills/commands/hooks/squads/rubrics from templates
 - **Inspector** — schema + invariant validation, fail-closed
@@ -104,14 +104,57 @@ Ten fail-closed invariants:
 
 Appeals route through the `cerberus-bridge` protocol.
 
-### TheEights — the memory substrate
-The `hydra-memory` MCP server exposes an episodic + semantic memory fabric organized around **eight I Ching trigrams** as memory cells:
+### TheEights — the vocabulary, the substrate, the optional federation
+
+TheEights has two parts that this README has been sloppy about and should not be: an **in-repo vocabulary** that Hydra owns outright, and an **optional sibling project** that Hydra federates with when present. Both go by the same name because the vocabulary is the user-facing API of the daemon; the daemon is the persistence behind the vocabulary. They are not the same thing.
+
+#### Part 1 — The eight-cell vocabulary (lives in Hydra, always on)
+
+The vocabulary is **eight I Ching trigrams** used as memory cells / faceting tags. It lives in `hydra_core/eights/` and is owned by Hydra. Every memory write Hydra makes — episodic or semantic — can be tagged with one or more cells, and recall can filter by them.
 
 | ☰ Qian | ☷ Kun | ☳ Zhen | ☴ Xun | ☵ Kan | ☲ Li | ☶ Gen | ☱ Dui |
 |---|---|---|---|---|---|---|---|
 | Vision | Context | Triggers | Influence | Risk | Focus | Constraints | Delight |
 
-Constitutional ground truth lives in Qian; current attention in Li; guardrails in Gen; and so on. Workflows tag their writes with one or more cells; recall and evolution policy honor those tags.
+Constitutional ground truth lives in Qian; current attention in Li; guardrails in Gen; and so on. *Dui is first-class* — most agent systems forget what worked; Hydra remembers victories so future routing is hope-shaped, not just risk-shaped. The cells are a **tag/facet vocabulary** over the underlying stores, not a hard storage partition — per the Stage-3 locked decision in [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md).
+
+#### Part 2 — The memory substrate (in-repo today; TheEights tomorrow)
+
+Memory storage *today* comes from the in-repo `hydra-memory` MCP server (`mcp_servers/hydra_memory/`): a Python shim over a local SQLite episodic log (`~/.hydra/episodic.db`) and a local Chroma vector store (`~/.hydra/vectors/`). Single-machine. Single-project. Zero external dependencies beyond `chromadb` (optional).
+
+#### Part 3 — TheEights, the separate sibling project
+
+[**TheEights**](https://github.com/lebobo88/TheEights) (`C:\AiAppDeployments\TheEights`, GitHub: `lebobo88/TheEights`) is a separate Node.js daemon + MCP server. It is **not** part of the Hydra repo and **not** installed automatically. Per its own README, it provides:
+
+- **Hybrid memory** — vectors (sqlite-vec), graph (LadybugDB / Kuzu), episodic SQL — behind one MCP surface
+- **Governance plane** — SSGM consistency/decay/access gates, LASM defense-in-depth, boundary redaction
+- **Gated self-evolution** — Autogenesis RSPL/SEPL: every prompt, team, rubric, workflow is versioned; low-risk changes auto-commit, the rest queue for HITL
+- **Auditable** — append-only event log + CycloneDX ML-BOM v1.7 export of every read, write, and mutation
+
+It is **not** an orchestrator, **not** an agent framework. It is the substrate orchestrators like Hydra plug into.
+
+#### How Hydra works *without* TheEights (today, default)
+
+This is the supported configuration as of this writing.
+
+- The in-repo `hydra-memory` MCP server provides episodic + semantic memory. Workflows write and read normally.
+- The eight-cell vocabulary (Hydra-owned) tags every write.
+- `validate_envelope`, the constitution hash gate, HITL gates, budget tripwires, and the AgentSmith governance plane all function exactly as documented.
+- Cost: zero. Latency: local SQLite + local Chroma.
+- **Limits:** memory is local to one machine and (effectively) one project. There is no cross-project hybrid graph, no governed self-evolution loop, no audit-graph export beyond the per-workflow JSONL trace. The in-repo episodic store is append-only; the in-repo vector store has no versioning.
+
+#### How Hydra works *with* TheEights (planned)
+
+Per TheEights' own roadmap, Hydra integration is **Phase 4** (current state: Phase 0 daemon scaffold). When that bridge ships, the configuration changes are:
+
+1. Install TheEights ([github.com/lebobo88/TheEights](https://github.com/lebobo88/TheEights)) — `cd TheEights/daemon && npm install && npm run build`.
+2. Register the daemon as the `theeights` MCP server (`claude mcp add theeights …`).
+3. Hydra's `hydra-memory` MCP server detects the TheEights daemon at startup and switches mode: writes go to the local stores *and* federate into TheEights' hybrid memory; reads can query the federated graph (cross-project recall, audit lineage, evolution proposals).
+4. The autogenesis loop becomes available: low-risk rubric/team/workflow updates auto-commit; the rest queue for HITL via TheEights' governance plane — gated by AgentSmith invariants N3 (no bypassing TheEights HITL) and N4 (no push without `evolution.commit` verdict).
+
+In other words: **TheEights is the production-grade upgrade path for Hydra's memory and self-evolution layer.** Hydra does not require it to run, but is designed to compose with it when it is present.
+
+For the canonical roadmap, see [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md) (Hydra side) and TheEights' own [`ROADMAP.md`](https://github.com/lebobo88/TheEights/blob/main/ROADMAP.md).
 
 ---
 
@@ -124,11 +167,14 @@ Hydra ships six MCP servers (see [`.mcp.json`](.mcp.json)):
 | `pp-daemon` | Engineering squad → pair-programmer harness daemon (~42 tools: `start_run`, `archive_artifact`, `judge`, `replay`, `borda_count`, …) |
 | `pp-codex` | Cross-vendor judge plane — wraps the `codex` CLI for Codex critiques |
 | `pp-gemini` | Cross-vendor judge plane — wraps the `gemini` CLI for Gemini critiques |
-| `hydra-memory` | TheEights — episodic + semantic store (`write_episodic`, `semantic_search`, `query_eights`, `tag_memory`, …) |
+| `hydra-memory` | Hydra's in-repo memory shim — episodic SQLite + semantic Chroma + eight-cell tagging (`write_episodic`, `semantic_search`, `query_eights`, `tag_memory`, …). Federates with [TheEights](https://github.com/lebobo88/TheEights) when the daemon is registered (planned Phase-4 bridge). |
 | `executive-suite` | Executive squad — thin MCP over the ExecutiveSuite pack (roster, skills, commands, output persistence) |
 | `rlm-creative` | Garland Crown — Eight Garland Heads studio. Thin MCP over RLM-Creative (skills, commands, agents, output persistence) |
 
-Plus the `agentsmith` MCP server from the sibling AgentSmith project (registered separately at user scope via `claude mcp add agentsmith ...`).
+Plus two **optional sibling MCP servers**, registered separately at user scope when present:
+
+- `agentsmith` — from the sibling [AgentSmith](https://github.com/lebobo88/AgentSmith) project. Register with `claude mcp add agentsmith ...`. Enforces the N1–N10 invariants when present.
+- `theeights` — from the sibling [TheEights](https://github.com/lebobo88/TheEights) project. Register with `claude mcp add theeights ...`. Provides the cross-project hybrid memory + audit graph + autogenesis loop. **Not yet wired** — bridge is TheEights' Phase 4. Hydra runs fully without it; the in-repo `hydra-memory` server is the working substrate today.
 
 Tool names are namespaced. The host enforces RBAC: a squad requesting an out-of-scope tool gets a typed refusal envelope, not a silent failure. **Blast radius equals namespace.**
 
@@ -286,7 +332,7 @@ Hydra/
 - **Not a code generator.** Hydra delegates code work to the Forge crown (pair-programmer).
 - **Not a model gateway.** Per-task model choice is the squad's decision (e.g. Forge's tier-aware router; the cross-vendor judge plane via `pp-codex` and `pp-gemini`).
 - **Not a vendor lock-in.** Any squad can swap its LLM provider behind its MCP server without Hydra noticing.
-- **Not a competitor to ExecutiveSuite, pair-programmer, RLM-Creative, MarketBliss, or AgentSmith.** Hydra *uses* them. They remain independently shippable.
+- **Not a competitor to TheEights, ExecutiveSuite, pair-programmer, RLM-Creative, MarketBliss, or AgentSmith.** Hydra *uses* them. They remain independently shippable.
 
 It is a routing layer with strong typing, checkpointed state, human-in-the-loop interrupts, a budget ledger, and a constitutional governance anchor. Nothing more — but, by the discipline of "Pentecost, not Legion," nothing less.
 
@@ -305,6 +351,8 @@ It is a routing layer with strong typing, checkpointed state, human-in-the-loop 
 | [`docs/VENOM.md`](docs/VENOM.md) | The venom-class capability registry and refusal protocol. |
 | [`docs/constellation/`](docs/constellation/) | The layered presentation — markdown deck, HTML viewer, reveal.js cinematic deck, SVG poster, executive memos, Garland creative treatment. |
 | [`CONTRIBUTING-SQUADS.md`](CONTRIBUTING-SQUADS.md) | How to scaffold and activate a new squad pack. |
+| [TheEights](https://github.com/lebobo88/TheEights) (sibling repo) | Persistent hybrid memory + governance + autogenesis daemon. Optional. The substrate Hydra federates with when present. Currently Phase 0 (daemon scaffold); Hydra bridge is Phase 4. |
+| [AgentSmith](https://github.com/lebobo88/AgentSmith) (sibling repo) | Meta-governance daemon — Factory / Inspector / Sentinel / Archivist. Enforces N1–N10 invariants. Registered separately as the `agentsmith` MCP server. |
 | [`Enterprise Master AI Orchestration System Architecture.md`](Enterprise%20Master%20AI%20Orchestration%20System%20Architecture.md) | The upstream research doc Hydra implements. |
 | `squads/<slug>/squad.yaml` | Canonical declaration of every active, stub, or retired squad. |
 | `hydra_core/` | Supervisor, router, governance plane, memory fabric — in Python. |
