@@ -124,7 +124,7 @@ Memory storage *today* comes from the in-repo `hydra-memory` MCP server (`mcp_se
 
 #### Part 3 — TheEights, the separate sibling project
 
-[**TheEights**](https://github.com/lebobo88/TheEights) (`C:\AiAppDeployments\TheEights`, GitHub: `lebobo88/TheEights`) is a separate Node.js daemon + MCP server. It is **not** part of the Hydra repo and **not** installed automatically. Per its own README, it provides:
+[**TheEights**](https://github.com/lebobo88/TheEights) is a separate Node.js daemon + MCP server. It is **not** part of the Hydra repo and **not** installed automatically. Per its own README, it provides:
 
 - **Hybrid memory** — vectors (sqlite-vec), graph (LadybugDB / Kuzu), episodic SQL — behind one MCP surface
 - **Governance plane** — SSGM consistency/decay/access gates, LASM defense-in-depth, boundary redaction
