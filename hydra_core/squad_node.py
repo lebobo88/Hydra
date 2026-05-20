@@ -23,6 +23,9 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import uuid4
 
+import subprocess
+from pathlib import Path
+
 from .iolaus import post_dispatch, pre_dispatch
 from .schemas import (
     DecisionRecord,
@@ -194,20 +197,97 @@ def _via_mcp(
     inner = result.get("result", result) if isinstance(result, dict) else {}
     run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
     pp_status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+
+    # Worktree handoff: when the inbound envelope ran on its own project_path
+    # (i.e. the planner allocated a worktree per the pp_harness_project_lock
+    # rule) and pp-harness reported a terminal status, harvest the archived
+    # artifacts into the project tree and commit them. Without this, work
+    # products end up stranded in <project>/.harness/<run_id>/ and are never
+    # visible on a branch — Discovery agent E2's research artifacts hit this
+    # exact failure mode in the bootstrap session.
+    commit_sha: str | None = None
+    if run_id and pp_status in {"done", "complete", "surfaced"} and project_path:
+        try:
+            commit_sha = harvest_pp_run_artifacts(
+                project_path=str(project_path),
+                run_id=str(run_id),
+                workflow_id=inbound.workflow_id,
+            )
+        except Exception:  # noqa: BLE001 — never crash dispatch on a git failure
+            commit_sha = None
+
     decision = DecisionRecord(
         workflow_id=inbound.workflow_id,
         parent_id=inbound.id,
         origin_squad=pack.slug,
         target_squad=inbound.origin_squad,
         decision=f"Engineering work dispatched to pair-programmer (run_id={run_id or '?'})",
-        rationale=f"mode={mode}; pp dispatch status: {pp_status}; inner: {str(inner)[:300]}",
+        rationale=(
+            f"mode={mode}; pp dispatch status: {pp_status}; "
+            f"commit_sha={commit_sha or 'none'}; inner: {str(inner)[:240]}"
+        ),
         artifacts=[MemoryRef(tier="episodic", key=f"pp:run:{run_id or 'unknown'}")] if run_id else [],
     )
     return SquadResult(
         envelopes=[decision],
-        artifacts=[{"kind": "pp_run", "ref": run_id, "raw": result}],
+        artifacts=[{"kind": "pp_run", "ref": run_id, "raw": result, "commit_sha": commit_sha}],
         status="running" if pp_status == "done" and run_id else pp_status,
     )
+
+
+def harvest_pp_run_artifacts(
+    *,
+    project_path: str,
+    run_id: str,
+    workflow_id: str,
+) -> str | None:
+    """Stage and commit any artifacts pp-harness archived under ``.harness/<run_id>``.
+
+    Returns the commit SHA on success, or ``None`` when there is nothing to
+    commit, the project isn't a git repo, or any git invocation fails. The
+    helper is deliberately fail-soft — Hydra's dispatch path must never
+    crash because the operator chose a non-git project root.
+
+    Why this exists: pp-harness writes archived artifacts into
+    ``<project>/.harness/<run_id>/...`` and stops there. When Hydra ran the
+    work in a worktree, those bytes are stranded if no one commits them.
+    This helper bundles the bytes into a single ``chore(hydra): harvest pp
+    run <run_id>`` commit so synthesis + the upstream merge see them.
+    """
+    root = Path(project_path)
+    if not root.is_dir():
+        return None
+    if not (root / ".git").exists() and not (root.parent / ".git").exists():
+        return None
+    harness_dir = root / ".harness" / run_id
+    if not harness_dir.is_dir():
+        return None
+
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    add = _git("add", "--", str(harness_dir))
+    if add.returncode != 0:
+        return None
+    status = _git("status", "--porcelain", "--", str(harness_dir))
+    if not status.stdout.strip():
+        return None  # nothing new to commit
+    commit = _git(
+        "-c", "user.name=hydra-dispatcher",
+        "-c", "user.email=hydra@local",
+        "commit",
+        "-m", f"chore(hydra): harvest pp run {run_id} (workflow={workflow_id})",
+    )
+    if commit.returncode != 0:
+        return None
+    sha = _git("rev-parse", "HEAD")
+    return sha.stdout.strip() or None
 
 
 def _via_impersonation(
