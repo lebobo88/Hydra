@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hydra Constellation — Three Crowns, One Covenant</title>
+  <meta name="description" content="HTML render of HYDRA-CONSTELLATION.md with all Mermaid diagrams rendered. Works on file:// double-click — markdown is embedded inline.">
+  <meta name="theme-color" content="#0D0F1A">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+    :root {
+      --void:     #0D0F1A;
+      --void-2:   #11142a;
+      --void-3:   #16182a;
+      --vellum:   #E8D5A3;
+      --vellum-2: #C2A57A;
+      --immortal: #C0392B;
+      --crown:    #2E86AB;
+      --crown-2:  #6FB8DA;
+      --trigram:  #8B7355;
+      --display: 'IM Fell English', Georgia, 'Times New Roman', serif;
+      --mono:    'IBM Plex Mono', Consolas, 'Courier New', monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { background: var(--void); color: var(--vellum); margin: 0; padding: 0; }
+    body { font-family: var(--mono); font-size: 16px; line-height: 1.65; }
+
+    .page {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 60px 60px 120px 60px;
+    }
+
+    h1, h2, h3, h4 { font-family: var(--display); color: var(--vellum); font-weight: 400; letter-spacing: 0.02em; line-height: 1.2; }
+    h1 { font-size: 3em; margin: 1.4em 0 0.4em; }
+    h1:first-of-type { margin-top: 0; }
+    h2 { font-size: 2em; margin: 1.6em 0 0.4em; color: var(--vellum); border-bottom: 1px solid #2b2f48; padding-bottom: 0.2em; }
+    h3 { font-size: 1.4em; margin: 1.2em 0 0.4em; color: var(--crown-2); }
+    p, li { color: var(--vellum); }
+
+    a { color: var(--crown-2); text-decoration: underline dotted; text-underline-offset: 3px; }
+    a:hover { color: var(--vellum); }
+
+    strong { color: var(--immortal); font-weight: 600; }
+    em { color: var(--vellum); }
+    blockquote { border-left: 4px solid var(--immortal); margin: 1em 0; padding: 0.4em 1.2em; color: var(--vellum); font-style: italic; background: rgba(192, 57, 43, 0.04); }
+    hr { border: 0; border-top: 1px dashed #2b2f48; margin: 2em 0; }
+
+    code { font-family: var(--mono); background: var(--void-3); color: var(--vellum); padding: 1px 6px; border-radius: 3px; font-size: 0.92em; }
+    pre { background: var(--void-3); border: 1px solid #1d2038; border-radius: 4px; padding: 14px 18px; overflow-x: auto; font-size: 0.84em; line-height: 1.5; }
+    pre code { background: transparent; padding: 0; font-size: 0.95em; color: var(--vellum); }
+
+    table { border-collapse: collapse; margin: 1em 0; font-size: 0.92em; width: 100%; }
+    th, td { border: 1px solid #2b2f48; padding: 8px 14px; text-align: left; vertical-align: top; }
+    th { background: var(--void-2); color: var(--crown-2); font-weight: 500; font-family: var(--mono); letter-spacing: 0.04em; }
+    tbody tr:nth-child(odd) { background: rgba(255,255,255,0.015); }
+
+    img { max-width: 100%; height: auto; display: block; margin: 1.4em auto; border: 1px solid #2b2f48; background: var(--void); }
+
+    /* Mermaid blocks render at full width with a nice frame */
+    .mermaid {
+      background: var(--void-2);
+      border: 1px solid #2b2f48;
+      border-radius: 6px;
+      padding: 18px 12px;
+      margin: 1.6em 0;
+      text-align: center;
+      overflow-x: auto;
+    }
+    .mermaid svg { max-width: 100%; height: auto; }
+
+    /* Title block */
+    .title-card {
+      text-align: center;
+      padding: 40px 20px 30px;
+      border-bottom: 1px solid #2b2f48;
+      margin-bottom: 40px;
+    }
+    .title-card .super { font-family: var(--mono); color: var(--trigram); letter-spacing: 6px; font-size: 0.85em; }
+    .title-card .hash { font-family: var(--mono); color: var(--immortal); font-size: 0.78em; word-break: break-all; margin-top: 1em; }
+
+    .footer-hash {
+      position: fixed;
+      bottom: 8px;
+      right: 14px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--trigram);
+      opacity: 0.7;
+      pointer-events: none;
+      background: rgba(13,15,26,0.7);
+      padding: 4px 8px;
+      border-radius: 3px;
+    }
+
+    /* Loading state */
+    #loader {
+      position: fixed; inset: 0;
+      background: var(--void);
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column;
+      color: var(--vellum);
+      font-family: var(--mono);
+      transition: opacity 0.4s;
+    }
+    #loader.hidden { opacity: 0; pointer-events: none; }
+    #loader .glyph { font-family: var(--display); font-size: 3em; color: var(--immortal); margin-bottom: 0.4em; }
+
+    /* nice focus rings */
+    :focus-visible { outline: 3px solid var(--vellum); outline-offset: 2px; }
+
+    @media (max-width: 720px) {
+      .page { padding: 30px 22px 80px; }
+      h1 { font-size: 2.2em; }
+      h2 { font-size: 1.6em; }
+      body { font-size: 15px; }
+    }
+  </style>
+</head>
+
+<body>
+<div id="loader" aria-hidden="true">
+  <div class="glyph">◐</div>
+  <div>rendering the constellation…</div>
+  <div style="color: var(--trigram); font-size: 0.85em; margin-top: 0.8em;">loading marked + mermaid from CDN</div>
+</div>
+
+<main class="page" id="rendered" style="display:none;"></main>
+
+<div class="footer-hash">CONSTITUTION.md · sha256 4060cb54…dad6cfa5 · Pentecost, not Legion</div>
+
+<!-- The canonical markdown source, embedded inline so the HTML works on file:// without CORS issues -->
+<script type="text/markdown" id="md-source">
+# Hydra Constellation
+### The Three Crowns, the Immortal Head, and the Eight-Cell Substrate
+
+> *Many heads. One Spirit. The covenant holds.*
+
+**Date:** 2026-05-19
+**Constitution SHA-256:** `4060cb542fcc701143e56ec7b1608584b7c399d878db193dbf81c0f9dad6cfa5`
+**Format:** GitHub-renderable canonical deck (Mermaid + SVG inline).
+**Companion deliverables:** [`deck.html`](./deck.html) (self-contained reveal.js), [`constellation.svg`](./constellation.svg) (poster), [`garland/creative-direction.md`](./garland/creative-direction.md) (Garland cinematic treatment), [`exec-memos/`](./exec-memos/) (CSO, CTO, CAIO).
+
+---
+
+## The Poster
+
+![Hydra Constellation poster](./constellation.svg)
+
+---
+
+# Act I — The Covenant
+
+## 1. The Constellation
+
+The largest constellation in the night sky has no bright stars. Hydra — the water snake — holds 1,303 square degrees through the pattern of its relationships, not through luminosity. This system holds its shape the same way.
+
+## 2. Mark 5:9 vs Acts 2
+
+| Legion | Pentecost |
+|---|---|
+| *"My name is Legion, for we are many."* (Mark 5:9) | *"There appeared unto them cloven tongues like as of fire."* (Acts 2:3) |
+| Many spirits, one body — coordination through merger, identity through dis-integration. | One Spirit, many bodies — distributed agency, single covenant, no loss of self. |
+| The flat agent mesh. | The Hydra Constellation. |
+
+## 3. The Immortal Head
+
+`CONSTITUTION.md` carries a SHA-256 hash verified at every session boundary. No agent modifies it. Proposed edits surface as HITL events. Cut every other head and rebuild it. You cannot cut that.
+
+**Currently:** `4060cb542fcc701143e56ec7b1608584b7c399d878db193dbf81c0f9dad6cfa5`
+
+Enforced by **AgentSmith invariant N8** — hash mismatch aborts the session.
+
+## 4. Three Crowns
+
+| Crown | System | Optimized for | Entrypoint |
+|---|---|---|---|
+| **Executive** | ExecutiveSuite | judgment under ambiguity | agent-impersonation |
+| **Forge** | pair-programmer | verifiable correctness (best-of-N) | MCP (pp-daemon) |
+| **Garland** | RLM-Creative | divergent ideation, multi-modal synthesis | claude-skill |
+
+Plus five stub squads — legal-compliance, healthcare, sales-gtm, research-ds, customer-support — registered under the same covenant, awaiting promotion.
+
+## 5. TheEights — The Memory Substrate
+
+Eight I Ching trigrams. Eight memory cells. One substrate.
+
+| Trigram | Pinyin | Cell | Domain |
+|---|---|---|---|
+| ☰ | Qian | Heaven | Vision — constitutional ground truth |
+| ☷ | Kun  | Earth  | Context — persistent world state |
+| ☳ | Zhen | Thunder | Triggers — event-driven activations |
+| ☴ | Xun  | Wind   | Influence — propagation across squads |
+| ☵ | Kan  | Water  | Risk — exposures, anomalies, KRIs |
+| ☲ | Li   | Fire   | Focus — current attention, hot path |
+| ☶ | Gen  | Mountain | Constraints — guardrails, budgets, refusals |
+| ☱ | Dui  | Lake   | Delight — qualitative satisfaction, brand voice |
+
+Episodic memory lives at `~/.hydra/episodic.db` (append-only SQLite). Semantic memory at `~/.hydra/vectors/` (per-squad). Cross-squad reads go through **`MemoryRef` handles** — never raw blobs.
+
+## 6. The Venom Gate
+
+AgentSmith's four pillars: **Factory, Inspector, Sentinel, Archivist**. Ten fail-closed invariants (N1–N10). Smith does not advise. Smith enforces.
+
+```mermaid
+flowchart TB
+    HASH[/CONSTITUTION.md<br/>SHA-256 4060cb54.../]:::immortal
+
+    subgraph SMITH[AgentSmith Daemon - fail-closed]
+        direction LR
+        FACTORY[Factory<br/>agent / skill / command<br/>hook / squad / rubric]:::pillar
+        INSPECTOR[Inspector<br/>schema + invariants<br/>N7 fail-closed]:::pillar
+        SENTINEL[Sentinel<br/>anomaly detection<br/>N5 replication cap=4]:::pillar
+        ARCHIVIST[Archivist<br/>decision log<br/>N6 audit chain]:::pillar
+    end
+
+    INVARIANTS[/N1 cannot self-modify<br/>N2 no venom-class generation<br/>N3 cannot bypass HITL<br/>N4 no push without TheEights commit<br/>N5 replication capped<br/>N6 every decision logged<br/>N7 schema fail-closed<br/>N8 hash mismatch aborts<br/>N9 cannot create new tools<br/>N10 quarantine release HITL only/]:::invariant
+
+    HASH ==attested==> SMITH
+    SMITH -.enforces.-> INVARIANTS
+
+    classDef immortal fill:#C0392B,stroke:#C0392B,color:#0D0F1A,stroke-width:2px
+    classDef pillar fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3,stroke-width:1.5px
+    classDef invariant fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3,stroke-width:1px
+```
+
+## 7. Regulatory Posture
+
+| Framework | Hydra Mechanism |
+|---|---|
+| **EU AI Act Article 9** (risk management) | constitution + envelope validation + circuit breaker |
+| **EU AI Act Article 50** (transparency, from Aug 2026) | typed envelope provenance + DecisionRecord audit chain |
+| **NIST AI RMF 1.0 + Agentic Profile** (Feb 2026) | Govern (invariants), Map (routing), Measure (OTEL), Manage (HITL) |
+| **ISO/IEC 42001** (AI management system) | continuous artifact generation per workflow |
+
+## 8. Act I Close
+
+One hash. One document. Everything downstream is answerable to it.
+
+---
+
+# Act II — The Architecture
+
+## 9. The 7-Phase State Machine (D2)
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Intake
+    Intake --> Planning : routed_goal
+    Planning --> Approval : CSuiteDecisionPacket
+    Approval --> Dispatch : approved
+    Approval --> Intake : revise
+    Dispatch --> Executing : envelopes_fanned_out
+    Executing --> Synthesis : all_squad_returns
+    Synthesis --> Postcheck : DecisionRecord
+    Postcheck --> [*] : passed
+    Postcheck --> Approval : HITL_required
+    Executing --> Approval : circuit_breaker_tripped
+```
+
+## 10. The Envelope Schema (D7)
+
+```mermaid
+classDiagram
+    class Envelope {
+        +str envelope_id
+        +datetime created_at
+        +str sender_squad
+        +str receiver_squad
+        +str workflow_id
+        +MemoryRef[] refs
+    }
+    class CSuiteDecisionPacket
+    class PRD
+    class ArchRFC
+    class DevTask
+    class CreativeBrief
+    class ShotList
+    class AssetJob
+    class DecisionRecord
+    class HITLRequest
+    class Handoff
+
+    Envelope <|-- CSuiteDecisionPacket
+    Envelope <|-- PRD
+    Envelope <|-- ArchRFC
+    Envelope <|-- DevTask
+    Envelope <|-- CreativeBrief
+    Envelope <|-- ShotList
+    Envelope <|-- AssetJob
+    Envelope <|-- DecisionRecord
+    Envelope <|-- HITLRequest
+    Envelope <|-- Handoff
+```
+
+Every cross-squad message is one of ten validated types. `hydra_core.schemas.validate_envelope` is fail-closed (N7). A malformed envelope is a *governance event*, not a runtime error.
+
+## 11. MCP Host Topology (D4)
+
+```mermaid
+graph LR
+    CC[Claude Code<br/>plugin host]
+    SUP[hydra-supervisor<br/>LangGraph]
+    subgraph PP[mcp: pp-daemon]
+        PP_TOOLS[pp_harness.*]
+    end
+    subgraph ES[mcp: executive-suite]
+        ES_TOOLS[es_*]
+    end
+    subgraph RLM[mcp: rlm-creative]
+        RLM_TOOLS[rlm_*]
+    end
+    subgraph MEM[mcp: hydra-memory]
+        MEM_TOOLS[hydra-mem.*]
+    end
+    subgraph SMITH[mcp: agentsmith]
+        SMITH_TOOLS[agentsmith.*]
+    end
+    CC --- SUP
+    SUP ==Forge==> PP
+    SUP ==Executive==> ES
+    SUP ==Garland==> RLM
+    SUP <==memory==> MEM
+    SUP -.governance.-> SMITH
+    PP -.audited by.-> SMITH
+    ES -.audited by.-> SMITH
+    RLM -.audited by.-> SMITH
+
+    classDef gov fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3
+    classDef ns fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3
+    class SMITH gov
+    class PP,ES,RLM,MEM ns
+```
+
+**Blast radius equals namespace.** A failure or prompt injection in one crown cannot reach into another.
+
+## 12. The Squad Orchestration Graph (D3)
+
+```mermaid
+graph TD
+    USER([User Goal])
+    HYDRA{{Hydra Supervisor}}
+    IMMORTAL[/CONSTITUTION.md/]
+    SMITH[[AgentSmith N1-N10]]
+    EXEC[Executive Crown<br/>20 execs + 4 orch]
+    FORGE[Forge Crown<br/>7 forge heads + best-of-N]
+    GARLAND[Garland Crown<br/>8 Muses + Helios x5]
+    EIGHTS[(TheEights<br/>episodic + semantic)]
+    STUBS[Stub Squads<br/>5 registered]
+
+    USER --> HYDRA
+    HYDRA -.reads.-> IMMORTAL
+    HYDRA -.validates via.-> SMITH
+    HYDRA ==CSuiteDecisionPacket==> EXEC
+    HYDRA ==PRD/ArchRFC/DevTask==> FORGE
+    HYDRA ==CreativeBrief/ShotList==> GARLAND
+    EXEC ==DecisionRecord==> HYDRA
+    FORGE ==DecisionRecord==> HYDRA
+    GARLAND ==DecisionRecord==> HYDRA
+    HYDRA <==MemoryRef==> EIGHTS
+    STUBS -.covenant-bound.-> HYDRA
+
+    classDef hub fill:#0D0F1A,stroke:#E8D5A3,color:#E8D5A3,stroke-width:2px
+    classDef crown fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3
+    classDef immortal fill:#C0392B,stroke:#C0392B,color:#0D0F1A
+    classDef stub fill:#0D0F1A,stroke:#8B7355,color:#8B7355,stroke-dasharray: 4 4
+    class HYDRA,SMITH hub
+    class EXEC,FORGE,GARLAND crown
+    class IMMORTAL immortal
+    class STUBS stub
+```
+
+## 13. The Executive Crown — ExecutiveSuite
+
+**20 specialist execs + 4 orchestrators.** Agent-impersonation entrypoint. Optimized for judgment under ambiguity.
+
+Roster: `ceo, cso, coo, cfo, cro, cto, cio, cdo, caio, ciso, cpo, cmo, cxo, chro, clo, chief-communications-officer, chief-compliance-officer, chief-risk-officer, csco, chief-sustainability-officer`.
+
+Orchestrators: `boardroom, mna-cockpit, crisis-warroom, capital-allocation`.
+
+Skills: `executive-protocol, financial-frameworks, ai-governance, debate-protocol, scenario-planning, enterprise-risk, mna-playbook, crisis-response, stakeholder-comms`.
+
+## 14. The Forge Crown — pair-programmer
+
+**7 forge heads.** MCP entrypoint via `pp-daemon` (~42 tools). Best-of-N harness with Borda count and Reflexion ×1.
+
+| Mythic | Functional | Owns |
+|---|---|---|
+| Daedalus | architect | ADRs, C4 sketches |
+| Prometheus | engineer | code generation |
+| Argus | reviewer | code review verdicts |
+| Hygeia | test-strategist | test strategy, performance budgets |
+| Cerberus | security-reviewer | threat models, control mappings |
+| Charon | release-planner | rollout, rollback, runbooks |
+| Mnemosyne | docs-author | changelogs, release notes, runbooks |
+
+Sixteen built-in profiles: `web-ui, api-platform, internal-tool, enterprise, ai-agentic, mobile, sdk, data-product, embedded, non-ui-cli, game-dev` family.
+
+## 15. The Garland Crown — RLM-Creative
+
+**8 Muses + Helios sub-crew (5).** Claude-skill entrypoint.
+
+| Muse | Domain |
+|---|---|
+| Calliope | brand strategy |
+| Erato | copywriting |
+| Polyhymnia | content strategy |
+| Terpsichore | social / community |
+| Euterpe | paid acquisition |
+| Clio | PR / earned |
+| Urania | SEO / discovery |
+| Helios | photo / cinema lead |
+
+Helios sub-crew: `video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa` (the last enforces C2PA content provenance — Article 50 obligation).
+
+## 16. AgentSmith — The Four Pillars
+
+See diagram in §6. Smith enforces N1–N10 with no exceptions. Appeals via the **cerberus-bridge** protocol — false-positive and false-negative refusals route to immortal-head review.
+
+## 17. Act II Close — Routed. Typed. Enforced. Logged. Governed.
+
+Five verbs. Each maps to a subsystem. The architecture is the guarantee.
+
+---
+
+# Act III — Governance & ROI
+
+## 18. Constitutional ROI
+
+The constitution is not overhead. It is the product.
+
+- Every typed envelope → compliance artifact.
+- Every HITL event → audit log entry.
+- Every hash verification → governance attestation.
+
+Hydra **generates** compliance as a byproduct of operation. It does not bolt it on.
+
+## 19. EU AI Act Article 9 — Lived
+
+| Article 9 obligation | Hydra mechanism |
+|---|---|
+| Identification of risks | squad-boundary redaction; venom-class detection |
+| Estimation / evaluation | envelope schema validation (N7) |
+| Risk mitigation | circuit breaker, loop ceiling, HITL gate |
+| Testing | best-of-N + cross-vendor judge plane |
+| Continuous monitoring | OTEL emit at every phase |
+| Documentation | archivist seal (N6); replay-deterministic trace |
+
+## 20. The HITL Gate (D9)
+
+```mermaid
+flowchart LR
+    IN([Envelope in]) --> SCHEMA{validate_envelope<br/>fail-closed N7}
+    SCHEMA -- pass --> REDACT[Boundary redaction]
+    SCHEMA -- fail --> ABORT[Governance event<br/>archivist seal]:::stop
+    REDACT --> BUDGET{Budget gate<br/>80%% downgrade<br/>100%% HITL}
+    BUDGET -- under --> LOOP{Loop ceiling<br/>25 iter / depth 5}
+    BUDGET -- 80%% --> DOWNGRADE[Model tier downgrade]:::warn
+    BUDGET -- 100%% --> HITL[/HITL Request/]:::hitl
+    LOOP -- under --> CIRCUIT{Circuit breaker<br/>3 strikes}
+    LOOP -- ceiling --> HITL
+    CIRCUIT -- under --> EXEC[Dispatch to squad]
+    CIRCUIT -- tripped --> HITL
+    EXEC --> OTEL[OTEL emit<br/>archivist seal N6]
+    OTEL --> OUT([DecisionRecord out])
+    HITL -. /hydra:approve .-> EXEC
+    HITL -. /hydra:resume .-> EXEC
+
+    classDef stop fill:#C0392B,stroke:#C0392B,color:#0D0F1A
+    classDef warn fill:#8B7355,stroke:#8B7355,color:#0D0F1A
+    classDef hitl fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3,stroke-width:2px
+```
+
+A paused workflow resumes only by human hand. No bypass. No timeout resumption.
+
+## 21. The Squad Expansion Model
+
+Five squads are stubs. *That is the design.* Legal-compliance, healthcare, sales-gtm, research-ds, customer-support — all registered under `squads/<slug>/squad.yaml`, all governed by the covenant, none yet operational.
+
+Adding a squad means **one `squad.yaml` + one typed entrypoint**. The covenant scales without renegotiation.
+
+## 22. Failure Modes & Mitigations
+
+| Failure mode | Invariant / Control | Mitigation |
+|---|---|---|
+| MAS coordination collapse | typed envelopes | `validate_envelope` fail-closed (N7) |
+| Runaway agent loop | loop ceiling | 25 iter / depth 5; HITL on breach |
+| Constitution drift | hash pin | N8 aborts session on mismatch |
+| Replication explosion | replication cap | N5 caps at 4 clones per scope |
+| Venom-class capability generation | refusal registry | N2 fail-closed; cerberus-bridge for appeal |
+| Push without verdict | TheEights gate | N4 requires evolution.commit before push |
+| Schema malformity | envelope validator | N7 fail-closed |
+| Tool inflation | factory ban | N9 — Smith cannot create new tools |
+| Quarantine bypass | release gate | N10 requires TheEights HITL |
+| Audit silence | decision log | N6 — every Smith decision logged |
+
+## 23. The Pentecost Frame — Final Statement
+
+Hydra is not Legion — it does not seek merger or dominance. Six squads, three crowns, one constitution. The distributed agency is not a bug in the governance model. It *is* the governance model.
+
+## 24. For the Builder
+
+```yaml
+# squads/<your-slug>/squad.yaml
+slug: your-squad
+version: 1.0.0
+entrypoint: mcp           # or: claude-skill | agent-impersonation
+namespace: your-namespace
+agents:
+  - name: your-agent
+    role: your-role
+risk_class: low           # low | medium | venom
+allow_list:
+  - tool: external.api.read
+constitution_attest: required
+```
+
+Read [`CONTRIBUTING-SQUADS.md`](../CONTRIBUTING-SQUADS.md). Register your slug. Define your envelope schema. Wire your entrypoint. Submit for constitution review. **The immortal head decides.**
+
+You don't have to rebuild the governance layer — it's already there.
+
+---
+
+## Coda — The Largest Constellation
+
+Hydra. 1,303 square degrees. Holding.
+
+The largest constellation has no bright stars. It holds its shape not by luminosity but by the pattern of its relationships. So does this system. The covenant is the shape.
+
+---
+
+## Appendix A — Three Crowns Roster (D8)
+
+```mermaid
+mindmap
+  root((Hydra<br/>Constellation))
+    Executive Crown
+      ceo / cso / coo / cfo / cro
+      cto / cio / cdo / caio / ciso
+      cpo / cmo / cxo / chro / clo
+      csco / chief-sustainability-officer
+      Orchestrators
+        boardroom
+        mna-cockpit
+        crisis-warroom
+        capital-allocation
+    Forge Crown
+      Daedalus · architect
+      Prometheus · engineer
+      Argus · reviewer
+      Hygeia · test-strategist
+      Cerberus · security-reviewer
+      Charon · release-planner
+      Mnemosyne · docs-author
+    Garland Crown
+      Calliope · brand
+      Erato · copy
+      Polyhymnia · content
+      Terpsichore · social
+      Euterpe · paid
+      Clio · PR
+      Urania · SEO
+      Helios · photo-cinema
+      Helios Sub-Crew
+        video-synth
+        audio-foley
+        music-score
+        dialogue-mix
+        governance-c2pa
+```
+
+## Appendix B — Executive Memos
+
+- [CSO — Strategic Case for Constellation Architecture](./exec-memos/cso.md)
+- [CTO — Architectural Reference](./exec-memos/cto.md)
+- [CAIO — AI Governance Posture](./exec-memos/caio.md)
+
+## Appendix C — Garland Cinematic Treatment
+
+- [Garland Creative Direction (brand voice, art direction, slide outline, narration, asset list, accessibility)](./garland/creative-direction.md)
+
+## Appendix D — Research Notes (Phase 4)
+
+- [Web research — LangGraph 2026, EU AI Act, NIST RMF, reveal.js](./assets/research-notes.md)
+
+---
+
+*Filed under the covenant. SHA-256 attested. Pentecost, not Legion.*
+</script>
+
+<!--
+  UMD bundles. Loaded as classic <script src> (NOT modules) so Chrome's
+  file:// origin restriction on dynamic ESM imports doesn't apply.
+  Both expose window globals: window.marked, window.mermaid.
+-->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+
+<script>
+(function() {
+  'use strict';
+
+  var loader   = document.getElementById('loader');
+  var rendered = document.getElementById('rendered');
+
+  function surfaceError(stage, err) {
+    try { console.error('[constellation]', stage, err); } catch(_) {}
+    var msg = (err && (err.stack || err.message)) || String(err);
+    loader.innerHTML =
+      '<div style="max-width:680px;padding:30px;text-align:left;font-family:var(--mono);color:var(--vellum);">' +
+        '<div style="font-family:var(--display);font-size:2em;color:var(--immortal);margin-bottom:0.4em;">⚠ render failed at ' + stage + '</div>' +
+        '<pre style="background:var(--void-3);border:1px solid #2b2f48;padding:12px;white-space:pre-wrap;word-break:break-word;font-size:0.85em;color:var(--vellum);">' +
+          msg.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') +
+        '</pre>' +
+        '<p style="color:var(--trigram);font-size:0.9em;margin-top:1em;">Open the canonical source directly: ' +
+          '<a href="./HYDRA-CONSTELLATION.md" style="color:var(--crown-2);">HYDRA-CONSTELLATION.md</a></p>' +
+      '</div>';
+  }
+
+  window.addEventListener('error', function(e) { surfaceError('window.onerror', e.error || e.message); });
+  window.addEventListener('unhandledrejection', function(e) { surfaceError('promise', e.reason); });
+
+  // 1. Verify CDN globals loaded
+  if (typeof window.marked === 'undefined') {
+    return surfaceError('marked global missing',
+      new Error('window.marked is undefined — UMD script may have been blocked. Check network tab for marked.umd.min.js.'));
+  }
+  if (typeof window.mermaid === 'undefined') {
+    return surfaceError('mermaid global missing',
+      new Error('window.mermaid is undefined — UMD script may have been blocked. Check network tab for mermaid.min.js.'));
+  }
+
+  // 2. Initialise Mermaid with the constellation theme
+  try {
+    window.mermaid.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      securityLevel: 'loose',
+      themeVariables: {
+        background: '#0D0F1A',
+        primaryColor: '#11142a',
+        primaryTextColor: '#E8D5A3',
+        primaryBorderColor: '#2E86AB',
+        lineColor: '#E8D5A3',
+        secondaryColor: '#16182a',
+        tertiaryColor: '#0D0F1A',
+        mainBkg: '#11142a',
+        nodeBorder: '#2E86AB',
+        clusterBkg: '#0D0F1A',
+        clusterBorder: '#2b2f48',
+        titleColor: '#E8D5A3',
+        edgeLabelBackground: '#0D0F1A',
+        textColor: '#E8D5A3',
+        noteBkgColor: '#16182a',
+        noteTextColor: '#E8D5A3',
+        noteBorderColor: '#8B7355'
+      },
+      flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' },
+      stateDiagram: { useMaxWidth: true }
+    });
+  } catch (e) { return surfaceError('mermaid.initialize', e); }
+
+  // 3. Configure marked: intercept ```mermaid``` fenced blocks
+  // marked v12 UMD exposes window.marked.marked (the function) and window.marked.use
+  // The UMD wrapper exposes everything on the top-level object, including .use()
+  var marked = window.marked;
+  try {
+    marked.use({
+      renderer: {
+        // marked v12 renderer uses token-object signature
+        code: function(token) {
+          if (token && token.lang === 'mermaid') {
+            return '<div class="mermaid">' + token.text + '</div>';
+          }
+          return false; // fall through to default renderer
+        }
+      }
+    });
+  } catch (e) { return surfaceError('marked.use', e); }
+
+  // 4. Render markdown
+  var html;
+  try {
+    var src = document.getElementById('md-source').textContent;
+    html = marked.parse(src);
+  } catch (e) { return surfaceError('marked.parse', e); }
+
+  rendered.innerHTML = html;
+  rendered.style.display = 'block';
+
+  // 5. Run Mermaid on the inserted diagrams
+  try {
+    var result = window.mermaid.run({ querySelector: '.mermaid' });
+    if (result && typeof result.then === 'function') {
+      result.then(finishLoader).catch(function(e) {
+        console.warn('[constellation] mermaid.run partial failure', e);
+        finishLoader();
+      });
+    } else {
+      finishLoader();
+    }
+  } catch (e) {
+    console.warn('[constellation] mermaid.run threw synchronously', e);
+    finishLoader();
+  }
+
+  function finishLoader() {
+    loader.classList.add('hidden');
+    setTimeout(function() { if (loader && loader.parentNode) loader.parentNode.removeChild(loader); }, 500);
+  }
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,23 @@
+%% D2 — Hydra LangGraph 7-Phase Supervisor State Machine
+stateDiagram-v2
+    direction LR
+    [*] --> Intake
+    Intake --> Planning : routed_goal
+    Planning --> Approval : CSuiteDecisionPacket
+    Approval --> Dispatch : approved
+    Approval --> Intake : revise
+    Dispatch --> Executing : envelopes_fanned_out
+    Executing --> Synthesis : all_squad_returns
+    Synthesis --> Postcheck : DecisionRecord
+    Postcheck --> [*] : passed
+    Postcheck --> Approval : HITL_required
+    Executing --> Approval : circuit_breaker_tripped
+    note right of Approval
+        HITL gate.
+        Resume only via
+        /hydra:approve or /hydra:resume.
+    end note
+    note left of Postcheck
+        Loop ceiling, budget,
+        missability checks.
+    end note

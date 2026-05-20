@@ -1,0 +1,60 @@
+%% D3 — Squad Orchestration Graph (Hydra Hub + Three Crowns + Stubs)
+graph TD
+    USER([User Goal])
+    HYDRA{{Hydra Supervisor<br/>LangGraph 7-phase}}
+    IMMORTAL[/CONSTITUTION.md<br/>sha256 4060cb54.../]
+    SMITH[[AgentSmith<br/>4 pillars / N1-N10]]
+
+    subgraph EXEC[Executive Crown - ExecutiveSuite]
+        direction TB
+        CEO(ceo) --- CSO(cso) --- CTO(cto) --- CAIO(caio)
+        CFO(cfo) --- CMO(cmo) --- CRO(cro) --- CISO(ciso)
+        ORCH_EX[[boardroom / mna-cockpit<br/>crisis-warroom / capital-allocation]]
+    end
+
+    subgraph FORGE[Forge Crown - pair-programmer]
+        direction TB
+        DAEDALUS(architect) --- PROMETHEUS(engineer) --- ARGUS(reviewer)
+        HYGEIA(test-strategist) --- CERBERUS(security-reviewer)
+        CHARON(release-planner) --- MNEMOSYNE(docs-author)
+    end
+
+    subgraph GARLAND[Garland Crown - RLM-Creative]
+        direction TB
+        CALLIOPE(Calliope) --- ERATO(Erato) --- POLYHYMNIA(Polyhymnia)
+        TERPSICHORE(Terpsichore) --- EUTERPE(Euterpe) --- CLIO(Clio)
+        URANIA(Urania) --- HELIOS{{Helios + sub-crew x5}}
+    end
+
+    subgraph STUBS[Stub Squads - covenant-bound, not yet active]
+        direction LR
+        S1[legal-compliance] --- S2[healthcare] --- S3[sales-gtm]
+        S4[research-ds] --- S5[customer-support]
+    end
+
+    EIGHTS[(TheEights<br/>episodic + semantic<br/>8 trigram cells)]
+
+    USER --> HYDRA
+    HYDRA -.reads.-> IMMORTAL
+    HYDRA -. validates via .-> SMITH
+    HYDRA ==CSuiteDecisionPacket==> EXEC
+    HYDRA ==PRD / ArchRFC / DevTask==> FORGE
+    HYDRA ==CreativeBrief / ShotList / AssetJob==> GARLAND
+    EXEC ==DecisionRecord==> HYDRA
+    FORGE ==DecisionRecord==> HYDRA
+    GARLAND ==DecisionRecord==> HYDRA
+    HYDRA <==MemoryRef==> EIGHTS
+    SMITH <-. attests .-> IMMORTAL
+    STUBS -.registered.-> HYDRA
+
+    classDef hub fill:#0D0F1A,stroke:#E8D5A3,color:#E8D5A3,stroke-width:2px
+    classDef crown fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3,stroke-width:1.5px
+    classDef stub fill:#0D0F1A,stroke:#8B7355,color:#8B7355,stroke-width:1px,stroke-dasharray: 4 4
+    classDef immortal fill:#C0392B,stroke:#C0392B,color:#0D0F1A,stroke-width:2px
+    classDef memory fill:#8B7355,stroke:#8B7355,color:#0D0F1A
+    class HYDRA hub
+    class EXEC,FORGE,GARLAND crown
+    class STUBS,S1,S2,S3,S4,S5 stub
+    class IMMORTAL immortal
+    class SMITH hub
+    class EIGHTS memory

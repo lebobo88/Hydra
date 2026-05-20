@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hydra Constellation — Three Crowns, One Covenant</title>
+  <meta name="description" content="Hydra Constellation: a layered deck (mythopoetic + technical + governance) for the LangGraph supervisor orchestrating ExecutiveSuite, pair-programmer, RLM-Creative, AgentSmith, and TheEights.">
+  <meta name="theme-color" content="#0D0F1A">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" id="theme">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <style>
+    /* ============================================================
+       Hydra Constellation theme — Void Black, Vellum, Immortal Red,
+       Crown Teal, Trigram Amber. See garland/creative-direction.md.
+       ============================================================ */
+    :root {
+      --void: #0D0F1A;
+      --vellum: #E8D5A3;
+      --immortal: #C0392B;
+      --crown: #2E86AB;
+      --trigram: #8B7355;
+      --display: 'IM Fell English', Georgia, 'Times New Roman', serif;
+      --mono: 'IBM Plex Mono', Consolas, monospace;
+    }
+
+    html, body, .reveal { background: var(--void); color: var(--vellum); }
+    .reveal { font-family: var(--mono); font-size: 22px; }
+    .reveal h1, .reveal h2, .reveal h3 { font-family: var(--display); color: var(--vellum); text-transform: none; letter-spacing: 0.04em; font-weight: 400; }
+    .reveal h1 { font-size: 2.4em; line-height: 1.1; }
+    .reveal h2 { font-size: 1.8em; line-height: 1.15; }
+    .reveal h3 { font-size: 1.3em; color: var(--crown); }
+    .reveal p, .reveal li { font-size: 0.92em; line-height: 1.55; color: var(--vellum); }
+    .reveal a { color: var(--crown); text-decoration: underline dotted; }
+    .reveal strong { color: var(--immortal); font-weight: 600; }
+    .reveal em.amber { color: var(--trigram); font-style: normal; }
+    .reveal code, .reveal pre { font-family: var(--mono); background: #16182a; color: var(--vellum); border: 1px solid #1d2038; }
+    .reveal pre { font-size: 0.62em; padding: 14px 18px; border-radius: 4px; }
+    .reveal table { font-family: var(--mono); font-size: 0.7em; color: var(--vellum); border-collapse: collapse; margin: 0.3em auto; }
+    .reveal table th, .reveal table td { border: 1px solid #2b2f48; padding: 6px 12px; text-align: left; }
+    .reveal table th { background: #16182a; color: var(--crown); font-weight: 500; }
+    .reveal blockquote { border-left: 4px solid var(--immortal); background: transparent; color: var(--vellum); font-style: italic; padding: 0.4em 1em; }
+
+    .act-title { text-align: center; padding-top: 1em; }
+    .act-title .act { font-family: var(--mono); color: var(--trigram); letter-spacing: 6px; font-size: 0.7em; }
+    .act-title h1 { font-size: 3em; margin-top: 0.2em; }
+    .act-title p { color: var(--trigram); margin-top: 0.5em; font-size: 0.8em; }
+
+    .crown-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; margin-top: 1em; }
+    .crown-card { background: #11142a; border: 1px solid var(--crown); padding: 16px; border-radius: 4px; }
+    .crown-card h3 { margin: 0 0 0.4em 0; color: var(--crown); font-family: var(--display); }
+    .crown-card .role { color: var(--trigram); font-size: 0.75em; margin-bottom: 0.6em; }
+    .crown-card ul { font-size: 0.7em; padding-left: 1.2em; }
+
+    .hash { font-family: var(--mono); color: var(--immortal); font-size: 0.7em; word-break: break-all; }
+    .footer-hash { position: fixed; bottom: 8px; left: 14px; font-family: var(--mono); font-size: 9px; color: var(--trigram); opacity: 0.7; pointer-events: none; }
+
+    .mermaid { background: transparent; }
+    .mermaid svg { max-width: 100%; height: auto; }
+
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; }
+    .columns .lhs, .columns .rhs { padding: 0.5em 0; }
+    .columns h3 { color: var(--immortal); }
+
+    .scripture { font-family: var(--display); font-style: italic; font-size: 1.2em; line-height: 1.5; color: var(--vellum); }
+    .citation { color: var(--trigram); font-size: 0.7em; margin-top: 0.3em; }
+
+    .invariant-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 24px; font-size: 0.65em; }
+    .invariant-grid div { padding: 4px 0; border-bottom: 1px dotted #2b2f48; }
+    .invariant-grid div b { color: var(--immortal); margin-right: 0.5em; }
+
+    .poster-frame { display: flex; justify-content: center; align-items: center; height: 78vh; }
+    .poster-frame img { max-height: 100%; max-width: 100%; }
+
+    .reveal section.center { text-align: center; }
+    .reveal .small { font-size: 0.7em; }
+    .reveal .amber { color: var(--trigram); }
+    .reveal .crown-color { color: var(--crown); }
+    .reveal .red { color: var(--immortal); }
+
+    /* focus ring per accessibility plan */
+    .reveal :focus { outline: 3px solid var(--vellum); outline-offset: 2px; }
+
+    /* reduced motion */
+    @media (prefers-reduced-motion: reduce) {
+      .reveal .slides section { transition: none !important; }
+    }
+  </style>
+</head>
+
+<body>
+<div class="reveal">
+  <div class="slides">
+
+    <!-- ============================================ -->
+    <!-- Act I — The Covenant                          -->
+    <!-- ============================================ -->
+
+    <!-- 1 -->
+    <section class="center" data-background-color="#0D0F1A">
+      <p class="amber" style="letter-spacing: 6px; font-size: 0.8em;">HYDRA CONSTELLATION</p>
+      <h1>The Largest Constellation</h1>
+      <p>One covenant. Many heads. The pattern of relationships holds.</p>
+      <p class="small amber" style="margin-top:2em;">SHA-256 · 4060cb54…dad6cfa5 · 2026-05-19</p>
+    </section>
+
+    <!-- 2 -->
+    <section>
+      <h2>Mark 5:9 vs Acts 2</h2>
+      <div class="columns">
+        <div class="lhs">
+          <h3 class="red">Legion</h3>
+          <p class="scripture">"My name is Legion: for we are many."</p>
+          <p class="citation">— Mark 5:9</p>
+          <p>Many spirits, one body. Coordination through merger; identity through dis-integration. <strong>The flat agent mesh.</strong></p>
+        </div>
+        <div class="rhs">
+          <h3 class="crown-color">Pentecost</h3>
+          <p class="scripture">"There appeared unto them cloven tongues like as of fire."</p>
+          <p class="citation">— Acts 2:3</p>
+          <p>One Spirit, many bodies. Distributed agency; single covenant; no loss of self. <strong>The Hydra Constellation.</strong></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3 -->
+    <section class="center">
+      <h2>The Immortal Head</h2>
+      <p>Cut every head. This one holds.</p>
+      <p class="hash">4060cb542fcc701143e56ec7b1608584b7c399d878db193dbf81c0f9dad6cfa5</p>
+      <p class="small amber">CONSTITUTION.md — SHA-256 pinned per session — AgentSmith invariant N8 aborts on mismatch.</p>
+    </section>
+
+    <!-- 4 -->
+    <section>
+      <h2>Three Crowns</h2>
+      <div class="crown-grid">
+        <div class="crown-card">
+          <h3>Executive</h3>
+          <p class="role">ExecutiveSuite · agent-impersonation</p>
+          <ul><li>20 specialist execs</li><li>4 orchestrators</li><li>judgment under ambiguity</li></ul>
+        </div>
+        <div class="crown-card">
+          <h3>Forge</h3>
+          <p class="role">pair-programmer · MCP</p>
+          <ul><li>7 forge heads</li><li>best-of-N + Borda</li><li>verifiable correctness</li></ul>
+        </div>
+        <div class="crown-card">
+          <h3>Garland</h3>
+          <p class="role">RLM-Creative · claude-skill</p>
+          <ul><li>8 Muses</li><li>Helios sub-crew × 5</li><li>multi-modal synthesis</li></ul>
+        </div>
+      </div>
+      <p class="small amber" style="margin-top:1.2em;">Plus five stub squads, covenant-bound, awaiting promotion: legal-compliance, healthcare, sales-gtm, research-ds, customer-support.</p>
+    </section>
+
+    <!-- 5 -->
+    <section>
+      <h2>TheEights — Memory Substrate</h2>
+      <p class="amber">Eight I Ching trigrams. Eight memory cells. One substrate.</p>
+      <table>
+        <tr><th>Trigram</th><th>Pinyin</th><th>Cell</th><th>Domain</th></tr>
+        <tr><td>☰</td><td>Qian</td><td>Heaven</td><td>Vision — constitutional ground truth</td></tr>
+        <tr><td>☷</td><td>Kun</td><td>Earth</td><td>Context — persistent world state</td></tr>
+        <tr><td>☳</td><td>Zhen</td><td>Thunder</td><td>Triggers — event activations</td></tr>
+        <tr><td>☴</td><td>Xun</td><td>Wind</td><td>Influence — propagation</td></tr>
+        <tr><td>☵</td><td>Kan</td><td>Water</td><td>Risk — exposures, anomalies</td></tr>
+        <tr><td>☲</td><td>Li</td><td>Fire</td><td>Focus — hot path, current attention</td></tr>
+        <tr><td>☶</td><td>Gen</td><td>Mountain</td><td>Constraints — guardrails, refusals</td></tr>
+        <tr><td>☱</td><td>Dui</td><td>Lake</td><td>Delight — qualitative satisfaction</td></tr>
+      </table>
+      <p class="small amber">Episodic SQLite + semantic vector store. Cross-squad reads via MemoryRef handles only.</p>
+    </section>
+
+    <!-- 6 -->
+    <section>
+      <h2>The Venom Gate</h2>
+      <p>AgentSmith — four pillars, ten fail-closed invariants.</p>
+      <div class="invariant-grid">
+        <div><b>N1</b> Cannot self-modify.</div>
+        <div><b>N2</b> Cannot generate venom-class capabilities.</div>
+        <div><b>N3</b> Cannot bypass HITL.</div>
+        <div><b>N4</b> No push without TheEights commit.</div>
+        <div><b>N5</b> Replication capped at 4 per scope.</div>
+        <div><b>N6</b> Every decision logged with rationale.</div>
+        <div><b>N7</b> Schema compliance fail-closed.</div>
+        <div><b>N8</b> Hash mismatch aborts session.</div>
+        <div><b>N9</b> Cannot create new tools.</div>
+        <div><b>N10</b> Quarantine release HITL only.</div>
+      </div>
+      <p class="small amber" style="margin-top:1em;">Smith does not advise. Smith enforces.</p>
+    </section>
+
+    <!-- 7 -->
+    <section>
+      <h2>Regulatory Posture</h2>
+      <table>
+        <tr><th>Framework</th><th>Hydra mechanism</th></tr>
+        <tr><td>EU AI Act <b>Article 9</b> (risk mgmt)</td><td>constitution + envelope validation + circuit breaker</td></tr>
+        <tr><td>EU AI Act <b>Article 50</b> (transparency, Aug 2026)</td><td>typed envelope provenance + DecisionRecord audit chain</td></tr>
+        <tr><td><b>NIST AI RMF 1.0 + Agentic Profile</b> (Feb 2026)</td><td>Govern · Map · Measure · Manage — mapped per function</td></tr>
+        <tr><td><b>ISO/IEC 42001</b> (AI MS)</td><td>continuous artifact generation per workflow</td></tr>
+      </table>
+      <p class="small amber">Compliance is generated as a byproduct of operation, not bolted on.</p>
+    </section>
+
+    <!-- 8 — Act I close -->
+    <section class="act-title">
+      <p class="act">END OF ACT I</p>
+      <h1>The Covenant Holds</h1>
+      <p>One hash. One document. Everything downstream is answerable to it.</p>
+    </section>
+
+    <!-- ============================================ -->
+    <!-- Act II — The Architecture                     -->
+    <!-- ============================================ -->
+
+    <!-- 9 -->
+    <section>
+      <h2>The 7-Phase State Machine</h2>
+      <div class="mermaid">
+%%{init: {'theme':'dark','themeVariables':{'background':'#0D0F1A','primaryColor':'#11142a','primaryTextColor':'#E8D5A3','primaryBorderColor':'#2E86AB','lineColor':'#E8D5A3','tertiaryColor':'#16182a'}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> Intake
+    Intake --> Planning : routed_goal
+    Planning --> Approval : CSuiteDecisionPacket
+    Approval --> Dispatch : approved
+    Approval --> Intake : revise
+    Dispatch --> Executing : envelopes_fanned_out
+    Executing --> Synthesis : all_squad_returns
+    Synthesis --> Postcheck : DecisionRecord
+    Postcheck --> [*] : passed
+    Postcheck --> Approval : HITL_required
+      </div>
+      <p class="small amber center">Intake · Planning · Approval · Dispatch · Executing · Synthesis · Postcheck</p>
+    </section>
+
+    <!-- 10 -->
+    <section>
+      <h2>The Envelope Schema</h2>
+      <p>Ten types. No raw blobs cross squad lines.</p>
+      <pre><code>class Envelope(BaseModel):
+    envelope_id: str
+    created_at: datetime
+    sender_squad: str
+    receiver_squad: str
+    workflow_id: str
+    refs: list[MemoryRef] = []
+
+CSuiteDecisionPacket | PRD | ArchRFC | DevTask |
+CreativeBrief | ShotList | AssetJob |
+DecisionRecord | HITLRequest | Handoff</code></pre>
+      <p class="small amber">hydra_core.schemas.validate_envelope is fail-closed (N7).</p>
+    </section>
+
+    <!-- 11 -->
+    <section>
+      <h2>MCP Host Topology</h2>
+      <div class="mermaid">
+%%{init: {'theme':'dark','themeVariables':{'background':'#0D0F1A','primaryColor':'#11142a','primaryTextColor':'#E8D5A3','primaryBorderColor':'#2E86AB','lineColor':'#E8D5A3'}}}%%
+graph LR
+    CC[Claude Code] --- SUP[hydra-supervisor]
+    SUP ==Forge==> PP[pp-daemon]
+    SUP ==Executive==> ES[executive-suite]
+    SUP ==Garland==> RLM[rlm-creative]
+    SUP <==memory==> MEM[hydra-memory]
+    SUP -.governance.-> SMITH[agentsmith]
+    PP -.audited.-> SMITH
+    ES -.audited.-> SMITH
+    RLM -.audited.-> SMITH
+    classDef gov fill:#16182a,stroke:#C0392B,color:#E8D5A3
+    class SMITH gov
+      </div>
+      <p class="small amber">Blast radius equals namespace.</p>
+    </section>
+
+    <!-- 12 — Executive -->
+    <section>
+      <h2>The Executive Crown</h2>
+      <p>ExecutiveSuite · 20 execs + 4 orchestrators · agent-impersonation</p>
+      <p class="small">
+        <strong>Roster:</strong> ceo · cso · coo · cfo · cro · cto · cio · cdo · caio · ciso · cpo · cmo · cxo · chro · clo · chief-communications-officer · chief-compliance-officer · chief-risk-officer · csco · chief-sustainability-officer<br><br>
+        <strong>Orchestrators:</strong> boardroom · mna-cockpit · crisis-warroom · capital-allocation<br><br>
+        <strong>Skills:</strong> executive-protocol · financial-frameworks · ai-governance · debate-protocol · scenario-planning · enterprise-risk · mna-playbook · crisis-response · stakeholder-comms
+      </p>
+      <p class="small amber">Strategy enters as intent. Exits as structured decision.</p>
+    </section>
+
+    <!-- 13 — Forge -->
+    <section>
+      <h2>The Forge Crown</h2>
+      <p>pair-programmer · 7 forge heads · MCP (pp-daemon) · ~42 tools</p>
+      <table>
+        <tr><th>Mythic</th><th>Functional</th><th>Owns</th></tr>
+        <tr><td>Daedalus</td><td>architect</td><td>ADRs, C4 sketches</td></tr>
+        <tr><td>Prometheus</td><td>engineer</td><td>code generation</td></tr>
+        <tr><td>Argus</td><td>reviewer</td><td>code review verdicts</td></tr>
+        <tr><td>Hygeia</td><td>test-strategist</td><td>test strategy, perf budgets</td></tr>
+        <tr><td>Cerberus</td><td>security-reviewer</td><td>threat models, control maps</td></tr>
+        <tr><td>Charon</td><td>release-planner</td><td>rollout, rollback, runbooks</td></tr>
+        <tr><td>Mnemosyne</td><td>docs-author</td><td>changelogs, release notes</td></tr>
+      </table>
+      <p class="small amber">Best-of-N · Borda count · Reflexion ×1 · rubrics pinned at @N.</p>
+    </section>
+
+    <!-- 14 — Garland -->
+    <section>
+      <h2>The Garland Crown</h2>
+      <p>RLM-Creative · 8 Muses + Helios sub-crew · claude-skill</p>
+      <table>
+        <tr><th>Muse</th><th>Domain</th></tr>
+        <tr><td>Calliope</td><td>brand strategy</td></tr>
+        <tr><td>Erato</td><td>copywriting</td></tr>
+        <tr><td>Polyhymnia</td><td>content strategy</td></tr>
+        <tr><td>Terpsichore</td><td>social / community</td></tr>
+        <tr><td>Euterpe</td><td>paid acquisition</td></tr>
+        <tr><td>Clio</td><td>PR / earned</td></tr>
+        <tr><td>Urania</td><td>SEO / discovery</td></tr>
+        <tr><td>Helios</td><td>photo / cinema (+ sub-crew: video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa)</td></tr>
+      </table>
+    </section>
+
+    <!-- 15 — Smith four pillars -->
+    <section>
+      <h2>AgentSmith — Four Pillars</h2>
+      <div class="mermaid">
+%%{init: {'theme':'dark','themeVariables':{'background':'#0D0F1A','primaryColor':'#11142a','primaryTextColor':'#E8D5A3','primaryBorderColor':'#2E86AB','lineColor':'#E8D5A3'}}}%%
+flowchart LR
+    HASH[/CONSTITUTION.md<br/>SHA-256/] --> SMITH
+    subgraph SMITH[AgentSmith]
+        FACTORY[Factory]
+        INSPECTOR[Inspector · N7]
+        SENTINEL[Sentinel · N5]
+        ARCHIVIST[Archivist · N6]
+    end
+    SMITH --> INV[/N1–N10 invariants/]
+      </div>
+      <p class="small amber">Smith does not advise. Smith enforces. Appeals via cerberus-bridge.</p>
+    </section>
+
+    <!-- 16 — Act II close -->
+    <section class="act-title">
+      <p class="act">END OF ACT II</p>
+      <h1>Routed. Typed. Enforced. Logged. Governed.</h1>
+      <p>Five verbs. Each maps to a subsystem.</p>
+    </section>
+
+    <!-- ============================================ -->
+    <!-- Act III — Governance & ROI                    -->
+    <!-- ============================================ -->
+
+    <!-- 17 -->
+    <section class="center">
+      <h2>Constitutional ROI</h2>
+      <p style="margin-top:1.5em; font-size:1.1em;">The constitution is not overhead.</p>
+      <p style="font-size:1.5em; color: var(--immortal); font-family: var(--display);">It is the product.</p>
+      <p class="small amber" style="margin-top:1.5em;">Every envelope · a compliance artifact. Every HITL event · an audit log entry. Every hash check · a governance attestation.</p>
+    </section>
+
+    <!-- 18 -->
+    <section>
+      <h2>EU AI Act Article 9 — Lived</h2>
+      <table>
+        <tr><th>Article 9 obligation</th><th>Hydra mechanism</th></tr>
+        <tr><td>Risk identification</td><td>boundary redaction; venom-class detection</td></tr>
+        <tr><td>Risk estimation / evaluation</td><td>envelope schema validation (N7)</td></tr>
+        <tr><td>Risk mitigation</td><td>circuit breaker; loop ceiling; HITL gate</td></tr>
+        <tr><td>Testing</td><td>best-of-N + cross-vendor judge plane</td></tr>
+        <tr><td>Continuous monitoring</td><td>OTEL emit at every phase</td></tr>
+        <tr><td>Documentation</td><td>archivist seal (N6); replay-deterministic trace</td></tr>
+      </table>
+    </section>
+
+    <!-- 19 — HITL Gate -->
+    <section>
+      <h2>The HITL Gate</h2>
+      <div class="mermaid">
+%%{init: {'theme':'dark','themeVariables':{'background':'#0D0F1A','primaryColor':'#11142a','primaryTextColor':'#E8D5A3','primaryBorderColor':'#2E86AB','lineColor':'#E8D5A3'}}}%%
+flowchart LR
+    IN([In]) --> SCHEMA{validate}
+    SCHEMA -- pass --> BUDGET{budget}
+    SCHEMA -- fail --> STOP[abort + seal]:::stop
+    BUDGET -- under --> LOOP{loop ceiling}
+    BUDGET -- 80%% --> DOWN[downgrade]
+    BUDGET -- 100%% --> HITL[/HITL/]:::hitl
+    LOOP -- under --> CIRCUIT{circuit}
+    LOOP -- breach --> HITL
+    CIRCUIT -- under --> EXEC[dispatch]
+    CIRCUIT -- breach --> HITL
+    EXEC --> OUT([DecisionRecord])
+    HITL -. approve .-> EXEC
+    classDef stop fill:#C0392B,stroke:#C0392B,color:#0D0F1A
+    classDef hitl fill:#16182a,stroke:#C0392B,color:#E8D5A3
+      </div>
+      <p class="small amber">A paused workflow resumes only by human hand. No bypass. No timeout resumption.</p>
+    </section>
+
+    <!-- 20 -->
+    <section>
+      <h2>The Squad Expansion Model</h2>
+      <p>Five squads are stubs. <em class="amber">That is the design.</em></p>
+      <ul>
+        <li>legal-compliance</li>
+        <li>healthcare</li>
+        <li>sales-gtm</li>
+        <li>research-ds</li>
+        <li>customer-support</li>
+      </ul>
+      <p>All registered under <code>squads/&lt;slug&gt;/squad.yaml</code>. All governed by the covenant. None yet operational.</p>
+      <p class="small amber">Adding a squad = one squad.yaml + one typed entrypoint. The covenant scales without renegotiation.</p>
+    </section>
+
+    <!-- 21 -->
+    <section>
+      <h2>Failure Modes &amp; Mitigations</h2>
+      <table>
+        <tr><th>Failure</th><th>Control</th><th>Mitigation</th></tr>
+        <tr><td>MAS coordination collapse</td><td>N7</td><td>fail-closed envelope validation</td></tr>
+        <tr><td>Runaway loop</td><td>loop ceiling</td><td>25 iter / depth 5 → HITL</td></tr>
+        <tr><td>Constitution drift</td><td>N8</td><td>hash pin aborts session</td></tr>
+        <tr><td>Replication explosion</td><td>N5</td><td>cap = 4 clones per scope</td></tr>
+        <tr><td>Venom-class generation</td><td>N2</td><td>fail-closed; cerberus appeal</td></tr>
+        <tr><td>Push without verdict</td><td>N4</td><td>TheEights evolution.commit required</td></tr>
+        <tr><td>Tool inflation</td><td>N9</td><td>Smith cannot create new tools</td></tr>
+        <tr><td>Quarantine bypass</td><td>N10</td><td>release requires TheEights HITL</td></tr>
+        <tr><td>Audit silence</td><td>N6</td><td>every Smith decision logged</td></tr>
+      </table>
+    </section>
+
+    <!-- 22 — Pentecost frame final -->
+    <section class="center">
+      <h2>The Pentecost Frame</h2>
+      <p class="scripture" style="margin: 1.5em 0;">Many heads. One Spirit.<br>The covenant holds.</p>
+      <p>The distributed agency is not a bug in the governance model.<br>It <strong>is</strong> the governance model.</p>
+    </section>
+
+    <!-- 23 — For the builder -->
+    <section>
+      <h2>For the Builder</h2>
+      <pre><code># squads/&lt;your-slug&gt;/squad.yaml
+slug: your-squad
+version: 1.0.0
+entrypoint: mcp           # or: claude-skill | agent-impersonation
+namespace: your-namespace
+agents:
+  - name: your-agent
+    role: your-role
+risk_class: low           # low | medium | venom
+allow_list:
+  - tool: external.api.read
+constitution_attest: required</code></pre>
+      <p class="small amber">Read CONTRIBUTING-SQUADS.md. Register your slug. Define your envelope schema. Wire your entrypoint. <strong>The immortal head decides.</strong></p>
+    </section>
+
+    <!-- 24 — Coda -->
+    <section class="center" data-background-color="#0D0F1A">
+      <p class="amber" style="letter-spacing: 6px;">CODA</p>
+      <h1>Hydra</h1>
+      <p style="font-size: 1.3em;">1,303 square degrees.<br>Holding.</p>
+      <p class="small amber" style="margin-top: 2em;">CONSTITUTION.md · sha256 4060cb54…dad6cfa5</p>
+    </section>
+
+  </div>
+
+  <div class="footer-hash">CONSTITUTION.md · sha256 4060cb54…dad6cfa5 · Pentecost, not Legion</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { background: '#0D0F1A', primaryColor: '#11142a', primaryTextColor: '#E8D5A3', primaryBorderColor: '#2E86AB', lineColor: '#E8D5A3' }});
+</script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    controls: true,
+    progress: true,
+    history: true,
+    transition: 'none',
+    backgroundTransition: 'none',
+    plugins: [ RevealNotes, RevealHighlight ]
+  });
+</script>
+</body>
+</html>

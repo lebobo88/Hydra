@@ -1,0 +1,46 @@
+%% D4 — MCP Host Topology (Per-Crown Namespaces + Meta-Governance)
+graph LR
+    CC[Claude Code<br/>plugin host]
+
+    subgraph HYDRA_NS[ Hydra Process ]
+        SUP[hydra-supervisor<br/>LangGraph]
+    end
+
+    subgraph PP[mcp: pp-daemon]
+        PP_TOOLS[pp_harness.*<br/>42 tools<br/>start_run / archive / judge / replay]
+    end
+
+    subgraph ES[mcp: executive-suite]
+        ES_TOOLS[es_*<br/>agent_get / roster_list<br/>command_get / output_read]
+    end
+
+    subgraph RLM[mcp: rlm-creative]
+        RLM_TOOLS[rlm_*<br/>agent_list / skill_get<br/>command_list / output_write]
+    end
+
+    subgraph MEM[mcp: hydra-memory]
+        MEM_TOOLS[hydra-mem.*<br/>read/write_episodic<br/>semantic_search<br/>query_eights / tag_memory]
+    end
+
+    subgraph SMITH[mcp: agentsmith]
+        SMITH_TOOLS[agentsmith.*<br/>inspector_inspect<br/>constitution_attest<br/>archivist_seal<br/>quarantine_isolate]
+    end
+
+    CC --- SUP
+    SUP ==Forge==> PP
+    SUP ==Executive==> ES
+    SUP ==Garland==> RLM
+    SUP <==memory==> MEM
+    SUP -.governance.-> SMITH
+    PP -.audited by.-> SMITH
+    ES -.audited by.-> SMITH
+    RLM -.audited by.-> SMITH
+
+    classDef host fill:#0D0F1A,stroke:#E8D5A3,color:#E8D5A3
+    classDef ns fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3
+    classDef memory fill:#0D0F1A,stroke:#8B7355,color:#E8D5A3
+    classDef gov fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3
+    class CC,SUP host
+    class PP,ES,RLM ns
+    class MEM memory
+    class SMITH gov

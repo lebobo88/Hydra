@@ -1,0 +1,22 @@
+%% D6 — AgentSmith Four Pillars + Constitution Anchor
+flowchart TB
+    HASH[/CONSTITUTION.md<br/>SHA-256 4060cb54.../]:::immortal
+
+    subgraph SMITH[AgentSmith Daemon - fail-closed]
+        direction LR
+        FACTORY[Factory<br/>agent / skill / command<br/>hook / squad / rubric]:::pillar
+        INSPECTOR[Inspector<br/>schema + invariants<br/>N7 fail-closed]:::pillar
+        SENTINEL[Sentinel<br/>anomaly detection<br/>N5 replication cap=4]:::pillar
+        ARCHIVIST[Archivist<br/>decision log<br/>N6 audit chain]:::pillar
+    end
+
+    INVARIANTS[/N1 cannot self-modify<br/>N2 no venom-class generation<br/>N3 cannot bypass HITL<br/>N4 no push without TheEights commit<br/>N5 replication capped<br/>N6 every decision logged<br/>N7 schema fail-closed<br/>N8 hash mismatch aborts<br/>N9 cannot create new tools<br/>N10 quarantine release HITL only/]:::invariant
+
+    HASH ==attested==> SMITH
+    SMITH -.enforces.-> INVARIANTS
+    FACTORY -. proposes via .-> EIGHTS_COMMIT[TheEights<br/>evolution.commit<br/>HITL required]:::eights
+
+    classDef immortal fill:#C0392B,stroke:#C0392B,color:#0D0F1A,stroke-width:2px
+    classDef pillar fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3,stroke-width:1.5px
+    classDef invariant fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3,stroke-width:1px
+    classDef eights fill:#8B7355,stroke:#8B7355,color:#0D0F1A

@@ -1,0 +1,21 @@
+%% D9 — Governance Plane (the controls inside every Hydra workflow)
+flowchart LR
+    IN([Envelope in]) --> SCHEMA{validate_envelope<br/>fail-closed N7}
+    SCHEMA -- pass --> REDACT[Boundary redaction<br/>PII / PHI / Financial]
+    SCHEMA -- fail --> ABORT[Governance event<br/>archivist seal]:::stop
+    REDACT --> BUDGET{Budget gate<br/>80%% downgrade<br/>100%% HITL}
+    BUDGET -- under --> LOOP{Loop ceiling<br/>25 iter / depth 5}
+    BUDGET -- 80%% --> DOWNGRADE[Model tier downgrade]:::warn
+    BUDGET -- 100%% --> HITL[/HITL Request/]:::hitl
+    LOOP -- under --> CIRCUIT{Circuit breaker<br/>3 strikes}
+    LOOP -- ceiling --> HITL
+    CIRCUIT -- under --> EXEC[Dispatch to squad]
+    CIRCUIT -- tripped --> HITL
+    EXEC --> OTEL[OTEL emit<br/>archivist seal N6]
+    OTEL --> OUT([DecisionRecord out])
+    HITL -. /hydra:approve .-> EXEC
+    HITL -. /hydra:resume .-> EXEC
+
+    classDef stop fill:#C0392B,stroke:#C0392B,color:#0D0F1A
+    classDef warn fill:#8B7355,stroke:#8B7355,color:#0D0F1A
+    classDef hitl fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3,stroke-width:2px

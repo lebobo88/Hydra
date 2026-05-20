@@ -1,0 +1,76 @@
+%% D7 — Typed Envelope Schemas (validated at every squad boundary)
+classDiagram
+    class Envelope {
+        +str envelope_id
+        +datetime created_at
+        +str sender_squad
+        +str receiver_squad
+        +str workflow_id
+        +MemoryRef[] refs
+    }
+    class CSuiteDecisionPacket {
+        +str decision_topic
+        +str[] participating_execs
+        +dict recommendation
+        +str confidence
+    }
+    class PRD {
+        +str feature_name
+        +str[] acceptance_criteria
+        +str[] non_goals
+    }
+    class ArchRFC {
+        +str title
+        +str[] options
+        +str chosen_option
+        +str[] tradeoffs
+    }
+    class DevTask {
+        +str scope
+        +str[] files
+        +str rubric_id_at_version
+    }
+    class CreativeBrief {
+        +str campaign
+        +str brand_voice
+        +str audience
+        +str[] deliverables
+    }
+    class ShotList {
+        +Shot[] shots
+        +str art_direction_ref
+    }
+    class AssetJob {
+        +str asset_type
+        +str input_ref
+        +str output_path
+    }
+    class DecisionRecord {
+        +str envelope_replied_to
+        +str outcome
+        +str rationale
+        +str[] dissents
+        +str[] artifact_refs
+    }
+    class HITLRequest {
+        +str reason
+        +str envelope_paused
+        +str[] options
+        +datetime expires_at
+    }
+    class Handoff {
+        +str from_squad
+        +str to_squad
+        +str context_ref
+    }
+
+    Envelope <|-- CSuiteDecisionPacket
+    Envelope <|-- PRD
+    Envelope <|-- ArchRFC
+    Envelope <|-- DevTask
+    Envelope <|-- CreativeBrief
+    Envelope <|-- ShotList
+    Envelope <|-- AssetJob
+    Envelope <|-- DecisionRecord
+    Envelope <|-- HITLRequest
+    Envelope <|-- Handoff
