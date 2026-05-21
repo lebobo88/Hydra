@@ -131,7 +131,7 @@ def test_mcp_client_routes_codex_to_pp_codex():
     fake = _FakeDispatcher({"verdict": "pass", "critique": "ok " * 30, "scores": {"x": 5}})
     client = MCPCritiqueClient(dispatcher=fake, cwd="/tmp")
     out = client.critique(vendor="codex", artifact_text="hi", rubric_md="rubric")
-    assert fake.calls[0]["server"] == "pp-codex"
+    assert fake.calls[0]["server"] == "pp_codex"
     assert fake.calls[0]["tool"] == "critique"
     assert out["outcome"] == "pass"
 
@@ -140,7 +140,7 @@ def test_mcp_client_routes_gemini_to_pp_gemini():
     fake = _FakeDispatcher({"verdict": "revise", "critique": "x", "scores": {}})
     client = MCPCritiqueClient(dispatcher=fake, cwd="/tmp")
     client.critique(vendor="gemini", artifact_text="hi", rubric_md="rubric")
-    assert fake.calls[0]["server"] == "pp-gemini"
+    assert fake.calls[0]["server"] == "pp_gemini"
 
 
 def test_mcp_client_raises_on_failed_status():

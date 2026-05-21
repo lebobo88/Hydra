@@ -52,7 +52,7 @@ class _FlakyDispatcher:
 
 def test_returns_none_after_two_failed_attempts():
     d = _RaisingDispatcher()
-    out = _mcp_call_safe(d, "executive-suite", "es.roster.list", {})
+    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {})
     assert out is None
     assert d.calls == 2  # exactly one retry, no exponential storm
 
@@ -65,18 +65,18 @@ def test_on_error_invoked_for_every_failed_attempt():
         events.append((server, tool, attempt, "-32000" in exc_repr))
 
     out = _mcp_call_safe(
-        d, "executive-suite", "es.roster.list", {}, on_error=cb,
+        d, "executive_suite", "es.roster.list", {}, on_error=cb,
     )
     assert out is None
     assert len(events) == 2
-    assert events[0] == ("executive-suite", "es.roster.list", 1, True)
-    assert events[1] == ("executive-suite", "es.roster.list", 2, True)
+    assert events[0] == ("executive_suite", "es.roster.list", 1, True)
+    assert events[1] == ("executive_suite", "es.roster.list", 2, True)
 
 
 def test_on_error_none_preserves_silent_legacy_behavior():
     """`on_error=None` is the deliberate opt-out — no exceptions escape."""
     d = _RaisingDispatcher()
-    out = _mcp_call_safe(d, "executive-suite", "es.roster.list", {}, on_error=None)
+    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=None)
     assert out is None
 
 
@@ -84,13 +84,13 @@ def test_retry_recovers_on_transient_failure():
     d = _FlakyDispatcher({"agents": [{"name": "ceo"}]})
     events: list[tuple] = []
     out = _mcp_call_safe(
-        d, "executive-suite", "es.roster.list", {},
+        d, "executive_suite", "es.roster.list", {},
         on_error=lambda s, t, e, a: events.append((s, a)),
     )
     assert out == {"agents": [{"name": "ceo"}]}
     assert d.calls == 2
     # On-error fires for the first failed attempt only — second call succeeded.
-    assert events == [("executive-suite", 1)]
+    assert events == [("executive_suite", 1)]
 
 
 def test_state_error_counter_increments_via_record_mcp_failure():
@@ -98,9 +98,9 @@ def test_state_error_counter_increments_via_record_mcp_failure():
     cb = _record_mcp_failure(state)
     assert cb is not None
     d = _RaisingDispatcher()
-    _mcp_call_safe(d, "executive-suite", "es.roster.list", {}, on_error=cb)
+    _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=cb)
     # Two failed attempts → counter at 2 (below the configured ceiling of 3).
-    assert state.error_counters["mcp_failure:executive-suite"] == 2
+    assert state.error_counters["mcp_failure:executive_suite"] == 2
     assert state.any_mcp_over_ceiling() == (False, None)
 
 
@@ -124,7 +124,7 @@ def test_record_mcp_failure_returns_none_for_no_state():
 
 def test_succeeds_in_one_call_when_dispatcher_works():
     d = _SucceedingDispatcher({"commands": []})
-    out = _mcp_call_safe(d, "rlm-creative", "rlm.command.list", {})
+    out = _mcp_call_safe(d, "rlm_creative", "rlm.command.list", {})
     assert out == {"commands": []}
     assert d.calls == 1
 

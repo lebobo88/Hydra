@@ -136,15 +136,15 @@ def _cmd_doctor(args) -> int:
         return 0 if fail_count == 0 else 1
     servers = _load_mcp_config(project)
     probes = [
-        ("pp-daemon", "ping", {}),
-        ("hydra-memory", "list_tools", {}),
-        ("executive-suite", "es.ping", {}),
-        ("rlm-creative", "rlm.ping", {}),
+        ("pp_harness", "ping", {}),
+        ("hydra_memory", "list_tools", {}),
+        ("executive_suite", "es.ping", {}),
+        ("rlm_creative", "rlm.ping", {}),
     ]
     dispatcher = MCPStdioDispatcher(project)
     for server, tool, tool_args in probes:
         if server not in servers:
-            print(f"WARN: {server} not in .mcp.json")
+            print(f"WARN: {server} not registered at user scope (~/.claude.json)")
             continue
         try:
             res = dispatcher.call_mcp(server, tool, tool_args)
@@ -232,8 +232,8 @@ def _cmd_run(args) -> int:
         from .dispatcher import MCPStdioDispatcher
         from .judge import MCPCritiqueClient
         dispatcher = MCPStdioDispatcher(project, verbose=args.verbose)
-        # Reuse the same dispatcher for cross-vendor judge calls; pp-codex /
-        # pp-gemini servers must be registered in .mcp.json.
+        # Reuse the same dispatcher for cross-vendor judge calls; pp_codex /
+        # pp_gemini servers must be registered at user scope (~/.claude.json).
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
     else:
         dispatcher = _NullDispatcher()
@@ -303,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run")
     r.add_argument("goal")
     r.add_argument("--squad", help="Comma-separated squad slugs to force-select")
-    r.add_argument("--live", action="store_true", help="Use the live MCP dispatcher (talks to pp-daemon etc.)")
+    r.add_argument("--live", action="store_true", help="Use the live MCP dispatcher (talks to pp_harness etc.)")
     r.add_argument("--verbose", action="store_true", help="Verbose MCP tool list / errors")
     r.add_argument(
         "--no-checkpoint",

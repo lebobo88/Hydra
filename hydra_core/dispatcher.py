@@ -1,8 +1,16 @@
 """Live dispatchers for squad-node execution.
 
-`MCPStdioDispatcher` connects to one or more MCP servers declared in `.mcp.json`
-and proxies tool calls into them. This is how the engineering squad reaches the
-pair-programmer daemon for a real `pp.harness.start_run`.
+`MCPStdioDispatcher` connects to one or more MCP servers declared at USER scope
+(`~/.claude.json` mcpServers) — with optional project-scope override from
+`.mcp.json` when one exists — and proxies tool calls into them. This is how
+the engineering squad reaches the pair-programmer daemon for a real
+`pp.harness.start_run`.
+
+Hydra no longer ships a project-scope `.mcp.json`; all squad backends
+(`pp_harness`, `pp_codex`, `pp_gemini`, `hydra_memory`, `executive_suite`,
+`rlm_creative`, `eights`, `agentsmith`) are registered once at user scope so
+every project — Hydra's own source tree, blank scratch dirs, and downstream
+consumers — sees the same set.
 
 Subprocess + claude-skill + impersonation dispatch are stubbed-out delegations
 that print a structured envelope intended for the host Claude Code session to
@@ -23,17 +31,47 @@ from typing import Any, Optional
 
 # --------- helpers ---------
 
-def _load_mcp_config(project_root: Path) -> dict[str, dict[str, Any]]:
-    cfg = project_root / ".mcp.json"
+def _strip_comments(spec: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in spec.items() if not k.startswith("_")}
+
+
+def _load_user_scope_mcp() -> dict[str, dict[str, Any]]:
+    """Read the top-level `mcpServers` block from `~/.claude.json`.
+
+    Skips per-project overrides nested under `projects.*.mcpServers` — those
+    are session-scoped and not relevant to Hydra dispatch. Silently returns
+    {} if the file is missing or unreadable; the caller treats absence as
+    "no servers" and surfaces `server not configured` per-call.
+    """
+    cfg = Path.home() / ".claude.json"
     if not cfg.exists():
         return {}
-    raw = json.loads(cfg.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
     servers = raw.get("mcpServers", {}) or {}
-    # Strip "_comment" decorations
-    return {
-        name: {k: v for k, v in spec.items() if not k.startswith("_")}
-        for name, spec in servers.items()
-    }
+    return {name: _strip_comments(spec) for name, spec in servers.items()}
+
+
+def _load_mcp_config(project_root: Path) -> dict[str, dict[str, Any]]:
+    """Merge user-scope and (optional) project-scope MCP server registrations.
+
+    User scope is the canonical source; project-scope `.mcp.json` — if present
+    — overrides individual entries. Hydra ships no `.mcp.json` of its own as
+    of 2026-05-21, but the override path is preserved for downstream consumers
+    that need to pin a specific daemon revision per project.
+    """
+    merged = _load_user_scope_mcp()
+    cfg = project_root / ".mcp.json"
+    if cfg.exists():
+        try:
+            raw = json.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return merged
+        for name, spec in (raw.get("mcpServers", {}) or {}).items():
+            merged[name] = _strip_comments(spec)
+    return merged
 
 
 # --------- live MCP dispatcher ---------
@@ -109,7 +147,14 @@ class MCPStdioDispatcher:
 
         spec = self._servers.get(server)
         if spec is None:
-            return {"status": "failed", "error": f"server {server!r} not in .mcp.json"}
+            return {
+                "status": "failed",
+                "error": (
+                    f"server {server!r} not registered at user scope "
+                    f"(~/.claude.json mcpServers) or project scope (.mcp.json). "
+                    f"Known: {sorted(self._servers)[:10]}"
+                ),
+            }
 
         # Open a fresh session per call. (For production: pool/cache by server.)
         params = StdioServerParameters(

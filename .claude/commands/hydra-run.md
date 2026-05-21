@@ -14,7 +14,7 @@ Drive the user goal through `hydra_core.supervisor.build_supervisor`. Lifecycle:
 
 1. Parse `$ARGUMENTS` into `{goal, squad?, budget?, risk?}`.
 2. Adopt the `hydra-supervisor` agent persona (`.claude/agents/hydra-supervisor.md`).
-3. Run the supervisor graph via the host-bound dispatcher (which proxies to `pp-daemon`, `hydra-memory`, `executive-suite` filesystem MCP, `rlm-creative` filesystem MCP).
+3. Run the supervisor graph via the host-bound dispatcher (which proxies to `pp_harness`, `hydra_memory`, `executive_suite` filesystem MCP, `rlm_creative` filesystem MCP).
 4. If an HITL request fires, STOP and surface the request — operator resumes with `/hydra:approve` or `/hydra:resume`.
 5. On completion, print the final `DECISION_RECORD` summary + paths to the trace and archived artifacts.
 

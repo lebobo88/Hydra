@@ -1,6 +1,6 @@
 # Forge Crown — cathedral overlay for the pair-programmer plaza roster.
 #
-# Plaza slugs map to pp-daemon agents under the hood. Hydra synthesizes in
+# Plaza slugs map to pp_harness agents under the hood. Hydra synthesizes in
 # cathedral voice; envelopes and PP tool calls keep the plaza slug.
 crown: forge
 heads:

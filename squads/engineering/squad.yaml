@@ -28,19 +28,19 @@ agents:
 
 tools:
   - name: pp.harness.start_run
-    mcp_server: pp-daemon
+    mcp_server: pp_harness
     privilege: execute
   - name: pp.harness.start_stage
-    mcp_server: pp-daemon
+    mcp_server: pp_harness
     privilege: execute
   - name: pp.harness.archive_artifact
-    mcp_server: pp-daemon
+    mcp_server: pp_harness
     privilege: write
   - name: pp.codex.generate
-    mcp_server: pp-daemon
+    mcp_server: pp_harness
     privilege: execute
   - name: pp.gemini.critique
-    mcp_server: pp-daemon
+    mcp_server: pp_harness
     privilege: execute
 
 accepts:

@@ -1,4 +1,4 @@
-"""Smoke tests for the executive-suite + rlm-creative MCP shims.
+"""Smoke tests for the executive_suite + rlm_creative MCP shims.
 
 Exercises the bare-stdio fallback so these run without the optional `mcp` SDK.
 """
@@ -219,8 +219,8 @@ def test_via_impersonation_persists_real_memoryref():
         proposed_tasks=[],
     )
     dispatcher = _FakeDispatcher({
-        ("executive-suite", "es.roster.list"): {"agents": [{"name": "ceo"}, {"name": "cfo"}]},
-        ("executive-suite", "es.output.write"): {
+        ("executive_suite", "es.roster.list"): {"agents": [{"name": "ceo"}, {"name": "cfo"}]},
+        ("executive_suite", "es.output.write"): {
             "path": "C:/fake/output/finance/review-q3-capital-allocation-2026-05-19.md",
             "relative": "output/finance/review-q3-capital-allocation-2026-05-19.md",
             "bytes": 512,
@@ -255,8 +255,8 @@ def test_via_claude_skill_persists_real_memoryref():
         constraints=Constraints(),
     )
     dispatcher = _FakeDispatcher({
-        ("rlm-creative", "rlm.command.list"): {"commands": [{"name": "rlm-team"}, {"name": "rlm-video"}]},
-        ("rlm-creative", "rlm.output.write"): {
+        ("rlm_creative", "rlm.command.list"): {"commands": [{"name": "rlm-team"}, {"name": "rlm-video"}]},
+        ("rlm_creative", "rlm.output.write"): {
             "path": "C:/fake/RLM/output/draft/teaser-2026-05-19.md",
             "relative": "RLM/output/draft/teaser-2026-05-19.md",
             "bytes": 320,

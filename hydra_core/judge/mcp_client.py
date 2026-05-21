@@ -6,13 +6,13 @@ real cross-vendor judgments. Reuses Hydra's existing `MCPStdioDispatcher` to
 avoid duplicating MCP-stdio plumbing.
 
 Configuration:
-  - .mcp.json must register `pp-codex` and `pp-gemini` servers (one stdio entry
-    each, pointing at the compiled pair-programmer daemon).
+  - User scope (~/.claude.json) must register `pp_codex` and `pp_gemini` servers
+    (one stdio entry each, pointing at the compiled pair-programmer daemon).
   - `cwd` defaults to the Hydra project root — PP uses it as the sandbox
     workspace for the critique call.
 
 Failure modes (all surface as JudgeDispatchError via the dispatcher):
-  - MCP server missing from .mcp.json
+  - MCP server missing from user scope (~/.claude.json mcpServers)
   - critique tool returned status="failed"
   - response missing the expected `outcome` field
 """
@@ -26,8 +26,8 @@ from .schemas import JudgeVendor
 
 
 _VENDOR_TO_SERVER: dict[JudgeVendor, str] = {
-    "codex": "pp-codex",
-    "gemini": "pp-gemini",
+    "codex": "pp_codex",
+    "gemini": "pp_gemini",
     # claude: served via Claude Code subagent dispatch (Phase 3+). Not wired here.
 }
 

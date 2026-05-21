@@ -186,11 +186,11 @@ def _via_mcp(
     # Drop None values — pp schema rejects them.
     args = {k: v for k, v in args.items() if v is not None}
     try:
-        result = dispatcher.call_mcp("pp-daemon", "start_run", args)
+        result = dispatcher.call_mcp("pp_harness", "start_run", args)
     except Exception as e:
         return SquadResult(
             envelopes=[], artifacts=[], status="failed",
-            rationale=f"pp-daemon unreachable: {e!r}",
+            rationale=f"pp_harness unreachable: {e!r}",
         )
 
     # MCP results come back as {"status":"done","tool":"start_run","result":{...}}
@@ -312,7 +312,7 @@ def _via_impersonation(
 ) -> SquadResult:
     """ExecutiveSuite pattern — Claude Code impersonates the roster IN PROCESS.
 
-    Enrichment pass: consult the `executive-suite` MCP for the live roster, then
+    Enrichment pass: consult the `executive_suite` MCP for the live roster, then
     after the host-pickup envelope, persist the prompt to the pack's `output/`
     tree via `es.output.write`. The returned `MemoryRef.key` points at the real
     on-disk path so downstream consumers can resolve it.
@@ -320,7 +320,7 @@ def _via_impersonation(
     # Pre-call: pull live roster from the MCP shim (falls back to pack.agents).
     _on_mcp_err = _record_mcp_failure(state)
     live_roster = _mcp_call_safe(
-        dispatcher, "executive-suite", "es.roster.list", {},
+        dispatcher, "executive_suite", "es.roster.list", {},
         on_error=_on_mcp_err,
     )
     roster_list = (live_roster or {}).get("agents", []) if isinstance(live_roster, dict) else []
@@ -354,7 +354,7 @@ def _via_impersonation(
     domain = _domain_for(pack, inbound)
     topic = (objective or "boardroom")[:80]
     write_result = _mcp_call_safe(
-        dispatcher, "executive-suite", "es.output.write",
+        dispatcher, "executive_suite", "es.output.write",
         {"domain": domain, "topic": topic,
          "content": _render_session_md("Boardroom Session", prompt, result)},
         on_error=_on_mcp_err,
@@ -399,7 +399,7 @@ def _via_claude_skill(
 ) -> SquadResult:
     """RLM-style — invoke a Claude Code skill (e.g. /rlm-team).
 
-    Enrichment: consult the `rlm-creative` MCP for the live skill catalogue, then
+    Enrichment: consult the `rlm_creative` MCP for the live skill catalogue, then
     persist the resulting host-pickup envelope under `RLM/output/{phase}/` via
     `rlm.output.write`. The returned `MemoryRef.key` points at the real path.
     """
@@ -408,7 +408,7 @@ def _via_claude_skill(
 
     _on_mcp_err = _record_mcp_failure(state)
     catalogue = _mcp_call_safe(
-        dispatcher, "rlm-creative", "rlm.command.list", {},
+        dispatcher, "rlm_creative", "rlm.command.list", {},
         on_error=_on_mcp_err,
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
@@ -428,7 +428,7 @@ def _via_claude_skill(
              or getattr(inbound, "summary", None)
              or cmd.lstrip("/"))[:80]
     write_result = _mcp_call_safe(
-        dispatcher, "rlm-creative", "rlm.output.write",
+        dispatcher, "rlm_creative", "rlm.output.write",
         {"phase": phase, "topic": topic,
          "content": _render_session_md(f"Creative dispatch via {cmd}",
                                        f"command_hint={cmd}\navailable={available_cmds}",
@@ -598,7 +598,7 @@ def abort_open_pp_runs(
     """B7 — release pp-harness locks for any open runs tracked on state.
 
     Called from `node_postcheck` ONLY when the workflow surfaces. Iterates
-    `state.open_pp_runs` and emits `pp-daemon.finalize_run(run_id, status=
+    `state.open_pp_runs` and emits `pp_harness.finalize_run(run_id, status=
     "aborted", reason=<reason>)` for each entry. Returns the list of entries
     that were drained so callers can emit a trace event.
 
@@ -616,7 +616,7 @@ def abort_open_pp_runs(
             continue
         try:
             dispatcher.call_mcp(
-                "pp-daemon",
+                "pp_harness",
                 "finalize_run",
                 {
                     "run_id": run_id,

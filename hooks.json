@@ -24,7 +24,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__hydra-memory__.*",
+        "matcher": "mcp__hydra_memory__.*",
         "hooks": [
           {
             "type": "command",
@@ -34,7 +34,7 @@
         ]
       },
       {
-        "matcher": "mcp__executive-suite__.*",
+        "matcher": "mcp__executive_suite__.*",
         "hooks": [
           {
             "type": "command",
@@ -44,7 +44,7 @@
         ]
       },
       {
-        "matcher": "mcp__rlm-creative__.*",
+        "matcher": "mcp__rlm_creative__.*",
         "hooks": [
           {
             "type": "command",
@@ -56,7 +56,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__hydra-memory__write.*",
+        "matcher": "mcp__hydra_memory__write.*",
         "hooks": [
           {
             "type": "command",
@@ -66,7 +66,7 @@
         ]
       },
       {
-        "matcher": "mcp__(executive-suite|rlm-creative)__.*output\\.write.*",
+        "matcher": "mcp__(executive_suite|rlm_creative)__.*output\\.write.*",
         "hooks": [
           {
             "type": "command",

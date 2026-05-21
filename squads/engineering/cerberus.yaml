@@ -77,16 +77,16 @@ venoms:
 # called. Anything not in this list requires explicit Cerberus pass.
 
 mcp_allowlist:
-  pp-daemon:
+  pp_harness:
     privileges: [read, write, execute]
     cross_tool_combinations_forbidden:
       - ["pp.harness.archive_artifact", "pp.harness.start_run"]
         # combining archive + run is the classic exfil pattern
-  hydra-mem:
+  hydra_memory:
     privileges: [read, write]
-  hydra-memory:
-    privileges: [read, write]
-  executive-suite:
+  executive_suite:
+    privileges: [read]
+  rlm_creative:
     privileges: [read]
 
 # --- audit sink --------------------------------------------------------------

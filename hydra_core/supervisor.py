@@ -75,7 +75,7 @@ def build_supervisor(
     judge_policy = load_policy(project_root)
     judge_trace_root = Path(project_root) if project_root else Path.cwd()
     # Best-effort attestation to the eights-daemon. No-ops cleanly when the
-    # daemon is not registered in `.mcp.json` (it usually isn't yet).
+    # daemon is not registered at user scope (~/.claude.json mcpServers).
     # B8: durable payloads (attest / envelope_record / hitl_request /
     # evolution.propose) that fail transport are spooled to disk via the
     # shared PendingSpool; `node_intake` calls `replay_pending()` once per

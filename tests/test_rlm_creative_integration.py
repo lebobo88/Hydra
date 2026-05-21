@@ -162,10 +162,23 @@ def test_crown_label_for_creative_squad_is_garland_crown():
 
 # --- mcp config --------------------------------------------------------------
 
-def test_mcp_json_points_rlm_creative_at_new_root():
-    raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
-    cfg = json.loads(raw)
-    rlm = cfg["mcpServers"]["rlm-creative"]
+def test_user_scope_points_rlm_creative_at_new_root():
+    """Regression guard: HYDRA_RLM_ROOT must point at RLM-Creative (the new
+    Garland pack), not at the deprecated RLM-CLI-Starter. After the
+    2026-05-21 user-scope migration, this lives in ~/.claude.json — skip when
+    not present (e.g., CI without the user config).
+    """
+    import os
+    from pathlib import Path
+    user_cfg = Path(os.path.expanduser("~/.claude.json"))
+    if not user_cfg.exists():
+        import pytest
+        pytest.skip("~/.claude.json not present in this environment")
+    cfg = json.loads(user_cfg.read_text(encoding="utf-8"))
+    rlm = cfg.get("mcpServers", {}).get("rlm_creative")
+    if not rlm:
+        import pytest
+        pytest.skip("rlm_creative not registered at user scope")
     root = rlm["env"]["HYDRA_RLM_ROOT"]
     assert "RLM-Creative" in root
     assert "RLM-CLI-Starter" not in root

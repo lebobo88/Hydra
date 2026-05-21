@@ -5,7 +5,7 @@ description: "Memory fabric usage — ephemeral / episodic / semantic. Read this
 
 # Memory Handles
 
-Hydra never crosses a squad boundary with a raw blob. Agents receive `MemoryRef` handles (`tier`, `key`, `summary`) and resolve them through the `hydra-memory` MCP server (or `hydra_core.memory.resolve` directly).
+Hydra never crosses a squad boundary with a raw blob. Agents receive `MemoryRef` handles (`tier`, `key`, `summary`) and resolve them through the `hydra_memory` MCP server (or `hydra_core.memory.resolve` directly).
 
 ## Three Tiers
 

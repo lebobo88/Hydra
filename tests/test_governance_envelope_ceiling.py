@@ -66,20 +66,20 @@ def test_envelope_ceiling_surfaces_over_cap(packs):
 
 def test_mcp_failure_ceiling_not_tripped_under_threshold(packs):
     s = _state()
-    s.error_counters["mcp_failure:executive-suite"] = 1
+    s.error_counters["mcp_failure:executive_suite"] = 1
     verdict = enforce_governance(s, packs)
     assert verdict.surfaced is False
 
 
 def test_mcp_failure_ceiling_surfaces_at_threshold(packs):
     s = _state()
-    s.error_counters["mcp_failure:executive-suite"] = 2
+    s.error_counters["mcp_failure:executive_suite"] = 2
     tripped, server = s.any_mcp_over_ceiling()
     assert tripped is True
-    assert server == "executive-suite"
+    assert server == "executive_suite"
     verdict = enforce_governance(s, packs)
     assert verdict.surfaced is True
-    assert verdict.reason.startswith("mcp_disconnect:executive-suite")
+    assert verdict.reason.startswith("mcp_disconnect:executive_suite")
     assert "failures=2" in verdict.reason
     assert "ceiling=2" in verdict.reason
 

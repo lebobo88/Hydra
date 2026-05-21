@@ -7,10 +7,10 @@ The daemon exposes MCP tools — `eights.constitution.attest`,
 event into a shared SQL ledger so cross-consumer audits work.
 
 This module is the Hydra-side caller. It calls those MCP tools **best-effort**:
-when the eights-daemon is not yet registered in `.mcp.json` (or any tool is
-missing), each method no-ops cleanly. This lets Hydra ship the call sites today
-and have them light up the moment the daemon is wired without further code
-changes here.
+when the eights-daemon is not yet registered at user scope (~/.claude.json)
+or a project-scope `.mcp.json` override (or any tool is missing), each method
+no-ops cleanly. This lets Hydra ship the call sites today and have them light
+up the moment the daemon is wired without further code changes here.
 
 Per `AGENTS.md` layering:
   - Hydra emits attestations; eights stores them.
@@ -29,10 +29,10 @@ from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool
 
 
-# MCP server slug the eights-daemon registers under. Aligned with the
-# convention in TheEights/.mcp.json.example (server name = "eights") so
-# Claude Code's /mcp reconnect path can find it. Override per environment
-# via `.mcp.json` if you mount the daemon on a different name.
+# MCP server slug the eights-daemon registers under. The user-scope
+# registration in ~/.claude.json keys this as "eights"; Claude Code's /mcp
+# reconnect path uses this name. Override per environment via a project-scope
+# `.mcp.json` if you mount the daemon on a different name.
 EIGHTS_MCP_SERVER = "eights"
 
 

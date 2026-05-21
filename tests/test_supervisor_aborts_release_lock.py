@@ -1,10 +1,10 @@
 """B7 — pp-harness lock release on supervisor surface.
 
 Verifies that `node_postcheck` drains `state.open_pp_runs` by calling
-`pp-daemon.finalize_run(status="aborted")` on every entry whenever the
+`pp_harness.finalize_run(status="aborted")` on every entry whenever the
 workflow surfaces. Closes the bootstrap-session failure mode where a
 crashed supervisor left `<project>/.harness/.lock` orphaned past the
-pp-daemon's TTL, blocking the next `/pp:run` on the same project until
+pp_harness TTL, blocking the next `/pp:run` on the same project until
 the operator manually removed the lock file.
 
 Covers three behaviors:
@@ -40,7 +40,7 @@ class _RecordingDispatcher:
         self.calls.append((server, tool, args))
         rid = args.get("run_id")
         if isinstance(rid, str) and rid in self.fail_run_ids:
-            raise RuntimeError(f"simulated pp-daemon failure for {rid}")
+            raise RuntimeError(f"simulated pp_harness failure for {rid}")
         return {"status": "done", "tool": tool, "result": {"run_id": rid, "status": "aborted"}}
 
     def emit_claude_prompt(self, *_a: Any, **_k: Any) -> Any:  # pragma: no cover
@@ -70,10 +70,10 @@ def test_abort_drains_every_entry_on_success() -> None:
 
     assert len(drained) == 2
     assert state.open_pp_runs == []
-    # Both calls must hit pp-daemon.finalize_run with status="aborted"
+    # Both calls must hit pp_harness.finalize_run with status="aborted"
     assert len(dispatcher.calls) == 2
     for server, tool, args in dispatcher.calls:
-        assert server == "pp-daemon"
+        assert server == "pp_harness"
         assert tool == "finalize_run"
         assert args["status"] == "aborted"
         assert args["reason"] == "envelope_ceiling"
@@ -82,7 +82,7 @@ def test_abort_drains_every_entry_on_success() -> None:
 
 
 def test_abort_partial_drain_leaves_failed_entries_in_state() -> None:
-    # Two runs registered; pp-daemon will raise for run_B (e.g., it was
+    # Two runs registered; pp_harness will raise for run_B (e.g., it was
     # already finalized externally, or the daemon is mid-restart). The
     # successful entry MUST be drained; the failed entry MUST stay on
     # state so an operator force_unlock can finish the cleanup.
