@@ -45,6 +45,14 @@
         "HYDRA_RLM_ROOT": "C:/AiAppDeployments/RLM-Creative"
       },
       "_comment": "Garland Crown — Eight Garland Heads studio. Thin MCP over RLM-Creative (skills, commands, agents, output persistence). Repointed from RLM-CLI-Starter on 2026-05-19 when the Garland Crown source pack shipped."
+    },
+    "eights": {
+      "command": "node",
+      "args": ["C:/AiAppDeployments/TheEights/daemon/dist/index.js"],
+      "env": {
+        "EIGHTS_LOG_LEVEL": "info"
+      },
+      "_comment": "TheEights substrate — constitution attestation, envelope-record ledger, evolution-proposal queue, HITL request mirror, redaction helper. Hydra calls into this via hydra_core.eights.attestation.EightsAttestor; durable payloads spool to ~/.hydra/eights-pending/ when this server is unreachable (B8) and replay on next workflow start. AgentSmith ALSO talks to TheEights via its own bridge child process; both paths are valid. Server slug matches TheEights/.mcp.json.example so /mcp reconnect can find it."
     }
   }
 }

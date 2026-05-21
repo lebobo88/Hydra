@@ -29,9 +29,11 @@ from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool
 
 
-# MCP server slug the eights-daemon registers under. Override per environment
+# MCP server slug the eights-daemon registers under. Aligned with the
+# convention in TheEights/.mcp.json.example (server name = "eights") so
+# Claude Code's /mcp reconnect path can find it. Override per environment
 # via `.mcp.json` if you mount the daemon on a different name.
-EIGHTS_MCP_SERVER = "eights-daemon"
+EIGHTS_MCP_SERVER = "eights"
 
 
 # Tools whose payload is durable enough to be worth replaying when the
