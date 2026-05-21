@@ -50,9 +50,11 @@
       "command": "node",
       "args": ["C:/AiAppDeployments/TheEights/daemon/dist/index.js"],
       "env": {
-        "EIGHTS_LOG_LEVEL": "info"
+        "EIGHTS_LOG_LEVEL": "info",
+        "EIGHTS_SKIP_AUDIT_CHECK": "1"
       },
-      "_comment": "TheEights substrate — constitution attestation, envelope-record ledger, evolution-proposal queue, HITL request mirror, redaction helper. Hydra calls into this via hydra_core.eights.attestation.EightsAttestor; durable payloads spool to ~/.hydra/eights-pending/ when this server is unreachable (B8) and replay on next workflow start. AgentSmith ALSO talks to TheEights via its own bridge child process; both paths are valid. Server slug matches TheEights/.mcp.json.example so /mcp reconnect can find it."
+      "_comment": "TheEights substrate — constitution attestation, envelope-record ledger, evolution-proposal queue, HITL request mirror, redaction helper. Hydra calls into this via hydra_core.eights.attestation.EightsAttestor; durable payloads spool to ~/.hydra/eights-pending/ when this server is unreachable (B8) and replay on next workflow start. AgentSmith ALSO talks to TheEights via its own bridge child process; both paths are valid. Server slug matches TheEights/.mcp.json.example so /mcp reconnect can find it. Singleton-guarded as of D2b — second spawn refuses cleanly with stderr diagnostic.",
+      "_eights_skip_audit_check_comment": "EIGHTS_SKIP_AUDIT_CHECK=1 lets the daemon boot despite a broken audit-chain row. Set on 2026-05-21 because the dual-spawn race (pre-D2b singleton guard) corrupted the chain at row 1337 — see ~/.eights/logs/eights-daemon-<date>.log. REMOVE THIS ENV VAR after the audit chain is repaired (rebuild from ~/.eights/events/*.jsonl). Leaving it set permanently masks future chain corruption from being surfaced."
     }
   }
 }
