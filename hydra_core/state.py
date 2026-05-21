@@ -81,6 +81,14 @@ class HydraState(BaseModel):
     depth: int = 0
     loop_ceiling: int = 25
     depth_ceiling: int = 5
+    # Preemptive in-flight ceilings (checked before damage accumulates, not
+    # only at postcheck). envelope_ceiling caps total envelopes accumulated
+    # in a single supervisor invocation — context exhaustion guard for the
+    # Claude Code sub-agent that hosts the supervisor for one tool round.
+    # mcp_failure_ceiling caps per-server consecutive _mcp_call_safe failures
+    # before the run surfaces to HITL with reason=mcp_disconnect:<server>.
+    envelope_ceiling: int = 30
+    mcp_failure_ceiling: int = 3
     error_counters: Annotated[dict[str, int], _merge_dict] = Field(default_factory=dict)
 
     requires_human_approval: bool = False
@@ -106,3 +114,15 @@ class HydraState(BaseModel):
 
     def is_looping(self) -> bool:
         return self.iteration_count >= self.loop_ceiling or self.depth >= self.depth_ceiling
+
+    def is_over_envelope_ceiling(self) -> bool:
+        return len(self.envelopes) >= self.envelope_ceiling
+
+    def mcp_failures_for(self, server: str) -> int:
+        return self.error_counters.get(f"mcp_failure:{server}", 0)
+
+    def any_mcp_over_ceiling(self) -> tuple[bool, Optional[str]]:
+        for key, count in self.error_counters.items():
+            if key.startswith("mcp_failure:") and count >= self.mcp_failure_ceiling:
+                return True, key.split(":", 1)[1]
+        return False, None

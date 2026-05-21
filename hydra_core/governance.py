@@ -148,6 +148,23 @@ def enforce_governance(
             surfaced=True,
             reason=f"loop ceiling tripped (iter={state.iteration_count}, depth={state.depth})",
         )
+    if state.is_over_envelope_ceiling():
+        return GovernanceVerdict(
+            surfaced=True,
+            reason=(
+                f"envelope_ceiling tripped "
+                f"(envelopes={len(state.envelopes)}, ceiling={state.envelope_ceiling})"
+            ),
+        )
+    mcp_tripped, mcp_server = state.any_mcp_over_ceiling()
+    if mcp_tripped:
+        return GovernanceVerdict(
+            surfaced=True,
+            reason=(
+                f"mcp_disconnect:{mcp_server} "
+                f"(failures={state.mcp_failures_for(mcp_server)}, ceiling={state.mcp_failure_ceiling})"
+            ),
+        )
     if state.is_over_budget():
         return GovernanceVerdict(
             surfaced=True,

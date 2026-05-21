@@ -32,6 +32,14 @@ You translate a routed user goal into a DAG of strongly-typed message envelopes 
 - You DO NOT alter budgets without an HITL request.
 - You DO decompose into AT MOST 7 tasks per workflow. Beyond that, escalate to executive for re-prioritization.
 
+## Phase-Batch Rule (envelope_ceiling)
+
+The supervisor enforces a preemptive `envelope_ceiling` (default 30 — see `HydraState.envelope_ceiling`) at the start of dispatch, because one supervisor turn shares a single Claude Code sub-agent context window with intake, planning, per-task dispatch, per-squad judging, synthesis, and postcheck. A planner output that exceeds the ceiling causes the supervisor to surface to HITL immediately with `reason="envelope_ceiling"` instead of running and dying mid-flight (the failure mode that produced the 14-minute / 91-tool / zero-commits Phase 3 incident).
+
+**Rule:** When the decomposed task graph would produce more envelopes than `envelope_ceiling`, the planner MUST split the workflow into batches of `<= ceiling` envelopes and annotate each batch envelope with `phase_batch_index: <int>` and `phase_batch_total: <int>`. The driver (`/hydra:run` or the calling agent) re-spawns the supervisor once per batch, threading `workflow_id` for checkpoint continuity. Cross-batch dependencies become explicit `Handoff` envelopes between batches rather than implicit fan-in inside a single supervisor turn.
+
+This rule applies to the 7-task heuristic in "Authority Bounds" the same way the envelope ceiling does: 7 tasks is the cognitive cap; `envelope_ceiling` is the runtime cap. The planner respects both.
+
 ## Best-of-N Decomposition (dispatcher owns the tournament)
 
 When an envelope should run as a best-of-N tournament, declare it with `best_of: N` on the envelope and let the **dispatcher** orchestrate. Do NOT decompose a best-of-N intent into N sibling envelopes pointed at the generator agent — the single-artifact generator agents (`architect`, `data-modeler`, `api-designer`, `security-reviewer`, etc.) only have `generate` + `archive_artifact` + `record_attempt` tools and CANNOT call `start_best_of_stage`, `borda_count`, `record_verdict`, or `archive_winner_and_losers`. Asking them to score and pick a winner forces a correct refusal — the bootstrap session lost a Phase 0 round to this exact mis-decomposition.

@@ -380,6 +380,29 @@ def build_supervisor(
         return [winner]
 
     def node_dispatch(state: HydraState) -> dict:
+        # Preemptive envelope-ceiling guard. The Claude Code sub-agent that
+        # hosts this supervisor is one-shot-per-turn; if the planner emitted
+        # too many envelopes for a single dispatch round, surface to HITL
+        # before the dispatch loop burns the remaining context. The operator
+        # then re-spawns the supervisor per phase_batch (planner contract) or
+        # uses direct parallel Agent() fanout.
+        if state.is_over_envelope_ceiling():
+            state.phase = "surfaced"
+            state.pending_hitl = {
+                "reason": "envelope_ceiling",
+                "remediation": (
+                    "Split phase across multiple supervisor invocations "
+                    "(planner phase_batch_index) or use parallel Agent() dispatch."
+                ),
+                "envelope_count": len(state.envelopes),
+                "envelope_ceiling": state.envelope_ceiling,
+            }
+            emit_trace(
+                state.workflow_id,
+                "supervisor.envelope_ceiling_surface",
+                {"count": len(state.envelopes), "ceiling": state.envelope_ceiling},
+            )
+            return {}
         state.phase = "executing"
         # For each pending task, drive the squad. The dispatcher is responsible
         # for actually invoking MCP / skills / subprocesses.

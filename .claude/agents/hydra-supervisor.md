@@ -51,3 +51,19 @@ The correct resume pattern is therefore:
 3. **Never** assume a prior background instance is still alive — addressability via `SendMessage` after a HITL surface is not guaranteed.
 
 Callers (parent agents and `/hydra:run` driver) MUST treat each supervisor invocation as a discrete turn and use `workflow_id` to thread continuity. Failing to do this forces operators to re-state the entire plan on resume.
+
+## Per-Invocation Envelope Budget (READ BEFORE LARGE PHASES)
+
+Because each supervisor turn is one-shot and shares the parent Claude Code sub-agent's context window with intake, planning, dispatch, per-squad judge passes, synthesis, and postcheck, the supervisor enforces a preemptive **envelope ceiling** at the start of the `dispatch` phase. The default is `HydraState.envelope_ceiling = 30` (see `hydra_core/state.py`). When the planner has accumulated more envelopes than the ceiling, the supervisor immediately surfaces to HITL with `reason="envelope_ceiling"` rather than thrashing through dispatch + judging until the context window dies mid-flight.
+
+This is governance, not throttling — the cap exists because empirically a single supervisor turn that fans out 9+ engineering envelopes consumes the available tool/token budget on dispatch + judge passes and dies before any envelope finalizes, leaving zero commits on disk. The ONLY supported remediation is:
+
+**Planner-side phase batching.** The planner (`hydra-planner`) MUST split a decomposed phase into batches of `<= envelope_ceiling` envelopes and emit a `phase_batch_index` annotation. The driver (`/hydra:run` or the parent agent) then re-spawns the supervisor once per batch, threading `workflow_id` for checkpoint continuity. Cross-batch dependencies become explicit `Handoff` envelopes.
+
+Operators MUST NOT bypass the supervisor with direct parallel `Agent({subagent_type: "engineer", ...})` calls — that pattern produced the ~80% off-Hydra dispatch rate in the RLMplatform bootstrap session and erases the audit trail (no `workflow_id`, no envelope validation, no postcheck, no DECISION_RECORD). If a phase legitimately needs parallel fan-out, the supervisor + planner deliver that *with* governance via `phase_batch_index`. The supervisor's postcheck (`hydra_core.governance.enforce_governance`) still catches the ceiling defense-in-depth if a planner under-batches, surfacing with reason `envelope_ceiling tripped (envelopes=N, ceiling=M)`.
+
+## Silent-MCP-Degradation Guard
+
+The supervisor's enrichment calls (executive roster, RLM command catalogue, executive output persistence) route through `hydra_core.squad_node._mcp_call_safe`. Each call now retries exactly once on exception and increments `state.error_counters["mcp_failure:<server>"]` on every failed attempt. When any server's count reaches `HydraState.mcp_failure_ceiling` (default 3), `enforce_constitution` surfaces with reason `mcp_disconnect:<server>` at postcheck.
+
+This closes a prior failure mode where `-32000` from `executive-suite` or `eights` was silently swallowed and the run proceeded with stale `pack.agents` fallback data. Operators were only learning about MCP loss by manually running `/mcp`. Do NOT widen the swallow path — if you need to ignore MCP failure for a specific call, pass `on_error=None` explicitly so the intent is auditable.

@@ -20,7 +20,7 @@ performed by an injected `Dispatcher` strategy so unit tests and other hosts
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 import subprocess
@@ -304,7 +304,11 @@ def _via_impersonation(
     on-disk path so downstream consumers can resolve it.
     """
     # Pre-call: pull live roster from the MCP shim (falls back to pack.agents).
-    live_roster = _mcp_call_safe(dispatcher, "executive-suite", "es.roster.list", {})
+    _on_mcp_err = _record_mcp_failure(state)
+    live_roster = _mcp_call_safe(
+        dispatcher, "executive-suite", "es.roster.list", {},
+        on_error=_on_mcp_err,
+    )
     roster_list = (live_roster or {}).get("agents", []) if isinstance(live_roster, dict) else []
     if roster_list:
         roster = ", ".join(r["name"] for r in roster_list[:8])
@@ -339,6 +343,7 @@ def _via_impersonation(
         dispatcher, "executive-suite", "es.output.write",
         {"domain": domain, "topic": topic,
          "content": _render_session_md("Boardroom Session", prompt, result)},
+        on_error=_on_mcp_err,
     )
     artifacts_refs: list[MemoryRef] = []
     rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
@@ -387,7 +392,11 @@ def _via_claude_skill(
     invoke = pack.invoke or {}
     cmd = invoke.get("command_hint", "/rlm-team")
 
-    catalogue = _mcp_call_safe(dispatcher, "rlm-creative", "rlm.command.list", {})
+    _on_mcp_err = _record_mcp_failure(state)
+    catalogue = _mcp_call_safe(
+        dispatcher, "rlm-creative", "rlm.command.list", {},
+        on_error=_on_mcp_err,
+    )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
     try:
         result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), {
@@ -410,6 +419,7 @@ def _via_claude_skill(
          "content": _render_session_md(f"Creative dispatch via {cmd}",
                                        f"command_hint={cmd}\navailable={available_cmds}",
                                        result)},
+        on_error=_on_mcp_err,
     )
     artifacts_refs: list[MemoryRef] = []
     rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
@@ -445,23 +455,62 @@ def _via_claude_skill(
 
 # ---------- enrichment helpers ----------
 
-def _mcp_call_safe(dispatcher: Dispatcher, server: str, tool: str,
-                   args: dict[str, Any]) -> dict[str, Any] | None:
+def _mcp_call_safe(
+    dispatcher: Dispatcher,
+    server: str,
+    tool: str,
+    args: dict[str, Any],
+    *,
+    on_error: "Callable[[str, str, str, int], None] | None" = None,
+) -> dict[str, Any] | None:
     """Best-effort MCP call. Returns the inner result dict, or None on any failure.
 
     The dispatchers wrap the daemon response as
     `{"status": "done", "tool": ..., "result": {...}}`; we unwrap that here.
+
+    Retries exactly once on exception (no exponential backoff — we are a
+    governance layer, not a resilience layer). When `on_error` is supplied
+    it is invoked on every failed attempt with (server, tool, repr(exc),
+    attempt_index) so callers can increment counters / emit telemetry. The
+    supervisor wires this to `state.error_counters["mcp_failure:<server>"]`
+    so postcheck can surface mcp_disconnect:<server> at the configured
+    threshold instead of degrading silently with stale data.
     """
-    try:
-        envelope = dispatcher.call_mcp(server, tool, args)
-    except Exception:
+    last_exc_repr: str | None = None
+    for attempt in (1, 2):
+        try:
+            envelope = dispatcher.call_mcp(server, tool, args)
+        except Exception as exc:
+            last_exc_repr = repr(exc)
+            if on_error is not None:
+                try:
+                    on_error(server, tool, last_exc_repr, attempt)
+                except Exception:
+                    pass
+            continue
+        if not isinstance(envelope, dict):
+            return None
+        if envelope.get("status") not in ("done", None):
+            return None
+        inner = envelope.get("result", envelope)
+        return inner if isinstance(inner, dict) else None
+    return None
+
+
+def _record_mcp_failure(state: "HydraState | None") -> "Callable[[str, str, str, int], None] | None":
+    """Build an on_error callback bound to `state.error_counters`.
+
+    Returns None when state is None (test/CLI paths that don't carry state),
+    so _mcp_call_safe falls back to its pre-existing silent behavior.
+    """
+    if state is None:
         return None
-    if not isinstance(envelope, dict):
-        return None
-    if envelope.get("status") not in ("done", None):
-        return None
-    inner = envelope.get("result", envelope)
-    return inner if isinstance(inner, dict) else None
+
+    def _cb(server: str, _tool: str, _exc_repr: str, _attempt: int) -> None:
+        key = f"mcp_failure:{server}"
+        state.error_counters[key] = state.error_counters.get(key, 0) + 1
+
+    return _cb
 
 
 def _domain_for(pack: SquadPack, inbound: HydraEnvelope) -> str:
