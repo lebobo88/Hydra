@@ -76,6 +76,10 @@ def build_supervisor(
     judge_trace_root = Path(project_root) if project_root else Path.cwd()
     # Best-effort attestation to the eights-daemon. No-ops cleanly when the
     # daemon is not registered in `.mcp.json` (it usually isn't yet).
+    # B8: durable payloads (attest / envelope_record / hitl_request /
+    # evolution.propose) that fail transport are spooled to disk via the
+    # shared PendingSpool; `node_intake` calls `replay_pending()` once per
+    # workflow start so the spool drains the next time eights is healthy.
     eights = EightsAttestor(dispatcher=dispatcher)
 
     # Cerberus' venom registry is hydrated from cerberus.yaml at boot.
@@ -89,6 +93,24 @@ def build_supervisor(
     def node_intake(state: HydraState) -> dict:
         state.phase = "intake"
         state.bump_iteration()
+        # B8: thread the workflow_id onto the attestor so any newly-spooled
+        # payloads from this turn carry it, then drain any prior-workflow
+        # spool entries while we have the dispatcher in scope. Replay is
+        # best-effort — if the daemon is still down, the spool stays and
+        # the next workflow will retry.
+        eights.workflow_id = str(state.workflow_id)
+        try:
+            replay_summary = eights.replay_pending()
+        except Exception:  # noqa: BLE001 — never crash intake on replay
+            replay_summary = {"sent": 0, "failed": 0, "skipped": 0}
+        if any(replay_summary.values()):
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.eights_replay",
+                replay_summary,
+            )
+
         # Route the goal text
         decision = classify_intent(
             state.root_goal,
@@ -398,6 +420,7 @@ def build_supervisor(
                 "envelope_ceiling": state.envelope_ceiling,
             }
             emit_trace(
+                judge_trace_root,
                 state.workflow_id,
                 "supervisor.envelope_ceiling_surface",
                 {"count": len(state.envelopes), "ceiling": state.envelope_ceiling},
@@ -726,11 +749,40 @@ def build_supervisor(
         verdict = enforce_governance(state, packs, constitution=constitution)
         if verdict.surfaced:
             state.phase = "surfaced"
+            # B7 — release pp-harness locks for any open runs this workflow
+            # started. On a clean "done" path we intentionally leave the
+            # entries in place (pp owns those runs from start_run onward),
+            # but on a surface the workflow has explicitly failed and any
+            # outstanding pp run is now an orphaned lock — drain it.
+            if state.open_pp_runs:
+                try:
+                    from .squad_node import abort_open_pp_runs
+                    drained = abort_open_pp_runs(
+                        state, dispatcher, reason=f"hydra_surface:{verdict.reason}"
+                    )
+                    emit_trace(
+                        judge_trace_root,
+                        state.workflow_id,
+                        "supervisor.pp_runs_aborted",
+                        {
+                            "count_drained": len(drained),
+                            "count_remaining": len(state.open_pp_runs),
+                            "surface_reason": verdict.reason,
+                        },
+                    )
+                except Exception as e:  # noqa: BLE001 — never mask the original surface
+                    emit_trace(
+                        judge_trace_root,
+                        state.workflow_id,
+                        "supervisor.pp_runs_abort_failed",
+                        {"error": repr(e), "surface_reason": verdict.reason},
+                    )
         else:
             state.phase = "done"
         return {
             "phase": state.phase,
             "last_event": verdict.reason,
+            "open_pp_runs": state.open_pp_runs,
         }
 
     # ----- routing edges -----

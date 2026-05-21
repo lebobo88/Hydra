@@ -106,6 +106,20 @@ class HydraState(BaseModel):
     constitution_version: Optional[str] = None
     constitution_receipt: Optional[str] = None
 
+    # B7 — pp-harness lock release on supervisor crash.
+    # Tracks pp-daemon runs that this workflow started but has not yet
+    # finalized. `_via_mcp` registers a run after `start_run` returns
+    # a run_id (lock acquired); `node_postcheck` drains the list by
+    # calling `pp-daemon.finalize_run(status="aborted")` on each entry
+    # ONLY when the workflow surfaces (state.phase == "surfaced"). On
+    # the normal "done" path entries are intentionally left in place so
+    # operators have an audit trail of which pp runs this workflow
+    # kicked off (pp itself owns those runs from that point forward).
+    # Each entry: {"run_id": "...", "project_path": "..."}.
+    # Replace-by-default (no _append reducer) so `abort_open_pp_runs`
+    # can shrink the list — append semantics would defeat draining.
+    open_pp_runs: list[dict[str, str]] = Field(default_factory=list)
+
     def bump_iteration(self) -> None:
         self.iteration_count += 1
 

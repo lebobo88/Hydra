@@ -21,15 +21,28 @@ Per `AGENTS.md` layering:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from ..immortal_head import ConstitutionSnapshot
+from .pending_spool import PendingSpool
 
 
 # MCP server slug the eights-daemon registers under. Override per environment
 # via `.mcp.json` if you mount the daemon on a different name.
 EIGHTS_MCP_SERVER = "eights-daemon"
+
+
+# Tools whose payload is durable enough to be worth replaying when the
+# daemon recovers. We do NOT spool ephemeral signals (ceiling_tick,
+# budget_charge) — those would be stale by the time the daemon is back.
+_SPOOLABLE_TOOLS = frozenset({
+    "eights.constitution.attest",
+    "eights.hydra.envelope_record",
+    "eights.governance.hitl_request",
+    "eights.evolution.propose",
+})
 
 
 @dataclass
@@ -39,24 +52,80 @@ class EightsAttestor:
     `dispatcher` must expose `.call_mcp(server, tool, args) -> dict`. When the
     eights-daemon is not registered, calls return None and the supervisor
     proceeds normally.
+
+    B8: durable payloads (see ``_SPOOLABLE_TOOLS``) are spooled to a local
+    JSON queue on failure; `replay_pending` drains that queue when the
+    daemon recovers. ``workflow_id`` is captured at construction so spool
+    entries carry the workflow that surfaced the lesson.
     """
     dispatcher: Any | None = None
     server: str = EIGHTS_MCP_SERVER
     enabled: bool = True
+    workflow_id: Optional[str] = None
+    spool: PendingSpool = field(default_factory=PendingSpool)
 
     def _call(self, tool: str, args: dict) -> Optional[dict]:
         if not self.enabled or self.dispatcher is None:
+            self._maybe_spool(tool, args, reason="eights_disabled_or_no_dispatcher")
             return None
         try:
             envelope = self.dispatcher.call_mcp(self.server, tool, args)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — fail-soft, spool the payload
+            self._maybe_spool(tool, args, reason=f"exception:{type(exc).__name__}")
             return None
         if not isinstance(envelope, dict):
+            self._maybe_spool(tool, args, reason="non_dict_envelope")
             return None
         if envelope.get("status") == "failed":
+            self._maybe_spool(tool, args, reason="daemon_status_failed")
             return None
         inner = envelope.get("result", envelope)
         return inner if isinstance(inner, dict) else None
+
+    def _maybe_spool(self, tool: str, args: dict, *, reason: str) -> None:
+        """Persist a durable failed payload to the spool. No-op for ephemeral
+        tools (ticks/charges) so we don't bloat the spool with stale signals."""
+        if tool not in _SPOOLABLE_TOOLS:
+            return
+        try:
+            self.spool.spool(
+                tool=tool,
+                args=dict(args or {}),
+                workflow_id=self.workflow_id,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001 — spool write must never crash dispatch
+            pass
+
+    def replay_pending(self) -> dict[str, int]:
+        """Drain the pending-call spool by re-issuing each call to the daemon.
+
+        Called by `node_intake` at the start of every workflow so the spool
+        naturally drains the next time eights is healthy. Returns the same
+        ``{sent, failed, skipped}`` summary as `PendingSpool.replay` so
+        callers can emit a trace event.
+        """
+        if not self.enabled or self.dispatcher is None:
+            return {"sent": 0, "failed": 0, "skipped": 0}
+
+        def _send(tool: str, args: dict[str, Any]) -> Any:
+            envelope = self.dispatcher.call_mcp(self.server, tool, args)
+            if not isinstance(envelope, dict):
+                return None
+            if envelope.get("status") == "failed":
+                return None
+            return envelope
+
+        try:
+            return self.spool.replay(_send)
+        except Exception:  # noqa: BLE001
+            return {"sent": 0, "failed": 0, "skipped": 0}
+
+    def pending_count(self) -> int:
+        try:
+            return self.spool.count()
+        except Exception:  # noqa: BLE001
+            return 0
 
     # ---------- constitution ----------
 

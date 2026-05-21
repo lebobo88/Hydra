@@ -198,6 +198,20 @@ def _via_mcp(
     run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
     pp_status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
 
+    # B7: register the pp run on state so node_postcheck can finalize-abort it
+    # if the workflow surfaces. start_run acquired <project>/.harness/.lock and
+    # the pp daemon will only release on a matching finalize_run. Without this
+    # registration a supervisor crash leaves the lock orphaned past the pp-side
+    # TTL — the failure surface the bootstrap session hit twice. We register
+    # whenever pp returned a run_id, regardless of pp_status; even a "done"
+    # response means the run row exists in pp's db and the lock is held until
+    # finalize.
+    if run_id and isinstance(run_id, str) and project_path:
+        try:
+            state.open_pp_runs.append({"run_id": run_id, "project_path": str(project_path)})
+        except Exception:  # noqa: BLE001 — never crash dispatch on state writes
+            pass
+
     # Worktree handoff: when the inbound envelope ran on its own project_path
     # (i.e. the planner allocated a worktree per the pp_harness_project_lock
     # rule) and pp-harness reported a terminal status, harvest the archived
@@ -573,3 +587,51 @@ def _via_subprocess(
         artifacts=[{"kind": "subprocess_result", "raw": result}],
         status="done",
     )
+
+
+def abort_open_pp_runs(
+    state: "HydraState",
+    dispatcher: Dispatcher,
+    *,
+    reason: str = "supervisor_surfaced",
+) -> list[dict[str, str]]:
+    """B7 — release pp-harness locks for any open runs tracked on state.
+
+    Called from `node_postcheck` ONLY when the workflow surfaces. Iterates
+    `state.open_pp_runs` and emits `pp-daemon.finalize_run(run_id, status=
+    "aborted", reason=<reason>)` for each entry. Returns the list of entries
+    that were drained so callers can emit a trace event.
+
+    Fail-soft on every MCP call — a daemon-side error during cleanup must
+    NOT mask the original surface reason. Entries that fail to finalize
+    are left on `state.open_pp_runs` so an operator-driven `force_unlock`
+    (see pair-programmer P3) can still salvage the project lock.
+    """
+    drained: list[dict[str, str]] = []
+    remaining: list[dict[str, str]] = []
+    for entry in list(state.open_pp_runs):
+        run_id = entry.get("run_id")
+        project_path = entry.get("project_path")
+        if not run_id:
+            continue
+        try:
+            dispatcher.call_mcp(
+                "pp-daemon",
+                "finalize_run",
+                {
+                    "run_id": run_id,
+                    "status": "aborted",
+                    "reason": reason,
+                    # project_path is informational for the daemon's log; it
+                    # already knows the path via the run row.
+                    "project_path": project_path,
+                },
+            )
+            drained.append(entry)
+        except Exception:  # noqa: BLE001 — leave the entry so force_unlock can salvage
+            remaining.append(entry)
+    # Replace in place so the LangGraph reducer sees the assignment as a
+    # full overwrite — `Annotated[..., _append]` would otherwise concat the
+    # original list with whatever we set, producing duplicates.
+    state.open_pp_runs = remaining
+    return drained
