@@ -56,6 +56,17 @@ class HydraEnvelope(BaseModel):
     context_refs: list[MemoryRef] = Field(default_factory=list)
     constraints: Constraints = Field(default_factory=Constraints)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # R3-tail post-mortem Fix 2.1 (2026-05-21): paths the receiving squad
+    # MUST NOT touch in its produced diff. Project-relative paths; glob
+    # patterns are NOT supported (literal-string equality). Receivers
+    # pre-flight-check their diff against this list and refuse to commit
+    # if any path matches.
+    # R3-tail δ tail-fix-4 demonstrated this prevents regressions: when
+    # the operator explicitly told test-strategist NOT to touch
+    # `apps/web/lib/idempotency.ts`, the surgical patches stayed
+    # surgical. Earlier rounds without it had regressions because the
+    # engineer kept re-touching files that earlier fixes had stabilized.
+    do_not_touch: list[str] = Field(default_factory=list)
 
 
 # ---------- executive squad ----------
@@ -171,7 +182,14 @@ class HITLRequest(HydraEnvelope):
     type: Literal["HITL_REQUEST"] = "HITL_REQUEST"
     reason: Literal["budget_approval", "prod_deploy", "high_risk", "policy_breach",
                     "campaign_signoff", "schema_conflict", "loop_ceiling",
-                    "constitution_breach"]
+                    "constitution_breach", "reflexion_override"]
+    # `reflexion_override`: emitted by `node_judge_per_squad` when an envelope's
+    # `revise` verdict cannot be retried because the Reflexion ×1 ceiling is
+    # exhausted. Operator approval raises `state.reflexion_override_granted_until`
+    # for this workflow only; the constitutional ×1 default is unchanged. Added
+    # in the R3-tail post-mortem (2026-05-21) to replace ad-hoc LLM-mediated
+    # ceiling overrides with a structured HITL audit trail. See
+    # `hydra_core.judge.reflexion.effective_max_retry_index`.
     summary: str
     options: list[str]
     default_option: Optional[str] = None

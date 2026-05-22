@@ -122,6 +122,119 @@ def test_per_squad_hitl_on_high_severity_fail():
     assert final.pending_hitl["reason"] == "policy_breach"
 
 
+# ---------------- Reflexion ceiling exhaustion (R3-tail 2026-05-21) ----------------
+
+def test_synthesis_preserves_dissents_and_marks_unsealed_on_conflict():
+    """R3-tail post-mortem Fix 2.2 (2026-05-21): node_synthesis must
+    preserve dissenting opinions verbatim (no paraphrase) AND set
+    sealed=False when mutually-exclusive verdicts exist on the same squad
+    (engineering 'pass' + security 'fail' is the canonical case). The
+    enriched synthesis was wired into the supervisor after the R3-tail
+    hydra-synthesizer subagent dropped mid-action."""
+    from hydra_core.supervisor import build_supervisor
+
+    # Force a revise verdict on the per-squad pass so the dissent flows
+    # into state.verdicts and node_synthesis picks it up.
+    client = _SequencedClient(queue=[
+        {"outcome": "revise",
+         "critique_md": "PHI redaction incomplete on inbound payload. needs explicit allowlist. " * 2,
+         "score_json": {"redaction_completeness": 1}},
+    ])
+    sup = build_supervisor(
+        project_root=HYDRA_ROOT,
+        dispatcher=_StubDispatcher(),
+        critique_client=client,
+        force_pure_python=True,
+    )
+    state = HydraState(root_goal="healthcare PHI redaction policy review")
+    final = _invoke(sup, state)
+
+    # Find the synthesis DecisionRecord (origin_squad="hydra" is the
+    # synthesis output; healthcare stubs also emit DECISION_RECORDs with
+    # origin_squad="healthcare" so we filter to hydra-origin).
+    decision_records = [
+        e for e in final.envelopes
+        if e.get("type") == "DECISION_RECORD" and e.get("origin_squad") == "hydra"
+    ]
+    assert decision_records, "expected the synthesis DECISION_RECORD (origin_squad='hydra')"
+    syn = decision_records[-1]  # last one is the synthesis output
+
+    # Dissents preserved verbatim (R3-tail contract: NEVER paraphrase).
+    dissents = syn.get("dissenting_opinions") or []
+    assert any("PHI redaction incomplete" in d for d in dissents), (
+        f"expected revise critique preserved verbatim in dissents, got: {dissents}"
+    )
+
+    # Rationale carries the structured per-squad / budget / HITL block.
+    rationale = syn.get("rationale") or ""
+    assert "Squad outputs:" in rationale, "rationale must include squad-by-squad breakdown"
+    assert "Budget:" in rationale, "rationale must include budget burn line"
+
+
+def test_reflexion_ceiling_exhausted_emits_override_hitl():
+    """When a retry envelope's re-judge ALSO returns 'revise', the active
+    Reflexion ceiling is exhausted. The supervisor must surface a
+    `reflexion_override` HITL instead of silently advancing to synthesis with
+    an unresolved revise. R3-tail post-mortem (2026-05-21) — operators kept
+    overriding the ×1 ceiling ad-hoc with no audit trail. This test pins the
+    formal path: ceiling-hit → HITL with reason=`reflexion_override`.
+
+    We route to the `engineering` squad because executive runs best-of-N which
+    consumes the queue during candidate scoring, never reaching the per-squad
+    reflexion path. Engineering's best_of_n=0 → straight to per-squad judge.
+    """
+    from hydra_core.supervisor import build_supervisor
+
+    # Healthcare's per-squad route exercises 2 rubrics per envelope. To force
+    # both the original AND its retry into 'revise', we queue 4 revises:
+    #   - calls 1,2: original envelope, 2 rubrics → both revise → trigger retry
+    #   - calls 3,4: retry envelope, 2 rubrics → both revise → ceiling exhausted
+    # Subsequent envelopes drain to the default pass and don't affect this path.
+    client = _SequencedClient(queue=[
+        {"outcome": "revise",
+         "critique_md": "PHI redaction coverage incomplete on inbound payload. " * 3,
+         "score_json": {"redaction_completeness": 1}},
+        {"outcome": "revise",
+         "critique_md": "constitution alignment check failed on the policy refusal pattern. " * 3,
+         "score_json": {"refusal_respect": 1}},
+        {"outcome": "revise",
+         "critique_md": "retry still leaks DOB in trace logs. " * 3,
+         "score_json": {"redaction_completeness": 2}},
+        {"outcome": "revise",
+         "critique_md": "retry still misaligned with Article II refusal pattern. " * 3,
+         "score_json": {"refusal_respect": 2}},
+    ])
+    sup = build_supervisor(
+        project_root=HYDRA_ROOT,
+        dispatcher=_StubDispatcher(),
+        critique_client=client,
+        force_pure_python=True,
+    )
+    # Goal phrased so the router picks 'healthcare' (best_of_n=0 AND
+    # `enabled` in policy.yaml). Both conditions matter: best_of_n=0 puts us
+    # on the per-squad judge path where Reflexion retry actually fires; and
+    # squad_enabled=True means the scripted critique client is used (not the
+    # NoOp fallback), so the revise verdicts are substantive, not
+    # pragmatic-guard artefacts from a not-yet-enabled squad.
+    state = HydraState(root_goal="healthcare PHI redaction policy review")
+    final = _invoke(sup, state)
+
+    # Ceiling was exhausted → workflow surfaced with reflexion_override HITL.
+    assert final.phase == "surfaced", (
+        f"expected phase=surfaced when ceiling exhausted, got {final.phase}"
+    )
+    assert final.pending_hitl is not None, "ceiling exhaustion must emit HITL"
+    assert final.pending_hitl["reason"] == "reflexion_override", (
+        f"expected reason=reflexion_override, got {final.pending_hitl.get('reason')}"
+    )
+    # Options offer both a raise-the-ceiling path and an accept-partial path.
+    options = final.pending_hitl["options"]
+    assert any("approve_override_raise_to_" in o for o in options), (
+        f"override HITL must offer a ceiling-raise option, got {options}"
+    )
+    assert "accept_partial" in options
+
+
 # ---------------- Best-of-N path ----------------
 
 def test_best_of_n_produces_n_candidates_and_picks_winner():

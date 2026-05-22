@@ -95,6 +95,14 @@ class HydraState(BaseModel):
     pending_hitl: Optional[dict[str, Any]] = None
     hitl_history: Annotated[list[dict[str, Any]], _append] = Field(default_factory=list)
 
+    # Per-workflow Reflexion ceiling raise (R3-tail post-mortem, 2026-05-21).
+    # Default 0 means "no raise — use MAX_RETRY_INDEX". Set by the operator
+    # approval handler for a `reflexion_override` HITL request to the new
+    # ceiling value (e.g. 2 to allow Reflexion ×2 on the next pass through
+    # `node_judge_per_squad`). Scoped to this workflow only — the
+    # constitutional ×1 invariant is unchanged for other workflows.
+    reflexion_override_granted_until: int = 0
+
     # Trace
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None

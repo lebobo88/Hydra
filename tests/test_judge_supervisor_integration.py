@@ -85,7 +85,21 @@ def test_supervisor_runs_judge_nodes_and_emits_verdicts(tmp_path):
 
 def test_supervisor_skips_judge_when_pp_verdict_present(tmp_path):
     build = _build()
-    client = _ScriptedCritiqueClient()
+    # R3-tail post-mortem (2026-05-21): Use a substantive critique so the
+    # pragmatic-pass guard doesn't trip and downgrade pass → revise on the
+    # engineering-squad envelope. The previous test relied on incidental
+    # behavior where revise verdicts on retry envelopes were silently absorbed
+    # into the workflow; the new contract surfaces a `reflexion_override`
+    # HITL in that case, which the original assertion (synthesis ran) cannot
+    # observe. We give the client enough substance to genuinely pass.
+    client = _ScriptedCritiqueClient(
+        critique_text=(
+            "thorough engineering review covering reliability, observability, "
+            "test plan, rollback strategy, and migration safety — all dimensions "
+            "addressed substantively " * 2
+        ),
+        scores={"reliability": 5, "observability": 4, "rollback": 5, "migration_safety": 4},
+    )
     runner = build(
         project_root=HYDRA_ROOT,
         dispatcher=_StubDispatcher(),

@@ -21,7 +21,7 @@ from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
 from .judge import dispatch_judge, route_judge, load_policy
 from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
-from .judge.reflexion import MAX_RETRY_INDEX, package_retry
+from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
 from .router import classify_intent
 from .telemetry import emit as emit_trace
@@ -508,8 +508,13 @@ def build_supervisor(
             return [], []
 
         verdict_obj = JudgeVerdict.model_validate(revise_verdict)
+        # R3-tail post-mortem: per-workflow ceiling raise after operator HITL
+        # approval of a `reflexion_override` request. Default 0 ⇒ no raise ⇒
+        # the ×1 invariant default still applies.
         packet = package_retry(
-            original_env, verdict_obj, prior_retry_index=prior_retry_index
+            original_env, verdict_obj,
+            prior_retry_index=prior_retry_index,
+            max_retry_override=state.reflexion_override_granted_until or None,
         )
         if packet is None:
             return [], []
@@ -570,11 +575,17 @@ def build_supervisor(
     def node_judge_per_squad(state: HydraState) -> dict:
         """Judge each squad-produced envelope from the most recent dispatch.
 
-        Three responsibilities:
+        Four responsibilities:
           1. Score each unjudged envelope against its rubrics.
           2. On `revise` (Phase 3): package_retry → re-dispatch source squad
-             once, then re-judge. Bounded by Reflexion ×1.
+             once, then re-judge. Bounded by Reflexion ×N (default ×1; raised
+             per-workflow only via operator-approved `reflexion_override` HITL).
           3. On `fail` with a HITL-severity rubric: surface to HITL.
+          4. On `revise` BUT ceiling exhausted (R3-tail post-mortem,
+             2026-05-21): surface a `reflexion_override` HITL instead of
+             silently advancing. The operator can either approve the raise
+             (sets `state.reflexion_override_granted_until` for next pass)
+             or accept the partial output.
         """
         state.phase = "judge_per_squad"
         already_judged = {v.get("target_envelope_id") for v in state.verdicts}
@@ -582,6 +593,15 @@ def build_supervisor(
         retry_envelopes: list[dict] = []
         retry_verdicts: list[dict] = []
         breach: dict | None = None
+        # R3-tail: envelopes whose `revise` verdict could not be retried
+        # because the active Reflexion ceiling is exhausted. Collected here
+        # and surfaced as one `reflexion_override` HITL at the end of the
+        # node so a single workflow with multiple ceiling-bound envelopes
+        # gets one HITL prompt, not N.
+        ceiling_blocked: list[tuple[dict, dict]] = []  # (envelope, revise_verdict)
+        active_ceiling = effective_max_retry_index(
+            max_retry_override=state.reflexion_override_granted_until or None
+        )
 
         # First: scan best_of_n verdicts already in state for HITL-severity
         # fails. These were emitted during dispatch on candidate envelopes
@@ -635,11 +655,41 @@ def build_supervisor(
             if revise is None:
                 continue
             prior_retry = int(env.get("_retry_index", 0) or 0)
-            if prior_retry >= MAX_RETRY_INDEX:
+            if prior_retry >= active_ceiling:
+                # (4) R3-tail: ceiling exhausted. Don't silently advance —
+                # collect for the `reflexion_override` HITL emitted below.
+                # Exception: if the envelope's origin squad is NOT enabled
+                # for judging (NoOp client path), the `revise` came from the
+                # pragmatic-pass guard downgrading NoOp's empty pass, not
+                # from substantive critique. Suppress the HITL in that case
+                # so staged-rollout squads don't block on synthetic revises.
+                if judge_policy.squad_enabled(env.get("origin_squad")):
+                    ceiling_blocked.append((env, revise))
                 continue
             r_envs, r_verdicts = _reflexion_retry(state, env, revise, prior_retry)
             retry_envelopes.extend(r_envs)
             retry_verdicts.extend(r_verdicts)
+
+        # R3-tail: also scan the just-completed retry verdicts. If a retry
+        # envelope's own re-judge came back `revise`, the next pass would need
+        # to retry it again — but the retry envelope already has
+        # `_retry_index = active_ceiling`, so the ceiling is exhausted.
+        # Surface those as ceiling_blocked alongside the for-loop entries.
+        # Same squad-enabled filter as above: ignore retry verdicts from
+        # staged-rollout squads whose `revise` is a pragmatic-guard artefact.
+        retry_envs_by_id = {str(e.get("id")): e for e in retry_envelopes}
+        for rv in retry_verdicts:
+            if rv.get("outcome") != "revise":
+                continue
+            target_id = str(rv.get("target_envelope_id"))
+            target_env = retry_envs_by_id.get(target_id)
+            if target_env is None:
+                continue
+            if not judge_policy.squad_enabled(target_env.get("origin_squad")):
+                continue
+            target_retry_idx = int(target_env.get("_retry_index", 0) or 0)
+            if target_retry_idx >= active_ceiling:
+                ceiling_blocked.append((target_env, rv))
 
         out: dict[str, Any] = {
             "verdicts": new_verdicts + retry_verdicts,
@@ -668,27 +718,182 @@ def build_supervisor(
                 "rubric_id": breach.get("rubric_id"),
                 "envelope_id": breach.get("target_envelope_id"),
             })
+        elif ceiling_blocked:
+            # R3-tail post-mortem (2026-05-21): emit a single
+            # `reflexion_override` HITL when at least one envelope's `revise`
+            # verdict could not be retried because the active ceiling is
+            # exhausted. The constitutional ×1 invariant is unchanged — the
+            # operator's choices are (a) raise the ceiling for THIS workflow
+            # only via `approve_override_raise_to_N`, (b) accept the partial
+            # output via `accept_partial`, or (c) abort. Summary truncates
+            # the first blocked envelope's critique for readability; the full
+            # critiques are reachable via state.verdicts lookup by id.
+            first_env, first_revise = ceiling_blocked[0]
+            count = len(ceiling_blocked)
+            blocked_ids = ", ".join(
+                str(env.get("id", "?"))[:8] for env, _ in ceiling_blocked
+            )
+            summary = (
+                f"Reflexion ceiling (={active_ceiling}) exhausted on "
+                f"{count} envelope(s) [{blocked_ids}] still in 'revise'. "
+                f"First critique: "
+                f"{(first_revise.get('critique_md') or '')[:200]}"
+            )[:240]
+            hitl = HITLRequest(
+                workflow_id=state.workflow_id,
+                origin_squad="hydra-judge",
+                target_squad="human",
+                reason="reflexion_override",
+                summary=summary,
+                options=[
+                    f"approve_override_raise_to_{active_ceiling + 1}",
+                    f"approve_override_raise_to_{active_ceiling + 2}",
+                    "accept_partial",
+                    "abort",
+                ],
+                default_option="accept_partial",
+            )
+            hitl_dict = hitl.model_dump(mode="json")
+            eights.hitl_request(hitl_dict)
+            out["pending_hitl"] = hitl_dict
+            out["phase"] = "surfaced"
+            emit_trace(judge_trace_root, state.workflow_id, "judge.reflexion_ceiling_hit", {
+                "active_ceiling": active_ceiling,
+                "blocked_count": count,
+                "blocked_envelope_ids": [str(env.get("id")) for env, _ in ceiling_blocked],
+                "rubric_ids": [v.get("rubric_id") for _, v in ceiling_blocked],
+            })
         return out
 
     def node_synthesis(state: HydraState) -> dict:
-        # Cathedral voice for user-facing output; plaza slugs remain in the
-        # envelope's structured fields. Per the manifesto: "no head speaks
-        # to the user without Hydra's synthesis."
+        """Synthesize the workflow into a DecisionRecord.
+
+        R3-tail post-mortem Fix 2.2 (2026-05-21): the `hydra-synthesizer`
+        Claude Code subagent (described in `.claude/agents/hydra-synthesizer.md`)
+        was previously not wired into the LangGraph — `node_synthesis` emitted
+        a minimal boilerplate DecisionRecord and `node_judge_synthesis`
+        validated against it. When the subagent dropped mid-action (R3-tail
+        observed this), Claude had to take over orchestration manually.
+
+        This enriched implementation does deterministically (no LLM call)
+        what the subagent contract specifies:
+          - Group envelopes by squad.
+          - Preserve dissenting opinions verbatim (verdicts with
+            outcome='revise' OR explicit dissenting_opinions field).
+          - List every artifact id (no drops).
+          - Call out budget burn + remaining headroom.
+          - Note any HITL gates that fired.
+          - Set sealed=False when mutually-exclusive verdicts exist.
+
+        Cathedral voice for user-facing output; plaza slugs remain in the
+        envelope's structured fields. Per the manifesto: "no head speaks
+        to the user without Hydra's synthesis."
+        """
         cathedral_roster = ", ".join(
             crown_label_for_squad(s) for s in state.selected_squads
         ) or "(no heads convened)"
+
+        # Group envelopes by origin_squad (skip Hydra's own routing slips).
+        squad_to_envs: dict[str, list[dict]] = {}
+        for env in state.envelopes:
+            origin = env.get("origin_squad") or "hydra"
+            if origin == "hydra":
+                continue
+            squad_to_envs.setdefault(origin, []).append(env)
+
+        # Preserve dissenting opinions verbatim (R3-tail contract: NEVER paraphrase).
+        # Sources:
+        #   1. Any verdict with outcome='revise' or 'fail' — the dissent is the critique.
+        #   2. CSuiteDecisionPacket.dissenting_opinions field (explicit dissent).
+        dissents: list[str] = []
+        for v in state.verdicts:
+            if v.get("outcome") in ("revise", "fail"):
+                critique = (v.get("critique_md") or "").strip()
+                if critique:
+                    dissents.append(
+                        f"[{v.get('judge_vendor', '?')}@{v.get('rubric_id', '?')}] "
+                        f"{critique[:480]}"
+                    )
+        for env in state.envelopes:
+            for d in (env.get("dissenting_opinions") or []):
+                if isinstance(d, str) and d.strip():
+                    dissents.append(d.strip())
+
+        # Conflict detection: mutually-exclusive verdicts at the synthesis
+        # stage = NOT sealed. Per hydra-synthesizer.md "When to Surface
+        # Instead of Decide": if engineering says ship and security says
+        # block, the synthesizer does NOT pick.
+        has_mutually_exclusive = False
+        outcomes_by_squad: dict[str, set[str]] = {}
+        for v in state.verdicts:
+            target_id = v.get("target_envelope_id")
+            target_env = next((e for e in state.envelopes if str(e.get("id")) == str(target_id)), None)
+            squad = (target_env or {}).get("origin_squad") or "?"
+            outcomes_by_squad.setdefault(squad, set()).add(v.get("outcome") or "?")
+        # Heuristic: any squad with both 'pass' AND 'fail' verdicts indicates
+        # cross-rubric disagreement worth surfacing.
+        for s, outs in outcomes_by_squad.items():
+            if "pass" in outs and "fail" in outs:
+                has_mutually_exclusive = True
+                break
+
+        # HITL trace: any prior HITL the workflow surfaced.
+        hitl_count = len(state.hitl_history or [])
+
+        # Artifact list: every artifact id, no drops.
+        artifact_count = len(state.artifacts or [])
+
+        # Per-squad breakdown for the rationale body.
+        squad_lines = []
+        for squad, envs in sorted(squad_to_envs.items()):
+            squad_lines.append(
+                f"  • {crown_label_for_squad(squad)} ({squad}): "
+                f"{len(envs)} envelope(s)"
+            )
+        squad_block = "\n".join(squad_lines) if squad_lines else "  (no squad envelopes)"
+
+        budget_pct = (
+            int(100 * state.budget.spent_usd / state.budget.budget_usd)
+            if state.budget.budget_usd > 0 else 0
+        )
+        rationale_lines = [
+            f"Council: {cathedral_roster}.",
+            f"Plaza slugs: {state.selected_squads}.",
+            f"",
+            f"Squad outputs:",
+            squad_block,
+            f"",
+            f"Tasks: {[t.status for t in state.tasks]}.",
+            f"Artifacts: {artifact_count} archived.",
+            f"Budget: ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f} "
+            f"({budget_pct}% used; "
+            f"${state.budget.usd_remaining:.2f} headroom).",
+        ]
+        if hitl_count > 0:
+            rationale_lines.append(f"HITL: {hitl_count} gate(s) fired during workflow.")
+        if has_mutually_exclusive:
+            rationale_lines.append(
+                "CONFLICT: mutually-exclusive verdicts detected — sealed=False, "
+                "operator must reconcile before downstream consumers act on this record."
+            )
+
+        # Decision line: be honest about completeness.
+        if has_mutually_exclusive:
+            decision_line = f"Workflow synthesis for: {state.root_goal} (UNSEALED — operator reconciliation required)"
+        elif dissents:
+            decision_line = f"Workflow synthesis for: {state.root_goal} (with {len(dissents)} preserved dissent(s))"
+        else:
+            decision_line = f"Workflow synthesis for: {state.root_goal}"
+
         record = DecisionRecord(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
             target_squad="human",
-            decision=f"Workflow synthesis for: {state.root_goal}",
-            rationale=(
-                f"Council: {cathedral_roster}. "
-                f"Plaza slugs: {state.selected_squads}. "
-                f"Tasks: {[t.status for t in state.tasks]}. "
-                f"Budget spent ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f}."
-            ),
-            artifacts=[],
+            decision=decision_line,
+            rationale="\n".join(rationale_lines),
+            dissenting_opinions=dissents,
+            artifacts=[],  # MemoryRef list — populated by archivist downstream
+            sealed=not has_mutually_exclusive,
         )
         record_dict = record.model_dump(mode="json")
         eights.envelope_record(record_dict)
