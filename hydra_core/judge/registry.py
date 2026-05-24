@@ -19,7 +19,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Rubric:
     rubric_id: str
-    kind: str  # "executive", "creative", "cross_domain", "governance", "synthesis"
+    kind: str  # "executive", "garland", "cross_domain", "governance", "synthesis"
     body_md: str
     score_dimensions: tuple[str, ...]
 
@@ -118,11 +118,11 @@ _register(Rubric(
     ),
 ))
 
-# ---------- creative ----------
+# ---------- garland ----------
 
 _register(Rubric(
     rubric_id="brand-consistency@1",
-    kind="creative",
+    kind="garland",
     body_md=(
         "# Brand Consistency (v1)\n"
         "- **voice_match** (0-5)\n"
@@ -134,7 +134,7 @@ _register(Rubric(
 
 _register(Rubric(
     rubric_id="audience-fit@1",
-    kind="creative",
+    kind="garland",
     body_md=(
         "# Audience Fit (v1)\n"
         "- **persona_resonance** (0-5)\n"

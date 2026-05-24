@@ -137,7 +137,7 @@ class DevTask(HydraEnvelope):
     pr_url: Optional[str] = None
 
 
-# ---------- creative squad ----------
+# ---------- garland squad ----------
 
 class CreativeBrief(HydraEnvelope):
     type: Literal["CREATIVE_BRIEF"] = "CREATIVE_BRIEF"

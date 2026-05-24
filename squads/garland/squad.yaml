@@ -1,82 +1,164 @@
-name: Garland Crown (Creative & Marketing) — RETIRED STUB
+name: "Creative & Production — Eight Garland Heads"
 version: 1.0.0
-deprecated_after: 2026-05-19   # Retired: the Garland Crown now lives at squads/creative/ (RLM-Creative shipped). Iolaus refuses dispatch via this slug.
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
-  RETIRED. This was the Stage-4 stub for the Garland Crown pending the
-  sibling RLM-Creative project. RLM-Creative shipped on 2026-05-19 and
-  the Garland Crown now lives at `squads/creative/squad.yaml` (the
-  Creative & Production "Eight Garland Heads" pack). Iolaus refuses
-  dispatch via this slug as of the deprecated_after date; the directory
-  is preserved so the cathedral-name overlay history remains in version
-  control. To revive this slug for a different purpose, change the
-  `name`, clear `deprecated_after`, and bump `version`.
-source_pack: C:\AiAppDeployments\RLM-Creative
-entrypoint: stub
+  Eight Garland Heads crew (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio,
+  Urania, Helios) plus five Helios sub-agents (video-synth, audio-foley, music-score,
+  dialogue-mix, governance-c2pa). Canonical source-of-truth lives at the RLM-Creative
+  repo; this file is the Hydra-side copy kept in sync with it.
+source_pack: https://github.com/lebobo88/RLM-Creative
+entrypoint: claude-skill
+best_of_n: 3   # produce 3 candidate creative drafts, judge each, Borda-rank
 industries:
+  - media
   - marketing
-  - brand
-  - creative
-  - photography
-  - cinematography
-  - content
-  - social-community
-  - performance-marketing
-  - pr-earned-media
-  - seo
+  - advertising
+  - film
+  - livestream
+  - creator-economy
 
 agents:
+  # Crew heads
   - slug: brand-strategist
-    role: "Calliope — narrative architecture, positioning, voice"
-    authority: advisory
-  - slug: copywriter
-    role: "Erato — long-form, short-form, headline craft"
-    authority: advisory
-  - slug: content-strategist
-    role: "Polyhymnia — editorial calendar, pillar content, repurposing"
-    authority: advisory
-  - slug: social-community
-    role: "Terpsichore — platform-native voice, community rhythm"
-    authority: advisory
-  - slug: paid-acquisition
-    role: "Euterpe — performance creative, channel arbitrage"
-    authority: advisory
-  - slug: pr-earned
-    role: "Clio — story angles, press kits, reporter relationships"
-    authority: advisory
-  - slug: seo-discovery
-    role: "Urania — schema, technical SEO, semantic clustering"
-    authority: advisory
-  - slug: photo-cinema
-    role: "Helios — visual direction, shot lists, color science"
+    mythic: Calliope
+    role: "Brand Strategist — Crew Lead"
     authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/calliope.md
 
-tools: []
+  - slug: copywriter
+    mythic: Erato
+    role: "Copywriter"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/erato.md
+
+  - slug: content-strategist
+    mythic: Polyhymnia
+    role: "Content Strategist"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/polyhymnia.md
+
+  - slug: social-community
+    mythic: Terpsichore
+    role: "Social & Community"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/terpsichore.md
+
+  - slug: paid-acquisition
+    mythic: Euterpe
+    role: "Paid Acquisition"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/euterpe.md
+
+  - slug: pr-earned
+    mythic: Clio
+    role: "PR & Earned Media"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/clio.md
+
+  - slug: seo-discovery
+    mythic: Urania
+    role: "SEO & Discovery"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/urania.md
+
+  - slug: photo-cinema
+    mythic: Helios
+    role: "Photo & Cinema — Sub-Crew Lead"
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/helios.md
+
+  # Helios sub-agents
+  - slug: video-synth
+    parent: photo-cinema
+    role: "Video Synthesis"
+    authority: execute
+    model_tier: haiku
+    agent_file: .claude/agents/helios-crew/video-synth.md
+
+  - slug: audio-foley
+    parent: photo-cinema
+    role: "Audio Foley & SFX"
+    authority: execute
+    model_tier: haiku
+    agent_file: .claude/agents/helios-crew/audio-foley.md
+
+  - slug: music-score
+    parent: photo-cinema
+    role: "Music Score"
+    authority: execute
+    model_tier: haiku
+    agent_file: .claude/agents/helios-crew/music-score.md
+
+  - slug: dialogue-mix
+    parent: photo-cinema
+    role: "Dialogue Mix"
+    authority: execute
+    model_tier: haiku
+    agent_file: .claude/agents/helios-crew/dialogue-mix.md
+
+  - slug: governance-c2pa
+    parent: photo-cinema
+    role: "IP Governance & C2PA Signing"
+    authority: execute
+    model_tier: opus
+    hitl_trigger: true
+    notes: "HITL required on IP-clearance failure, brand-safety failure, or any asset pending C2PA signing."
+    agent_file: .claude/agents/helios-crew/governance-c2pa.md
+
+tools:
+  - name: comfyui
+    privilege: execute
+    notes: "Callable by Helios and video-synth only. All other agents are prohibited."
+  - name: gemini-image
+    privilege: execute
+  - name: gemini-content
+    privilege: execute
+  - name: frontend-design
+    privilege: advisory
+    notes: "Helios may propose landing-page mock-ups; implementation is delegated to the engineering squad."
+  - name: marketing-expertise
+    privilege: read
+  - name: media-business
+    privilege: read
+  - name: eights-memory
+    privilege: read+write
+    notes: "All ops require domain='creative' and at least one scope tag."
 
 accepts:
   - CREATIVE_BRIEF
+  - SHOT_LIST
+  - ASSET_JOB
   - HANDOFF
 
 emits:
-  - CREATIVE_BRIEF
   - SHOT_LIST
   - ASSET_JOB
   - DECISION_RECORD
 
 gates:
-  - rubric_id: brand-voice-consistency
+  - rubric_id: brand-consistency
+    when: always
+  - rubric_id: ip-clearance
     hitl_required: true
-  - rubric_id: visual-direction-color-science
+    when: "constraints.risk_tolerance == 'low'"
+  - rubric_id: media-cost-cap
     hitl_required: true
+    when: "asset_job.max_render_cost_usd > 200"
+  - rubric_id: brand-safety
+    when: always
 
 invoke:
-  # Stub mode — surface with a pointer until RLM-Creative ships.
   command_hint: "/creative-campaign"
   fallback_commands:
-    - "/photo-direction"
-    - "/brand-refresh"
-  output_dir: "output/garland/{phase}/{topic-kebab}-{date}.md"
-  pending_project: "C:\\AiAppDeployments\\RLM-Creative"
-  pending_message: >
-    The Garland Crown is scaffolded but its source pack (RLM-Creative) has not
-    shipped yet. Surface this work to the user for manual routing or implement
-    the sibling project per docs/ROADMAP-MANIFESTO.md (parallel track).
+    - /photo-direction
+    - /brand-refresh
+    - /rlm-team
+  output_dir: "RLM/output/{phase}/{topic}-{date}.md"

@@ -361,7 +361,7 @@ def build_supervisor(
         bon_rubrics = ["constitution-alignment@1"]
         if pack.slug == "executive":
             bon_rubrics.append("board-decision-quality@1")
-        elif pack.slug == "creative":
+        elif pack.slug == "garland":
             bon_rubrics.extend(["brand-consistency@1", "audience-fit@1"])
 
         try:

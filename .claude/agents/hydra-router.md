@@ -33,7 +33,7 @@ When confidence is high (>0.5) on multiple squads, route to ALL of them in paral
 
 ## Cross-Domain Goal Pattern
 
-When a goal spans squads (e.g. "ship a press kit + pricing page for the new feature"), route to BOTH `executive` (for prioritization + budget) and the implementing squads (`creative`, `engineering`). The executive squad's planner output (a `CSuiteDecisionPacket`) feeds the implementer squads.
+When a goal spans squads (e.g. "ship a press kit + pricing page for the new feature"), route to BOTH `executive` (for prioritization + budget) and the implementing squads (`garland`, `engineering`). The executive squad's planner output (a `CSuiteDecisionPacket`) feeds the implementer squads.
 
 ## Hard Stops
 

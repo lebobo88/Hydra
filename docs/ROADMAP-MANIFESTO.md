@@ -4,7 +4,7 @@ Distilled from the approved plan at `C:\Users\robob\.claude\plans\c-aiappdeploym
 
 **Locked decisions** (from clarifying Q&A on 2026-05-19):
 - Scope: full six-stage roadmap; Stage 1 shipped in initial run.
-- Garland Crown: new sibling project at `C:\AiAppDeployments\RLM-Creative`. RLM-CLI-Starter contributes only `copilot-content`, `copilot-image`, `copilot-frontend-designer`, and ComfyUI integration.
+- Garland Crown: sibling project at [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative). RLM-CLI-Starter contributes only `copilot-content`, `copilot-image`, `copilot-frontend-designer`, and ComfyUI integration.
 - Voice: dual register — cathedral in `CONSTITUTION.md` / manifesto / `docs/MANIFESTO.md`; plaza in `squad.yaml`, schemas, code. Mythic head names attach via alias overlay.
 - TheEights: generic semantic graph as storage; eight cells implemented as a tag/facet vocabulary, not a hard partition.
 
@@ -70,7 +70,7 @@ Distilled from the approved plan at `C:\Users\robob\.claude\plans\c-aiappdeploym
 - `HED-1` `hydra_core/heads.py` — `HEAD_ALIASES` registry. Each entry: plaza slug → mythic name + register + refusal pattern + sigil hint.
 - `HED-2` `squads/executive/heads.yaml` — Solon=CEO, Athena=CSO, Hermes=CMO, Hephaestus=CTO, Demeter=CFO, Hestia=COO, Themis=CLO, Asclepius=CPO, Iris=Board. Bind to ExecutiveSuite's existing personas.
 - `HED-3` `squads/engineering/heads.yaml` — Daedalus=architect, Prometheus=engineer, Argus=reviewer, Hygeia=test-strategist, Cerberus=security-reviewer, Charon=ops-author, Mnemosyne=docs-author.
-- `HED-4` `squads/garland/squad.yaml` — stub pointing at `C:\AiAppDeployments\RLM-Creative` with `entrypoint: stub` until that project ships.
+- `HED-4` `squads/garland/squad.yaml` — stub pointing at [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) with `entrypoint: stub` until that project ships.
 - `HED-5` `hydra_core/deliberation.py` — Society-of-Mind cycle for Executive Crown: independent drafts → cross-critique → Iris devil's-advocate → Hydra synthesizes. Dissents persisted to TheEights Kan cell (substantive disagreements) or Dui cell (validated patterns).
 - `HED-6` Update synthesis renderer in `supervisor.py` to use cathedral names in user-facing output, plaza slugs in envelopes.
 
@@ -110,7 +110,7 @@ Distilled from the approved plan at `C:\Users\robob\.claude\plans\c-aiappdeploym
 
 ## Parallel Track — RLM-Creative (Garland Crown's home)
 
-New sibling project at `C:\AiAppDeployments\RLM-Creative`. Not in any of the six Hydra stages; runs in parallel.
+Sibling project at [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative). Not in any of the six Hydra stages; runs in parallel.
 
 ### From RLM-CLI-Starter (pull, do not duplicate)
 - `copilot-content`, `copilot-image`, `copilot-frontend-designer`

@@ -245,7 +245,6 @@ def all_aliases(*, project_root: Path | None = None) -> Iterable[HeadAlias]:
 _SQUAD_CROWN_LABELS: dict[str, str] = {
     "executive": "the Executive Crown",
     "engineering": "the Forge Crown",
-    "creative": "the Garland Crown",
     "garland": "the Garland Crown",
 }
 

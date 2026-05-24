@@ -239,10 +239,10 @@ session. The 20+ C-level personas plus 4 orchestrators (`boardroom`,
 `capital-allocation`, `crisis-warroom`, `mna-cockpit`) emit a
 `CSuiteDecisionPacket` which the planner converts to per-squad tasks.
 
-**RLM-CLI-Starter (creative).** Entrypoint is `claude-skill`. Hydra
-invokes `/rlm-team` (or fallbacks `/rlm-exec-creative-brief`,
-`/rlm-feature-design`, `/rlm-video`, `/rlm-design`, `/cinematic-landing`)
-through the Claude Code skill mechanism. The creative squad emits
+**RLM-Creative (garland).** Entrypoint is `claude-skill`. Hydra
+invokes `/rlm-team` (or fallbacks `/creative-campaign`,
+`/photo-direction`, `/brand-refresh`)
+through the Claude Code skill mechanism. The garland squad emits
 `SHOT_LIST`, `ASSET_JOB`, and `DECISION_RECORD`. Outputs land under
 `RLM/output/{phase}/{topic}-{date}.md` per the squad yaml.
 

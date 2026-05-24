@@ -4,7 +4,7 @@ This file is the single source of truth for any AI agent (Claude Code, Codex, Ge
 
 ## What Hydra Is
 
-A central LangGraph supervisor + Claude Code plugin that routes work across heterogeneous AI agent squads (executive, engineering, creative, plus stubs). Hydra does NOT do the squads' work; it routes, governs, and synthesizes.
+A central LangGraph supervisor + Claude Code plugin that routes work across heterogeneous AI agent squads (executive, engineering, garland, plus stubs). Hydra does NOT do the squads' work; it routes, governs, and synthesizes.
 
 See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
@@ -12,9 +12,9 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
 | Slug | Source pack | Entrypoint |
 |---|---|---|
-| executive | `C:\AiAppDeployments\ExecutiveSuite` | agent-impersonation |
-| engineering | `C:\AiAppDeployments\pair-programmer` | mcp |
-| creative | `C:\AiAppDeployments\RLM-Creative` | claude-skill |
+| executive | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | agent-impersonation |
+| engineering | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | mcp |
+| garland | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | claude-skill |
 | legal-compliance | (stub) | stub |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |

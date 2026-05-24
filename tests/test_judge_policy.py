@@ -16,7 +16,7 @@ def test_default_policy_loads_and_has_enabled_squads():
     assert isinstance(p, JudgePolicy)
     # Built-in defaults include executive + creative.
     assert "executive" in p.enabled_squads
-    assert "creative" in p.enabled_squads
+    assert "garland" in p.enabled_squads
 
 
 def test_default_policy_hitl_severities_present():

@@ -5,7 +5,7 @@ description: >
   Software engineering, product management, architecture, QA, DevOps. Wired to
   the pair-programmer harness — Hydra dispatches Engineering work as PP runs
   (single, best-of, team-mode, or governance-forum review).
-source_pack: C:\AiAppDeployments\pair-programmer
+source_pack: https://github.com/lebobo88/pair-programmer
 entrypoint: mcp
 industries: [software, saas, ai-platform, devtools, fintech-eng, healthtech-eng]
 

@@ -17,7 +17,7 @@ You translate a routed user goal into a DAG of strongly-typed message envelopes 
 2. If `executive` is in the squad list, FIRST emit a `CSuiteDecisionPacket` to the executive squad asking for objective decomposition + budget split. WAIT for a `DECISION_RECORD` back before fanning out to implementer squads.
 3. For each implementer squad, produce the correct envelope:
    - engineering: `PRD` (high-level) → it will produce its own `ARCH_RFC` and `DEV_TASK` internally.
-   - creative: `CREATIVE_BRIEF`.
+   - garland: `CREATIVE_BRIEF`.
    - legal-compliance: `HANDOFF` containing the artifact under review.
    - healthcare: `HANDOFF` with `phi_handling=strict`.
    - sales-gtm: `HANDOFF` with deal/account context.
@@ -39,6 +39,7 @@ A plan MUST NOT contain any of the following. If the routing decision or operato
 | Pattern | Why forbidden |
 |---|---|
 | `Agent({subagent_type: "engineer", ...})` (or any direct sub-agent fanout outside the supervisor) | Erases the workflow audit trail — no `workflow_id`, no envelope validation, no postcheck, no DECISION_RECORD. This is what produced the ~80% off-Hydra dispatch rate in the RLMplatform bootstrap session. Parallel fan-out goes through `phase_batch_index` batching against the supervisor, not around it. |
+| `Agent({subagent_type: "general-purpose", ...})` when a typed agent owns the artifact kind | Breaks replay provenance and disables agent-type-tied evolution proposals. The R5 bootstrap recorded ~10 build attempts as `agent_type=general-purpose` because typed `engineer` was bypassed. Use the typed agent declared in the team yaml's `generator.agent`; if it appears to lack a required tool, surface `agent_tool_surface_mismatch` HITL instead of downgrading. |
 | "Use direct dispatch as a fallback when the supervisor stalls" | The supervisor stalling is a defect to fix (envelope_ceiling, MCP failure, lock leak), not a license to bypass. File the defect and either batch or wait. |
 | "Just commit directly without going through the dispatcher" | The dispatcher owns lock acquisition, taxonomy mapping, judge gates, missability checks, and master-plan patching. Bypassing it is what produces stranded `.harness/run_*/` directories. |
 | "Skip best-of-N for speed" when `best_of: N` was declared on the envelope | Best-of-N is a governance choice made upstream. Skipping it silently produces an artifact that downstream consumers assume was selected by Borda. If you genuinely need to skip, change `best_of` to 1 explicitly. |
@@ -56,7 +57,7 @@ This rule applies to the 7-task heuristic in "Authority Bounds" the same way the
 
 ## Best-of-N Decomposition (dispatcher owns the tournament)
 
-When an envelope should run as a best-of-N tournament, declare it with `best_of: N` on the envelope and let the **dispatcher** orchestrate. Do NOT decompose a best-of-N intent into N sibling envelopes pointed at the generator agent — the single-artifact generator agents (`architect`, `data-modeler`, `api-designer`, `security-reviewer`, etc.) only have `generate` + `archive_artifact` + `record_attempt` tools and CANNOT call `start_best_of_stage`, `borda_count`, `record_verdict`, or `archive_winner_and_losers`. Asking them to score and pick a winner forces a correct refusal — the bootstrap session lost a Phase 0 round to this exact mis-decomposition.
+When an envelope should run as a best-of-N tournament, declare it with `best_of: N` on the envelope and let the **dispatcher** orchestrate. Do NOT decompose a best-of-N intent into N sibling envelopes pointed at the generator agent — the single-artifact generator agents (`architect`, `data-modeler`, `api-designer`, `security-reviewer`, etc.) own `Read/Write/Edit/Glob/Grep` + `archive_artifact` + `record_attempt` (per the 2026-05-23 native-authoring fix) and CANNOT call `start_best_of_stage`, `borda_count`, `record_verdict`, or `archive_winner_and_losers`. Asking them to score and pick a winner forces a correct refusal — the bootstrap session lost a Phase 0 round to this exact mis-decomposition.
 
 The contract:
 
@@ -66,8 +67,8 @@ The contract:
 
 ## DAG Rules
 
-- Dependencies: when one squad's output is the next's input (e.g. creative `SHOT_LIST` → creative `ASSET_JOB`), declare the dependency explicitly in the task graph.
-- Parallelism: independent tasks (e.g. engineering implementation + creative press kit) MUST be marked parallel.
+- Dependencies: when one squad's output is the next's input (e.g. garland `SHOT_LIST` → garland `ASSET_JOB`), declare the dependency explicitly in the task graph.
+- Parallelism: independent tasks (e.g. engineering implementation + garland press kit) MUST be marked parallel.
 - Fan-in: name a synthesizer task that joins parallel branches before postcheck.
 
 ## Worktree-Fanout Rule (pp-harness Lock Awareness)

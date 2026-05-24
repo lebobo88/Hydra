@@ -30,7 +30,7 @@ from mcp_servers._pack_shim import (  # noqa: E402
 
 
 def _tool_handlers():
-    root = resolve_root("HYDRA_ES_ROOT", "C:/AiAppDeployments/ExecutiveSuite")
+    root = resolve_root("HYDRA_ES_ROOT", str(_HERE.parents[2].parent / "ExecutiveSuite"))
 
     def roster_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),

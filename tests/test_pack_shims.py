@@ -243,7 +243,7 @@ def test_via_claude_skill_persists_real_memoryref():
     from hydra_core.state import HydraState
 
     packs = discover_squads(HYDRA_ROOT)
-    pack = packs["creative"]
+    pack = packs["garland"]
 
     wf = uuid4()
     inbound = CreativeBrief(

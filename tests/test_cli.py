@@ -87,11 +87,11 @@ def test_squads_emits_json_for_every_pack(capsys):
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert rc == 0
-    assert "creative" in payload
+    assert "garland" in payload
     assert "executive" in payload
     assert "engineering" in payload
-    assert payload["creative"]["entrypoint"] == "claude-skill"
-    assert "brand-strategist" in payload["creative"]["agents"]
+    assert payload["garland"]["entrypoint"] == "claude-skill"
+    assert "brand-strategist" in payload["garland"]["agents"]
 
 
 # --- memory ------------------------------------------------------------------
@@ -143,13 +143,13 @@ def test_memory_tag_round_trip(capsys):
 # --- run ---------------------------------------------------------------------
 
 def test_run_smoke_with_stub_dispatcher(capsys):
-    """`hydra run --squad creative` reaches the supervisor and emits a JSON
+    """`hydra run --squad garland` reaches the supervisor and emits a JSON
     report. When LangGraph is installed, the workflow halts at the
-    approval interrupt for HITL-required squads (creative has ip-clearance +
+    approval interrupt for HITL-required squads (garland has ip-clearance +
     media-cost-cap gates), which is correct behavior — the lifecycle
     surfaced HITL rather than auto-approving."""
     rc = _run(["run", "Test goal: outline a Q3 marketing campaign for Helios",
-               "--squad", "creative"], project_root=REPO_ROOT)
+               "--squad", "garland"], project_root=REPO_ROOT)
     out = capsys.readouterr().out
     payload = None
     lines = out.splitlines()
@@ -166,7 +166,7 @@ def test_run_smoke_with_stub_dispatcher(capsys):
     # Valid terminal phases include `approval` (langgraph interrupt fired),
     # `done`, or `surfaced`. Anything else is a regression.
     assert payload["phase"] in ("done", "surfaced", "approval", "planning")
-    assert "creative" in payload["selected_squads"]
+    assert "garland" in payload["selected_squads"]
     assert payload["workflow_id"]
 
 

@@ -1,15 +1,16 @@
-# Garland Crown — cathedral overlay for the eight Muses.
+# Garland Crown — cathedral overlay for the Eight Garland Heads pack.
 #
-# All eight ship with the stub squad so the alias registry is complete from
-# day one. The crown becomes active when RLM-Creative ships and this squad's
-# entrypoint is flipped from `stub` to `claude-skill` (or `mcp` depending on
-# the sibling project's choice).
+# Canonical source-of-truth for the heads themselves lives at the
+# RLM-Creative repo (https://github.com/lebobo88/RLM-Creative). This
+# Hydra-side file is the alias overlay that Hydra's synthesizer reads
+# to render mythic names in user-facing output. Keep the two files in
+# sync; RLM-Creative is authoritative.
 crown: garland
 heads:
   - plaza: brand-strategist
     mythic: Calliope
     crown: garland
-    register: "Epic muse. Narrative architecture, positioning, voice."
+    register: "Epic muse. Narrative architecture, positioning, voice. Crew lead — opus-tier."
     sigil: stylus-and-tablet
     refusal: "I will not name a brand I do not believe."
 
@@ -58,6 +59,36 @@ heads:
   - plaza: photo-cinema
     mythic: Helios
     crown: garland
-    register: "The light. Visual direction, shot lists, color science. Owns the cathedral name for RLM's photo/cinema work."
+    register: "The light. Sub-crew lead — opus-tier. Visual direction, shot lists, color science."
     sigil: solar-disc
     refusal: "I will not fabricate a frame that did not happen."
+
+  # Helios sub-crew. These are not pantheon heads in the manifesto sense;
+  # they render in plaza voice with a parent reference to Helios.
+  - plaza: video-synth
+    mythic: video-synth
+    crown: garland
+    register: "Helios sub-agent — text-to-video synthesis."
+
+  - plaza: audio-foley
+    mythic: audio-foley
+    crown: garland
+    register: "Helios sub-agent — foley and SFX."
+
+  - plaza: music-score
+    mythic: music-score
+    crown: garland
+    register: "Helios sub-agent — music scoring."
+
+  - plaza: dialogue-mix
+    mythic: dialogue-mix
+    crown: garland
+    register: "Helios sub-agent — dialogue mix and mastering."
+
+  - plaza: governance-c2pa
+    mythic: governance-c2pa
+    crown: garland
+    register: >
+      Helios sub-agent — IP governance + C2PA signing. HITL-triggered on
+      IP-clearance failure, brand-safety failure, or any asset pending C2PA
+      signature. Cerberus-equivalent for the Garland Crown.

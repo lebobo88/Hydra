@@ -105,7 +105,7 @@ def test_redact_for_squad_returns_redacted_text():
         "eights.redaction.redact_for_squad": {"redacted": "ssn [REDACTED]"},
     })
     a = EightsAttestor(dispatcher=d)
-    out = a.redact_for_squad(text="ssn 123-45-6789", from_squad="executive", to_squad="creative")
+    out = a.redact_for_squad(text="ssn 123-45-6789", from_squad="executive", to_squad="garland")
     assert out == "ssn [REDACTED]"
 
 

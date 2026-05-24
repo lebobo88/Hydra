@@ -14,7 +14,7 @@ A philosophical / theological / architectural charter for the Hydra orchestrator
 2. **The Three Crowns** — head clusters by domain.
    - *Executive Crown* — Solon, Athena, Hermes, Hephaestus, Demeter, Hestia, Themis, Asclepius, Iris. Maps onto ExecutiveSuite.
    - *Forge Crown* — Daedalus, Prometheus, Argus, Hygeia, Cerberus, Charon, Mnemosyne. Maps onto pair-programmer.
-   - *Garland Crown* — Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios. Maps onto RLM-Creative (planned at `C:\AiAppDeployments\RLM-Creative`).
+   - *Garland Crown* — Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios. Maps onto [RLM-Creative](https://github.com/lebobo88/RLM-Creative).
 3. **TheEights** — the persistent memory substrate, partitioned by an eight-cell tag vocabulary derived from the I Ching trigrams (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui = Vision/Context/Triggers/Influence/Risk/Focus/Constraints/Delight).
 
 ## Cathedral and plaza voices

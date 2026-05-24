@@ -22,7 +22,7 @@ HYDRA_ROOT = Path(__file__).resolve().parents[1]
 def test_registry_discovers_eight_squads():
     packs = discover_squads(HYDRA_ROOT)
     assert set(packs) >= {
-        "executive", "engineering", "creative",
+        "executive", "engineering", "garland",
         "legal-compliance", "healthcare", "sales-gtm",
         "research-ds", "customer-support",
     }
@@ -44,7 +44,7 @@ def test_router_picks_executive_on_strategy_keywords():
 def test_router_picks_creative_on_campaign_keywords():
     packs = discover_squads(HYDRA_ROOT)
     d = classify_intent("Produce a video press kit for the brand launch", packs)
-    assert "creative" in d.squads
+    assert "garland" in d.squads
 
 
 def test_schema_validate_roundtrip():

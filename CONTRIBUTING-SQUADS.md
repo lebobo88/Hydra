@@ -9,7 +9,7 @@ recognize work for it. There is no Hydra-core change required —
 This guide walks through the full activation path. Reference squads:
 `squads/engineering/` (MCP entrypoint, PP delegation),
 `squads/executive/` (agent-impersonation, ES delegation),
-`squads/creative/` (Claude-skill, RLM delegation),
+`squads/garland/` (Claude-skill, RLM delegation),
 `squads/legal-compliance/` (stub template).
 
 ## a) Create the squad folder

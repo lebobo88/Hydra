@@ -30,7 +30,7 @@ def test_creative_brief_is_same_vendor_by_default():
     env = {
         "id": str(uuid4()),
         "type": "CREATIVE_BRIEF",
-        "origin_squad": "creative",
+        "origin_squad": "garland",
         "workflow_id": str(uuid4()),
         "campaign_id": str(uuid4()),
         "objective": "launch",
@@ -46,7 +46,7 @@ def test_content_escalation_upgrades_same_vendor():
     env = {
         "id": str(uuid4()),
         "type": "CREATIVE_BRIEF",
-        "origin_squad": "creative",
+        "origin_squad": "garland",
         "workflow_id": str(uuid4()),
         "campaign_id": str(uuid4()),
         "objective": "GDPR-compliant audience targeting plan",
@@ -148,7 +148,7 @@ def test_enterprise_profile_forces_cross_vendor():
     env = {
         "id": str(uuid4()),
         "type": "CREATIVE_BRIEF",
-        "origin_squad": "creative",
+        "origin_squad": "garland",
         "workflow_id": str(uuid4()),
         "campaign_id": str(uuid4()),
         "objective": "blue",

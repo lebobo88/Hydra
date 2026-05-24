@@ -125,7 +125,7 @@ def test_overlay_missing_is_not_an_error(tmp_path):
 def test_crown_label_for_squad_renders_known_crowns():
     assert crown_label_for_squad("executive") == "the Executive Crown"
     assert crown_label_for_squad("engineering") == "the Forge Crown"
-    assert crown_label_for_squad("creative") == "the Garland Crown"
+    assert crown_label_for_squad("garland") == "the Garland Crown"
     assert crown_label_for_squad("garland") == "the Garland Crown"
 
 

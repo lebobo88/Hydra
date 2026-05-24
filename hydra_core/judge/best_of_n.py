@@ -1,4 +1,4 @@
-"""Best-of-N orchestration for executive + creative squads.
+"""Best-of-N orchestration for executive + garland squads.
 
 Wraps the existing `deliberation.deliberate()` cycle: produce N independent
 DeliberationOutcomes, judge each, Borda-rank, return the winner. Losers are
@@ -6,7 +6,7 @@ returned alongside so callers can archive them to episodic memory tagged with
 the `Kan` (dissent) cell per TheEights taxonomy.
 
 This module is content-agnostic — it works for any artifact list, not only
-deliberation outcomes. The supervisor's executive/creative squad nodes will
+deliberation outcomes. The supervisor's executive/garland squad nodes will
 opt-in via the `best_of_n: N` field in `squads/<slug>/squad.yaml`.
 """
 from __future__ import annotations

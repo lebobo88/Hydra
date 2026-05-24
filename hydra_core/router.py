@@ -33,7 +33,7 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "m&a", "acquisition", "merger", "capex", "opex", "wacc", "irr", "npv",
         "risk appetite", "earnings", "shareholder", "crisis", "succession",
     ),
-    "creative": (
+    "garland": (
         "campaign", "brand", "logo", "video", "shot", "script", "copy",
         "press kit", "social", "thumbnail", "voiceover", "music", "image",
         "render", "scene", "storyboard", "cinematic", "youtube", "tiktok",

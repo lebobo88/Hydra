@@ -1,6 +1,6 @@
 # Hydra — Enterprise Agent Mesh
 
-**Hydra is the central supervisor / state engine that routes work across heterogeneous AI agent squads** (executive, engineering, creative, legal, healthcare, sales, research, customer-support — and any future pack).
+**Hydra is the central supervisor / state engine that routes work across heterogeneous AI agent squads** (executive, engineering, garland, legal, healthcare, sales, research, customer-support — and any future pack).
 
 Hydra does *not* re-implement what those squads already do. It sits ABOVE them as:
 
@@ -19,9 +19,9 @@ The architecture is grounded in `Enterprise Master AI Orchestration System Archi
 
 | Squad | Slug | Source pack | Status |
 |---|---|---|---|
-| Executive (C-Suite) | `executive` | `C:\AiAppDeployments\ExecutiveSuite` | active |
-| Engineering & Product | `engineering` | `C:\AiAppDeployments\pair-programmer` | active |
-| Creative & Production | `creative` | `C:\AiAppDeployments\RLM-CLI-Starter` | active |
+| Executive (C-Suite) | `executive` | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | active |
+| Engineering & Product | `engineering` | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | active |
+| Garland (Creative & Production) | `garland` | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | active |
 | Legal & Compliance | `legal-compliance` | (stub) | scaffold |
 | Healthcare / Clinical | `healthcare` | (stub) | scaffold |
 | Sales & GTM | `sales-gtm` | (stub) | scaffold |

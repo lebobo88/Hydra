@@ -42,7 +42,6 @@ _TYPE_DEFAULTS: dict[str, tuple[Cell, ...]] = {
 _SQUAD_NUDGES: dict[str, tuple[Cell, ...]] = {
     "executive":         ("qian",),
     "engineering":       ("gen",),
-    "creative":          ("xun",),
     "garland":           ("xun",),
     "legal-compliance":  ("gen",),
     "healthcare":        ("gen", "kan"),

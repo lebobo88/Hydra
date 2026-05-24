@@ -6,7 +6,7 @@ description: >
   the ExecutiveSuite pack — Hydra dispatches Executive work as boardroom /
   capital-allocation / crisis-warroom / mna-cockpit sessions through Claude
   Code's sub-agent impersonation pattern (no spawned sub-processes).
-source_pack: C:\AiAppDeployments\ExecutiveSuite
+source_pack: https://github.com/lebobo88/ExecutiveSuite
 entrypoint: agent-impersonation
 best_of_n: 3   # produce 3 candidate boardroom drafts, judge each, Borda-rank
 industries:

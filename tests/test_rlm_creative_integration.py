@@ -1,7 +1,7 @@
 """Integration tests for the RLM-Creative Garland Crown wiring.
 
 After RLM-Creative shipped externally on 2026-05-19, these tests pin the
-Hydra-side contract: the creative squad loads with all 13 agents, the
+Hydra-side contract: the garland squad loads with all 13 agents, the
 Garland sub-agents declare their Helios parent, the C2PA governance head
 carries the HITL trigger, and the router fires on Muse keywords.
 """
@@ -29,23 +29,23 @@ def packs():
 # --- squad-loader: AgentSpec / ToolSpec accept new fields --------------------
 
 def test_creative_squad_loads_with_thirteen_agents(packs):
-    creative = packs["creative"]
-    assert creative.entrypoint == "claude-skill"
-    assert "RLM-Creative" in (creative.source_pack or "")
-    assert len(creative.agents) == 13
+    garland = packs["garland"]
+    assert garland.entrypoint == "claude-skill"
+    assert "RLM-Creative" in (garland.source_pack or "")
+    assert len(garland.agents) == 13
 
 
 def test_creative_agents_carry_mythic_names(packs):
-    creative = packs["creative"]
-    mythic_by_plaza = {a.slug: a.mythic for a in creative.agents}
+    garland = packs["garland"]
+    mythic_by_plaza = {a.slug: a.mythic for a in garland.agents}
     assert mythic_by_plaza["brand-strategist"] == "Calliope"
     assert mythic_by_plaza["photo-cinema"] == "Helios"
     assert mythic_by_plaza["copywriter"] == "Erato"
 
 
 def test_helios_sub_agents_have_photo_cinema_parent(packs):
-    creative = packs["creative"]
-    sub_agents = [a for a in creative.agents if a.parent == "photo-cinema"]
+    garland = packs["garland"]
+    sub_agents = [a for a in garland.agents if a.parent == "photo-cinema"]
     sub_slugs = {a.slug for a in sub_agents}
     assert sub_slugs == {
         "video-synth", "audio-foley", "music-score",
@@ -54,45 +54,45 @@ def test_helios_sub_agents_have_photo_cinema_parent(packs):
 
 
 def test_governance_c2pa_is_hitl_triggered(packs):
-    creative = packs["creative"]
-    gov = next(a for a in creative.agents if a.slug == "governance-c2pa")
+    garland = packs["garland"]
+    gov = next(a for a in garland.agents if a.slug == "governance-c2pa")
     assert gov.hitl_trigger is True
     assert gov.model_tier == "opus"
 
 
 def test_calliope_and_helios_are_gatekeepers_on_opus(packs):
-    creative = packs["creative"]
-    by_slug = {a.slug: a for a in creative.agents}
+    garland = packs["garland"]
+    by_slug = {a.slug: a for a in garland.agents}
     for slug in ("brand-strategist", "photo-cinema"):
         assert by_slug[slug].authority == "gatekeeper"
         assert by_slug[slug].model_tier == "opus"
 
 
 def test_creative_tools_accept_composite_privilege_string(packs):
-    creative = packs["creative"]
-    eights_tool = next(t for t in creative.tools if t.name == "eights-memory")
+    garland = packs["garland"]
+    eights_tool = next(t for t in garland.tools if t.name == "eights-memory")
     assert "read" in eights_tool.privilege and "write" in eights_tool.privilege
 
 
 def test_creative_emits_and_accepts_creative_envelopes(packs):
-    creative = packs["creative"]
-    assert "CREATIVE_BRIEF" in creative.accepts
-    assert "SHOT_LIST" in creative.emits
-    assert "ASSET_JOB" in creative.emits
+    garland = packs["garland"]
+    assert "CREATIVE_BRIEF" in garland.accepts
+    assert "SHOT_LIST" in garland.emits
+    assert "ASSET_JOB" in garland.emits
 
 
 # --- four Garland gates ------------------------------------------------------
 
 def test_creative_squad_declares_four_garland_gates(packs):
-    creative = packs["creative"]
-    rubric_ids = {g.rubric_id for g in creative.gates}
+    garland = packs["garland"]
+    rubric_ids = {g.rubric_id for g in garland.gates}
     assert {"brand-consistency", "ip-clearance", "media-cost-cap",
             "brand-safety"}.issubset(rubric_ids)
 
 
 def test_ip_clearance_and_media_cost_cap_require_hitl(packs):
-    creative = packs["creative"]
-    by_rubric = {g.rubric_id: g for g in creative.gates}
+    garland = packs["garland"]
+    by_rubric = {g.rubric_id: g for g in garland.gates}
     assert by_rubric["ip-clearance"].hitl_required is True
     assert by_rubric["media-cost-cap"].hitl_required is True
 
@@ -128,17 +128,17 @@ def test_iolaus_refuses_dispatch_to_retired_garland_stub(packs):
 
 def test_router_picks_creative_on_muse_names(packs):
     decision = classify_intent("Send this to Calliope and Helios for review", packs)
-    assert "creative" in decision.squads
+    assert "garland" in decision.squads
 
 
 def test_router_picks_creative_on_garland_keyword(packs):
     decision = classify_intent("Convene the garland crew on the rebrand", packs)
-    assert "creative" in decision.squads
+    assert "garland" in decision.squads
 
 
 def test_router_picks_creative_on_creative_crew_phrase(packs):
     decision = classify_intent("Run the creative crew on Q3 campaign", packs)
-    assert "creative" in decision.squads
+    assert "garland" in decision.squads
 
 
 # --- cathedral overlay -------------------------------------------------------
@@ -157,7 +157,7 @@ def test_creative_heads_yaml_overlay_loads_all_eight_muses():
 
 
 def test_crown_label_for_creative_squad_is_garland_crown():
-    assert crown_label_for_squad("creative") == "the Garland Crown"
+    assert crown_label_for_squad("garland") == "the Garland Crown"
 
 
 # --- mcp config --------------------------------------------------------------
