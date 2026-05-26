@@ -27,7 +27,7 @@ from .judge import dispatch_judge, route_judge, load_policy
 from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
-from .router import classify_intent
+from .router import classify_intent, compute_tool_scope
 from .telemetry import emit as emit_trace
 from .venom import load_cerberus_venoms
 from .schemas import (
@@ -97,6 +97,19 @@ def build_supervisor(
     if hasattr(dispatcher, "set_squad_packs"):
         dispatcher.set_squad_packs(packs)
 
+    # Build the toolshed (meta-tool facade for large MCP servers).
+    from .toolshed import build_default_shed
+    toolshed = build_default_shed(dispatcher=dispatcher)
+
+    # Node-scoped context trimming.
+    from .node_context import build_node_context
+
+    # Tool usage analytics (Phase D1).
+    from .tool_analytics import ToolUsageTracker, analytics_path
+    tool_tracker = ToolUsageTracker(packs=packs)
+    if hasattr(dispatcher, "_tool_tracker"):
+        dispatcher._tool_tracker = tool_tracker
+
     # ----- boundary enforcement helpers -----
 
     def _validate_and_redact_envelope(
@@ -140,8 +153,24 @@ def build_supervisor(
 
     # ----- node implementations -----
 
+    def _emit_node_context(state: HydraState, node_name: str) -> None:
+        """Emit node context to the trace for debugging/audit."""
+        ctx = build_node_context(
+            node_name,
+            selected_squads=getattr(state, "selected_squads", []),
+            packs=packs,
+            toolshed=toolshed,
+        )
+        emit_trace(judge_trace_root, state.workflow_id, "node_context", {
+            "node": node_name,
+            "tool_categories": ctx.tool_categories,
+            "relevant_squads": ctx.relevant_squads,
+            "instructions_len": len(ctx.instructions),
+        })
+
     def node_intake(state: HydraState) -> dict:
         state.phase = "intake"
+        _emit_node_context(state, "intake")
         state.bump_iteration()
         # B8: thread the workflow_id onto the attestor so any newly-spooled
         # payloads from this turn carry it, then drain any prior-workflow
@@ -169,6 +198,17 @@ def build_supervisor(
             classify_callable=classify_callable,
         )
         state.selected_squads = decision.squads
+
+        tool_scope = compute_tool_scope(
+            state.root_goal, decision.squads, packs, toolshed=toolshed,
+        )
+        emit_trace(judge_trace_root, state.workflow_id, "tool_scope", {
+            "relevant_tools": list(tool_scope.relevant_tools)[:20],
+            "relevant_categories": list(tool_scope.relevant_categories),
+            "intent_keywords": list(tool_scope.intent_keywords),
+            "tool_count": tool_scope.tool_count,
+        })
+
         state.last_event = f"intake: chose {decision.squads} ({decision.rationale})"
 
         # Eights attestation: stamp the constitution hash into state and
@@ -452,6 +492,7 @@ def build_supervisor(
         return [winner]
 
     def node_dispatch(state: HydraState) -> dict:
+        _emit_node_context(state, "dispatch")
         # Preemptive envelope-ceiling guard. The Claude Code sub-agent that
         # hosts this supervisor is one-shot-per-turn; if the planner emitted
         # too many envelopes for a single dispatch round, surface to HITL
@@ -654,6 +695,7 @@ def build_supervisor(
              or accept the partial output.
         """
         state.phase = "judge_per_squad"
+        _emit_node_context(state, "judge_per_squad")
         already_judged = {v.get("target_envelope_id") for v in state.verdicts}
         new_verdicts: list[dict] = []
         retry_envelopes: list[dict] = []
@@ -855,6 +897,7 @@ def build_supervisor(
         envelope's structured fields. Per the manifesto: "no head speaks
         to the user without Hydra's synthesis."
         """
+        _emit_node_context(state, "synthesis")
         cathedral_roster = ", ".join(
             crown_label_for_squad(s) for s in state.selected_squads
         ) or "(no heads convened)"
@@ -1025,6 +1068,7 @@ def build_supervisor(
         return out
 
     def node_postcheck(state: HydraState) -> dict:
+        _emit_node_context(state, "postcheck")
         verdict = enforce_governance(state, packs, constitution=constitution)
         if verdict.surfaced:
             state.phase = "surfaced"
@@ -1058,6 +1102,25 @@ def build_supervisor(
                     )
         else:
             state.phase = "done"
+
+        # Flush tool usage analytics to disk at workflow end.
+        try:
+            flushed = tool_tracker.flush_to_file(
+                analytics_path(Path(project_root) if project_root else Path.cwd())
+            )
+            if flushed:
+                report = tool_tracker.report(str(state.workflow_id))
+                emit_trace(judge_trace_root, state.workflow_id, "tool_usage_report", {
+                    "total_calls": report.total_calls,
+                    "unique_tools": report.unique_tools,
+                    "calls_by_server": report.calls_by_server,
+                    "declared_but_unused": report.declared_but_unused[:10],
+                    "used_but_undeclared": report.used_but_undeclared[:10],
+                    "recommendations": report.recommendations,
+                })
+        except Exception:
+            pass
+
         return {
             "phase": state.phase,
             "last_event": verdict.reason,

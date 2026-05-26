@@ -15,8 +15,8 @@ classifier can all satisfy the protocol.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
 from .squad_loader import SquadPack
 
@@ -94,11 +94,24 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
 
 
 @dataclass(frozen=True)
+class ToolScope:
+    """Intent-based tool scope emitted alongside routing decisions."""
+    relevant_tools: tuple[str, ...] = ()
+    relevant_categories: tuple[str, ...] = ()
+    intent_keywords: tuple[str, ...] = ()
+
+    @property
+    def tool_count(self) -> int:
+        return len(self.relevant_tools)
+
+
+@dataclass(frozen=True)
 class RoutingDecision:
     squads: list[str]
     confidence: float                # 0..1, max across selected squads
     rationale: str
     used_fallback: bool = False
+    tool_scope: ToolScope = field(default_factory=ToolScope)
 
 
 ClassifyCallable = Callable[[str, dict[str, SquadPack]], list[str]]
@@ -169,4 +182,88 @@ def classify_intent(
         squads=[default] if default else [],
         confidence=0.1,
         rationale="no signal; default to executive for triage",
+    )
+
+
+# ---------- intent-based tool gating ----------
+
+_TOOL_INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "rubric": ("rubric", "judge", "verdict", "score", "grade", "critique"),
+    "run": ("run", "start", "execute", "dispatch", "launch"),
+    "budget": ("budget", "cost", "spend", "price", "expense", "financial"),
+    "profile": ("profile", "config", "setting", "preference"),
+    "taxonomy": ("taxonomy", "section", "mapping", "category"),
+    "artifact": ("artifact", "archive", "file", "output", "deliverable"),
+    "evolution": ("evolve", "propose", "approve", "reject", "commit", "drift"),
+    "memory": ("memory", "episodic", "semantic", "recall", "remember"),
+    "governance": ("governance", "policy", "constitution", "gate", "hitl"),
+    "audit": ("audit", "trace", "log", "decision", "record"),
+    "squad": ("squad", "team", "roster", "agent"),
+    "test": ("test", "check", "validate", "verify", "smoke"),
+    "design": ("design", "template", "wireframe", "ux", "ui"),
+    "docs": ("doc", "readme", "changelog", "release", "runbook"),
+}
+
+
+def compute_tool_scope(
+    text: str,
+    selected_squads: list[str],
+    packs: dict[str, SquadPack],
+    *,
+    toolshed: Any = None,
+    top_k: int = 20,
+) -> ToolScope:
+    """Compute intent-based tool scope from the goal text.
+
+    Scores each tool category against the goal using keyword overlap,
+    then returns the top-k most relevant tool names. This is the
+    "Tool Attention" pattern from arXiv:2604.21816.
+    """
+    text_l = text.lower()
+    text_terms = set(re.split(r"[\s_\-.,;:()]+", text_l))
+    text_terms.discard("")
+
+    # Score intent categories
+    category_scores: dict[str, float] = {}
+    matched_keywords: list[str] = []
+    for category, keywords in _TOOL_INTENT_KEYWORDS.items():
+        hits = sum(1 for k in keywords if k in text_l)
+        if hits:
+            category_scores[category] = hits / len(keywords)
+            matched_keywords.extend(k for k in keywords if k in text_l)
+
+    # Collect tools from selected squads' packs
+    squad_tools: list[str] = []
+    for slug in selected_squads:
+        pack = packs.get(slug)
+        if pack:
+            for t in pack.tools:
+                squad_tools.append(f"{t.mcp_server or slug}.{t.name}")
+
+    # If toolshed is available, search it with the top intent keywords
+    toolshed_results: list[str] = []
+    if toolshed and matched_keywords:
+        query = " ".join(matched_keywords[:5])
+        try:
+            results = toolshed.search(query, limit=top_k)
+            toolshed_results = [f"{r.server}.{r.name}" for r in results]
+        except Exception:
+            pass
+
+    # Merge: squad tools first (always relevant), then toolshed results
+    seen: set[str] = set()
+    relevant: list[str] = []
+    for t in squad_tools + toolshed_results:
+        if t not in seen:
+            seen.add(t)
+            relevant.append(t)
+            if len(relevant) >= top_k:
+                break
+
+    ranked_categories = sorted(category_scores, key=lambda c: -category_scores[c])
+
+    return ToolScope(
+        relevant_tools=tuple(relevant),
+        relevant_categories=tuple(ranked_categories[:5]),
+        intent_keywords=tuple(matched_keywords[:10]),
     )

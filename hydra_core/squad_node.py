@@ -36,6 +36,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
+from .tool_scope import build_tool_scope_directive
 from .version import DoubleSpawnRefused, SquadDeprecated
 
 
@@ -334,6 +335,7 @@ def _via_impersonation(
         ) or ", ".join(a.slug for a in pack.agents[:4])
 
     objective = getattr(inbound, "objective", None) or getattr(inbound, "summary", None) or "(see envelope)"
+    tool_scope = build_tool_scope_directive(pack)
     prompt = (
         "[Hydra→Executive Squad] You are the boardroom facilitator. "
         f"Convene relevant executives ({roster}). "
@@ -343,6 +345,7 @@ def _via_impersonation(
         "Follow ExecutiveSuite Board Meeting Protocol. Output a "
         "C_SUITE_DECISION_PACKET with proposed_tasks decomposed for downstream "
         "squads, and a DECISION_RECORD with dissenting opinions preserved verbatim."
+        + (f"\n\n{tool_scope}" if tool_scope else "")
     )
     try:
         result = dispatcher.emit_claude_prompt(prompt, agent="boardroom")
@@ -414,10 +417,12 @@ def _via_claude_skill(
         squad_id=pack.slug, on_error=_on_mcp_err,
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
+    tool_scope = build_tool_scope_directive(pack)
     try:
         result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), {
             "envelope": inbound.model_dump(mode="json"),
             "available_commands": available_cmds,
+            "tool_scope": tool_scope,
         })
     except Exception as e:
         return SquadResult(

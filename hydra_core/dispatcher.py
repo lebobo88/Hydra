@@ -97,6 +97,7 @@ class MCPStdioDispatcher:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._squad_packs: dict[str, Any] = {}
         self._active_handoffs: list[dict[str, Any]] = []
+        self._tool_tracker: Any = None
 
     def set_squad_packs(self, packs: dict[str, Any]) -> None:
         """Inject discovered squad packs for RBAC enforcement."""
@@ -161,8 +162,33 @@ class MCPStdioDispatcher:
                 })
             except Exception:
                 pass
+            self._record_tool_usage(server, tool, squad_id, "rejected")
             return {"status": "rejected", "error": rejection}
-        return self._run(self._async_call(server, tool, args))
+        import time as _time
+        _t0 = _time.monotonic()
+        result = self._run(self._async_call(server, tool, args))
+        _dur = (_time.monotonic() - _t0) * 1000
+        status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+        self._record_tool_usage(server, tool, squad_id, status, _dur)
+        return result
+
+    def _record_tool_usage(self, server: str, tool: str,
+                           squad_id: str | None, status: str,
+                           duration_ms: float = 0.0) -> None:
+        if self._tool_tracker is None:
+            return
+        try:
+            self._tool_tracker.record(
+                workflow_id="",
+                squad_id=squad_id or "unknown",
+                node_name="dispatch",
+                server=server,
+                tool=tool,
+                status=status,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            pass
 
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
         try:
