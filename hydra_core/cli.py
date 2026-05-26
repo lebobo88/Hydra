@@ -29,7 +29,7 @@ from .telemetry import emit, trace_path
 class _NullDispatcher:
     """Inert dispatcher for the CLI smoke path. Real dispatchers come from
     the Claude Code plugin / MCP host."""
-    def call_mcp(self, server, tool, args):
+    def call_mcp(self, server, tool, args, **_kw):
         return {"status": "stub", "tool": tool, "args": args, "run_id": str(uuid4())[:8]}
     def spawn_subprocess(self, cmd, env=None):
         return {"status": "stub", "stdout": "(no subprocess from CLI)", "cmd": cmd}
@@ -292,6 +292,209 @@ def _cmd_trace(args) -> int:
     return 0
 
 
+# ---------- gateway management ----------
+
+def _cmd_gateway_backup(args) -> int:
+    """Back up ~/.claude.json and ~/.claude/settings.json before gateway migration."""
+    import shutil
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    backup_dir = Path.home() / ".hydra" / "backups" / ts
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    sources = [
+        (Path.home() / ".claude.json", "claude.json.bak"),
+        (Path.home() / ".claude" / "settings.json", "settings.json.bak"),
+    ]
+    for src, dst_name in sources:
+        if src.exists():
+            shutil.copy2(src, backup_dir / dst_name)
+            print(f"  backed up: {src} → {backup_dir / dst_name}")
+        else:
+            print(f"  skipped (not found): {src}")
+    print(f"\nBackup dir: {backup_dir}")
+    return 0
+
+
+def _cmd_gateway_export_backends(args) -> int:
+    """Export mcpServers block from ~/.claude.json to ~/.hydra/backends.json."""
+    from .dispatcher import _load_user_scope_mcp, BACKEND_REGISTRY
+    servers = _load_user_scope_mcp()
+    if not servers:
+        print("No mcpServers found in ~/.claude.json")
+        return 1
+    BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_REGISTRY.write_text(
+        json.dumps(servers, indent=2, default=str), encoding="utf-8"
+    )
+    print(f"Exported {len(servers)} backends to {BACKEND_REGISTRY}")
+    for name in sorted(servers):
+        spec = servers[name]
+        print(f"  {name}: {spec.get('command')} {' '.join(spec.get('args', []))[:60]}")
+    return 0
+
+
+def _cmd_gateway_migrate_hooks(args) -> int:
+    """Update settings.json hook matchers and permissions for gateway prefix."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if not settings_path.exists():
+        print(f"settings.json not found at {settings_path}")
+        return 1
+
+    raw = settings_path.read_text(encoding="utf-8")
+    original = raw
+
+    replacements = [
+        ("mcp__pp_harness__", "mcp__hydra_gateway__pp_harness__"),
+        ("mcp__pp_codex__", "mcp__hydra_gateway__pp_codex__"),
+        ("mcp__pp_gemini__", "mcp__hydra_gateway__pp_gemini__"),
+        ("mcp__eights__", "mcp__hydra_gateway__eights__"),
+        ("mcp__agentsmith__", "mcp__hydra_gateway__agentsmith__"),
+        ("mcp__hydra_memory__", "mcp__hydra_gateway__hydra_memory__"),
+        ("mcp__executive_suite__", "mcp__hydra_gateway__executive_suite__"),
+        ("mcp__rlm_creative__", "mcp__hydra_gateway__rlm_creative__"),
+    ]
+    count = 0
+    for old, new in replacements:
+        if old in raw and new not in raw:
+            occurrences = raw.count(old)
+            raw = raw.replace(old, new)
+            count += occurrences
+            print(f"  {old} → {new} ({occurrences} occurrences)")
+
+    if count == 0:
+        print("No matchers to update (already migrated or no matches found)")
+        return 0
+
+    settings_path.write_text(raw, encoding="utf-8")
+    print(f"\nUpdated {count} matcher/permission entries in {settings_path}")
+    return 0
+
+
+def _cmd_gateway_remove_old_backends(args) -> int:
+    """Remove old backend entries from ~/.claude.json (keep only hydra_gateway)."""
+    from .dispatcher import BACKEND_REGISTRY
+    if not BACKEND_REGISTRY.exists():
+        print("ERROR: ~/.hydra/backends.json must exist before removing old entries.")
+        print("Run: hydra gateway-export-backends first.")
+        return 1
+
+    claude_json = Path.home() / ".claude.json"
+    if not claude_json.exists():
+        print("~/.claude.json not found")
+        return 1
+
+    raw = json.loads(claude_json.read_text(encoding="utf-8"))
+    mcp = raw.get("mcpServers", {})
+    keep = {"hydra_gateway", "hydra_toolshed"}
+    removed = [k for k in list(mcp) if k not in keep]
+    for k in removed:
+        del mcp[k]
+
+    raw["mcpServers"] = mcp
+    claude_json.write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
+    print(f"Removed {len(removed)} backend entries from ~/.claude.json: {removed}")
+    print(f"Remaining: {sorted(mcp.keys())}")
+    return 0
+
+
+def _cmd_gateway_rollback(args) -> int:
+    """Restore ~/.claude.json and settings.json from a backup."""
+    import shutil
+    backup_dir = Path(args.backup) if args.backup else None
+    if not backup_dir:
+        backups_root = Path.home() / ".hydra" / "backups"
+        if backups_root.exists():
+            dirs = sorted(backups_root.iterdir(), reverse=True)
+            if dirs:
+                backup_dir = dirs[0]
+    if not backup_dir or not backup_dir.exists():
+        print("No backup found. Specify --backup <path>")
+        return 1
+
+    targets = [
+        ("claude.json.bak", Path.home() / ".claude.json"),
+        ("settings.json.bak", Path.home() / ".claude" / "settings.json"),
+    ]
+    for bak_name, target in targets:
+        bak = backup_dir / bak_name
+        if bak.exists():
+            shutil.copy2(bak, target)
+            print(f"  restored: {bak} → {target}")
+        else:
+            print(f"  skipped (no backup): {bak_name}")
+    print(f"\nRollback complete from {backup_dir}")
+    return 0
+
+
+def _cmd_gateway_setup(args) -> int:
+    """Interactive setup for fresh machines. Discovers siblings, writes backends.json."""
+    import os
+    templates_path = Path(__file__).parent / "gateway_templates.json"
+    if not templates_path.exists():
+        print(f"Template registry not found at {templates_path}")
+        return 1
+
+    templates = json.loads(templates_path.read_text(encoding="utf-8"))
+    hydra_root = Path(__file__).resolve().parents[1]
+
+    default_paths = {
+        "HYDRA_ROOT": str(hydra_root),
+        "PP_ROOT": str(hydra_root.parent / "pair-programmer"),
+        "EIGHTS_ROOT": str(hydra_root.parent / "TheEights"),
+        "AGENTSMITH_ROOT": str(hydra_root.parent / "AgentSmith"),
+        "ES_ROOT": str(hydra_root.parent / "ExecutiveSuite"),
+        "RLM_ROOT": str(hydra_root.parent / "RLM-Creative"),
+        "USERPROFILE": os.environ.get("USERPROFILE", str(Path.home())),
+    }
+
+    backends: dict[str, dict] = {}
+    for name, template in templates.items():
+        if name.startswith("_"):
+            continue
+        required = template.get("required", False)
+        desc = template.get("description", name)
+
+        spec: dict[str, Any] = {"type": template.get("type", "stdio")}
+        spec["command"] = template["command"]
+
+        if "args_template" in template:
+            spec["args"] = [_interpolate(a, default_paths) for a in template["args_template"]]
+        else:
+            spec["args"] = template.get("args", [])
+
+        if "cwd_template" in template:
+            spec["cwd"] = _interpolate(template["cwd_template"], default_paths)
+
+        if "env_template" in template:
+            spec["env"] = {k: _interpolate(v, default_paths) for k, v in template["env_template"].items()}
+        elif "env" in template:
+            spec["env"] = template["env"]
+
+        check_path = spec["args"][0] if spec["args"] else spec.get("cwd", "")
+        exists = Path(check_path).exists() if check_path else False
+
+        if exists or required:
+            backends[name] = spec
+            status = "FOUND" if exists else "REQUIRED (not found)"
+            print(f"  [{status}] {name}: {desc}")
+        else:
+            print(f"  [SKIP]  {name}: {desc} — not found at {check_path}")
+
+    from .dispatcher import BACKEND_REGISTRY
+    BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_REGISTRY.write_text(json.dumps(backends, indent=2), encoding="utf-8")
+    print(f"\nWrote {len(backends)} backends to {BACKEND_REGISTRY}")
+    return 0
+
+
+def _interpolate(template: str, values: dict[str, str]) -> str:
+    result = template
+    for key, val in values.items():
+        result = result.replace(f"{{{key}}}", val)
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hydra", description="Enterprise Agent Mesh supervisor")
     ap.add_argument("--project", help="Project root (defaults to cwd)")
@@ -320,6 +523,15 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("workflow_id")
     sub.add_parser("approve").add_argument("workflow_id")
 
+    # gateway management
+    sub.add_parser("gateway-backup")
+    sub.add_parser("gateway-export-backends")
+    sub.add_parser("gateway-migrate-hooks")
+    sub.add_parser("gateway-remove-old-backends")
+    gr = sub.add_parser("gateway-rollback")
+    gr.add_argument("--backup", help="Path to backup directory")
+    sub.add_parser("gateway-setup")
+
     # `memory query <cell>` and `memory tag <key> --cells …`
     mem = sub.add_parser("memory")
     msub = mem.add_subparsers(dest="memcmd", required=True)
@@ -346,6 +558,12 @@ def main(argv: list[str] | None = None) -> int:
         "status": _cmd_status,
         "trace": _cmd_trace,
         "approve": lambda a: (print("approval pathway lives in the Claude Code plugin (/hydra:approve)"), 0)[1],
+        "gateway-backup": _cmd_gateway_backup,
+        "gateway-export-backends": _cmd_gateway_export_backends,
+        "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,
+        "gateway-remove-old-backends": _cmd_gateway_remove_old_backends,
+        "gateway-rollback": _cmd_gateway_rollback,
+        "gateway-setup": _cmd_gateway_setup,
     }[args.cmd](args)
 
 

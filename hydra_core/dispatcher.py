@@ -58,15 +58,47 @@ def _load_user_scope_mcp() -> dict[str, dict[str, Any]]:
     return {name: _strip_comments(spec) for name, spec in servers.items()}
 
 
-def _load_mcp_config(project_root: Path) -> dict[str, dict[str, Any]]:
-    """Merge user-scope and (optional) project-scope MCP server registrations.
+BACKEND_REGISTRY = Path.home() / ".hydra" / "backends.json"
 
-    User scope is the canonical source; project-scope `.mcp.json` — if present
-    — overrides individual entries. Hydra ships no `.mcp.json` of its own as
-    of 2026-05-21, but the override path is preserved for downstream consumers
-    that need to pin a specific daemon revision per project.
+
+def _load_backend_registry() -> dict[str, dict[str, Any]]:
+    """Read the Hydra-owned backend registry at ``~/.hydra/backends.json``.
+
+    This file contains the same server specs as ``~/.claude.json`` mcpServers
+    but lives outside Claude Code's discovery path. Used in gateway mode when
+    backends are no longer registered in ``~/.claude.json`` but Hydra's
+    internal dispatcher still needs to reach them.
+
+    Returns {} if the file is missing or unreadable.
     """
-    merged = _load_user_scope_mcp()
+    if not BACKEND_REGISTRY.exists():
+        return {}
+    try:
+        raw = json.loads(BACKEND_REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(raw, dict):
+        return {name: _strip_comments(spec) for name, spec in raw.items()
+                if isinstance(spec, dict)}
+    return {}
+
+
+def _load_mcp_config(project_root: Path) -> dict[str, dict[str, Any]]:
+    """Merge backend sources in precedence order.
+
+    Resolution: ``~/.hydra/backends.json`` (base) → ``~/.claude.json``
+    mcpServers (override) → project ``.mcp.json`` (final override).
+
+    In standalone mode (no gateway): backends.json doesn't exist, so
+    ``~/.claude.json`` is the only source — identical to pre-gateway behavior.
+
+    In gateway mode: backends removed from ``~/.claude.json`` are still found
+    via ``backends.json``, so Hydra's internal dispatcher (supervisor, judge,
+    squad_node) continues working.
+    """
+    merged = _load_backend_registry()
+    for name, spec in _load_user_scope_mcp().items():
+        merged[name] = spec
     cfg = project_root / ".mcp.json"
     if cfg.exists():
         try:
@@ -243,17 +275,17 @@ class MCPStdioDispatcher:
             return {
                 "status": "failed",
                 "error": (
-                    f"server {server!r} not registered at user scope "
-                    f"(~/.claude.json mcpServers) or project scope (.mcp.json). "
+                    f"server {server!r} not registered in backends.json, "
+                    f"~/.claude.json, or .mcp.json. "
                     f"Known: {sorted(self._servers)[:10]}"
                 ),
             }
 
-        # Open a fresh session per call. (For production: pool/cache by server.)
         params = StdioServerParameters(
             command=spec["command"],
             args=list(spec.get("args", [])),
             env=spec.get("env"),
+            cwd=spec.get("cwd"),
         )
         try:
             async with stdio_client(params) as (read, write):

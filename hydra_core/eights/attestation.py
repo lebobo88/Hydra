@@ -7,10 +7,11 @@ The daemon exposes MCP tools — `eights.constitution.attest`,
 event into a shared SQL ledger so cross-consumer audits work.
 
 This module is the Hydra-side caller. It calls those MCP tools **best-effort**:
-when the eights-daemon is not yet registered at user scope (~/.claude.json)
-or a project-scope `.mcp.json` override (or any tool is missing), each method
-no-ops cleanly. This lets Hydra ship the call sites today and have them light
-up the moment the daemon is wired without further code changes here.
+when the eights-daemon is not reachable via the dispatcher (checked in
+``~/.hydra/backends.json`` → ``~/.claude.json`` → ``.mcp.json`` resolution
+order), each method no-ops cleanly. This lets Hydra ship the call sites
+today and have them light up the moment the daemon is wired without further
+code changes here.
 
 Per `AGENTS.md` layering:
   - Hydra emits attestations; eights stores them.

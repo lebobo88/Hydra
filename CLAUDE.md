@@ -39,7 +39,14 @@ Hydra dispatches to pair-programmer via the engineering squad internally.
 
 ### Connected Systems (use proactively on every interaction)
 
-- **AgentSmith** (mcp__agentsmith__*) — validate artifacts, audit decisions, inspect schemas, keymaker scans
-- **TheEights** (mcp__eights__*) — query memory, check governance, propose evolutions, cell classification
-- **ExecutiveSuite** (mcp__executive_suite__*) — strategic framing, executive briefs, roster queries
-- **Hydra Memory** (mcp__hydra_memory__*) — episodic recall, semantic search, workflow history
+In gateway mode (tool names prefixed with `mcp__hydra_gateway__`):
+- **AgentSmith** (mcp__hydra_gateway__agentsmith__*) — validate artifacts, audit decisions, inspect schemas, keymaker scans
+- **TheEights** (mcp__hydra_gateway__eights__*) — query memory, check governance, propose evolutions, cell classification
+- **ExecutiveSuite** (mcp__hydra_gateway__executive_suite__*) — strategic framing, executive briefs, roster queries
+- **Hydra Memory** (mcp__hydra_gateway__hydra_memory__*) — episodic recall, semantic search, workflow history
+- **Gateway Meta-Tools** (gateway.*) — search, describe, navigate, scope, health across all backends
+
+In standalone mode (without gateway, each system registered individually):
+- **AgentSmith** (mcp__agentsmith__*), **TheEights** (mcp__eights__*), **ExecutiveSuite** (mcp__executive_suite__*), **Hydra Memory** (mcp__hydra_memory__*)
+
+See `docs/MCP_SETUP.md` for setup and migration instructions.

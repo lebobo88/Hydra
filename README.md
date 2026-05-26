@@ -308,10 +308,24 @@ Hydra ships six MCP servers (registered via the [plugin manifest](.claude-plugin
 
 Plus two **optional sibling MCP servers**, registered separately at user scope when present:
 
-- `agentsmith` — from the sibling [AgentSmith](https://github.com/lebobo88/AgentSmith) project. Register with `claude mcp add agentsmith ...`. Enforces the N1–N10 invariants when present.
-- `theeights` — from the sibling [TheEights](https://github.com/lebobo88/TheEights) project. Register with `claude mcp add theeights ...`. Provides the cross-project hybrid memory + audit graph + autogenesis loop. Optional — Hydra runs fully without it; the in-repo `hydra-memory` server is the default substrate.
+- `agentsmith` — from the sibling [AgentSmith](https://github.com/lebobo88/AgentSmith) project. Enforces the N1–N10 invariants when present.
+- `theeights` — from the sibling [TheEights](https://github.com/lebobo88/TheEights) project. Provides the cross-project hybrid memory + audit graph + autogenesis loop. Optional — Hydra runs fully without it; the in-repo `hydra-memory` server is the default substrate.
 
-Tool names are namespaced. The host enforces RBAC: a squad requesting an out-of-scope tool gets a typed refusal envelope, not a silent failure. **Blast radius equals namespace.**
+### Gateway consolidation
+
+In **gateway mode**, all 8 servers are consolidated behind a single `hydra_gateway` MCP registration. Claude Code sees one server; the gateway proxies to backends discovered from `~/.hydra/backends.json`. Each connected system still works independently without Hydra — you pick and choose which to install.
+
+```bash
+# Migrate from 8 servers to 1 gateway:
+python -m hydra_core.cli gateway-backup
+python -m hydra_core.cli gateway-export-backends
+python -m hydra_core.cli gateway-migrate-hooks
+# Then register hydra_gateway via /mcp and remove old entries
+```
+
+See [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md) for full setup and migration instructions.
+
+Tool names are namespaced. The dispatcher enforces RBAC: a squad requesting an out-of-scope tool gets a typed refusal envelope, not a silent failure. **Blast radius equals namespace.**
 
 For the public per-crown surface, see [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CROWN.md).
 

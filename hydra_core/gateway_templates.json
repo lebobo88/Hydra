@@ -1,0 +1,80 @@
+{
+  "_comment": "Template registry for clean-machine gateway bootstrap. Path variables ({VAR}) are interpolated from environment or interactive prompts.",
+  "pp_harness": {
+    "type": "stdio",
+    "command": "node",
+    "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp"],
+    "env": {},
+    "required": false,
+    "description": "Pair-programmer harness daemon"
+  },
+  "pp_codex": {
+    "type": "stdio",
+    "command": "node",
+    "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp-codex"],
+    "env": {},
+    "required": false,
+    "description": "Cross-vendor critique via OpenAI Codex"
+  },
+  "pp_gemini": {
+    "type": "stdio",
+    "command": "node",
+    "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp-gemini"],
+    "env": {},
+    "required": false,
+    "description": "Cross-vendor critique via Google Gemini"
+  },
+  "eights": {
+    "type": "stdio",
+    "command": "node",
+    "args_template": ["{EIGHTS_ROOT}/daemon/dist/index.js"],
+    "env": {"EIGHTS_LOG_LEVEL": "info"},
+    "required": false,
+    "description": "TheEights evolution and governance daemon"
+  },
+  "agentsmith": {
+    "type": "stdio",
+    "command": "node",
+    "args_template": ["{AGENTSMITH_ROOT}/daemon/dist/index.js"],
+    "env": {},
+    "required": false,
+    "description": "AgentSmith artifact validation and audit"
+  },
+  "hydra_memory": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.hydra_memory"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_EPISODIC_DB": "{USERPROFILE}/.hydra/episodic.db",
+      "HYDRA_VECTOR_DIR": "{USERPROFILE}/.hydra/vectors"
+    },
+    "required": true,
+    "description": "Hydra episodic and semantic memory"
+  },
+  "executive_suite": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.executive_suite"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_ES_ROOT": "{ES_ROOT}"
+    },
+    "required": false,
+    "description": "ExecutiveSuite pack introspection"
+  },
+  "rlm_creative": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.rlm_creative"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_RLM_ROOT": "{RLM_ROOT}"
+    },
+    "required": false,
+    "description": "RLM-Creative pack introspection"
+  }
+}

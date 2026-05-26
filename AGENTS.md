@@ -43,7 +43,9 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
 - PII / PHI / financial data is redacted at squad boundaries (`governance.redact_for_squad_boundary`) unless the receiving squad's `squad.yaml` has explicit allow-list.
 - The healthcare squad's `phi-redactor` agent runs FIRST on every inbound envelope.
-- MCP tools are namespaced and whitelisted per-squad. The host enforces RBAC; agents do not self-check.
+- MCP tools are namespaced and whitelisted per-squad. The dispatcher enforces RBAC at runtime; agents do not self-check.
+- In gateway mode, all MCP tools are proxied through `hydra_gateway`. Tool names follow the pattern `mcp__hydra_gateway__{server}__{tool}`. Backend specs live in `~/.hydra/backends.json`, not `~/.claude.json`.
+- Each connected system (pair-programmer, TheEights, AgentSmith, ExecutiveSuite, RLM-Creative) can also run independently without Hydra by registering its MCP server directly.
 
 ## Where To Read More
 

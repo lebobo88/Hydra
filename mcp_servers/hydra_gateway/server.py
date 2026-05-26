@@ -1,195 +1,224 @@
 """Hydra Gateway — unified MCP server proxying all backend servers.
 
-Integrates RBAC enforcement (Phase A), meta-tool facade (Phase B),
-intent-based tool gating (Phase C1), and progressive disclosure (Phase C3)
-into a single MCP endpoint.
+Consolidates 8 individual MCP server registrations into 1. Claude Code
+registers only `hydra_gateway`; it discovers backends from
+``~/.hydra/backends.json`` and proxies tool calls to them.
 
-Replaces the need to register 8 separate MCP servers at user scope.
-Agents interact with one server that routes to the correct backend.
+Backend tools are exposed under their original server-qualified names:
+``{server}__{tool_name}`` → Claude sees ``mcp__hydra_gateway__{server}__{tool_name}``.
 
-Tools:
-  - gateway.discover     — list available servers and categories
-  - gateway.search       — search tools by keyword across all servers
-  - gateway.describe     — get full schema for a specific tool
-  - gateway.call         — execute a tool on its backend server (with RBAC)
-  - gateway.scope        — get the tool scope for a goal + squad combo
-  - gateway.health       — check which backend servers are reachable
+Also exposes 7 gateway meta-tools for search/describe/navigate/health.
 
-Resource URIs:
-  - hydra://squad/{slug}/tools  — tools available to a specific squad
-  - hydra://server/{name}/tools — all tools on a specific server
+Architecture:
+- AsyncBackendPool manages long-lived async MCP client sessions
+- Reads ~/.hydra/backends.json (NOT ~/.claude.json — avoids circular dep)
+- Self-excludes hydra_gateway/hydra_toolshed entries to prevent recursion
+- Per-backend failure isolation: one backend down doesn't affect others
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import signal
 import sys
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 
-from hydra_core.toolshed import ToolShed, ProgressiveDisclosureTree, build_default_shed  # noqa: E402
+from hydra_core.dispatcher import BACKEND_REGISTRY, _load_backend_registry, _strip_comments  # noqa: E402
+from hydra_core.toolshed import build_default_shed, ProgressiveDisclosureTree  # noqa: E402
 from hydra_core.squad_loader import discover_squads  # noqa: E402
-from hydra_core.tool_scope import (  # noqa: E402
-    build_tool_scope_directive,
-    squad_tool_manifest,
-)
 from hydra_core.router import compute_tool_scope  # noqa: E402
 
-
-def _build_gateway() -> tuple[ToolShed, dict, ProgressiveDisclosureTree]:
-    """Build the gateway's internal state."""
-    project_root = _HERE.parents[2]
-    shed = build_default_shed()
-    packs = discover_squads(project_root)
-    tree = ProgressiveDisclosureTree(shed, packs)
-    return shed, packs, tree
+_SELF_NAMES = frozenset({"hydra_gateway", "hydra_toolshed"})
+_CONNECT_TIMEOUT = 10.0
 
 
-def _tool_handlers() -> dict[str, callable]:
-    shed, packs, tree = _build_gateway()
+class AsyncBackendPool:
+    """Manages async MCP client sessions to backend servers."""
 
-    def discover(args: dict[str, Any]) -> dict[str, Any]:
-        server_filter = args.get("server")
-        squad_filter = args.get("squad")
+    def __init__(self, specs: dict[str, dict[str, Any]]) -> None:
+        self._specs = {k: v for k, v in specs.items() if k not in _SELF_NAMES}
+        self._stack = AsyncExitStack()
+        self._sessions: dict[str, Any] = {}
+        self._tool_cache: dict[str, list[dict[str, Any]]] = {}
+        self._failed: set[str] = set()
 
-        if squad_filter:
-            pack = packs.get(squad_filter)
-            if pack is None:
-                return {"error": "unknown_squad", "squad": squad_filter}
-            return squad_tool_manifest(pack)
+    @property
+    def server_names(self) -> list[str]:
+        return sorted(self._specs.keys())
 
-        result: dict[str, Any] = {
-            "servers": shed.list_servers(),
-            "squads": [
-                {
-                    "slug": s,
-                    "name": p.name,
-                    "entrypoint": p.entrypoint,
-                    "tool_count": len(p.tools),
-                }
-                for s, p in sorted(packs.items())
-            ],
-        }
-        if server_filter:
-            result["categories"] = shed.list_categories(server=server_filter)
-        else:
-            result["categories"] = shed.list_categories()
-        return result
+    async def _connect(self, server: str) -> Any:
+        """Open a stdio session to a backend. Returns the ClientSession."""
+        if server in self._sessions:
+            return self._sessions[server]
+        if server not in self._specs:
+            return None
 
-    def search(args: dict[str, Any]) -> dict[str, Any]:
-        results = shed.search(
-            args.get("query", ""),
-            server=args.get("server"),
-            category=args.get("category"),
-            limit=int(args.get("limit", 10)),
+        try:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+        except ImportError:
+            return None
+
+        spec = self._specs[server]
+        params = StdioServerParameters(
+            command=spec["command"],
+            args=list(spec.get("args", [])),
+            env=spec.get("env"),
+            cwd=spec.get("cwd"),
         )
-        return {
-            "results": [
+        try:
+            transport = await asyncio.wait_for(
+                self._stack.enter_async_context(stdio_client(params)),
+                timeout=_CONNECT_TIMEOUT,
+            )
+            read, write = transport
+            session = await self._stack.enter_async_context(
+                ClientSession(read, write)
+            )
+            await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
+            self._sessions[server] = session
+            self._failed.discard(server)
+            logger.info("Connected to backend: %s", server)
+            return session
+        except Exception as exc:
+            logger.warning("Failed to connect to %s: %s", server, exc)
+            self._failed.add(server)
+            return None
+
+    async def list_tools(self, server: str) -> list[dict[str, Any]]:
+        """Get tool list from a backend (cached after first successful call)."""
+        if server in self._tool_cache:
+            return self._tool_cache[server]
+
+        session = await self._connect(server)
+        if session is None:
+            return []
+
+        try:
+            result = await asyncio.wait_for(session.list_tools(), timeout=_CONNECT_TIMEOUT)
+            tools = [
                 {
-                    "server": r.server,
-                    "name": r.name,
-                    "description": r.description,
-                    "category": r.category,
-                    "relevance": r.relevance_score,
+                    "name": t.name,
+                    "description": getattr(t, "description", t.name) or t.name,
+                    "inputSchema": getattr(t, "inputSchema", {"type": "object"}),
                 }
-                for r in results
-            ],
-            "count": len(results),
-        }
+                for t in result.tools
+            ]
+            self._tool_cache[server] = tools
+            return tools
+        except Exception as exc:
+            logger.warning("list_tools failed for %s: %s", server, exc)
+            self._failed.add(server)
+            return []
 
-    def describe(args: dict[str, Any]) -> dict[str, Any]:
-        entry = shed.describe(args.get("server", ""), args.get("tool_name", ""))
-        if entry is None:
-            return {"error": "not_found"}
-        return entry
+    async def call_tool(self, server: str, tool: str,
+                        args: dict[str, Any]) -> dict[str, Any]:
+        """Forward a tool call to a backend."""
+        session = await self._connect(server)
+        if session is None:
+            return {
+                "status": "failed",
+                "error": f"backend {server!r} not connected",
+            }
+        try:
+            result = await session.call_tool(tool, args)
+            return _extract_result(result)
+        except Exception as exc:
+            self._failed.add(server)
+            self._sessions.pop(server, None)
+            return {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "server": server,
+                "tool": tool,
+            }
 
-    def call(args: dict[str, Any]) -> dict[str, Any]:
-        server = args.get("server", "")
-        tool_name = args.get("tool_name", "")
-        tool_args = args.get("args", {})
-        squad_id = args.get("squad_id")
-        if squad_id:
-            pack = packs.get(squad_id)
-            if pack:
-                allowed = {t.name for t in pack.tools}
-                if tool_name not in allowed:
-                    mcp_servers = {t.mcp_server for t in pack.tools if t.mcp_server}
-                    full_names = {f"{t.mcp_server}.{t.name}" if t.mcp_server else t.name for t in pack.tools}
-                    key = f"{server}.{tool_name}"
-                    if key not in full_names and tool_name not in allowed:
-                        return {
-                            "status": "rejected",
-                            "error": f"RBAC: squad {squad_id!r} not authorized for {tool_name} on {server}",
-                            "allowed_tools": sorted(allowed),
-                        }
-        return shed.execute(server, tool_name, tool_args, squad_id=squad_id)
+    async def discover_all_tools(self) -> list[dict[str, Any]]:
+        """Discover tools from all backends. Returns namespaced tool list."""
+        all_tools: list[dict[str, Any]] = []
+        for server in self.server_names:
+            backend_tools = await self.list_tools(server)
+            for t in backend_tools:
+                all_tools.append({
+                    "name": f"{server}__{t['name']}",
+                    "description": f"[{server}] {t.get('description', t['name'])}",
+                    "inputSchema": t.get("inputSchema", {"type": "object"}),
+                    "_backend_server": server,
+                    "_backend_tool": t["name"],
+                })
+        return all_tools
 
-    def scope(args: dict[str, Any]) -> dict[str, Any]:
-        goal = args.get("goal", "")
-        squad_slugs = args.get("squads", [])
-        if isinstance(squad_slugs, str):
-            squad_slugs = [squad_slugs]
-        ts = compute_tool_scope(goal, squad_slugs, packs, toolshed=shed)
+    async def health(self) -> dict[str, Any]:
         return {
-            "relevant_tools": list(ts.relevant_tools),
-            "relevant_categories": list(ts.relevant_categories),
-            "intent_keywords": list(ts.intent_keywords),
-            "tool_count": ts.tool_count,
+            "registered": self.server_names,
+            "connected": sorted(self._sessions.keys()),
+            "failed": sorted(self._failed),
+            "cached_tool_counts": {s: len(t) for s, t in self._tool_cache.items()},
         }
 
-    def health(args: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "toolshed": shed.stats(),
-            "squads_discovered": len(packs),
-            "squad_slugs": sorted(packs.keys()),
-            "status": "ok",
-        }
-
-    def navigate(args: dict[str, Any]) -> dict[str, Any]:
-        path = args.get("path", "")
-        result = tree.navigate(path)
-        result["token_estimate"] = tree.token_estimate()
-        return result
-
-    return {
-        "gateway.discover": discover,
-        "gateway.search": search,
-        "gateway.describe": describe,
-        "gateway.call": call,
-        "gateway.scope": scope,
-        "gateway.health": health,
-        "gateway.navigate": navigate,
-    }
+    async def close(self) -> None:
+        """Shut down all backend connections."""
+        try:
+            await self._stack.aclose()
+        except Exception as exc:
+            logger.warning("Error closing backend pool: %s", exc)
+        self._sessions.clear()
+        self._tool_cache.clear()
 
 
-TOOL_SCHEMAS = {
+def _extract_result(result: Any) -> dict[str, Any]:
+    content = getattr(result, "content", None)
+    if not content:
+        return {"status": "done", "result": str(result)}
+    out: list[Any] = []
+    for c in content:
+        text = getattr(c, "text", None)
+        if text is None:
+            out.append(str(c))
+            continue
+        try:
+            out.append(json.loads(text))
+        except (json.JSONDecodeError, TypeError):
+            out.append(text)
+    payload = out[0] if len(out) == 1 else out
+    return {"status": "done", "result": payload}
+
+
+# ---------- Meta-tool schemas ----------
+
+META_TOOL_SCHEMAS = {
     "gateway.discover": {
-        "description": "List available servers, squads, and tool categories. Optionally filter by server or squad.",
+        "description": "List available backend servers, squads, and tool categories.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "Filter by MCP server"},
-                "squad": {"type": "string", "description": "Show tools for a specific squad"},
+                "server": {"type": "string"},
+                "squad": {"type": "string"},
             },
         },
     },
     "gateway.search": {
-        "description": "Search tools by keyword across all registered servers.",
+        "description": "Search tools by keyword across all backend servers.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Search keywords"},
-                "server": {"type": "string", "description": "Filter by server"},
-                "category": {"type": "string", "description": "Filter by category"},
+                "query": {"type": "string"},
+                "server": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
             },
             "required": ["query"],
         },
     },
     "gateway.describe": {
-        "description": "Get full schema and metadata for a specific tool.",
+        "description": "Get full schema for a specific backend tool.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -199,125 +228,166 @@ TOOL_SCHEMAS = {
             "required": ["server", "tool_name"],
         },
     },
-    "gateway.call": {
-        "description": "Execute a tool on its backend server. RBAC enforced when squad_id is provided.",
+    "gateway.navigate": {
+        "description": "Progressive disclosure: navigate the tool tree. Path: '' (squads) → 'squad' (servers) → 'server' (categories) → 'server/category' (tools) → 'server/category/tool' (schema).",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string"},
-                "tool_name": {"type": "string"},
-                "args": {"type": "object"},
-                "squad_id": {"type": "string", "description": "Calling squad for RBAC enforcement"},
+                "path": {"type": "string"},
             },
-            "required": ["server", "tool_name"],
         },
     },
     "gateway.scope": {
-        "description": "Compute intent-based tool scope for a goal + squad combination.",
+        "description": "Compute intent-based tool scope for a goal.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "goal": {"type": "string", "description": "The goal text to analyze"},
-                "squads": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Squad slugs to scope tools for",
-                },
+                "goal": {"type": "string"},
+                "squads": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["goal"],
         },
     },
     "gateway.health": {
-        "description": "Check gateway health: toolshed stats, discovered squads, backend status.",
+        "description": "Check gateway health: backend connections, tool counts, failures.",
         "inputSchema": {"type": "object", "properties": {}},
-    },
-    "gateway.navigate": {
-        "description": "Progressive disclosure: navigate the tool tree level by level. "
-                       "Path format: '' (squads) → 'squad_slug' (servers) → 'server' (categories) "
-                       "→ 'server/category' (tools) → 'server/category/tool_name' (full schema).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Slash-delimited path: '' | 'engineering' | 'pp_harness' | 'pp_harness/read' | 'pp_harness/read/get_rubric'",
-                },
-            },
-        },
     },
 }
 
 
-def _serve_with_mcp_sdk() -> bool:
-    try:
-        from mcp.server import Server  # type: ignore
-        from mcp.server.stdio import stdio_server  # type: ignore
-        import mcp.types as t  # type: ignore
-    except ImportError:
-        return False
+# ---------- MCP Server ----------
 
-    handlers = _tool_handlers()
+def main() -> None:
+    try:
+        from mcp.server import Server
+        from mcp.server.stdio import stdio_server
+        import mcp.types as t
+    except ImportError:
+        sys.stderr.write("hydra-gateway: mcp SDK required. pip install mcp\n")
+        sys.exit(1)
+
+    specs = _load_backend_registry()
+    pool = AsyncBackendPool(specs)
+
+    project_root = _HERE.parents[2]
+    shed = build_default_shed()
+    packs = discover_squads(project_root)
+    tree = ProgressiveDisclosureTree(shed, packs)
+
     server = Server("hydra-gateway")
 
     @server.list_tools()
     async def _list_tools():
-        return [
+        proxied = await pool.discover_all_tools()
+        tools = [
             t.Tool(
+                name=pt["name"],
+                description=pt["description"],
+                inputSchema=pt.get("inputSchema", {"type": "object"}),
+            )
+            for pt in proxied
+        ]
+        for name, schema in META_TOOL_SCHEMAS.items():
+            tools.append(t.Tool(
                 name=name,
                 description=schema["description"],
                 inputSchema=schema["inputSchema"],
-            )
-            for name, schema in TOOL_SCHEMAS.items()
-        ]
+            ))
+        return tools
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict):
-        if name not in handlers:
-            raise ValueError(f"unknown tool: {name}")
-        result = handlers[name](arguments)
-        return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+        if name in META_TOOL_SCHEMAS:
+            result = await _handle_meta_tool(name, arguments, pool, shed, packs, tree)
+            return [t.TextContent(type="text", text=json.dumps(result, default=str))]
 
-    import asyncio
+        if "__" in name:
+            parts = name.split("__", 1)
+            if len(parts) == 2:
+                backend_server, backend_tool = parts
+                result = await pool.call_tool(backend_server, backend_tool, arguments)
+                return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+
+        return [t.TextContent(type="text", text=json.dumps({
+            "status": "failed",
+            "error": f"unknown tool: {name}. Use gateway.search to find tools.",
+        }))]
 
     async def run() -> None:
         async with stdio_server() as (r, w):
-            await server.run(r, w, server.create_initialization_options())
+            try:
+                await server.run(r, w, server.create_initialization_options())
+            finally:
+                await pool.close()
 
-    asyncio.run(run())
-    return True
-
-
-def _serve_bare() -> None:
-    handlers = _tool_handlers()
-    sys.stderr.write("hydra-gateway: serving in bare-stdio fallback mode\n")
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError as e:
-            sys.stdout.write(json.dumps({"error": "parse_error", "detail": str(e)}) + "\n")
-            sys.stdout.flush()
-            continue
-        try:
-            method = msg.get("method") or msg.get("tool")
-            args = msg.get("params") or msg.get("arguments") or {}
-            if method == "list_tools":
-                out = {"id": msg.get("id"), "result": list(TOOL_SCHEMAS.keys())}
-            elif method in handlers:
-                out = {"id": msg.get("id"), "result": handlers[method](args)}
-            else:
-                out = {"id": msg.get("id"), "error": f"unknown_method: {method!r}"}
-        except Exception as e:
-            out = {"id": msg.get("id"), "error": str(e)}
-        sys.stdout.write(json.dumps(out, default=str) + "\n")
-        sys.stdout.flush()
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
 
 
-def main() -> None:
-    if not _serve_with_mcp_sdk():
-        _serve_bare()
+async def _handle_meta_tool(
+    name: str,
+    args: dict[str, Any],
+    pool: AsyncBackendPool,
+    shed: Any,
+    packs: dict,
+    tree: Any,
+) -> dict[str, Any]:
+    if name == "gateway.health":
+        return await pool.health()
+
+    if name == "gateway.discover":
+        squad_filter = args.get("squad")
+        if squad_filter and squad_filter in packs:
+            from hydra_core.tool_scope import squad_tool_manifest
+            return squad_tool_manifest(packs[squad_filter])
+        return {
+            "servers": [
+                {"server": s, "tool_count": len(await pool.list_tools(s))}
+                for s in pool.server_names
+            ],
+            "squads": [
+                {"slug": s, "name": p.name, "entrypoint": p.entrypoint}
+                for s, p in sorted(packs.items())
+            ],
+        }
+
+    if name == "gateway.search":
+        results = shed.search(
+            args.get("query", ""),
+            server=args.get("server"),
+            limit=int(args.get("limit", 10)),
+        )
+        return {
+            "results": [
+                {"server": r.server, "name": r.name,
+                 "description": r.description, "relevance": r.relevance_score}
+                for r in results
+            ],
+        }
+
+    if name == "gateway.describe":
+        entry = shed.describe(args.get("server", ""), args.get("tool_name", ""))
+        return entry or {"error": "not_found"}
+
+    if name == "gateway.navigate":
+        return tree.navigate(args.get("path", ""))
+
+    if name == "gateway.scope":
+        ts = compute_tool_scope(
+            args.get("goal", ""),
+            args.get("squads", []),
+            packs,
+            toolshed=shed,
+        )
+        return {
+            "relevant_tools": list(ts.relevant_tools),
+            "relevant_categories": list(ts.relevant_categories),
+            "intent_keywords": list(ts.intent_keywords),
+        }
+
+    return {"error": f"unknown meta-tool: {name}"}
 
 
 if __name__ == "__main__":

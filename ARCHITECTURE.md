@@ -201,9 +201,9 @@ flows through `agent-impersonation` and `claude-skill` entrypoints.
 | `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Evolution, governance, memory, cells |
 | `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Artifact validation, audit, constitution attestation |
 
-These must be registered in `~/.claude.json` before Hydra can reach
-them. `MCPStdioDispatcher.call_mcp()` returns `"server not registered"`
-when a server is absent — the system degrades gracefully.
+In **standalone mode** these are registered directly in `~/.claude.json`.
+In **gateway mode** their specs live in `~/.hydra/backends.json` and the
+gateway proxies them — see §6e.
 
 ### 6c. Non-MCP execution paths
 
@@ -224,6 +224,26 @@ validates every call against the calling squad's tool allowlist and
 rejects unauthorized access with a telemetry event. Cross-squad tool
 delegation is supported via `Handoff` envelopes carrying explicit
 `granted_tools` lists with expiration timestamps.
+
+### 6e. Gateway consolidation (two-layer registry)
+
+In gateway mode, Claude Code registers only `hydra_gateway`. Backend
+specs live in a separate Hydra-owned file:
+
+| Layer | File | Reader |
+|-------|------|--------|
+| Claude-visible | `~/.claude.json` (only `hydra_gateway`) | Claude Code |
+| Backend registry | `~/.hydra/backends.json` | Gateway + internal dispatcher |
+
+The gateway reads `backends.json`, connects to each backend via stdio,
+and re-exposes their tools under namespaced names:
+`{server}__{tool_name}` → Claude sees `mcp__hydra_gateway__{server}__{tool_name}`.
+
+Hydra's internal dispatcher (`MCPStdioDispatcher`) also reads
+`backends.json` as a fallback, so supervisor/judge/squad_node calls
+still work when backends are absent from `~/.claude.json`.
+
+See `docs/MCP_SETUP.md` for migration and setup instructions.
 
 ## 7. Governance plane
 

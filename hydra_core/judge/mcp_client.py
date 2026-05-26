@@ -6,13 +6,15 @@ real cross-vendor judgments. Reuses Hydra's existing `MCPStdioDispatcher` to
 avoid duplicating MCP-stdio plumbing.
 
 Configuration:
-  - User scope (~/.claude.json) must register `pp_codex` and `pp_gemini` servers
-    (one stdio entry each, pointing at the compiled pair-programmer daemon).
+  - `pp_codex` and `pp_gemini` servers must be reachable via the dispatcher.
+    In standalone mode: registered in `~/.claude.json` mcpServers.
+    In gateway mode: registered in `~/.hydra/backends.json` (the dispatcher
+    checks both locations with backends.json as fallback).
   - `cwd` defaults to the Hydra project root — PP uses it as the sandbox
     workspace for the critique call.
 
 Failure modes (all surface as JudgeDispatchError via the dispatcher):
-  - MCP server missing from user scope (~/.claude.json mcpServers)
+  - MCP server missing from both ~/.claude.json and ~/.hydra/backends.json
   - critique tool returned status="failed"
   - response missing the expected `outcome` field
 """
