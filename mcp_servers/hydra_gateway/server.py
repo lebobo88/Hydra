@@ -257,6 +257,36 @@ META_TOOL_SCHEMAS = {
 
 # ---------- MCP Server ----------
 
+def _build_static_tool_list(
+    shed: Any,
+    specs: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the tool list from the static toolshed catalog.
+
+    No live connections needed — the toolshed already catalogs 169 tools
+    from pp_harness, eights, and agentsmith. Tools are namespaced as
+    ``{server}__{tool_name}`` so Claude sees
+    ``mcp__hydra_gateway__{server}__{tool_name}``.
+
+    Live backends are connected on-demand only when ``call_tool`` is
+    invoked. This avoids startup latency and async context conflicts.
+    """
+    filtered = {k for k in specs if k not in _SELF_NAMES}
+    tools: list[dict[str, Any]] = []
+    for server_name in sorted(shed._catalog.keys()):
+        if server_name not in filtered and filtered:
+            continue
+        for entry in shed._catalog.get(server_name, []):
+            tools.append({
+                "name": f"{server_name}__{entry.name}",
+                "description": f"[{server_name}] {entry.description}",
+                "inputSchema": entry.input_schema or {"type": "object"},
+                "_backend_server": server_name,
+                "_backend_tool": entry.name,
+            })
+    return tools
+
+
 def main() -> None:
     try:
         from mcp.server import Server
@@ -267,25 +297,30 @@ def main() -> None:
         sys.exit(1)
 
     specs = _load_backend_registry()
-    pool = AsyncBackendPool(specs)
 
     project_root = _HERE.parents[2]
     shed = build_default_shed()
     packs = discover_squads(project_root)
     tree = ProgressiveDisclosureTree(shed, packs)
 
+    # Build tool list from static catalog — no live connections at startup.
+    # Backends are connected on-demand when call_tool is invoked.
+    cached_tools = _build_static_tool_list(shed, specs)
+
+    # The pool handles on-demand connections for call_tool proxying.
+    pool = AsyncBackendPool(specs)
+
     server = Server("hydra-gateway")
 
     @server.list_tools()
     async def _list_tools():
-        proxied = await pool.discover_all_tools()
         tools = [
             t.Tool(
                 name=pt["name"],
                 description=pt["description"],
                 inputSchema=pt.get("inputSchema", {"type": "object"}),
             )
-            for pt in proxied
+            for pt in cached_tools
         ]
         for name, schema in META_TOOL_SCHEMAS.items():
             tools.append(t.Tool(
