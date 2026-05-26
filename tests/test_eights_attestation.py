@@ -27,7 +27,7 @@ class _RecordingDispatcher:
         self.calls: list[dict] = []
         self.scripted = scripted or {}
 
-    def call_mcp(self, server, tool, args):
+    def call_mcp(self, server, tool, args, **_kw):
         self.calls.append({"server": server, "tool": tool, "args": args})
         if tool in self.scripted:
             return {"status": "done", "tool": tool, "result": self.scripted[tool]}

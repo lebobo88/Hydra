@@ -147,7 +147,7 @@ class _UpDispatcher:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any], **_kw: Any) -> dict[str, Any]:
         self.calls.append((server, tool, args))
         return {"status": "done", "tool": tool, "result": {"ok": True}}
 

@@ -36,7 +36,8 @@ class _RecordingDispatcher:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.fail_run_ids: set[str] = fail_run_ids or set()
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any],
+                 *, squad_id: str | None = None) -> dict[str, Any]:
         self.calls.append((server, tool, args))
         rid = args.get("run_id")
         if isinstance(rid, str) and rid in self.fail_run_ids:

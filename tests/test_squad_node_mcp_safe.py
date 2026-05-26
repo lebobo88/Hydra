@@ -21,7 +21,7 @@ class _RaisingDispatcher:
     def __init__(self):
         self.calls = 0
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any], **_kw: Any) -> dict:
         self.calls += 1
         raise RuntimeError(f"-32000 mock failure for {server}.{tool}")
 
@@ -31,7 +31,7 @@ class _SucceedingDispatcher:
         self.payload = payload
         self.calls = 0
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any], **_kw: Any) -> dict:
         self.calls += 1
         return {"status": "done", "tool": tool, "result": self.payload}
 
@@ -43,7 +43,7 @@ class _FlakyDispatcher:
         self.payload = payload
         self.calls = 0
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any], **_kw: Any) -> dict:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("transient")

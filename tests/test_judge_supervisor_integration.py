@@ -15,7 +15,7 @@ HYDRA_ROOT = Path(__file__).resolve().parents[1]
 
 class _StubDispatcher:
     """Minimal dispatcher protocol stand-in. Returns a fake result envelope."""
-    def call_mcp(self, server, tool, args):
+    def call_mcp(self, server, tool, args, **_kw):
         return {"status": "done", "tool": tool, "result": {"ok": True}}
 
     def spawn_subprocess(self, cmd, env=None):

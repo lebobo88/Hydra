@@ -116,21 +116,47 @@ agents:
 tools:
   - name: comfyui
     privilege: execute
-    notes: "Callable by Helios and video-synth only. All other agents are prohibited."
+    notes: >
+      ComfyUI node-based image/video generation pipeline.
+      Use for: image generation, video synthesis, visual asset production.
+      Not for: text content or copy — use gemini-content instead.
+      Restricted to: Helios and video-synth agents only.
   - name: gemini-image
     privilege: execute
+    notes: >
+      Google Gemini image generation and editing.
+      Use for: quick image drafts, concept art, visual brainstorming.
+      Not for: production video — use comfyui instead.
   - name: gemini-content
     privilege: execute
+    notes: >
+      Google Gemini text content generation.
+      Use for: copy drafts, content ideation, text-based creative.
+      Not for: image/video generation — use gemini-image or comfyui instead.
   - name: frontend-design
     privilege: advisory
-    notes: "Helios may propose landing-page mock-ups; implementation is delegated to the engineering squad."
+    notes: >
+      Frontend design skill for landing-page mock-ups and component specs.
+      Use for: proposing UI designs and layout concepts.
+      Not for: implementation — delegate to engineering squad via Handoff.
   - name: marketing-expertise
     privilege: read
+    notes: >
+      Marketing domain knowledge and best practices reference.
+      Use for: informing campaign strategy, audience targeting, channel selection.
+      Not for: executing campaigns or generating assets.
   - name: media-business
     privilege: read
+    notes: >
+      Media industry knowledge, pricing models, distribution channels.
+      Use for: informing media buying decisions, industry benchmarking.
+      Not for: financial modeling — that belongs to the executive squad.
   - name: eights-memory
     privilege: read+write
-    notes: "All ops require domain='creative' and at least one scope tag."
+    notes: >
+      TheEights memory fabric for creative domain.
+      Use for: storing/retrieving creative briefs, brand guidelines, campaign history.
+      Not for: engineering or financial data. All ops require domain='creative' and at least one scope tag.
 
 accepts:
   - CREATIVE_BRIEF

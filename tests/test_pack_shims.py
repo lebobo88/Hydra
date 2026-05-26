@@ -185,7 +185,7 @@ class _FakeDispatcher:
         self.calls: list[tuple[str, str, dict]] = []
         self._scripted = scripted
 
-    def call_mcp(self, server, tool, args):
+    def call_mcp(self, server, tool, args, **_kw):
         self.calls.append((server, tool, args))
         key = (server, tool)
         if key in self._scripted:

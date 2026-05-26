@@ -173,20 +173,57 @@ The synthesizer is the only node allowed to dereference handles in bulk.
 
 ## 6. MCP host topology
 
-Hydra is an MCP host. It opens one isolated client session per
-`(squad, server)` pair declared in `.mcp.json` and each squad's
-`squad.yaml#tools`. Tool names are namespaced:
+Hydra consumes MCP servers registered at operator-managed user scope
+(`~/.claude.json` mcpServers). It does **not** register them itself.
+The servers fall into three categories:
 
-- `hydra-eng.pp.*` — pair-programmer harness daemon (engineering)
-- `hydra-exec.es.*` — executive suite (impersonation pseudo-tools)
-- `hydra-creative.rlm.*` — RLM skills
-- `hydra-mem.*` — memory fabric (episodic + semantic)
-- `hydra-redact.*` — redaction service at squad boundaries
+### 6a. In-repo MCP shims (shipped with Hydra)
 
-RBAC is enforced at the host: each squad's allowed tools come from its
-`tools:` block, and an executive agent cannot call an engineering deploy
-tool unless the planner emits an explicit `Handoff` envelope that grants
-the privilege.
+| Server | Location | Purpose |
+|--------|----------|---------|
+| `hydra_memory` | `mcp_servers/hydra_memory/server.py` | Thin shim over SQLite episodic store + TheEights cells |
+| `executive_suite` | `mcp_servers/executive_suite/server.py` | Read-only introspection of ExecutiveSuite's `.claude/` directory (roster, skills, commands, output) |
+| `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of RLM-Creative's `.claude/` directory |
+
+These are pack-shim servers that read filesystem state from sibling
+projects. They are **not** the primary execution path for their
+respective squads — `executive_suite` and `rlm_creative` provide
+enrichment data (live roster, skill catalogue) while the actual work
+flows through `agent-impersonation` and `claude-skill` entrypoints.
+
+### 6b. Externally registered sibling servers (operator must install)
+
+| Server | Source project | Purpose |
+|--------|---------------|---------|
+| `pp_harness` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | Engineering work: `start_run`, `start_stage`, `archive_artifact` |
+| `pp_codex` | pair-programmer daemon | Cross-vendor critique (OpenAI Codex) |
+| `pp_gemini` | pair-programmer daemon | Cross-vendor critique (Google Gemini) |
+| `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Evolution, governance, memory, cells |
+| `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Artifact validation, audit, constitution attestation |
+
+These must be registered in `~/.claude.json` before Hydra can reach
+them. `MCPStdioDispatcher.call_mcp()` returns `"server not registered"`
+when a server is absent — the system degrades gracefully.
+
+### 6c. Non-MCP execution paths
+
+| Squad | Entrypoint | Mechanism |
+|-------|-----------|-----------|
+| Executive | `agent-impersonation` | `dispatcher.emit_claude_prompt()` → host-pickup envelope; Claude Code impersonates the persona in-process |
+| Garland | `claude-skill` | `dispatcher.invoke_claude_skill()` → host-pickup envelope; Claude Code invokes the skill |
+| Stubs | `stub` | Returns a placeholder `DecisionRecord` |
+
+Only the Engineering squad uses MCP as its primary execution path.
+
+### 6d. RBAC enforcement
+
+Each squad's `squad.yaml#tools` block declares which tools and MCP
+servers the squad is authorized to use, with privilege levels
+(`read | write | execute | destructive`). `MCPStdioDispatcher.call_mcp()`
+validates every call against the calling squad's tool allowlist and
+rejects unauthorized access with a telemetry event. Cross-squad tool
+delegation is supported via `Handoff` envelopes carrying explicit
+`granted_tools` lists with expiration timestamps.
 
 ## 7. Governance plane
 
@@ -212,11 +249,18 @@ Behaviour:
   `depth >= depth_ceiling` (default 5) terminates with `surfaced`.
 - **Circuit breaker**: three consecutive failures on the same node
   disables that node for the rest of the workflow.
-- **Redaction**: every cross-squad message passes through `redactor.py`,
-  which strips PII / financial / SoT fields according to the squad
-  permission matrix.
+- **Redaction**: every cross-squad message passes through
+  `governance.redact_for_squad_boundary()`, which strips PII (SSN,
+  credit card, email, phone) and neutralizes MCP-attack patterns
+  (prompt injection, cross-tool exfiltration, base64 obfuscation).
+  Applied at squad dispatch and synthesis boundaries in `supervisor.py`.
+- **Envelope validation**: `schemas.validate_envelope()` runs at every
+  squad-boundary edge. Invalid envelopes fail closed (task → `failed`,
+  error counter increments).
 - **Telemetry**: OTEL spans per node plus JSONL trace at
   `<project>/.hydra/<workflow_id>/trace.jsonl` in PP-compatible format.
+  Boundary crossings (dispatch, synthesis, redaction, RBAC violations)
+  emit structured trace events.
 
 ## 8. Delegation to PP, ES, and RLM
 

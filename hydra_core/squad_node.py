@@ -40,7 +40,8 @@ from .version import DoubleSpawnRefused, SquadDeprecated
 
 
 class Dispatcher(Protocol):
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]: ...
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any],
+                 *, squad_id: str | None = None) -> dict[str, Any]: ...
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]: ...
     def emit_claude_prompt(self, prompt: str, *, agent: str | None = None) -> dict[str, Any]: ...
     def invoke_claude_skill(self, skill: str, args: dict[str, Any]) -> dict[str, Any]: ...
@@ -186,7 +187,8 @@ def _via_mcp(
     # Drop None values — pp schema rejects them.
     args = {k: v for k, v in args.items() if v is not None}
     try:
-        result = dispatcher.call_mcp("pp_harness", "start_run", args)
+        result = dispatcher.call_mcp("pp_harness", "start_run", args,
+                                     squad_id=pack.slug)
     except Exception as e:
         return SquadResult(
             envelopes=[], artifacts=[], status="failed",
@@ -321,7 +323,7 @@ def _via_impersonation(
     _on_mcp_err = _record_mcp_failure(state)
     live_roster = _mcp_call_safe(
         dispatcher, "executive_suite", "es.roster.list", {},
-        on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err,
     )
     roster_list = (live_roster or {}).get("agents", []) if isinstance(live_roster, dict) else []
     if roster_list:
@@ -357,7 +359,7 @@ def _via_impersonation(
         dispatcher, "executive_suite", "es.output.write",
         {"domain": domain, "topic": topic,
          "content": _render_session_md("Boardroom Session", prompt, result)},
-        on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err,
     )
     artifacts_refs: list[MemoryRef] = []
     rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
@@ -409,7 +411,7 @@ def _via_claude_skill(
     _on_mcp_err = _record_mcp_failure(state)
     catalogue = _mcp_call_safe(
         dispatcher, "rlm_creative", "rlm.command.list", {},
-        on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err,
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
     try:
@@ -433,7 +435,7 @@ def _via_claude_skill(
          "content": _render_session_md(f"Creative dispatch via {cmd}",
                                        f"command_hint={cmd}\navailable={available_cmds}",
                                        result)},
-        on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err,
     )
     artifacts_refs: list[MemoryRef] = []
     rel_path = (write_result or {}).get("relative") if isinstance(write_result, dict) else None
@@ -475,6 +477,7 @@ def _mcp_call_safe(
     tool: str,
     args: dict[str, Any],
     *,
+    squad_id: str | None = None,
     on_error: "Callable[[str, str, str, int], None] | None" = None,
 ) -> dict[str, Any] | None:
     """Best-effort MCP call. Returns the inner result dict, or None on any failure.
@@ -493,7 +496,8 @@ def _mcp_call_safe(
     last_exc_repr: str | None = None
     for attempt in (1, 2):
         try:
-            envelope = dispatcher.call_mcp(server, tool, args)
+            envelope = dispatcher.call_mcp(server, tool, args,
+                                           squad_id=squad_id)
         except Exception as exc:
             last_exc_repr = repr(exc)
             if on_error is not None:
@@ -622,10 +626,9 @@ def abort_open_pp_runs(
                     "run_id": run_id,
                     "status": "aborted",
                     "reason": reason,
-                    # project_path is informational for the daemon's log; it
-                    # already knows the path via the run row.
                     "project_path": project_path,
                 },
+                squad_id="engineering",
             )
             drained.append(entry)
         except Exception:  # noqa: BLE001 — leave the entry so force_unlock can salvage

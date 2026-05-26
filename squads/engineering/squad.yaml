@@ -30,18 +30,38 @@ tools:
   - name: pp.harness.start_run
     mcp_server: pp_harness
     privilege: execute
+    notes: >
+      Start a pair-programmer run (single/team/best-of/review mode).
+      Use for: initiating engineering work dispatched by Hydra.
+      Not for: read-only queries or status checks.
   - name: pp.harness.start_stage
     mcp_server: pp_harness
     privilege: execute
+    notes: >
+      Start a specific stage within an active PP run.
+      Use for: advancing through taxonomy stages (spec, design, code, test).
+      Not for: starting a new run — use pp.harness.start_run instead.
   - name: pp.harness.archive_artifact
     mcp_server: pp_harness
     privilege: write
+    notes: >
+      Archive a produced artifact to the run's .harness directory.
+      Use for: persisting spec/design/code/test artifacts after generation.
+      Not for: reading or listing existing artifacts.
   - name: pp.codex.generate
     mcp_server: pp_harness
     privilege: execute
+    notes: >
+      Generate code or artifacts via OpenAI Codex.
+      Use for: code generation when cross-vendor diversity is needed.
+      Not for: critique/review — use pp.gemini.critique instead.
   - name: pp.gemini.critique
     mcp_server: pp_harness
     privilege: execute
+    notes: >
+      Judge/critique artifacts via Google Gemini.
+      Use for: cross-vendor review of generated artifacts.
+      Not for: code generation — use pp.codex.generate instead.
 
 accepts:
   - PRD

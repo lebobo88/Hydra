@@ -94,12 +94,28 @@ agents:
 tools:
   - name: financial-frameworks
     privilege: execute
+    notes: >
+      WACC, NPV, IRR, payback, EVA, real-options, Monte Carlo, sensitivity analysis.
+      Use for: capital allocation decisions, investment analysis, financial modeling.
+      Not for: compliance/regulatory analysis — use ai-governance instead.
   - name: ai-governance
     privilege: execute
+    notes: >
+      EU AI Act Article 9, NIST AI RMF, ISO/IEC 42001, risk classification, HITL policy.
+      Use for: AI system compliance assessment, model governance, AI risk classification.
+      Not for: financial analysis — use financial-frameworks instead.
   - name: enterprise-risk
     privilege: execute
+    notes: >
+      COSO ERM 2017, ISO 31000, risk appetite, top-risk register, KRIs, Bow-Tie analysis.
+      Use for: enterprise risk assessment, risk register updates, scenario stress testing.
+      Not for: AI-specific risk — use ai-governance instead.
   - name: scenario-planning
     privilege: execute
+    notes: >
+      2x2 matrices, four-case canvas, Monte Carlo, sensitivity, tornado, war-game, reverse stress test.
+      Use for: strategic scenario analysis, option valuation, uncertainty modeling.
+      Not for: operational risk assessment — use enterprise-risk instead.
 
 accepts:
   - "*"                     # executive can be asked about anything

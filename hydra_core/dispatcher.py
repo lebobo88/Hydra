@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # --------- helpers ---------
@@ -91,10 +95,73 @@ class MCPStdioDispatcher:
         self._sessions: dict[str, Any] = {}
         self._stack: Optional[AsyncExitStack] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._squad_packs: dict[str, Any] = {}
+        self._active_handoffs: list[dict[str, Any]] = []
+
+    def set_squad_packs(self, packs: dict[str, Any]) -> None:
+        """Inject discovered squad packs for RBAC enforcement."""
+        self._squad_packs = packs
+
+    def grant_handoff(self, squad_id: str, granted_tools: list[str],
+                      expires_at: datetime | None = None) -> None:
+        """Register a Handoff privilege escalation."""
+        self._active_handoffs.append({
+            "squad_id": squad_id,
+            "granted_tools": granted_tools,
+            "expires_at": expires_at,
+        })
+
+    def _check_tool_rbac(self, server: str, tool: str,
+                         squad_id: str | None) -> str | None:
+        """Validate that the squad is authorized to call this tool.
+
+        Returns None if authorized, or a rejection reason string.
+        Skips enforcement when squad_id is None (CLI/test paths).
+        """
+        if squad_id is None:
+            return None
+        pack = self._squad_packs.get(squad_id)
+        if pack is None:
+            return None
+        declared_tools = getattr(pack, "tools", ())
+        tool_key = f"{server}.{tool}" if server else tool
+        for t in declared_tools:
+            t_name = getattr(t, "name", t) if not isinstance(t, str) else t
+            t_server = getattr(t, "mcp_server", None)
+            if t_name == tool_key:
+                return None
+            if t_name == tool and (t_server is None or t_server == server):
+                return None
+        now = datetime.now(timezone.utc)
+        for h in self._active_handoffs:
+            if h["squad_id"] != squad_id:
+                continue
+            if h["expires_at"] and h["expires_at"] < now:
+                continue
+            if tool_key in h["granted_tools"] or tool in h["granted_tools"]:
+                return None
+        return (
+            f"RBAC: squad {squad_id!r} is not authorized for tool "
+            f"{tool!r} on server {server!r}. Declared tools: "
+            f"{[getattr(t, 'name', t) for t in declared_tools]}"
+        )
 
     # --- sync facade matching the squad_node.Dispatcher Protocol ---
 
-    def call_mcp(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any],
+                 *, squad_id: str | None = None) -> dict[str, Any]:
+        rejection = self._check_tool_rbac(server, tool, squad_id)
+        if rejection:
+            logger.warning("MCP RBAC violation: %s", rejection)
+            from . import telemetry
+            try:
+                telemetry.emit(self.project_root, "rbac", "rbac_violation", {
+                    "squad_id": squad_id, "server": server, "tool": tool,
+                    "reason": rejection,
+                })
+            except Exception:
+                pass
+            return {"status": "rejected", "error": rejection}
         return self._run(self._async_call(server, tool, args))
 
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:

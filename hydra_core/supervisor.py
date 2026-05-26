@@ -16,7 +16,11 @@ from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from .eights.attestation import EightsAttestor
-from .governance import enforce_governance, GovernanceVerdict
+from .governance import (
+    enforce_governance,
+    GovernanceVerdict,
+    redact_for_squad_boundary,
+)
 from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
 from .judge import dispatch_judge, route_judge, load_policy
@@ -32,6 +36,7 @@ from .schemas import (
     HITLRequest,
     HydraEnvelope,
     ProposedTask,
+    validate_envelope,
 )
 from .squad_loader import SquadPack, discover_squads
 from .squad_node import Dispatcher, execute_squad
@@ -87,6 +92,51 @@ def build_supervisor(
     # through `require_cerberus_pass`, so a missing file means *no* venom
     # is callable — the safe default per the manifesto.
     load_cerberus_venoms(project_root)
+
+    # Inject squad packs into dispatcher for RBAC enforcement.
+    if hasattr(dispatcher, "set_squad_packs"):
+        dispatcher.set_squad_packs(packs)
+
+    # ----- boundary enforcement helpers -----
+
+    def _validate_and_redact_envelope(
+        env_dict: dict,
+        *,
+        direction: str,
+        squad_id: str | None = None,
+    ) -> dict:
+        """Validate envelope schema and redact text at a squad boundary.
+
+        Called at dispatch (outbound to squad) and synthesis (inbound from squad).
+        Invalid envelopes raise ValueError — caller decides whether to fail the
+        task or surface to HITL.
+        """
+        try:
+            validate_envelope(env_dict)
+        except (ValueError, Exception) as exc:
+            emit_trace(judge_trace_root, "boundary", "envelope_validation_failed", {
+                "envelope_id": env_dict.get("id"),
+                "envelope_type": env_dict.get("type"),
+                "direction": direction,
+                "squad_id": squad_id,
+                "error": str(exc),
+            })
+            raise
+
+        redacted = dict(env_dict)
+        for text_field in ("objective", "summary", "instructions", "decision",
+                           "rationale", "risk_assessment", "rollout_plan"):
+            if text_field in redacted and isinstance(redacted[text_field], str):
+                redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
+
+        emit_trace(judge_trace_root, env_dict.get("workflow_id", "boundary"),
+                   "squad_boundary_crossing", {
+                       "envelope_id": env_dict.get("id"),
+                       "envelope_type": env_dict.get("type"),
+                       "direction": direction,
+                       "squad_id": squad_id,
+                   })
+        return redacted
 
     # ----- node implementations -----
 
@@ -469,11 +519,21 @@ def build_supervisor(
                 )
                 continue
             task.status = result.status
-            # Propagate host-pickup-pending onto each dumped envelope so the
-            # judge node can skip placeholder artifacts that have no substance
-            # to score (Claude Code subagent will fulfil out of band).
+            # Validate and redact envelopes crossing the squad boundary back
+            # into the supervisor. Invalid envelopes fail the task.
             for produced in result.envelopes:
                 d = produced.model_dump(mode="json")
+                try:
+                    d = _validate_and_redact_envelope(
+                        d, direction="inbound_from_squad",
+                        squad_id=pack.slug,
+                    )
+                except (ValueError, Exception):
+                    task.status = "failed"
+                    state.error_counters[task.owner_squad] = (
+                        state.error_counters.get(task.owner_squad, 0) + 1
+                    )
+                    continue
                 if result.host_pickup_pending:
                     d["_host_pickup_pending"] = True
                 new_decisions.append(d)
@@ -554,7 +614,13 @@ def build_supervisor(
         new_env_dicts: list[dict] = []
         for produced in result.envelopes:
             d = produced.model_dump(mode="json")
-            # Tag the envelope with its retry depth so we don't loop on it.
+            try:
+                d = _validate_and_redact_envelope(
+                    d, direction="reflexion_retry_inbound",
+                    squad_id=origin,
+                )
+            except (ValueError, Exception):
+                continue
             d["_retry_index"] = packet.retry_index
             new_env_dicts.append(d)
 
@@ -794,12 +860,20 @@ def build_supervisor(
         ) or "(no heads convened)"
 
         # Group envelopes by origin_squad (skip Hydra's own routing slips).
+        # Redact at synthesis boundary — envelopes from different squads are
+        # merged here, so cross-squad text must be sanitized.
         squad_to_envs: dict[str, list[dict]] = {}
         for env in state.envelopes:
             origin = env.get("origin_squad") or "hydra"
             if origin == "hydra":
                 continue
-            squad_to_envs.setdefault(origin, []).append(env)
+            try:
+                redacted = _validate_and_redact_envelope(
+                    env, direction="synthesis_merge", squad_id=origin,
+                )
+                squad_to_envs.setdefault(origin, []).append(redacted)
+            except (ValueError, Exception):
+                squad_to_envs.setdefault(origin, []).append(env)
 
         # Preserve dissenting opinions verbatim (R3-tail contract: NEVER paraphrase).
         # Sources:

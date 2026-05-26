@@ -20,7 +20,7 @@ class _StubDispatcher:
     """Returns `done` (not `host_pickup_required`) so the judge plane scores
     the resulting envelopes. Use _HostPickupDispatcher in tests that need
     placeholder behavior."""
-    def call_mcp(self, server, tool, args):
+    def call_mcp(self, server, tool, args, **_kw):
         return {"status": "done", "tool": tool, "result": {"ok": True}}
 
     def spawn_subprocess(self, cmd, env=None):
