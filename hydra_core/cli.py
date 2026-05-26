@@ -309,7 +309,7 @@ def _cmd_gateway_backup(args) -> int:
     for src, dst_name in sources:
         if src.exists():
             shutil.copy2(src, backup_dir / dst_name)
-            print(f"  backed up: {src} → {backup_dir / dst_name}")
+            print(f"  backed up: {src} -> {backup_dir / dst_name}")
         else:
             print(f"  skipped (not found): {src}")
     print(f"\nBackup dir: {backup_dir}")
@@ -360,7 +360,7 @@ def _cmd_gateway_migrate_hooks(args) -> int:
             occurrences = raw.count(old)
             raw = raw.replace(old, new)
             count += occurrences
-            print(f"  {old} → {new} ({occurrences} occurrences)")
+            print(f"  {old} -> {new} ({occurrences} occurrences)")
 
     if count == 0:
         print("No matchers to update (already migrated or no matches found)")
@@ -420,7 +420,7 @@ def _cmd_gateway_rollback(args) -> int:
         bak = backup_dir / bak_name
         if bak.exists():
             shutil.copy2(bak, target)
-            print(f"  restored: {bak} → {target}")
+            print(f"  restored: {bak} -> {target}")
         else:
             print(f"  skipped (no backup): {bak_name}")
     print(f"\nRollback complete from {backup_dir}")
