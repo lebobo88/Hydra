@@ -2,8 +2,8 @@
 
 Hydra is one of four consumers of TheEights daemon (per the Phase-6 roadmap).
 The daemon exposes MCP tools — `eights.constitution.attest`,
-`eights.hydra.envelope_record`, `eights.governance.ceiling_tick`,
-`eights.redaction.redact_for_squad`, etc. — that record every supervisor-side
+`eights.hydra.envelope.record`, `eights.governance.ceiling.tick`,
+`eights.governance.redact_for_squad`, etc. — that record every supervisor-side
 event into a shared SQL ledger so cross-consumer audits work.
 
 This module is the Hydra-side caller. It calls those MCP tools **best-effort**:
@@ -42,8 +42,8 @@ EIGHTS_MCP_SERVER = "eights"
 # budget_charge) — those would be stale by the time the daemon is back.
 _SPOOLABLE_TOOLS = frozenset({
     "eights.constitution.attest",
-    "eights.hydra.envelope_record",
-    "eights.governance.hitl_request",
+    "eights.hydra.envelope.record",
+    "eights.governance.hitl.request",
     "eights.evolution.propose",
 })
 
@@ -67,22 +67,39 @@ class EightsAttestor:
     workflow_id: Optional[str] = None
     spool: PendingSpool = field(default_factory=PendingSpool)
 
+    def _eights_envelope(self) -> dict[str, Any]:
+        """Build a TheEights-compatible envelope from workflow context.
+
+        Every TheEights MCP tool (except identity.* and audit.*) requires
+        this envelope for audit lineage. Fields match the Zod schema in
+        TheEights/daemon/src/schemas/envelope.ts.
+        """
+        return {
+            "tenant_id": "local",
+            "actor_id": "hydra.supervisor",
+            "project_id": "Hydra",
+            "domain": "orchestration",
+            "scope": [],
+            "trace_id": str(self.workflow_id or "no-workflow"),
+        }
+
     def _call(self, tool: str, args: dict) -> Optional[dict]:
         if not self.enabled or self.dispatcher is None:
             self._maybe_spool(tool, args, reason="eights_disabled_or_no_dispatcher")
             return None
+        call_args = {"envelope": self._eights_envelope(), **args}
         try:
-            envelope = self.dispatcher.call_mcp(self.server, tool, args)
+            result = self.dispatcher.call_mcp(self.server, tool, call_args)
         except Exception as exc:  # noqa: BLE001 — fail-soft, spool the payload
             self._maybe_spool(tool, args, reason=f"exception:{type(exc).__name__}")
             return None
-        if not isinstance(envelope, dict):
-            self._maybe_spool(tool, args, reason="non_dict_envelope")
+        if not isinstance(result, dict):
+            self._maybe_spool(tool, args, reason="non_dict_result")
             return None
-        if envelope.get("status") == "failed":
+        if result.get("status") == "failed":
             self._maybe_spool(tool, args, reason="daemon_status_failed")
             return None
-        inner = envelope.get("result", envelope)
+        inner = result.get("result", result)
         return inner if isinstance(inner, dict) else None
 
     def _maybe_spool(self, tool: str, args: dict, *, reason: str) -> None:
@@ -143,11 +160,7 @@ class EightsAttestor:
             {"hash": "sha256:...", "version": "...", "receipt": "uuid"}
         """
         return self._call("eights.constitution.attest", {
-            "hash": snapshot.sha256,
-            "version": getattr(snapshot, "version", "1"),
-            "bytes": len(snapshot.text.encode("utf-8")),
-            "refusal_count": len(snapshot.refusals),
-            "path": str(snapshot.path),
+            "consumer": "hydra",
         })
 
     # ---------- envelope lineage ----------
@@ -157,13 +170,15 @@ class EightsAttestor:
         the daemon dedupes by envelope id."""
         if not isinstance(envelope, dict) or not envelope.get("id"):
             return None
-        return self._call("eights.hydra.envelope_record", {
-            "id": str(envelope.get("id")),
-            "type": envelope.get("type"),
-            "workflow_id": str(envelope.get("workflow_id", "")),
-            "origin_squad": envelope.get("origin_squad"),
-            "target_squad": envelope.get("target_squad"),
-            "parent_id": str(envelope.get("parent_id") or "") or None,
+        return self._call("eights.hydra.envelope.record", {
+            "hydra_envelope": {
+                "id": str(envelope.get("id")),
+                "type": envelope.get("type"),
+                "workflow_id": str(envelope.get("workflow_id", "")),
+                "origin_squad": envelope.get("origin_squad", "hydra"),
+                "target_squad": envelope.get("target_squad"),
+                "parent_id": str(envelope.get("parent_id") or "") or None,
+            },
         })
 
     # ---------- governance ----------
@@ -171,9 +186,9 @@ class EightsAttestor:
     def ceiling_tick(self, *, workflow_id: str, node: str) -> Optional[dict]:
         """Bump the loop-ceiling counter in the shared ledger so cross-consumer
         loops are caught (e.g., engineering + executive ping-ponging)."""
-        return self._call("eights.governance.ceiling_tick", {
-            "workflow_id": str(workflow_id),
-            "node": node,
+        return self._call("eights.governance.ceiling.tick", {
+            "run_id": str(workflow_id),
+            "kind": "iteration",
         })
 
     def budget_charge(
@@ -188,23 +203,23 @@ class EightsAttestor:
         """Record token/cost spend. The daemon enforces caps; Hydra does not
         gate on this return value — the local BudgetLedger is authoritative
         within a workflow."""
-        return self._call("eights.governance.budget_charge", {
-            "workflow_id": str(workflow_id),
-            "usd": float(usd),
+        return self._call("eights.governance.budget.charge", {
+            "run_id": str(workflow_id),
+            "cost_usd": float(usd),
             "tokens": int(tokens),
-            "vendor": vendor,
-            "purpose": purpose,
         })
 
     def hitl_request(self, hitl_envelope: dict) -> Optional[dict]:
         """Enqueue a HITL request to the shared ledger so the operator UI
         can show pending requests across consumers."""
-        return self._call("eights.governance.hitl_request", {
-            "id": str(hitl_envelope.get("id", "")),
-            "workflow_id": str(hitl_envelope.get("workflow_id", "")),
-            "reason": hitl_envelope.get("reason"),
-            "summary": hitl_envelope.get("summary"),
-            "options": list(hitl_envelope.get("options") or []),
+        return self._call("eights.governance.hitl.request", {
+            "run_id": str(hitl_envelope.get("workflow_id", "")),
+            "kind": hitl_envelope.get("reason", "operator_review"),
+            "payload": {
+                "id": str(hitl_envelope.get("id", "")),
+                "summary": hitl_envelope.get("summary"),
+                "options": list(hitl_envelope.get("options") or []),
+            },
         })
 
     # ---------- redaction ----------
@@ -223,11 +238,9 @@ class EightsAttestor:
         Returns the redacted text, or None when the daemon didn't service the
         call (so the caller knows to use the local fallback).
         """
-        out = self._call("eights.redaction.redact_for_squad", {
-            "text": text,
-            "from_squad": from_squad,
-            "to_squad": to_squad,
-            "allow_pii": allow_pii,
+        out = self._call("eights.governance.redact_for_squad", {
+            "target_squad": to_squad,
+            "payload": {"text": text, "from_squad": from_squad, "allow_pii": allow_pii},
         })
         if isinstance(out, dict) and isinstance(out.get("redacted"), str):
             return out["redacted"]
@@ -237,7 +250,7 @@ class EightsAttestor:
 
     def prompt_get(self, *, slug: str) -> Optional[str]:
         """Fetch a registered prompt (system prompt for a squad/agent)."""
-        out = self._call("eights.prompt.get", {"slug": slug})
+        out = self._call("eights.prompt.get", {"rid": slug})
         if isinstance(out, dict) and isinstance(out.get("text"), str):
             return out["text"]
         return None

@@ -1,8 +1,9 @@
 """Toolshed — search-describe-execute meta-tool facade.
 
-Wraps large MCP servers (pp_harness, eights, agentsmith) behind three
-meta-tools per server, reducing the context footprint from ~N tool schemas
-to 3 constant-size meta-tools regardless of catalog size.
+Wraps MCP servers (pp_harness, eights, agentsmith, hydra_memory,
+executive_suite, rlm_creative, pp_codex, pp_gemini) behind search/
+describe/execute meta-tools, reducing the context footprint from ~N tool
+schemas to a handful of constant-size meta-tools.
 
 Inspired by Speakeasy's Dynamic Toolsets pattern (avg 96% input reduction).
 
@@ -287,47 +288,80 @@ PP_HARNESS_TOOLS = [
 ]
 
 EIGHTS_TOOLS = [
-    "adapters_exec_register_now", "adapters_exec_start", "adapters_exec_stop",
-    "adapters_exec_sync_now", "adapters_hydra_register_now",
-    "adapters_pp_register_now", "adapters_pp_start", "adapters_pp_stop",
-    "adapters_pp_sync_now", "adapters_rlm_register_now", "adapters_rlm_start",
-    "adapters_rlm_stop", "adapters_rlm_sync_now", "audit_bom", "audit_trace",
-    "audit_verify", "cells_classify", "cells_distribution", "cells_query",
-    "constitution_attest", "constitution_get", "constitution_propose_amendment",
-    "evolution_approve", "evolution_commit", "evolution_detect_drift",
-    "evolution_evaluate", "evolution_get_resource", "evolution_list_pending",
-    "evolution_list_resources", "evolution_propose", "evolution_register",
-    "evolution_reject", "evolution_rollback", "evolution_unfreeze",
-    "governance_access_check", "governance_breaker_outcome",
-    "governance_breaker_reset", "governance_breaker_status",
-    "governance_budget_charge", "governance_cap_set", "governance_ceiling_tick",
-    "governance_consistency_check", "governance_hitl_list",
-    "governance_hitl_request", "governance_hitl_resolve",
-    "governance_policy_evaluate", "governance_redact", "governance_redact_for_squad",
-    "hydra_envelope_query", "hydra_envelope_record", "hydra_handoff_list",
-    "identity_register_actor", "identity_register_project", "memory_add",
-    "memory_get", "memory_link", "memory_resolve", "memory_resolve_batch",
-    "memory_search", "miner_run_now", "prompt_diff", "prompt_get", "prompt_list",
-    "squad_get", "squad_list",
+    "eights.adapters.exec.register_now", "eights.adapters.exec.start",
+    "eights.adapters.exec.stop", "eights.adapters.exec.sync_now",
+    "eights.adapters.hydra.register_now",
+    "eights.adapters.pp.register_now", "eights.adapters.pp.start",
+    "eights.adapters.pp.stop", "eights.adapters.pp.sync_now",
+    "eights.adapters.rlm.register_now", "eights.adapters.rlm.start",
+    "eights.adapters.rlm.stop", "eights.adapters.rlm.sync_now",
+    "eights.audit.bom", "eights.audit.trace", "eights.audit.verify",
+    "eights.cells.classify", "eights.cells.distribution", "eights.cells.query",
+    "eights.constitution.attest", "eights.constitution.get",
+    "eights.constitution.propose_amendment",
+    "eights.evolution.approve", "eights.evolution.commit",
+    "eights.evolution.detect_drift", "eights.evolution.evaluate",
+    "eights.evolution.get_resource", "eights.evolution.list_pending",
+    "eights.evolution.list_resources", "eights.evolution.propose",
+    "eights.evolution.register", "eights.evolution.reject",
+    "eights.evolution.rollback", "eights.evolution.unfreeze",
+    "eights.governance.access.check", "eights.governance.breaker.outcome",
+    "eights.governance.breaker.reset", "eights.governance.breaker.status",
+    "eights.governance.budget.charge", "eights.governance.cap.set",
+    "eights.governance.ceiling.tick", "eights.governance.consistency_check",
+    "eights.governance.hitl.list", "eights.governance.hitl.request",
+    "eights.governance.hitl.resolve",
+    "eights.governance.policy.evaluate", "eights.governance.redact",
+    "eights.governance.redact_for_squad",
+    "eights.hydra.envelope.query", "eights.hydra.envelope.record",
+    "eights.hydra.handoff.list",
+    "eights.identity.register_actor", "eights.identity.register_project",
+    "eights.memory.add", "eights.memory.get", "eights.memory.link",
+    "eights.memory.resolve", "eights.memory.resolve_batch", "eights.memory.search",
+    "eights.miner.run_now",
+    "eights.prompt.diff", "eights.prompt.get", "eights.prompt.list",
+    "eights.squad.get", "eights.squad.list",
 ]
 
 AGENTSMITH_TOOLS = [
-    "agentsmith_archivist_audit", "agentsmith_archivist_decisions",
-    "agentsmith_archivist_seal", "agentsmith_constitution_attest",
-    "agentsmith_constitution_get", "agentsmith_constitution_propose_amendment",
-    "agentsmith_eights_evolution_propose", "agentsmith_eights_hitl_request",
-    "agentsmith_eights_lookup_envelope_attempt", "agentsmith_eights_memory_add",
-    "agentsmith_factory_promote", "agentsmith_factory_scaffold",
-    "agentsmith_hydra_squad_list", "agentsmith_hydra_venom_cross_check",
-    "agentsmith_inspector_inspect", "agentsmith_inspector_invariants_list",
-    "agentsmith_keymaker_gap_report", "agentsmith_keymaker_scan",
-    "agentsmith_oracle_evaluate", "agentsmith_pp_best_of_start",
-    "agentsmith_pp_borda_count", "agentsmith_quarantine_isolate",
-    "agentsmith_quarantine_release", "agentsmith_replicator_list",
-    "agentsmith_replicator_spawn", "agentsmith_replicator_teardown",
-    "agentsmith_sentinel_classify", "agentsmith_sentinel_events_recent",
-    "agentsmith_sentinel_signatures_list",
+    "agentsmith.archivist.audit", "agentsmith.archivist.decisions",
+    "agentsmith.archivist.seal", "agentsmith.constitution.attest",
+    "agentsmith.constitution.get", "agentsmith.constitution.propose_amendment",
+    "agentsmith.eights.evolution_propose", "agentsmith.eights.hitl_request",
+    "agentsmith.eights.lookup_envelope_attempt", "agentsmith.eights.memory_add",
+    "agentsmith.factory.promote", "agentsmith.factory.scaffold",
+    "agentsmith.hydra.squad_list", "agentsmith.hydra.venom_cross_check",
+    "agentsmith.inspector.inspect", "agentsmith.inspector.invariants_list",
+    "agentsmith.keymaker.gap_report", "agentsmith.keymaker.scan",
+    "agentsmith.oracle.evaluate", "agentsmith.pp.best_of_start",
+    "agentsmith.pp.borda_count", "agentsmith.quarantine.isolate",
+    "agentsmith.quarantine.release", "agentsmith.replicator.list",
+    "agentsmith.replicator.spawn", "agentsmith.replicator.teardown",
+    "agentsmith.sentinel.classify", "agentsmith.sentinel.events_recent",
+    "agentsmith.sentinel.signatures_list",
 ]
+
+
+HYDRA_MEMORY_TOOLS = [
+    "hydra-mem.write_episodic", "hydra-mem.read_episodic",
+    "hydra-mem.list_workflow", "hydra-mem.semantic_search",
+    "hydra-mem.query_eights", "hydra-mem.tag_memory",
+]
+
+EXECUTIVE_SUITE_TOOLS = [
+    "es.roster.list", "es.agent.get", "es.skill.list", "es.skill.get",
+    "es.command.list", "es.command.get", "es.output.write", "es.output.read",
+    "es.ping",
+]
+
+RLM_CREATIVE_TOOLS = [
+    "rlm.skill.list", "rlm.skill.get", "rlm.command.list", "rlm.command.get",
+    "rlm.agent.list", "rlm.agent.get", "rlm.output.write", "rlm.output.read",
+    "rlm.ping",
+]
+
+PP_CODEX_TOOLS = ["generate", "critique"]
+PP_GEMINI_TOOLS = ["generate", "critique"]
 
 
 class ProgressiveDisclosureTree:
@@ -467,9 +501,14 @@ class ProgressiveDisclosureTree:
 
 
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
-    """Build a ToolShed pre-loaded with static catalogs for the big servers."""
+    """Build a ToolShed pre-loaded with static catalogs for all 8 backends."""
     shed = ToolShed(dispatcher=dispatcher)
     shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS)
     shed.register_static_catalog("eights", EIGHTS_TOOLS)
     shed.register_static_catalog("agentsmith", AGENTSMITH_TOOLS)
+    shed.register_static_catalog("hydra_memory", HYDRA_MEMORY_TOOLS)
+    shed.register_static_catalog("executive_suite", EXECUTIVE_SUITE_TOOLS)
+    shed.register_static_catalog("rlm_creative", RLM_CREATIVE_TOOLS)
+    shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
+    shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
     return shed

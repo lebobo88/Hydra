@@ -62,16 +62,17 @@ def test_constitution_attest_call_shape():
             "hash": "sha256:abc", "version": "1", "receipt": "rcpt-001"
         },
     })
-    a = EightsAttestor(dispatcher=d)
+    a = EightsAttestor(dispatcher=d, workflow_id="wf-test")
     snap = load_constitution(HYDRA_ROOT)
     out = a.constitution_attest(snap)
     assert out is not None
     assert out["receipt"] == "rcpt-001"
     assert d.calls[0]["server"] == EIGHTS_MCP_SERVER
     assert d.calls[0]["tool"] == "eights.constitution.attest"
-    assert d.calls[0]["args"]["hash"] == snap.sha256
-    assert d.calls[0]["args"]["bytes"] == len(snap.text.encode("utf-8"))
-    assert d.calls[0]["args"]["refusal_count"] == len(snap.refusals)
+    args = d.calls[0]["args"]
+    assert args["consumer"] == "hydra"
+    assert args["envelope"]["actor_id"] == "hydra.supervisor"
+    assert args["envelope"]["trace_id"] == "wf-test"
 
 
 def test_envelope_record_skips_when_id_missing():
@@ -93,16 +94,18 @@ def test_envelope_record_call_shape():
         "parent_id": "33333333-3333-3333-3333-333333333333",
     }
     a.envelope_record(env)
-    assert d.calls[0]["tool"] == "eights.hydra.envelope_record"
+    assert d.calls[0]["tool"] == "eights.hydra.envelope.record"
     args = d.calls[0]["args"]
-    assert args["id"] == env["id"]
-    assert args["type"] == "DECISION_RECORD"
-    assert args["origin_squad"] == "executive"
+    assert "envelope" in args
+    hydra_env = args["hydra_envelope"]
+    assert hydra_env["id"] == env["id"]
+    assert hydra_env["type"] == "DECISION_RECORD"
+    assert hydra_env["origin_squad"] == "executive"
 
 
 def test_redact_for_squad_returns_redacted_text():
     d = _RecordingDispatcher(scripted={
-        "eights.redaction.redact_for_squad": {"redacted": "ssn [REDACTED]"},
+        "eights.governance.redact_for_squad": {"redacted": "ssn [REDACTED]"},
     })
     a = EightsAttestor(dispatcher=d)
     out = a.redact_for_squad(text="ssn 123-45-6789", from_squad="executive", to_squad="garland")
@@ -171,5 +174,5 @@ def test_supervisor_calls_eights_envelope_record():
     eights_calls = [c for c in d.calls if c["server"] == EIGHTS_MCP_SERVER]
     tools_called = {c["tool"] for c in eights_calls}
     assert "eights.constitution.attest" in tools_called
-    assert "eights.governance.ceiling_tick" in tools_called
-    assert "eights.hydra.envelope_record" in tools_called
+    assert "eights.governance.ceiling.tick" in tools_called
+    assert "eights.hydra.envelope.record" in tools_called

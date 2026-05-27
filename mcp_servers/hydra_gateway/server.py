@@ -41,11 +41,17 @@ _CONNECT_TIMEOUT = 10.0
 
 
 class AsyncBackendPool:
-    """Manages async MCP client sessions to backend servers."""
+    """Manages async MCP client sessions to backend servers.
+
+    Each backend gets its own AsyncExitStack so a crash in one backend's
+    transport never cascades to others. CancelledError (not a subclass of
+    Exception in Python 3.11+) is caught explicitly to prevent it from
+    escaping into the MCP SDK's task group and crashing the gateway.
+    """
 
     def __init__(self, specs: dict[str, dict[str, Any]]) -> None:
         self._specs = {k: v for k, v in specs.items() if k not in _SELF_NAMES}
-        self._stack = AsyncExitStack()
+        self._stacks: dict[str, AsyncExitStack] = {}
         self._sessions: dict[str, Any] = {}
         self._tool_cache: dict[str, list[dict[str, Any]]] = {}
         self._failed: set[str] = set()
@@ -53,6 +59,17 @@ class AsyncBackendPool:
     @property
     def server_names(self) -> list[str]:
         return sorted(self._specs.keys())
+
+    async def _teardown_backend(self, server: str) -> None:
+        """Tear down a single backend's stack, session, and cache."""
+        self._sessions.pop(server, None)
+        self._tool_cache.pop(server, None)
+        stack = self._stacks.pop(server, None)
+        if stack:
+            try:
+                await stack.aclose()
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _connect(self, server: str) -> Any:
         """Open a stdio session to a backend. Returns the ClientSession."""
@@ -67,6 +84,9 @@ class AsyncBackendPool:
         except ImportError:
             return None
 
+        # Tear down any previous broken stack for this server
+        await self._teardown_backend(server)
+
         spec = self._specs[server]
         params = StdioServerParameters(
             command=spec["command"],
@@ -74,23 +94,29 @@ class AsyncBackendPool:
             env=spec.get("env"),
             cwd=spec.get("cwd"),
         )
+        stack = AsyncExitStack()
         try:
             transport = await asyncio.wait_for(
-                self._stack.enter_async_context(stdio_client(params)),
+                stack.enter_async_context(stdio_client(params)),
                 timeout=_CONNECT_TIMEOUT,
             )
             read, write = transport
-            session = await self._stack.enter_async_context(
+            session = await stack.enter_async_context(
                 ClientSession(read, write)
             )
             await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
+            self._stacks[server] = stack
             self._sessions[server] = session
             self._failed.discard(server)
             logger.info("Connected to backend: %s", server)
             return session
-        except Exception as exc:
+        except (asyncio.CancelledError, Exception) as exc:
             logger.warning("Failed to connect to %s: %s", server, exc)
             self._failed.add(server)
+            try:
+                await stack.aclose()
+            except (asyncio.CancelledError, Exception):
+                pass
             return None
 
     async def list_tools(self, server: str) -> list[dict[str, Any]]:
@@ -114,7 +140,7 @@ class AsyncBackendPool:
             ]
             self._tool_cache[server] = tools
             return tools
-        except Exception as exc:
+        except (asyncio.CancelledError, Exception) as exc:
             logger.warning("list_tools failed for %s: %s", server, exc)
             self._failed.add(server)
             return []
@@ -123,37 +149,42 @@ class AsyncBackendPool:
 
     async def call_tool(self, server: str, tool: str,
                         args: dict[str, Any]) -> dict[str, Any]:
-        """Forward a tool call to a backend."""
-        session = await self._connect(server)
-        if session is None:
-            return {
-                "status": "failed",
-                "error": f"backend {server!r} not connected",
-            }
-        try:
-            result = await asyncio.wait_for(
-                session.call_tool(tool, args),
-                timeout=self._TOOL_TIMEOUT,
-            )
-            return _extract_result(result)
-        except asyncio.TimeoutError:
-            self._failed.add(server)
-            self._sessions.pop(server, None)
-            return {
-                "status": "failed",
-                "error": f"tool {tool} on {server} timed out after {self._TOOL_TIMEOUT}s",
-                "server": server,
-                "tool": tool,
-            }
-        except Exception as exc:
-            self._failed.add(server)
-            self._sessions.pop(server, None)
-            return {
-                "status": "failed",
-                "error": f"{type(exc).__name__}: {exc}",
-                "server": server,
-                "tool": tool,
-            }
+        """Forward a tool call to a backend. Retries once on stale session."""
+        for attempt in range(2):
+            session = await self._connect(server)
+            if session is None:
+                return {
+                    "status": "failed",
+                    "error": f"backend {server!r} not connected",
+                }
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool(tool, args),
+                    timeout=self._TOOL_TIMEOUT,
+                )
+                return _extract_result(result)
+            except asyncio.TimeoutError:
+                await self._teardown_backend(server)
+                self._failed.add(server)
+                return {
+                    "status": "failed",
+                    "error": f"tool {tool} on {server} timed out after {self._TOOL_TIMEOUT}s",
+                    "server": server,
+                    "tool": tool,
+                }
+            except (asyncio.CancelledError, Exception) as exc:
+                await self._teardown_backend(server)
+                self._failed.add(server)
+                if attempt == 0:
+                    logger.info("Retrying %s.%s after failure: %s", server, tool, exc)
+                    continue
+                return {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "server": server,
+                    "tool": tool,
+                }
+        return {"status": "failed", "error": f"exhausted retries for {server}.{tool}"}
 
     async def discover_all_tools(self) -> list[dict[str, Any]]:
         """Discover tools from all backends. Returns namespaced tool list."""
@@ -179,11 +210,13 @@ class AsyncBackendPool:
         }
 
     async def close(self) -> None:
-        """Shut down all backend connections."""
-        try:
-            await self._stack.aclose()
-        except Exception as exc:
-            logger.warning("Error closing backend pool: %s", exc)
+        """Shut down all backend connections independently."""
+        for server in list(self._stacks):
+            try:
+                await self._teardown_backend(server)
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.warning("Error closing %s: %s", server, exc)
+        self._stacks.clear()
         self._sessions.clear()
         self._tool_cache.clear()
 
@@ -277,18 +310,23 @@ def _build_static_tool_list(
 ) -> list[dict[str, Any]]:
     """Build the tool list from the static toolshed catalog.
 
-    No live connections needed — the toolshed already catalogs 169 tools
-    from pp_harness, eights, and agentsmith. Tools are namespaced as
-    ``{server}__{tool_name}`` so Claude sees
-    ``mcp__hydra_gateway__{server}__{tool_name}``.
+    No live connections needed — the toolshed catalogs ~200 tools across
+    8 backends. Tools are namespaced as ``{server}__{tool_name}`` so
+    Claude sees ``mcp__hydra_gateway__{server}__{tool_name}``.
+
+    Only tools whose server has a matching entry in ``backends.json``
+    (the ``specs`` dict) are advertised. If no backends are configured,
+    nothing is advertised (prevents false-advertising dead tools).
 
     Live backends are connected on-demand only when ``call_tool`` is
     invoked. This avoids startup latency and async context conflicts.
     """
     filtered = {k for k in specs if k not in _SELF_NAMES}
+    if not filtered:
+        return []
     tools: list[dict[str, Any]] = []
     for server_name in sorted(shed._catalog.keys()):
-        if server_name not in filtered and filtered:
+        if server_name not in filtered:
             continue
         for entry in shed._catalog.get(server_name, []):
             tools.append({
@@ -321,6 +359,13 @@ def main() -> None:
     # Backends are connected on-demand when call_tool is invoked.
     cached_tools = _build_static_tool_list(shed, specs)
 
+    # Explicit routing lookup: tool display name → (backend_server, backend_tool).
+    # Avoids fragile string splitting on "__".
+    _tool_routing: dict[str, tuple[str, str]] = {
+        pt["name"]: (pt["_backend_server"], pt["_backend_tool"])
+        for pt in cached_tools
+    }
+
     # The pool handles on-demand connections for call_tool proxying.
     pool = AsyncBackendPool(specs)
 
@@ -347,14 +392,25 @@ def main() -> None:
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict):
         if name in META_TOOL_SCHEMAS:
-            result = await _handle_meta_tool(name, arguments, pool, shed, packs, tree)
+            try:
+                result = await _handle_meta_tool(
+                    name, arguments, pool, shed, packs, tree)
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.error("meta-tool %s failed: %s", name, exc, exc_info=True)
+                result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
             return [t.TextContent(type="text", text=json.dumps(result, default=str))]
 
+        route = _tool_routing.get(name)
+        if route:
+            backend_server, backend_tool = route
+            result = await pool.call_tool(backend_server, backend_tool, arguments)
+            return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+
+        # Fallback for dynamically-discovered tools not in the static catalog
         if "__" in name:
             parts = name.split("__", 1)
             if len(parts) == 2:
-                backend_server, backend_tool = parts
-                result = await pool.call_tool(backend_server, backend_tool, arguments)
+                result = await pool.call_tool(parts[0], parts[1], arguments)
                 return [t.TextContent(type="text", text=json.dumps(result, default=str))]
 
         return [t.TextContent(type="text", text=json.dumps({
@@ -366,6 +422,8 @@ def main() -> None:
         async with stdio_server() as (r, w):
             try:
                 await server.run(r, w, server.create_initialization_options())
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.critical("Gateway server exiting: %s", exc, exc_info=True)
             finally:
                 await pool.close()
 
@@ -391,11 +449,16 @@ async def _handle_meta_tool(
         if squad_filter and squad_filter in packs:
             from hydra_core.tool_scope import squad_tool_manifest
             return squad_tool_manifest(packs[squad_filter])
+        server_info = []
+        for s in pool.server_names:
+            try:
+                tools = await pool.list_tools(s)
+                server_info.append({"server": s, "tool_count": len(tools)})
+            except (asyncio.CancelledError, Exception) as exc:
+                logger.warning("discover failed for %s: %s", s, exc)
+                server_info.append({"server": s, "tool_count": 0, "error": str(exc)})
         return {
-            "servers": [
-                {"server": s, "tool_count": len(await pool.list_tools(s))}
-                for s in pool.server_names
-            ],
+            "servers": server_info,
             "squads": [
                 {"slug": s, "name": p.name, "entrypoint": p.entrypoint}
                 for s, p in sorted(packs.items())
