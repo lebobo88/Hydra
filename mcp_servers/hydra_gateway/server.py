@@ -119,6 +119,8 @@ class AsyncBackendPool:
             self._failed.add(server)
             return []
 
+    _TOOL_TIMEOUT = 120.0
+
     async def call_tool(self, server: str, tool: str,
                         args: dict[str, Any]) -> dict[str, Any]:
         """Forward a tool call to a backend."""
@@ -129,8 +131,20 @@ class AsyncBackendPool:
                 "error": f"backend {server!r} not connected",
             }
         try:
-            result = await session.call_tool(tool, args)
+            result = await asyncio.wait_for(
+                session.call_tool(tool, args),
+                timeout=self._TOOL_TIMEOUT,
+            )
             return _extract_result(result)
+        except asyncio.TimeoutError:
+            self._failed.add(server)
+            self._sessions.pop(server, None)
+            return {
+                "status": "failed",
+                "error": f"tool {tool} on {server} timed out after {self._TOOL_TIMEOUT}s",
+                "server": server,
+                "tool": tool,
+            }
         except Exception as exc:
             self._failed.add(server)
             self._sessions.pop(server, None)
