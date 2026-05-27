@@ -9,7 +9,7 @@
 Hydra is a **typed-envelope supervisor over three specialist crowns**, not a flat agent swarm. Confidence: **High**. The architecture is a deliberate inversion of the "more agents" reflex: one LangGraph state machine routes contracts, three MCP-isolated crowns execute them, and a memory fabric makes the system learn across runs. This is what makes it implementable today and fundable for the next three years.
 
 ## Situation Assessment
-The default failure mode of multi-agent systems is **emergent chaos**: N agents gossiping on a shared bus, with non-deterministic handoffs, unbounded loops, and no audit chain. Hydra rejects that topology. We chose a **contract-net supervisor** (LangGraph, 7 phases: intake → planning → approval → dispatch → executing → synthesis → postcheck) that brokers typed work packets to specialist crowns. Squad boundaries are contracts, not conversations.
+The default failure mode of multi-agent systems is **emergent chaos**: N agents gossiping on a shared bus, with non-deterministic handoffs, unbounded loops, and no audit chain. Hydra rejects that topology. We chose a **contract-net supervisor** (LangGraph, 8 nodes: intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck) that brokers typed work packets to specialist crowns. Squad boundaries are contracts, not conversations.
 
 ## Detail
 

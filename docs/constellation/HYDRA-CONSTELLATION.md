@@ -109,23 +109,26 @@ One hash. One document. Everything downstream is answerable to it.
 
 # Act II — The Architecture
 
-## 9. The 7-Phase State Machine (D2)
+## 9. The 8-Node State Machine (D2)
 
 ```mermaid
 %%{init: {'theme':'dark','themeVariables':{'primaryColor':'#0D0F1A','primaryTextColor':'#E8D5A3','primaryBorderColor':'#2E86AB','lineColor':'#E8D5A3'}}}%%
 stateDiagram-v2
     direction LR
     [*] --> Intake
-    Intake --> Planning : routed_goal
-    Planning --> Approval : CSuiteDecisionPacket
+    Intake --> Planner : routed_goal
+    Planner --> Approval : CSuiteDecisionPacket
+    Planner --> Dispatch : no_approval_needed
     Approval --> Dispatch : approved
     Approval --> Intake : revise
-    Dispatch --> Executing : envelopes_fanned_out
-    Executing --> Synthesis : all_squad_returns
-    Synthesis --> Postcheck : DecisionRecord
+    Dispatch --> JudgePerSquad : envelopes_fanned_out
+    JudgePerSquad --> Synthesis : all_verdicts_in
+    JudgePerSquad --> Approval : circuit_breaker_tripped
+    Synthesis --> JudgeSynthesis : DecisionRecord
+    JudgeSynthesis --> Postcheck : passed
+    JudgeSynthesis --> Approval : HITL_required
     Postcheck --> [*] : passed
     Postcheck --> Approval : HITL_required
-    Executing --> Approval : circuit_breaker_tripped
 ```
 
 ## 10. The Envelope Schema (D7)

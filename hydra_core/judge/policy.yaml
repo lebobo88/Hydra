@@ -42,7 +42,7 @@ budget_cap_per_workflow_usd: 2.50
 # get the supervisor wiring but no real judge call.
 enabled_squads:
   - executive
-  - creative
+  - garland
   - healthcare
   - legal-compliance
 

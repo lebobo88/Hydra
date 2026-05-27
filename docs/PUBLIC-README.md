@@ -22,7 +22,7 @@ Hydra is a LangGraph supervisor + Claude Code plugin that:
 - Pauses for human approval at HITL gates (`/hydra:approve`,
   `/hydra:resume`).
 - Remembers every decision in a three-tier memory fabric (ephemeral /
-  episodic / semantic) with bi-temporal modeling.
+  episodic / semantic).
 - Synthesizes a single integrated answer back to the user.
 
 Hydra does **not** do the squads' work — it routes, governs, synthesizes.
@@ -33,21 +33,23 @@ Out of the box, Hydra ships with three productized crews:
 
 | Crown | Squad | Source pack | What it does |
 |---|---|---|---|
-| Executive | `executive` | [ExecutiveSuite](https://example.invalid) | C-suite strategic decisions, boardroom, capital allocation, M&A, crisis response |
-| Forge | `engineering` | [pair-programmer](https://example.invalid) | spec-driven dev: PRD → ArchRFC → DevTask → tests → review → release |
-| Garland | `garland` | RLM-Creative *(planned)* | brand, copy, content, social, paid, PR, SEO, visual direction |
+| Executive | `executive` | [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) | C-suite strategic decisions, boardroom, capital allocation, M&A, crisis response |
+| Forge | `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | spec-driven dev: PRD → ArchRFC → DevTask → tests → review → release |
+| Garland | `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | brand, copy, content, social, paid, PR, SEO, visual direction |
 
-Plus six stub crews scaffolded for legal-compliance, healthcare, sales-gtm,
-research-ds, customer-support, and the Garland Crown (until its source pack
-ships). Drop a `squads/<slug>/squad.yaml` file and it appears in the
-registry — no code changes.
+Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo88/MarketBliss)
+(5 squads: marketing-strategy, marketing-creative, marketing-research,
+marketing-production, marketing-ops) and five stub crews scaffolded for
+legal-compliance, healthcare, sales-gtm, research-ds, and customer-support.
+Drop a `squads/<slug>/squad.yaml` file and it appears in the registry — no
+code changes.
 
 ## TheEights — persistent memory
 
 The Hydra's memory layer. Three tiers:
 
 - **Episodic** — append-only SQLite log of every envelope, tool call,
-  verdict, with bi-temporal modeling.
+  and verdict.
 - **Semantic** — pluggable vector index (Chroma/Qdrant/in-memory
   fallback).
 - **Procedural** — self-rewriting routing heuristics, gated by the
@@ -110,8 +112,8 @@ a paused workflow past an HITL gate.
 ## Architecture (one-pager)
 
 - **Supervisor** — `hydra_core/supervisor.py`. LangGraph state machine,
-  8 phases: intake → planning → approval(?) → dispatch → executing →
-  synthesis → postcheck → done/surfaced. Checkpointed to
+  8 nodes: intake → planner → approval → dispatch → judge_per_squad →
+  synthesis → judge_synthesis → postcheck. Checkpointed to
   `~/.hydra/checkpoints.db`.
 - **Schemas** — `hydra_core/schemas.py`. 10 typed envelopes, validated at
   every squad boundary.

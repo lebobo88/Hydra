@@ -15,6 +15,11 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 | executive | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | agent-impersonation |
 | engineering | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | mcp |
 | garland | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | claude-skill |
+| marketing-strategy | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
+| marketing-creative | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
+| marketing-research | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
+| marketing-production | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
+| marketing-ops | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
 | legal-compliance | (stub) | stub |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |

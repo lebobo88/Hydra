@@ -34,7 +34,7 @@ Every squad declares — in its `squad.yaml`:
 - `accepts:` message types it consumes (e.g. `CREATIVE_BRIEF`)
 - `emits:` message types it produces (e.g. `SHOT_LIST`, `ASSET_JOB`)
 - `gates:` rubrics + HITL checkpoints
-- `entrypoint:` how Hydra invokes it (`mcp` | `subprocess` | `agent-impersonation` | `claude-skill`)
+- `entrypoint:` how Hydra invokes it (`mcp` | `subprocess` | `agent-impersonation` | `claude-skill` | `stub`)
 - `industries:` keyword tags used by the router
 
 Adding a new squad = dropping a folder into `squads/`. No code change to Hydra core.
@@ -49,7 +49,7 @@ USER GOAL ──► │  intake / triage │  classifies into 1+ squads, budget,
               └────────┬─────────┘
                        ▼
               ┌──────────────────┐
-              │  planner (CEO-A) │  decomposes into typed tasks, builds DAG
+              │     planner      │  decomposes into typed tasks, builds DAG
               └────────┬─────────┘
                        ▼
               ┌──────────────────┐    HITL interrupt
@@ -57,21 +57,23 @@ USER GOAL ──► │  intake / triage │  classifies into 1+ squads, budget,
               └────────┬─────────┘                │
                        ▼                          │
               ┌──────────────────┐                │
-              │   dispatcher     │ ──► squad subgraphs (parallel)
+              │    dispatch      │ ──► squad subgraphs (parallel)
               └────────┬─────────┘                │
                        ▼                          │
-   ┌──────────┐  ┌──────────┐  ┌──────────┐       │
-   │ exec     │  │ eng      │  │ creative │  ...  │
-   │ subgraph │  │ subgraph │  │ subgraph │       │
-   └────┬─────┘  └────┬─────┘  └────┬─────┘       │
-        └─────────────┴─────────────┘             │
+              ┌──────────────────┐                │
+              │ judge_per_squad  │  cross-vendor judge per squad result
+              └────────┬─────────┘                │
                        ▼                          │
               ┌──────────────────┐                │
-              │   synthesizer    │ ──► DECISION_RECORD, artifact links
+              │   synthesis      │ ──► DECISION_RECORD, artifact links
+              └────────┬─────────┘                │
+                       ▼                          │
+              ┌──────────────────┐                │
+              │ judge_synthesis  │  cross-vendor judge on merged output
               └────────┬─────────┘                │
                        ▼                          │
               ┌──────────────────┐ ─ budget/loop/risk breach ─► HITL ──┘
-              │  postcheck       │
+              │    postcheck     │
               └────────┬─────────┘
                        ▼
                     RESPONSE
@@ -106,7 +108,7 @@ Schema validation runs at every squad-boundary edge in the graph (`schema-valida
 
 ## 4. MCP Host Configuration
 
-Hydra is an MCP host. It opens one isolated client session per squad-server pair declared in `.mcp.json` and in each squad's `squad.yaml`. Tool names are namespaced (`hydra-eng.pp.*`, `hydra-exec.es.*`, `hydra-mem.*`). RBAC at the host: tools are *whitelisted per squad* — an executive agent cannot call an engineering deploy tool unless the planner explicitly grants a `Handoff`.
+Hydra is an MCP host. It opens one isolated client session per squad-server pair declared in `~/.hydra/backends.json` (gateway mode) or `~/.claude.json` (standalone). Tool names are namespaced per server (`pp_harness.*`, `executive_suite.*`, `hydra_memory.*`). RBAC at the host: tools are *whitelisted per squad* — an executive agent cannot call an engineering deploy tool unless the planner explicitly grants a `Handoff`.
 
 ---
 
@@ -122,7 +124,7 @@ Agents receive **handles**, never raw blobs, to keep prompt cost predictable.
 
 ## 6. Governance Plane
 
-- **HITL**: `interrupt_before=["approval_gate", "high_risk_dispatch", "synthesizer"]` on the supervisor graph. `/hydra:approve <workflow_id>` resumes.
+- **HITL**: `interrupt_before=["approval", "synthesis", "judge_synthesis"]` on the supervisor graph. `/hydra:approve <workflow_id>` resumes.
 - **Budget**: per-workflow `Constraints.budget_usd` enforced by `budget_tripwire` hook; auto-downgrades model tier when 80% consumed (mirrors PP cost router).
 - **Loop ceiling**: max `iterations` (default 25) and `depth` (default 5) per supervisor; circuit-breaker disables a node after 3 consecutive failures.
 - **Redaction**: cross-squad messages pass through `redactor.py` — strips PII / financial / source-of-truth fields per squad permission matrix.
@@ -145,14 +147,16 @@ Agents receive **handles**, never raw blobs, to keep prompt cost predictable.
 
 User: *"Launch a Q3 campaign for the new billing-microservice — needs a press kit, in-app announcement, and pricing-page update."*
 
-1. **`/hydra:run`** → `intake` classifies: `executive` (pricing strategy) + `engineering` (pricing page) + `creative` (press kit + in-app).
+1. **`/hydra:run`** → `intake` classifies: `executive` (pricing strategy) + `engineering` (pricing page) + `garland` (press kit + in-app).
 2. **planner** emits a `CSuiteDecisionPacket` (CEO+CFO+CMO impersonation via ExecutiveSuite's `boardroom` pattern) → `DECISION_RECORD` with budget split.
 3. **approval gate** interrupts; user `/hydra:approve` confirms budget.
 4. **dispatcher** fans out:
-   - `creative` ← `CreativeBrief` → invokes RLM `rlmboard`+`copywriter`+`gemini-image` → returns `AssetJob` results.
-   - `engineering` ← `PRD` → invokes pair-programmer `/pp:team feature-team` → returns PR url + smoke-pass.
+   - `garland` ← `CreativeBrief` → invokes RLM skills → returns `AssetJob` results.
+   - `engineering` ← `PRD` → invokes pair-programmer → returns PR url + smoke-pass.
    - `executive` parks dependency on `cfo` to validate pricing after both finish.
-5. **synthesizer** consolidates into `DECISION_RECORD` v2 with go-live runbook, posts to episodic memory, files master-plan patches in `PROJECT_MASTER.md`.
+5. **judge_per_squad** evaluates each squad's output via cross-vendor rubrics.
+6. **synthesizer** consolidates into `DECISION_RECORD` v2 with go-live runbook, posts to episodic memory, files master-plan patches in `PROJECT_MASTER.md`.
+7. **judge_synthesis** validates the merged output; HITL escalation on policy breach.
 
 The full trace is replayable via `/hydra:replay <workflow_id>`.
 

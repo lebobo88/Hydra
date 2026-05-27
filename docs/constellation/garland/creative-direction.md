@@ -64,7 +64,7 @@ Voice exemplars to keep on the copywriter's desk: Donella Meadows in *Thinking i
 
 | # | Title | Headline | Visual cue |
 |---|---|---|---|
-| 9 | The State Machine | Seven phases. Typed state. No shortcuts. | D2 |
+| 9 | The State Machine | Eight nodes. Typed state. No shortcuts. | D2 |
 | 10 | The Envelope Schema | Typed envelopes. No raw blobs cross squad lines. | Code block, 12 lines |
 | 11 | MCP Host Topology | Namespaced. Whitelisted. Host-enforced. | D4 |
 | 12 | The Executive Crown | Strategy enters as intent. Exits as structured decision. | Hexagon at 60% width + capability list |

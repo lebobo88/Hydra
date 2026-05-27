@@ -30,7 +30,7 @@ modes a contributor should expect.
 |     supervisor.py  -> build_supervisor() compiles the graph  |
 |     router.py      -> deterministic + LLM-fallback intent    |
 |     squad_loader.py-> auto-discovers squads/<slug>/squad.yaml|
-|     squad_node.py  -> 4 entrypoint adapters                  |
+|     squad_node.py  -> 5 entrypoint adapters                  |
 |     governance.py  -> budget, loops, circuit break, redact   |
 |     memory.py      -> episodic SQLite + semantic Chroma      |
 |     telemetry.py   -> OTEL spans + JSONL trace               |
@@ -40,34 +40,36 @@ modes a contributor should expect.
         |                    |                    |
 +-------v------+    +--------v-------+   +--------v-------+
 | Squad packs  |    | MCP host       |   | Memory fabric  |
-| (8 today)    |    | per-squad      |   | episodic + vec |
+| (13 today)   |    | per-squad      |   | episodic + vec |
 |              |    | client session |   |                |
-| executive    |    | pp-daemon      |   | ~/.hydra/      |
-| engineering  |    | rlm-skills     |   |   episodic.db  |
-| creative     |    | hydra-mem      |   |   vectors/     |
-| 5 stubs      |    | hydra-redact   |   |   checkpoints  |
+| executive    |    | hydra_memory   |   | ~/.hydra/      |
+| engineering  |    | executive_suite|   |   episodic.db  |
+| garland      |    | rlm_creative   |   |   vectors/     |
+| 5 marketing  |    | hydra_toolshed |   |   checkpoints  |
+| 5 stubs      |    | hydra_gateway  |   |                |
 +--------------+    +----------------+   +----------------+
 ```
 
 A Claude Code session loads the plugin. The plugin's hooks initialize the
 registry and start the supervisor on `/hydra:run`. The supervisor compiles
 a LangGraph state machine (or a pure-python fallback runner when LangGraph
-is absent), dispatches each squad through one of four adapters, persists
+is absent), dispatches each squad through one of five adapters, persists
 state to LangGraph's `SqliteSaver` at `~/.hydra/checkpoints.db`, and emits
 OTEL spans plus a JSONL trace at `<project>/.hydra/<workflow_id>/trace.jsonl`.
 
 ## 2. LangGraph state machine
 
-The supervisor graph has seven explicit phases, mirroring `HYDRA.md` §2:
+The supervisor graph has eight explicit nodes, mirroring `HYDRA.md` §2:
 
 | Phase | Node | Purpose |
 |---|---|---|
 | `intake` | `hydra-router` | Classify goal -> 1+ squad slugs (deterministic keywords first, LLM fallback). Establish `Constraints` (budget, deadline, risk_tolerance, industries). |
-| `planning` | `hydra-planner` | Decompose into typed `TaskState` entries, build a small DAG, populate `selected_squads`, draft a `CSuiteDecisionPacket`. |
+| `planner` | `hydra-planner` | Decompose into typed `TaskState` entries, build a small DAG, populate `selected_squads`, draft a `CSuiteDecisionPacket`. |
 | `approval` | `hydra-hitl-gate` | `interrupt_before` checkpoint. Sets `pending_hitl`; supervisor halts until `/hydra:approve` resumes the thread. |
-| `dispatch` | `dispatcher` | Fan out to squad subgraphs in parallel, materialize one envelope per task. |
-| `executing` | per-squad node | `squad_node.execute_squad()` routes through one of four adapters (mcp / subprocess / agent-impersonation / claude-skill / stub) and produces a `SquadResult`. |
+| `dispatch` | `dispatcher` | Fan out to squad subgraphs in parallel via one of five adapters (mcp / subprocess / agent-impersonation / claude-skill / stub), materialize one envelope per task, produce a `SquadResult` per squad. |
+| `judge_per_squad` | cross-vendor judge | Per-squad rubric evaluation via `pp_codex` / `pp_gemini`. Reflexion ×1 retry on `revise`. Skips host-pickup envelopes. |
 | `synthesis` | `hydra-synthesizer` | Merge all `SquadResult`s into a single `DECISION_RECORD`, post artifacts to episodic memory, append a master-plan patch. |
+| `judge_synthesis` | cross-vendor judge | Judge the merged `DecisionRecord` against synthesis-level rubrics. HITL escalation on policy breach. |
 | `postcheck` | `hydra-cfo-gate` | Re-evaluate budget, loop ceiling, residual risk. May surface back to HITL or to `done`. |
 
 Conditional edges from `postcheck` route to `done`, back to `dispatch`
@@ -91,7 +93,8 @@ class HydraState(BaseModel):
     tenant_id: str = "default"
     root_goal: str = ""
     phase: Literal["intake", "planning", "approval", "dispatch",
-                   "executing", "synthesis", "postcheck",
+                   "executing", "judge_per_squad", "synthesis",
+                   "judge_synthesis", "postcheck",
                    "done", "surfaced"] = "intake"
 
     selected_squads: list[str]
@@ -144,8 +147,8 @@ The discriminator types currently defined:
 - `PRD` — product requirement doc; produced by `engineering` or `executive`.
 - `ArchRFC` — architecture RFC; produced by `engineering`.
 - `DevTask` — granular implementation unit; consumed by `engineering`.
-- `CreativeBrief` — produced by `executive` or `sales-gtm`; consumed by `creative`.
-- `ShotList`, `AssetJob` — internal to and emitted by `creative`.
+- `CreativeBrief` — produced by `executive` or `sales-gtm`; consumed by `garland`.
+- `ShotList`, `AssetJob` — internal to and emitted by `garland`.
 - `DecisionRecord` — terminal artifact, emitted by every squad and merged
   by the synthesizer.
 - `HITLRequest` — any node can raise one; surfaces to the approval gate.
@@ -177,13 +180,15 @@ Hydra consumes MCP servers registered at operator-managed user scope
 (`~/.claude.json` mcpServers). It does **not** register them itself.
 The servers fall into three categories:
 
-### 6a. In-repo MCP shims (shipped with Hydra)
+### 6a. In-repo MCP servers (shipped with Hydra)
 
 | Server | Location | Purpose |
 |--------|----------|---------|
 | `hydra_memory` | `mcp_servers/hydra_memory/server.py` | Thin shim over SQLite episodic store + TheEights cells |
 | `executive_suite` | `mcp_servers/executive_suite/server.py` | Read-only introspection of ExecutiveSuite's `.claude/` directory (roster, skills, commands, output) |
 | `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of RLM-Creative's `.claude/` directory |
+| `hydra_toolshed` | `mcp_servers/hydra_toolshed/server.py` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
+| `hydra_gateway` | `mcp_servers/hydra_gateway/server.py` | Unified proxy — consolidates all backend servers behind a single MCP registration with static tool catalog and on-demand backend connections |
 
 These are pack-shim servers that read filesystem state from sibling
 projects. They are **not** the primary execution path for their
@@ -261,7 +266,7 @@ enforce_governance(state, ...) -> GovernanceVerdict
 
 Behaviour:
 
-- **HITL**: `interrupt_before=["approval_gate", "high_risk_dispatch", "synthesizer"]`.
+- **HITL**: `interrupt_before=["approval", "synthesis", "judge_synthesis"]`.
 - **Budget**: enforced per workflow. At 80% consumption Hydra signals the
   current squad to downgrade model tier (mirrors PP's cost router); at
   100% it blocks dispatch and raises an HITL.

@@ -39,7 +39,7 @@ A non-technical reader gets the Pentecost story by slide 5. A technical reader g
 
 This bundle is itself an example of the system. It was produced through a Hydra-style full-fan-out run:
 
-1. **Pre-flight** — verified all six MCP servers reachable (`pp-daemon`, `executive-suite`, `rlm-creative`, `hydra-memory`, `agentsmith`); snapshotted constitution SHA.
+1. **Pre-flight** — verified all MCP servers reachable (`pp_harness`, `executive_suite`, `rlm_creative`, `hydra_memory`, `agentsmith`); snapshotted constitution SHA.
 2. **Executive Crown** — CSO, CTO, and CAIO authored the three executive memos (parallel dispatch).
 3. **Garland Crown** — RLM-Creative-style designer produced brand voice + slide-by-slide outline + narration + accessibility plan.
 4. **Forge Crown** — Mermaid sources for D2–D9 + SVG poster combining D1, D5, D10.

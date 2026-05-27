@@ -1,9 +1,9 @@
 """LangGraph supervisor graph for Hydra.
 
-Phase machine:
-    intake → planning → approval(?) → dispatch → executing → synthesis → postcheck → done
+Phase machine (8 nodes):
+    intake → planner → approval(?) → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck → done
 
-`interrupt_before` is set on approval, dispatch (when high-risk), and synthesis,
+`interrupt_before` is set on approval, synthesis, and judge_synthesis,
 so HITL via Claude Code's `/hydra:approve <workflow_id>` resumes the run.
 
 The graph is built lazily — discovers squads from the registry and adds one

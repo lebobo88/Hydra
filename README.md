@@ -96,10 +96,10 @@ graph TD
 
 ## What Hydra is
 
-1. A **LangGraph supervisor graph** running a 7-phase state machine: `intake → planning → approval → dispatch → executing → synthesis → postcheck`. Checkpointed via SQLite (`~/.hydra/checkpoints.db`); long workflows survive restarts.
+1. A **LangGraph supervisor graph** running an 8-node state machine: `intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck`. Checkpointed via SQLite (`~/.hydra/checkpoints.db`); long workflows survive restarts.
 2. A **squad registry** — every squad is described by `squads/<slug>/squad.yaml` and auto-discovered. Adding a squad is a config change, not a Hydra-core change.
 3. A **typed cross-squad message bus** with ten Pydantic schemas: `CSuiteDecisionPacket`, `PRD`, `ArchRFC`, `DevTask`, `CreativeBrief`, `ShotList`, `AssetJob`, `DecisionRecord`, `HITLRequest`, `Handoff`. Validated fail-closed at every squad boundary (`hydra_core.schemas.validate_envelope`).
-4. An **MCP host** that fans out to each squad's tool surface as an isolated MCP client session. Six MCP servers ship in this repo (see [§ MCP topology](#mcp-topology)).
+4. An **MCP host** that fans out to each squad's tool surface as an isolated MCP client session. Five MCP servers ship in this repo (see [§ MCP topology](#mcp-topology)).
 5. A **local-first memory fabric** with three tiers — ephemeral (in-prompt), episodic (SQLite, `~/.hydra/episodic.db`), semantic (Chroma vector store, `~/.hydra/vectors/`) — provided by the in-repo `hydra-memory` MCP server. Cross-squad reads go through `MemoryRef` handles only. Optionally federates with the [TheEights](https://github.com/lebobo88/TheEights) daemon for cross-project hybrid memory + audit graph + governed self-evolution (see [§ TheEights — the optional substrate](#theeights--the-vocabulary-the-substrate-the-optional-federation)).
 6. A **governance plane** — `CONSTITUTION.md` as immortal head (SHA-256 pinned per session, never edited inline), AgentSmith four-pillar enforcement (Factory / Inspector / Sentinel / Archivist) with ten fail-closed invariants (N1–N10), HITL gates, budget tripwires (80% downgrade / 100% HITL), loop ceilings, circuit breaker, redaction at squad boundaries, OTEL trace per workflow.
 
@@ -107,20 +107,27 @@ graph TD
 stateDiagram-v2
     direction LR
     [*] --> Intake
-    Intake --> Planning : routed_goal
-    Planning --> Approval : CSuiteDecisionPacket
+    Intake --> Planner : routed_goal
+    Planner --> Approval : CSuiteDecisionPacket
+    Planner --> Dispatch : no_approval_needed
     Approval --> Dispatch : approved
     Approval --> Intake : revise
-    Dispatch --> Executing : envelopes_fanned_out
-    Executing --> Synthesis : all_squad_returns
-    Synthesis --> Postcheck : DecisionRecord
+    Dispatch --> JudgePerSquad : envelopes_fanned_out
+    JudgePerSquad --> Synthesis : all_verdicts_in
+    JudgePerSquad --> Approval : circuit_breaker_tripped
+    Synthesis --> JudgeSynthesis : DecisionRecord
+    JudgeSynthesis --> Postcheck : passed
+    JudgeSynthesis --> Approval : HITL_required
     Postcheck --> [*] : passed
     Postcheck --> Approval : HITL_required
-    Executing --> Approval : circuit_breaker_tripped
     note right of Approval
         HITL gate.
         Resume only via
         /hydra:approve or /hydra:resume.
+    end note
+    note left of JudgePerSquad
+        Cross-vendor judge per squad.
+        Reflexion ×1 retry on revise.
     end note
     note left of Postcheck
         Loop ceiling, budget,
@@ -139,7 +146,7 @@ The active squads are organized into three crowns, each optimized for a differen
 ```mermaid
 graph TD
     USER([User Goal])
-    HYDRA{{"Hydra Supervisor<br/>LangGraph 7-phase"}}
+    HYDRA{{"Hydra Supervisor<br/>LangGraph 8-node"}}
     IMMORTAL[/"CONSTITUTION.md<br/>SHA-256 attested"/]
 
     subgraph EXEC["Executive Crown — ExecutiveSuite"]
@@ -295,21 +302,25 @@ For the canonical roadmap, see [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFE
 
 ## MCP topology
 
-Hydra ships six MCP servers (registered via the [plugin manifest](.claude-plugin/plugin.json)):
+Hydra ships five in-repo MCP servers under `mcp_servers/`:
 
-| Server | Purpose |
-|---|---|
-| `pp-daemon` | Engineering squad → [pair-programmer](https://github.com/lebobo88/pair-programmer) harness daemon (~42 tools: `start_run`, `archive_artifact`, `judge`, `replay`, `borda_count`, …) |
-| `pp-codex` | Cross-vendor judge plane — wraps the `codex` CLI for Codex critiques |
-| `pp-gemini` | Cross-vendor judge plane — wraps the `gemini` CLI for Gemini critiques |
-| `hydra-memory` | Hydra's in-repo memory shim — episodic SQLite + semantic Chroma + eight-cell tagging (`write_episodic`, `semantic_search`, `query_eights`, `tag_memory`, …). Federates with [TheEights](https://github.com/lebobo88/TheEights) when the daemon is registered. |
-| `executive-suite` | Executive squad — thin MCP over the [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) pack (roster, skills, commands, output persistence) |
-| `rlm-creative` | Garland Crown — Eight Garland Heads studio. Thin MCP over [RLM-Creative](https://github.com/lebobo88/RLM-Creative) (skills, commands, agents, output persistence) |
+| Server | Location | Purpose |
+|---|---|---|
+| `hydra_memory` | `mcp_servers/hydra_memory/` | Episodic SQLite + semantic Chroma + eight-cell tagging (`write_episodic`, `semantic_search`, `query_eights`, `tag_memory`, …). Federates with [TheEights](https://github.com/lebobo88/TheEights) when the daemon is registered. |
+| `executive_suite` | `mcp_servers/executive_suite/` | Thin MCP over the [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) pack (roster, skills, commands, output persistence) |
+| `rlm_creative` | `mcp_servers/rlm_creative/` | Thin MCP over [RLM-Creative](https://github.com/lebobo88/RLM-Creative) (skills, commands, agents, output persistence) |
+| `hydra_toolshed` | `mcp_servers/hydra_toolshed/` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
+| `hydra_gateway` | `mcp_servers/hydra_gateway/` | Unified proxy — consolidates all backend servers behind a single MCP registration (see [§ Gateway consolidation](#gateway-consolidation)) |
 
-Plus two **optional sibling MCP servers**, registered separately at user scope when present:
+Plus **externally registered servers** from sibling projects (operator must install):
 
-- `agentsmith` — from the sibling [AgentSmith](https://github.com/lebobo88/AgentSmith) project. Enforces the N1–N10 invariants when present.
-- `theeights` — from the sibling [TheEights](https://github.com/lebobo88/TheEights) project. Provides the cross-project hybrid memory + audit graph + autogenesis loop. Optional — Hydra runs fully without it; the in-repo `hydra-memory` server is the default substrate.
+| Server | Source | Purpose |
+|---|---|---|
+| `pp_harness` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | Engineering harness daemon (~42 tools) |
+| `pp_codex` | pair-programmer | Cross-vendor judge plane — Codex critiques |
+| `pp_gemini` | pair-programmer | Cross-vendor judge plane — Gemini critiques |
+| `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Meta-governance — N1–N10 invariants |
+| `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Cross-project hybrid memory + audit graph + autogenesis loop |
 
 ### Gateway consolidation
 
@@ -376,7 +387,7 @@ This registers the local marketplace, copies the plugin into `~/.claude/plugins/
 Verify:
 
 ```
-/mcp                   # expect 6 servers connected: pp-daemon, pp-codex, pp-gemini, hydra-memory, executive-suite, rlm-creative
+/mcp                   # in gateway mode: expect hydra_gateway connected; standalone: expect individual servers
 /hydra:hydra-squads    # expect 13 squads listed (3 crowns active, 5 marketing active, 5 stubs)
 /doctor                # expect 0 plugin errors
 ```
@@ -405,7 +416,7 @@ Available in any Claude Code session once the plugin is registered:
 
 | Command | Purpose |
 |---|---|
-| `/hydra:run "<goal>"` | Start a new workflow. Routes through intake → planning → approval → dispatch → synthesis. |
+| `/hydra:run "<goal>"` | Start a new workflow. Routes through intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck. |
 | `/hydra:status [<workflow_id>]` | List recent workflows or dump the trace for one. |
 | `/hydra:squads` | Show the discovered squad registry (slugs, entrypoints, accepts/emits, industries). |
 | `/hydra:approve <workflow_id>` | Resume a workflow paused at the HITL approval gate. |
@@ -470,8 +481,8 @@ Hydra/
 │       ├── exec-memos/               ← CSO / CTO / CAIO memos (Act III voice)
 │       ├── garland/                  ← Garland-crown cinematic treatment
 │       └── assets/diagrams/          ← Mermaid sources D2–D9
-├── hydra_core/                       ← Python: supervisor, router, planner, dispatcher, synthesizer, governance, memory
-├── mcp_servers/                      ← Python MCP shims (hydra_memory, executive_suite, rlm_creative)
+├── hydra_core/                       ← Python: supervisor, router, planner, dispatcher, synthesizer, governance, memory, judge
+├── mcp_servers/                      ← Python MCP servers (hydra_memory, executive_suite, rlm_creative, hydra_toolshed, hydra_gateway)
 ├── squads/<slug>/squad.yaml          ← squad declarations (active + stub)
 ├── scripts/install.ps1               ← Python runtime installer
 ├── scripts/hydra.ps1                 ← convenience wrapper around `python -m hydra_core.cli`
