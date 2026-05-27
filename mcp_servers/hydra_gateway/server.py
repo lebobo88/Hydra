@@ -20,11 +20,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import signal
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
+
+import anyio
 
 logger = logging.getLogger(__name__)
 
@@ -71,21 +72,20 @@ class AsyncBackendPool:
             except (asyncio.CancelledError, Exception):
                 pass
 
-    async def _connect(self, server: str) -> Any:
-        """Open a stdio session to a backend. Returns the ClientSession."""
-        if server in self._sessions:
-            return self._sessions[server]
-        if server not in self._specs:
-            return None
+    async def _do_connect(self, server: str) -> Any:
+        """Internal: open a stdio session in its own async context.
 
+        Runs as a standalone coroutine (via ensure_future) so that the
+        anyio task groups inside stdio_client don't nest inside the MCP
+        handler's cancel scope — that nesting causes RuntimeError:
+        'Attempted to exit a cancel scope that isn't the current task's
+        current cancel scope'.
+        """
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
         except ImportError:
             return None
-
-        # Tear down any previous broken stack for this server
-        await self._teardown_backend(server)
 
         spec = self._specs[server]
         params = StdioServerParameters(
@@ -96,27 +96,51 @@ class AsyncBackendPool:
         )
         stack = AsyncExitStack()
         try:
-            transport = await asyncio.wait_for(
-                stack.enter_async_context(stdio_client(params)),
-                timeout=_CONNECT_TIMEOUT,
-            )
+            transport = await stack.enter_async_context(stdio_client(params))
             read, write = transport
             session = await stack.enter_async_context(
                 ClientSession(read, write)
             )
-            await asyncio.wait_for(session.initialize(), timeout=_CONNECT_TIMEOUT)
+            await session.initialize()
             self._stacks[server] = stack
             self._sessions[server] = session
             self._failed.discard(server)
             logger.info("Connected to backend: %s", server)
             return session
-        except (asyncio.CancelledError, Exception) as exc:
+        except (TimeoutError, asyncio.CancelledError, Exception) as exc:
             logger.warning("Failed to connect to %s: %s", server, exc)
             self._failed.add(server)
             try:
                 await stack.aclose()
             except (asyncio.CancelledError, Exception):
                 pass
+            return None
+
+    async def _connect(self, server: str) -> Any:
+        """Open a stdio session to a backend. Returns the ClientSession.
+
+        The actual connection runs in a separate asyncio Task so that the
+        anyio cancel scopes from stdio_client don't interleave with the
+        MCP SDK's handler cancel scopes.
+        """
+        if server in self._sessions:
+            return self._sessions[server]
+        if server not in self._specs:
+            return None
+
+        await self._teardown_backend(server)
+
+        try:
+            task = asyncio.ensure_future(self._do_connect(server))
+            return await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
+        except (TimeoutError, asyncio.TimeoutError):
+            task.cancel()
+            logger.warning("Timeout connecting to %s", server)
+            self._failed.add(server)
+            return None
+        except (asyncio.CancelledError, Exception) as exc:
+            logger.warning("Failed to connect to %s: %s", server, exc)
+            self._failed.add(server)
             return None
 
     async def list_tools(self, server: str) -> list[dict[str, Any]]:
@@ -129,7 +153,8 @@ class AsyncBackendPool:
             return []
 
         try:
-            result = await asyncio.wait_for(session.list_tools(), timeout=_CONNECT_TIMEOUT)
+            task = asyncio.ensure_future(session.list_tools())
+            result = await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
             tools = [
                 {
                     "name": t.name,
@@ -140,12 +165,17 @@ class AsyncBackendPool:
             ]
             self._tool_cache[server] = tools
             return tools
-        except (asyncio.CancelledError, Exception) as exc:
+        except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
             logger.warning("list_tools failed for %s: %s", server, exc)
             self._failed.add(server)
             return []
 
     _TOOL_TIMEOUT = 120.0
+
+    async def _do_call(self, session: Any, tool: str,
+                       args: dict[str, Any]) -> Any:
+        """Run session.call_tool in its own coroutine context."""
+        return await session.call_tool(tool, args)
 
     async def call_tool(self, server: str, tool: str,
                         args: dict[str, Any]) -> dict[str, Any]:
@@ -158,12 +188,11 @@ class AsyncBackendPool:
                     "error": f"backend {server!r} not connected",
                 }
             try:
-                result = await asyncio.wait_for(
-                    session.call_tool(tool, args),
-                    timeout=self._TOOL_TIMEOUT,
-                )
+                task = asyncio.ensure_future(self._do_call(session, tool, args))
+                result = await asyncio.wait_for(task, timeout=self._TOOL_TIMEOUT)
                 return _extract_result(result)
-            except asyncio.TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
+                task.cancel()
                 await self._teardown_backend(server)
                 self._failed.add(server)
                 return {
