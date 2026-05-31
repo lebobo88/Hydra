@@ -262,7 +262,7 @@ Constitutional ground truth lives in Qian; current attention in Li; guardrails i
 
 #### Part 2 — The memory substrate (in-repo default; TheEights optional)
 
-The default memory backend is the in-repo `hydra-memory` MCP server (`mcp_servers/hydra_memory/`): a Python shim over a local SQLite episodic log (`~/.hydra/episodic.db`) and a local Chroma vector store (`~/.hydra/vectors/`). Single-machine. Single-project. Zero external dependencies beyond `chromadb` (optional).
+The default memory backend is the in-repo `hydra-memory` MCP server (`mcp_servers/hydra_memory/`): a Python shim over a local SQLite episodic log (`~/.hydra/episodic.db`). `hydra-mem.semantic_search` runs an honest full-text search (LIKE across stored payloads, kinds, and keys) over that log. A vector/embedding layer (Chroma-pluggable) and TheEights federation are optional add-ons on top — the default install is pure SQLite, single-machine, single-project, with zero external dependencies.
 
 #### Part 3 — TheEights, the separate sibling project
 

@@ -97,11 +97,19 @@ class ToolShed:
 
     def register_static_catalog(self, server: str,
                                 tool_names: list[str],
-                                descriptions: dict[str, str] | None = None) -> int:
-        """Register tools from a static name list (no live discovery needed)."""
+                                descriptions: dict[str, str] | None = None,
+                                schemas: dict[str, dict[str, Any]] | None = None) -> int:
+        """Register tools from a static name list (no live discovery needed).
+
+        ``schemas`` optionally maps a tool name to its real JSON input schema.
+        Hand-seeded schemas (see ``SCHEMA_OVERRIDES``) give the gateway typed
+        params for high-value tools before the offline schema cache is warmed,
+        so nested objects and numeric args survive the proxy hop."""
         descs = descriptions or {}
+        schemas = schemas or {}
         tools = [
-            {"name": n, "description": descs.get(n, n)}
+            {"name": n, "description": descs.get(n, n),
+             "inputSchema": schemas.get(n, {})}
             for n in tool_names
         ]
         return self.register_server(server, tools)
@@ -500,13 +508,121 @@ class ProgressiveDisclosureTree:
         }
 
 
+# ---------- hand-seeded schemas (immediate relief before cache warm-up) ----------
+#
+# The static catalogs above carry only names + descriptions, so the gateway
+# advertises `{"type":"object"}` for every tool — which strips type info and
+# makes Claude emit nested objects / numeric args as strings (e.g.
+# `start_run(n=3)` arrives as `"3"` and the daemon rejects it). These overrides
+# declare real schemas for the highest-value tools so calls work even before
+# `refresh_schemas` warms ~/.hydra/gateway_schemas.json. Keyed by the catalog
+# tool name. The live refresh cache takes precedence over these at runtime.
+SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
+    "pp_harness": {
+        "start_run": {
+            "type": "object",
+            "properties": {
+                "request_text": {"type": "string", "minLength": 1},
+                "project_path": {"type": "string", "minLength": 1},
+                "mode": {"type": "string",
+                         "enum": ["single", "best_of", "team", "review"]},
+                "team": {"type": "string"},
+                "forum": {"type": "string"},
+                "n": {"type": "integer", "minimum": 1, "maximum": 8,
+                      "description": "Candidate count for best_of mode."},
+                "session_id": {"type": "string"},
+                "hydra_workflow_id": {"type": "string"},
+                "hydra_envelope_id": {"type": "string"},
+                "hydra_origin_squad": {"type": "string"},
+                "hydra_envelope_type": {"type": "string"},
+            },
+            "required": ["request_text", "project_path", "mode"],
+            "additionalProperties": False,
+        },
+    },
+    "eights": {
+        "eights.memory.add": {
+            "type": "object",
+            "properties": {
+                "envelope": {"type": "object",
+                             "description": "TheEights envelope (origin, objective, ids)."},
+                "content": {"type": "string"},
+                "type": {"type": "string",
+                         "enum": ["working", "episodic", "semantic",
+                                  "procedural", "meta"]},
+                "summary": {"type": "string"},
+                "scopes": {"type": "array", "items": {"type": "string"}},
+                "provenance": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "actor": {"type": "string"},
+                        "model": {"type": "string"},
+                        "source_uri": {"type": "string"},
+                    },
+                    "required": ["actor"],
+                },
+                "embedding": {"type": "array", "items": {"type": "number"}},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "supersedes": {"type": "array", "items": {"type": "string"}},
+                "cell": {"type": "string"},
+            },
+            "required": ["envelope", "content", "type", "provenance"],
+        },
+        "eights.memory.search": {
+            "type": "object",
+            "properties": {
+                "envelope": {"type": "object"},
+                "query": {"type": "string"},
+                "query_embedding": {"type": "array", "items": {"type": "number"}},
+                "types": {"type": "array", "items": {"type": "string"}},
+                "scopes": {"type": "array", "items": {"type": "string"}},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 100},
+                "fusion": {"type": "string",
+                           "enum": ["hybrid", "vector", "graph", "episodic"]},
+            },
+            "required": ["envelope", "query"],
+        },
+    },
+    "hydra_memory": {
+        "hydra-mem.write_episodic": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "kind": {"type": "string"},
+                "payload": {"type": "object"},
+                "key": {"type": "string"},
+                "cells": {"type": "array", "items": {"type": "string"}},
+                "origin_squad": {"type": "string"},
+            },
+            "required": ["workflow_id"],
+        },
+        "hydra-mem.semantic_search": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "Full-text query over episodic memory."},
+                "k": {"type": "integer", "minimum": 1, "maximum": 50},
+                "workflow_id": {"type": "string"},
+                "cell": {"type": "string"},
+                "index": {"type": "string"},
+                "embedding": {"type": "array", "items": {"type": "number"}},
+            },
+        },
+    },
+}
+
+
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
     """Build a ToolShed pre-loaded with static catalogs for all 8 backends."""
     shed = ToolShed(dispatcher=dispatcher)
-    shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS)
-    shed.register_static_catalog("eights", EIGHTS_TOOLS)
+    shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("pp_harness"))
+    shed.register_static_catalog("eights", EIGHTS_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("eights"))
     shed.register_static_catalog("agentsmith", AGENTSMITH_TOOLS)
-    shed.register_static_catalog("hydra_memory", HYDRA_MEMORY_TOOLS)
+    shed.register_static_catalog("hydra_memory", HYDRA_MEMORY_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("hydra_memory"))
     shed.register_static_catalog("executive_suite", EXECUTIVE_SUITE_TOOLS)
     shed.register_static_catalog("rlm_creative", RLM_CREATIVE_TOOLS)
     shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)

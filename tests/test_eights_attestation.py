@@ -176,3 +176,46 @@ def test_supervisor_calls_eights_envelope_record():
     assert "eights.constitution.attest" in tools_called
     assert "eights.governance.ceiling.tick" in tools_called
     assert "eights.hydra.envelope.record" in tools_called
+
+
+# ---------------- memory federation ----------------
+
+def test_memory_search_attaches_envelope_and_query():
+    d = _RecordingDispatcher(scripted={"eights.memory.search": {"hits": [{"id": "m1"}]}})
+    a = EightsAttestor(dispatcher=d, workflow_id="wf-1")
+    res = a.memory_search("billing retries", top_k=5, fusion="hybrid")
+    assert res == {"hits": [{"id": "m1"}]}
+    call = next(c for c in d.calls if c["tool"] == "eights.memory.search")
+    assert call["args"]["query"] == "billing retries"
+    assert call["args"]["top_k"] == 5
+    assert call["args"]["fusion"] == "hybrid"
+    # Audit envelope is attached, same contract as every other eights call.
+    assert call["args"]["envelope"]["trace_id"] == "wf-1"
+
+
+def test_memory_search_workflow_id_is_per_call():
+    # Per-call workflow_id stamps the envelope without mutating the shared
+    # attestor — so concurrent callers can't cross-contaminate audit lineage.
+    d = _RecordingDispatcher(scripted={"eights.memory.search": {"hits": []}})
+    a = EightsAttestor(dispatcher=d, workflow_id="default-wf")
+    a.memory_search("q1", workflow_id="call-wf")
+    call = next(c for c in d.calls if c["tool"] == "eights.memory.search")
+    assert call["args"]["envelope"]["trace_id"] == "call-wf"
+    assert a.workflow_id == "default-wf"  # instance state untouched
+
+
+def test_memory_search_noops_without_dispatcher():
+    assert EightsAttestor().memory_search("x") is None
+
+
+def test_memory_search_noops_on_empty_query():
+    d = _RecordingDispatcher()
+    a = EightsAttestor(dispatcher=d)
+    assert a.memory_search("   ") is None
+    assert d.calls == []  # never reaches the daemon
+
+
+def test_memory_search_returns_none_on_daemon_failure():
+    # Daemon returns status=failed → federation degrades to None (caller
+    # falls back to local search).
+    assert EightsAttestor(dispatcher=_NullDispatcher()).memory_search("q") is None

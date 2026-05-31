@@ -60,11 +60,30 @@ def test_doctor_reports_constitution_and_eights_and_cerberus(capsys):
     assert "Cerberus venom registry" in out
 
 
-def test_doctor_flags_deprecated_garland_stub(capsys):
+def test_doctor_lists_garland_as_active(capsys):
+    # garland is now the active creative squad, not a deprecated stub.
     rc = _run(["doctor"], project_root=REPO_ROOT)
     out = capsys.readouterr().out
+    garland_line = next((ln for ln in out.splitlines() if "garland" in ln), "")
+    assert garland_line, "garland should appear in doctor output"
+    assert "[DEPRECATED]" not in garland_line
+
+
+def test_doctor_renders_deprecated_marker_for_deprecated_squad(tmp_path, capsys):
+    # Synthetic fixture: a squad past its deprecated_after date must render the
+    # [DEPRECATED] marker in the doctor squad listing. This pins the rendering
+    # behavior independent of any real squad's mutable config.
+    squad = tmp_path / "squads" / "ghost"
+    squad.mkdir(parents=True)
+    (squad / "squad.yaml").write_text(
+        "name: ghost\nversion: 1.0.0\nentrypoint: stub\n"
+        "deprecated_after: 2000-01-01\n",
+        encoding="utf-8",
+    )
+    _run(["doctor"], project_root=tmp_path)
+    out = capsys.readouterr().out
     assert "[DEPRECATED]" in out
-    assert "garland" in out
+    assert "ghost" in out
 
 
 def test_doctor_fails_when_constitution_missing(tmp_path, capsys):

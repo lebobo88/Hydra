@@ -191,6 +191,63 @@ def query_by_cell(
     ]
 
 
+def search_episodic(
+    query: str,
+    *,
+    k: int = 5,
+    workflow_id: Optional[UUID | str] = None,
+    cell: Optional[Cell | str] = None,
+    db: Path = EPISODIC_DB,
+) -> list[MemoryRef]:
+    """Full-text search over episodic memory: case-insensitive ``LIKE`` across
+    ``payload_json``, ``kind``, and ``key``, newest first. Optional
+    ``workflow_id`` / ``cell`` narrow the scan.
+
+    Returns ``MemoryRef`` handles with a truncated summary — handles, not raw
+    blobs, cross the squad boundary. Resolve a hit with
+    ``resolve_episodic(ref.key)`` for the full row. This is the honest local
+    backing for ``hydra-mem.semantic_search``; vector/embedding search and
+    TheEights federation layer on top later."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    k = max(1, min(int(k), 50))
+    # Escape LIKE wildcards in the user term; backslash is the ESCAPE char.
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{esc}%"
+    clauses = [
+        "(payload_json LIKE ? ESCAPE '\\' "
+        "OR kind LIKE ? ESCAPE '\\' "
+        "OR key LIKE ? ESCAPE '\\')"
+    ]
+    params: list[Any] = [like, like, like]
+    if workflow_id is not None:
+        clauses.append("workflow_id=?")
+        params.append(str(workflow_id))
+    if cell is not None:
+        cell_str = str(cell).strip().lower()
+        if cell_str not in ALL_CELLS:
+            return []
+        clauses.append("cells LIKE ?")
+        params.append(f'%"{cell_str}"%')
+    where = " AND ".join(clauses)
+    params.append(k)
+    with _ensure_episodic(db) as conn:
+        rows = conn.execute(
+            "SELECT key, kind, payload_json, cells FROM episodic "
+            f"WHERE {where} ORDER BY created_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+    refs: list[MemoryRef] = []
+    for (key, kind, payload, cells) in rows:
+        snippet = f"{kind}: {payload}"
+        refs.append(MemoryRef(
+            tier="episodic", key=key, summary=snippet[:200],
+            cells=validate_cells(json.loads(cells or "[]")),
+        ))
+    return refs
+
+
 # --------- semantic (Chroma-pluggable; no hard dep) ---------
 
 class SemanticIndex:

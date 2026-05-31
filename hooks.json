@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor",
+            "command": "python -m hydra_core.cli doctor --quick",
             "timeout": 20
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor",
+            "command": "python -m hydra_core.cli doctor --quick",
             "timeout": 10
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor",
+            "command": "python -m hydra_core.cli doctor --quick",
             "timeout": 10
           }
         ]
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor",
+            "command": "python -m hydra_core.cli doctor --quick",
             "timeout": 10
           }
         ]

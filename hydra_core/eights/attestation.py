@@ -67,12 +67,14 @@ class EightsAttestor:
     workflow_id: Optional[str] = None
     spool: PendingSpool = field(default_factory=PendingSpool)
 
-    def _eights_envelope(self) -> dict[str, Any]:
+    def _eights_envelope(self, *, workflow_id: Optional[str] = None) -> dict[str, Any]:
         """Build a TheEights-compatible envelope from workflow context.
 
         Every TheEights MCP tool (except identity.* and audit.*) requires
         this envelope for audit lineage. Fields match the Zod schema in
-        TheEights/daemon/src/schemas/envelope.ts.
+        TheEights/daemon/src/schemas/envelope.ts. ``workflow_id`` overrides the
+        instance default for a single call, so callers that share one attestor
+        across workflows don't race on ``self.workflow_id``.
         """
         return {
             "tenant_id": "local",
@@ -80,7 +82,7 @@ class EightsAttestor:
             "project_id": "Hydra",
             "domain": "orchestration",
             "scope": [],
-            "trace_id": str(self.workflow_id or "no-workflow"),
+            "trace_id": str(workflow_id or self.workflow_id or "no-workflow"),
         }
 
     def _call(self, tool: str, args: dict) -> Optional[dict]:
@@ -180,6 +182,47 @@ class EightsAttestor:
                 "parent_id": str(envelope.get("parent_id") or "") or None,
             },
         })
+
+    # ---------- memory federation ----------
+
+    def memory_search(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        types: Optional[list[str]] = None,
+        scopes: Optional[list[str]] = None,
+        fusion: str = "hybrid",
+        workflow_id: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Federated hybrid memory search via TheEights ``eights.memory.search``.
+
+        Returns the daemon's hit payload (a list of hits, or a dict wrapping
+        them — eights returns ``engine.search(...)`` directly, so the shape is
+        not always a dict, which is why this does NOT go through ``_call``).
+        Returns ``None`` when eights is disabled/unreachable so callers can fall
+        back to local search. ``workflow_id`` stamps the audit envelope per
+        call (no shared-state race). The envelope is added here, same as
+        ``_call``."""
+        if not self.enabled or self.dispatcher is None or not (query or "").strip():
+            return None
+        args: dict[str, Any] = {
+            "envelope": self._eights_envelope(workflow_id=workflow_id),
+            "query": query,
+            "top_k": int(top_k),
+            "fusion": fusion,
+        }
+        if types:
+            args["types"] = types
+        if scopes:
+            args["scopes"] = scopes
+        try:
+            result = self.dispatcher.call_mcp(self.server, "eights.memory.search", args)
+        except Exception:  # noqa: BLE001 — fail-soft; caller falls back to local
+            return None
+        if not isinstance(result, dict) or result.get("status") == "failed":
+            return None
+        return result.get("result", result)
 
     # ---------- governance ----------
 

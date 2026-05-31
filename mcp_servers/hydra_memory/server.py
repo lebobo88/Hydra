@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ sys.path.insert(0, str(_HERE.parents[2]))
 
 from hydra_core.memory import (  # noqa: E402
     EPISODIC_DB, append_episodic, get_index, list_episodic, query_by_cell,
-    resolve_episodic, tag_episodic,
+    resolve_episodic, search_episodic, tag_episodic,
 )
 from hydra_core.eights import ALL_CELLS  # noqa: E402
 
@@ -57,10 +58,33 @@ def _tool_handlers() -> dict[str, callable]:
         return {"rows": rows, "count": len(rows)}
 
     def semantic_search(args: dict[str, Any]) -> dict[str, Any]:
-        index = get_index(args["index"])
-        emb = args.get("embedding") or [0.0]
-        refs = index.search(emb, k=int(args.get("k", 5)))
-        return {"refs": [r.model_dump(mode="json") for r in refs]}
+        # Back-compat first: an explicit pre-computed embedding signals the
+        # legacy vector path, so honor it even when a query is also present.
+        emb = args.get("embedding")
+        if emb:
+            index = get_index(args.get("index") or "default")
+            refs = index.search(emb, k=int(args.get("k", 5)))
+            return {"refs": [r.model_dump(mode="json") for r in refs]}
+        # Primary path: honest full-text search over episodic memory by query.
+        query = (args.get("query") or "").strip()
+        if query:
+            refs = search_episodic(
+                query,
+                k=int(args.get("k", 5)),
+                workflow_id=args.get("workflow_id"),
+                cell=args.get("cell"),
+            )
+            out: dict[str, Any] = {
+                "query": query, "count": len(refs), "source": "local",
+                "refs": [r.model_dump(mode="json") for r in refs],
+            }
+            # Opt-in: enrich with TheEights hybrid search when enabled/reachable.
+            fed = _maybe_federate_search(query, args)
+            if fed is not None:
+                out["eights"] = fed
+                out["source"] = "local+eights"
+            return out
+        return {"refs": [], "count": 0}
 
     def query_eights(args: dict[str, Any]) -> dict[str, Any]:
         cell = (args.get("cell") or "").strip().lower()
@@ -91,6 +115,180 @@ def _tool_handlers() -> dict[str, callable]:
     }
 
 
+# Real advertised schemas. An empty `{"type":"object"}` strips param types and
+# makes callers (incl. the gateway) mangle nested objects / numeric args; these
+# give every memory tool a typed surface.
+_CELL_ENUM = sorted(ALL_CELLS)
+_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "hydra-mem.write_episodic": {
+        "description": "Append a payload to episodic memory; returns a MemoryRef key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "kind": {"type": "string", "default": "note"},
+                "payload": {"type": "object"},
+                "key": {"type": "string"},
+                "cells": {"type": "array", "items": {"type": "string",
+                                                     "enum": _CELL_ENUM}},
+                "origin_squad": {"type": "string"},
+            },
+            "required": ["workflow_id"],
+        },
+    },
+    "hydra-mem.read_episodic": {
+        "description": "Resolve an episodic key to its full row.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    "hydra-mem.list_workflow": {
+        "description": "List every episodic row for a workflow_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+    },
+    "hydra-mem.semantic_search": {
+        "description": ("Full-text search over episodic memory by query "
+                        "(LIKE across payload/kind/key). Optional workflow_id "
+                        "and cell narrow the scan."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "minimum": 1, "maximum": 50,
+                      "default": 5},
+                "workflow_id": {"type": "string"},
+                "cell": {"type": "string", "enum": _CELL_ENUM},
+                "index": {"type": "string"},
+                "embedding": {"type": "array", "items": {"type": "number"}},
+            },
+        },
+    },
+    "hydra-mem.query_eights": {
+        "description": "Query episodic rows tagged with a TheEights cell.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cell": {"type": "string", "enum": _CELL_ENUM},
+                "limit": {"type": "integer", "minimum": 1, "default": 50},
+                "workflow_id": {"type": "string"},
+            },
+            "required": ["cell"],
+        },
+    },
+    "hydra-mem.tag_memory": {
+        "description": "Attach TheEights cells to an existing episodic row.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "cells": {"type": "array", "items": {"type": "string",
+                                                     "enum": _CELL_ENUM}},
+                "replace": {"type": "boolean", "default": False},
+            },
+            "required": ["key"],
+        },
+    },
+}
+
+
+# ---------- optional TheEights federation (opt-in) ----------
+#
+# Default behavior is pure-local SQLite search. When HYDRA_MEM_FEDERATE_EIGHTS
+# is truthy, semantic_search ALSO queries TheEights eights.memory.search
+# (hybrid vector+graph+episodic) and attaches its hits alongside the local
+# refs. Federation degrades to local-only on any failure and never blocks the
+# local result.
+#
+# The EightsAttestor wraps a synchronous MCPStdioDispatcher whose `_run` drives
+# its own event loop via run_until_complete. That CANNOT run on the MCP SDK's
+# already-running async handler thread (nested loops raise) and the dispatcher
+# loop is thread-affine. So federation runs on a single dedicated worker thread
+# (its own loop, reused consistently) with a bounded result timeout — a hung
+# daemon times out into local-only instead of blocking the search.
+_EIGHTS_ATTESTOR: Any = None
+_EIGHTS_FED_DISABLED = False
+_FED_EXECUTOR: Any = None
+_FED_LOCK = threading.Lock()
+
+
+def _federation_enabled() -> bool:
+    return os.environ.get("HYDRA_MEM_FEDERATE_EIGHTS", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _fed_timeout() -> float:
+    try:
+        return float(os.environ.get("HYDRA_MEM_FEDERATE_TIMEOUT", "8"))
+    except (TypeError, ValueError):
+        return 8.0
+
+
+def _fed_executor() -> Any:
+    """Single-worker executor so every federation call shares one thread (and
+    thus one dispatcher event loop). Built lazily under a lock so concurrent
+    first calls cannot race two 'single-worker' pools into existence (which
+    would break the thread-affinity the shared dispatcher loop relies on)."""
+    global _FED_EXECUTOR
+    if _FED_EXECUTOR is None:
+        with _FED_LOCK:
+            if _FED_EXECUTOR is None:
+                import concurrent.futures
+                _FED_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="mem-fed")
+    return _FED_EXECUTOR
+
+
+def _get_attestor() -> Any:
+    """Lazily build a cached EightsAttestor with a real MCP dispatcher. Returns
+    None (and latches off) if construction fails, so the handler stays local."""
+    global _EIGHTS_ATTESTOR, _EIGHTS_FED_DISABLED
+    if _EIGHTS_FED_DISABLED:
+        return None
+    if _EIGHTS_ATTESTOR is not None:
+        return _EIGHTS_ATTESTOR
+    try:
+        from hydra_core.dispatcher import MCPStdioDispatcher
+        from hydra_core.eights.attestation import EightsAttestor
+        _EIGHTS_ATTESTOR = EightsAttestor(dispatcher=MCPStdioDispatcher(Path.cwd()))
+        return _EIGHTS_ATTESTOR
+    except Exception:  # noqa: BLE001 — federation is best-effort
+        _EIGHTS_FED_DISABLED = True
+        return None
+
+
+def _maybe_federate_search(query: str, args: dict[str, Any]) -> Any:
+    """Opt-in federation to TheEights eights.memory.search. Returns the eights
+    hit payload (list/dict) or None when disabled/unreachable/timed-out. Runs
+    the blocking dispatcher off the caller's (async) thread with a timeout so a
+    hung daemon degrades to local-only instead of blocking."""
+    if not _federation_enabled():
+        return None
+    att = _get_attestor()
+    if att is None:
+        return None
+    try:
+        top_k = int(args.get("k", 5))
+    except (TypeError, ValueError):
+        top_k = 5
+    wf = args.get("workflow_id")
+    wf = str(wf) if wf else None
+    # workflow_id is passed per-call (not stamped on the shared attestor) so
+    # concurrent searches can't cross-contaminate the audit envelope.
+    fut = _fed_executor().submit(att.memory_search, query, top_k=top_k,
+                                 workflow_id=wf)
+    try:
+        return fut.result(timeout=_fed_timeout())
+    except Exception:  # noqa: BLE001 — timeout or error → local-only
+        fut.cancel()  # drop it if still queued; a running call is left to finish
+        return None
+
+
 # ---------- Try the real MCP SDK first ----------
 
 def _serve_with_mcp_sdk() -> bool:
@@ -107,7 +305,12 @@ def _serve_with_mcp_sdk() -> bool:
     @server.list_tools()
     async def _list_tools():
         return [
-            t.Tool(name=name, description=name, inputSchema={"type": "object"})
+            t.Tool(
+                name=name,
+                description=_TOOL_SCHEMAS.get(name, {}).get("description", name),
+                inputSchema=_TOOL_SCHEMAS.get(name, {}).get(
+                    "inputSchema", {"type": "object"}),
+            )
             for name in handlers
         ]
 

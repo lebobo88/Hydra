@@ -97,22 +97,25 @@ def test_ip_clearance_and_media_cost_cap_require_hitl(packs):
     assert by_rubric["media-cost-cap"].hitl_required is True
 
 
-# --- garland stub is retired -------------------------------------------------
+# --- garland is the active creative squad ------------------------------------
+# garland graduated from a retired placeholder stub into the active
+# RLM-Creative squad (claude-skill entrypoint, full Muse roster — see the
+# router + cathedral-overlay tests below). It must NOT be flagged deprecated.
+# The deprecation MECHANISM itself is covered by synthetic fixtures in
+# tests/test_iolaus.py, so these assertions track garland's live state.
 
-def test_garland_stub_is_deprecated(packs):
+def test_garland_is_active_not_deprecated(packs):
     garland = packs.get("garland")
-    assert garland is not None, "stub should still be present in the registry"
-    assert garland.deprecated_after is not None
-    assert is_deprecated(garland.deprecated_after), (
-        "stub should be past its deprecated_after date so Iolaus refuses dispatch"
-    )
+    assert garland is not None, "garland should be present in the registry"
+    assert garland.deprecated_after is None
+    assert not is_deprecated(garland.deprecated_after)
+    assert garland.entrypoint != "stub"
 
 
-def test_iolaus_refuses_dispatch_to_retired_garland_stub(packs):
+def test_iolaus_allows_dispatch_to_active_garland(packs):
     from hydra_core.iolaus import pre_dispatch, SpawnLedger
     from hydra_core.schemas import CSuiteDecisionPacket
     from uuid import uuid4
-    from hydra_core.version import SquadDeprecated
 
     garland = packs["garland"]
     env = CSuiteDecisionPacket(
@@ -120,8 +123,9 @@ def test_iolaus_refuses_dispatch_to_retired_garland_stub(packs):
         target_squad="garland", origin="BOARDROOM",
         objective="creative work",
     )
-    with pytest.raises(SquadDeprecated):
-        pre_dispatch(garland, env, ledger=SpawnLedger())
+    # Active squad → pre_dispatch returns a verdict without raising.
+    verdict = pre_dispatch(garland, env, ledger=SpawnLedger())
+    assert verdict is not None
 
 
 # --- router fires on the new Muse keywords -----------------------------------

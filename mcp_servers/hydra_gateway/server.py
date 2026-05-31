@@ -250,6 +250,100 @@ class AsyncBackendPool:
         self._tool_cache.clear()
 
 
+GATEWAY_SCHEMA_CACHE = Path.home() / ".hydra" / "gateway_schemas.json"
+
+
+def _load_schema_cache(path: Path = GATEWAY_SCHEMA_CACHE) -> dict[str, dict[str, Any]]:
+    """Load ``{server: {tool_name: inputSchema}}`` written by ``refresh_schemas``.
+
+    Missing/corrupt cache is non-fatal — the gateway falls back to the
+    hand-seeded ``SCHEMA_OVERRIDES`` and then ``{"type":"object"}``."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        server: tools
+        for server, tools in data.items()
+        if isinstance(tools, dict)
+    }
+
+
+def _apply_schema_cache_to_shed(shed: Any,
+                                schema_cache: dict[str, dict[str, Any]]) -> None:
+    """Overlay warmed schemas onto the ToolShed catalog entries in place, so
+    the progressive-disclosure meta-tools (``gateway.describe`` /
+    ``gateway.navigate``) resolve the same real schemas the gateway advertises.
+    Cache wins over hand-seeded ``input_schema``; absent a cache entry the
+    hand-seed (or empty) schema is left untouched. Catalog and ``_by_key``
+    share entry objects, so a single mutation updates both views."""
+    if not schema_cache:
+        return
+    for server_name, entries in shed._catalog.items():
+        cached_for_server = schema_cache.get(server_name, {})
+        if not cached_for_server:
+            continue
+        for entry in entries:
+            cached = cached_for_server.get(entry.name)
+            if cached:
+                entry.input_schema = cached
+
+
+_COERCE_SENTINEL = object()
+
+
+def _coerce_scalar(val: str, declared: Any) -> Any:
+    """Lossless cast of a string to a declared scalar JSON type, or sentinel."""
+    types = declared if isinstance(declared, list) else [declared]
+    if "string" in types:            # caller intends a string — leave it
+        return _COERCE_SENTINEL
+    s = val.strip()
+    if "integer" in types:
+        try:
+            return int(s)
+        except ValueError:
+            return _COERCE_SENTINEL
+    if "number" in types:
+        try:
+            return float(s)
+        except ValueError:
+            return _COERCE_SENTINEL
+    if "boolean" in types:
+        low = s.lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+    return _COERCE_SENTINEL
+
+
+def _coerce_args_to_schema(args: Any, schema: Any) -> Any:
+    """Best-effort defensive guard: cast top-level string args to the scalar
+    type declared by the advertised schema (e.g. ``"3"`` → ``3`` for an
+    integer param). Only touches scalar properties with a lossless cast;
+    objects, arrays, and unknown-typed values pass through untouched. This
+    makes numeric params survive even when a caller serialized them as a
+    string despite a correct schema."""
+    if not isinstance(args, dict) or not isinstance(schema, dict):
+        return args
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return args
+    out: dict[str, Any] = dict(args)
+    for key, val in args.items():
+        if not isinstance(val, str):
+            continue
+        prop = props.get(key)
+        if not isinstance(prop, dict):
+            continue
+        coerced = _coerce_scalar(val, prop.get("type"))
+        if coerced is not _COERCE_SENTINEL:
+            out[key] = coerced
+    return out
+
+
 def _extract_result(result: Any) -> dict[str, Any]:
     content = getattr(result, "content", None)
     if not content:
@@ -336,6 +430,7 @@ META_TOOL_SCHEMAS = {
 def _build_static_tool_list(
     shed: Any,
     specs: dict[str, dict[str, Any]],
+    schema_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the tool list from the static toolshed catalog.
 
@@ -347,9 +442,19 @@ def _build_static_tool_list(
     (the ``specs`` dict) are advertised. If no backends are configured,
     nothing is advertised (prevents false-advertising dead tools).
 
+    The advertised ``inputSchema`` is resolved in priority order:
+    ``schema_cache`` (real schemas fetched offline by ``refresh_schemas``)
+    → ``entry.input_schema`` (hand-seeded ``SCHEMA_OVERRIDES``) →
+    ``{"type":"object"}`` (last-resort when a backend was never refreshed).
+    A bare ``{"type":"object"}`` strips param types and makes nested
+    objects / numeric args mangle on the proxy hop, so a real schema here
+    is what keeps writes like ``eights.memory.add`` and numeric params like
+    ``start_run(n=3)`` intact.
+
     Live backends are connected on-demand only when ``call_tool`` is
     invoked. This avoids startup latency and async context conflicts.
     """
+    schema_cache = schema_cache or {}
     filtered = {k for k in specs if k not in _SELF_NAMES}
     if not filtered:
         return []
@@ -357,11 +462,15 @@ def _build_static_tool_list(
     for server_name in sorted(shed._catalog.keys()):
         if server_name not in filtered:
             continue
+        cached_for_server = schema_cache.get(server_name, {})
         for entry in shed._catalog.get(server_name, []):
+            schema = (cached_for_server.get(entry.name)
+                      or entry.input_schema
+                      or {"type": "object"})
             tools.append({
                 "name": f"{server_name}__{entry.name}",
                 "description": f"[{server_name}] {entry.description}",
-                "inputSchema": entry.input_schema or {"type": "object"},
+                "inputSchema": schema,
                 "_backend_server": server_name,
                 "_backend_tool": entry.name,
             })
@@ -385,14 +494,25 @@ def main() -> None:
     tree = ProgressiveDisclosureTree(shed, packs)
 
     # Build tool list from static catalog — no live connections at startup.
-    # Backends are connected on-demand when call_tool is invoked.
-    cached_tools = _build_static_tool_list(shed, specs)
+    # Backends are connected on-demand when call_tool is invoked. The schema
+    # cache (warmed offline by refresh_schemas) overlays real backend schemas
+    # so advertised tools carry typed params; absent a cache we fall back to
+    # the hand-seeded SCHEMA_OVERRIDES, then {"type":"object"}.
+    schema_cache = _load_schema_cache()
+    # Overlay warmed schemas onto the shed so describe/navigate match the
+    # advertised list, then build the advertised tool list.
+    _apply_schema_cache_to_shed(shed, schema_cache)
+    cached_tools = _build_static_tool_list(shed, specs, schema_cache)
 
     # Explicit routing lookup: tool display name → (backend_server, backend_tool).
     # Avoids fragile string splitting on "__".
     _tool_routing: dict[str, tuple[str, str]] = {
         pt["name"]: (pt["_backend_server"], pt["_backend_tool"])
         for pt in cached_tools
+    }
+    # Display name → advertised inputSchema, for the defensive coercion guard.
+    _tool_schemas: dict[str, dict[str, Any]] = {
+        pt["name"]: pt.get("inputSchema", {}) for pt in cached_tools
     }
 
     # The pool handles on-demand connections for call_tool proxying.
@@ -432,6 +552,9 @@ def main() -> None:
         route = _tool_routing.get(name)
         if route:
             backend_server, backend_tool = route
+            # Defensive coercion: cast string scalars to the advertised type
+            # so numeric/boolean params survive even if a caller sent a string.
+            arguments = _coerce_args_to_schema(arguments, _tool_schemas.get(name))
             result = await pool.call_tool(backend_server, backend_tool, arguments)
             return [t.TextContent(type="text", text=json.dumps(result, default=str))]
 

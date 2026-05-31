@@ -17,12 +17,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
+# langgraph (imported lazily by `run`) transitively pulls in langchain_core,
+# which emits a Pydantic-v1 UserWarning under Python 3.14. It is harmless, but
+# when this module runs as a SessionStart/PreToolUse hook Claude Code surfaces
+# hook stderr as an error. Silence it at the source so hook output stays clean.
+warnings.filterwarnings("ignore", category=UserWarning, module=r"langchain_core.*")
+
 from .squad_loader import discover_squads
 from .state import HydraState
-from .supervisor import build_supervisor
 from .telemetry import emit, trace_path
 
 
@@ -113,6 +119,15 @@ def _cmd_doctor(args) -> int:
     except Exception as e:
         print(f"FAIL: Cerberus venom load — {e}")
         fail_count += 1
+
+    # --- quick mode (hooks) -------------------------------------------------
+    # Stop before the heavyweight checks. `--quick` is what SessionStart /
+    # PreToolUse hooks run: it skips the langgraph import (whose transitive
+    # langchain_core warning would pollute hook stderr) and the MCP subprocess
+    # probes (too costly to spawn on every session start / tool call). It stays
+    # honest — a real FAIL above still returns non-zero.
+    if getattr(args, "quick", False):
+        return 0 if fail_count == 0 else 1
 
     # --- runtime deps -------------------------------------------------------
     try:
@@ -237,6 +252,9 @@ def _cmd_run(args) -> int:
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
     else:
         dispatcher = _NullDispatcher()
+    # Lazy import: pulls in langgraph (and the langchain_core warning). Keeping
+    # it out of module scope means `doctor`/`squads`/`verify` never load it.
+    from .supervisor import build_supervisor
     sup = build_supervisor(
         project_root=project,
         dispatcher=dispatcher,
@@ -500,7 +518,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--project", help="Project root (defaults to cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor")
+    dp = sub.add_parser("doctor")
+    dp.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "Fast health check for hooks: constitution, squads, TheEights "
+            "vocabulary, episodic DB only. Skips the langgraph import and the "
+            "MCP subprocess probes."
+        ),
+    )
     sub.add_parser("verify")
     sub.add_parser("squads")
     r = sub.add_parser("run")
