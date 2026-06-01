@@ -372,9 +372,11 @@ python -m hydra_core.cli doctor
 
 This pip-installs `hydra-core` in editable mode and runs `python -m hydra_core.cli doctor` to confirm squads are discovered and the constitution loads cleanly.
 
+> **The `python` on your PATH must be 3.11+.** `hydra-core` declares `requires-python = ">=3.11"`, so the editable install fails outright on older interpreters (e.g. `ERROR: Package 'hydra-core' requires a different Python: 3.10.x not in '>=3.11'`). This matters beyond install time: the plugin's hooks and its three Python MCP servers all invoke **bare `python`**, so whatever `python` resolves to on your PATH is what runs them. Verify with `python --version` *before* continuing. On Windows, if an older Python is first on PATH, install into 3.11+ explicitly (`py -3.12 -m pip install -e ".[langgraph,mcp]"`) and reorder PATH so the 3.11+ interpreter wins.
+
 ### 2. Register the plugin with Claude Code (user scope)
 
-Inside any Claude Code session, from the repo directory:
+Run these inside a Claude Code session **whose working directory is the repo root**, so `.` resolves to your Hydra checkout:
 
 ```
 /plugin marketplace add .
@@ -382,9 +384,28 @@ Inside any Claude Code session, from the repo directory:
 /reload-plugins
 ```
 
-This registers the local marketplace, copies the plugin into `~/.claude/plugins/cache/hydra-local/hydra/<version>/`, and enables it in `~/.claude/settings.json`. Slash commands are now available in every Claude Code session, not just sessions opened from the Hydra repo.
+> **If `/plugin install` reports `Marketplace "hydra-local" not found`,** the `add .` step did not register the marketplace — almost always because the session's working directory was *not* the repo root, so `.` pointed elsewhere. Pass the **absolute path** instead (this is the reliable form):
+>
+> ```
+> /plugin marketplace add /absolute/path/to/Hydra      # Windows, e.g. H:\Hydra
+> ```
+>
+> The marketplace name is always `hydra-local` regardless of the path you add — it comes from the `name` field in `.claude-plugin/marketplace.json`, not from the directory name. (So `/plugin marketplace add hydra-local` is **not** a valid command — `hydra-local` is the marketplace name, not a source path.)
 
-Verify:
+What each step does:
+
+- **`marketplace add`** registers a *local directory* marketplace named `hydra-local` and links the repo into `~/.claude/plugins/marketplaces/hydra-local`, recording it in `~/.claude/plugins/known_marketplaces.json` with `source: { "source": "directory", "path": "<repo>" }`.
+- **`install`** records `hydra@hydra-local` in `~/.claude/plugins/installed_plugins.json` and enables it under `enabledPlugins` in `~/.claude/settings.json`. Because this is a **local directory marketplace, the plugin is referenced in place** — its `installPath` points at the repo itself, *not* a copied `~/.claude/plugins/cache/...` directory (that cache-copy behavior applies only to `github`/`git` marketplaces). Live edits to agents/skills/commands therefore take effect on the next `/reload-plugins` with no re-copy.
+
+Slash commands are now available in every Claude Code session, not just sessions opened from the Hydra repo.
+
+> **The plugin manifest provides agents, skills, commands, and hooks only — not MCP servers.** Hydra's three Python MCP servers (`hydra_memory`, `executive_suite`, `rlm_creative`) are registered into `~/.claude.json` by the **gateway setup** step, not by `/plugin install`. Until you run it, `doctor` will warn `… not registered at user scope (~/.claude.json)`. Wire them with:
+>
+> ```bash
+> python -m hydra_core.cli gateway-setup     # writes the MCP server entries; see § MCP topology
+> ```
+
+Verify (restart Claude Code first so it reloads the plugin registry and picks up any PATH changes):
 
 ```
 /mcp                   # in gateway mode: expect hydra_gateway connected; standalone: expect individual servers
@@ -394,7 +415,13 @@ Verify:
 
 ### Updating after edits
 
-After bumping the `version` field in `.claude-plugin/plugin.json`:
+Because the local marketplace is referenced in place, **edits to agents, skills, commands, or hooks just need a reload** — no re-install:
+
+```
+/reload-plugins
+```
+
+Only when you bump the `version` field in `.claude-plugin/plugin.json` (or change `marketplace.json` itself) do you need to refresh the marketplace and re-register the plugin so the new version is recorded:
 
 ```
 /plugin marketplace update hydra-local
