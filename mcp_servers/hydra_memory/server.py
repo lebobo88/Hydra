@@ -16,12 +16,16 @@ makes Hydra usable without external dependencies during early bootstrap.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("hydra_memory")
 
 # Add project root to sys.path so `hydra_core` resolves when launched as
 # a child process from `.mcp.json`.
@@ -79,10 +83,17 @@ def _tool_handlers() -> dict[str, callable]:
                 "refs": [r.model_dump(mode="json") for r in refs],
             }
             # Opt-in: enrich with TheEights hybrid search when enabled/reachable.
+            # Local refs/count/source/query are always present; federation only
+            # adds to the result (eights hits) or flags degradation — it never
+            # removes or reshapes the local payload.
             fed = _maybe_federate_search(query, args)
-            if fed is not None:
-                out["eights"] = fed
+            hits = fed.get("hits")
+            if hits is not None:
+                out["eights"] = hits
                 out["source"] = "local+eights"
+            elif fed.get("degraded"):
+                out["degraded"] = True
+                out["degraded_reason"] = fed.get("reason")
             return out
         return {"refs": [], "count": 0}
 
@@ -216,6 +227,16 @@ _EIGHTS_FED_DISABLED = False
 _FED_EXECUTOR: Any = None
 _FED_LOCK = threading.Lock()
 
+# Circuit breaker. fut.cancel() does NOT stop an already-running federation
+# call, so a run of timeouts would otherwise pile work onto the single-worker
+# executor (each new search waits the full timeout behind the stuck one). After
+# _FED_BREAKER_THRESHOLD consecutive failures we stop attempting federation for
+# _FED_BREAKER_COOLDOWN_S, degrading cleanly to local-only until Eights recovers.
+_FED_BREAKER_THRESHOLD = 3
+_FED_BREAKER_COOLDOWN_S = 60.0
+_FED_CONSECUTIVE_FAILURES = 0
+_FED_COOLDOWN_UNTIL = 0.0
+
 
 def _federation_enabled() -> bool:
     return os.environ.get("HYDRA_MEM_FEDERATE_EIGHTS", "").strip().lower() in (
@@ -262,31 +283,73 @@ def _get_attestor() -> Any:
         return None
 
 
-def _maybe_federate_search(query: str, args: dict[str, Any]) -> Any:
-    """Opt-in federation to TheEights eights.memory.search. Returns the eights
-    hit payload (list/dict) or None when disabled/unreachable/timed-out. Runs
-    the blocking dispatcher off the caller's (async) thread with a timeout so a
-    hung daemon degrades to local-only instead of blocking."""
+def _maybe_federate_search(query: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Opt-in federation to TheEights eights.memory.search.
+
+    Returns a status dict ``{"hits": <payload|None>, "degraded": bool,
+    "reason": str|None}``:
+      - federation disabled         → hits=None, degraded=False (not attempted)
+      - breaker open (cooldown)     → hits=None, degraded=True,  reason="cooldown"
+      - attestor unavailable        → hits=None, degraded=True,  reason="unavailable"
+      - timeout / error             → hits=None, degraded=True,  reason="timeout"|"error"
+      - success                     → hits=<payload>, degraded=False
+
+    Degradation is logged and surfaced to the caller (never silently swallowed),
+    and a circuit breaker stops hammering a down daemon."""
+    import concurrent.futures as _cf
+
+    global _FED_CONSECUTIVE_FAILURES, _FED_COOLDOWN_UNTIL
+
     if not _federation_enabled():
-        return None
+        return {"hits": None, "degraded": False, "reason": None}
+
+    now = time.monotonic()
+    if now < _FED_COOLDOWN_UNTIL:
+        return {"hits": None, "degraded": True, "reason": "cooldown"}
+
     att = _get_attestor()
     if att is None:
-        return None
+        return {"hits": None, "degraded": True, "reason": "unavailable"}
+
     try:
         top_k = int(args.get("k", 5))
     except (TypeError, ValueError):
         top_k = 5
     wf = args.get("workflow_id")
     wf = str(wf) if wf else None
+
+    def _trip(reason: str) -> dict[str, Any]:
+        """Record a failure, arm the breaker if we've crossed the threshold."""
+        global _FED_CONSECUTIVE_FAILURES, _FED_COOLDOWN_UNTIL
+        _FED_CONSECUTIVE_FAILURES += 1
+        if _FED_CONSECUTIVE_FAILURES >= _FED_BREAKER_THRESHOLD:
+            _FED_COOLDOWN_UNTIL = time.monotonic() + _FED_BREAKER_COOLDOWN_S
+            logger.warning(
+                "eights federation breaker OPEN after %d consecutive %s; "
+                "degrading to local-only for %.0fs",
+                _FED_CONSECUTIVE_FAILURES, reason, _FED_BREAKER_COOLDOWN_S,
+            )
+        else:
+            logger.warning(
+                "eights federation %s (%d/%d) — degrading this search to local-only",
+                reason, _FED_CONSECUTIVE_FAILURES, _FED_BREAKER_THRESHOLD,
+            )
+        return {"hits": None, "degraded": True, "reason": reason}
+
     # workflow_id is passed per-call (not stamped on the shared attestor) so
     # concurrent searches can't cross-contaminate the audit envelope.
     fut = _fed_executor().submit(att.memory_search, query, top_k=top_k,
                                  workflow_id=wf)
     try:
-        return fut.result(timeout=_fed_timeout())
-    except Exception:  # noqa: BLE001 — timeout or error → local-only
-        fut.cancel()  # drop it if still queued; a running call is left to finish
-        return None
+        hits = fut.result(timeout=_fed_timeout())
+        _FED_CONSECUTIVE_FAILURES = 0  # success resets the breaker
+        return {"hits": hits, "degraded": False, "reason": None}
+    except _cf.TimeoutError:
+        fut.cancel()  # drop if still queued; a running call is left to finish
+        return _trip("timeout")
+    except Exception:  # noqa: BLE001 — any backend error → local-only
+        fut.cancel()
+        return _trip("error")
 
 
 # ---------- Try the real MCP SDK first ----------

@@ -38,7 +38,12 @@ from hydra_core.squad_loader import discover_squads  # noqa: E402
 from hydra_core.router import compute_tool_scope  # noqa: E402
 
 _SELF_NAMES = frozenset({"hydra_gateway", "hydra_toolshed"})
-_CONNECT_TIMEOUT = 10.0
+# Defense-in-depth headroom for a backend's first cold open (e.g. a daemon that
+# loads a large on-disk store before answering initialize). The real fix is
+# backend-side boot speed; this just stops a borderline cold start from being
+# marked failed. Per-server locking (see _connect) prevents concurrent callers
+# from all paying this latency at once.
+_CONNECT_TIMEOUT = 20.0
 
 
 class AsyncBackendPool:
@@ -56,6 +61,14 @@ class AsyncBackendPool:
         self._sessions: dict[str, Any] = {}
         self._tool_cache: dict[str, list[dict[str, Any]]] = {}
         self._failed: set[str] = set()
+        # Per-server connect lock: serializes connect attempts for one backend so
+        # two concurrent callers can't race two child spawns / two sessions.
+        self._locks: dict[str, asyncio.Lock] = {}
+        # Per-server generation token: only the current generation may commit to
+        # _sessions/_stacks/_failed. A connect that times out bumps the
+        # generation so a late-completing (cancelled) attempt can't resurrect a
+        # stale session after we've already marked the backend failed.
+        self._generation: dict[str, int] = {}
 
     @property
     def server_names(self) -> list[str]:
@@ -72,7 +85,7 @@ class AsyncBackendPool:
             except (asyncio.CancelledError, Exception):
                 pass
 
-    async def _do_connect(self, server: str) -> Any:
+    async def _do_connect(self, server: str, gen: int) -> Any:
         """Internal: open a stdio session in its own async context.
 
         Runs as a standalone coroutine (via ensure_future) so that the
@@ -80,6 +93,11 @@ class AsyncBackendPool:
         handler's cancel scope — that nesting causes RuntimeError:
         'Attempted to exit a cancel scope that isn't the current task's
         current cancel scope'.
+
+        ``gen`` is the connect generation captured by the caller. Shared state
+        is only committed if this attempt is still current — a superseded
+        attempt (its caller timed out and bumped the generation) tears its own
+        transport down instead of resurrecting a stale session.
         """
         try:
             from mcp import ClientSession, StdioServerParameters
@@ -102,6 +120,11 @@ class AsyncBackendPool:
                 ClientSession(read, write)
             )
             await session.initialize()
+            if self._generation.get(server) != gen:
+                # Superseded (caller timed out / a newer attempt started). Do
+                # not commit — close this transport and bail.
+                await stack.aclose()
+                return None
             self._stacks[server] = stack
             self._sessions[server] = session
             self._failed.discard(server)
@@ -109,39 +132,59 @@ class AsyncBackendPool:
             return session
         except (TimeoutError, asyncio.CancelledError, Exception) as exc:
             logger.warning("Failed to connect to %s: %s", server, exc)
-            self._failed.add(server)
+            if self._generation.get(server) == gen:
+                self._failed.add(server)
             try:
                 await stack.aclose()
             except (asyncio.CancelledError, Exception):
                 pass
             return None
 
+    def _lock_for(self, server: str) -> asyncio.Lock:
+        lock = self._locks.get(server)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[server] = lock
+        return lock
+
     async def _connect(self, server: str) -> Any:
         """Open a stdio session to a backend. Returns the ClientSession.
 
-        The actual connection runs in a separate asyncio Task so that the
-        anyio cancel scopes from stdio_client don't interleave with the
-        MCP SDK's handler cancel scopes.
+        Serialized per-server by a lock so concurrent callers don't spawn
+        duplicate children. The actual connection runs in a separate asyncio
+        Task so that the anyio cancel scopes from stdio_client don't interleave
+        with the MCP SDK's handler cancel scopes.
         """
         if server in self._sessions:
             return self._sessions[server]
         if server not in self._specs:
             return None
 
-        await self._teardown_backend(server)
+        async with self._lock_for(server):
+            # Re-check under the lock: a concurrent caller may have connected
+            # while we waited.
+            if server in self._sessions:
+                return self._sessions[server]
 
-        try:
-            task = asyncio.ensure_future(self._do_connect(server))
-            return await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
-        except (TimeoutError, asyncio.TimeoutError):
-            task.cancel()
-            logger.warning("Timeout connecting to %s", server)
-            self._failed.add(server)
-            return None
-        except (asyncio.CancelledError, Exception) as exc:
-            logger.warning("Failed to connect to %s: %s", server, exc)
-            self._failed.add(server)
-            return None
+            await self._teardown_backend(server)
+            gen = self._generation.get(server, 0) + 1
+            self._generation[server] = gen
+
+            try:
+                task = asyncio.ensure_future(self._do_connect(server, gen))
+                return await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
+            except (TimeoutError, asyncio.TimeoutError):
+                task.cancel()
+                # Bump the generation so a late-completing attempt won't commit.
+                self._generation[server] = gen + 1
+                logger.warning("Timeout connecting to %s", server)
+                self._failed.add(server)
+                return None
+            except (asyncio.CancelledError, Exception) as exc:
+                self._generation[server] = gen + 1
+                logger.warning("Failed to connect to %s: %s", server, exc)
+                self._failed.add(server)
+                return None
 
     async def list_tools(self, server: str) -> list[dict[str, Any]]:
         """Get tool list from a backend (cached after first successful call)."""
@@ -167,6 +210,10 @@ class AsyncBackendPool:
             return tools
         except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
             logger.warning("list_tools failed for %s: %s", server, exc)
+            # Drop the (now-suspect) session BEFORE marking failed so the backend
+            # is never simultaneously in `connected` and `failed` (the flapping
+            # display). Teardown removes session/stack/cache first.
+            await self._teardown_backend(server)
             self._failed.add(server)
             return []
 
@@ -601,14 +648,22 @@ async def _handle_meta_tool(
         if squad_filter and squad_filter in packs:
             from hydra_core.tool_scope import squad_tool_manifest
             return squad_tool_manifest(packs[squad_filter])
-        server_info = []
-        for s in pool.server_names:
+        # Probe backends concurrently — list_tools already enforces a per-call
+        # timeout, and _connect serializes per server, so one slow/cold backend
+        # no longer blocks the whole sweep behind it.
+        names = pool.server_names
+
+        async def _probe(s: str) -> dict[str, Any]:
             try:
                 tools = await pool.list_tools(s)
-                server_info.append({"server": s, "tool_count": len(tools)})
+                return {"server": s, "tool_count": len(tools)}
             except (asyncio.CancelledError, Exception) as exc:
                 logger.warning("discover failed for %s: %s", s, exc)
-                server_info.append({"server": s, "tool_count": 0, "error": str(exc)})
+                return {"server": s, "tool_count": 0, "error": str(exc)}
+
+        server_info = list(
+            await asyncio.gather(*(_probe(s) for s in names))
+        )
         return {
             "servers": server_info,
             "squads": [
