@@ -60,6 +60,7 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
     "customer-support": (
         "ticket", "support", "complaint", "outage", "downtime", "sla",
         "p1 incident", "escalation", "knowledge base", "kb", "tier 1",
+        "refund", "csat", "churn", "help desk", "angry customer",
     ),
     "marketing-research": (
         "market research", "competitor", "competitive intel", "tam", "sam", "som",

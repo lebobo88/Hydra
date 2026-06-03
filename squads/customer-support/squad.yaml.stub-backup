@@ -1,0 +1,55 @@
+name: Customer Service & Support
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
+description: >
+  Tier-1/2/3 support triage, knowledge-base RAG, escalation routing, SLA
+  enforcement, voice-of-customer synthesis. STUB.
+source_pack: null
+entrypoint: stub
+industries: [customer-support, success, helpdesk, contact-center]
+
+agents:
+  - slug: support-supervisor
+    role: "Routes tickets across tiers; enforces SLA"
+    authority: gatekeeper
+  - slug: tier1-responder
+    role: "FAQ + KB-grounded responses"
+    authority: execute
+  - slug: tier2-investigator
+    role: "Reproduction, log analysis, escalation to engineering"
+    authority: advisory
+  - slug: escalation-manager
+    role: "Owns 'angry customer' / executive-escalation flow"
+    authority: gatekeeper
+  - slug: voc-synthesizer
+    role: "Voice-of-customer themes feeding back to product"
+    authority: advisory
+  - slug: kb-curator
+    role: "Maintains KB freshness; flags gaps"
+    authority: advisory
+
+tools:
+  - name: ticket-system-bridge
+    privilege: write
+  - name: kb-rag
+    privilege: read
+  - name: telemetry-grep
+    privilege: read
+
+accepts:
+  - HANDOFF
+  - HITL_REQUEST
+
+emits:
+  - PRD                              # feedback → product
+  - DECISION_RECORD
+
+gates:
+  - rubric_id: sla-p1-1hour
+  - rubric_id: empathy-tone-required
+  # Cross-model judge rubric (hydra_core.judge.registry). Auto-applied by the
+  # router whenever an envelope crosses the customer-support boundary.
+  - rubric_id: support-deflection-quality@1
+
+invoke:
+  notes: "Stub. Add ticket-system + KB RAG MCP when activated."
