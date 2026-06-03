@@ -20,11 +20,11 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 | marketing-research | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
 | marketing-production | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
 | marketing-ops | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| legal-compliance | (stub) | stub |
+| legal-compliance | [`Senate`](https://github.com/lebobo88/Senate) | claude-skill |
+| customer-support | [`Xenia`](https://github.com/lebobo88/Xenia-Support) | claude-skill |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |
 | research-ds | (stub) | stub |
-| customer-support | (stub) | stub |
 
 ## Hard Rules
 
