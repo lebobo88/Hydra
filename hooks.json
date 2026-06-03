@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 20
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli squads",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" squads",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m hydra_core.cli doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
