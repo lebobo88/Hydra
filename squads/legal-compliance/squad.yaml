@@ -1,41 +1,121 @@
-name: Legal & Compliance
+name: "Senate — Legal & Compliance (The Curia Crown)"
 version: 1.0.0
 deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
-  Contract review, regulatory mapping (GDPR/CCPA/HIPAA/EU AI Act/SOX), IP &
-  trademark, privacy impact assessments, litigation triage, vendor MSA review.
-  STUB — implement agents + tools when activated.
-source_pack: null
-entrypoint: stub
-industries: [legal, compliance, governance, privacy, ip]
+  Twelve-jurist legal wing under the Twelve Tables: Papinian (general
+  counsel, crew lead), Gaius (contracts), Ulpian (regulatory), Angerona
+  (privacy), Minerva (IP), Scaevola (M&A), Cicero (litigation), Cato
+  (governance), Tribonian (citation verification), plus the consilium —
+  Paulus (employment), Modestinus (tax), Janus (export controls).
+  Deliberates by the Law of Citations; halts at the Tribune's Veto.
+  Wired to the Senate source pack.
+source_pack: https://github.com/lebobo88/Senate
+entrypoint: claude-skill
+industries: [legal, compliance, governance, privacy, ip, regulatory]
 
 agents:
+  # Curia heads
   - slug: general-counsel
-    role: "Top of legal stack — go/no-go on legal-sensitive moves"
+    mythic: Papinian
+    role: "General Counsel — Crew Lead. Triage, deliberation, tiebreak, DECISION_RECORD gate"
     authority: gatekeeper
-  - slug: privacy-officer
-    role: "DPIA, data-subject rights, cross-border transfer review"
+    model_tier: opus
+    agent_file: .claude/agents/general-counsel.md
+
+  - slug: contract-counsel
+    mythic: Gaius
+    role: "Contracts & Commercial — redline, clause risk, playbooks"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/contract-counsel.md
+
+  - slug: regulatory-counsel
+    mythic: Ulpian
+    role: "Regulatory & Compliance — obligation catalogs, control mapping, EU AI Act classification"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/regulatory-counsel.md
+
+  - slug: privacy-counsel
+    mythic: Angerona
+    role: "Privacy & Data Protection — DPIA, TIA, cross-border transfers"
     authority: gatekeeper
-  - slug: contract-reviewer
-    role: "MSA/SOW/NDA redline + risk extraction"
-    authority: advisory
-  - slug: regulatory-mapper
-    role: "Maps proposed feature/change to applicable regulation"
-    authority: advisory
+    model_tier: sonnet
+    hitl_trigger: true
+    notes: "HITL on cross-border transfer risk, DPIA-required processing, breach scenarios."
+    agent_file: .claude/agents/privacy-counsel.md
+
   - slug: ip-counsel
-    role: "Trademark, patent, copyright, open-source license review"
+    mythic: Minerva
+    role: "Intellectual Property — FTO, trademark clearance, OSS license compatibility"
     authority: gatekeeper
-  - slug: litigation-triage
-    role: "Incoming-claim triage + privilege-handling"
+    model_tier: sonnet
+    agent_file: .claude/agents/ip-counsel.md
+
+  - slug: mna-counsel
+    mythic: Scaevola
+    role: "M&A & Transactions — diligence, red flags, R&W heatmaps"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/mna-counsel.md
+
+  - slug: litigation-counsel
+    mythic: Cicero
+    role: "Litigation & Disputes — case assessment, privilege, settlement trees"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/litigation-counsel.md
+
+  - slug: governance-counsel
+    mythic: Cato
+    role: "Corporate Governance — fiduciary, board materials, AI oversight reporting"
     authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/governance-counsel.md
+
+  - slug: citation-verifier
+    mythic: Tribonian
+    role: "Legal Research & Citation Verification — the anti-hallucination gate (Table III)"
+    authority: gatekeeper
+    model_tier: sonnet
+    hitl_trigger: true
+    notes: "HITL on any fabricated-authority finding."
+    agent_file: .claude/agents/citation-verifier.md
+
+  # Consilium (junior counsel under parent jurists)
+  - slug: employment-counsel
+    mythic: Paulus
+    parent: contract-counsel
+    role: "Employment & Labor — covenants, separations, classification"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/employment-counsel.md
+
+  - slug: tax-counsel
+    mythic: Modestinus
+    parent: mna-counsel
+    role: "Tax (deal structures) — structure flags, withholding, step plans"
+    authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/tax-counsel.md
+
+  - slug: export-controls
+    mythic: Janus
+    parent: regulatory-counsel
+    role: "Export Controls & Sanctions — screening protocol, license triggers"
+    authority: gatekeeper
+    model_tier: sonnet
+    hitl_trigger: true
+    notes: "HITL on any unresolved sanctions/export exposure."
+    agent_file: .claude/agents/export-controls.md
 
 tools:
-  - name: regulatory-corpus-rag
-    privilege: read
-  - name: contract-clause-library
-    privilege: read
-  - name: dpia-template
+  - name: eights-memory
+    privilege: read+write
+    notes: "Optional precedent memory: domain='legal', scope 'team:senate'. Degrades gracefully when absent."
+  - name: senate-output
     privilege: write
+    notes: "Counsel-work-product filing via senate.output.write (mcp_servers/senate shim)."
 
 accepts:
   - HANDOFF
@@ -48,16 +128,32 @@ emits:
   - HITL_REQUEST
 
 gates:
-  - rubric_id: gdpr-art-25-privacy-by-design
+  - rubric_id: citation-integrity@1
     hitl_required: true
-  - rubric_id: eu-ai-act-classification
+  - rubric_id: aba-512-ethics@1
+    hitl_required: true
+  - rubric_id: gdpr-art-25-privacy-by-design@1
+    hitl_required: true
+    when: "personal data in scope"
+  - rubric_id: eu-ai-act-classification@1
     hitl_required: true
     when: "'ai' in constraints.industries or 'ai-platform' in constraints.industries"
-  - rubric_id: open-source-license-compatibility
+  - rubric_id: open-source-license-compatibility@1
+    when: "open-source components in scope"
   # Cross-model judge rubric (hydra_core.judge.registry). Auto-applied by the
   # router whenever an envelope crosses the legal-compliance boundary.
   - rubric_id: compliance-coverage@1
     hitl_required: true
 
+# Best-of-N disabled in v1: the judge router's best-of-N rubric selection has
+# no legal branch yet (Phase-2 follow-up). The Law of Citations supplies
+# multi-opinion judgment inside the squad.
+best_of_n: 0
+
 invoke:
-  notes: "Activate by adding implementing agents + MCP server + commands."
+  command_hint: "/senate"
+  fallback_commands:
+    - /contract-review
+    - /privacy-assess
+    - /legal-opinion
+  output_dir: "output/{domain}/{topic}-{date}.md"

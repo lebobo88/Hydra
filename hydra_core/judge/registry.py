@@ -19,7 +19,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Rubric:
     rubric_id: str
-    kind: str  # "executive", "garland", "cross_domain", "governance", "synthesis"
+    kind: str  # "executive", "garland", "curia", "cross_domain", "governance", "synthesis"
     body_md: str
     score_dimensions: tuple[str, ...]
 
@@ -176,6 +176,112 @@ _register(Rubric(
     ),
     score_dimensions=(
         "jurisdiction_mapping", "citation_quality", "risk_classification",
+    ),
+))
+
+# ---------- curia (legal-compliance / Senate) ----------
+# Real rubrics for the Senate squad (squads/legal-compliance). Each mirrors a
+# .claude/rubrics/*.md file in the Senate source pack — keep dimensions in sync.
+
+_register(Rubric(
+    rubric_id="citation-integrity@1",
+    kind="curia",
+    body_md=(
+        "# Citation Integrity (v1) — Tribonian's gate\n"
+        "Mirrors Senate/.claude/rubrics/citation-integrity@1.md (Table III).\n"
+        "Any fabricated authority → outcome=fail regardless of scores.\n"
+        "- **tag_honesty** (0-5): every authority tagged VERIFIED:source-in-matter /\n"
+        "  VERIFIED:well-established / UNVERIFIED; doubt resolved toward UNVERIFIED\n"
+        "- **downgrade_discipline** (0-5): load-bearing UNVERIFIED ⇒ conclusion\n"
+        "  marked preliminary, never silent full weight\n"
+        "- **jurisdiction_temporal_tagging** (0-5): jurisdiction + validity status\n"
+        "  on every authority\n"
+        "- **citation_hygiene** (0-5): pin cites, exact quotes, secondary-as-secondary\n"
+    ),
+    score_dimensions=(
+        "tag_honesty", "downgrade_discipline",
+        "jurisdiction_temporal_tagging", "citation_hygiene",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="aba-512-ethics@1",
+    kind="curia",
+    body_md=(
+        "# ABA Formal Opinion 512 Ethics (v1)\n"
+        "Mirrors Senate/.claude/rubrics/aba-512-ethics@1.md (Tables II & VI).\n"
+        "UPL bright-line crossed (signature/filing/appearance/third-party opinion)\n"
+        "→ outcome=fail regardless of scores.\n"
+        "- **supervision_readiness** (0-5): reviewing attorney can audit the chain\n"
+        "- **confidentiality_discipline** (0-5): matter-scoped data; boundary redaction\n"
+        "- **competence_candor** (0-5): confidence tiers; uncertainty surfaced\n"
+        "- **disclaimer_discipline** (0-5): work-product banner + not-legal-advice\n"
+        "  notice present once, prominently\n"
+    ),
+    score_dimensions=(
+        "supervision_readiness", "confidentiality_discipline",
+        "competence_candor", "disclaimer_discipline",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="gdpr-art-25-privacy-by-design@1",
+    kind="curia",
+    body_md=(
+        "# GDPR Art. 25 Privacy by Design (v1) — Angerona's gate\n"
+        "Mirrors Senate/.claude/rubrics/gdpr-art-25-privacy-by-design@1.md.\n"
+        "- **by_design_integration** (0-5): privacy designed in, not appended\n"
+        "- **necessity_proportionality** (0-5): lawful basis named; minimization\n"
+        "  answered honestly; retention bounded\n"
+        "- **risk_assessment_quality** (0-5): likelihood × severity scored;\n"
+        "  special-category multipliers applied\n"
+        "- **anonymization_honesty** (0-5): the three-part test applied;\n"
+        "  pseudonymized called pseudonymized\n"
+    ),
+    score_dimensions=(
+        "by_design_integration", "necessity_proportionality",
+        "risk_assessment_quality", "anonymization_honesty",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="eu-ai-act-classification@1",
+    kind="curia",
+    body_md=(
+        "# EU AI Act Classification (v1) — Ulpian's tree\n"
+        "Mirrors Senate/.claude/rubrics/eu-ai-act-classification@1.md.\n"
+        "Any Art. 5 prohibited-practice proximity unflagged → outcome=fail.\n"
+        "- **tier_justification** (0-5): classification grounded in actual function\n"
+        "  and Annex categories; closest-call alternative named\n"
+        "- **role_classification** (0-5): provider/deployer/importer/distributor\n"
+        "  classified — duty sets differ\n"
+        "- **duty_set_completeness** (0-5): applicable chapter's duties cataloged\n"
+        "- **temporal_accuracy** (0-5): phase-in dates and pending guidance flagged\n"
+    ),
+    score_dimensions=(
+        "tier_justification", "role_classification",
+        "duty_set_completeness", "temporal_accuracy",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="open-source-license-compatibility@1",
+    kind="curia",
+    body_md=(
+        "# OSS License Compatibility (v1) — Minerva's matrix\n"
+        "Mirrors Senate/.claude/rubrics/open-source-license-compatibility@1.md.\n"
+        "AGPL in a network-service stack not flagged Critical → outcome=fail.\n"
+        "- **matrix_correctness** (0-5): verdicts match the compatibility matrix;\n"
+        "  license-version specificity respected (v2-only vs v2+)\n"
+        "- **obligations_inventory** (0-5): notices, license texts, source offers\n"
+        "  cataloged per component\n"
+        "- **boundary_analysis_depth** (0-5): linking/derivative analysis for\n"
+        "  copyleft components — analyzed, not assumed\n"
+        "- **remediation_actionability** (0-5): incompatibilities end in options\n"
+    ),
+    score_dimensions=(
+        "matrix_correctness", "obligations_inventory",
+        "boundary_analysis_depth", "remediation_actionability",
     ),
 ))
 

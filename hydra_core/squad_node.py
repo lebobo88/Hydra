@@ -396,24 +396,44 @@ def _via_impersonation(
     )
 
 
+# Per-squad shim registry for claude-skill packs. Each entry names the MCP
+# shim server, its tool prefix (`<prefix>.command.list`, `<prefix>.output.write`),
+# how the output-write path is keyed ("phase" → _phase_for, "domain" →
+# _domain_for), and the user-facing labels. Unknown claude-skill squads fall
+# back to the RLM entry (the original behavior) so legacy packs keep working.
+_SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
+    "garland": {
+        "server": "rlm_creative", "prefix": "rlm", "default_cmd": "/rlm-team",
+        "path_key": "phase", "label": "Creative work", "artifact_kind": "creative_output",
+    },
+    "legal-compliance": {
+        "server": "senate", "prefix": "senate", "default_cmd": "/senate",
+        "path_key": "domain", "label": "Legal counsel", "artifact_kind": "legal_output",
+    },
+}
+
+
 def _via_claude_skill(
     state: HydraState,
     pack: SquadPack,
     inbound: HydraEnvelope,
     dispatcher: Dispatcher,
 ) -> SquadResult:
-    """RLM-style — invoke a Claude Code skill (e.g. /rlm-team).
+    """Pack-skill pattern — invoke a Claude Code skill (e.g. /rlm-team, /senate).
 
-    Enrichment: consult the `rlm_creative` MCP for the live skill catalogue, then
-    persist the resulting host-pickup envelope under `RLM/output/{phase}/` via
-    `rlm.output.write`. The returned `MemoryRef.key` points at the real path.
+    Enrichment: consult the squad's MCP shim (per `_SKILL_PACK_SHIMS`) for the
+    live command catalogue, then persist the resulting host-pickup envelope via
+    `<prefix>.output.write`. The returned `MemoryRef.key` points at the real
+    on-disk path. Squads without a shim entry use the RLM shim (legacy default).
     """
+    shim = _SKILL_PACK_SHIMS.get(pack.slug, _SKILL_PACK_SHIMS["garland"])
+    server, prefix = shim["server"], shim["prefix"]
     invoke = pack.invoke or {}
-    cmd = invoke.get("command_hint", "/rlm-team")
+    cmd = invoke.get("command_hint", shim["default_cmd"])
 
     _on_mcp_err = _record_mcp_failure(state)
     catalogue = _mcp_call_safe(
-        dispatcher, "rlm_creative", "rlm.command.list", {},
+        dispatcher, server, f"{prefix}.command.list", {},
         squad_id=pack.slug, on_error=_on_mcp_err,
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
@@ -430,14 +450,15 @@ def _via_claude_skill(
             rationale=f"claude-skill {cmd} failed: {e!r}",
         )
 
-    phase = _phase_for(inbound)
+    path_val = (_domain_for(pack, inbound) if shim["path_key"] == "domain"
+                else _phase_for(inbound))
     topic = (getattr(inbound, "objective", None)
              or getattr(inbound, "summary", None)
              or cmd.lstrip("/"))[:80]
     write_result = _mcp_call_safe(
-        dispatcher, "rlm_creative", "rlm.output.write",
-        {"phase": phase, "topic": topic,
-         "content": _render_session_md(f"Creative dispatch via {cmd}",
+        dispatcher, server, f"{prefix}.output.write",
+        {shim["path_key"]: path_val, "topic": topic,
+         "content": _render_session_md(f"{shim['label']} dispatch via {cmd}",
                                        f"command_hint={cmd}\navailable={available_cmds}",
                                        result)},
         squad_id=pack.slug, on_error=_on_mcp_err,
@@ -447,18 +468,18 @@ def _via_claude_skill(
     if rel_path:
         artifacts_refs.append(MemoryRef(
             tier="episodic",
-            key=f"rlm:output:{rel_path}",
-            summary=f"Creative dispatch: {topic}",
+            key=f"{prefix}:output:{rel_path}",
+            summary=f"{shim['label']} dispatch: {topic}",
         ))
     else:
-        artifacts_refs.append(MemoryRef(tier="episodic", key=f"rlm:{uuid4()}"))
+        artifacts_refs.append(MemoryRef(tier="episodic", key=f"{prefix}:{uuid4()}"))
 
     decision = DecisionRecord(
         workflow_id=inbound.workflow_id,
         parent_id=inbound.id,
         origin_squad=pack.slug,
         target_squad=inbound.origin_squad,
-        decision=f"Creative work dispatched via {cmd}",
+        decision=f"{shim['label']} dispatched via {cmd}",
         rationale=str(result.get("summary", ""))[:1000],
         artifacts=artifacts_refs,
     )
@@ -468,7 +489,7 @@ def _via_claude_skill(
     )
     return SquadResult(
         envelopes=[decision],
-        artifacts=[{"kind": "creative_output", "raw": result, "persisted": write_result}],
+        artifacts=[{"kind": shim["artifact_kind"], "raw": result, "persisted": write_result}],
         status=result.get("status", "done"),
         host_pickup_pending=host_pickup,
     )

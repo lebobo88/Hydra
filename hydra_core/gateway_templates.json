@@ -76,5 +76,17 @@
     },
     "required": false,
     "description": "RLM-Creative pack introspection"
+  },
+  "senate": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.senate"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_SENATE_ROOT": "{SENATE_ROOT}"
+    },
+    "required": false,
+    "description": "Senate legal pack introspection (the Curia Crown)"
   }
 }

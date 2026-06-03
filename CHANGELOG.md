@@ -8,6 +8,48 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Added — Senate: the legal-compliance squad goes active (the Curia Crown)
+
+The `legal-compliance` stub is promoted to an active `claude-skill` squad
+backed by the external [Senate](https://github.com/lebobo88/Senate) pack —
+12 jurists (9 Curia heads + 3 consilium) deliberating under the Law of
+Citations (majority rules; Papinian breaks ties; dissents preserved
+verbatim), bound by the Twelve Tables constitution, halting at the Tribune's
+Veto (HITL). Fulfils the constellation roadmap item "Promote one stub squad
+(legal-compliance) to active" (docs/constellation/exec-memos/cto.md).
+
+- **`squads/legal-compliance/squad.yaml`** — stub → active: full 12-agent
+  roster with mythic aliases, consilium `parent:` links, HITL triggers
+  (Angerona/Tribonian/Janus), six gates (citation-integrity@1 +
+  aba-512-ethics@1 always-on), `invoke.command_hint: /senate`. `best_of_n: 0`
+  until the judge plane grows a legal best-of-N branch.
+- **`squads/legal-compliance/heads.yaml`** — Curia cathedral overlay.
+- **`hydra_core/heads.py`** — fourth crown: `Crown` literal gains `"curia"`,
+  12 built-in jurist aliases, `crown_label_for_squad("legal-compliance") ==
+  "the Curia Crown"`.
+- **`hydra_core/squad_node.py`** — `_via_claude_skill` generalized via a
+  `_SKILL_PACK_SHIMS` registry (garland→rlm_creative, legal-compliance→
+  senate); RLM remains the fallback for unknown claude-skill squads.
+- **`hydra_core/router.py`** — legal fingerprints extended with operational
+  vocabulary (dpia, redline, indemnification, export controls, sanctions, …)
+  and mythic routing keys (senate, curia, papinian, ulpian, cicero, …).
+- **`hydra_core/judge/registry.py`** — five real `curia`-kind rubrics
+  (citation-integrity@1, aba-512-ethics@1, gdpr-art-25-privacy-by-design@1,
+  eu-ai-act-classification@1, open-source-license-compatibility@1) mirroring
+  the Senate pack's rubric files.
+- **`hydra_core/judge/router.py`** — legal-compliance boundary now binds the
+  always-on pair unconditionally plus `_LEGAL_TOPIC_RUBRICS` content matches.
+- **`mcp_servers/senate/`** — pack shim (`senate.roster.list`,
+  `senate.agent.get`, `senate.skill.*`, `senate.command.*`,
+  `senate.output.*`, `senate.ping`; root override `HYDRA_SENATE_ROOT`).
+- **Gateway + doctor wiring** — `gateway_templates.json` senate entry,
+  `SENATE_ROOT` interpolation, `toolshed.py` `SENATE_TOOLS` static catalog,
+  `cli.py doctor` senate.ping probe, `hooks.json` senate matchers.
+- **`tests/test_senate_integration.py`** — 20 tests pinning the contract
+  (loader, consilium parents, gates, router, cathedral overlay, judge
+  routing, shim dispatch, no mythic-name collisions); `tests/test_heads.py`
+  updated for the fourth crown.
+
 ### Added — Cross-vendor judge plane
 
 Hydra now incorporates the pair-programmer "rubber-duck across vendors" pattern

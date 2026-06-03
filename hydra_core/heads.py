@@ -32,7 +32,7 @@ from typing import Iterable, Literal, Optional
 import yaml
 
 
-Crown = Literal["executive", "forge", "garland", "unaffiliated"]
+Crown = Literal["executive", "forge", "garland", "curia", "unaffiliated"]
 
 
 @dataclass(frozen=True)
@@ -156,6 +156,57 @@ _BUILTIN_ALIASES: tuple[HeadAlias, ...] = (
               register="The light. Visual direction, shot lists, color science.",
               sigil="solar-disc",
               refusal="I will not fabricate a frame that did not happen."),
+
+    # Curia Crown — legal & compliance (the Senate pack; jurists of the
+    # Law of Citations, 426 AD: majority prevails, Papinian breaks ties)
+    HeadAlias("general-counsel", "Papinian", "curia",
+              register="The weigher. Measured, final, never first to speak.",
+              sigil="weighed-scroll",
+              refusal="I will not let an opinion leave the Curia unweighed or uncited."),
+    HeadAlias("contract-counsel", "Gaius", "curia",
+              register="The teacher. Systematic, clause by clause, obligations first.",
+              sigil="institutes-tablet",
+              refusal="I will not redline what I have not read in full."),
+    HeadAlias("regulatory-counsel", "Ulpian", "curia",
+              register="The public lawyer. Maps the state's demands to the firm's controls.",
+              sigil="digest-column",
+              refusal="I will not map an obligation to a control that does not exist."),
+    HeadAlias("privacy-counsel", "Angerona", "curia",
+              register="The guarded silence. Speaks only of data that may speak.",
+              sigil="finger-to-lips",
+              refusal="I will not let personal data cross a border unexamined."),
+    HeadAlias("ip-counsel", "Minerva", "curia",
+              register="Creations of the mind. Owl-eyed over every mark and license.",
+              sigil="owl-and-olive",
+              refusal="I will not clear a mark I have not searched."),
+    HeadAlias("mna-counsel", "Scaevola", "curia",
+              register="The transactional master. Walks the data room before the deal.",
+              sigil="clasped-hands",
+              refusal="I will not bless a deal whose data room I have not walked."),
+    HeadAlias("litigation-counsel", "Cicero", "curia",
+              register="The advocate. Argues both sides before recommending one.",
+              sigil="rostrum",
+              refusal="I will not argue a position the evidence cannot carry."),
+    HeadAlias("governance-counsel", "Cato", "curia",
+              register="The censor. Rectitude in the record; ceterum censeo.",
+              sigil="censors-stylus",
+              refusal="I will not draft minutes for a meeting that did not happen."),
+    HeadAlias("citation-verifier", "Tribonian", "curia",
+              register="The compiler. Nothing enters the Digest unverified.",
+              sigil="digest-codex",
+              refusal="I will not pass a citation I cannot verify."),
+    HeadAlias("employment-counsel", "Paulus", "curia",
+              register="Consilium of Gaius. The law of the people who do the work.",
+              sigil="paired-tablets",
+              refusal="I will not paper over a worker's statutory right."),
+    HeadAlias("tax-counsel", "Modestinus", "curia",
+              register="Consilium of Scaevola. Last to speak, fatal to forget.",
+              sigil="abacus",
+              refusal="I will not opine on a structure whose substance I cannot see."),
+    HeadAlias("export-controls", "Janus", "curia",
+              register="Consilium of Ulpian. Two-faced over every threshold.",
+              sigil="two-faces",
+              refusal="I will not open a gate the law has closed."),
 )
 
 
@@ -185,7 +236,7 @@ def _load_overlay(path: Path) -> dict[str, HeadAlias]:
         out[plaza] = HeadAlias(
             plaza=plaza,
             mythic=mythic,
-            crown=crown if crown in ("executive", "forge", "garland", "unaffiliated") else "unaffiliated",
+            crown=crown if crown in ("executive", "forge", "garland", "curia", "unaffiliated") else "unaffiliated",
             register=entry.get("register", ""),
             sigil=entry.get("sigil", ""),
             refusal=entry.get("refusal", ""),
@@ -246,6 +297,7 @@ _SQUAD_CROWN_LABELS: dict[str, str] = {
     "executive": "the Executive Crown",
     "engineering": "the Forge Crown",
     "garland": "the Garland Crown",
+    "legal-compliance": "the Curia Crown",
 }
 
 

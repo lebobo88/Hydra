@@ -182,6 +182,7 @@ graph TD
 | **Executive** | `executive` | [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) | agent-impersonation | judgment under ambiguity — 20 C-suite agents + 4 orchestrators (boardroom, M&A cockpit, crisis war-room, capital allocation) |
 | **Forge** | `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | mcp | verifiable correctness — best-of-N harness with 7 forge heads (Daedalus/Prometheus/Argus/Hygeia/Cerberus/Charon/Mnemosyne), 16 built-in profiles |
 | **Garland** | `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | claude-skill | divergent ideation — 8 Muses (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) + Helios sub-crew (video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa) |
+| **Curia** | `legal-compliance` | [Senate](https://github.com/lebobo88/Senate) | claude-skill | binding judgment under law — 9 jurists of the Law of Citations (Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian) + consilium (Paulus, Modestinus, Janus); deliberates by majority with Papinian's tiebreak, halts at the Tribune's Veto |
 
 Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo88/MarketBliss):
 
@@ -193,15 +194,16 @@ Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo8
 | `marketing-production` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | asset production pipelines |
 | `marketing-ops` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | MarTech wiring, attribution, automation |
 
-And **five stub squads** — registered under the same covenant, awaiting activation:
+Plus the **Xenia Hearth** customer-support squad (`customer-support`, sourced
+from the Xenia pack, claude-skill entrypoint).
+
+And **three stub squads** — registered under the same covenant, awaiting activation:
 
 | Slug | Industry tags |
 |---|---|
-| `legal-compliance` | legal, compliance, governance |
 | `healthcare` | healthcare, clinical, life-sciences |
 | `sales-gtm` | sales, GTM, revops |
 | `research-ds` | research, data-science |
-| `customer-support` | support, success, CX |
 
 Every squad declares in its `squad.yaml`:
 - `agents:` roster (slugs + role + authority bounds)

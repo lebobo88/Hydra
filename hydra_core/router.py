@@ -44,6 +44,15 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "gdpr", "ccpa", "hipaa", "contract", "nda", "msa", "privacy",
         "license", "trademark", "patent", "regulatory", "lawsuit", "dmca",
         "eu ai act", "sox", "data subject", "litigation",
+        # legal-operational vocabulary (Senate activation)
+        "legal", "counsel", "dpia", "due diligence", "diligence", "redline",
+        "clause", "indemnification", "indemnity", "terms of service", "tos",
+        "eula", "copyright", "infringement", "breach notification",
+        "export control", "export controls", "sanctions", "employment law",
+        "labor law", "compliance",
+        # mythic routing keys (Garland precedent) — the Curia Crown jurists
+        "senate", "curia", "papinian", "ulpian", "gaius", "cicero",
+        "tribonian", "angerona", "scaevola", "jurist", "jurists",
     ),
     "healthcare": (
         "patient", "diagnosis", "clinical", "ehr", "icd-10", "snomed", "fhir",

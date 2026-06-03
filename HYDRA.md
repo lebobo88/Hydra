@@ -22,11 +22,11 @@ The architecture is grounded in `Enterprise Master AI Orchestration System Archi
 | Executive (C-Suite) | `executive` | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | active |
 | Engineering & Product | `engineering` | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | active |
 | Garland (Creative & Production) | `garland` | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | active |
-| Legal & Compliance | `legal-compliance` | (stub) | scaffold |
+| Senate — Legal & Compliance (Curia) | `legal-compliance` | [`Senate`](https://github.com/lebobo88/Senate) | active |
 | Healthcare / Clinical | `healthcare` | (stub) | scaffold |
 | Sales & GTM | `sales-gtm` | (stub) | scaffold |
 | Research & Data-Science | `research-ds` | (stub) | scaffold |
-| Customer Support | `customer-support` | (stub) | scaffold |
+| Customer Support (Xenia Hearth) | `customer-support` | Xenia (local pack) | active |
 
 Every squad declares — in its `squad.yaml`:
 - `agents:` the roster (slugs + role description + authority bounds)

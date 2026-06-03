@@ -368,6 +368,12 @@ RLM_CREATIVE_TOOLS = [
     "rlm.ping",
 ]
 
+SENATE_TOOLS = [
+    "senate.roster.list", "senate.agent.get", "senate.skill.list",
+    "senate.skill.get", "senate.command.list", "senate.command.get",
+    "senate.output.write", "senate.output.read", "senate.ping",
+]
+
 PP_CODEX_TOOLS = ["generate", "critique"]
 PP_GEMINI_TOOLS = ["generate", "critique"]
 
@@ -614,7 +620,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
-    """Build a ToolShed pre-loaded with static catalogs for all 8 backends."""
+    """Build a ToolShed pre-loaded with static catalogs for all 9 backends."""
     shed = ToolShed(dispatcher=dispatcher)
     shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS,
                                  schemas=SCHEMA_OVERRIDES.get("pp_harness"))
@@ -625,6 +631,7 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
                                  schemas=SCHEMA_OVERRIDES.get("hydra_memory"))
     shed.register_static_catalog("executive_suite", EXECUTIVE_SUITE_TOOLS)
     shed.register_static_catalog("rlm_creative", RLM_CREATIVE_TOOLS)
+    shed.register_static_catalog("senate", SENATE_TOOLS)
     shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
     shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
     return shed

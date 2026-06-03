@@ -36,11 +36,12 @@ Out of the box, Hydra ships with three productized crews:
 | Executive | `executive` | [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) | C-suite strategic decisions, boardroom, capital allocation, M&A, crisis response |
 | Forge | `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | spec-driven dev: PRD → ArchRFC → DevTask → tests → review → release |
 | Garland | `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | brand, copy, content, social, paid, PR, SEO, visual direction |
+| Curia | `legal-compliance` | [Senate](https://github.com/lebobo88/Senate) | contracts, regulatory, privacy, IP, M&A, litigation, governance, citation verification |
 
 Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo88/MarketBliss)
 (5 squads: marketing-strategy, marketing-creative, marketing-research,
-marketing-production, marketing-ops) and five stub crews scaffolded for
-legal-compliance, healthcare, sales-gtm, research-ds, and customer-support.
+marketing-production, marketing-ops) and four stub crews scaffolded for
+healthcare, sales-gtm, research-ds, and customer-support.
 Drop a `squads/<slug>/squad.yaml` file and it appears in the registry — no
 code changes.
 

@@ -155,6 +155,7 @@ def _cmd_doctor(args) -> int:
         ("hydra_memory", "list_tools", {}),
         ("executive_suite", "es.ping", {}),
         ("rlm_creative", "rlm.ping", {}),
+        ("senate", "senate.ping", {}),
     ]
     dispatcher = MCPStdioDispatcher(project)
     for server, tool, tool_args in probes:
@@ -463,6 +464,7 @@ def _cmd_gateway_setup(args) -> int:
         "AGENTSMITH_ROOT": str(hydra_root.parent / "AgentSmith"),
         "ES_ROOT": str(hydra_root.parent / "ExecutiveSuite"),
         "RLM_ROOT": str(hydra_root.parent / "RLM-Creative"),
+        "SENATE_ROOT": str(hydra_root.parent / "Senate"),
         "USERPROFILE": os.environ.get("USERPROFILE", str(Path.home())),
     }
 

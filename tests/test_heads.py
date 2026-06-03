@@ -58,6 +58,24 @@ def test_garland_crown_has_eight_muses():
         assert garland.get(plaza) == mythic
 
 
+def test_curia_crown_has_twelve_jurists():
+    # Senate pack (legal-compliance squad): nine heads + three consilium.
+    expected = {
+        "general-counsel": "Papinian", "contract-counsel": "Gaius",
+        "regulatory-counsel": "Ulpian", "privacy-counsel": "Angerona",
+        "ip-counsel": "Minerva", "mna-counsel": "Scaevola",
+        "litigation-counsel": "Cicero", "governance-counsel": "Cato",
+        "citation-verifier": "Tribonian",
+        # consilium
+        "employment-counsel": "Paulus", "tax-counsel": "Modestinus",
+        "export-controls": "Janus",
+    }
+    curia = {a.plaza: a.mythic for a in heads_in_crown("curia", project_root=REPO_ROOT)}
+    for plaza, mythic in expected.items():
+        assert curia.get(plaza) == mythic
+    assert len(curia) >= 12
+
+
 # --- single-slug API ---------------------------------------------------------
 
 def test_cathedral_name_returns_mythic_for_known_slug():
@@ -126,20 +144,22 @@ def test_crown_label_for_squad_renders_known_crowns():
     assert crown_label_for_squad("executive") == "the Executive Crown"
     assert crown_label_for_squad("engineering") == "the Forge Crown"
     assert crown_label_for_squad("garland") == "the Garland Crown"
-    assert crown_label_for_squad("garland") == "the Garland Crown"
+    assert crown_label_for_squad("legal-compliance") == "the Curia Crown"
 
 
 def test_crown_label_for_squad_falls_back_for_unknown():
-    assert crown_label_for_squad("legal-compliance") == "Legal Compliance"
     assert crown_label_for_squad("research-ds") == "Research Ds"
+    assert crown_label_for_squad("sales-gtm") == "Sales Gtm"
 
 
 # --- iteration API -----------------------------------------------------------
 
 def test_all_aliases_returns_non_empty():
     all_a = list(all_aliases(project_root=REPO_ROOT))
-    assert len(all_a) >= 24  # 9 exec + 8 forge + 8 garland (Asclepius double-counts)
+    # 9 exec + 8 forge + 8 garland + 12 curia (Asclepius double-counts)
+    assert len(all_a) >= 36
     crowns = {a.crown for a in all_a}
     assert "executive" in crowns
     assert "forge" in crowns
     assert "garland" in crowns
+    assert "curia" in crowns

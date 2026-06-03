@@ -69,6 +69,23 @@ _EXEC_TOPIC_RUBRICS = [
 ]
 
 
+# Topic-specific rubric additions for legal-compliance (Curia) envelopes.
+# citation-integrity@1 and aba-512-ethics@1 are bound unconditionally at the
+# squad boundary; these three are content-conditional (mirrors the gate
+# `when:` clauses in squads/legal-compliance/squad.yaml).
+_LEGAL_TOPIC_RUBRICS = [
+    (re.compile(r"\bgdpr\b|\bdpia\b|\bprivacy\b|\bpersonal data\b|\bdata subject\b",
+                re.IGNORECASE),
+     "gdpr-art-25-privacy-by-design@1"),
+    (re.compile(r"\bai act\b|\bai system\b|\bhigh[- ]risk ai\b|\bgpai\b",
+                re.IGNORECASE),
+     "eu-ai-act-classification@1"),
+    (re.compile(r"\bopen[- ]source\b|\boss\b|\bgpl\b|\bagpl\b|\blgpl\b|\blicense compatibilit",
+                re.IGNORECASE),
+     "open-source-license-compatibility@1"),
+]
+
+
 @dataclass
 class JudgeRoute:
     tier: JudgeTier
@@ -154,7 +171,13 @@ def route_judge(
         rubrics.append("phi-redaction-completeness@1")
         tier = "cross_vendor"
     if origin_squad == "legal-compliance" or (envelope.get("target_squad") == "legal-compliance"):
-        rubrics.append("compliance-coverage@1")
+        # Senate (Curia Crown) boundary: the two always-on gates bind
+        # unconditionally; topic-conditional legal rubrics attach below.
+        rubrics.extend([
+            "compliance-coverage@1",
+            "citation-integrity@1",
+            "aba-512-ethics@1",
+        ])
         tier = "cross_vendor"
     if origin_squad == "sales-gtm" or (envelope.get("target_squad") == "sales-gtm"):
         rubrics.append("sales-gtm-rigor@1")
@@ -172,6 +195,10 @@ def route_judge(
                 break
     if etype == "C_SUITE_DECISION_PACKET":
         for pat, rid in _EXEC_TOPIC_RUBRICS:
+            if pat.search(text) and rid not in rubrics:
+                rubrics.append(rid)
+    if origin_squad == "legal-compliance" or (envelope.get("target_squad") == "legal-compliance"):
+        for pat, rid in _LEGAL_TOPIC_RUBRICS:
             if pat.search(text) and rid not in rubrics:
                 rubrics.append(rid)
 

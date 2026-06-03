@@ -118,3 +118,4 @@ In gateway mode, `~/.claude.json` contains only `hydra_gateway`. The actual back
 | `hydra_memory` | Hydra (in-repo) | Python shim | Yes (with Hydra) |
 | `executive_suite` | Hydra (in-repo) | Python shim | No |
 | `rlm_creative` | Hydra (in-repo) | Python shim | No |
+| `senate` | Hydra (in-repo) | Python shim | No |

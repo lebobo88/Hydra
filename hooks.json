@@ -52,6 +52,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "mcp__(hydra_gateway__)?senate__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -66,7 +76,7 @@
         ]
       },
       {
-        "matcher": "mcp__(executive_suite|rlm_creative)__.*output\\.write.*",
+        "matcher": "mcp__(executive_suite|rlm_creative|senate)__.*output\\.write.*",
         "hooks": [
           {
             "type": "command",
