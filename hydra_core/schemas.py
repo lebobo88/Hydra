@@ -215,12 +215,119 @@ class Handoff(HydraEnvelope):
     expires_at: Optional[datetime] = None
 
 
+# ---------- customer-support squad (Xenia) ----------
+
+
+class ActiveObject(BaseModel):
+    type: str
+    ref: str
+    state: str
+
+
+class SentimentSnapshot(BaseModel):
+    current: Literal["positive", "neutral", "negative", "hostile"]
+    trajectory: Literal["improving", "stable", "worsening"]
+
+
+class ActionAttempted(BaseModel):
+    action: str
+    by: str
+    executed: bool
+    result: Optional[str] = None
+
+
+class PortableContextPayload(BaseModel):
+    """The structured state token from the portable-context-token skill.
+
+    Minted by Iris; updated by every head on state change.  `customer_ref`
+    is ALWAYS opaque (`customer:<hash>`).  Raw identity MUST NOT appear
+    here (constitution Article IV).
+    """
+    ctx_id: str                                  # CTX-<ticket-id>-<rev>
+    ticket_id: str
+    customer_ref: str                            # customer:<hash> — never raw PII
+    goal: str
+    active_objects: list[ActiveObject] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    sentiment: Optional[SentimentSnapshot] = None
+    history_digest: str = ""
+    actions_attempted: list[ActionAttempted] = Field(default_factory=list)
+    minted_by: str = "iris"
+    minted_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    rev: int = 1
+
+
+class SupportTicket(HydraEnvelope):
+    """First-class support ticket envelope.
+
+    Carries a normalised inbound support request — from a channel adapter,
+    an operator paste, or a HANDOFF lift — into the customer-support squad.
+    `portable_context` is optional; it is populated when the ticket
+    originates from an in-progress session that already has a context token.
+
+    BACKWARD COMPAT: HANDOFF-tunneled portable_context remains valid; the
+    HANDOFF payload envelope id may point at one of these or any other
+    artifact type.
+    """
+    type: Literal["SUPPORT_TICKET"] = "SUPPORT_TICKET"
+    ticket_id: str
+    customer_ref: str                            # customer:<hash> — never raw PII
+    subject: str
+    body: str
+    priority: Literal["P0", "P1", "P2", "P3"] = "P2"
+    intent: Optional[str] = None
+    channel: Optional[str] = None               # e.g. "email", "chat", "voice", "api"
+    portable_context: Optional[PortableContextPayload] = None
+
+
+class PortableContext(HydraEnvelope):
+    """Portable-context token as a first-class envelope.
+
+    Allows the token to travel as a standalone artifact between squads,
+    rather than only inside a HANDOFF payload.  The inner `payload` is the
+    same PortableContextPayload schema used in SupportTicket.
+
+    BACKWARD COMPAT: HANDOFF-tunneled portable_context is still accepted;
+    this envelope is additive.
+    """
+    type: Literal["PORTABLE_CONTEXT"] = "PORTABLE_CONTEXT"
+    payload: PortableContextPayload
+
+
+class VocTheme(BaseModel):
+    theme: str
+    count: int
+    trend: Optional[str] = None                 # e.g. "+12% vs prior period"
+    sentiment_trajectory: Optional[str] = None
+    representative_quote_redacted: Optional[str] = None
+    kb_gap: bool = False
+
+
+class VocReport(HydraEnvelope):
+    """Voice-of-Customer report envelope.
+
+    Produced by Echo (Soteria sub-agent) and delivered upward to the
+    executive layer via this first-class type.  All fields are aggregates
+    and opaque refs — raw customer identity MUST NOT appear here
+    (constitution Article IV).
+    """
+    type: Literal["VOC_REPORT"] = "VOC_REPORT"
+    period: dict[str, str]                       # {"from": "ISO-8601", "to": "ISO-8601"}
+    coverage: str                                # e.g. "47 tickets, 2026-05-01 to 2026-06-01"
+    themes: list[VocTheme] = Field(default_factory=list)
+    escalation_patterns: Optional[str] = None
+    delight_signals: Optional[str] = None
+    recommendations: list[str] = Field(default_factory=list)
+
+
 # ---------- discriminator union for routing ----------
 
 AnyEnvelope = (
     CSuiteDecisionPacket | PRD | ArchRFC | DevTask
     | CreativeBrief | ShotList | AssetJob
     | HITLRequest | DecisionRecord | Handoff
+    | SupportTicket | PortableContext | VocReport
 )
 
 
@@ -235,6 +342,9 @@ SCHEMA_REGISTRY: dict[str, type[HydraEnvelope]] = {
     "HITL_REQUEST": HITLRequest,
     "DECISION_RECORD": DecisionRecord,
     "HANDOFF": Handoff,
+    "SUPPORT_TICKET": SupportTicket,
+    "PORTABLE_CONTEXT": PortableContext,
+    "VOC_REPORT": VocReport,
 }
 
 

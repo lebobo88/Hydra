@@ -138,10 +138,13 @@ tools:
 accepts:
   - HANDOFF
   - HITL_REQUEST
+  - SUPPORT_TICKET
+  - PORTABLE_CONTEXT
 
 emits:
   - PRD
   - DECISION_RECORD
+  - VOC_REPORT
 
 gates:
   - rubric_id: sla-p1-1hour
