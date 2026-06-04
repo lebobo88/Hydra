@@ -191,7 +191,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _index_needs_rebuild(conn: sqlite3.Connection, md_files: list[Path]) -> bool:
-    """Return True if any source .md file is newer than the stored index mtime."""
+    """Return True if the index is stale and must be rebuilt.
+
+    Triggers a rebuild when ANY of:
+      1. No 'indexed_at' timestamp is stored (fresh DB).
+      2. Any source .md file has a mtime newer than the stored index timestamp
+         (covers: doc updated, doc added).
+      3. The count of source .md files differs from the count stored at last
+         index time (covers: doc deleted — mtime-only check cannot detect this
+         because no surviving file changes mtime when a peer is removed).
+    """
     row = conn.execute("SELECT value FROM meta WHERE key='indexed_at'").fetchone()
     if row is None:
         return True
@@ -199,6 +208,20 @@ def _index_needs_rebuild(conn: sqlite3.Connection, md_files: list[Path]) -> bool
         indexed_at = float(row["value"])
     except (ValueError, TypeError):
         return True
+
+    # Check 3: file-count change (catches deletions that mtime alone misses)
+    count_row = conn.execute("SELECT value FROM meta WHERE key='indexed_file_count'").fetchone()
+    if count_row is not None:
+        try:
+            indexed_count = int(count_row["value"])
+            if indexed_count != len(md_files):
+                return True
+        except (ValueError, TypeError):
+            return True  # Can't parse stored count — rebuild to be safe
+    # If no stored count (pre-existing DB without this meta key), fall through
+    # to mtime check; the next rebuild will store the count.
+
+    # Check 2: mtime change (covers updates and additions)
     for f in md_files:
         if f.stat().st_mtime > indexed_at:
             return True
@@ -237,9 +260,15 @@ def _rebuild_index(conn: sqlite3.Connection, kb_dir: Path, md_files: list[Path])
             total += 1
 
     import time
+    now_ts = str(time.time())
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('indexed_at', ?)",
-        (str(time.time()),),
+        (now_ts,),
+    )
+    # Also persist the file count so _index_needs_rebuild can detect deletions.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('indexed_file_count', ?)",
+        (str(len(md_files)),),
     )
     conn.commit()
     return total

@@ -159,8 +159,20 @@ def _ticket_summary(ticket: dict[str, Any]) -> dict[str, Any]:
 def _parse_flat_yaml(text: str) -> dict[str, str]:
     """Parse a flat key: value YAML file.  No pyyaml dependency.
     Handles optional surrounding quotes on values.  Comments (#) stripped.
+
+    Security-relevant keys (SECURITY_KEYS below) are duplicate-detected: if the
+    same key appears more than once in the document the value is set to the
+    sentinel _DUPLICATE_KEY_SENTINEL so that callers can fail-closed rather than
+    silently last-winning to a potentially attacker-controlled value.
     """
+    # Security-relevant keys where duplicate detection is mandatory.
+    # A YAML file with status: denied / status: approved must NOT silently
+    # resolve to 'approved' via last-wins; it must be rejected by callers.
+    SECURITY_KEYS = {"status", "expires_at", "issued_by", "action", "scope"}
+    _DUPLICATE_KEY_SENTINEL = "__DUPLICATE_KEY__"
+
     result: dict[str, str] = {}
+    seen_keys: set[str] = set()
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -177,7 +189,12 @@ def _parse_flat_yaml(text: str) -> dict[str, str]:
         if (val.startswith('"') and val.endswith('"')) or \
            (val.startswith("'") and val.endswith("'")):
             val = val[1:-1]
-        result[key] = val
+        # Duplicate detection on security-relevant keys: mark as sentinel
+        if key in SECURITY_KEYS and key in seen_keys:
+            result[key] = _DUPLICATE_KEY_SENTINEL
+        else:
+            result[key] = val
+        seen_keys.add(key)
     return result
 
 
@@ -218,8 +235,15 @@ def _find_valid_approval(
 
         parsed = _parse_flat_yaml(text)
 
-        # Must be approved
-        if parsed.get("status", "").lower() != "approved":
+        # Must be approved — EXACT lowercase match required (no casing drift).
+        # The sentinel __DUPLICATE_KEY__ is never equal to "approved", so duplicate
+        # status keys automatically fail-closed here without a separate check.
+        # Reject any value that is not the exact lowercase string "approved":
+        #   - "Approved", "APPROVED", " approved " all fail (casing/whitespace drift)
+        #   - __DUPLICATE_KEY__ fails (ambiguous status)
+        #   - anything else fails
+        raw_status = parsed.get("status", "")
+        if raw_status != "approved":
             continue
 
         # ticket_id must be present in the artifact
@@ -227,23 +251,28 @@ def _find_valid_approval(
         if art_ticket and art_ticket != ticket_id:
             continue
 
-        # action must match (case-insensitive)
-        art_action = parsed.get("action", "").lower()
-        if art_action and art_action != action.lower():
+        # action must match (case-insensitive) — but reject sentinel
+        art_action = parsed.get("action", "")
+        if art_action == "__DUPLICATE_KEY__":
+            continue
+        if art_action and art_action.lower() != action.lower():
             continue
 
-        # scope must match if present
+        # scope must match if present — reject sentinel
         art_scope = parsed.get("scope", "")
+        if art_scope == "__DUPLICATE_KEY__":
+            continue
         if art_scope and art_scope != scope:
             continue
 
-        # issued_by must be present
-        if not parsed.get("issued_by", "").strip():
+        # issued_by must be present — reject sentinel
+        issued_by = parsed.get("issued_by", "")
+        if issued_by == "__DUPLICATE_KEY__" or not issued_by.strip():
             continue
 
-        # expires_at must be present and in the future
+        # expires_at must be present and in the future — reject sentinel
         expires_str = parsed.get("expires_at", "")
-        if not expires_str:
+        if not expires_str or expires_str == "__DUPLICATE_KEY__":
             continue
         try:
             # Handle both offset-aware and naive ISO timestamps
