@@ -377,6 +377,17 @@ SENATE_TOOLS = [
 PP_CODEX_TOOLS = ["generate", "critique"]
 PP_GEMINI_TOOLS = ["generate", "critique"]
 
+XENIA_KB_TOOLS = [
+    "xenia-kb.search", "xenia-kb.get", "xenia-kb.list", "xenia-kb.ping",
+]
+
+XENIA_TICKETS_TOOLS = [
+    "xenia-tickets.create", "xenia-tickets.get", "xenia-tickets.list",
+    "xenia-tickets.comment", "xenia-tickets.update_fields",
+    "xenia-tickets.send_response", "xenia-tickets.recommend",
+    "xenia-tickets.execute_approved", "xenia-tickets.ping",
+]
+
 
 class ProgressiveDisclosureTree:
     """Hierarchical tool navigation: squad → server → category → tool.
@@ -620,7 +631,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
-    """Build a ToolShed pre-loaded with static catalogs for all 9 backends."""
+    """Build a ToolShed pre-loaded with static catalogs for all 11 backends."""
     shed = ToolShed(dispatcher=dispatcher)
     shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS,
                                  schemas=SCHEMA_OVERRIDES.get("pp_harness"))
@@ -634,4 +645,6 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
     shed.register_static_catalog("senate", SENATE_TOOLS)
     shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
     shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
+    shed.register_static_catalog("xenia_kb", XENIA_KB_TOOLS)
+    shed.register_static_catalog("xenia_tickets", XENIA_TICKETS_TOOLS)
     return shed
