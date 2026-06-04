@@ -65,35 +65,35 @@ Tools appear as `mcp__hydra_gateway__pp_harness__start_run`, etc. The gateway:
 
 ```bash
 # 1. Backup current config
-python -m hydra_core.cli gateway-backup
+py -3.12 -m hydra_core.cli gateway-backup
 
 # 2. Export backend specs to ~/.hydra/backends.json
-python -m hydra_core.cli gateway-export-backends
+py -3.12 -m hydra_core.cli gateway-export-backends
 
 # 3. Register gateway via Claude Code /mcp dialog
 #    Add: hydra_gateway → python -m mcp_servers.hydra_gateway
 
 # 4. Update hook matchers for gateway prefix
-python -m hydra_core.cli gateway-migrate-hooks
+py -3.12 -m hydra_core.cli gateway-migrate-hooks
 
 # 5. Verify gateway health (start a new Claude Code session)
 #    Call: mcp__hydra_gateway__gateway.health
 
 # 6. Remove old backend entries from ~/.claude.json
-python -m hydra_core.cli gateway-remove-old-backends
+py -3.12 -m hydra_core.cli gateway-remove-old-backends
 ```
 
 ## Rollback: Gateway → Standalone
 
 ```bash
-python -m hydra_core.cli gateway-rollback
+py -3.12 -m hydra_core.cli gateway-rollback
 # Restores ~/.claude.json and settings.json from the most recent backup
 ```
 
 ## Fresh Machine Setup
 
 ```bash
-python -m hydra_core.cli gateway-setup
+py -3.12 -m hydra_core.cli gateway-setup
 # Detects which sibling projects exist, generates backends.json
 ```
 

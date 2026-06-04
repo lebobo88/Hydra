@@ -328,9 +328,9 @@ In **gateway mode**, all 8 servers are consolidated behind a single `hydra_gatew
 
 ```bash
 # Migrate from 8 servers to 1 gateway:
-python -m hydra_core.cli gateway-backup
-python -m hydra_core.cli gateway-export-backends
-python -m hydra_core.cli gateway-migrate-hooks
+py -3.12 -m hydra_core.cli gateway-backup
+py -3.12 -m hydra_core.cli gateway-export-backends
+py -3.12 -m hydra_core.cli gateway-migrate-hooks
 # Then register hydra_gateway via /mcp and remove old entries
 ```
 
@@ -367,10 +367,10 @@ cd Hydra
 
 # macOS / Linux:
 pip install -e .
-python -m hydra_core.cli doctor
+py -3.12 -m hydra_core.cli doctor
 ```
 
-This pip-installs `hydra-core` in editable mode and runs `python -m hydra_core.cli doctor` to confirm squads are discovered and the constitution loads cleanly.
+This pip-installs `hydra-core` in editable mode and runs `py -3.12 -m hydra_core.cli doctor` to confirm squads are discovered and the constitution loads cleanly.
 
 > **The `python` on your PATH must be 3.11+.** `hydra-core` declares `requires-python = ">=3.11"`, so the editable install fails outright on older interpreters (e.g. `ERROR: Package 'hydra-core' requires a different Python: 3.10.x not in '>=3.11'`). This matters beyond install time: the plugin's hooks and its three Python MCP servers all invoke **bare `python`**, so whatever `python` resolves to on your PATH is what runs them. Verify with `python --version` *before* continuing. On Windows, if an older Python is first on PATH, install into 3.11+ explicitly (`py -3.12 -m pip install -e ".[langgraph,mcp]"`) and reorder PATH so the 3.11+ interpreter wins.
 
@@ -402,7 +402,7 @@ Slash commands are now available in every Claude Code session, not just sessions
 > **The plugin manifest provides agents, skills, commands, and hooks only — not MCP servers.** Hydra's three Python MCP servers (`hydra_memory`, `executive_suite`, `rlm_creative`) are registered into `~/.claude.json` by the **gateway setup** step, not by `/plugin install`. Until you run it, `doctor` will warn `… not registered at user scope (~/.claude.json)`. Wire them with:
 >
 > ```bash
-> python -m hydra_core.cli gateway-setup     # writes the MCP server entries; see § MCP topology
+> py -3.12 -m hydra_core.cli gateway-setup     # writes the MCP server entries; see § MCP topology
 > ```
 
 Verify (restart Claude Code first so it reloads the plugin registry and picks up any PATH changes):
@@ -456,10 +456,10 @@ Available in any Claude Code session once the plugin is registered:
 Headless CLI mirrors a subset:
 
 ```bash
-python -m hydra_core.cli run "Refactor billing service auth" --squad engineering
-python -m hydra_core.cli status
-python -m hydra_core.cli trace 7f3c…
-python -m hydra_core.cli doctor
+py -3.12 -m hydra_core.cli run "Refactor billing service auth" --squad engineering
+py -3.12 -m hydra_core.cli status
+py -3.12 -m hydra_core.cli trace 7f3c…
+py -3.12 -m hydra_core.cli doctor
 ```
 
 ---
@@ -512,7 +512,7 @@ Hydra/
 ├── mcp_servers/                      ← Python MCP servers (hydra_memory, executive_suite, rlm_creative, hydra_toolshed, hydra_gateway)
 ├── squads/<slug>/squad.yaml          ← squad declarations (active + stub)
 ├── scripts/install.ps1               ← Python runtime installer
-├── scripts/hydra.ps1                 ← convenience wrapper around `python -m hydra_core.cli`
+├── scripts/hydra.ps1                 ← convenience wrapper around `py -3.12 -m hydra_core.cli`
 ├── .claude-plugin/                   ← Claude Code plugin manifest + hooks
 │   ├── plugin.json                   ← version, MCP server registrations
 │   ├── marketplace.json              ← local marketplace metadata

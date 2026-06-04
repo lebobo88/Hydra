@@ -12,10 +12,28 @@ if (-not (Test-Path $hydraDir)) {
     Write-Host "Created $hydraDir"
 }
 
+# hydra-core declares requires-python >= 3.11. Prefer the Windows launcher
+# pinned to a known-good version, probing that the pin actually resolves
+# (the launcher may be installed without that version); fall back to 3.11,
+# then bare `python`.
+$py = $null
+foreach ($candidate in @(@('py', '-3.12'), @('py', '-3.11'), @('python'))) {
+    $cmd = $candidate[0]
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) { continue }
+    & $cmd @(@($candidate | Select-Object -Skip 1) + @('-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)')) 2>$null
+    if ($LASTEXITCODE -eq 0) { $py = $candidate; break }
+}
+if (-not $py) {
+    Write-Error "No Python >= 3.11 found (tried: py -3.12, py -3.11, python). Install Python 3.11+ first."
+    exit 1
+}
+$pyCmd = $py[0]; $pyArgs = @($py | Select-Object -Skip 1)
+Write-Host "Using interpreter: $($py -join ' ')"
+
 Push-Location $root
 try {
     Write-Host "Installing hydra-core (editable) ..."
-    & python -m pip install -e ".[langgraph]" 2>&1 | Out-Host
+    & $pyCmd @($pyArgs + @('-m', 'pip', 'install', '-e', '.[langgraph]')) 2>&1 | Out-Host
 }
 finally {
     Pop-Location
@@ -23,7 +41,7 @@ finally {
 
 Write-Host ""
 Write-Host "Smoke-testing the registry ..."
-& python -m hydra_core.cli doctor
+& $pyCmd @($pyArgs + @('-m', 'hydra_core.cli', 'doctor'))
 
 Write-Host ""
 Write-Host "Hydra installed."

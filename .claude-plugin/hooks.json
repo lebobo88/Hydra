@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python ./.claude-plugin/hooks/iolaus_check.py"
+          "command": "py -3.12 ./.claude-plugin/hooks/iolaus_check.py"
         }
       ]
     }
@@ -16,7 +16,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "python ./.claude-plugin/hooks/iolaus_log.py"
+          "command": "py -3.12 ./.claude-plugin/hooks/iolaus_log.py"
         }
       ]
     }

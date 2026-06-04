@@ -244,16 +244,16 @@ fallback — not by misrouting.
 
 ```powershell
 # 1. Verify discovery and schema parse
-python -m hydra_core.cli doctor
+py -3.12 -m hydra_core.cli doctor
 
 # 2. Inspect the loaded pack as JSON
-python -m hydra_core.cli squads
+py -3.12 -m hydra_core.cli squads
 
 # 3. Force-select the squad for a smoke run
-python -m hydra_core.cli run "Smoke test for myhealth squad" --squad myhealth
+py -3.12 -m hydra_core.cli run "Smoke test for myhealth squad" --squad myhealth
 
 # 4. Tail the trace
-python -m hydra_core.cli trace <workflow_id>
+py -3.12 -m hydra_core.cli trace <workflow_id>
 ```
 
 `hydra doctor` will print the squad as a `·` (stub) until you flip the

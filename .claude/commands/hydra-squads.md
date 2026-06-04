@@ -5,6 +5,6 @@ model: haiku
 
 # /hydra:squads
 
-Run `python -m hydra_core.cli squads` and render the JSON registry: slug, entrypoint, accepted/emitted envelope types, agent count, industry tags.
+Run `py -3.12 -m hydra_core.cli squads` and render the JSON registry: slug, entrypoint, accepted/emitted envelope types, agent count, industry tags.
 
 Use this to verify a new squad pack is discovered before invoking `/hydra:run` against it.

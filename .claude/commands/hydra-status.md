@@ -11,4 +11,4 @@ model: haiku
 /hydra:status <workflow_id>   # print full trace + tasks + HITL state
 ```
 
-Implementation: call `python -m hydra_core.cli status [<workflow_id>]` and render the output.
+Implementation: call `py -3.12 -m hydra_core.cli status [<workflow_id>]` and render the output.
