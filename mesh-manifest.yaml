@@ -1,0 +1,77 @@
+apiVersion: agentmesh/v1
+kind: SiblingManifest
+
+metadata:
+  id: hydra
+  displayName: "Hydra Episodic Memory"
+  version: "1.0.0"
+  description: "Episodic memory tiers, semantic search, and workflow-scoped audit records for the enterprise AI mesh. Served by the hydra_memory MCP server."
+  # backendsKey: the dict key meshd manages in ~/.hydra/backends.json.
+  # The real gateway uses key "hydra_memory" while metadata.id is "hydra".
+  # Amendment 2026-06-04: added to reconcile manifest id with gateway registry key.
+  backendsKey: "hydra_memory"
+
+runtime:
+  type: python-langgraph
+  entrypoint: "mcp_servers/hydra_memory/__main__.py"
+  cwd: "C:/AiAppDeployments/Hydra"
+  # OPTIONAL runtime.env: written into the gateway spawn spec for this sibling.
+  # NO secrets (AM-EDGE-007). Copied from the real ~/.hydra/backends.json hydra_memory entry.
+  # Amendment 2026-06-04: added so BackendsJsonWriter can produce correct gateway spawn specs.
+  env:
+    PYTHONPATH: "C:/AiAppDeployments/Hydra"
+    HYDRA_EPISODIC_DB: "${USERPROFILE}/.hydra/episodic.db"
+    HYDRA_VECTOR_DIR: "${USERPROFILE}/.hydra/vectors"
+    HYDRA_MEM_FEDERATE_EIGHTS: "1"
+    HYDRA_MEM_FEDERATE_TIMEOUT: "8"
+  healthProbe:
+    type: mcp-tool-call
+    # hydra-mem.list_workflow: cheap read — list episodic rows for a fixed workflow_id.
+    # Source: Hydra/mcp_servers/hydra_memory/server.py — _tool_handlers()["hydra-mem.list_workflow"]
+    tool: "hydra-mem.list_workflow"
+    intervalMs: 20000
+    timeoutMs: 8000
+    failureThreshold: 3
+
+mcp:
+  endpoint:
+    type: stdio
+  # REAL tool names discovered from Hydra/mcp_servers/hydra_memory/server.py — _tool_handlers().
+  # Note: hydra-mem.write_episodic is a WRITE tool (in WRITE_TOOL_DENY_LIST) but must be listed
+  # here because the schema requires mcp.tools to include audit.exportTool and governance.attestTool.
+  # meshd's McpClientBase.callTool() enforces the write-tool deny-list at runtime regardless.
+  tools:
+    - "hydra-mem.write_episodic"
+    - "hydra-mem.read_episodic"
+    - "hydra-mem.list_workflow"
+    - "hydra-mem.semantic_search"
+    - "hydra-mem.query_eights"
+    - "hydra-mem.tag_memory"
+
+lifecycle:
+  startTimeoutMs: 60000
+  gracefulShutdownMs: 10000
+  crashLoopBreaker:
+    threshold: 5
+    windowMs: 60000
+
+audit:
+  # Best-effort audit export via episodic memory listing.
+  # hydra-mem.list_workflow returns all episodic rows for a workflow_id.
+  # Source: Hydra/mcp_servers/hydra_memory/server.py — list_workflow handler
+  # Note: Hydra's authoritative audit chain is in TheEights (eights.audit.trace).
+  # This tool exports Hydra's own episodic records for federated stitching.
+  exportTool: "hydra-mem.list_workflow"
+  dedupeKeyField: "key"
+
+governance:
+  # Constitution file path relative to runtime.cwd (C:/AiAppDeployments/Hydra).
+  # Verified to exist: C:/AiAppDeployments/Hydra/CONSTITUTION.md
+  constitutionPath: "CONSTITUTION.md"
+  # Hydra's hydra_memory server does not expose a dedicated constitution attestation tool.
+  # hydra-mem.read_episodic is used as the governance-connectivity probe: meshd calls this
+  # with a well-known governance key to verify the server is reachable and responsive.
+  # Formal constitution hash attestation for Hydra routes through TheEights
+  # (eights.constitution.attest with consumer="hydra") per governance precedence order
+  # (TheEights → AgentSmith → Hydra, CONSTITUTION.md Article II).
+  attestTool: "hydra-mem.read_episodic"
