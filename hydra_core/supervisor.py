@@ -27,7 +27,7 @@ from .judge import dispatch_judge, route_judge, load_policy
 from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
-from .router import classify_intent, compute_tool_scope
+from .router import RoutingDecision, classify_intent, compute_tool_scope
 from .telemetry import emit as emit_trace
 from .venom import load_cerberus_venoms
 from .schemas import (
@@ -190,13 +190,33 @@ def build_supervisor(
                 replay_summary,
             )
 
-        # Route the goal text
-        decision = classify_intent(
-            state.root_goal,
-            packs,
-            industries=tuple(getattr(state.budget, "industries", []) or []),
-            classify_callable=classify_callable,
-        )
+        # Route the goal text. A pre-seeded non-empty `selected_squads`
+        # (CLI `hydra run --squad ...` / operator force-select) wins over
+        # the intent router: validate slugs against discovered packs and
+        # skip classification. Unknown slugs are dropped with a trace event;
+        # if nothing valid survives, fall back to the router.
+        forced = [s for s in state.selected_squads if s in packs]
+        unknown = [s for s in state.selected_squads if s not in packs]
+        if unknown:
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.force_select_unknown_squads",
+                {"unknown": unknown, "known": sorted(packs)},
+            )
+        if forced:
+            decision = RoutingDecision(
+                squads=forced,
+                confidence=1.0,
+                rationale=f"operator force-select: {forced}",
+            )
+        else:
+            decision = classify_intent(
+                state.root_goal,
+                packs,
+                industries=tuple(getattr(state.budget, "industries", []) or []),
+                classify_callable=classify_callable,
+            )
         state.selected_squads = decision.squads
 
         tool_scope = compute_tool_scope(
@@ -1187,6 +1207,26 @@ def build_supervisor(
     )
 
 
+def _reducer_channels() -> tuple[set[str], set[str]]:
+    """Channels on HydraState that carry a LangGraph reducer annotation.
+
+    Returns (append_channels, merge_dict_channels). Everything else is
+    replace-by-default — including `selected_squads` (operator force-select
+    must be replaceable) and `open_pp_runs` (must be able to shrink during
+    drain; see state.py).
+    """
+    from .state import _append as _append_fn, _merge_dict as _merge_fn
+    append_ch: set[str] = set()
+    merge_ch: set[str] = set()
+    for fname, field in HydraState.model_fields.items():
+        for meta in getattr(field, "metadata", ()):
+            if meta is _append_fn:
+                append_ch.add(fname)
+            elif meta is _merge_fn:
+                merge_ch.add(fname)
+    return append_ch, merge_ch
+
+
 class _PurePythonRunner:
     """Fallback runner when LangGraph is not installed. Step-by-step execution,
     in-memory state. Useful for tests and the bootstrap dev loop."""
@@ -1195,6 +1235,12 @@ class _PurePythonRunner:
         self.steps = steps
 
     def invoke(self, initial: HydraState, *, stop_before: str | None = None) -> HydraState:
+        # Mirror LangGraph channel semantics: append/merge ONLY where the
+        # state model declares that reducer; otherwise replace. The previous
+        # blanket list-append duplicated replace-channels like
+        # `selected_squads` whenever a node both mutated state in place and
+        # returned the same value in its patch.
+        append_ch, merge_ch = _reducer_channels()
         s = initial
         for name, fn in self.steps:
             if stop_before == name:
@@ -1208,9 +1254,9 @@ class _PurePythonRunner:
             for k, v in patch.items():
                 if hasattr(s, k):
                     cur = getattr(s, k)
-                    if isinstance(cur, list) and isinstance(v, list):
+                    if k in append_ch and isinstance(cur, list) and isinstance(v, list):
                         setattr(s, k, [*cur, *v])
-                    elif isinstance(cur, dict) and isinstance(v, dict):
+                    elif k in merge_ch and isinstance(cur, dict) and isinstance(v, dict):
                         setattr(s, k, {**cur, **v})
                     else:
                         setattr(s, k, v)
