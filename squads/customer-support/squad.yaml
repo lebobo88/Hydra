@@ -1,11 +1,12 @@
 name: "Customer Support — Xenia Hearth"
-version: 1.0.0
+version: 1.1.0
 deprecated_after: null
 description: >
   Xenia customer-support squad: Hestia (crown lead), Iris, Metis, Asclepius,
-  Harmonia, Soteria, Hermes, Themis, Eunomia, plus one Soteria sub-agent
+  Harmonia, Soteria, Plutus, Hermes, Themis, Eunomia, plus one Soteria sub-agent
   (Echo, voice-of-customer). Tier-1/2/3 triage, KB-grounded RAG with mandatory
   citations, technical diagnosis, de-escalation, recommend-only retention,
+  billing/account head (Plutus, recommend-only on all monetary actions),
   quality/fairness review, compliance/redaction, and human escalation with a
   structured approval contract. Xun converts Kan into Dui. Replaces the
   customer-support stub; wired to the Xenia source pack.
@@ -58,6 +59,14 @@ agents:
     agent_file: .claude/agents/soteria.md
     notes: "Recommend-only on offers and credits; no autonomous monetary action."
 
+  - slug: billing-account
+    mythic: Plutus
+    role: "Billing & Account"
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/plutus.md
+    notes: "Recommend-only on all billing actions; cites policy; never executes — Hermes carries approved actions."
+
   - slug: voc-synthesis
     mythic: Echo
     parent: retention-success
@@ -102,7 +111,7 @@ tools:
     privilege: write
     mcp_server: xenia-tickets
     notes: >
-      Iris, Soteria, and Hermes only. Binding live via mcp_server: xenia-tickets.
+      Iris, Soteria, Plutus, and Hermes only. Binding live via mcp_server: xenia-tickets.
       Deny-by-default for ALL monetary or irreversible actions (refund, credit,
       plan change, cancellation, deletion) in every mode: such actions are
       recommend-only unless a matching, unexpired, human-issued approval artifact
