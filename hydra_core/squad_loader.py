@@ -18,6 +18,15 @@ from .version import Version, parse_deprecated_after
 
 SQUAD_DIR_NAMES = ("squads",)
 USER_SQUAD_DIR = Path.home() / ".hydra" / "squads"
+# Built-in squads shipped with the Hydra install (<repo>/squads), searched
+# last so project- and user-scope packs shadow them by slug.
+# NOTE: resolves via the repo layout (hydra_core/ sibling of squads/), which
+# holds for the supported editable install (`pip install -e .`). A wheel /
+# site-packages install does not ship squads/ as package data, so built-ins
+# would be absent there — discover_squads() degrades gracefully (the dir
+# existence check skips it). Packaging squads via importlib.resources is a
+# known follow-up if non-editable installs become supported.
+BUILTIN_SQUAD_DIR = Path(__file__).resolve().parent.parent / "squads"
 
 
 @dataclass(frozen=True)
@@ -113,6 +122,7 @@ def discover_squads(project_root: Path | None = None) -> dict[str, SquadPack]:
     for name in SQUAD_DIR_NAMES:
         search_dirs.append(project_root / name)
     search_dirs.append(USER_SQUAD_DIR)
+    search_dirs.append(BUILTIN_SQUAD_DIR)
 
     for d in search_dirs:
         if not d.exists():
