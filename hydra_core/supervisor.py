@@ -190,17 +190,33 @@ def build_supervisor(
                 replay_summary,
             )
 
-        # Route the goal text
-        decision = classify_intent(
-            state.root_goal,
-            packs,
-            industries=tuple(getattr(state.budget, "industries", []) or []),
-            classify_callable=classify_callable,
-        )
-        state.selected_squads = decision.squads
+        # Route the goal text — unless squads were explicitly forced (e.g.
+        # CLI --squad), in which case the router is skipped and the forced
+        # selection is validated against the discovered packs instead.
+        if state.squads_forced and state.selected_squads:
+            unknown = [s for s in state.selected_squads if s not in packs]
+            if unknown:
+                raise ValueError(
+                    f"Forced squad(s) not discovered: {unknown}. "
+                    f"Available: {sorted(packs)}"
+                )
+            effective_squads = list(state.selected_squads)
+            state.last_event = f"intake: forced {effective_squads}"
+        else:
+            decision = classify_intent(
+                state.root_goal,
+                packs,
+                industries=tuple(getattr(state.budget, "industries", []) or []),
+                classify_callable=classify_callable,
+            )
+            effective_squads = decision.squads
+            state.last_event = (
+                f"intake: chose {decision.squads} ({decision.rationale})"
+            )
+        state.selected_squads = effective_squads
 
         tool_scope = compute_tool_scope(
-            state.root_goal, decision.squads, packs, toolshed=toolshed,
+            state.root_goal, effective_squads, packs, toolshed=toolshed,
         )
         emit_trace(judge_trace_root, state.workflow_id, "tool_scope", {
             "relevant_tools": list(tool_scope.relevant_tools)[:20],
@@ -209,14 +225,13 @@ def build_supervisor(
             "tool_count": tool_scope.tool_count,
         })
 
-        state.last_event = f"intake: chose {decision.squads} ({decision.rationale})"
-
         # Eights attestation: stamp the constitution hash into state and
         # record the receipt for audit. The local immortal_head check is
         # still the authoritative refusal gate; this is the shared-ledger
         # attestation. Falls through if the daemon is offline.
         update: dict[str, Any] = {
-            "selected_squads": decision.squads,
+            "selected_squads": effective_squads,
+            "squads_forced": state.squads_forced,
             "phase": "planning",
             "last_event": state.last_event,
             "iteration_count": state.iteration_count,
@@ -1187,12 +1202,25 @@ def build_supervisor(
     )
 
 
+def _annotated_reducer_fields() -> set[str]:
+    """Field names on HydraState that declare a LangGraph reducer via
+    Annotated metadata (e.g. `_append`). Everything else is
+    replace-by-default — the pure-python runner must mirror that, or
+    fields like `selected_squads` get spuriously appended on merge."""
+    fields: set[str] = set()
+    for name, info in HydraState.model_fields.items():
+        if any(callable(m) for m in (info.metadata or [])):
+            fields.add(name)
+    return fields
+
+
 class _PurePythonRunner:
     """Fallback runner when LangGraph is not installed. Step-by-step execution,
     in-memory state. Useful for tests and the bootstrap dev loop."""
     def __init__(self, packs, steps):
         self.packs = packs
         self.steps = steps
+        self._reducer_fields = _annotated_reducer_fields()
 
     def invoke(self, initial: HydraState, *, stop_before: str | None = None) -> HydraState:
         s = initial
@@ -1208,9 +1236,10 @@ class _PurePythonRunner:
             for k, v in patch.items():
                 if hasattr(s, k):
                     cur = getattr(s, k)
-                    if isinstance(cur, list) and isinstance(v, list):
+                    has_reducer = k in self._reducer_fields
+                    if has_reducer and isinstance(cur, list) and isinstance(v, list):
                         setattr(s, k, [*cur, *v])
-                    elif isinstance(cur, dict) and isinstance(v, dict):
+                    elif has_reducer and isinstance(cur, dict) and isinstance(v, dict):
                         setattr(s, k, {**cur, **v})
                     else:
                         setattr(s, k, v)

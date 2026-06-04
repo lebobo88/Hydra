@@ -61,6 +61,9 @@ class HydraState(BaseModel):
 
     # Routing
     selected_squads: list[str] = Field(default_factory=list)
+    # True when squads were explicitly forced (e.g. CLI --squad); intake must
+    # honor them instead of overwriting with the auto-router's pick.
+    squads_forced: bool = False
     current_node: Optional[str] = None
 
     # Work

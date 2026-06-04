@@ -242,6 +242,7 @@ def _cmd_run(args) -> int:
     initial = HydraState(workflow_id=workflow_id, root_goal=args.goal)
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
+        initial.squads_forced = bool(initial.selected_squads)
     critique_client = None
     if args.live:
         from .dispatcher import MCPStdioDispatcher
