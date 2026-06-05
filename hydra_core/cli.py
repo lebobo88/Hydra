@@ -376,6 +376,66 @@ def _acquire_resume_lock(project: Path, wf: str):
     return None, lock_path  # pragma: no cover — loop always returns
 
 
+def _prune_spooled_hitl_requests(workflow_id: str, gate_node: str | None) -> int:
+    """Late-spool reconciliation (mesh-console-unification C3,
+    Codex verdict_IhqMFtUpua item 2; gate-identity scoping per
+    verdict_-o_Ks3I_dI).
+
+    A gate filed while TheEights was down sits in the eights-pending spool.
+    If the operator resolves that gate from the LIVE surface (mesh.hitl.list
+    'hydra-live' rows have no eights ticket), a later spool replay would file
+    a ticket for an already-resolved gate — a permanent orphan in the
+    pending queue. Pruning at resume time prevents the orphan at its source.
+
+    SCOPE — keyed to the GATE IDENTITY (workflow_id + gate_node), the same
+    dedupe key the mesh merge uses. A different unresolved gate in the SAME
+    workflow (different gate_node) survives. Only when the resolved gate has
+    no recorded gate_node (pre-C2 state) does the prune fall back to entries
+    that ALSO lack a gate_node — never a wildcard over the workflow. All
+    other spooled payload classes (attestations, envelope records,
+    proposals) are always preserved.
+
+    COMPLETENESS INVARIANT (verdict_QLdpFA8Qdq): every spooled hitl.request
+    written by C2+ code carries payload.gate_node — `EightsAttestor
+    .hitl_request` ALWAYS emits it ("unspecified" floor when a caller passes
+    none; pinned by test_hitl_request_always_carries_gate_node). And because
+    the spool entry and the checkpoint's pending_hitl are written by the
+    SAME node execution, they are version-consistent: a keyed gate can never
+    coexist with an unkeyed spool entry for itself. The keyed/unkeyed
+    branches above therefore partition reality exactly — no orphan class
+    falls between them.
+    """
+    import os as _os
+    from .eights.pending_spool import DEFAULT_SPOOL_ROOT
+    root = Path(_os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT)
+    if not root.exists():
+        return 0
+    pruned = 0
+    for f in root.glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # corrupt files are an operator concern — never touched
+        if d.get("tool") != "eights.governance.hitl.request":
+            continue
+        args = d.get("args") or {}
+        if not (d.get("workflow_id") == workflow_id or args.get("run_id") == workflow_id):
+            continue
+        spooled_gate = ((args.get("payload") or {}).get("gate_node")
+                        if isinstance(args.get("payload"), dict) else None)
+        if gate_node:
+            if spooled_gate != gate_node:
+                continue  # a DIFFERENT gate in this workflow — must replay
+        elif spooled_gate:
+            continue  # resolved gate has no identity; never wildcard a keyed entry
+        try:
+            f.unlink()
+            pruned += 1
+        except OSError:
+            pass
+    return pruned
+
+
 def _release_resume_lock(fd, lock_path) -> None:
     import os as _os
     try:
@@ -488,10 +548,14 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             return 1
 
     sup.update_state(config, patch)
+    # C3: prevent a later spool replay from filing a ticket for this
+    # now-resolved gate (late-spool orphan reconciliation, gate-identity-keyed).
+    pruned_spool = _prune_spooled_hitl_requests(wf, resolution.get("gate_node"))
     emit(project, wf, "hitl_resumed", {
         "action": action,
         "option": option,
         "gate_node": resolution.get("gate_node"),
+        "pruned_spooled_hitl_requests": pruned_spool,
     })
 
     if action == "reject":

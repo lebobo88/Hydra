@@ -374,6 +374,80 @@ def test_read_surface_while_writer_connection_open(tmp_path, monkeypatch):
         writer.close()
 
 
+# --- late-spool reconciliation (C3 — Codex verdict_IhqMFtUpua) -------------------
+
+def test_resume_prunes_spool_keyed_to_gate_identity(tmp_path, monkeypatch, capsys):
+    """Resolving a live gate must prevent a later spool replay from filing an
+    orphan ticket — but the prune is keyed to GATE IDENTITY
+    (workflow_id + gate_node), so a different unresolved gate in the SAME
+    workflow survives, as do other workflows' entries and non-hitl payloads."""
+    wf = _start_paused_workflow(tmp_path, monkeypatch)  # gate_node == "approval"
+    spool = tmp_path / "eights-pending"
+    spool.mkdir()
+    monkeypatch.setenv("HYDRA_EIGHTS_SPOOL", str(spool))
+
+    (spool / "a.json").write_text(json.dumps({
+        "id": "a", "tool": "eights.governance.hitl.request",
+        "args": {"run_id": wf, "kind": "hydra_gate",
+                 "payload": {"workflow_id": wf, "gate_node": "approval"}},
+        "workflow_id": wf,
+        "spooled_at": "2026-06-05T00:00:00Z", "reason": "daemon down"}))
+    # SAME workflow, DIFFERENT gate — must survive (would be a real unresolved gate)
+    (spool / "a2.json").write_text(json.dumps({
+        "id": "a2", "tool": "eights.governance.hitl.request",
+        "args": {"run_id": wf, "kind": "hydra_gate",
+                 "payload": {"workflow_id": wf, "gate_node": "judge_synthesis"}},
+        "workflow_id": wf,
+        "spooled_at": "2026-06-05T00:00:00Z", "reason": "daemon down"}))
+    (spool / "b.json").write_text(json.dumps({
+        "id": "b", "tool": "eights.governance.hitl.request",
+        "args": {"run_id": "other-wf",
+                 "payload": {"workflow_id": "other-wf", "gate_node": "approval"}},
+        "workflow_id": "other-wf",
+        "spooled_at": "2026-06-05T00:00:00Z", "reason": "daemon down"}))
+    (spool / "c.json").write_text(json.dumps({
+        "id": "c", "tool": "eights.constitution.attest",
+        "args": {"run_id": wf}, "workflow_id": wf,
+        "spooled_at": "2026-06-05T00:00:00Z", "reason": "daemon down"}))
+
+    rc = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "reject"])
+    capsys.readouterr()
+    assert rc == 0
+
+    assert not (spool / "a.json").exists(), "the RESOLVED gate's entry must be pruned"
+    assert (spool / "a2.json").exists(), "a DIFFERENT gate in the same workflow must survive"
+    assert (spool / "b.json").exists(), "other workflows' entries must survive"
+    assert (spool / "c.json").exists(), "non-hitl payloads (attest) must survive"
+
+
+def test_hitl_request_always_carries_gate_node(monkeypatch):
+    """Completeness invariant for spool reconciliation (verdict_QLdpFA8Qdq):
+    EVERY hitl.request payload carries gate_node — even when the caller
+    passes none, the attestor floors it to 'unspecified'. Combined with the
+    same-node-execution version consistency of spool entry + pending_hitl,
+    the prune's keyed/unkeyed branches partition all spool entries exactly."""
+    from hydra_core.eights.attestation import EightsAttestor
+
+    captured: list[dict] = []
+
+    def fake_call(self, tool, payload):
+        captured.append({"tool": tool, "payload": payload})
+        return {"request_id": "hitl_x"}
+
+    monkeypatch.setattr(EightsAttestor, "_call", fake_call)
+    att = EightsAttestor.__new__(EightsAttestor)  # bypass dispatcher ctor
+
+    # With an explicit gate_node
+    att.hitl_request({"workflow_id": "wf-1", "reason": "high_risk"}, gate_node="approval")
+    # WITHOUT gate_node — the floor must kick in
+    att.hitl_request({"workflow_id": "wf-1", "reason": "high_risk"})
+
+    assert captured[0]["payload"]["payload"]["gate_node"] == "approval"
+    assert captured[1]["payload"]["payload"]["gate_node"] == "unspecified"
+    for c in captured:
+        assert "gate_node" in c["payload"]["payload"], "no unkeyed hitl.request can ever be spooled"
+
+
 # --- hydra_control validation ----------------------------------------------------
 
 def test_control_ping():
