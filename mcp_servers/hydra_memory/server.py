@@ -5,6 +5,7 @@ Tools:
   - hydra-mem.read_episodic        — resolve a key
   - hydra-mem.list_workflow        — list all episodic rows for a workflow_id
   - hydra-mem.semantic_search      — search a named semantic index by query
+  - hydra-mem.ping                 — no-arg liveness probe (AgentMesh healthProbe)
 
 Resources:
   - hydra://episodic/<workflow_id> — list of rows as JSON
@@ -116,6 +117,20 @@ def _tool_handlers() -> dict[str, callable]:
         )
         return {"key": args["key"], "cells": merged}
 
+    def ping(args: dict[str, Any]) -> dict[str, Any]:
+        # No-arg liveness probe for AgentMesh's mcp-tool-call healthProbe
+        # (campaign mesh-console-unification, C1). list_workflow requires a
+        # workflow_id so a generic prober cannot call it; ping is free of
+        # required args and touches the episodic DB path read-only to prove
+        # the server is actually wired to its storage, not just alive.
+        return {
+            "ok": True,
+            "server": "hydra_memory",
+            "episodic_db": str(EPISODIC_DB),
+            "episodic_db_exists": Path(EPISODIC_DB).exists(),
+            "ts": time.time(),
+        }
+
     return {
         "hydra-mem.write_episodic": write_episodic,
         "hydra-mem.read_episodic": read_episodic,
@@ -123,6 +138,7 @@ def _tool_handlers() -> dict[str, callable]:
         "hydra-mem.semantic_search": semantic_search,
         "hydra-mem.query_eights": query_eights,
         "hydra-mem.tag_memory": tag_memory,
+        "hydra-mem.ping": ping,
     }
 
 
@@ -203,6 +219,14 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "replace": {"type": "boolean", "default": False},
             },
             "required": ["key"],
+        },
+    },
+    "hydra-mem.ping": {
+        "description": ("No-arg liveness probe: returns ok + episodic DB path. "
+                        "Used by AgentMesh's mcp-tool-call healthProbe."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
 }

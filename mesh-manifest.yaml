@@ -26,9 +26,12 @@ runtime:
     HYDRA_MEM_FEDERATE_TIMEOUT: "8"
   healthProbe:
     type: mcp-tool-call
-    # hydra-mem.list_workflow: cheap read — list episodic rows for a fixed workflow_id.
-    # Source: Hydra/mcp_servers/hydra_memory/server.py — _tool_handlers()["hydra-mem.list_workflow"]
-    tool: "hydra-mem.list_workflow"
+    # hydra-mem.ping: no-arg liveness probe returning ok + episodic DB path.
+    # Amendment 2026-06-05 (campaign mesh-console-unification, C1): replaced
+    # hydra-mem.list_workflow, whose required workflow_id argument made it
+    # uncallable by a generic no-arg prober (probe always failed → degraded).
+    # Source: Hydra/mcp_servers/hydra_memory/server.py — _tool_handlers()["hydra-mem.ping"]
+    tool: "hydra-mem.ping"
     intervalMs: 20000
     timeoutMs: 8000
     failureThreshold: 3
@@ -47,6 +50,7 @@ mcp:
     - "hydra-mem.semantic_search"
     - "hydra-mem.query_eights"
     - "hydra-mem.tag_memory"
+    - "hydra-mem.ping"
 
 lifecycle:
   startTimeoutMs: 60000
