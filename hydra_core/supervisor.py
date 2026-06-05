@@ -11,6 +11,7 @@ squad-node per pack so the graph is self-describing.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -285,27 +286,55 @@ def build_supervisor(
         )
         state.requires_human_approval = high_risk or state.is_over_budget()
 
-        return {
+        out: dict = {
             "tasks": new_tasks,
             "envelopes": new_envelopes,
             "requires_human_approval": state.requires_human_approval,
             "phase": "approval" if state.requires_human_approval else "dispatch",
         }
 
+        if state.requires_human_approval:
+            # C2 (mesh-console-unification): the graph interrupts BEFORE the
+            # `approval` node, so the HITL request must be built and filed
+            # HERE (pre-interrupt) for the paused state to carry pending_hitl
+            # and for TheEights' hitl_queue to see the gate. Previously the
+            # request was only rendered inside node_approval — i.e. AFTER the
+            # operator had already resumed — so the approval gate was
+            # invisible to both /hydra:status state and the mesh HITL Center.
+            hitl = HITLRequest(
+                workflow_id=state.workflow_id,
+                origin_squad="hydra",
+                target_squad="human",
+                reason="high_risk",
+                summary=f"Approve dispatch of: {state.selected_squads} for goal: {state.root_goal}",
+                options=["approve", "reject", "modify-budget"],
+                default_option="reject",
+            )
+            hitl_dict = hitl.model_dump(mode="json")
+            hitl_dict["gate_node"] = "approval"  # C2: dedupe key half (workflow_id+gate_node)
+            # Required-with-spool: transport failures land in
+            # ~/.hydra/eights-pending/ and replay at the next node_intake.
+            eights.hitl_request(hitl_dict, gate_node="approval")
+            out["pending_hitl"] = hitl_dict
+
+        return out
+
     def node_approval(state: HydraState) -> dict:
-        # Render HITL request; LangGraph will `interrupt_before` and surface
-        # the request to the operator via `/hydra:status`.
-        hitl = HITLRequest(
-            workflow_id=state.workflow_id,
-            origin_squad="hydra",
-            target_squad="human",
-            reason="high_risk",
-            summary=f"Approve dispatch of: {state.selected_squads} for goal: {state.root_goal}",
-            options=["approve", "reject", "modify-budget"],
-            default_option="reject",
-        )
+        # Runs only AFTER the operator resumes past the interrupt — the gate
+        # itself is rendered+filed by node_planner (see above). This node is
+        # post-resume bookkeeping: clear the pending gate (idempotent with
+        # `hydra resume`, which also clears it before re-invoking).
+        #
+        # Clobber guard (Codex verdict_ZCsp2WBc3e item 2): only clear a gate
+        # this node owns. If pending_hitl carries a DIFFERENT gate_node (a
+        # foreign gate landed via replay/update_state between the operator's
+        # clear and this continuation), leave it untouched so the newer gate
+        # is never silently discarded.
+        cur = state.pending_hitl
+        if isinstance(cur, dict) and cur.get("gate_node") not in (None, "approval"):
+            return {"phase": "approval"}
         return {
-            "pending_hitl": hitl.model_dump(mode="json"),
+            "pending_hitl": None,
             "phase": "approval",
         }
 
@@ -522,7 +551,14 @@ def build_supervisor(
         if state.is_over_envelope_ceiling():
             state.phase = "surfaced"
             state.pending_hitl = {
+                "workflow_id": str(state.workflow_id),
                 "reason": "envelope_ceiling",
+                "gate_node": "dispatch",  # C2 dedupe key half
+                "summary": (
+                    f"Envelope ceiling hit: {len(state.envelopes)} envelopes "
+                    f"(ceiling {state.envelope_ceiling})"
+                ),
+                "options": ["split_phase", "abort"],
                 "remediation": (
                     "Split phase across multiple supervisor invocations "
                     "(planner phase_batch_index) or use parallel Agent() dispatch."
@@ -530,6 +566,8 @@ def build_supervisor(
                 "envelope_count": len(state.envelopes),
                 "envelope_ceiling": state.envelope_ceiling,
             }
+            # C2: file the ceiling gate into TheEights' hitl_queue too
+            eights.hitl_request(state.pending_hitl, gate_node="dispatch")
             emit_trace(
                 judge_trace_root,
                 state.workflow_id,
@@ -838,7 +876,8 @@ def build_supervisor(
                 default_option="reject",
             )
             hitl_dict = hitl.model_dump(mode="json")
-            eights.hitl_request(hitl_dict)
+            hitl_dict["gate_node"] = "judge_per_squad"  # C2 dedupe key half
+            eights.hitl_request(hitl_dict, gate_node="judge_per_squad")
             out["pending_hitl"] = hitl_dict
             out["phase"] = "surfaced"
             emit_trace(judge_trace_root, state.workflow_id, "judge.hitl_escalation", {
@@ -882,7 +921,8 @@ def build_supervisor(
                 default_option="accept_partial",
             )
             hitl_dict = hitl.model_dump(mode="json")
-            eights.hitl_request(hitl_dict)
+            hitl_dict["gate_node"] = "judge_per_squad"  # C2 dedupe key half
+            eights.hitl_request(hitl_dict, gate_node="judge_per_squad")
             out["pending_hitl"] = hitl_dict
             out["phase"] = "surfaced"
             emit_trace(judge_trace_root, state.workflow_id, "judge.reflexion_ceiling_hit", {
@@ -1078,7 +1118,8 @@ def build_supervisor(
                 default_option="reject",
             )
             hitl_dict = hitl.model_dump(mode="json")
-            eights.hitl_request(hitl_dict)
+            hitl_dict["gate_node"] = "judge_synthesis"  # C2 dedupe key half
+            eights.hitl_request(hitl_dict, gate_node="judge_synthesis")
             out["pending_hitl"] = hitl_dict
             out["phase"] = "surfaced"
             emit_trace(judge_trace_root, state.workflow_id, "judge.hitl_escalation", {
@@ -1195,7 +1236,11 @@ def build_supervisor(
     graph.add_edge("judge_synthesis", "postcheck")
     graph.add_conditional_edges("postcheck", after_postcheck, {END: END})
 
-    cp_path = checkpoint_path or (Path.home() / ".hydra" / "checkpoints.db")
+    # HYDRA_CHECKPOINT_DB override (C2): keeps the supervisor, the hydra_memory
+    # read tools, and `hydra resume` pointed at the same store — and lets tests
+    # run against a hermetic temp DB.
+    _env_cp = os.environ.get("HYDRA_CHECKPOINT_DB")
+    cp_path = checkpoint_path or (Path(_env_cp) if _env_cp else (Path.home() / ".hydra" / "checkpoints.db"))
     cp_path.parent.mkdir(parents=True, exist_ok=True)
     import sqlite3
     conn = sqlite3.connect(str(cp_path), check_same_thread=False)

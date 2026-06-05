@@ -51,6 +51,12 @@ mcp:
     - "hydra-mem.query_eights"
     - "hydra-mem.tag_memory"
     - "hydra-mem.ping"
+    # C2 (mesh-console-unification): read-only workflow/squad/HITL surface
+    # for the unified mesh console. checkpoints.db is opened mode=ro.
+    - "hydra-mem.workflows_list"
+    - "hydra-mem.workflow_status"
+    - "hydra-mem.squad_list"
+    - "hydra-mem.hitl_pending"
 
 lifecycle:
   startTimeoutMs: 60000

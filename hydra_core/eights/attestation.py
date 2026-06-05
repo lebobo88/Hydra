@@ -252,16 +252,30 @@ class EightsAttestor:
             "tokens": int(tokens),
         })
 
-    def hitl_request(self, hitl_envelope: dict) -> Optional[dict]:
+    def hitl_request(self, hitl_envelope: dict, *, gate_node: str = "") -> Optional[dict]:
         """Enqueue a HITL request to the shared ledger so the operator UI
-        can show pending requests across consumers."""
+        can show pending requests across consumers.
+
+        Campaign mesh-console-unification C2 (2026-06-05): emits the frozen
+        hydra_gate contract so AgentMesh can federate Hydra gates with the
+        TheEights hitl_queue and dedupe by workflow_id + gate_node:
+          run_id = workflow_id; kind = "hydra_gate"
+          payload = { hitl_id, workflow_id, reason, summary, options[],
+                      default_option, gate_node, expires_at }
+        """
+        wf = str(hitl_envelope.get("workflow_id", ""))
         return self._call("eights.governance.hitl.request", {
-            "run_id": str(hitl_envelope.get("workflow_id", "")),
-            "kind": hitl_envelope.get("reason", "operator_review"),
+            "run_id": wf,
+            "kind": "hydra_gate",
             "payload": {
-                "id": str(hitl_envelope.get("id", "")),
+                "hitl_id": str(hitl_envelope.get("id", "")),
+                "workflow_id": wf,
+                "reason": hitl_envelope.get("reason", "operator_review"),
                 "summary": hitl_envelope.get("summary"),
                 "options": list(hitl_envelope.get("options") or []),
+                "default_option": hitl_envelope.get("default_option"),
+                "gate_node": gate_node or "unspecified",
+                "expires_at": hitl_envelope.get("expires_at"),
             },
         })
 

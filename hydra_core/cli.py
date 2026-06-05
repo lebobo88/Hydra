@@ -7,7 +7,10 @@ Subcommands:
   hydra squads                       — list discovered squad packs (JSON)
   hydra run "<goal>" [--squad slug]  — start a workflow
   hydra status [<workflow_id>]       — list runs / show a run
-  hydra approve <workflow_id>        — resume an HITL-paused run
+  hydra approve <workflow_id>        — resume an HITL-paused run (= resume --action approve)
+  hydra resume <workflow_id> --action approve|reject|modify-budget|
+               force-dispatch|change-squads [--option …] [--live]
+                                     — resolve a pending HITL gate from checkpoint
   hydra trace <workflow_id>          — tail the JSONL trace
   hydra memory query <cell>          — query TheEights by cell
   hydra memory tag <key> --cells …   — attach cells to an episodic row
@@ -282,6 +285,239 @@ def _cmd_run(args) -> int:
     return 0
 
 
+_RESUME_LOCK_GRACE_S = 30        # min age before a dead-owner lock is reclaimed
+_RESUME_LOCK_HARD_CAP_S = 86_400  # PID-reuse safety valve: dead-or-alive, 24h max
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for a lock-owner PID (cross-platform)."""
+    if pid <= 0:
+        return False
+    import os as _os
+    if _os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:  # pragma: no cover — POSIX path, Windows-first deployment
+        _os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_resume_lock(project: Path, wf: str):
+    """Atomic claim-and-resume guard (Codex verdict_ZCsp2WBc3e item 1;
+    reclaim semantics hardened per verdict_uO18YVw9V4).
+
+    O_CREAT|O_EXCL is atomic on NTFS and POSIX — exactly one of two
+    near-simultaneous resumes wins the claim; the loser exits benignly with
+    reason=resume_in_progress instead of double-invoking the graph.
+
+    Reclaim policy — OWNER LIVENESS, never wall-clock for a live owner
+    (verdict_sTc2ZQgHHB): the lock file carries the owner PID.
+      - PID readable and ALIVE  → claim held, indefinitely. There is NO
+        wall-clock path that reclaims a live owner.
+      - PID readable and DEAD   → reclaim after a short grace (protects the
+        window between open and pid-write+fsync).
+      - PID UNREADABLE (corrupt/empty lock — liveness unverifiable) →
+        reclaim only after the 24h hard cap. The cap applies to THIS case
+        only: it bounds an unverifiable lock, never a live one.
+
+    Returns (fd, lock_path) on success, or (None, lock_path) when another
+    live resume holds the claim.
+    """
+    import os as _os
+    import time as _time
+    lock_dir = project / ".hydra" / wf
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "resume.lock"
+    for attempt in (0, 1):
+        try:
+            fd = _os.open(str(lock_path), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+            _os.write(fd, str(_os.getpid()).encode())
+            _os.fsync(fd)
+            return fd, lock_path
+        except FileExistsError:
+            if attempt == 1:
+                return None, lock_path
+            try:
+                age = _time.time() - lock_path.stat().st_mtime
+            except OSError:
+                age = 0.0
+            pid_readable = True
+            try:
+                owner_pid = int(lock_path.read_text().strip())
+            except (OSError, ValueError):
+                pid_readable = False
+                owner_pid = 0
+            if pid_readable:
+                # Liveness is the sole authority for readable locks.
+                reclaim = age >= _RESUME_LOCK_GRACE_S and not _pid_alive(owner_pid)
+            else:
+                # Liveness unverifiable — bounded by the hard cap only.
+                reclaim = age >= _RESUME_LOCK_HARD_CAP_S
+            if reclaim:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue  # one re-claim attempt via O_EXCL (still atomic)
+            return None, lock_path
+    return None, lock_path  # pragma: no cover — loop always returns
+
+
+def _release_resume_lock(fd, lock_path) -> None:
+    import os as _os
+    try:
+        _os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+def _cmd_resume(args) -> int:
+    """Resume an HITL-paused workflow from its checkpoint.
+
+    Campaign mesh-console-unification C2 (2026-06-05): replaces the old
+    `approve` stub. Clears `pending_hitl`, appends the resolution to
+    `hitl_history`, applies action-specific patches, then re-invokes the
+    compiled graph with the workflow's thread_id so LangGraph continues from
+    the interrupt. Idempotent: a workflow with no pending gate is a no-op
+    (exit 0) so a retried resume launch never double-applies. Concurrent
+    resumes are serialized by an atomic per-workflow lock file.
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+    action = args.action
+    option = getattr(args, "option", None)
+
+    # Atomic claim BEFORE reading gate state (claim-then-check): the loser of
+    # a concurrent double-resume must never observe the still-uncleared gate.
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({
+            "workflow_id": wf,
+            "resumed": False,
+            "reason": "resume_in_progress",
+            "lock": str(lock_path),
+        }))
+        return 0
+    try:
+        return _cmd_resume_locked(args, project, wf, action, option)
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int:
+
+    critique_client = None
+    if getattr(args, "live", False):
+        from .dispatcher import MCPStdioDispatcher
+        from .judge import MCPCritiqueClient
+        dispatcher = MCPStdioDispatcher(project, verbose=getattr(args, "verbose", False))
+        critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
+    else:
+        dispatcher = _NullDispatcher()
+
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(
+        project_root=project,
+        dispatcher=dispatcher,
+        critique_client=critique_client,
+    )
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "error": "langgraph unavailable — resume requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+
+    config = {"configurable": {"thread_id": wf}}
+    snap = sup.get_state(config)
+    if snap is None or not snap.values:
+        print(json.dumps({"workflow_id": wf, "error": "not_found"}))
+        return 1
+    values = snap.values
+    pending = values.get("pending_hitl")
+    if not pending:
+        print(json.dumps({
+            "workflow_id": wf,
+            "resumed": False,
+            "reason": "no_pending_gate",
+            "phase": values.get("phase"),
+        }))
+        return 0
+
+    from datetime import datetime, timezone
+    resolution = {
+        **(pending if isinstance(pending, dict) else {}),
+        "resolution": action,
+        "option": option,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    patch: dict = {"pending_hitl": None, "hitl_history": [resolution]}
+
+    if action == "change-squads":
+        if not option:
+            print(json.dumps({"error": "change-squads needs --option \"squad-a,squad-b\""}),
+                  file=sys.stderr)
+            return 1
+        patch["selected_squads"] = [s.strip() for s in option.split(",") if s.strip()]
+    if action == "modify-budget":
+        try:
+            budget = values.get("budget")
+            b = dict(budget) if isinstance(budget, dict) else (
+                budget.model_dump(mode="json") if hasattr(budget, "model_dump") else {})
+            b["budget_usd"] = float(option)
+            patch["budget"] = b
+        except (TypeError, ValueError):
+            print(json.dumps({"error": f"modify-budget needs a numeric --option, got {option!r}"}),
+                  file=sys.stderr)
+            return 1
+
+    sup.update_state(config, patch)
+    emit(project, wf, "hitl_resumed", {
+        "action": action,
+        "option": option,
+        "gate_node": resolution.get("gate_node"),
+    })
+
+    if action == "reject":
+        # A rejected gate does NOT continue the graph; the workflow stays
+        # parked as 'surfaced' with the resolution on record.
+        sup.update_state(config, {"phase": "surfaced"})
+        print(json.dumps({
+            "workflow_id": wf,
+            "resumed": False,
+            "action": "reject",
+            "phase": "surfaced",
+        }, indent=2))
+        return 0
+
+    final_dict = sup.invoke(None, config=config)
+    phase = final_dict.get("phase") if isinstance(final_dict, dict) else getattr(final_dict, "phase", "?")
+    print(json.dumps({
+        "workflow_id": wf,
+        "resumed": True,
+        "action": action,
+        "phase": phase,
+        "trace": str(trace_path(project, wf)),
+    }, indent=2))
+    return 0
+
+
 def _cmd_status(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     base = project / ".hydra"
@@ -550,7 +786,22 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("workflow_id", nargs="?")
     t = sub.add_parser("trace")
     t.add_argument("workflow_id")
-    sub.add_parser("approve").add_argument("workflow_id")
+    ap_approve = sub.add_parser("approve")
+    ap_approve.add_argument("workflow_id")
+    ap_approve.add_argument("--live", action="store_true",
+                            help="Continue with the live MCP dispatcher")
+    # C2 (mesh-console-unification): real HITL resume from checkpoint.
+    rs = sub.add_parser("resume")
+    rs.add_argument("workflow_id")
+    rs.add_argument("--action", required=True,
+                    choices=["approve", "reject", "modify-budget",
+                             "force-dispatch", "change-squads"])
+    rs.add_argument("--option", help=(
+        "Action argument: chosen option label, new budget USD for "
+        "modify-budget, or comma-separated squads for change-squads"))
+    rs.add_argument("--live", action="store_true",
+                    help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
+    rs.add_argument("--verbose", action="store_true")
 
     # gateway management
     sub.add_parser("gateway-backup")
@@ -586,7 +837,12 @@ def main(argv: list[str] | None = None) -> int:
         "run": _cmd_run,
         "status": _cmd_status,
         "trace": _cmd_trace,
-        "approve": lambda a: (print("approval pathway lives in the Claude Code plugin (/hydra:approve)"), 0)[1],
+        # C2: approve == resume --action approve (the old stub printed a
+        # plugin pointer and did nothing; resume is now first-class).
+        "approve": lambda a: _cmd_resume(argparse.Namespace(
+            project=a.project, workflow_id=a.workflow_id, action="approve",
+            option=None, live=getattr(a, "live", False), verbose=False)),
+        "resume": _cmd_resume,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,
         "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,

@@ -191,8 +191,15 @@ def test_run_smoke_with_stub_dispatcher(capsys):
 
 # --- approve ----------------------------------------------------------------
 
-def test_approve_points_at_claude_code(capsys):
+def test_approve_is_real_resume_now(capsys, tmp_path, monkeypatch):
+    # C2 (mesh-console-unification): `approve` is no longer a stub pointing at
+    # the Claude Code plugin — it delegates to `resume --action approve`.
+    # Unknown workflow → structured not_found + exit 1 (fail-closed),
+    # instead of the old print-and-exit-0.
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
     rc = _run(["approve", "fake-id"], project_root=REPO_ROOT)
     out = capsys.readouterr().out
-    assert rc == 0
-    assert "/hydra:approve" in out
+    assert rc == 1
+    payload = json.loads(out)
+    assert payload["error"] == "not_found"
+    assert payload["workflow_id"] == "fake-id"

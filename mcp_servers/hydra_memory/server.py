@@ -6,6 +6,10 @@ Tools:
   - hydra-mem.list_workflow        — list all episodic rows for a workflow_id
   - hydra-mem.semantic_search      — search a named semantic index by query
   - hydra-mem.ping                 — no-arg liveness probe (AgentMesh healthProbe)
+  - hydra-mem.workflows_list       — read-only: workflows from checkpoints.db
+  - hydra-mem.workflow_status      — read-only: one workflow's live state
+  - hydra-mem.squad_list           — read-only: discovered squad packs
+  - hydra-mem.hitl_pending         — read-only: pending HITL gates across workflows
 
 Resources:
   - hydra://episodic/<workflow_id> — list of rows as JSON
@@ -38,6 +42,85 @@ from hydra_core.memory import (  # noqa: E402
     resolve_episodic, search_episodic, tag_episodic,
 )
 from hydra_core.eights import ALL_CELLS  # noqa: E402
+
+
+# ---------- workflow status surface (campaign mesh-console-unification C2) ----
+#
+# Read-only views over the LangGraph checkpoint store so AgentMesh (and the
+# unified console behind it) can show workflows, squads, and pending HITL
+# gates WITHOUT touching the supervisor. The checkpoint DB is opened with
+# SQLite `mode=ro` — this server never writes workflow state. When langgraph
+# is not importable (bare-bootstrap mode) the tools degrade with an explicit
+# `degraded` flag rather than fabricating emptiness (Art V).
+
+_SCAN_CAP = 200  # max distinct workflows scanned per call
+
+
+def _checkpoints_db_path() -> Path:
+    p = os.environ.get("HYDRA_CHECKPOINT_DB")
+    return Path(p) if p else (Path.home() / ".hydra" / "checkpoints.db")
+
+
+def _open_checkpoints_ro():
+    import sqlite3
+    db = _checkpoints_db_path()
+    if not db.exists():
+        return None
+    return sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True,
+                           check_same_thread=False)
+
+
+def _checkpoint_thread_ids(conn, cap: int = _SCAN_CAP) -> list[str]:
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints LIMIT ?", (cap,)
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:  # noqa: BLE001 — schema absent / older langgraph layout
+        return []
+
+
+def _load_state_values(workflow_id: str) -> dict[str, Any] | None:
+    """Latest checkpoint channel_values for a workflow (read-only), or None."""
+    conn = _open_checkpoints_ro()
+    if conn is None:
+        return None
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        saver = SqliteSaver(conn)
+        tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
+        if tup is None:
+            return None
+        cp = tup.checkpoint or {}
+        return {"values": cp.get("channel_values") or {}, "ts": cp.get("ts")}
+    finally:
+        conn.close()
+
+
+def _summarize_workflow(workflow_id: str, values: dict[str, Any],
+                        ts: Any) -> dict[str, Any]:
+    budget = values.get("budget")
+    tasks = values.get("tasks") or []
+    return {
+        "workflow_id": str(workflow_id),
+        "phase": values.get("phase"),
+        "root_goal": (values.get("root_goal") or "")[:300],
+        "selected_squads": list(values.get("selected_squads") or []),
+        "budget": budget if isinstance(budget, dict) else (
+            budget.model_dump(mode="json") if hasattr(budget, "model_dump") else None),
+        "pending_hitl": values.get("pending_hitl"),
+        "tasks": [
+            {
+                "owner_squad": getattr(t, "owner_squad", None) or (t.get("owner_squad") if isinstance(t, dict) else None),
+                "status": getattr(t, "status", None) or (t.get("status") if isinstance(t, dict) else None),
+                "description": ((getattr(t, "description", None) or (t.get("description") if isinstance(t, dict) else "")) or "")[:200],
+            }
+            for t in tasks
+        ],
+        "envelope_count": len(values.get("envelopes") or []),
+        "verdict_count": len(values.get("verdicts") or []),
+        "updated_at": ts,
+    }
 
 
 def _tool_handlers() -> dict[str, callable]:
@@ -131,6 +214,129 @@ def _tool_handlers() -> dict[str, callable]:
             "ts": time.time(),
         }
 
+    def workflows_list(args: dict[str, Any]) -> dict[str, Any]:
+        limit = max(1, min(int(args.get("limit", 50)), _SCAN_CAP))
+        conn = _open_checkpoints_ro()
+        if conn is None:
+            return {"workflows": [], "count": 0, "degraded": True,
+                    "reason": "checkpoints_db_missing"}
+        try:
+            thread_ids = _checkpoint_thread_ids(conn)
+        finally:
+            conn.close()
+        out: list[dict[str, Any]] = []
+        degraded_reason = None
+        for wf in thread_ids:
+            try:
+                st = _load_state_values(wf)
+            except ImportError:
+                degraded_reason = "langgraph_unavailable"
+                break
+            except Exception as e:  # noqa: BLE001 — one bad row must not hide the rest
+                out.append({"workflow_id": wf, "phase": None,
+                            "error": str(e)[:120]})
+                continue
+            if st is None:
+                continue
+            v = st["values"]
+            out.append({
+                "workflow_id": wf,
+                "phase": v.get("phase"),
+                "root_goal": (v.get("root_goal") or "")[:160],
+                "selected_squads": list(v.get("selected_squads") or []),
+                "has_pending_hitl": bool(v.get("pending_hitl")),
+                "updated_at": st["ts"],
+            })
+        out.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+        result: dict[str, Any] = {"workflows": out[:limit], "count": len(out)}
+        if degraded_reason:
+            result["degraded"] = True
+            result["reason"] = degraded_reason
+        return result
+
+    def workflow_status(args: dict[str, Any]) -> dict[str, Any]:
+        wf = str(args["workflow_id"])
+        try:
+            st = _load_state_values(wf)
+        except ImportError:
+            return {"workflow_id": wf, "degraded": True,
+                    "reason": "langgraph_unavailable"}
+        if st is None:
+            return {"workflow_id": wf, "error": "not_found"}
+        return _summarize_workflow(wf, st["values"], st["ts"])
+
+    def squad_list(args: dict[str, Any]) -> dict[str, Any]:
+        from hydra_core.squad_loader import discover_squads
+        root = Path(os.environ.get("HYDRA_ROOT") or Path.cwd())
+        packs = discover_squads(root)
+        squads = []
+        for slug, p in packs.items():
+            squads.append({
+                "slug": slug,
+                "name": p.name,
+                "version": str(p.version),
+                "description": (p.description or "")[:300],
+                "entrypoint": p.entrypoint,
+                "industries": list(p.industries),
+                "accepts": list(p.accepts),
+                "emits": list(p.emits),
+                "best_of_n": p.best_of_n,
+                "deprecated_after": str(p.deprecated_after) if p.deprecated_after else None,
+                "agents": [
+                    {
+                        "slug": a.slug,
+                        "role": a.role,
+                        "authority": getattr(a, "authority", None),
+                        "model_tier": getattr(a, "model_tier", None),
+                        "hitl_trigger": getattr(a, "hitl_trigger", None),
+                    }
+                    for a in p.agents
+                ],
+                "gates": [
+                    {
+                        "rubric_id": g.rubric_id,
+                        "hitl_required": g.hitl_required,
+                        "when": getattr(g, "when", None),
+                    }
+                    for g in p.gates
+                ],
+            })
+        return {"squads": squads, "count": len(squads)}
+
+    def hitl_pending(args: dict[str, Any]) -> dict[str, Any]:
+        conn = _open_checkpoints_ro()
+        if conn is None:
+            return {"gates": [], "count": 0, "degraded": True,
+                    "reason": "checkpoints_db_missing"}
+        try:
+            thread_ids = _checkpoint_thread_ids(conn)
+        finally:
+            conn.close()
+        gates: list[dict[str, Any]] = []
+        for wf in thread_ids:
+            try:
+                st = _load_state_values(wf)
+            except ImportError:
+                return {"gates": [], "count": 0, "degraded": True,
+                        "reason": "langgraph_unavailable"}
+            except Exception:  # noqa: BLE001
+                continue
+            if st is None:
+                continue
+            v = st["values"]
+            hitl = v.get("pending_hitl")
+            if not hitl:
+                continue
+            gates.append({
+                "workflow_id": wf,
+                "phase": v.get("phase"),
+                "gate_node": (hitl.get("gate_node") if isinstance(hitl, dict) else None) or "unspecified",
+                "hitl": hitl,
+                "updated_at": st["ts"],
+            })
+        gates.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+        return {"gates": gates, "count": len(gates)}
+
     return {
         "hydra-mem.write_episodic": write_episodic,
         "hydra-mem.read_episodic": read_episodic,
@@ -139,6 +345,10 @@ def _tool_handlers() -> dict[str, callable]:
         "hydra-mem.query_eights": query_eights,
         "hydra-mem.tag_memory": tag_memory,
         "hydra-mem.ping": ping,
+        "hydra-mem.workflows_list": workflows_list,
+        "hydra-mem.workflow_status": workflow_status,
+        "hydra-mem.squad_list": squad_list,
+        "hydra-mem.hitl_pending": hitl_pending,
     }
 
 
@@ -224,6 +434,44 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "hydra-mem.ping": {
         "description": ("No-arg liveness probe: returns ok + episodic DB path. "
                         "Used by AgentMesh's mcp-tool-call healthProbe."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    "hydra-mem.workflows_list": {
+        "description": ("Read-only list of workflows from the LangGraph "
+                        "checkpoint store (phase, squads, pending-HITL flag), "
+                        "newest first."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                          "default": 50},
+            },
+        },
+    },
+    "hydra-mem.workflow_status": {
+        "description": ("Read-only live state of one workflow: phase, budget, "
+                        "tasks, pending_hitl, envelope/verdict counts."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+    },
+    "hydra-mem.squad_list": {
+        "description": ("Read-only discovered squad packs: roster, gates, "
+                        "accepts/emits envelope types, best_of_n."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    "hydra-mem.hitl_pending": {
+        "description": ("Read-only pending HITL gates across all workflows "
+                        "(workflow_id + gate_node + the HITL payload). The "
+                        "live-truth complement to TheEights' hitl_queue."),
         "inputSchema": {
             "type": "object",
             "properties": {},
