@@ -664,6 +664,12 @@ def _cmd_gateway_migrate_hooks(args) -> int:
     original = raw
 
     replacements = [
+        # Permission entries first: a bare "__*" tool wildcard is rejected by
+        # Claude Code's allow-rule validator, so map the installer-written
+        # "mcp__agentsmith__*" to a partial glob that names the scope it widens.
+        ("mcp__agentsmith__*", "mcp__hydra_gateway__agentsmith__agentsmith_*"),
+        # Repair pass: fix entries already migrated to the rejected bare-glob form.
+        ("mcp__hydra_gateway__agentsmith__*", "mcp__hydra_gateway__agentsmith__agentsmith_*"),
         ("mcp__pp_harness__", "mcp__hydra_gateway__pp_harness__"),
         ("mcp__pp_codex__", "mcp__hydra_gateway__pp_codex__"),
         ("mcp__pp_gemini__", "mcp__hydra_gateway__pp_gemini__"),
@@ -675,8 +681,11 @@ def _cmd_gateway_migrate_hooks(args) -> int:
     ]
     count = 0
     for old, new in replacements:
-        if old in raw and new not in raw:
-            occurrences = raw.count(old)
+        # Naturally idempotent: every migrated form starts with
+        # "mcp__hydra_gateway__", which never contains an un-migrated
+        # "mcp__<backend>__" substring, so no "already migrated" guard needed.
+        occurrences = raw.count(old)
+        if occurrences:
             raw = raw.replace(old, new)
             count += occurrences
             print(f"  {old} -> {new} ({occurrences} occurrences)")
