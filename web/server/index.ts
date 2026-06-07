@@ -54,11 +54,12 @@ import { writeFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { HydraMemClient } from './hydra-mem-client.js';
+import { HydraControlClient } from './hydra-control-client.js';
 import { allowTool, READ_HYDRA_TOOLS } from './whitelist.js';
 import { sessionToken, verifyToken } from './operator.js';
-import { launchWorkflow, LaunchValidationError } from './launch.js';
+import { launchWorkflow, LaunchValidationError, WORKFLOW_ID_RE } from './launch.js';
 import { mintNonce, consumeNonce } from './nonces.js';
-import { isWriteAllowed, needsNonce } from './write-whitelist.js';
+import { isWriteAllowed, needsNonce, needsTypedChallenge, isResumeAction, validateOption, OptionValidationError } from './write-whitelist.js';
 
 const HOST = '127.0.0.1'; // INVARIANT #3 — loopback only, NEVER 0.0.0.0
 const PREFERRED_PORT = Number(process.env['HYDRA_COCKPIT_BRIDGE_PORT'] ?? 8795);
@@ -115,7 +116,7 @@ async function choosePort(): Promise<number> {
 export { choosePort, PORT_FILE };
 
 // ---------------------------------------------------------------------------
-// hydra-mem client singleton
+// hydra-mem client singleton (read path)
 // ---------------------------------------------------------------------------
 
 const client = new HydraMemClient();
@@ -130,6 +131,24 @@ export function _setClientForTest(c: HydraMemClient | null): void {
 
 function getClient(): HydraMemClient {
   return _clientOverride ?? client;
+}
+
+// ---------------------------------------------------------------------------
+// hydra-control client singleton (write path — resume actions only)
+// ---------------------------------------------------------------------------
+
+const hydraControl = new HydraControlClient();
+
+// Allow injection of a fake hydra-control client for unit tests
+let _hydraControlOverride: HydraControlClient | null = null;
+
+/** For testing only — inject a mock hydra-control client. */
+export function _setHydraControlForTest(c: HydraControlClient | null): void {
+  _hydraControlOverride = c;
+}
+
+function getHydraControl(): HydraControlClient {
+  return _hydraControlOverride ?? hydraControl;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,8 +335,123 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
 
+    // --- POST /api/resume — gate writes: all 5 resume actions ---
+    if (path === '/api/resume') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch {
+        json(res, 400, { error: 'invalid request body', code: 'BAD_BODY' });
+        return;
+      }
+
+      const action = typeof body['action'] === 'string' ? body['action'] : '';
+
+      // (2) action must be in the write whitelist AND must be a resume action.
+      // Non-resume actions (launch, replay, tag_memory) are NOT routable here.
+      if (!isWriteAllowed(action) || !isResumeAction(action)) {
+        json(res, 400, {
+          error: `action '${action}' is not a valid gate-resume action`,
+          code: 'INVALID_ACTION',
+        });
+        return;
+      }
+
+      // (3) validate workflow_id — byte-identical regex to _WORKFLOW_ID_RE in hydra_control/server.py
+      const workflowId = typeof body['workflow_id'] === 'string' ? body['workflow_id'] : '';
+      if (!WORKFLOW_ID_RE.test(workflowId)) {
+        json(res, 400, {
+          error: 'workflow_id must match ^[A-Za-z0-9][A-Za-z0-9\\-_]{0,63}$',
+          code: 'INVALID_WORKFLOW_ID',
+        });
+        return;
+      }
+
+      // (4) validate option per action
+      let validatedOption: string | undefined;
+      try {
+        validatedOption = validateOption(action, body['option']);
+      } catch (e) {
+        if (e instanceof OptionValidationError) {
+          json(res, 400, { error: e.message, code: e.code });
+          return;
+        }
+        json(res, 400, { error: 'invalid option', code: 'OPTION_INVALID' });
+        return;
+      }
+
+      // (5) typed challenge — required if needsTypedChallenge(action)
+      if (needsTypedChallenge(action)) {
+        const presented = typeof body['typedChallenge'] === 'string' ? body['typedChallenge'] : '';
+        if (presented !== workflowId) {
+          json(res, 403, {
+            error: `action '${action}' requires typedChallenge === workflow_id`,
+            code: 'TYPED_CHALLENGE_REQUIRED',
+          });
+          return;
+        }
+      }
+
+      // (6) nonce — required if needsNonce(action)
+      if (needsNonce(action)) {
+        const presentedNonce = typeof body['confirmNonce'] === 'string' ? body['confirmNonce'] : undefined;
+        if (!consumeNonce(presentedNonce, action)) {
+          json(res, 403, {
+            error: `action '${action}' requires a server-issued confirm nonce (POST /api/confirm/preview first)`,
+            code: 'NONCE_REQUIRED',
+          });
+          return;
+        }
+      }
+
+      // (7) TODO(C5): file an eights envelope here before dispatching. // ANTI-PATTERN-OK: C5 scope per COCKPIT-DESIGN.md §5.2
+      // cockpitEnvelope() provides actor='hydra-cockpit', project='Hydra'.
+      // Leave hook: await fileEightsEnvelope(cockpitEnvelope(), action, { workflow_id: workflowId, option: validatedOption });
+
+      // (8) call hydra_control.resume and return the result
+      let resumeResult: Awaited<ReturnType<typeof hydraControl.resume>>;
+      try {
+        resumeResult = await getHydraControl().resume(workflowId, action, validatedOption);
+      } catch (e) {
+        // Child connectivity error — do not leak raw internals
+        process.stderr.write(`[cockpit-bridge] resume upstream error: ${String(e)}\n`);
+        json(res, 502, { error: 'bridge upstream error', code: 'UPSTREAM' });
+        return;
+      }
+
+      // Map hydra_control refusal/venom-block to a clean non-leaking envelope.
+      // ok:false from the Python side is a governed refusal (e.g. venom gate),
+      // NOT a bridge error. Surface it as 409/403 with a code, no raw internals.
+      if (!resumeResult.ok) {
+        const errorCode = resumeResult.error ?? 'RESUME_REFUSED';
+        // Map known hydra_control error tokens to HTTP status codes
+        const status = errorCode === 'invalid_workflow_id' ? 400
+          : errorCode === 'invalid_action' ? 400
+          : errorCode === 'invalid_option' ? 400
+          : errorCode === 'venom_blocked' ? 403
+          : 409; // Conflict — gate already resolved, venom refused, etc.
+        json(res, status, {
+          error: 'resume refused by hydra_control',
+          code: 'RESUME_REFUSED',
+          // Surface the governed refusal reason without raw traceback/internals
+          reason: errorCode,
+        });
+        return;
+      }
+
+      // Success: return the hydra_control result envelope (200 or 202)
+      json(res, 202, {
+        ok: resumeResult.ok,
+        launched: resumeResult.launched,
+        pid: resumeResult.pid,
+        workflow_id: resumeResult.workflow_id,
+        action: resumeResult.action,
+        log: resumeResult.log,
+      });
+      return;
+    }
+
     // All other POST routes: 404.
-    // C3 will add: /api/resume (gate writes — approve/reject/modify-budget/force-dispatch/change-squads)
     // C6 will add: /api/replay, /api/tag_memory
     json(res, 404, { error: 'not found' });
     return;
@@ -334,21 +468,39 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // Route table — read-only GET routes
     // -----------------------------------------------------------------------
 
-    // GET /api/health — bridge liveness + hydra-mem.ping child liveness
+    // GET /api/health — bridge liveness + both child liveness probes
     if (path === '/api/health') {
-      let childOk = false;
-      let pingDetail: unknown = null;
+      // Probe child 1: hydra-mem (read path)
+      let child1Ok = false;
+      let ping1Detail: unknown = null;
       try {
-        pingDetail = await readTool('hydra-mem.ping');
-        childOk = true;
+        ping1Detail = await readTool('hydra-mem.ping');
+        child1Ok = true;
       } catch {
         // child not reachable — degrade gracefully; still return 200 for bridge health
       }
+
+      // Probe child 2: hydra-control (write path)
+      let child2Ok = false;
+      let ping2Detail: unknown = null;
+      try {
+        ping2Detail = await getHydraControl().ping();
+        child2Ok = true;
+      } catch {
+        // child not reachable — degrade gracefully; still return 200 for bridge health
+      }
+
       json(res, 200, {
         ok: true,
         bridge: 'hydra-cockpit',
         readTools: READ_HYDRA_TOOLS,
-        child: { ok: childOk, ping: pingDetail },
+        // Legacy shape (child) kept for backwards compatibility with any C1 consumers
+        child: { ok: child1Ok, ping: ping1Detail },
+        // Extended shape: named children for clarity
+        children: {
+          'hydra-mem': { ok: child1Ok, ping: ping1Detail },
+          'hydra-control': { ok: child2Ok, ping: ping2Detail },
+        },
       });
       return;
     }
@@ -464,6 +616,7 @@ const shutdown = (): void => {
   removePortFile();
   server.close();
   void client.close();
+  void hydraControl.close();
   process.exit(0);
 };
 

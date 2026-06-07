@@ -13,6 +13,16 @@
  *     require a confirm nonce (though Med may add one in a later chunk).
  *   - needsTypedChallenge(action) — true for High writes with a typed-challenge
  *     requirement (modify-budget) and unconditionally for force-dispatch.
+ *   - isResumeAction(action) — true iff the action is one of the 5 gate-resume
+ *     actions routed through hydra_control. Non-resume writes (launch, replay,
+ *     tag_memory) are NOT routable via /api/resume.
+ *   - validateOption(action, option) — validates the option field per-action.
+ *     modify-budget: requires a numeric USD value (positive finite number string).
+ *     change-squads: requires a comma-separated slug list.
+ *     approve/reject/force-dispatch: option must be absent or empty.
+ *     The option alphabet is BYTE-IDENTICAL to _OPTION_RE in hydra_control/server.py:
+ *       /^[A-Za-z0-9 ,._\-]{0,200}$/
+ *     This prevents the bridge from accepting an option the Python side would reject.
  *
  * Transport column is informational; actual dispatch lives in the route handlers.
  *
@@ -160,4 +170,167 @@ export function getWriteEntry(action: string): WriteEntry | undefined {
  */
 export function getWriteWhitelist(): readonly WriteEntry[] {
   return WRITE_WHITELIST;
+}
+
+// ---------------------------------------------------------------------------
+// Resume-action set — the 5 actions routed through hydra_control
+// ---------------------------------------------------------------------------
+
+/**
+ * The 5 gate-resume actions that route through hydra_control.resume.
+ * BYTE-IDENTICAL to _RESUME_ACTIONS in hydra_control/server.py.
+ * Non-resume actions (launch, replay, tag_memory) must NOT be routed to /api/resume.
+ */
+export const RESUME_ACTIONS = Object.freeze([
+  'approve',
+  'reject',
+  'modify-budget',
+  'force-dispatch',
+  'change-squads',
+] as const);
+
+export type ResumeAction = (typeof RESUME_ACTIONS)[number];
+
+const RESUME_SET: ReadonlySet<string> = new Set(RESUME_ACTIONS);
+
+/**
+ * Returns true iff `action` is one of the 5 gate-resume actions
+ * that route through the hydra_control child (hydra.workflow.resume).
+ * Returns false for launch, replay, tag_memory, and all unknown actions.
+ */
+export function isResumeAction(action: string): action is ResumeAction {
+  return RESUME_SET.has(action);
+}
+
+// ---------------------------------------------------------------------------
+// Option validation — BYTE-IDENTICAL to hydra_control/server.py _OPTION_RE
+// ---------------------------------------------------------------------------
+
+/**
+ * Validation alphabets byte-identical to hydra_control/server.py.
+ *
+ *   _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
+ *
+ * Keeping these identical prevents the bridge from accepting a value the
+ * Python side would reject (or vice-versa). Do not broaden the alphabet
+ * without a matching change in hydra_control/server.py.
+ */
+export const OPTION_RE = /^[A-Za-z0-9 ,._\-]{0,200}$/;
+
+/**
+ * Error thrown when option validation fails.
+ * Carries a `code` field for structured error responses.
+ */
+export class OptionValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+  ) {
+    super(message);
+    this.name = 'OptionValidationError';
+  }
+}
+
+/**
+ * Validate the `option` field for a resume action.
+ *
+ * Per-action rules (mirror hydra_control semantics + COCKPIT-DESIGN.md §2.5):
+ *   approve          — option must be absent or empty (no option accepted)
+ *   reject           — option must be absent or empty
+ *   force-dispatch   — option must be absent or empty
+ *   modify-budget    — option REQUIRED; must be a positive finite number string
+ *                      (e.g. "80", "120.50") — budget in USD
+ *   change-squads    — option REQUIRED; must be a non-empty comma-separated
+ *                      list of squad slugs (lowercase alphanumeric + hyphen)
+ *
+ * All accepted option strings must also match OPTION_RE (the Python-side alphabet).
+ *
+ * Throws OptionValidationError on failure.
+ * Returns the trimmed option string (or undefined for actions that take no option).
+ */
+export function validateOption(action: string, option: unknown): string | undefined {
+  const optStr = option !== undefined && option !== null && option !== ''
+    ? String(option).trim()
+    : undefined;
+
+  switch (action) {
+    case 'approve':
+    case 'reject':
+    case 'force-dispatch': {
+      // No option accepted for these actions
+      if (optStr !== undefined && optStr !== '') {
+        throw new OptionValidationError(
+          `action '${action}' does not accept an option argument`,
+          'OPTION_NOT_ACCEPTED',
+        );
+      }
+      return undefined;
+    }
+
+    case 'modify-budget': {
+      if (optStr === undefined || optStr === '') {
+        throw new OptionValidationError(
+          'modify-budget requires an option: the new budget in USD (e.g. "120")',
+          'OPTION_REQUIRED',
+        );
+      }
+      // Must match the shared alphabet first
+      if (!OPTION_RE.test(optStr)) {
+        throw new OptionValidationError(
+          'modify-budget option contains invalid characters',
+          'OPTION_INVALID',
+        );
+      }
+      // Must be a positive finite number
+      const n = Number(optStr);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new OptionValidationError(
+          'modify-budget option must be a positive finite number (USD amount)',
+          'OPTION_INVALID',
+        );
+      }
+      return optStr;
+    }
+
+    case 'change-squads': {
+      if (optStr === undefined || optStr === '') {
+        throw new OptionValidationError(
+          'change-squads requires an option: a comma-separated list of squad slugs',
+          'OPTION_REQUIRED',
+        );
+      }
+      // Must match the shared alphabet first
+      if (!OPTION_RE.test(optStr)) {
+        throw new OptionValidationError(
+          'change-squads option contains invalid characters',
+          'OPTION_INVALID',
+        );
+      }
+      // Each slug must be a lowercase alphanumeric + hyphen sequence
+      const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+      const slugs = optStr.split(',').map((s) => s.trim()).filter(Boolean);
+      if (slugs.length === 0) {
+        throw new OptionValidationError(
+          'change-squads option must contain at least one squad slug',
+          'OPTION_INVALID',
+        );
+      }
+      for (const slug of slugs) {
+        if (!SLUG_RE.test(slug)) {
+          throw new OptionValidationError(
+            `change-squads slug ${JSON.stringify(slug)} is invalid — must match [a-z0-9][a-z0-9-]{0,63}`,
+            'OPTION_INVALID',
+          );
+        }
+      }
+      return optStr;
+    }
+
+    default:
+      // Unknown action — fail closed
+      throw new OptionValidationError(
+        `unknown action '${action}' for option validation`,
+        'UNKNOWN_ACTION',
+      );
+  }
 }
