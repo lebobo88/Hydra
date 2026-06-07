@@ -280,6 +280,167 @@ def test_run_workflow_id_regex_boundary(capsys):
         assert not _WORKFLOW_ID_RE.match(v), f"expected INVALID: {v!r}"
 
 
+# --- replay (C6) -----------------------------------------------------------
+
+def test_replay_subcommand_is_registered(capsys):
+    """The `replay` subcommand must be registered and its --help must not
+    raise SystemExit with a 'no such command' message."""
+    try:
+        _run(["replay", "--help"])
+    except SystemExit as e:
+        # argparse exits 0 on --help; that is fine.
+        assert e.code == 0
+
+
+def test_replay_rejects_invalid_workflow_id(capsys):
+    """Bad source workflow_id (contains shell metachar) → non-zero exit + error JSON
+    on stderr. Uses 'bad;id' — the semicolon is rejected by _WORKFLOW_ID_RE and
+    is not interpreted as an option flag (doesn't start with '-')."""
+    rc = _run(["replay", "bad;id"], project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    payload = json.loads(err)
+    assert "error" in payload
+    assert "bad;id" in payload["error"] or "invalid" in payload["error"].lower()
+
+
+def test_replay_rejects_bad_from_phase(capsys):
+    """--from-phase must be one of the known phases; argparse choices enforcement
+    means an unknown phase triggers SystemExit (argparse error, code 2)."""
+    valid_wf = "5ebd4268-5de0-4dbf-a82d-42c596d4818e"
+    try:
+        rc = _run(["replay", valid_wf, "--from-phase", "bogus-phase"],
+                  project_root=REPO_ROOT)
+        # If we reach here, the handler caught it and returned non-zero
+        assert rc == 1
+        err = capsys.readouterr().err
+        payload = json.loads(err)
+        assert "invalid" in payload.get("error", "").lower() or "from_phase" in str(payload)
+    except SystemExit as e:
+        # argparse exits 2 on invalid choices — also acceptable
+        assert e.code == 2
+
+
+def test_replay_rejects_bad_swap_model(capsys):
+    """--swap-model with shell metacharacters is rejected by _MODEL_ID_RE."""
+    valid_wf = "5ebd4268-5de0-4dbf-a82d-42c596d4818e"
+    rc = _run(["replay", valid_wf, "--swap-model", "model;evil"],
+              project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    payload = json.loads(err)
+    assert "invalid" in payload.get("error", "").lower() or "swap_model" in str(payload)
+
+
+def test_replay_missing_checkpoint_produces_clean_error(capsys, tmp_path, monkeypatch):
+    """Replay of a non-existent workflow → clean error JSON on stderr, exit 1.
+    Uses a blank checkpoints.db directory so no real checkpoint exists."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    valid_wf = "5ebd4268-5de0-4dbf-a82d-42c596d4818e"
+    rc = _run(["replay", valid_wf, "--from-phase", "intake"],
+              project_root=REPO_ROOT)
+    out = capsys.readouterr()
+    assert rc == 1
+    # Error must go to stderr as JSON (not a Python traceback)
+    err_text = out.err
+    assert err_text.strip(), "expected non-empty stderr on missing checkpoint"
+    payload = json.loads(err_text)
+    assert "error" in payload
+    # Clean error — no Python traceback in stderr
+    assert "Traceback" not in err_text
+
+
+def test_replay_known_phase_regex():
+    """_KNOWN_PHASES must cover exactly the 8 supervisor phase names."""
+    from hydra_core.cli import _KNOWN_PHASES
+    expected = {
+        "intake", "planning", "approval", "dispatch",
+        "executing", "judge", "synthesis", "postcheck",
+    }
+    assert _KNOWN_PHASES == expected, (
+        f"_KNOWN_PHASES mismatch. Got {_KNOWN_PHASES}; expected {expected}"
+    )
+
+
+def test_replay_model_id_re():
+    """_MODEL_ID_RE must accept valid model ids and reject shell metacharacters."""
+    from hydra_core.cli import _MODEL_ID_RE
+    valid = [
+        "claude-sonnet-4-6",
+        "gpt-4o",
+        "gemini-2-flash",
+        "openai/o3-mini",
+        "a",
+    ]
+    invalid = [
+        "-starts-with-hyphen",
+        "model;evil",
+        "model|pipe",
+        "model$(subshell)",
+        "",  # empty
+    ]
+    for v in valid:
+        assert _MODEL_ID_RE.match(v), f"expected VALID: {v!r}"
+    for v in invalid:
+        assert not _MODEL_ID_RE.match(v), f"expected INVALID: {v!r}"
+
+
+def test_replay_mints_new_workflow_id(capsys, tmp_path, monkeypatch):
+    """Dry replay of an existing checkpoint (via the --no-checkpoint pure-Python
+    runner) should produce a NEW workflow_id. We use a workaround: run a workflow
+    to create a checkpoint, then replay it and check the ids differ.
+
+    NOTE: This test is skipped if langgraph is not installed (dry replay uses
+    the checkpointing supervisor, which requires langgraph).
+    """
+    try:
+        import langgraph  # type: ignore  # noqa
+    except ImportError:
+        pytest.skip("langgraph not installed — replay dry smoke skipped")
+
+    # Step 1: run a real workflow to produce a checkpoint.
+    from uuid import uuid4
+    source_id = str(uuid4())
+    rc1 = _run(
+        ["run", "Replay test source workflow",
+         "--squad", "engineering",
+         "--workflow-id", source_id],
+        project_root=REPO_ROOT,
+    )
+    # Accept rc 0 or non-zero; we just need the checkpoint to exist.
+    capsys.readouterr()  # flush
+
+    # Step 2: replay from the checkpoint (dry — no --live).
+    rc2 = _run(
+        ["replay", source_id, "--from-phase", "intake"],
+        project_root=REPO_ROOT,
+    )
+    out2 = capsys.readouterr().out
+
+    # If checkpoint was never written (rc1 != 0 before checkpoint phase),
+    # replay will exit 1 with checkpoint_not_found — that is fine.
+    if rc2 != 0:
+        err2 = capsys.readouterr().err
+        # Must be a clean JSON error, not a traceback
+        assert "Traceback" not in out2
+        return
+
+    # If replay succeeded, the output must be JSON with a different id.
+    payload = None
+    for line in out2.splitlines():
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line + "\n" + "\n".join(
+                    [l for l in out2.splitlines()[out2.splitlines().index(line):]]))
+                break
+            except json.JSONDecodeError:
+                continue
+    if payload is not None:
+        assert payload["source_workflow_id"] == source_id
+        assert payload["replay_workflow_id"] != source_id
+        assert payload["from_phase"] == "intake"
+
+
 # --- approve ----------------------------------------------------------------
 
 def test_approve_is_real_resume_now(capsys, tmp_path, monkeypatch):

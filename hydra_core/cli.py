@@ -12,6 +12,11 @@ Subcommands:
                force-dispatch|change-squads [--option …] [--live]
                                      — resolve a pending HITL gate from checkpoint
   hydra trace <workflow_id>          — tail the JSONL trace
+  hydra replay <workflow_id>         — replay a workflow from a LangGraph checkpoint
+               [--from-phase <phase>]  (default: intake)
+               [--swap-model <id>]     (optional: test a different model)
+               [--live]               (default: dry reconstruct, no spend)
+                                     — mints a NEW workflow_id for the replay run
   hydra memory query <cell>          — query TheEights by cell
   hydra memory tag <key> --cells …   — attach cells to an episodic row
 """
@@ -648,6 +653,190 @@ def _cmd_trace(args) -> int:
 
 # ---------- gateway management ----------
 
+# ---------------------------------------------------------------------------
+# Replay subcommand constants  (C6)
+# ---------------------------------------------------------------------------
+
+# The canonical phase order — mirrors supervisor.py interrupt_before boundaries.
+# Used both for --from-phase validation and for graph re-entry position.
+_KNOWN_PHASES = frozenset([
+    "intake", "planning", "approval", "dispatch",
+    "executing", "judge", "synthesis", "postcheck",
+])
+
+# Model-id charset: alphanumeric plus hyphen, dot, underscore, slash, colon.
+# Covers ids like "claude-sonnet-4-6", "gpt-4o", "gemini-2-flash", "openai/o3".
+# Max 128 chars so no argv token can be unreasonably long.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_./:]{0,127}$")
+
+
+def _cmd_replay(args) -> int:
+    """Replay a past workflow from its LangGraph checkpoint.
+
+    C6 (Hydra Cockpit): adds a deterministic CLI surface for replay so the
+    Cockpit bridge can launch it as a fixed-argv detached subprocess.
+
+    Behaviour
+    ---------
+    * Loads the LangGraph checkpoint for <source_workflow_id> (keyed by
+      thread_id=workflow_id in SqliteSaver at ~/.hydra/checkpoints.db).
+    * Reconstructs the graph from --from-phase (default: intake) — the graph
+      is re-invoked with the state snapshot at that phase boundary.
+    * Mints a NEW workflow_id for the replay run (original is untouched).
+    * Emits a replay_start trace event and a workflow_start for the new id.
+    * --swap-model: string; stored in replay_state.swap_model and surfaced in
+      the trace for regression / cost-study use. The supervisor honours it when
+      building the dispatcher if an MCPStdioDispatcher override is present.
+    * --live: uses the live MCP dispatcher (real spend). Without --live the
+      NullDispatcher is used (dry reconstruct, no spend). The Cockpit bridge
+      is venom-gated when --live is requested.
+    * The new workflow_id is printed to stdout as JSON so the bridge can
+      capture it from the log header line (fire-and-attach).
+
+    Idempotency: a replay always produces a distinct new lineage; the source
+    checkpoint is read-only and never mutated.
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    source_wf = str(args.workflow_id)
+
+    # Validate source workflow_id
+    if not _WORKFLOW_ID_RE.match(source_wf):
+        print(json.dumps({
+            "error": f"invalid workflow_id {source_wf!r}",
+            "detail": "must match ^[A-Za-z0-9][A-Za-z0-9\\-_]{{0,63}}$",
+        }), file=sys.stderr)
+        return 1
+
+    from_phase = getattr(args, "from_phase", None) or "intake"
+    # Validate --from-phase against known phases
+    if from_phase not in _KNOWN_PHASES:
+        print(json.dumps({
+            "error": f"invalid --from-phase {from_phase!r}",
+            "valid": sorted(_KNOWN_PHASES),
+        }), file=sys.stderr)
+        return 1
+
+    swap_model = getattr(args, "swap_model", None)
+    if swap_model is not None and not _MODEL_ID_RE.match(swap_model):
+        print(json.dumps({
+            "error": f"invalid --swap-model {swap_model!r}",
+            "detail": "must match ^[A-Za-z0-9][A-Za-z0-9\\-_./:]{{0,127}}$",
+        }), file=sys.stderr)
+        return 1
+
+    live = getattr(args, "live", False)
+
+    # Mint a NEW workflow_id for the replay lineage
+    replay_wf = uuid4()
+
+    # Build dispatcher
+    critique_client = None
+    if live:
+        from .dispatcher import MCPStdioDispatcher
+        from .judge import MCPCritiqueClient
+        dispatcher = MCPStdioDispatcher(project, verbose=getattr(args, "verbose", False))
+        critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
+    else:
+        dispatcher = _NullDispatcher()
+
+    # Lazy import (same as _cmd_run)
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(
+        project_root=project,
+        dispatcher=dispatcher,
+        critique_client=critique_client,
+    )
+
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "error": "langgraph unavailable — replay requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+
+    # Load source checkpoint
+    source_config = {"configurable": {"thread_id": source_wf}}
+    snap = sup.get_state(source_config)
+    if snap is None or not snap.values:
+        print(json.dumps({
+            "source_workflow_id": source_wf,
+            "error": "checkpoint_not_found",
+            "detail": f"No checkpoint for workflow_id={source_wf!r}. "
+                      "Run `hydra status` to list known workflows.",
+        }), file=sys.stderr)
+        return 1
+
+    # Reconstruct state at the requested phase boundary
+    values: dict = dict(snap.values)
+    current_phase = values.get("phase", "intake")
+
+    # Reset state to the from_phase starting point:
+    # keep the root_goal, selected_squads, budget; clear runtime artifacts.
+    replay_initial = HydraState(
+        workflow_id=replay_wf,
+        root_goal=values.get("root_goal", ""),
+        phase=from_phase,
+        selected_squads=values.get("selected_squads", []),
+    )
+    # Copy budget snapshot if present
+    budget = values.get("budget")
+    if budget is not None:
+        if isinstance(budget, dict):
+            try:
+                from .state import BudgetLedger
+                replay_initial.budget = BudgetLedger.model_validate(budget)
+            except Exception:
+                pass  # non-fatal: replay proceeds with default budget
+        else:
+            replay_initial.budget = budget
+
+    # Record the replay provenance in the trace (source id, phase, swap_model)
+    emit(project, replay_wf, "replay_start", {
+        "source_workflow_id": source_wf,
+        "source_phase": current_phase,
+        "from_phase": from_phase,
+        "swap_model": swap_model,
+        "live": live,
+    })
+    emit(project, replay_wf, "workflow_start", {
+        "goal": replay_initial.root_goal,
+        "replay": True,
+        "source_workflow_id": source_wf,
+    })
+
+    # Invoke the graph with the new thread_id
+    replay_config = {"configurable": {"thread_id": str(replay_wf)}}
+
+    # If swap_model is requested, stash it in the environment so any
+    # model-selection logic in the supervisor/judge can honour it.
+    # We don't mutate the dispatcher here (that's a deeper extension);
+    # we document it in the trace and expose it for callers that check
+    # the state snapshot.
+    import os as _os
+    if swap_model:
+        _os.environ["HYDRA_REPLAY_MODEL"] = swap_model
+
+    final_dict = sup.invoke(
+        replay_initial,
+        config=replay_config,
+    )
+    phase = (
+        final_dict.get("phase")
+        if isinstance(final_dict, dict)
+        else getattr(final_dict, "phase", "?")
+    )
+
+    print(json.dumps({
+        "source_workflow_id": source_wf,
+        "replay_workflow_id": str(replay_wf),
+        "from_phase": from_phase,
+        "swap_model": swap_model,
+        "live": live,
+        "phase": phase,
+        "trace": str(trace_path(project, replay_wf)),
+    }, indent=2))
+    return 0
+
+
 def _cmd_gateway_backup(args) -> int:
     """Back up ~/.claude.json and ~/.claude/settings.json before gateway migration."""
     import shutil
@@ -924,6 +1113,37 @@ def main(argv: list[str] | None = None) -> int:
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
     rs.add_argument("--verbose", action="store_true")
 
+    # C6: replay subcommand
+    rp = sub.add_parser("replay", help="Replay a workflow from a LangGraph checkpoint")
+    rp.add_argument("workflow_id", help="Source workflow id to replay from")
+    rp.add_argument(
+        "--from-phase",
+        dest="from_phase",
+        default="intake",
+        choices=sorted(_KNOWN_PHASES),
+        help="Phase to restart from (default: intake)",
+    )
+    rp.add_argument(
+        "--swap-model",
+        dest="swap_model",
+        default=None,
+        metavar="MODEL_ID",
+        help=(
+            "Model id to use instead of the original (e.g. 'claude-sonnet-4-6'). "
+            "Must match [A-Za-z0-9][A-Za-z0-9\\-_./:]{{0,127}}."
+        ),
+    )
+    rp.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Use the live MCP dispatcher (real spend). "
+            "Without --live the run is a dry reconstruct (NullDispatcher). "
+            "The Cockpit bridge venom-gates --live replay."
+        ),
+    )
+    rp.add_argument("--verbose", action="store_true")
+
     # gateway management
     sub.add_parser("gateway-backup")
     sub.add_parser("gateway-export-backends")
@@ -964,6 +1184,7 @@ def main(argv: list[str] | None = None) -> int:
             project=a.project, workflow_id=a.workflow_id, action="approve",
             option=None, live=getattr(a, "live", False), verbose=False)),
         "resume": _cmd_resume,
+        "replay": _cmd_replay,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,
         "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,

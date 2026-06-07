@@ -61,6 +61,40 @@ import { launchWorkflow, LaunchValidationError, WORKFLOW_ID_RE } from './launch.
 import { mintNonce, consumeNonce } from './nonces.js';
 import { isWriteAllowed, needsNonce, needsTypedChallenge, isResumeAction, validateOption, OptionValidationError } from './write-whitelist.js';
 import { streamWorkflow, pollWorkflow, type GetWorkflowStatus } from './sse.js';
+import { launchReplay, ReplayValidationError, _setReplaySpawnerForTest } from './replay.js';
+import type { SpawnFn } from './launch.js';
+
+// ---------------------------------------------------------------------------
+// Replay spawner injection for tests (mirrors launch.ts pattern)
+// ---------------------------------------------------------------------------
+
+/** For testing only — inject a fake replay spawner. */
+export function _setReplaySpawnerForTestBridge(fn: SpawnFn | null): void {
+  _setReplaySpawnerForTest(fn);
+}
+
+// ---------------------------------------------------------------------------
+// tag_memory write: sanctioned direct call to hydra-mem (bypasses read whitelist)
+// ---------------------------------------------------------------------------
+
+/**
+ * TAG_MEMORY_BAGUA_KEYS — the 8 valid cell keys.
+ * Mirrors the episodic cell enum in hydra_core/eights/__init__.py.
+ * Validation here is belt-and-braces; the Python MCP tool validates again.
+ */
+const TAG_MEMORY_BAGUA_KEYS = Object.freeze([
+  'qian', 'kun', 'zhen', 'xun', 'kan', 'li', 'gen', 'dui',
+] as const);
+
+type BaguaKey = (typeof TAG_MEMORY_BAGUA_KEYS)[number];
+
+const BAGUA_SET: ReadonlySet<string> = new Set(TAG_MEMORY_BAGUA_KEYS);
+
+/**
+ * TAG_MEMORY_KEY_RE — key charset: alphanumeric, hyphen, underscore, dot.
+ * Reasonable identifier charset; rejects shell metacharacters.
+ */
+const TAG_MEMORY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9\-_.]{0,199}$/;
 
 const HOST = '127.0.0.1'; // INVARIANT #3 — loopback only, NEVER 0.0.0.0
 const PREFERRED_PORT = Number(process.env['HYDRA_COCKPIT_BRIDGE_PORT'] ?? 8795);
@@ -482,8 +516,194 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
 
+    // --- POST /api/replay — fire-and-attach replay launch (C6) ---
+    if (path === '/api/replay') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch {
+        json(res, 400, { error: 'invalid request body', code: 'BAD_BODY' });
+        return;
+      }
+
+      // (1) write-whitelist check
+      if (!isWriteAllowed('replay')) {
+        json(res, 403, { error: 'replay is not a sanctioned write', code: 'FORBIDDEN_TOOL' });
+        return;
+      }
+
+      // (2) validate source workflow_id (browser-supplied, must be an existing workflow)
+      const sourceWorkflowId = typeof body['workflow_id'] === 'string' ? body['workflow_id'] : '';
+      if (!WORKFLOW_ID_RE.test(sourceWorkflowId)) {
+        json(res, 400, {
+          error: 'workflow_id must match ^[A-Za-z0-9][A-Za-z0-9\\-_]{0,63}$',
+          code: 'INVALID_SOURCE_WORKFLOW_ID',
+        });
+        return;
+      }
+
+      // (3) Replay is High-risk: confirm nonce required regardless of live/dry.
+      //     (venom-gated typed challenge required ONLY when live=true)
+      const live = body['live'] === true;
+      const presentedNonce = typeof body['confirmNonce'] === 'string' ? body['confirmNonce'] : undefined;
+      if (!needsNonce('replay') || !consumeNonce(presentedNonce, 'replay')) {
+        json(res, 403, {
+          error: 'replay requires a server-issued confirm nonce (POST /api/confirm/preview first)',
+          code: 'NONCE_REQUIRED',
+        });
+        return;
+      }
+
+      // (4) venom gate — replay --live requires typed challenge (source workflow_id)
+      if (live) {
+        const typedChallenge = typeof body['typedChallenge'] === 'string' ? body['typedChallenge'] : '';
+        if (typedChallenge !== sourceWorkflowId) {
+          json(res, 403, {
+            error: 'replay --live requires typedChallenge === source workflow_id (venom gate)',
+            code: 'TYPED_CHALLENGE_REQUIRED',
+          });
+          return;
+        }
+      }
+
+      // (5) C5-style audit (action='replay') before dispatch.
+      // Order: validate → audit → dispatch. Never blocks on audit failure.
+      const _replayEnv = cockpitEnvelope();
+      const _replayAuditResult = await getHydraControl().audit(_replayEnv, 'replay', {
+        workflow_id: sourceWorkflowId,
+        detail: live ? 'replay --live' : 'replay dry (no --live)',
+      });
+      const _replayAuditNote = !_replayAuditResult.ok
+        ? 'degraded'
+        : _replayAuditResult.spooled
+          ? 'spooled'
+          : 'recorded';
+
+      // (6) Launch the detached replay subprocess
+      let replayResult: Awaited<ReturnType<typeof launchReplay>>;
+      try {
+        replayResult = await launchReplay({
+          sourceWorkflowId,
+          fromPhase: body['fromPhase'],
+          swapModel: body['swapModel'],
+          live,
+        });
+      } catch (e) {
+        if (e instanceof ReplayValidationError) {
+          json(res, 400, { error: e.message, code: e.code });
+          return;
+        }
+        process.stderr.write(`[cockpit-bridge] replay error: ${String(e)}\n`);
+        json(res, 502, { error: 'bridge upstream error', code: 'UPSTREAM' });
+        return;
+      }
+
+      const replayResp: Record<string, unknown> = {
+        workflow_id: replayResult.workflow_id,
+        pid: replayResult.pid,
+        log: replayResult.log,
+      };
+      if (_replayAuditNote === 'degraded') replayResp['audit'] = 'degraded';
+      json(res, 202, replayResp);
+      return;
+    }
+
+    // --- POST /api/tag_memory — tag an episodic row with additional cells (C6) ---
+    if (path === '/api/tag_memory') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch {
+        json(res, 400, { error: 'invalid request body', code: 'BAD_BODY' });
+        return;
+      }
+
+      // (1) write-whitelist check
+      if (!isWriteAllowed('tag_memory')) {
+        json(res, 403, { error: 'tag_memory is not a sanctioned write', code: 'FORBIDDEN_TOOL' });
+        return;
+      }
+
+      // (2) validate key — non-empty, reasonable charset
+      const tagKey = typeof body['key'] === 'string' ? body['key'].trim() : '';
+      if (tagKey.length === 0) {
+        json(res, 400, { error: 'key must be a non-empty string', code: 'INVALID_KEY' });
+        return;
+      }
+      if (!TAG_MEMORY_KEY_RE.test(tagKey)) {
+        json(res, 400, {
+          error: 'key contains invalid characters — must match [A-Za-z0-9][A-Za-z0-9\\-_.]{0,199}',
+          code: 'INVALID_KEY',
+        });
+        return;
+      }
+
+      // (3) validate cells — subset of the 8 bagua keys
+      const rawCells = body['cells'];
+      if (!Array.isArray(rawCells) || rawCells.length === 0) {
+        json(res, 400, {
+          error: 'cells must be a non-empty array of bagua keys: ' + TAG_MEMORY_BAGUA_KEYS.join(', '),
+          code: 'INVALID_CELLS',
+        });
+        return;
+      }
+      const invalidCells = rawCells.filter((c) => typeof c !== 'string' || !BAGUA_SET.has(c as string));
+      if (invalidCells.length > 0) {
+        json(res, 400, {
+          error: `invalid cell(s): ${JSON.stringify(invalidCells)}. Valid: ${TAG_MEMORY_BAGUA_KEYS.join(', ')}`,
+          code: 'INVALID_CELLS',
+        });
+        return;
+      }
+      const cells = rawCells as BaguaKey[];
+
+      const replace = body['replace'] === true;
+
+      // (4) tag_memory is Low risk — no nonce required.
+      //     (CSRF is already checked above before this block is reached.)
+
+      // (5) C5-style audit (action='tag_memory') before dispatch.
+      const _tagEnv = cockpitEnvelope();
+      const _tagAuditResult = await getHydraControl().audit(_tagEnv, 'tag_memory', {
+        detail: `key=${tagKey} cells=${cells.join(',')}`,
+      });
+      const _tagAuditNote = !_tagAuditResult.ok
+        ? 'degraded'
+        : _tagAuditResult.spooled
+          ? 'spooled'
+          : 'recorded';
+
+      // (6) Sanctioned direct write to hydra-mem.tag_memory.
+      //     This is the ONE sanctioned hydra-mem write the cockpit makes.
+      //     It BYPASSES allowTool() (the read-only gate) intentionally —
+      //     tag_memory is a WRITE tool that the read whitelist correctly excludes.
+      //     This bypass is ONLY for tag_memory; no other write can reach the
+      //     mem client through this path.
+      let tagResult: unknown;
+      try {
+        tagResult = await getClient().call('hydra-mem.tag_memory', {
+          key: tagKey,
+          cells,
+          replace,
+        });
+      } catch (e) {
+        process.stderr.write(`[cockpit-bridge] tag_memory upstream error: ${String(e)}\n`);
+        json(res, 502, { error: 'bridge upstream error', code: 'UPSTREAM' });
+        return;
+      }
+
+      const tagResp: Record<string, unknown> = {
+        ok: true,
+        key: tagKey,
+        cells,
+        result: tagResult,
+      };
+      if (_tagAuditNote === 'degraded') tagResp['audit'] = 'degraded';
+      json(res, 200, tagResp);
+      return;
+    }
+
     // All other POST routes: 404.
-    // C6 will add: /api/replay, /api/tag_memory
     json(res, 404, { error: 'not found' });
     return;
   }
