@@ -105,6 +105,31 @@ export interface ResumeResult {
 }
 
 // ---------------------------------------------------------------------------
+// C5: Audit result shape (hydra.cockpit.audit return)
+// ---------------------------------------------------------------------------
+
+export interface AuditResult {
+  /** true always — audit must not block the operator action */
+  ok: boolean;
+  /** true when TheEights was offline and the payload was spooled locally */
+  spooled?: boolean;
+  /** populated when ok:false (validation failure) or spooled:true with a reason */
+  reason?: string;
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// C5: Audit envelope args — mirrors hydra.cockpit.audit inputSchema
+// ---------------------------------------------------------------------------
+
+export interface AuditArgs {
+  action: string;
+  workflow_id?: string;
+  option?: string;
+  detail?: string;
+}
+
+// ---------------------------------------------------------------------------
 // HydraControlClient — stdio MCP child client
 // ---------------------------------------------------------------------------
 
@@ -244,6 +269,53 @@ export class HydraControlClient {
       args['option'] = option;
     }
     return this.call<ResumeResult>('hydra.workflow.resume', args);
+  }
+
+  /**
+   * C5: File a cockpit_write audit envelope to TheEights via hydra.cockpit.audit.
+   *
+   * SPOOL-SAFE: if TheEights is offline, the Python tool spools the payload
+   * locally and returns {ok:true, spooled:true}. This method propagates that
+   * result faithfully so the bridge can surface audit:"spooled" to the operator.
+   *
+   * NEVER THROWS in a way that blocks the caller: any hard failure (child crash,
+   * timeout, parse error) is caught, logged, and returns {ok:false}. The caller
+   * must proceed with the action even on {ok:false} — the audit is an obligation,
+   * not a gate. See COCKPIT-DESIGN.md §2.6 degraded-mode doctrine.
+   *
+   * The fixed cockpit envelope fields (actor, project, traceId) are supplied
+   * by the caller from cockpitEnvelope() — injected server-side, never from
+   * browser input (INVARIANT #1).
+   *
+   * @param envelope  - the fixed server-side cockpit envelope (actor/project/traceId)
+   * @param action    - the cockpit write action (e.g. 'launch', 'approve')
+   * @param opts      - optional workflow_id, option, detail
+   */
+  async audit(
+    envelope: { actor: string; project: string; traceId: string },
+    action: string,
+    opts: { workflow_id?: string; option?: string; detail?: string } = {},
+  ): Promise<AuditResult> {
+    const args: Record<string, unknown> = {
+      action,
+      actor: envelope.actor,
+      project: envelope.project,
+      trace_id: envelope.traceId,
+    };
+    if (opts.workflow_id) args['workflow_id'] = opts.workflow_id;
+    if (opts.option) args['option'] = opts.option;
+    if (opts.detail) args['detail'] = opts.detail;
+
+    try {
+      return await this.call<AuditResult>('hydra.cockpit.audit', args);
+    } catch (e) {
+      // Child crash, timeout, or parse error — log server-side, return degraded.
+      // The caller MUST proceed with the action regardless (audit is not a gate).
+      process.stderr.write(
+        `[cockpit-bridge] audit degraded: ${String(e instanceof Error ? e.message : e)}\n`,
+      );
+      return { ok: false, reason: 'audit_client_error' };
+    }
   }
 
   async close(): Promise<void> {

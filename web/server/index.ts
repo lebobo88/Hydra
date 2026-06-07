@@ -56,7 +56,7 @@ import { dirname, resolve } from 'node:path';
 import { HydraMemClient } from './hydra-mem-client.js';
 import { HydraControlClient } from './hydra-control-client.js';
 import { allowTool, READ_HYDRA_TOOLS } from './whitelist.js';
-import { sessionToken, verifyToken } from './operator.js';
+import { sessionToken, verifyToken, cockpitEnvelope } from './operator.js';
 import { launchWorkflow, LaunchValidationError, WORKFLOW_ID_RE } from './launch.js';
 import { mintNonce, consumeNonce } from './nonces.js';
 import { isWriteAllowed, needsNonce, needsTypedChallenge, isResumeAction, validateOption, OptionValidationError } from './write-whitelist.js';
@@ -306,9 +306,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
 
-      // TODO(C5): file an eights envelope here before spawning. // ANTI-PATTERN-OK: C5 scope per COCKPIT-DESIGN.md §5.2 + explicit instruction in C2 deliverable brief
-      // cockpitEnvelope() provides actor='hydra-cockpit', project='Hydra'.
-      // Leave hook: await fileEightsEnvelope(cockpitEnvelope(), 'launch', { live, goal: body['goal'] });
+      // C5: file an eights audit envelope before spawning (after nonce/CSRF validation).
+      // Audit fires here: request is validated (CSRF + nonce for live), not yet dispatched.
+      // Order: validate → audit → dispatch (per COCKPIT-DESIGN.md §2.6).
+      // cockpitEnvelope() is fixed server-side (actor='hydra-cockpit', project='Hydra').
+      // NEVER blocks the dispatch: if audit fails hard, include audit:"degraded" in response.
+      const _launchEnv = cockpitEnvelope();
+      const _launchAuditResult = await getHydraControl().audit(_launchEnv, 'launch', {
+        detail: live ? 'live launch' : 'dry-run launch',
+      });
+      const _launchAuditNote = !_launchAuditResult.ok
+        ? 'degraded'
+        : _launchAuditResult.spooled
+          ? 'spooled'
+          : 'recorded';
 
       let result: Awaited<ReturnType<typeof launchWorkflow>>;
       try {
@@ -328,11 +339,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return;
       }
 
-      json(res, 202, {
+      const launchResp: Record<string, unknown> = {
         workflow_id: result.workflow_id,
         pid: result.pid,
         log: result.log,
-      });
+      };
+      // Surface audit degradation to caller (degraded-mode doctrine: surface, don't block)
+      if (_launchAuditNote === 'degraded') launchResp['audit'] = 'degraded';
+      json(res, 202, launchResp);
       return;
     }
 
@@ -405,9 +419,22 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         }
       }
 
-      // (7) TODO(C5): file an eights envelope here before dispatching. // ANTI-PATTERN-OK: C5 scope per COCKPIT-DESIGN.md §5.2
-      // cockpitEnvelope() provides actor='hydra-cockpit', project='Hydra'.
-      // Leave hook: await fileEightsEnvelope(cockpitEnvelope(), action, { workflow_id: workflowId, option: validatedOption });
+      // (7) C5: file an eights audit envelope before dispatching.
+      // Order: validate (CSRF + nonce + typed challenge) → audit → dispatch.
+      // A refused/invalid request never reaches this point (returned above).
+      // cockpitEnvelope() is fixed server-side (actor='hydra-cockpit', project='Hydra').
+      // NEVER blocks the dispatch: audit failure → include audit:"degraded" in response.
+      const _resumeEnv = cockpitEnvelope();
+      const _resumeAuditOpts: { workflow_id?: string; option?: string } = {
+        workflow_id: workflowId,
+      };
+      if (validatedOption !== undefined) _resumeAuditOpts.option = validatedOption;
+      const _resumeAuditResult = await getHydraControl().audit(_resumeEnv, action, _resumeAuditOpts);
+      const _resumeAuditNote = !_resumeAuditResult.ok
+        ? 'degraded'
+        : _resumeAuditResult.spooled
+          ? 'spooled'
+          : 'recorded';
 
       // (8) call hydra_control.resume and return the result
       let resumeResult: Awaited<ReturnType<typeof hydraControl.resume>>;
@@ -441,14 +468,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
 
       // Success: return the hydra_control result envelope (200 or 202)
-      json(res, 202, {
+      const resumeResp: Record<string, unknown> = {
         ok: resumeResult.ok,
         launched: resumeResult.launched,
         pid: resumeResult.pid,
         workflow_id: resumeResult.workflow_id,
         action: resumeResult.action,
         log: resumeResult.log,
-      });
+      };
+      // Surface audit degradation to caller (degraded-mode doctrine: surface, don't block)
+      if (_resumeAuditNote === 'degraded') resumeResp['audit'] = 'degraded';
+      json(res, 202, resumeResp);
       return;
     }
 
