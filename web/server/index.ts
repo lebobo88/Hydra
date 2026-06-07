@@ -56,6 +56,9 @@ import { dirname, resolve } from 'node:path';
 import { HydraMemClient } from './hydra-mem-client.js';
 import { allowTool, READ_HYDRA_TOOLS } from './whitelist.js';
 import { sessionToken, verifyToken } from './operator.js';
+import { launchWorkflow, LaunchValidationError } from './launch.js';
+import { mintNonce, consumeNonce } from './nonces.js';
+import { isWriteAllowed, needsNonce } from './write-whitelist.js';
 
 const HOST = '127.0.0.1'; // INVARIANT #3 — loopback only, NEVER 0.0.0.0
 const PREFERRED_PORT = Number(process.env['HYDRA_COCKPIT_BRIDGE_PORT'] ?? 8795);
@@ -232,10 +235,90 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const url = new URL(req.url ?? '/', `http://${HOST}:${boundPort}`);
   const path = url.pathname;
 
-  // Write path — POST only, CSRF-gated (C3 delivers the full write routes)
+  // -------------------------------------------------------------------------
+  // Write path — POST only, CSRF-gated
+  // -------------------------------------------------------------------------
   if (req.method === 'POST') {
-    // C3 will add: /api/launch, /api/resume
-    // For now, no write routes exposed; 404 everything.
+    // INVARIANT #4 — CSRF required on ALL POSTs before any body is read.
+    if (!csrfOk(req, res)) return;
+
+    // --- POST /api/confirm/preview — mint a single-use confirm nonce ---
+    if (path === '/api/confirm/preview') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch {
+        json(res, 400, { error: 'invalid request body', code: 'BAD_BODY' });
+        return;
+      }
+      const action = typeof body['action'] === 'string' ? body['action'] : '';
+      if (!isWriteAllowed(action)) {
+        json(res, 400, { error: `unknown or unsanctioned action: ${action}`, code: 'UNKNOWN_ACTION' });
+        return;
+      }
+      const { nonce, expiresAt } = mintNonce(action);
+      json(res, 200, { nonce, expiresAt, action });
+      return;
+    }
+
+    // --- POST /api/launch — fire-and-attach workflow launch ---
+    if (path === '/api/launch') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readBody(req);
+      } catch {
+        json(res, 400, { error: 'invalid request body', code: 'BAD_BODY' });
+        return;
+      }
+
+      const live = body['live'] === true;
+
+      // Live launch is High-risk: requires a valid confirm nonce.
+      // Dry-run does NOT require a nonce (it dispatches nothing).
+      if (live) {
+        const presented = typeof body['confirmNonce'] === 'string' ? body['confirmNonce'] : undefined;
+        if (!needsNonce('launch') || !consumeNonce(presented, 'launch')) {
+          json(res, 403, {
+            error: 'live launch requires a server-issued confirm nonce (POST /api/confirm/preview first)',
+            code: 'NONCE_REQUIRED',
+          });
+          return;
+        }
+      }
+
+      // TODO(C5): file an eights envelope here before spawning. // ANTI-PATTERN-OK: C5 scope per COCKPIT-DESIGN.md §5.2 + explicit instruction in C2 deliverable brief
+      // cockpitEnvelope() provides actor='hydra-cockpit', project='Hydra'.
+      // Leave hook: await fileEightsEnvelope(cockpitEnvelope(), 'launch', { live, goal: body['goal'] });
+
+      let result: Awaited<ReturnType<typeof launchWorkflow>>;
+      try {
+        result = await launchWorkflow({
+          goal: body['goal'],
+          squads: body['squads'],
+          budgetUsd: body['budgetUsd'],
+          live,
+        });
+      } catch (e) {
+        if (e instanceof LaunchValidationError) {
+          json(res, 400, { error: e.message, code: e.code });
+          return;
+        }
+        process.stderr.write(`[cockpit-bridge] launch error: ${String(e)}\n`);
+        json(res, 502, { error: 'bridge upstream error', code: 'UPSTREAM' });
+        return;
+      }
+
+      json(res, 202, {
+        workflow_id: result.workflow_id,
+        pid: result.pid,
+        log: result.log,
+      });
+      return;
+    }
+
+    // All other POST routes: 404.
+    // C3 will add: /api/resume (gate writes — approve/reject/modify-budget/force-dispatch/change-squads)
+    // C6 will add: /api/replay, /api/tag_memory
     json(res, 404, { error: 'not found' });
     return;
   }

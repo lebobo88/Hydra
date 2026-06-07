@@ -19,10 +19,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import warnings
 from pathlib import Path
 from uuid import uuid4
+
+# Validation regex for workflow ids supplied via --workflow-id.
+# BYTE-IDENTICAL to _WORKFLOW_ID_RE in mcp_servers/hydra_control/server.py.
+# Do NOT change one without changing the other.
+_WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 
 # langgraph (imported lazily by `run`) transitively pulls in langchain_core,
 # which emits a Pydantic-v1 UserWarning under Python 3.14. It is harmless, but
@@ -242,7 +248,36 @@ def _cmd_squads(args) -> int:
 
 def _cmd_run(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
-    workflow_id = uuid4()
+    # --workflow-id: use the caller-supplied id if present and valid; otherwise
+    # mint a fresh uuid4(). The Hydra Cockpit bridge pre-allocates the id so it
+    # can return it to the UI immediately (fire-and-attach) before the run ends.
+    wf_id_override = getattr(args, "workflow_id_override", None)
+    if wf_id_override is not None:
+        if not _WORKFLOW_ID_RE.match(wf_id_override):
+            warnings.warn(
+                f"--workflow-id {wf_id_override!r} does not match "
+                r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$ — minting a fresh uuid4() instead.",
+                stacklevel=2,
+            )
+            workflow_id = uuid4()
+        else:
+            # HydraState.workflow_id is typed UUID; attempt to coerce.
+            # The Hydra Cockpit bridge always supplies a standard uuid4() string
+            # (e.g. "5ebd4268-5de0-4dbf-a82d-42c596d4818e").  Non-UUID tokens
+            # that pass the regex (e.g. "my-custom-id") are not valid UUID literals
+            # and will fail Pydantic validation; warn and fall back in that case.
+            try:
+                from uuid import UUID as _UUID
+                workflow_id = _UUID(wf_id_override)
+            except ValueError:
+                warnings.warn(
+                    f"--workflow-id {wf_id_override!r} is a valid identifier but not a "
+                    "UUID (HydraState requires UUID) — minting a fresh uuid4() instead.",
+                    stacklevel=2,
+                )
+                workflow_id = uuid4()
+    else:
+        workflow_id = uuid4()
     initial = HydraState(workflow_id=workflow_id, root_goal=args.goal)
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
@@ -853,6 +888,19 @@ def main(argv: list[str] | None = None) -> int:
             "Force the pure-Python supervisor runner (no LangGraph checkpoints, "
             "no HITL interrupts). Use for smoke tests / dev loops; production "
             "runs should let LangGraph pause at HITL gates."
+        ),
+    )
+    r.add_argument(
+        "--workflow-id",
+        dest="workflow_id_override",
+        default=None,
+        metavar="ID",
+        help=(
+            "Pre-allocate the workflow id (UUID-like: [A-Za-z0-9][A-Za-z0-9-_]{0,63}). "
+            "When supplied and valid, the run uses this id instead of minting a fresh one. "
+            "Used by the Hydra Cockpit bridge to return the id to the UI before the run "
+            "completes (fire-and-attach). If omitted or invalid, a fresh uuid4() is minted "
+            "and a warning is emitted."
         ),
     )
     s = sub.add_parser("status")

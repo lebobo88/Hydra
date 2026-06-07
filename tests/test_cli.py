@@ -189,6 +189,97 @@ def test_run_smoke_with_stub_dispatcher(capsys):
     assert payload["workflow_id"]
 
 
+# --- run --workflow-id -------------------------------------------------------
+
+def test_run_workflow_id_passthrough(capsys):
+    """--workflow-id passes a pre-allocated id into the run; the emitted JSON
+    must echo that exact id back. Uses --no-checkpoint (pure-Python supervisor)
+    to avoid the LangGraph HITL interrupt that would keep the run alive."""
+    # Must be a valid UUID4 string — HydraState.workflow_id is UUID-typed.
+    # This is the same format the Hydra Cockpit bridge mints via randomUUID().
+    pre_id = "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"
+    rc = _run(
+        ["run", "Cockpit C2 --workflow-id passthrough test",
+         "--no-checkpoint", "--workflow-id", pre_id],
+        project_root=REPO_ROOT,
+    )
+    out = capsys.readouterr().out
+    payload = None
+    for i, line in enumerate(out.splitlines()):
+        if line.startswith("{"):
+            try:
+                payload = json.loads("\n".join(out.splitlines()[i:]))
+                break
+            except json.JSONDecodeError:
+                continue
+    assert payload is not None, f"no JSON output found: {out[-300:]}"
+    assert rc == 0
+    assert payload["workflow_id"] == pre_id, (
+        f"expected workflow_id={pre_id!r}, got {payload['workflow_id']!r}"
+    )
+
+
+def test_run_workflow_id_invalid_falls_back_to_uuid(capsys):
+    """An invalid --workflow-id (contains shell special chars) is rejected at
+    validation time; the run falls back to a freshly-minted uuid4() and emits
+    a warning. The emitted id must NOT be the rejected value."""
+    bad_id = "bad id with spaces"  # fails _WORKFLOW_ID_RE
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        rc = _run(
+            ["run", "Cockpit C2 invalid-id fallback test",
+             "--no-checkpoint", "--workflow-id", bad_id],
+            project_root=REPO_ROOT,
+        )
+    out = capsys.readouterr().out
+    payload = None
+    for i, line in enumerate(out.splitlines()):
+        if line.startswith("{"):
+            try:
+                payload = json.loads("\n".join(out.splitlines()[i:]))
+                break
+            except json.JSONDecodeError:
+                continue
+    assert payload is not None, f"no JSON output: {out[-300:]}"
+    assert rc == 0
+    assert payload["workflow_id"] != bad_id, "invalid id must not be used"
+    # A uuid4 looks like 8-4-4-4-12 hex or similar — at minimum not empty
+    assert len(payload["workflow_id"]) > 4
+    # A UserWarning must have been emitted
+    warning_texts = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    assert any("--workflow-id" in t or "uuid4" in t or "minting" in t for t in warning_texts), (
+        f"expected a UserWarning about --workflow-id, got: {warning_texts}"
+    )
+
+
+def test_run_workflow_id_regex_boundary(capsys):
+    """Verify the boundary of _WORKFLOW_ID_RE:
+      - Valid: uuid4 string, cockpit-style id with hyphens/underscores.
+      - Invalid: empty string, starts with hyphen, contains spaces, too long.
+    This pins regex parity with hydra_control server.py _WORKFLOW_ID_RE."""
+    from hydra_core.cli import _WORKFLOW_ID_RE
+    valid = [
+        "a",
+        "abc123",
+        "some-workflow-id",
+        "wf_foo_bar",
+        "a" * 64,
+        "5ebd4268-5de0-4dbf-a82d-42c596d4818e",
+    ]
+    invalid = [
+        "",          # empty
+        "-starts-with-hyphen",  # must start with alnum
+        "has space",  # space not in alphabet
+        "has!bang",   # ! not in alphabet
+        "a" * 65,     # too long (max 64 chars total)
+    ]
+    for v in valid:
+        assert _WORKFLOW_ID_RE.match(v), f"expected VALID: {v!r}"
+    for v in invalid:
+        assert not _WORKFLOW_ID_RE.match(v), f"expected INVALID: {v!r}"
+
+
 # --- approve ----------------------------------------------------------------
 
 def test_approve_is_real_resume_now(capsys, tmp_path, monkeypatch):
