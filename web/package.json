@@ -1,0 +1,40 @@
+{
+  "name": "hydra-cockpit-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hydra Cockpit — standalone operator UI for the Hydra orchestrator. Bridge talks to Hydra only via loopback stdio MCP (hydra_memory) and hydra_control.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "bridge": "node --import tsx/esm server/index.ts",
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run --config vitest.server.config.ts",
+    "test:ui": "vitest run --config vitest.ui.config.ts"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "better-sqlite3": "11.10.0",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.12",
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "jsdom": "^24.1.1",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.3",
+    "vitest": "^3.1.3"
+  },
+  "notes": {
+    "better-sqlite3": "11.10.0 — matches AgentMesh daemon + TheEights ABI for Node 20 native module on Windows",
+    "zod": "3.24.1 — matches AgentMesh daemon; used by bridge for payload validation"
+  }
+}
