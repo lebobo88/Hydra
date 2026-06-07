@@ -60,6 +60,7 @@ import { sessionToken, verifyToken } from './operator.js';
 import { launchWorkflow, LaunchValidationError, WORKFLOW_ID_RE } from './launch.js';
 import { mintNonce, consumeNonce } from './nonces.js';
 import { isWriteAllowed, needsNonce, needsTypedChallenge, isResumeAction, validateOption, OptionValidationError } from './write-whitelist.js';
+import { streamWorkflow, pollWorkflow, type GetWorkflowStatus } from './sse.js';
 
 const HOST = '127.0.0.1'; // INVARIANT #3 — loopback only, NEVER 0.0.0.0
 const PREFERRED_PORT = Number(process.env['HYDRA_COCKPIT_BRIDGE_PORT'] ?? 8795);
@@ -574,6 +575,58 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const wfId = memWfMatch[1];
       if (wfId !== undefined) {
         json(res, 200, await readTool('hydra-mem.list_workflow', { workflow_id: wfId }));
+        return;
+      }
+    }
+
+    // GET /api/workflows/:id/stream — SSE trace tail
+    // Headers: text/event-stream, cache-control: no-store, connection: keep-alive
+    // Query: ?cursor=<byteOffset> (default 0)
+    // This is a GET (read-only); Host guard applies; no CSRF required.
+    const streamMatch = path.match(/^\/api\/workflows\/([A-Za-z0-9][A-Za-z0-9\-_]{0,63})\/stream$/);
+    if (streamMatch !== null) {
+      const wfId = streamMatch[1];
+      if (wfId !== undefined) {
+        // Parse optional byte cursor from query string
+        const rawCursor = url.searchParams.get('cursor');
+        const cursor = rawCursor !== null ? Math.max(0, parseInt(rawCursor, 10) || 0) : 0;
+
+        // Set SSE headers and flush so the browser sees the stream begin
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-store',
+          'connection': 'keep-alive',
+          'x-accel-buffering': 'no', // disable Nginx buffering if present
+        });
+
+        // Build the workflow_status getter that uses the whitelisted read path
+        const getWorkflowStatus: GetWorkflowStatus = async (workflowId: string) => {
+          return readTool<Record<string, unknown>>('hydra-mem.workflow_status', { workflow_id: workflowId });
+        };
+
+        // Hand off to the SSE streaming module
+        streamWorkflow(req, res, wfId, cursor, getWorkflowStatus);
+        return; // do NOT fall through — streamWorkflow owns res from here
+      }
+    }
+
+    // GET /api/workflows/:id/poll — polling fallback endpoint
+    // Returns { state, traceLines, nextCursor } — identical shapes to SSE events.
+    // Query: ?cursor=<byteOffset> (default 0)
+    // This is a GET (read-only); Host guard applies; no CSRF required.
+    const pollMatch = path.match(/^\/api\/workflows\/([A-Za-z0-9][A-Za-z0-9\-_]{0,63})\/poll$/);
+    if (pollMatch !== null) {
+      const wfId = pollMatch[1];
+      if (wfId !== undefined) {
+        const rawCursor = url.searchParams.get('cursor');
+        const cursor = rawCursor !== null ? Math.max(0, parseInt(rawCursor, 10) || 0) : 0;
+
+        const getWorkflowStatus: GetWorkflowStatus = async (workflowId: string) => {
+          return readTool<Record<string, unknown>>('hydra-mem.workflow_status', { workflow_id: workflowId });
+        };
+
+        const result = await pollWorkflow(wfId, cursor, getWorkflowStatus);
+        json(res, 200, result);
         return;
       }
     }
