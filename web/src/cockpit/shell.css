@@ -511,6 +511,94 @@
   color: color-mix(in srgb, var(--bone-mid) 70%, transparent);
 }
 
+/* =========================================================================
+   Memory pane tabs + EmbeddedPeer (sibling-UI iframe surface)
+========================================================================= */
+.memory-tabs {
+  display: flex;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+}
+.memory-tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: var(--sp-2) var(--sp-3);
+  font-family: var(--font-covenant);
+  font-size: var(--t-small);
+  letter-spacing: 0.04em;
+  color: var(--bone-mid);
+  cursor: pointer;
+  min-height: 32px;
+}
+.memory-tab:hover { color: var(--bone); }
+.memory-tab--active {
+  color: var(--spirit-amber);
+  border-bottom-color: var(--spirit-amber);
+}
+
+.embedded-peer {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 15%, transparent);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--void-panel);
+}
+.embedded-peer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-3);
+  border-bottom: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  background: color-mix(in srgb, var(--covenant-indigo) 50%, transparent);
+}
+.embedded-peer-src { font-size: var(--t-micro); color: var(--bone-mid); }
+.embedded-peer-open {
+  font-size: var(--t-micro);
+  color: var(--biolume);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.embedded-peer-open:hover,
+.embedded-peer-open:focus-visible { color: var(--bone); text-decoration: underline; }
+.embedded-peer-frame {
+  width: 100%;
+  height: 70vh;
+  min-height: 480px;
+  border: none;
+  display: block;
+  background: var(--void);
+}
+.embedded-peer-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  min-height: 480px;
+  padding: var(--sp-8);
+  text-align: center;
+  color: var(--bone-mid);
+}
+.embedded-peer-fallback-title {
+  font-family: var(--font-oracle);
+  font-style: italic;
+  font-size: 1.125rem;
+  color: var(--bone);
+}
+.embedded-peer-fallback-hint { font-size: var(--t-small); max-width: 42ch; }
+.embedded-peer-fallback-hint code {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--spirit-amber);
+}
+.embedded-peer-fallback-actions { display: flex; gap: var(--sp-2); }
+
 /* Stale / abandoned workflows — collapsed <details>, de-emphasized */
 .body-stale {
   margin-top: var(--sp-1);

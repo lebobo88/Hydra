@@ -18,6 +18,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { LoadingScreen, ErrorScreen, DegradedBanner, OfflineBanner } from '../components/StateScreens.tsx';
 import { ViewHeader } from '../components/ViewHeader.tsx';
+import { EmbeddedPeer } from '../components/EmbeddedPeer.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import type { CockpitDialogState } from '../cockpit/types.ts';
 import type { EightsCell, EightsCellRecord, SearchResult } from '../api/client.ts';
@@ -183,7 +184,17 @@ interface MemoryViewProps {
   online: boolean;
 }
 
+// TheEights Atlas base — the sibling UI's Vite dev server. Configurable for
+// non-default ports; mirrors AgentMesh's VITE_COCKPIT_BASE convention.
+const EIGHTS_BASE =
+  ((import.meta as any).env?.['VITE_EIGHTS_BASE'] as string | undefined) ?? 'http://127.0.0.1:5174';
+
+type MemoryTab = 'cells' | 'atlas';
+
 export function MemoryView({ online }: MemoryViewProps): JSX.Element {
+  // ---- which Memory pane: federated episodic Cells, or TheEights Atlas UI ----
+  const [memoryTab, setMemoryTab] = useState<MemoryTab>('cells');
+
   // ---- Overview state ----
   const [cells, setCells] = useState<Record<string, EightsCell>>({});
   const [loading, setLoading] = useState(true);
@@ -445,6 +456,41 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
         </div>
       ) : null}
 
+      {/* Pane toggle: federated episodic Cells (default) vs TheEights Atlas UI */}
+      <div className="memory-tabs" role="tablist" aria-label="Memory view">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={memoryTab === 'cells'}
+          className={`memory-tab${memoryTab === 'cells' ? ' memory-tab--active' : ''}`}
+          onClick={() => setMemoryTab('cells')}
+        >
+          Episodic Cells
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={memoryTab === 'atlas'}
+          className={`memory-tab${memoryTab === 'atlas' ? ' memory-tab--active' : ''}`}
+          onClick={() => setMemoryTab('atlas')}
+          data-testid="memory-tab-atlas"
+        >
+          TheEights Atlas
+        </button>
+      </div>
+
+      {memoryTab === 'atlas' ? (
+        <section className="memory-section" aria-label="TheEights Atlas">
+          <EmbeddedPeer
+            src={EIGHTS_BASE}
+            title="TheEights Atlas — governance, audit, evolution &amp; cells"
+            fallbackTitle="TheEights Atlas isn’t reachable"
+            fallbackHint="Start it with `npm run dev` (and `npm run bridge`) in TheEights/web, then Retry."
+            testId="eights-atlas"
+          />
+        </section>
+      ) : (
+      <>
       {/* ─── THE EIGHT CELLS ─────────────────────────────────────────────── */}
       <section
         className="memory-section"
@@ -802,6 +848,8 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
           <p className="text-muted text-sm">No episodic records for this workflow.</p>
         ) : null}
       </section>
+      </>
+      )}
     </div>
   );
 }

@@ -965,3 +965,38 @@ describe('MemoryView — accessibility', () => {
     }, { timeout: 2000 });
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// TheEights Atlas embedded sub-tab
+// ---------------------------------------------------------------------------
+
+describe('MemoryView — TheEights Atlas sub-tab', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _setCachedToken('test-session-token');
+  });
+
+  it('defaults to Episodic Cells and switches to the Atlas embed on toggle', async () => {
+    vi.stubGlobal('fetch', setupOnlineRoutes());
+    render(<MemoryView online={true} />);
+
+    // Default pane = cells radial.
+    await waitFor(() => {
+      expect(screen.getByTestId('bagua-radial')).toBeTruthy();
+    }, { timeout: 2000 });
+    expect(screen.queryByTestId('eights-atlas')).toBeNull();
+
+    // Toggle to Atlas → EmbeddedPeer renders; cells radial gone.
+    fireEvent.click(screen.getByTestId('memory-tab-atlas'));
+    await waitFor(() => {
+      expect(screen.getByTestId('eights-atlas')).toBeTruthy();
+    }, { timeout: 2000 });
+    expect(screen.queryByTestId('bagua-radial')).toBeNull();
+
+    // The embed always exposes an open-in-new-tab affordance to TheEights base.
+    const link = screen.getByText('Open in new tab ↗').closest('a');
+    expect(link?.getAttribute('href')).toContain('5174');
+    expect(link?.getAttribute('rel')).toContain('noopener');
+  });
+});
