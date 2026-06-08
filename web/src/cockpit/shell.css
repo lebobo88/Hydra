@@ -1253,6 +1253,364 @@
 }
 
 /* =========================================================================
+   R2 — THE CONSTELLATION (Launchpad view interior)
+   Layout + visual rules for constellation-view, constellation-field,
+   constellation-svg, speak-intent, recent-intent-chips, accessible-twin.
+   Token references: Pentecost theme tokens only. No physics, no JS anim loops.
+========================================================================= */
+
+/* Constellation view container */
+.constellation-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4) var(--sp-6);
+  min-height: 100%;
+  position: relative;
+}
+
+/* The constellation field — glass + grain surface */
+.constellation-field {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  width: 100%;
+  max-width: 520px;
+  margin: 0 auto;
+
+  /* Glass / covenant-indigo tint */
+  background: color-mix(in srgb, var(--covenant-indigo) 60%, transparent);
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 15%, transparent);
+  border-radius: var(--radius-lg);
+  padding: var(--sp-5) var(--sp-4) var(--sp-4);
+
+  /* backdrop-filter glass effect — constellation field §1 */
+  backdrop-filter: blur(8px);
+}
+
+/* Loading state variant */
+.constellation-field--loading {
+  min-height: 340px;
+  justify-content: center;
+  opacity: 0.6;
+}
+
+/* IAU idle state marker — for testing + CSS hooks */
+.constellation-field[data-iau-idle] .head-circle {
+  opacity: 0.4;
+}
+
+/* 3% grain overlay — SVG turbulence via absolutely-positioned div */
+.constellation-grain {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  /* SVG turbulence grain as inline data URI — 3% opacity, not animated */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23g)' opacity='0.03'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.6;
+}
+
+/* The SVG constellation canvas */
+.constellation-svg {
+  width: 100%;
+  max-width: 420px;
+  height: auto;
+  display: block;
+  position: relative;
+  z-index: 1;
+  overflow: visible;
+}
+
+.constellation-svg--skeleton {
+  opacity: 0.4;
+}
+
+/* Spirit core — pulse host in SVG context */
+.spirit-core-circle {
+  /* Spirit pulse host in SVG is handled via CSS filter/opacity glow */
+  filter: drop-shadow(0 0 8px color-mix(in srgb, var(--spirit-amber) 50%, transparent));
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes spirit-svg-pulse {
+    0%, 100% { filter: drop-shadow(0 0 6px color-mix(in srgb, var(--spirit-amber) 40%, transparent)); }
+    50%      { filter: drop-shadow(0 0 14px color-mix(in srgb, var(--spirit-amber) 80%, transparent)); }
+  }
+
+  .spirit-core-circle {
+    animation: spirit-svg-pulse 1667ms ease-in-out infinite;
+  }
+
+  [data-attest-paused] .spirit-core-circle {
+    animation-play-state: paused;
+  }
+}
+
+/* Spirit diverge ring pulse */
+.spirit-diverge-ring {
+  stroke-dasharray: 3 6;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes diverge-ring-spin {
+    from { stroke-dashoffset: 0; }
+    to   { stroke-dashoffset: 18; }
+  }
+  .spirit-diverge-ring {
+    animation: diverge-ring-spin 4s linear infinite;
+  }
+}
+
+/* Head node transitions */
+.head-label {
+  pointer-events: none;
+  user-select: none;
+}
+
+.head-flame {
+  pointer-events: none;
+}
+
+/* Neck lines */
+.neck-line {
+  pointer-events: none;
+}
+.neck-dash {
+  pointer-events: none;
+}
+
+/* ---- Speak-intent affordance ---- */
+.speak-intent {
+  width: 100%;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  position: relative;
+  z-index: 2;
+}
+
+.speak-intent-inner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  background: color-mix(in srgb, var(--covenant-indigo) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 25%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+}
+
+.speak-intent-textarea {
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--spirit-amber) 20%, transparent);
+  border-radius: 0;
+  color: var(--bone);
+  font-family: var(--font-oracle);
+  font-style: italic;
+  font-size: var(--t-body);
+  line-height: 1.5;
+  padding: var(--sp-2) 0;
+  resize: none;
+  min-height: 48px;
+}
+
+.speak-intent-textarea::placeholder {
+  color: var(--bone-mid);
+  font-style: italic;
+}
+
+.speak-intent-textarea:focus {
+  outline: none;
+  border-bottom-color: var(--spirit-amber);
+}
+
+.speak-intent-textarea:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Mode selection radios */
+.speak-intent-mode {
+  display: flex;
+  gap: var(--sp-4);
+  align-items: center;
+}
+
+.speak-intent-mode-label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--t-small);
+  color: var(--bone-mid);
+  cursor: pointer;
+  min-height: 24px;
+}
+
+.speak-intent-mode-label input[type="radio"] {
+  accent-color: var(--spirit-amber);
+  min-width: 14px;
+  min-height: 14px;
+}
+
+.speak-intent-live-label {
+  color: var(--venom);
+}
+
+/* Submit button */
+.speak-intent-submit {
+  align-self: flex-end;
+  padding: var(--sp-1) var(--sp-5);
+  min-height: 32px;
+  background: color-mix(in srgb, var(--spirit-amber) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 60%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--spirit-amber);
+  font-family: var(--font-ui);
+  font-size: var(--t-small);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+
+.speak-intent-submit:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--spirit-amber) 28%, transparent);
+  color: var(--bone);
+}
+
+.speak-intent-submit:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.speak-intent-offline {
+  padding: var(--sp-2) var(--sp-3);
+  background: color-mix(in srgb, var(--venom) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--venom) 30%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--bone-mid);
+  font-size: var(--t-small);
+}
+
+.speak-intent-error {
+  padding: var(--sp-2) var(--sp-3);
+  background: color-mix(in srgb, var(--venom) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--venom) 30%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--bone);
+  font-size: var(--t-small);
+}
+
+/* ---- Recent-intent arc chips ---- */
+.recent-intent-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  width: 100%;
+  max-width: 420px;
+  justify-content: center;
+  position: relative;
+  z-index: 2;
+}
+
+.intent-chip {
+  padding: 4px var(--sp-3);
+  min-height: 28px;
+  background: color-mix(in srgb, var(--covenant-indigo) 80%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bone) 15%, transparent);
+  border-radius: var(--radius-pill);
+  color: var(--bone-mid);
+  font-family: var(--font-oracle);
+  font-style: italic;
+  font-size: var(--t-small);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.intent-chip:hover,
+.intent-chip:focus-visible {
+  border-color: var(--spirit-amber);
+  color: var(--bone);
+  background: color-mix(in srgb, var(--spirit-amber) 10%, transparent);
+}
+
+/* ---- Constellation empty state ---- */
+.constellation-empty {
+  font-family: var(--font-oracle);
+  font-style: italic;
+  font-size: 1rem;
+  color: var(--bone-mid);
+  text-align: center;
+  padding: var(--sp-4) var(--sp-6);
+  position: relative;
+  z-index: 2;
+}
+
+/* ---- Accessible twin — visually hidden but fully keyboard-accessible ---- */
+.constellation-accessible-twin {
+  /* NOT sr-only: it needs to be reachable via keyboard, just not visible over the SVG */
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  /* When focused, becomes visible */
+}
+
+.constellation-accessible-twin:focus-within {
+  position: static;
+  left: auto;
+  top: auto;
+  width: auto;
+  height: auto;
+  overflow: auto;
+  background: var(--void-panel);
+  border: 1px solid var(--spirit-amber);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  z-index: 10;
+}
+
+.acc-workflow-link {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
+  color: var(--bone-mid);
+  text-decoration: none;
+  font-size: var(--t-small);
+  border-radius: var(--radius-sm);
+  min-height: 32px;
+  transition: color 0.1s, background 0.1s;
+}
+
+.acc-workflow-link:hover,
+.acc-workflow-link:focus-visible {
+  color: var(--bone);
+  background: color-mix(in srgb, var(--bone) 6%, transparent);
+}
+
+.acc-head-item {
+  display: inline-block;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--t-small);
+  color: var(--bone-mid);
+}
+
+/* =========================================================================
    RESPONSIVE BREAKPOINTS (§8 responsive matrix)
 ========================================================================= */
 

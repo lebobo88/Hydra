@@ -381,3 +381,186 @@
   will-change: transform, opacity;
 }
 /* After animation: reset (handled in JS via animationend → removeClass) */
+
+/* =========================================================================
+   R2 CONSTELLATION ANIMATIONS
+   New keyframes for: neck-sway, IAU idle ease, neck breach burst,
+   neck dash direction (dispatch / synthesis), divergence arrhythmic pulse,
+   gate pulse ring.
+   All wrapped in prefers-reduced-motion: no-preference per D4 §6 pattern.
+========================================================================= */
+
+/* -------------------------------------------------------------------------
+   13. Neck sway — cubic-bezier control-point sinusoidal oscillation
+   At rest: gentle 3–5s cycle, ± 8px amplitude (encoded in the SVG path).
+   ≥80% budget: amplitude escalates to ±18px (handled in buildNeckPath JS).
+   Breach burst (12Hz, 1s): encoded as the neck-line--breach class.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes neck-sway {
+    0%   { stroke-dashoffset: 0; }
+    50%  { stroke-dashoffset: 4; }
+    100% { stroke-dashoffset: 0; }
+  }
+
+  /* Dispatch: dash travels Spirit → Head (positive offset direction) */
+  .neck-dash--dispatch {
+    animation: neck-dash-dispatch 2.5s linear infinite;
+    will-change: stroke-dashoffset;
+  }
+
+  @keyframes neck-dash-dispatch {
+    from { stroke-dashoffset: 28; }
+    to   { stroke-dashoffset: 0; }
+  }
+
+  /* Synthesis: dash travels Head → Spirit (reverse direction) */
+  .neck-dash--synthesis {
+    animation: neck-dash-synthesis 2.5s linear infinite;
+    will-change: stroke-dashoffset;
+  }
+
+  @keyframes neck-dash-synthesis {
+    from { stroke-dashoffset: 0; }
+    to   { stroke-dashoffset: 28; }
+  }
+
+  /*
+   * Breach signal: single slow ramp-in / ramp-out pulse — WCAG 2.3.1 compliant.
+   *
+   * WCAG 2.3.1 (Level A) forbids > 3 flashes per second for ANY user, regardless
+   * of prefers-reduced-motion.  The previous 12Hz steps-burst violated this at
+   * Level A.  This replacement produces exactly ONE opacity cycle over 1.6 s
+   * (0.625 Hz) — well under the 3 Hz ceiling — and then holds at full opacity.
+   *
+   * Rate proof: 1 flash / 1.6 s = 0.625 Hz < 3 Hz.  The CSS custom-property
+   * --neck-breach-hz documents the rate so automated checks can assert it.
+   */
+  :root {
+    /* Documented breach rate for test assertions: 0.625 Hz — below WCAG 3 Hz cap */
+    --neck-breach-hz: 0.625;
+  }
+
+  @keyframes neck-breach-ramp {
+    0%   { opacity: 0.3; stroke-width: 1; }
+    40%  { opacity: 1;   stroke-width: 3; }
+    70%  { opacity: 0.6; stroke-width: 2; }
+    100% { opacity: 1;   stroke-width: 2; }
+  }
+
+  .neck-line--breach {
+    /* 1.6 s = 0.625 Hz — single ramp-in/out, holds at full opacity. */
+    animation: neck-breach-ramp 1.6s ease-in-out 1 forwards;
+  }
+}
+
+/* Reduced-motion: breach = color-only, no animation */
+@media (prefers-reduced-motion: reduce) {
+  .neck-dash--dispatch,
+  .neck-dash--synthesis {
+    stroke-dashoffset: 0;
+  }
+  .neck-line--breach {
+    /* static venom color — no burst animation */
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   14. IAU idle formation ease
+   Heads transition to IAU angles over 1.5s via CSS custom-property interpolation.
+   CSS transitions on SVG circle cx/cy are not supported natively, so the
+   head-node elements transition their opacity, and the deterministic JS layout
+   updates positions instantly (same-slug, same-angle guarantee).
+   The visual transition is on group opacity + scale.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .head-node {
+    transition: opacity 1.5s ease, transform 1.5s ease;
+  }
+
+  /* IAU idle: heads dim and relax */
+  .head-node--iau-idle .head-circle {
+    transition: opacity 1.5s ease;
+    opacity: 0.4;
+  }
+
+  /* Intent preview: heads that match intent text light up */
+  .head-node--intent .head-circle {
+    opacity: 1;
+    filter: saturate(1.5);
+    transition: opacity 0.3s ease, filter 0.3s ease;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .head-node { transition: none; }
+  .head-node--iau-idle .head-circle { opacity: 0.4; }
+}
+
+/* -------------------------------------------------------------------------
+   15. Divergence signals
+   Spirit arrhythmic pulse: erratic keyframe (two pulses, long gap).
+   Neck oscillation for diverging necks: 0.5Hz ± 4px (color-only for RM).
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes spirit-diverge-pulse {
+    0%   { opacity: 0.4; transform: scale(1); }
+    10%  { opacity: 1;   transform: scale(1.06); }
+    20%  { opacity: 0.5; transform: scale(1); }
+    30%  { opacity: 1;   transform: scale(1.04); }
+    40%  { opacity: 0.4; transform: scale(1); }
+    /* long gap */
+    100% { opacity: 0.4; transform: scale(1); }
+  }
+
+  .spirit-node--diverging .spirit-core-circle::after {
+    animation: spirit-diverge-pulse 2s ease-in-out infinite;
+  }
+
+  .spirit-node--diverging .spirit-glow-ring {
+    animation: spirit-diverge-pulse 2s ease-in-out infinite reverse;
+  }
+
+  @keyframes neck-diverge-oscillate {
+    0%, 100% { stroke-dashoffset: 0; }
+    25%      { stroke-dashoffset: 4; }
+    75%      { stroke-dashoffset: -4; }
+  }
+
+  .neck-line--divergent {
+    animation: neck-diverge-oscillate 2s ease-in-out infinite;
+  }
+}
+
+/* Reduced-motion divergence: Spirit color shifts to bone-mid, no animation */
+@media (prefers-reduced-motion: reduce) {
+  .spirit-node--diverging .spirit-core-circle {
+    stroke: var(--bone-mid);
+  }
+  .neck-line--divergent { animation: none; }
+}
+
+/* -------------------------------------------------------------------------
+   16. Gate pulse ring — amber→venom pulsation on head with pending gate
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes gate-head-pulse {
+    0%, 100% { opacity: 0.6; r: 17; }
+    50%      { opacity: 0.2; r: 20; }
+  }
+
+  .gate-pulse-ring {
+    animation: gate-head-pulse 1.2s ease-in-out infinite;
+    will-change: opacity;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gate-pulse-ring { animation: none; opacity: 0.6; }
+}
