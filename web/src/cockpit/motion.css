@@ -1,0 +1,383 @@
+/**
+ * Pentecost Cockpit — Motion Primitives
+ * §3 Motion language: CSS/SVG-only, per-animation prefers-reduced-motion fallback.
+ *
+ * PATTERN: All animation rules live inside
+ *   @media (prefers-reduced-motion: no-preference) { }
+ * so zero animation runs by default — motion is opt-in (D4 §6 pattern).
+ * Static fallbacks (box-shadow, opacity, color) are the default rendering.
+ */
+
+/* -------------------------------------------------------------------------
+   1. Spirit Pulse — the ONE heartbeat (0.6 Hz ≈ 1667ms cycle)
+   The singular living signal: the system is alive and attended.
+   Applied via ::after on .spirit-pulse-host elements.
+   Reduced-motion default: static amber box-shadow glow.
+------------------------------------------------------------------------- */
+
+.spirit-pulse-host {
+  position: relative;
+}
+
+.spirit-pulse-host::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: inherit;
+  /* Static glow — the default (reduced-motion baseline) */
+  box-shadow: 0 0 8px 2px color-mix(in srgb, var(--spirit-amber) 40%, transparent);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes spirit-pulse {
+    0%, 100% {
+      opacity: 0.5;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.08);
+    }
+  }
+
+  .spirit-pulse-host::after {
+    animation: spirit-pulse 1667ms ease-in-out infinite;
+    box-shadow: none; /* animation replaces static glow */
+  }
+
+  /* Paused state via sigil click (§8 IMMORTAL HEAD BAR) */
+  [data-attest-paused] .spirit-pulse-host::after,
+  [data-attest-paused].spirit-pulse-host::after {
+    animation-play-state: paused;
+    /* revert to static glow when paused */
+    box-shadow: 0 0 8px 2px color-mix(in srgb, var(--spirit-amber) 40%, transparent);
+  }
+}
+
+/* Spirit pulse on the Immortal Head bar — 1px breath on the bar edge */
+.immortal-head-bar::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 0; right: 0;
+  height: 1px;
+  background: var(--spirit-amber);
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes bar-breath {
+    0%, 100% { opacity: 0.2; }
+    50% { opacity: 0.7; }
+  }
+
+  .immortal-head-bar::after {
+    animation: bar-breath 1667ms ease-in-out infinite;
+  }
+
+  [data-attest-paused] .immortal-head-bar::after {
+    animation-play-state: paused;
+    opacity: 0.4;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   2. Venom Ink — global state-arrival clip-path expansion
+   Applied when an element transitions to active/error/selected.
+   --seed-x / --seed-y set inline by the triggering component.
+   Utility: add class .venom-enter to trigger; animation removes itself.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes venom-ink {
+    from {
+      clip-path: circle(0% at var(--seed-x) var(--seed-y));
+      opacity: 0;
+    }
+    to {
+      clip-path: circle(150% at var(--seed-x) var(--seed-y));
+      opacity: 1;
+    }
+  }
+
+  .venom-enter {
+    animation: venom-ink 280ms ease-out forwards;
+  }
+}
+
+/* Reduced-motion: opacity fade only */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes venom-ink-reduced {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .venom-enter {
+    animation: venom-ink-reduced 200ms ease-out forwards;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   3. Trace Inscription — clip-path left-sweep for new trace lines (from D5)
+   Each new envelope line sweeps in from left, operator as co-author.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes trace-inscription {
+    from {
+      clip-path: inset(0 100% 0 0);
+      opacity: 0.6;
+    }
+    to {
+      clip-path: inset(0 0% 0 0);
+      opacity: 1;
+    }
+  }
+
+  .trace-inscribe {
+    animation: trace-inscription 320ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes trace-inscription-reduced {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .trace-inscribe {
+    animation: trace-inscription-reduced 150ms ease-out forwards;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   4. Biolume Travel — conic-gradient phase advance (800ms peristaltic wave)
+   Applied to phase spine progress fill.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes biolume-travel {
+    from {
+      mask-position: -100% 0;
+      opacity: 0.6;
+    }
+    to {
+      mask-position: 0% 0;
+      opacity: 1;
+    }
+  }
+
+  .biolume-advance {
+    animation: biolume-travel 800ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .biolume-advance {
+    transition: background-color 200ms ease, opacity 200ms ease;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   5. Head Ignition — squad goes active → head brightens + flame
+   SVG opacity transition + aria-hidden flame sprite.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes head-ignition {
+    0% { opacity: 0.3; filter: saturate(0.3); }
+    60% { opacity: 1; filter: saturate(1.4); }
+    100% { opacity: 1; filter: saturate(1); }
+  }
+
+  .head-ignite {
+    animation: head-ignition 600ms ease-out forwards;
+  }
+
+  @keyframes flame-flicker {
+    0% { opacity: 0; transform: scaleY(0.8) scaleX(0.9); }
+    30% { opacity: 1; transform: scaleY(1.1) scaleX(0.95); }
+    60% { opacity: 0.9; transform: scaleY(0.95) scaleX(1.05); }
+    100% { opacity: 1; transform: scaleY(1) scaleX(1); }
+  }
+
+  .flame-enter {
+    animation: flame-flicker 400ms ease-out forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .head-ignite {
+    opacity: 1;
+    filter: saturate(1);
+    transition: none;
+  }
+  .flame-enter {
+    opacity: 1;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   6. Oracle Voice Line Assembly — 40ms stagger, 8px translateY slide
+   Each line slides from translateY(8px)+opacity:0 → settled+opacity:1
+   240ms ease-out per line. Stagger applied via CSS custom prop --line-index.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes oracle-line-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .oracle-line {
+    animation: oracle-line-in 240ms ease-out both;
+    animation-delay: calc(var(--line-index, 0) * 40ms);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes oracle-line-reduced {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .oracle-line {
+    animation: oracle-line-reduced 120ms ease-out both;
+    animation-delay: 0ms; /* all lines appear simultaneously */
+  }
+}
+
+/* -------------------------------------------------------------------------
+   7. Budget Flash — 100% breach alarm (opacity only — safe for RM isolation)
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes budget-alarm {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .budget-alarm {
+    animation: budget-alarm 1.2s ease-in-out infinite;
+  }
+}
+
+/* Reduced-motion: no flash; static state + text label (handled in component) */
+@media (prefers-reduced-motion: reduce) {
+  .budget-alarm {
+    animation: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   8. Venom Tremor (from D1) — venom-class action staged
+   200ms 4px body tremor + --venom edge glow.
+   Reduced-motion: no tremor; static venom edge glow only.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes venom-tremor {
+    0%   { transform: translateX(0); }
+    20%  { transform: translateX(-4px); }
+    40%  { transform: translateX(4px); }
+    60%  { transform: translateX(-3px); }
+    80%  { transform: translateX(3px); }
+    100% { transform: translateX(0); }
+  }
+
+  .venom-tremble {
+    animation: venom-tremor 200ms ease-out;
+    box-shadow: 0 0 0 1px var(--venom), 0 0 12px 2px color-mix(in srgb, var(--venom) 30%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .venom-tremble {
+    animation: none;
+    box-shadow: 0 0 0 2px var(--venom);
+  }
+}
+
+/* Static venom edge glow (always visible for venom-class context) */
+.venom-context {
+  box-shadow: 0 0 0 1px var(--venom);
+  border-color: var(--venom) !important;
+}
+
+/* -------------------------------------------------------------------------
+   9. Seal Break ceremony timing (for venom-class gates — R4 implements detail)
+   Timing constants as CSS custom props for the R4 engineer:
+     Standard: crack 600ms + halves 400ms + reveal 300ms = ~1.3s
+     Venom: crack 300ms + halves (±24px) + reveal = ~0.9s
+------------------------------------------------------------------------- */
+
+:root {
+  --seal-crack-ms: 600ms;
+  --seal-halves-ms: 400ms;
+  --seal-reveal-ms: 300ms;
+  --seal-crack-ms-venom: 300ms;
+}
+
+/* -------------------------------------------------------------------------
+   10. Many→One Synthesis — streaks converge into Oracle (R3/R4 full impl)
+   Utility class stub; full SVG animation in R3.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes synthesis-streak {
+    from {
+      stroke-dashoffset: var(--streak-len, 200);
+      opacity: 0;
+    }
+    to {
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }
+  }
+
+  .synthesis-streak {
+    animation: synthesis-streak 600ms ease-out forwards;
+    animation-delay: calc(var(--streak-index, 0) * 40ms);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .synthesis-streak {
+    stroke-dashoffset: 0;
+    opacity: 1;
+    transition: opacity 200ms ease;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   11. Serpentine nav underline — active route indicator
+   SVG path draws between nav items on route change (300ms ease).
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes serpentine-draw {
+    from { stroke-dashoffset: var(--serp-len, 100); }
+    to { stroke-dashoffset: 0; }
+  }
+
+  .nav-serpentine {
+    animation: serpentine-draw 300ms ease forwards;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   12. will-change lifecycle management (D5 §3.2)
+   Apply .animating to promote layer; JS removes it on animationend.
+------------------------------------------------------------------------- */
+.animating {
+  will-change: transform, opacity;
+}
+/* After animation: reset (handled in JS via animationend → removeClass) */

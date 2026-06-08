@@ -1,0 +1,210 @@
+/**
+ * Pentecost Cockpit — Design Tokens
+ * §2 Visual System: palette, type, spacing, radii, z-layers
+ *
+ * Font loading strategy: Google Fonts via <link> in index.html.
+ * Four families: Cormorant Garamond (Spirit/Oracle voice),
+ *   Cinzel (carved covenant register), Barlow Condensed + Inter (UI),
+ *   JetBrains Mono (data/trace).
+ */
+
+:root {
+  /* -------------------------------------------------------------------------
+     Palette — §2 exact tokens
+  ------------------------------------------------------------------------- */
+  --void: #09090F;           /* ground: blue-black depth */
+  --void-panel: #0D0E16;     /* rail / panel fill */
+  --covenant-indigo: #161A2E; /* glass panel tint, head-orbit field */
+  --spirit-amber: #F4A820;   /* THE Spirit — central glow, heartbeat, one-voice accent */
+  --bone: #F2EDE3;           /* primary text — 17:1 on void (AAA) */
+  --bone-mid: #A2A0B0;       /* metadata — 5.8:1 on void (AA) */
+  --crown-exec: #C8922A;     /* Executive crown — sovereign gold — USE only at large text or UI component */
+  --crown-forge: #37C6E0;    /* Forge crown — craft cyan — 9.1:1 on void (AAA) */
+  --crown-garland: #E0568C;  /* Garland crown — creative rose — 5.4:1 on void (AA) */
+  --biolume: #00E5CC;        /* active phase / live progress — 7.1:1 on void */
+  --venom: #CC2200;          /* RESERVED: venom-class only (force-dispatch, live-replay, Cerberus gate) */
+  --gold-immortal: #C9A84C;  /* immortal-head sigil + constitution glyph — 6.1:1 on void */
+
+  /* Derived / semantic aliases */
+  --sinew: var(--bone-mid);      /* budget strand default color */
+  --amber-tension: var(--spirit-amber); /* budget strand at tension */
+  --biolume-dim: color-mix(in srgb, var(--biolume) 40%, var(--void)); /* spent phase */
+
+  /* -------------------------------------------------------------------------
+     Typography — §2 type families (loaded from Google Fonts in index.html)
+  ------------------------------------------------------------------------- */
+  --font-oracle: 'Cormorant Garamond', 'Georgia', serif;   /* Spirit/Oracle voice only */
+  --font-covenant: 'Cinzel', 'Trajan Pro', serif;          /* carved covenant register */
+  --font-ui: 'Inter', 'Barlow Condensed', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Consolas', 'SF Mono', monospace;
+
+  /* Type scale */
+  --t-giant: clamp(1.75rem, 3vw, 2.5rem); /* hero / motto */
+  --t-display: 1.5rem;    /* Oracle voice lines */
+  --t-heading: 1.125rem;  /* section headings */
+  --t-body: 0.875rem;     /* primary UI — 14px */
+  --t-small: 0.8125rem;   /* 13px dense UI */
+  --t-micro: 0.6875rem;   /* 11px: metadata, badges */
+  --t-nano: 0.625rem;     /* 10px: epigraphic labels */
+
+  /* -------------------------------------------------------------------------
+     Spacing
+  ------------------------------------------------------------------------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* -------------------------------------------------------------------------
+     Radii
+  ------------------------------------------------------------------------- */
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --radius-pill: 999px;
+
+  /* -------------------------------------------------------------------------
+     Z-layers (semantic stack)
+  ------------------------------------------------------------------------- */
+  --z-base: 0;
+  --z-panel: 10;
+  --z-rail: 20;
+  --z-immortal-head: 100;  /* top bar — never scrolls under */
+  --z-phase-rail: 150;     /* Phase Rail overlay strip */
+  --z-dialog: 200;         /* confirm/gate dialogs */
+  --z-toast: 300;          /* SR-only announcements */
+
+  /* -------------------------------------------------------------------------
+     Layout dimensions
+  ------------------------------------------------------------------------- */
+  --immortal-head-h: 52px;   /* top bar fixed height */
+  --body-rail-w: 220px;      /* left rail width */
+  --oracle-rail-w: 280px;    /* right oracle rail width */
+
+  /* -------------------------------------------------------------------------
+     Budget custom property (set by JS per workflow)
+  ------------------------------------------------------------------------- */
+  --budget-pct: 0;
+
+  /* -------------------------------------------------------------------------
+     Venom-ink seed point (set by triggering component via inline style)
+  ------------------------------------------------------------------------- */
+  --seed-x: 50%;
+  --seed-y: 50%;
+
+  /* -------------------------------------------------------------------------
+     Legacy bridge tokens (kept for existing components during transition)
+     These map old C7 tokens → Pentecost equivalents
+  ------------------------------------------------------------------------- */
+  --color-bg: var(--void);
+  --color-surface: var(--void-panel);
+  --color-surface-2: var(--covenant-indigo);
+  --color-surface-3: color-mix(in srgb, var(--covenant-indigo) 70%, var(--void));
+  --color-border: color-mix(in srgb, var(--bone) 12%, transparent);
+  --color-border-subtle: color-mix(in srgb, var(--bone) 6%, transparent);
+  --color-text: var(--bone);
+  --color-text-muted: var(--bone-mid);
+  --color-text-subtle: color-mix(in srgb, var(--bone-mid) 60%, transparent);
+  --color-primary: var(--biolume);
+  --color-primary-dark: color-mix(in srgb, var(--biolume) 70%, var(--void));
+  --color-danger: var(--venom);
+  --color-danger-dark: color-mix(in srgb, var(--venom) 70%, var(--void));
+  --color-warn: var(--spirit-amber);
+  --color-success: var(--biolume);
+  --color-venom: var(--venom);
+  --color-accent: var(--biolume);
+  --color-gate-loud: var(--venom);
+
+  /* gap/radius bridge tokens */
+  --gap: var(--sp-3);
+  --gap-lg: var(--sp-6);
+}
+
+/* -------------------------------------------------------------------------
+   Base reset + global defaults on the new token system
+------------------------------------------------------------------------- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: var(--void);
+  color: var(--bone);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Meta color-scheme so browser chrome darkens */
+:root { color-scheme: dark; }
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* -------------------------------------------------------------------------
+   Focus — amber outline (8.3:1 on void — AAA; satisfies WCAG 2.4.11)
+------------------------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--spirit-amber);
+  outline-offset: 2px;
+}
+
+/* -------------------------------------------------------------------------
+   Skip-to-content — first focusable element in <body>
+------------------------------------------------------------------------- */
+.skip-link {
+  position: absolute;
+  top: -100%;
+  left: var(--sp-4);
+  z-index: calc(var(--z-dialog) + 10);
+  background: var(--spirit-amber);
+  color: var(--void);
+  font-family: var(--font-ui);
+  font-size: var(--t-small);
+  font-weight: 600;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+}
+.skip-link:focus {
+  top: var(--sp-2);
+}
+
+/* -------------------------------------------------------------------------
+   Utility classes
+------------------------------------------------------------------------- */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.mono { font-family: var(--font-mono); font-size: 0.875em; }
+.covenant { font-family: var(--font-covenant); }
+.oracle-voice { font-family: var(--font-oracle); }
+
+.text-sm { font-size: var(--t-small); }
+.text-muted { color: var(--bone-mid); }
+.required-mark { color: var(--venom); }
+
+.btn-link {
+  background: none; border: none; padding: 0;
+  color: var(--biolume); cursor: pointer; font-size: inherit;
+  text-decoration: underline;
+}

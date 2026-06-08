@@ -5,11 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <meta name="description" content="Hydra Cockpit — operator UI for the Hydra orchestrator" />
-    <meta name="theme-color" content="#0d1117" />
+    <meta name="theme-color" content="#09090F" />
     <title>Hydra Cockpit</title>
+
+    <!--
+      Font loading — Google Fonts (strategy: single <link> preconnect + stylesheet).
+      Four families per §2:
+        Cormorant Garamond 300,300i — Spirit/Oracle voice
+        Cinzel 400,600       — carved covenant register
+        Barlow Condensed 400 — dense UI labels
+        JetBrains Mono 400   — trace stream, IDs, budgets
+      Inter (UI body) is loaded via @fontsource in main or served by browser fallback
+      (system-ui / Segoe UI are visually equivalent for dense metadata).
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;1,300;1,400&family=Cinzel:wght@400;600&family=Barlow+Condensed:wght@400;500&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap"
+    />
+
     <style>
-      /* Prevent FOUC before React hydrates */
-      html { background: #0d1117; color: #e6edf3; }
+      /* Prevent FOUC before React hydrates — Pentecost void */
+      html { background: #09090F; color: #F2EDE3; }
     </style>
   </head>
   <body>
