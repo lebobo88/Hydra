@@ -279,7 +279,8 @@ async function readTool<T = unknown>(
 // Main request handler
 // ---------------------------------------------------------------------------
 
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** Exported for test harnesses that spin up a dedicated test HTTP server. */
+export async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   // INVARIANT #3 — DNS-rebinding defense: Host must be loopback on EVERY request
   if (!isLoopbackHost(req)) {
     json(res, 403, { error: 'loopback host required (DNS-rebinding protection)', code: 'HOST_REJECTED' });
@@ -785,16 +786,70 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     // GET /api/memory/cells?cell=<bagua_key>&limit=&workflow_id= — query_eights
+    //
+    // Two modes:
+    //   ABSENT cell param  → fan out all 8 bagua keys, return {cells:[{cell,count},...], degraded?:true}
+    //   PRESENT cell param → query that single cell, return {cell, records, rows, count}
+    //                        (rows is an alias kept for back-compat; records is what the SPA reads)
+    //
+    // Invalid cell → 400 (never 502).
     if (path === '/api/memory/cells') {
-      const cell = url.searchParams.get('cell') ?? '';
+      const rawCell = url.searchParams.get('cell');
       const limit = Math.min(
         200,
         Math.max(1, parseInt(url.searchParams.get('limit') ?? '50', 10) || 50),
       );
       const workflowId = url.searchParams.get('workflow_id') ?? undefined;
-      const cellArgs: Record<string, unknown> = { cell, limit };
-      if (workflowId !== undefined) cellArgs['workflow_id'] = workflowId;
-      json(res, 200, await readTool('hydra-mem.query_eights', cellArgs));
+
+      if (rawCell !== null && rawCell !== '') {
+        // --- DRILL-DOWN: single cell ---
+        // Validate the cell is one of the 8 bagua keys (400, not 502, on invalid).
+        if (!BAGUA_SET.has(rawCell)) {
+          json(res, 400, {
+            error: `invalid cell '${rawCell}' — must be one of: ${TAG_MEMORY_BAGUA_KEYS.join(', ')}`,
+            code: 'INVALID_CELL',
+          });
+          return;
+        }
+        const cellArgs: Record<string, unknown> = { cell: rawCell, limit };
+        if (workflowId !== undefined) cellArgs['workflow_id'] = workflowId;
+        const result = await readTool<{ cell?: string; rows?: unknown[]; count?: number }>(
+          'hydra-mem.query_eights',
+          cellArgs,
+        );
+        // Shape the response so the SPA's drill-down can read body.records.
+        // Keep rows as an alias for any existing consumers.
+        json(res, 200, {
+          cell: result.cell ?? rawCell,
+          records: result.rows ?? [],
+          rows: result.rows ?? [],
+          count: result.count ?? (result.rows?.length ?? 0),
+        });
+        return;
+      }
+
+      // --- OVERVIEW: fan out all 8 bagua keys ---
+      // Each query_eights call with limit=200 gives an accurate count for
+      // realistic episodic DB sizes; treat any per-cell error as count=0 + degraded.
+      const OVERVIEW_LIMIT = 200;
+      let degraded = false;
+      const cellResults = await Promise.all(
+        TAG_MEMORY_BAGUA_KEYS.map(async (key) => {
+          try {
+            const r = await readTool<{ cell?: string; rows?: unknown[]; count?: number }>(
+              'hydra-mem.query_eights',
+              { cell: key, limit: OVERVIEW_LIMIT },
+            );
+            return { cell: key, count: r.count ?? (r.rows?.length ?? 0) };
+          } catch {
+            degraded = true;
+            return { cell: key, count: 0 };
+          }
+        }),
+      );
+      const overview: Record<string, unknown> = { cells: cellResults };
+      if (degraded) overview['degraded'] = true;
+      json(res, 200, overview);
       return;
     }
 
