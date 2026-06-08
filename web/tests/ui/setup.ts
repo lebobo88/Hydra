@@ -26,3 +26,6 @@ vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
   status: 200,
   json: () => Promise.resolve({}),
 }));
+
+// jsdom does not implement scrollIntoView — stub it globally
+Element.prototype.scrollIntoView = vi.fn();

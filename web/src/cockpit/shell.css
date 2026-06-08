@@ -1253,6 +1253,554 @@
 }
 
 /* =========================================================================
+   R3 — THE LIVING RUN (Live Workflow view interior)
+   Vertical phase spine + biolume peristalsis; squad-head emergence;
+   trace inscription; budget tension strand; task register; scroll-pause pill.
+========================================================================= */
+
+/* Living run container — flex column, full height */
+.living-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-height: 0;
+}
+
+/* Living run header — compact, no decorative view-header */
+.living-run-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.living-run-back {
+  font-size: var(--t-small);
+  color: var(--bone-mid);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 28px;
+}
+.living-run-back:hover { color: var(--bone); }
+
+.living-run-id {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+}
+
+.living-run-phase-badge {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  font-weight: 600;
+  padding: 2px var(--sp-2);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--biolume) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--biolume) 30%, transparent);
+  color: var(--biolume);
+}
+.living-run-phase-badge--approval,
+.living-run-phase-badge--judge,
+.living-run-phase-badge--synthesis {
+  background: color-mix(in srgb, var(--spirit-amber) 12%, transparent);
+  border-color: color-mix(in srgb, var(--spirit-amber) 30%, transparent);
+  color: var(--spirit-amber);
+}
+.living-run-phase-badge--done {
+  background: color-mix(in srgb, var(--biolume-dim) 20%, transparent);
+  border-color: color-mix(in srgb, var(--biolume-dim) 40%, transparent);
+  color: var(--biolume-dim);
+}
+.living-run-phase-badge--surfaced {
+  background: color-mix(in srgb, var(--spirit-amber) 12%, transparent);
+  border-color: color-mix(in srgb, var(--spirit-amber) 30%, transparent);
+  color: var(--spirit-amber);
+}
+
+.living-run-stream-pill {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  margin-left: auto;
+}
+.living-run-stream-pill--live {
+  color: var(--biolume);
+  border: 1px solid color-mix(in srgb, var(--biolume) 30%, transparent);
+  background: color-mix(in srgb, var(--biolume) 8%, transparent);
+}
+.living-run-stream-pill--poll {
+  color: var(--spirit-amber);
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 30%, transparent);
+  background: color-mix(in srgb, var(--spirit-amber) 8%, transparent);
+}
+.living-run-stream-pill--paused {
+  color: var(--bone-mid);
+  border: 1px solid color-mix(in srgb, var(--bone-mid) 20%, transparent);
+  background: color-mix(in srgb, var(--bone-mid) 8%, transparent);
+}
+
+.living-run-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+/* ---- Vertical Phase Spine ---- */
+.phase-spine-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.phase-spine-label {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+  margin-bottom: var(--sp-1);
+}
+
+.phase-spine {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0;
+  position: relative;
+  /* Spine SVG + phase nodes side-by-side */
+}
+
+/* The SVG containing spine track + squad arms */
+.phase-spine-svg {
+  flex-shrink: 0;
+  overflow: visible;
+}
+
+/* Phase node list — vertical, beside the SVG */
+.phase-node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1;
+}
+
+.phase-spine-node {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 48px;
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--radius-sm);
+  position: relative;
+  transition: background 0.15s;
+}
+
+.phase-spine-node--active {
+  background: color-mix(in srgb, var(--biolume) 6%, transparent);
+}
+
+.phase-spine-node--interrupt {
+  /* Interrupt-before boundary: subtle amber left stripe */
+  border-left: 2px solid color-mix(in srgb, var(--spirit-amber) 40%, transparent);
+}
+
+.phase-spine-name {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+  min-width: 70px;
+  flex-shrink: 0;
+}
+.phase-spine-name--active { color: var(--biolume); }
+.phase-spine-name--done { color: color-mix(in srgb, var(--bone-mid) 60%, transparent); }
+.phase-spine-name--interrupt { color: var(--spirit-amber); }
+
+.phase-spine-status {
+  font-size: var(--t-nano);
+  color: var(--bone-mid);
+}
+
+.phase-interrupt-marker {
+  font-size: var(--t-nano);
+  color: var(--spirit-amber);
+  margin-left: var(--sp-1);
+}
+
+/* Squad-head arms region — appears at dispatch phase */
+.dispatch-arms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  align-items: center;
+  padding: var(--sp-1) 0;
+}
+
+.dispatch-arm-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--t-nano);
+  font-family: var(--font-mono);
+  padding: 2px var(--sp-2);
+  border-radius: var(--radius-pill);
+  border: 1px solid currentColor;
+  opacity: 0; /* starts invisible; arm-draw brings it in */
+}
+.dispatch-arm-head--active {
+  opacity: 1; /* already emerged */
+}
+.dispatch-arm-head--exec    { color: var(--crown-exec); }
+.dispatch-arm-head--forge   { color: var(--crown-forge); }
+.dispatch-arm-head--garland { color: var(--crown-garland); }
+
+/* Flame icon on active head */
+.head-flame-icon {
+  font-size: 10px;
+}
+
+/* ---- Budget Tension Strand ---- */
+.budget-strand-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.budget-strand-label {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+}
+
+.budget-strand-annotation {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  color: var(--bone-mid);
+  margin-left: auto;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.budget-strand-track {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bone-mid) 12%, transparent);
+  overflow: visible;
+}
+
+.budget-strand-fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  min-width: 2px;
+  transition: width 0.3s ease;
+  /* §8 sinew→amber color-mix per budget pct */
+  background: color-mix(
+    in oklch,
+    var(--sinew) calc((1 - var(--budget-pct, 0)) * 100%),
+    var(--amber-tension) calc(var(--budget-pct, 0) * 100%)
+  );
+}
+.budget-strand-fill--warn {
+  background: var(--spirit-amber);
+}
+.budget-strand-fill--critical {
+  background: var(--venom);
+}
+
+/* Band tick marks at 80% and 100% */
+.budget-strand-mark {
+  position: absolute;
+  top: -4px;
+  width: 1px;
+  height: 12px;
+  transform: translateX(-50%);
+  opacity: 0.6;
+}
+.budget-strand-mark--80 { background: var(--spirit-amber); left: 80%; }
+.budget-strand-mark--100 { background: var(--venom); left: 100%; }
+
+/* ---- Trace (Envelope Stream) ---- */
+.trace-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-height: 0;
+  position: relative;
+}
+
+.trace-section-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.trace-section-label {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+}
+
+.trace-count-badge {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  color: color-mix(in srgb, var(--bone-mid) 60%, transparent);
+}
+
+.trace-scroll-container {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--void-panel);
+  border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  /* Smooth scrolling for auto-scroll */
+  scroll-behavior: smooth;
+}
+
+/* Trace line with inscription animation */
+.trace-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  padding: 3px var(--sp-1);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid transparent;
+  /* New lines animate in via trace-inscribe class */
+}
+
+.trace-line:hover {
+  background: color-mix(in srgb, var(--bone) 4%, transparent);
+}
+
+/* Reflexion ×1 — amber left border + italic annotation */
+.trace-line--reflexion {
+  border-left-color: var(--spirit-amber);
+  background: color-mix(in srgb, var(--spirit-amber) 4%, transparent);
+}
+
+/* Violation (reflexion > 1) — venom border + venom bg */
+.trace-line--violation {
+  border-left-color: var(--venom);
+  background: color-mix(in srgb, var(--venom) 6%, transparent);
+}
+
+/* Judge verdict line */
+.trace-line--judge {
+  border-left-color: var(--biolume);
+}
+
+.trace-ts {
+  color: color-mix(in srgb, var(--bone-mid) 50%, transparent);
+  width: 72px;
+  flex-shrink: 0;
+}
+
+.trace-kind-label {
+  color: var(--bone);
+  flex-shrink: 0;
+  min-width: 90px;
+}
+.trace-kind-label--judge    { color: var(--biolume); }
+.trace-kind-label--reflexion { color: var(--spirit-amber); font-style: italic; }
+
+.trace-actor-label { color: var(--bone-mid); font-size: 0.9em; }
+.trace-vendor-label { color: var(--bone-mid); font-size: 0.9em; }
+
+.trace-outcome-label {
+  font-size: 0.9em;
+}
+.trace-outcome-label--approve { color: var(--biolume); }
+.trace-outcome-label--revise  { color: var(--spirit-amber); }
+
+.trace-retry-label {
+  color: var(--spirit-amber);
+  font-weight: 600;
+  font-style: italic;
+}
+.trace-retry-label--violation {
+  color: var(--venom);
+  font-style: normal;
+}
+
+.trace-reflexion-annotation {
+  font-size: var(--t-nano);
+  font-style: italic;
+  color: var(--spirit-amber);
+  margin-left: var(--sp-1);
+}
+
+.trace-gap-notice {
+  padding: var(--sp-3) var(--sp-4);
+  color: var(--bone-mid);
+  font-size: var(--t-small);
+  font-style: italic;
+  text-align: center;
+  font-family: var(--font-oracle);
+}
+
+/* "↓ new events" scroll-pause pill */
+.scroll-pause-pill {
+  position: sticky;
+  bottom: var(--sp-2);
+  align-self: center;
+  padding: 4px var(--sp-4);
+  background: color-mix(in srgb, var(--spirit-amber) 90%, transparent);
+  color: var(--void);
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  font-weight: 700;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  border: none;
+  z-index: var(--z-panel);
+  min-height: 28px;
+  min-width: 28px;
+}
+.scroll-pause-pill:hover,
+.scroll-pause-pill:focus-visible {
+  background: var(--spirit-amber);
+  outline: 2px solid var(--spirit-amber);
+  outline-offset: 2px;
+}
+
+/* ---- Task Register ---- */
+.task-register {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  background: var(--void-panel);
+  border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.task-register-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  background: color-mix(in srgb, var(--covenant-indigo) 60%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  cursor: pointer;
+  min-height: 36px;
+  user-select: none;
+}
+
+.task-register-header-label {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-mid);
+  flex: 1;
+}
+
+.task-register-toggle {
+  font-size: var(--t-nano);
+  color: var(--bone-mid);
+}
+
+.task-register-list {
+  list-style: none;
+  padding: var(--sp-2) var(--sp-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.task-register-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  padding: 3px 0;
+}
+
+.task-status-mark {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+.task-status-mark--pending   { color: var(--bone-mid); }
+.task-status-mark--active    { color: var(--spirit-amber); }
+.task-status-mark--done      { color: var(--biolume); }
+
+.task-description {
+  color: var(--bone-mid);
+  flex: 1;
+}
+
+.task-owner {
+  color: color-mix(in srgb, var(--bone-mid) 60%, transparent);
+  font-size: var(--t-nano);
+}
+
+/* ---- Actions row ---- */
+.living-run-bottom-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  padding-top: var(--sp-2);
+  border-top: 1px solid color-mix(in srgb, var(--bone) 6%, transparent);
+}
+
+.living-run-bottom-actions .btn-venom-replay {
+  /* Replay-live = venom confirm path */
+  border-color: var(--venom);
+  color: var(--bone);
+  background: color-mix(in srgb, var(--venom) 10%, transparent);
+}
+.living-run-bottom-actions .btn-venom-replay:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--venom) 20%, transparent);
+}
+
+/* ---- Living run skeleton (loading state) ---- */
+.living-run-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+  opacity: 0.4;
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--bone-mid) 20%, transparent);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes skeleton-shimmer {
+    0%, 100% { opacity: 0.3; }
+    50%       { opacity: 0.6; }
+  }
+  .skeleton-line {
+    animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  }
+}
+
+/* =========================================================================
    R2 — THE CONSTELLATION (Launchpad view interior)
    Layout + visual rules for constellation-view, constellation-field,
    constellation-svg, speak-intent, recent-intent-chips, accessible-twin.

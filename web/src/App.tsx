@@ -16,6 +16,7 @@ import { GateCockpitView } from './views/GateCockpitView.tsx';
 import { SquadsView } from './views/SquadsView.tsx';
 import { CampaignsView } from './views/CampaignsView.tsx';
 import { MemoryView } from './views/MemoryView.tsx';
+import { SynthesisContext } from './cockpit/SynthesisContext.ts';
 
 // ---------------------------------------------------------------------------
 // Crown glyph SVGs (16px inline, aria-hidden)
@@ -578,9 +579,15 @@ export function App(): JSX.Element {
   // Click-to-pause sigil toggle (§8 IMMORTAL HEAD BAR)
   const [attestPaused, setAttestPaused] = useState(false);
 
-  // Latest synthesis from oracle (passed from LiveWorkflowView in R3; stub for now)
-  const [latestSynthesis, _setLatestSynthesis] = useState<string | null>(null);
-  const isExecuting = parsed.view === 'workflow';
+  // Synthesis state — lifted from LiveWorkflowView via SynthesisContext (R3)
+  const [latestSynthesis, setLatestSynthesisState] = useState<string | null>(null);
+  const [isExecuting, setIsExecutingState] = useState(false);
+
+  // Stable setSynthesis callback for the context value
+  const setSynthesis = useCallback((text: string | null, executing: boolean) => {
+    setLatestSynthesisState(text);
+    setIsExecutingState(executing);
+  }, []);
 
   // Direct-jump keyboard shortcuts (§5, §8)
   useEffect(() => {
@@ -696,7 +703,10 @@ export function App(): JSX.Element {
       ? 'immortal-budget-fill immortal-budget-fill--warn'
       : 'immortal-budget-fill';
 
+  const synthesisContextValue = { latestSynthesis, isExecuting, setSynthesis };
+
   return (
+    <SynthesisContext.Provider value={synthesisContextValue}>
     <div
       className={`cockpit-shell${offline ? ' cockpit-shell--offline' : ''}`}
       data-testid="cockpit-shell"
@@ -854,5 +864,6 @@ export function App(): JSX.Element {
         />
       </div>
     </div>
+    </SynthesisContext.Provider>
   );
 }

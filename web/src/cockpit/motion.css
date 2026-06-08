@@ -564,3 +564,173 @@
 @media (prefers-reduced-motion: reduce) {
   .gate-pulse-ring { animation: none; opacity: 0.6; }
 }
+
+/* =========================================================================
+   R3 — LIVING WORKFLOW ANIMATIONS
+   Peristaltic phase advance, coiling progress ring, squad-head lateral draw,
+   ink-dry phase completion, scroll-pause pill reveal.
+   All wrapped in prefers-reduced-motion: no-preference per D4 §6 pattern.
+========================================================================= */
+
+/* -------------------------------------------------------------------------
+   17. Peristaltic phase advance — single traveling conic-gradient mask sweep
+   The biolume fill travels phase-to-phase as a continuous muscle contraction.
+   Applied via .phase-spine-fill on the active/completing segment SVG.
+   800ms cubic-bezier per transition, one visual gesture not two fills.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes phase-peristalsis {
+    0%   { mask-position: -100% 0; opacity: 0.6; }
+    60%  { mask-position: -20%  0; opacity: 1; }
+    100% { mask-position: 0%    0; opacity: 1; }
+  }
+
+  .phase-peristalsis {
+    animation: phase-peristalsis 800ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    will-change: mask-position, opacity;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phase-peristalsis {
+    /* Instant fill, 200ms opacity settle */
+    opacity: 1;
+    transition: opacity 200ms ease;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   18. Coiling progress ring — stroke-dasharray clockwise progress
+   Applied to SVG circle elements on each phase dot.
+   At completion: coils to 360° in 400ms then transitions to biolume-dim.
+   --progress CSS custom property (0–1) set by the SSE handler per phase.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes ring-coil-complete {
+    0%   { stroke-dashoffset: 0; stroke: var(--biolume); }
+    70%  { stroke-dashoffset: 0; stroke: var(--biolume); }
+    100% { stroke-dashoffset: 0; stroke: var(--biolume-dim); }
+  }
+
+  .phase-ring-complete {
+    animation: ring-coil-complete 400ms ease-out forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phase-ring-complete {
+    stroke-dashoffset: 0;
+    stroke: var(--biolume-dim);
+    transition: stroke 200ms ease;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   19. Squad-head lateral arm draw — stroke-dashoffset 0→path-length
+   600ms per head, 150ms stagger (applied via --head-index custom prop).
+   Head silhouette fill-opacity 0→1 over the final 200ms of the 600ms draw.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes arm-draw {
+    from { stroke-dashoffset: var(--arm-len, 120); opacity: 0.4; }
+    to   { stroke-dashoffset: 0; opacity: 1; }
+  }
+
+  .arm-draw {
+    animation: arm-draw 600ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    animation-delay: calc(var(--head-index, 0) * 150ms);
+    will-change: stroke-dashoffset, opacity;
+  }
+
+  @keyframes head-fill-emerge {
+    0%   { fill-opacity: 0; }
+    60%  { fill-opacity: 0; }
+    100% { fill-opacity: 1; }
+  }
+
+  .head-fill-emerge {
+    animation: head-fill-emerge 600ms ease-out forwards;
+    animation-delay: calc(var(--head-index, 0) * 150ms);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arm-draw {
+    stroke-dashoffset: 0;
+    opacity: 1;
+    transition: none;
+  }
+  .head-fill-emerge {
+    fill-opacity: 1;
+    transition: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   20. Ink-dry phase completion — SVG fill flood from biolume → biolume-dim
+   1.2s ease — the slow "ink settling" moment when a phase fully completes.
+   Distinct from the coiling ring (400ms); this is the final permanence signal.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .phase-dot-complete {
+    transition: fill 1.2s ease;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phase-dot-complete {
+    transition: fill 0ms;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   21. Scroll-pause pill reveal — "↓ new events" amber pill
+   Slides up from just below the trace viewport bottom on scroll-pause.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes pill-reveal {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .scroll-pause-pill {
+    animation: pill-reveal 200ms ease-out forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scroll-pause-pill {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   22. Serpentine cubic-bezier phase connector draw (vertical spine)
+   SVG path stroke-dashoffset full→0 on completion, 400ms cubic-bezier.
+   Done/surfaced connector draws in sequence with 60ms stagger per phase.
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes connector-draw {
+    from { stroke-dashoffset: var(--connector-len, 60); opacity: 0.5; }
+    to   { stroke-dashoffset: 0; opacity: 1; }
+  }
+
+  .phase-connector-draw {
+    animation: connector-draw 400ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+    animation-delay: calc(var(--connector-index, 0) * 60ms);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phase-connector-draw {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
