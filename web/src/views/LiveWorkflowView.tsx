@@ -641,6 +641,127 @@ function LivingRunSkeleton(): JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
+// SynthesisConvergence — showpiece: many crown-colored streaks rushing inward
+// ---------------------------------------------------------------------------
+
+interface SynthesisConvergenceProps {
+  squads: string[];
+}
+
+/** Crown color for a squad slug — mirrors the CROWN_MAP logic */
+function squadCrownColor(slug: string): string {
+  const exec = new Set(['executive', 'legal', 'finance', 'compliance']);
+  const forge = new Set(['engineering', 'forge', 'platform', 'infra', 'devops', 'security']);
+  const lower = slug.toLowerCase();
+  if (exec.has(lower)) return 'var(--crown-exec)';
+  if (forge.has(lower)) return 'var(--crown-forge)';
+  return 'var(--crown-garland)';
+}
+
+function SynthesisConvergence({ squads }: SynthesisConvergenceProps): JSX.Element {
+  const cx = 200;
+  const cy = 80;
+  const streakSources = squads.length > 0 ? squads.slice(0, 6) : ['a', 'b', 'c'];
+  const total = streakSources.length;
+
+  return (
+    <div
+      className="synthesis-convergence-wrapper"
+      aria-hidden="true"
+      data-testid="synthesis-convergence"
+    >
+      <svg
+        viewBox="0 0 400 160"
+        width="100%"
+        height="160"
+        aria-hidden="true"
+        className="synthesis-convergence-svg"
+      >
+        {/* Ambient aura at convergence center */}
+        <circle
+          cx={cx} cy={cy} r={24}
+          fill="none"
+          stroke="var(--spirit-amber)"
+          strokeWidth="0.6"
+          opacity="0.4"
+          className="synthesis-convergence-aura"
+        />
+        <circle
+          cx={cx} cy={cy} r={14}
+          fill="color-mix(in srgb, var(--spirit-amber) 15%, transparent)"
+          stroke="var(--spirit-amber)"
+          strokeWidth="1"
+          opacity="0.7"
+        />
+
+        {/* Synthesis.png flourish at center */}
+        <image
+          href="/images/chosen/synthesis.png"
+          x={cx - 20} y={cy - 20}
+          width={40} height={40}
+          preserveAspectRatio="xMidYMid meet"
+          opacity="0.7"
+          className="synthesis-hero-flourish"
+        />
+
+        {/* Convergence streaks — one per squad, from edges to center */}
+        {streakSources.map((slug, i) => {
+          const angle = (i / total) * Math.PI * 2 - Math.PI / 2;
+          const srcR = 160;
+          const srcX = cx + Math.cos(angle) * srcR;
+          const srcY = cy + Math.sin(angle) * srcR;
+          const color = squadCrownColor(slug);
+          // Approximate path length for dasharray
+          const pathLen = Math.sqrt((srcX - cx) ** 2 + (srcY - cy) ** 2);
+
+          return (
+            <line
+              key={slug}
+              x1={srcX} y1={srcY}
+              x2={cx} y2={cy}
+              stroke={color}
+              strokeWidth="1.5"
+              opacity="0.8"
+              strokeDasharray={`${pathLen}`}
+              strokeDashoffset={`${pathLen}`}
+              className="convergence-streak"
+              style={{
+                '--streak-index': i,
+                '--streak-len': pathLen,
+              } as React.CSSProperties}
+            />
+          );
+        })}
+
+        {/* Oracle radiance bloom — expands outward after streaks converge */}
+        <circle
+          cx={cx} cy={cy} r={0}
+          fill="none"
+          stroke="var(--spirit-amber)"
+          strokeWidth="1.5"
+          opacity="0"
+          className="oracle-radiance-bloom"
+          style={{ '--streak-count': total } as React.CSSProperties}
+        />
+
+        {/* Label */}
+        <text
+          x={cx} y={cy + 44}
+          textAnchor="middle"
+          fontSize="9"
+          fill="var(--spirit-amber)"
+          opacity="0.7"
+          fontFamily="var(--font-covenant)"
+          letterSpacing="0.12em"
+        >
+          SYNTHESIS
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main LiveWorkflowView component
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1228,11 @@ export function LiveWorkflowView({ workflowId, online }: LiveWorkflowViewProps):
           spent={wfState.budget?.spent_usd ?? 0}
           budget={wfState.budget?.budget_usd ?? 0}
         />
+      ) : null}
+
+      {/* ---- Synthesis Convergence Showpiece ---- */}
+      {wfState.phase === 'synthesis' ? (
+        <SynthesisConvergence squads={wfState.squads} />
       ) : null}
 
       {/* ---- Trace / Envelope Stream ---- */}

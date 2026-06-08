@@ -17,6 +17,9 @@ import { SquadsView } from './views/SquadsView.tsx';
 import { CampaignsView } from './views/CampaignsView.tsx';
 import { MemoryView } from './views/MemoryView.tsx';
 import { SynthesisContext } from './cockpit/SynthesisContext.ts';
+import { AmbientField } from './components/AmbientField.tsx';
+import { OracleWordAssembly } from './components/OracleWordAssembly.tsx';
+import { ViewTransition } from './components/ViewTransition.tsx';
 
 // ---------------------------------------------------------------------------
 // Crown glyph SVGs (16px inline, aria-hidden)
@@ -545,7 +548,7 @@ function OracleRail({ latestSynthesis, isExecuting }: OracleRailProps): JSX.Elem
               className="oracle-voice-line oracle-line"
               style={{ '--line-index': i } as React.CSSProperties}
             >
-              {line}{i < lines.length - 1 ? '.' : ''}
+              <OracleWordAssembly text={line + (i < lines.length - 1 ? '.' : '')} />
             </p>
           ))
         ) : (
@@ -852,8 +855,12 @@ export function App(): JSX.Element {
           aria-label="The Working — main content"
           data-testid="working-center"
         >
-          <div className="working-inner">
-            {renderView()}
+          {/* Living ambient field — drifting embers, parallax depth, vignette */}
+          <AmbientField />
+          <div className="working-inner" style={{ position: 'relative', zIndex: 1 }}>
+            <ViewTransition viewKey={parsed.view + (parsed.id ?? '')}>
+              {renderView()}
+            </ViewTransition>
           </div>
         </main>
 

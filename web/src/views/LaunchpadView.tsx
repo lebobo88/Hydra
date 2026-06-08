@@ -754,13 +754,50 @@ function SpiritNode({ cx, cy, r, isDiverging }: SpiritNodeProps): JSX.Element {
       data-testid="spirit-node"
       aria-hidden="true"
     >
-      {/* Outer glow ring */}
+      {/* Deep ambient glow — layered soft radiance */}
       <circle
-        cx={cx} cy={cy} r={r + 12}
+        cx={cx} cy={cy} r={r + 28}
+        fill="none"
+        stroke="var(--spirit-amber)"
+        strokeWidth="0.3"
+        opacity="0.06"
+      />
+      <circle
+        cx={cx} cy={cy} r={r + 20}
         fill="none"
         stroke="var(--spirit-amber)"
         strokeWidth="0.5"
-        opacity={isDiverging ? 0.25 : 0.15}
+        opacity="0.1"
+      />
+      {/* Corona ring — slow-rotating dashed ring (CSS animation applied) */}
+      <circle
+        cx={cx} cy={cy} r={r + 14}
+        fill="none"
+        stroke="var(--spirit-amber)"
+        strokeWidth="0.8"
+        opacity="0.22"
+        strokeDasharray="2 6"
+        className="spirit-corona"
+        style={{ transformOrigin: `${cx}px ${cy}px` } as React.CSSProperties}
+      />
+      {/* Second corona — opposite-phase rotation for depth */}
+      <circle
+        cx={cx} cy={cy} r={r + 8}
+        fill="none"
+        stroke="var(--spirit-amber)"
+        strokeWidth="0.5"
+        opacity="0.3"
+        strokeDasharray="4 4"
+        className="spirit-corona"
+        style={{ transformOrigin: `${cx}px ${cy}px`, animationDirection: 'reverse', animationDuration: '16s' } as React.CSSProperties}
+      />
+      {/* Outer glow ring */}
+      <circle
+        cx={cx} cy={cy} r={r + 6}
+        fill="none"
+        stroke="var(--spirit-amber)"
+        strokeWidth="0.5"
+        opacity={isDiverging ? 0.25 : 0.18}
         className="spirit-glow-ring"
       />
       {/* Main Spirit body */}
@@ -771,14 +808,19 @@ function SpiritNode({ cx, cy, r, isDiverging }: SpiritNodeProps): JSX.Element {
         strokeWidth="1.5"
         className="spirit-core-circle spirit-pulse-host"
       />
-      {/* Spirit image */}
-      <image
-        href="/images/chosen/spirit-core.png"
-        x={cx - r} y={cy - r}
-        width={r * 2} height={r * 2}
-        preserveAspectRatio="xMidYMid meet"
-        aria-hidden="true"
-      />
+      {/* Spirit image — slow counter-rotation for depth illusion */}
+      <g
+        className="spirit-image-rotating"
+        style={{ transformOrigin: `${cx}px ${cy}px` } as React.CSSProperties}
+      >
+        <image
+          href="/images/chosen/spirit-core.png"
+          x={cx - r} y={cy - r}
+          width={r * 2} height={r * 2}
+          preserveAspectRatio="xMidYMid meet"
+          aria-hidden="true"
+        />
+      </g>
       {/* Divergence indicator ring */}
       {isDiverging ? (
         <circle
@@ -816,12 +858,21 @@ function HeadNode({ hp, headData, isIntentHover, isAllIdle }: HeadNodeProps): JS
     ? `color-mix(in srgb, ${strokeColor} 25%, var(--void))`
     : 'var(--void)';
 
+  // Per-head drift period and phase derived from slug hash for deterministic diversity
+  const slugHash = stableHash(hp.slug);
+  const driftPeriod = 5 + (slugHash % 30) / 10; // 5–8s
+  const driftPhase = -((slugHash % 30) / 10);   // 0 to -3s offset
+
   return (
     <g
       className={`head-node${isActive ? ' head-node--active' : ''}${isIntentHover ? ' head-node--intent' : ''}${isAllIdle ? ' head-node--iau-idle' : ''}`}
       data-slug={hp.slug}
       data-crown={crown}
       aria-hidden="true"
+      style={{
+        '--drift-period': `${driftPeriod}s`,
+        '--drift-phase': `${driftPhase}s`,
+      } as React.CSSProperties}
     >
       {/* Head circle */}
       <circle
@@ -833,6 +884,18 @@ function HeadNode({ hp, headData, isIntentHover, isAllIdle }: HeadNodeProps): JS
         className={`head-circle${isActive ? ' head-ignite' : ''}`}
         style={{ '--head-angle': hp.angle } as React.CSSProperties}
       />
+      {/* Hover bloom ring — expands outward and fades */}
+      {(isActive || isIntentHover) ? (
+        <circle
+          cx={hp.x} cy={hp.y} r={r}
+          fill="none"
+          stroke={strokeColor}
+          strokeWidth="1"
+          opacity="0"
+          className="head-bloom-ring"
+          aria-hidden="true"
+        />
+      ) : null}
       {/* Head label */}
       <text
         x={hp.x} y={hp.y + r + 9}
@@ -846,7 +909,7 @@ function HeadNode({ hp, headData, isIntentHover, isAllIdle }: HeadNodeProps): JS
       >
         {hp.slug.slice(0, 8)}
       </text>
-      {/* Flame icon (active heads only) */}
+      {/* Flame image (active heads — primary) */}
       {isActive ? (
         <image
           href="/images/chosen/flame-sprite.png"
@@ -856,6 +919,38 @@ function HeadNode({ hp, headData, isIntentHover, isAllIdle }: HeadNodeProps): JS
           aria-hidden="true"
           className="head-flame flame-enter"
         />
+      ) : null}
+      {/* Flame lick particles — tiny SVG ellipses licking upward from active heads */}
+      {isActive ? (
+        <>
+          <ellipse
+            cx={hp.x - 2} cy={hp.y - r - 4}
+            rx="1.5" ry="3"
+            fill="var(--spirit-amber)"
+            opacity="0.8"
+            aria-hidden="true"
+            className="flame-lick"
+            style={{ transformOrigin: `${hp.x - 2}px ${hp.y - r - 4}px` } as React.CSSProperties}
+          />
+          <ellipse
+            cx={hp.x + 2} cy={hp.y - r - 6}
+            rx="1" ry="2.5"
+            fill="var(--spirit-amber)"
+            opacity="0.6"
+            aria-hidden="true"
+            className="flame-lick"
+            style={{ transformOrigin: `${hp.x + 2}px ${hp.y - r - 6}px` } as React.CSSProperties}
+          />
+          <ellipse
+            cx={hp.x} cy={hp.y - r - 8}
+            rx="0.8" ry="2"
+            fill="var(--bone)"
+            opacity="0.7"
+            aria-hidden="true"
+            className="flame-lick"
+            style={{ transformOrigin: `${hp.x}px ${hp.y - r - 8}px` } as React.CSSProperties}
+          />
+        </>
       ) : null}
       {/* Pending gate pulse ring */}
       {hasPendingGate ? (

@@ -111,6 +111,7 @@
 
 .immortal-nav-link {
   position: relative;
+  overflow: hidden; /* clip the bloom ::before */
   padding: var(--sp-1) var(--sp-3);
   font-family: var(--font-ui);
   font-size: var(--t-small);
@@ -241,6 +242,8 @@
 
 /* New Run CTA */
 .new-run-cta {
+  position: relative;
+  overflow: hidden; /* clip bloom ::before */
   display: inline-flex;
   align-items: center;
   gap: var(--sp-1);
@@ -425,6 +428,7 @@
   flex-direction: column;
   min-height: 0;
   position: relative;
+  isolation: isolate; /* contain stacking context for AmbientField */
 
   /* glass effect — constellation field uses backdrop-filter in R2 */
   background: var(--void);
@@ -1591,6 +1595,20 @@
    Vertical phase spine + biolume peristalsis; squad-head emergence;
    trace inscription; budget tension strand; task register; scroll-pause pill.
 ========================================================================= */
+
+/* Synthesis convergence showpiece wrapper */
+.synthesis-convergence-wrapper {
+  width: 100%;
+  background: color-mix(in srgb, var(--spirit-amber) 4%, var(--void-panel));
+  border: 1px solid color-mix(in srgb, var(--spirit-amber) 20%, transparent);
+  border-radius: var(--radius);
+  overflow: hidden;
+  padding: var(--sp-2) 0;
+}
+
+.synthesis-convergence-svg {
+  display: block;
+}
 
 /* Living run container — flex column, full height */
 .living-run {

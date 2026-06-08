@@ -480,7 +480,7 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
             className="bagua-radial-img"
           />
 
-          {/* Ring SVG — decorative orbit track only; aria-hidden */}
+          {/* Ring SVG — decorative orbit track + slow rotation; aria-hidden */}
           <svg
             viewBox="0 0 280 280"
             width="280"
@@ -488,6 +488,19 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
             className="bagua-ring-svg"
             aria-hidden="true"
           >
+            {/* Rotating outer dashed ring — slow 120s orbit */}
+            <circle
+              cx={CENTER}
+              cy={CENTER}
+              r={RING_R + 8}
+              fill="none"
+              stroke="var(--spirit-amber)"
+              strokeWidth="0.4"
+              opacity="0.12"
+              strokeDasharray="3 8"
+              className="bagua-ring-rotating"
+              style={{ transformOrigin: `${CENTER}px ${CENTER}px` } as React.CSSProperties}
+            />
             {/* Orbit track */}
             <circle
               cx={CENTER}
@@ -495,8 +508,36 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
               r={RING_R}
               className="bagua-ring-track"
             />
+            {/* Inner glow ring */}
+            <circle
+              cx={CENTER}
+              cy={CENTER}
+              r={RING_R - 10}
+              fill="none"
+              stroke="var(--spirit-amber)"
+              strokeWidth="0.3"
+              opacity="0.08"
+              strokeDasharray="6 12"
+              className="bagua-ring-rotating"
+              style={{
+                transformOrigin: `${CENTER}px ${CENTER}px`,
+                animationDirection: 'reverse',
+                animationDuration: '80s',
+              } as React.CSSProperties}
+            />
             {/* Spirit center glyph */}
-            <circle cx={CENTER} cy={CENTER} r={16} className="bagua-ring-center" />
+            <circle cx={CENTER} cy={CENTER} r={18} className="bagua-ring-center" />
+            {/* Ambient amber aura behind center */}
+            <circle
+              cx={CENTER}
+              cy={CENTER}
+              r={28}
+              fill="none"
+              stroke="var(--spirit-amber)"
+              strokeWidth="0.5"
+              opacity="0.15"
+              className="spirit-glow-ring"
+            />
             <text
               x={CENTER}
               y={CENTER + 1}
@@ -673,8 +714,11 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
             {searchResults.map((r, i) => (
               <li
                 key={i}
-                className="search-result trace-inscribe"
-                style={{ ['--line-index' as string]: i } as React.CSSProperties}
+                className="search-result trace-inscribe search-result-inscribed"
+                style={{
+                  ['--line-index' as string]: i,
+                  ['--result-index' as string]: i,
+                } as React.CSSProperties}
               >
                 <span className="mono text-sm">{r.cell ?? '?'}</span>
                 {r.workflow_id ? (

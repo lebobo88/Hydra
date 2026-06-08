@@ -12,3 +12,7 @@
 
 /* 3-region shell layout + all component styles */
 @import './cockpit/shell.css';
+
+/* Creative enhancement pass: AmbientField, ViewTransition, OracleWordAssembly,
+   micro-interactions, constellation corona, memory orbital, synthesis showpiece */
+@import './components/ambient-field.css';

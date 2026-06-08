@@ -1,0 +1,662 @@
+/**
+ * AmbientField — CSS for the living ambient particle layer.
+ *
+ * Structure:
+ *   .ambient-field-wrapper  — absolute-fills the Working center
+ *     .ambient-field-canvas — Canvas element (particles)
+ *     .ambient-vignette     — radial vignette (always present)
+ *     .ambient-scale-drift  — slow scale-texture parallax drift (CSS only)
+ *
+ * All animation rules inside @media (prefers-reduced-motion: no-preference).
+ * Canvas is hidden under reduced-motion (static vignette remains).
+ * aria-hidden="true" on the wrapper ensures no AT exposure.
+ */
+
+/* ---- Wrapper ---- */
+.ambient-field-wrapper {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+/* ---- Canvas: particle embers ---- */
+.ambient-field-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  /* Hidden by default; shown when motion allowed */
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ambient-field-canvas {
+    opacity: 1;
+  }
+}
+
+/* ---- Vignette: breathing radial shadow (always present) ---- */
+.ambient-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Static vignette — default (reduced-motion baseline) */
+  background: radial-gradient(
+    ellipse 80% 70% at 50% 60%,
+    transparent 0%,
+    color-mix(in srgb, var(--void) 25%, transparent) 55%,
+    color-mix(in srgb, var(--void) 65%, transparent) 100%
+  );
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes vignette-breathe {
+    0%, 100% {
+      opacity: 0.7;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1.04);
+    }
+  }
+
+  .ambient-vignette {
+    animation: vignette-breathe 8s ease-in-out infinite;
+    will-change: opacity, transform;
+  }
+}
+
+/* ---- Scale texture parallax drift ---- */
+.ambient-scale-drift {
+  position: absolute;
+  inset: -12%;   /* oversized so drift doesn't expose edges */
+  width: 124%;
+  height: 124%;
+  pointer-events: none;
+  background-image: url('/images/chosen/scale-texture.png');
+  background-size: 320px 320px;
+  background-repeat: repeat;
+  opacity: 0.025;   /* very subtle — material weight only */
+  mix-blend-mode: overlay;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes scale-parallax {
+    0%   { transform: translate(0, 0); }
+    25%  { transform: translate(-8px, -4px); }
+    50%  { transform: translate(-4px, -10px); }
+    75%  { transform: translate(6px, -6px); }
+    100% { transform: translate(0, 0); }
+  }
+
+  .ambient-scale-drift {
+    animation: scale-parallax 45s ease-in-out infinite;
+    /* GPU-friendly: transform only, no layout */
+    will-change: transform;
+  }
+}
+
+/* =========================================================================
+   ViewTransition — route change choreography
+   Fallback CSS (no View Transitions API) + VTA pseudo-element styles.
+========================================================================= */
+
+.view-transition-host {
+  width: 100%;
+  height: 100%;
+  /* No styles by default — transparent wrapper */
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes view-settle-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .view-transition-host.view-transition-enter {
+    animation: view-settle-in 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    will-change: opacity, transform;
+  }
+
+  /* View Transitions API pseudo-element: new state settles in */
+  ::view-transition-new(main-view) {
+    animation: view-settle-in 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  /* Old state fades out */
+  @keyframes view-fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+
+  ::view-transition-old(main-view) {
+    animation: view-fade-out 180ms ease-out both;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes view-settle-in-reduced {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .view-transition-host.view-transition-enter {
+    animation: view-settle-in-reduced 80ms ease-out both;
+  }
+}
+
+/* =========================================================================
+   OracleWordAssembly — word-by-word stagger
+========================================================================= */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes oracle-word-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .oracle-word {
+    display: inline;
+    animation: oracle-word-in 200ms ease-out both;
+    animation-delay: calc(var(--word-index, 0) * 30ms);
+    will-change: opacity, transform;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes oracle-word-in-reduced {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .oracle-word {
+    display: inline;
+    animation: oracle-word-in-reduced 120ms ease-out both;
+    /* No delay in reduced motion — all appear simultaneously */
+  }
+}
+
+/* =========================================================================
+   Micro-interactions: button/nav hover blooms + focus glows
+   All in prefers-reduced-motion: no-preference per D4 §6 pattern.
+========================================================================= */
+
+/* Nav link hover bloom — crown-colored radial expand from center */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes nav-bloom {
+    from {
+      opacity: 0;
+      transform: scale(0.6);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .immortal-nav-link::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in srgb, var(--spirit-amber) 12%, transparent) 0%,
+      transparent 70%
+    );
+    opacity: 0;
+    transform: scale(0.6);
+    transition: opacity 0.18s ease, transform 0.22s ease;
+    pointer-events: none;
+  }
+
+  .immortal-nav-link:hover::before,
+  .immortal-nav-link:focus-visible::before {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  /* Active nav link: persistent amber underline draw */
+  @keyframes nav-underline-draw {
+    from { transform: scaleX(0); transform-origin: left; }
+    to   { transform: scaleX(1); transform-origin: left; }
+  }
+
+  .immortal-nav-link--active::after {
+    content: '';
+    position: absolute;
+    bottom: 2px;
+    left: var(--sp-3);
+    right: var(--sp-3);
+    height: 1px;
+    background: var(--spirit-amber);
+    opacity: 0.7;
+    animation: nav-underline-draw 220ms ease-out both;
+    transform-origin: left;
+  }
+
+  /* Button press tactile state */
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
+    transition: transform 0.08s ease;
+  }
+
+  /* New Run CTA bloom */
+  .new-run-cta::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in srgb, var(--spirit-amber) 20%, transparent) 0%,
+      transparent 70%
+    );
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+  }
+
+  .new-run-cta:hover:not([aria-disabled="true"])::before {
+    opacity: 1;
+  }
+
+  /* Focus glow: enhanced amber ring beyond the default outline */
+  .btn:focus-visible,
+  .immortal-nav-link:focus-visible,
+  .new-run-cta:focus-visible,
+  .resume-action-btn:focus-visible,
+  .bagua-cell-node:focus-visible,
+  .intent-chip:focus-visible {
+    box-shadow:
+      0 0 0 2px var(--spirit-amber),
+      0 0 10px 3px color-mix(in srgb, var(--spirit-amber) 30%, transparent);
+  }
+}
+
+/* Budget sinew shimmer — tension visual when at high load */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes sinew-shimmer {
+    0%   { background-position: -100% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  .immortal-budget-fill--warn {
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      color-mix(in srgb, var(--spirit-amber) 60%, transparent) 40%,
+      color-mix(in srgb, var(--bone) 70%, transparent) 50%,
+      color-mix(in srgb, var(--spirit-amber) 60%, transparent) 60%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    animation: sinew-shimmer 2.2s ease-in-out infinite;
+  }
+}
+
+/* =========================================================================
+   Immortal Head Bar — gold-leaf shimmer sweep + enhanced heartbeat
+========================================================================= */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes gold-shimmer-sweep {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 300% 0; }
+  }
+
+  /* Gold-leaf shimmer on the sigil border */
+  .immortal-sigil {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .immortal-sigil::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: linear-gradient(
+      105deg,
+      transparent 0%,
+      color-mix(in srgb, var(--gold-immortal) 0%, transparent) 30%,
+      color-mix(in srgb, var(--gold-immortal) 55%, transparent) 50%,
+      color-mix(in srgb, var(--gold-immortal) 0%, transparent) 70%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    animation: gold-shimmer-sweep 4.5s ease-in-out infinite;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* Motto text faint breath */
+  @keyframes motto-breathe {
+    0%, 100% { opacity: 0.85; }
+    50%       { opacity: 1; }
+  }
+
+  .immortal-motto-text {
+    animation: motto-breathe 3.2s ease-in-out infinite;
+  }
+
+  /* Immortal head bar heartbeat ripple */
+  @keyframes bar-heartbeat-ripple {
+    0%, 100% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--gold-immortal) 0%, transparent);
+    }
+    15% {
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--gold-immortal) 18%, transparent);
+    }
+    40% {
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--gold-immortal) 0%, transparent);
+    }
+  }
+
+  .immortal-head-bar {
+    animation: bar-heartbeat-ripple 1667ms ease-in-out infinite;
+  }
+
+  [data-attest-paused] .immortal-head-bar {
+    animation: none;
+  }
+}
+
+/* =========================================================================
+   Constellation — Spirit corona layered glow + slow rotation
+========================================================================= */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Spirit corona outer ring slow rotation */
+  @keyframes corona-rotate {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  .spirit-corona {
+    animation: corona-rotate 24s linear infinite;
+    transform-origin: center center;
+    will-change: transform;
+  }
+
+  /* Spirit inner image slow counter-rotation (depth layering) */
+  @keyframes spirit-image-counter-rotate {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(-360deg); }
+  }
+
+  .spirit-image-rotating {
+    animation: spirit-image-counter-rotate 60s linear infinite;
+    transform-origin: center center;
+    will-change: transform;
+  }
+
+  /* Head hover bloom — radial glow expands */
+  @keyframes head-bloom {
+    from {
+      opacity: 0;
+      r: 12;
+    }
+    60% {
+      opacity: 0.7;
+      r: 22;
+    }
+    to {
+      opacity: 0;
+      r: 28;
+    }
+  }
+
+  .head-bloom-ring {
+    animation: head-bloom 600ms ease-out forwards;
+  }
+
+  /* Flame lick particles — quick upward flickers off active heads */
+  @keyframes flame-lick {
+    0%   { opacity: 0; transform: translateY(0) scaleX(0.8); }
+    20%  { opacity: 0.9; transform: translateY(-6px) scaleX(1.1); }
+    100% { opacity: 0; transform: translateY(-18px) scaleX(0.6); }
+  }
+
+  .flame-lick {
+    animation: flame-lick 800ms ease-out infinite;
+  }
+
+  .flame-lick:nth-child(2) { animation-delay: 280ms; }
+  .flame-lick:nth-child(3) { animation-delay: 560ms; }
+
+  /* Head "leaning" toward intent text — slight rotate toward center */
+  @keyframes head-lean-intent {
+    0%, 100% { transform: scale(1) rotate(0deg); }
+    50%       { transform: scale(1.08) rotate(-2deg); }
+  }
+
+  .head-node--intent .head-circle {
+    animation: head-lean-intent 1.4s ease-in-out infinite;
+  }
+
+  /* Orbital drift — gentle perpetual motion on head nodes */
+  @keyframes orbital-drift {
+    0%, 100% { transform: translate(0, 0); }
+    25%       { transform: translate(1.5px, -2px); }
+    50%       { transform: translate(2px, 0); }
+    75%       { transform: translate(0.5px, 2px); }
+  }
+
+  .head-node {
+    animation: orbital-drift var(--drift-period, 6s) ease-in-out infinite;
+    animation-delay: var(--drift-phase, 0s);
+  }
+
+  /* Synthesis convergence — showpiece light-streaks rushing inward */
+  @keyframes convergence-streak-in {
+    0%   { stroke-dashoffset: var(--streak-len, 300); opacity: 0; }
+    20%  { opacity: 1; }
+    100% { stroke-dashoffset: 0; opacity: 0.9; }
+  }
+
+  .convergence-streak {
+    animation: convergence-streak-in 800ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    animation-delay: calc(var(--streak-index, 0) * 60ms);
+    will-change: stroke-dashoffset, opacity;
+  }
+
+  /* Oracle amber radiance bloom at synthesis convergence center */
+  @keyframes oracle-radiance {
+    0%   { opacity: 0; r: 0; }
+    40%  { opacity: 0.9; r: 28; }
+    100% { opacity: 0; r: 60; }
+  }
+
+  .oracle-radiance-bloom {
+    animation: oracle-radiance 1.2s ease-out forwards;
+    animation-delay: calc(var(--streak-count, 3) * 60ms + 400ms);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spirit-corona { animation: none; }
+  .spirit-image-rotating { animation: none; }
+  .head-bloom-ring { animation: none; }
+  .flame-lick { animation: none; opacity: 0.6; }
+  .head-node { animation: none; }
+  .convergence-streak {
+    stroke-dashoffset: 0;
+    opacity: 0.8;
+    transition: opacity 200ms ease;
+  }
+  .oracle-radiance-bloom { animation: none; }
+}
+
+/* =========================================================================
+   Memory View — orbital ring rotation + search inscription cascade
+========================================================================= */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Slow orbital rotation of the whole bagua ring */
+  @keyframes bagua-orbit-slow {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  .bagua-ring-rotating {
+    animation: bagua-orbit-slow 120s linear infinite;
+    transform-origin: 140px 140px; /* SVG center */
+    will-change: transform;
+  }
+
+  /* Cell selection bloom + ripple */
+  @keyframes cell-bloom-ripple {
+    0%   { opacity: 0.8; transform: translate(-50%, -50%) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, -50%) scale(2.2); }
+  }
+
+  .bagua-cell-bloom {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    border: 1.5px solid var(--spirit-amber);
+    pointer-events: none;
+    animation: cell-bloom-ripple 500ms ease-out forwards;
+  }
+
+  /* Search results inscription — cascade in */
+  @keyframes result-inscribe {
+    from {
+      clip-path: inset(0 100% 0 0);
+      opacity: 0.5;
+    }
+    to {
+      clip-path: inset(0 0% 0 0);
+      opacity: 1;
+    }
+  }
+
+  .search-result-inscribed {
+    animation: result-inscribe 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    animation-delay: calc(var(--result-index, 0) * 50ms);
+  }
+
+  /* Dui richer gold-leaf shimmer — runs on hover and selected */
+  @keyframes dui-shimmer-lush {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 300% 0; }
+  }
+
+  .bagua-cell-node--dui:hover .bagua-dui-shimmer,
+  .bagua-cell-node--dui.bagua-cell-node--selected .bagua-dui-shimmer {
+    background: linear-gradient(
+      110deg,
+      transparent 0%,
+      color-mix(in srgb, var(--gold-immortal) 8%, transparent) 25%,
+      color-mix(in srgb, var(--gold-immortal) 65%, transparent) 45%,
+      color-mix(in srgb, var(--bone) 50%, transparent) 50%,
+      color-mix(in srgb, var(--gold-immortal) 65%, transparent) 55%,
+      color-mix(in srgb, var(--gold-immortal) 8%, transparent) 75%,
+      transparent 100%
+    );
+    background-size: 300% 100%;
+    background-repeat: no-repeat;
+    animation: dui-shimmer-lush 1.6s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bagua-ring-rotating { animation: none; }
+  .bagua-cell-bloom { animation: none; display: none; }
+  .search-result-inscribed {
+    clip-path: none;
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* =========================================================================
+   Living Workflow — luscious peristaltic wave + synthesis convergence showpiece
+========================================================================= */
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Synthesis convergence overlay — shown when phase === 'synthesis' */
+  @keyframes synthesis-aura-pulse {
+    0%, 100% {
+      opacity: 0.3;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.7;
+      transform: scale(1.06);
+    }
+  }
+
+  .synthesis-convergence-aura {
+    animation: synthesis-aura-pulse 1.8s ease-in-out infinite;
+    will-change: opacity, transform;
+  }
+
+  /* synthesis.png flourish fades in during synthesis phase */
+  @keyframes synthesis-hero-in {
+    from {
+      opacity: 0;
+      transform: scale(0.88);
+      filter: blur(8px);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+      filter: blur(0);
+    }
+  }
+
+  .synthesis-hero-flourish {
+    animation: synthesis-hero-in 700ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    will-change: opacity, transform, filter;
+  }
+
+  /* Budget strand shimmer at tension */
+  @keyframes strand-shimmer {
+    0%   { background-position: -150% 0; }
+    100% { background-position: 250% 0; }
+  }
+
+  .budget-strand--tension {
+    background-image: linear-gradient(
+      90deg,
+      var(--sinew) 0%,
+      color-mix(in srgb, var(--spirit-amber) 80%, transparent) 40%,
+      color-mix(in srgb, var(--bone) 60%, transparent) 50%,
+      color-mix(in srgb, var(--spirit-amber) 80%, transparent) 60%,
+      var(--sinew) 100%
+    );
+    background-size: 200% 100%;
+    animation: strand-shimmer 2s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .synthesis-convergence-aura { animation: none; opacity: 0.5; }
+  .synthesis-hero-flourish { animation: none; opacity: 1; }
+  .budget-strand--tension { animation: none; }
+}
