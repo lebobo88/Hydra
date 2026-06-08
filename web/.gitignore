@@ -4,3 +4,7 @@ dist-server
 .hydra-cockpit-bridge-port
 *.log
 *.tsbuildinfo
+
+# Visual regression — transient outputs (baseline/ is committed)
+tests/visual/current/
+tests/visual/diff/
