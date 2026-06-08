@@ -1296,48 +1296,270 @@
 
 /* Memory view */
 .memory-view { display: flex; flex-direction: column; gap: var(--sp-6); }
-.bagua-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr);
-  gap: var(--sp-3); margin-bottom: var(--sp-3);
-}
-@media (max-width: 600px) {
-  .bagua-grid { grid-template-columns: repeat(2, 1fr); }
-}
-.bagua-cell {
-  display: flex; flex-direction: column; align-items: center; gap: var(--sp-1);
-  padding: var(--sp-4) var(--sp-2);
+
+/* =========================================================================
+   R5 — THE EIGHT CELLS radial Memory view
+   Replaces the old bagua-grid with a radial ring of 8 positioned cells.
+   The radial is 280×280 SVG-coordinated; cell buttons are absolutely positioned
+   over it via CSS transform. Dui (victory) cell is gilded with gold-leaf shimmer.
+========================================================================= */
+
+/* Section texture — scale-texture panel background for the Memory view */
+.memory-section {
   background: var(--void-panel);
   border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
-  border-radius: var(--radius); cursor: pointer;
-  text-align: center; min-height: 90px;
-  transition: border-color 0.1s, background 0.1s;
+  border-radius: var(--radius);
+  padding: var(--sp-5);
+  /* serpent-scale texture */
+  background-image: url('/images/chosen/scale-texture.png');
+  background-blend-mode: soft-light;
+  background-size: 160px 160px;
 }
-.bagua-cell:hover { border-color: var(--bone-mid); background: color-mix(in srgb, var(--bone) 4%, transparent); }
-.bagua-cell--selected {
+
+/* ---- Radial container ---- */
+.bagua-radial {
+  position: relative;
+  width: 280px;
+  height: 280px;
+  margin: 0 auto var(--sp-4);
+}
+
+.bagua-radial--skeleton {
+  opacity: 0.35;
+}
+
+/* Backdrop image — cells-radial.png (8 trigrams in a ring) */
+.bagua-radial-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0.18; /* subtle watermark behind the interactive nodes */
+  pointer-events: none;
+  border-radius: 50%;
+}
+
+/* SVG orbit track — aria-hidden decorative */
+.bagua-ring-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.bagua-ring-track {
+  fill: none;
+  stroke: color-mix(in srgb, var(--bone-mid) 12%, transparent);
+  stroke-width: 1;
+  stroke-dasharray: 4 6;
+}
+
+.bagua-ring-center {
+  fill: color-mix(in srgb, var(--spirit-amber) 12%, transparent);
+  stroke: color-mix(in srgb, var(--spirit-amber) 40%, transparent);
+  stroke-width: 1;
+}
+
+.bagua-center-symbol {
+  font-size: 14px;
+  fill: var(--spirit-amber);
+  opacity: 0.6;
+}
+
+/* Skeleton node circles */
+.bagua-skeleton-node {
+  fill: color-mix(in srgb, var(--bone-mid) 10%, transparent);
+  stroke: color-mix(in srgb, var(--bone-mid) 20%, transparent);
+  stroke-width: 1;
+}
+
+/* ---- Cells overlay — interactive buttons ---- */
+.bagua-cells-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none; /* children re-enable pointer-events */
+}
+
+/* Individual cell buttons — positioned absolutely by JS-computed style */
+.bagua-cell-node {
+  position: absolute;
+  pointer-events: all;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 48px;
+  height: 48px;
+  padding: var(--sp-1);
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--bone) 15%, transparent);
+  background: color-mix(in srgb, var(--void-panel) 90%, transparent);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
+  /* WCAG 2.5.8: 48×48px target */
+  min-width: 48px;
+  min-height: 48px;
+}
+
+.bagua-cell-node:hover {
+  border-color: var(--bone-mid);
+  background: color-mix(in srgb, var(--bone) 8%, transparent);
+}
+
+.bagua-cell-node:focus-visible {
+  outline: 2px solid var(--spirit-amber);
+  outline-offset: 3px;
+}
+
+.bagua-cell-node--selected {
   border-color: var(--spirit-amber);
-  background: color-mix(in srgb, var(--spirit-amber) 6%, transparent);
+  background: color-mix(in srgb, var(--spirit-amber) 10%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--spirit-amber) 30%, transparent),
+              0 0 12px 2px color-mix(in srgb, var(--spirit-amber) 15%, transparent);
 }
-.bagua-symbol { font-size: 24px; line-height: 1; }
-.bagua-key { font-size: var(--t-micro); font-weight: 600; }
-.bagua-label { font-size: var(--t-nano); }
-.bagua-count {
-  font-family: var(--font-mono); font-size: var(--t-small); font-weight: 700;
+
+/* Dui (victory/joy) cell — gilded with gold-immortal border + shimmer fill */
+.bagua-cell-node--dui {
+  border-color: var(--gold-immortal);
+  background: color-mix(in srgb, var(--gold-immortal) 8%, var(--void-panel));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--gold-immortal) 40%, transparent),
+    0 0 16px 3px color-mix(in srgb, var(--gold-immortal) 12%, transparent);
+  overflow: hidden;
+  position: absolute; /* keep absolute from parent rule */
+}
+
+.bagua-cell-node--dui:hover {
+  border-color: var(--gold-immortal);
+  background: color-mix(in srgb, var(--gold-immortal) 14%, var(--void-panel));
+}
+
+/* Gold-leaf shimmer element — pseudo-positioned inside Dui cell */
+.bagua-dui-shimmer {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  /* Static gold sweep — visible in reduced-motion */
+  background: linear-gradient(
+    135deg,
+    transparent 0%,
+    color-mix(in srgb, var(--gold-immortal) 20%, transparent) 45%,
+    color-mix(in srgb, var(--gold-immortal) 35%, transparent) 50%,
+    color-mix(in srgb, var(--gold-immortal) 20%, transparent) 55%,
+    transparent 100%
+  );
+}
+
+/* Trigram symbol */
+.bagua-cell-symbol {
+  font-size: 18px;
+  line-height: 1;
+  color: var(--bone-mid);
+}
+
+.bagua-cell-symbol--dui {
+  color: var(--gold-immortal);
+}
+
+/* Record count */
+.bagua-cell-count {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  font-weight: 700;
+  color: var(--bone-mid);
+  line-height: 1;
+}
+
+.bagua-cell-node--selected .bagua-cell-count,
+.bagua-cell-node--dui .bagua-cell-count {
   color: var(--spirit-amber);
 }
-.cell-detail {
-  background: var(--void-panel);
-  border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
-  border-radius: var(--radius); padding: var(--sp-4);
-  margin-top: var(--sp-3);
+
+.bagua-cell-node--dui .bagua-cell-count {
+  color: var(--gold-immortal);
 }
-.cell-detail-heading { font-size: var(--t-small); font-weight: 600; margin-bottom: var(--sp-3); }
-.cell-records { list-style: none; display: flex; flex-direction: column; gap: var(--sp-1); }
-.cell-record { display: flex; align-items: center; gap: var(--sp-3); padding: 4px 0; font-size: var(--t-micro); }
+
+/* Accessible flat list — visually hidden, keyboard accessible (SR workaround) */
+.bagua-accessible-list {
+  list-style: none;
+  /* off-screen accessible only — becomes visible on focus */
+}
+
+.sr-only-focusable {
+  position: absolute;
+  left: -9999px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}
+
+.sr-only-focusable:focus-within {
+  position: static;
+  left: auto;
+  width: auto;
+  height: auto;
+  overflow: auto;
+}
+
+.bagua-accessible-btn {
+  display: block;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--t-small);
+  color: var(--bone-mid);
+  background: none;
+  border: none;
+  cursor: pointer;
+  min-height: 28px;
+  text-align: left;
+}
+
+.bagua-accessible-btn:hover,
+.bagua-accessible-btn:focus {
+  color: var(--bone);
+  background: color-mix(in srgb, var(--bone) 6%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+/* Keyboard navigation hint */
+.bagua-nav-hint {
+  text-align: center;
+  font-size: var(--t-nano);
+  color: color-mix(in srgb, var(--bone-mid) 50%, transparent);
+  margin-top: var(--sp-1);
+  font-family: var(--font-mono);
+}
+
+/* Loading skeleton label — nests LoadingScreen; suppress margin */
+.memory-radial-loading-label {
+  display: contents;
+}
+
+/* Offline reason */
+.memory-offline-reason {
+  margin-top: var(--sp-1);
+}
+
+/* Replay disabled offline text */
+.memory-replay-offline {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+/* Empty cell notice */
+.memory-empty-cell {
+  font-style: italic;
+}
+
+/* ---- Shared memory inner layout ---- */
 .search-row { display: flex; gap: var(--sp-2); align-items: center; }
 .search-results { list-style: none; display: flex; flex-direction: column; gap: var(--sp-1); margin-top: var(--sp-3); }
 .search-result {
   display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-1) var(--sp-3);
-  background: var(--void-panel);
+  background: color-mix(in srgb, var(--void) 60%, transparent);
   border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
   border-radius: var(--radius-sm);
 }
@@ -1354,6 +1576,15 @@
   border: 1px solid color-mix(in srgb, var(--bone-mid) 15%, transparent);
   font-size: var(--t-nano); color: var(--bone-mid);
 }
+.cell-detail {
+  background: color-mix(in srgb, var(--void) 60%, transparent);
+  border: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  border-radius: var(--radius); padding: var(--sp-4);
+  margin-top: var(--sp-3);
+}
+.cell-detail-heading { font-size: var(--t-small); font-weight: 600; margin-bottom: var(--sp-3); }
+.cell-records { list-style: none; display: flex; flex-direction: column; gap: var(--sp-1); }
+.cell-record { display: flex; align-items: center; gap: var(--sp-3); padding: 4px 0; font-size: var(--t-micro); }
 
 /* =========================================================================
    R3 — THE LIVING RUN (Live Workflow view interior)
