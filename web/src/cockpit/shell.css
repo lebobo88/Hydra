@@ -1068,8 +1068,111 @@
 .trace-retry { color: var(--spirit-amber); font-weight: 600; }
 .trace-retry--violation { color: var(--venom); }
 
-/* Gate Cockpit */
+/* Gate Cockpit — R4 ceremony additions */
 .gate-view { display: flex; flex-direction: column; gap: var(--sp-6); }
+
+/* Gate panel — role=alertdialog wrapper */
+.gate-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  background: var(--void-panel);
+  border: 1px solid color-mix(in srgb, var(--bone) 10%, transparent);
+  border-radius: var(--radius);
+  padding: var(--sp-6);
+  position: relative;
+}
+
+/* Venom-class gate panel: persistent venom border */
+.gate-panel--venom {
+  border-color: var(--venom);
+}
+
+/* Chain-lock icon top of gate panel */
+.gate-chain-lock {
+  display: flex;
+  align-items: center;
+  margin-bottom: calc(var(--sp-2) * -1);
+}
+
+/* Gate panel title */
+.gate-panel-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--bone);
+  margin: 0;
+}
+
+/* Cinzel venom-class title */
+.gate-title-venom {
+  color: var(--venom);
+  font-size: 1.25rem;
+  letter-spacing: 0.08em;
+}
+
+/* Venom named paragraph — rubricated in vermillion */
+.venom-named {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  background: color-mix(in srgb, var(--venom) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--venom) 30%, transparent);
+  border-radius: var(--radius-sm);
+  font-size: var(--t-small);
+  line-height: 1.4;
+  /* --venom on --void-panel at 18px+ passes AA large text (4.6:1) */
+  color: var(--venom);
+}
+
+.venom-named-label {
+  /* Cinzel register via .covenant utility */
+  font-size: var(--t-nano);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+  color: var(--venom);
+}
+
+.venom-named-reason {
+  font-size: var(--t-small);
+  font-weight: 600;
+  color: var(--venom);
+  word-break: break-word;
+}
+
+/* Ghost/helper text — "Approving inscribes your name…" */
+.gate-inscription-ghost {
+  font-size: var(--t-micro);
+  color: var(--bone-mid);
+  font-style: italic;
+  text-align: center;
+  padding: var(--sp-2) 0;
+  border-top: 1px solid color-mix(in srgb, var(--bone) 8%, transparent);
+  margin-top: var(--sp-2);
+}
+
+/* Gate not-pending state */
+.gate-not-pending {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-12) var(--sp-6);
+  text-align: center;
+}
+
+.gate-not-pending-msg {
+  font-size: var(--t-small);
+  color: var(--bone-mid);
+}
+
+/* Offline reason within gate */
+.gate-offline-reason {
+  font-size: var(--t-micro);
+  color: var(--bone-mid);
+  margin-top: var(--sp-1);
+}
 .gate-expiry {
   font-family: var(--font-mono); font-size: var(--t-small); font-weight: 600;
   color: var(--spirit-amber);

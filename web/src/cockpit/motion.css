@@ -566,6 +566,208 @@
 }
 
 /* =========================================================================
+   R4 — GATE CEREMONY (Seal-Break) ANIMATIONS
+   §8 exact timing chain: crack 600ms → halves 400ms → reveal 300ms (standard)
+   Venom variant: crack 300ms (faster urgency signal), halves ±24px (vs ±12px).
+   ALL wrapped in prefers-reduced-motion: no-preference per D4 §6 pattern.
+   Reduced-motion: seal fades to revealed form instantly; no crack animation.
+========================================================================= */
+
+/* -------------------------------------------------------------------------
+   23. Seal materializing (loading state) — soft fade-in of the seal image
+------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes seal-materialize {
+    from { opacity: 0; transform: scale(0.96); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+
+  .seal-ceremony {
+    animation: seal-materialize 400ms ease-out forwards;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .seal-ceremony { opacity: 1; }
+}
+
+/* -------------------------------------------------------------------------
+   24. Seal crack — gold SVG stroke-dashoffset draw (600ms standard / 300ms venom)
+   The CSS transition on stroke-dashoffset drives the drawing.
+   --crack-duration is set as an inline CSS custom property by the component.
+------------------------------------------------------------------------- */
+
+.seal-crack-path {
+  transition: none; /* default: no transition (stage=idle) */
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .seal-crack--drawing .seal-crack-path {
+    /* stroke-dashoffset animated from 220→0 when .seal-crack--drawing is applied */
+    transition: stroke-dashoffset var(--crack-duration, 600ms) ease-in;
+  }
+
+  /* Venom-class crack: glows red under the gold line */
+  .seal-crack--venom .seal-crack-path {
+    filter: drop-shadow(0 0 3px var(--venom));
+  }
+
+  /* -----------------------------------------------------------------------
+     25. Seal halves split — translateX(±12px) rotate(±3°) over 400ms
+     Venom variant: ±24px for urgency
+  ----------------------------------------------------------------------- */
+
+  @keyframes seal-half-split-left {
+    from { transform: translateX(0) rotate(0deg); }
+    to   { transform: translateX(-12px) rotate(-3deg); }
+  }
+
+  @keyframes seal-half-split-right {
+    from { transform: translateX(0) rotate(0deg); }
+    to   { transform: translateX(12px) rotate(3deg); }
+  }
+
+  @keyframes seal-half-split-left-venom {
+    from { transform: translateX(0) rotate(0deg); }
+    to   { transform: translateX(-24px) rotate(-4deg); }
+  }
+
+  @keyframes seal-half-split-right-venom {
+    from { transform: translateX(0) rotate(0deg); }
+    to   { transform: translateX(24px) rotate(4deg); }
+  }
+
+  .seal-halves--split .seal-half--left {
+    animation: seal-half-split-left 400ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+
+  .seal-halves--split .seal-half--right {
+    animation: seal-half-split-right 400ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+
+  .seal-halves--venom.seal-halves--split .seal-half--left {
+    animation: seal-half-split-left-venom 400ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+
+  .seal-halves--venom.seal-halves--split .seal-half--right {
+    animation: seal-half-split-right-venom 400ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+
+  /* -----------------------------------------------------------------------
+     26. Gate form reveal — clip-path inset(50% 0) → inset(0% 0) over 300ms
+  ----------------------------------------------------------------------- */
+
+  @keyframes gate-reveal {
+    from { clip-path: inset(50% 0 50% 0); opacity: 0; }
+    to   { clip-path: inset(0% 0 0% 0); opacity: 1; }
+  }
+
+  .gate-panel--ceremony.gate-panel--venom .hitl-verbatim,
+  .gate-panel--ceremony.gate-panel--venom .resume-actions,
+  .gate-panel--ceremony.gate-panel--venom .gate-inscription-ghost {
+    animation: gate-reveal 300ms ease-out forwards;
+  }
+}
+
+/* Reduced-motion fallback: seal fades directly, no crack / split / reveal */
+@media (prefers-reduced-motion: reduce) {
+  .seal-ceremony {
+    opacity: 0;
+    transition: opacity 200ms ease-out;
+  }
+  /* When stage becomes 'revealed', opacity transitions to 0 (seal disappears) */
+  .seal-ceremony[data-stage="revealed"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* Form elements immediately visible */
+  .gate-panel--ceremony .hitl-verbatim,
+  .gate-panel--ceremony .resume-actions,
+  .gate-panel--ceremony .gate-inscription-ghost {
+    opacity: 1;
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Seal layout helpers (non-animated structural CSS)
+------------------------------------------------------------------------- */
+
+.seal-ceremony-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: var(--sp-5) 0;
+}
+
+.seal-ceremony {
+  position: relative;
+  width: 240px;
+  height: 240px;
+  flex-shrink: 0;
+}
+
+.seal-halves {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.seal-half {
+  position: absolute;
+  top: 0;
+  width: 50%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.seal-half--left {
+  left: 0;
+}
+
+.seal-half--right {
+  right: 0;
+}
+
+/* Show only the appropriate half of the seal image */
+.seal-img {
+  position: absolute;
+  top: 0;
+  width: 240px; /* full image width */
+  height: 240px;
+  object-fit: cover;
+  opacity: 0.9;
+  filter: drop-shadow(0 0 12px color-mix(in srgb, var(--venom) 40%, transparent));
+}
+
+.seal-img--left {
+  left: 0;
+}
+
+.seal-img--right {
+  right: -120px; /* shift so right half shows the right half of the image */
+}
+
+/* SVG crack overlay — positioned over the full seal */
+.seal-crack {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+
+/* Venom edge glow frame around the gate panel during ceremony */
+.gate-panel--venom {
+  box-shadow:
+    0 0 0 1px var(--venom),
+    0 0 24px 4px color-mix(in srgb, var(--venom) 20%, transparent);
+}
+
+/* =========================================================================
    R3 — LIVING WORKFLOW ANIMATIONS
    Peristaltic phase advance, coiling progress ring, squad-head lateral draw,
    ink-dry phase completion, scroll-pause pill reveal.

@@ -67,7 +67,10 @@ export type ViewId =
   | 'gate'
   | 'squads'
   | 'campaigns'
-  | 'memory';
+  | 'memory'
+  | 'governance'
+  | 'reliquary'
+  | 'prototypes';
 
 export interface ParsedView {
   view: ViewId;
@@ -102,6 +105,12 @@ export function parseView(hash: string): ParsedView {
       return { view: 'campaigns', params };
     case 'memory':
       return { view: 'memory', params };
+    case 'governance':
+      return { view: 'governance', params };
+    case 'reliquary':
+      return { view: 'reliquary', params };
+    case 'prototypes':
+      return { view: 'prototypes', params };
     default:
       return { view: 'launchpad', params };
   }
