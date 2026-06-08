@@ -17,6 +17,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { LoadingScreen, ErrorScreen, DegradedBanner, OfflineBanner } from '../components/StateScreens.tsx';
+import { ViewHeader } from '../components/ViewHeader.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import type { CockpitDialogState } from '../cockpit/types.ts';
 import type { EightsCell, EightsCellRecord, SearchResult } from '../api/client.ts';
@@ -393,10 +394,7 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
   if (loading) {
     return (
       <div className="memory-view">
-        <header className="view-header">
-          <a href="#/" className="back-link">← Launchpad</a>
-          <h1 className="view-title" id="memory-heading">Memory</h1>
-        </header>
+        <ViewHeader title="Memory" />
         <section className="memory-section" aria-labelledby="cells-heading">
           <h2 id="cells-heading" className="section-heading">The Eight Cells</h2>
           <RadialSkeleton />
@@ -409,10 +407,7 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
   if (error) {
     return (
       <div className="memory-view">
-        <header className="view-header">
-          <a href="#/" className="back-link">← Launchpad</a>
-          <h1 className="view-title">Memory</h1>
-        </header>
+        <ViewHeader title="Memory" />
         <ErrorScreen message={error} onRetry={() => { void loadCells(); }} />
       </div>
     );
@@ -434,10 +429,7 @@ export function MemoryView({ online }: MemoryViewProps): JSX.Element {
       ) : null}
 
       {/* View header */}
-      <header className="view-header">
-        <a href="#/" className="back-link">← Launchpad</a>
-        <h1 className="view-title" id="memory-heading">Memory</h1>
-      </header>
+      <ViewHeader title="Memory" />
 
       {/* Banners */}
       {!online ? <OfflineBanner /> : null}

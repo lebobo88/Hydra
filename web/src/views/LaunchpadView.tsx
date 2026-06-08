@@ -26,103 +26,15 @@ import { launchWorkflow, previewNonce, fetchSquads, fetchWorkflows } from '../ap
 import type { WorkflowSummary, SquadPack, LaunchResult } from '../api/client.ts';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import type { CockpitDialogState } from '../cockpit/types.ts';
+import { crownOf, crownColorVar as crownColor } from '../cockpit/crowns.ts';
+import type { CrownFamily } from '../cockpit/crowns.ts';
+import {
+  stableHash, RING_R, distributeHeads,
+} from '../cockpit/constellation-layout.ts';
 
-// ---------------------------------------------------------------------------
-// Crown mapping (mirrors App.tsx CROWN_MAP — kept local for separation)
-// ---------------------------------------------------------------------------
-
-type CrownFamily = 'exec' | 'forge' | 'garland';
-
-const CROWN_MAP: Record<string, CrownFamily> = {
-  executive: 'exec', legal: 'exec', finance: 'exec', compliance: 'exec',
-  engineering: 'forge', forge: 'forge', platform: 'forge', infra: 'forge',
-  devops: 'forge', security: 'forge',
-  garland: 'garland', marketing: 'garland', creative: 'garland',
-  design: 'garland', product: 'garland', research: 'garland',
-};
-
-function crownOf(slug: string): CrownFamily {
-  return CROWN_MAP[slug.toLowerCase()] ?? 'forge';
-}
-
-function crownColor(crown: CrownFamily): string {
-  if (crown === 'exec') return 'var(--crown-exec)';
-  if (crown === 'forge') return 'var(--crown-forge)';
-  return 'var(--crown-garland)';
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic radial layout helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Stable hash of a string → integer in [0, 2^31).
- * djb2 variant — same slug always returns the same integer across renders and
- * page loads. This is the bedrock of the deterministic layout guarantee.
- */
-function stableHash(str: string): number {
-  let h = 5381;
-  for (let i = 0; i < str.length; i++) {
-    h = ((h << 5) + h) ^ str.charCodeAt(i);
-    h = h >>> 0; // unsigned 32-bit
-  }
-  return h;
-}
-
-/**
- * Map a squad slug to a working angle in [0, 360) degrees.
- * The angle is *within* the crown-family's angular sector so heads don't
- * overlap across rings. Sectors: exec 0–110°, forge 120–240°, garland 250–360°.
- * Intra-sector distribution is uniform via the hash.
- */
-const CROWN_SECTOR: Record<CrownFamily, [number, number]> = {
-  exec:    [0,   110],
-  forge:   [120, 240],
-  garland: [250, 360],
-};
-
-function workingAngle(slug: string): number {
-  const crown = crownOf(slug);
-  const [start, end] = CROWN_SECTOR[crown];
-  const span = end - start;
-  const h = stableHash(slug);
-  return start + (h % span);
-}
-
-/**
- * IAU Hydra constellation reference positions (simplified to 13 key nodes).
- * These are biased angles derived from the IAU Hydra constellation shape —
- * the largest constellation, sinuous and elongated horizontally.
- * When all heads are idle the radial drifts toward these positions.
- */
-const IAU_HYDRA_ANGLES: number[] = [
-  10, 28, 48, 68, 88, 108, 130, 155, 185, 215, 248, 282, 320,
-];
-
-function iauAngle(index: number): number {
-  return IAU_HYDRA_ANGLES[index % IAU_HYDRA_ANGLES.length];
-}
-
-// ---------------------------------------------------------------------------
-// Polar → Cartesian helper
-// ---------------------------------------------------------------------------
-
-function polarToXY(
-  cx: number, cy: number, r: number, angleDeg: number,
-): { x: number; y: number } {
-  const rad = ((angleDeg - 90) * Math.PI) / 180; // 0° = top
-  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
-}
-
-// ---------------------------------------------------------------------------
-// Ring radii by crown
-// ---------------------------------------------------------------------------
-
-const RING_R: Record<CrownFamily, number> = {
-  exec:    100,
-  forge:   140,
-  garland: 175,
-};
+// Crown family → slug mapping and colours live in src/cockpit/crowns.ts; the
+// deterministic, collision-free constellation geometry lives in
+// src/cockpit/constellation-layout.ts (unit-tested in tests/ui/launchpad.test.tsx).
 
 // ---------------------------------------------------------------------------
 // Active phase detection
@@ -397,27 +309,20 @@ export function LaunchpadView({ live, offline, offlineSince }: LaunchpadViewProp
     angle: number;
     crown: CrownFamily;
     isHeadActive: boolean;
+    /** 0/1 alternating tier — pushes every other label further out so dense
+        arcs (many garland/forge squads) keep their labels from colliding. */
+    labelTier: number;
   }
 
   const headPositions = useMemo((): HeadPosition[] => {
-    const isAllIdle = activeHeadCount === 0;
-    return headSlugs.map((slug, idx) => {
-      const crown = crownOf(slug);
-      const r = RING_R[crown];
-      const wAngle = workingAngle(slug);
-      const iAngle = iauAngle(idx);
-      // IAU idle: use IAU angle when all heads dormant, else working angle
-      const angle = isAllIdle ? iAngle : wAngle;
-      const { x, y } = polarToXY(CX, CY, r, angle);
-      return {
-        slug,
-        x, y,
-        angle,
-        crown,
-        isHeadActive: (headMap.get(slug)?.workflows.length ?? 0) > 0,
-      };
-    });
-  }, [headSlugs, headMap, activeHeadCount]);
+    // Geometry (even per-sector distribution → collision-free) is computed by
+    // the pure, unit-tested layout module; we only layer on live workflow
+    // state here.
+    return distributeHeads(headSlugs, CX, CY).map((g) => ({
+      ...g,
+      isHeadActive: (headMap.get(g.slug)?.workflows.length ?? 0) > 0,
+    }));
+  }, [headSlugs, headMap]);
 
   // ---- intent handling -----------------------------------------------------
 
@@ -840,7 +745,7 @@ function SpiritNode({ cx, cy, r, isDiverging }: SpiritNodeProps): JSX.Element {
 // ---- Head node --------------------------------------------------------------
 
 interface HeadNodeProps {
-  hp: { slug: string; x: number; y: number; crown: CrownFamily; isHeadActive: boolean; angle: number };
+  hp: { slug: string; x: number; y: number; crown: CrownFamily; isHeadActive: boolean; angle: number; labelTier: number };
   headData: { workflows: WorkflowSummary[]; squad: SquadPack | null } | null;
   isIntentHover: boolean;
   isAllIdle: boolean;
@@ -896,18 +801,19 @@ function HeadNode({ hp, headData, isIntentHover, isAllIdle }: HeadNodeProps): JS
           aria-hidden="true"
         />
       ) : null}
-      {/* Head label */}
+      {/* Head label — full slug (only truncated past 14 chars, with ellipsis);
+          even-distribution placement keeps neighbouring labels from colliding. */}
       <text
-        x={hp.x} y={hp.y + r + 9}
+        x={hp.x} y={hp.y + r + 10 + (hp.labelTier ? 11 : 0)}
         textAnchor="middle"
-        fontSize="7"
+        fontSize="8"
         fill={hasPendingGate ? 'var(--venom)' : strokeColor}
-        opacity={isActive ? 1 : 0.5}
+        opacity={isActive ? 1 : 0.72}
         fontFamily="var(--font-mono)"
         aria-hidden="true"
         className="head-label"
       >
-        {hp.slug.slice(0, 8)}
+        {hp.slug.length > 14 ? hp.slug.slice(0, 13) + '…' : hp.slug}
       </text>
       {/* Flame image (active heads — primary) */}
       {isActive ? (
@@ -996,7 +902,7 @@ function NeckLine({ cx, cy, hx, hy, status, phase, swayPhase, slug }: NeckLinePr
       ? 'var(--bone-mid)'
       : isSynthesis
         ? 'var(--spirit-amber)'
-        : `var(--${slug.includes('exec') ? 'crown-exec' : slug.includes('forge') || slug.includes('engineer') ? 'crown-forge' : 'crown-garland'})`;
+        : crownColor(crownOf(slug));
 
   return (
     <g aria-hidden="true" className="neck-group">

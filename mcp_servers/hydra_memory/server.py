@@ -55,6 +55,18 @@ from hydra_core.eights import ALL_CELLS  # noqa: E402
 
 _SCAN_CAP = 200  # max distinct workflows scanned per call
 
+# Terminal phases — a workflow in any of these has closed out. Everything else
+# is non-terminal ("live") and must stay at the top of the list so a bulk
+# timestamp bump (e.g. `hydra reap` re-stamping many closed rows) can never page
+# genuinely-active runs out of the limit window.
+_TERMINAL_PHASES = frozenset({"done", "surfaced"})
+
+
+def _is_live(phase: Any, has_pending_hitl: bool) -> bool:
+    """A workflow is live if it has not reached a terminal phase, or it is
+    actively awaiting a human at a gate."""
+    return (phase not in _TERMINAL_PHASES) or bool(has_pending_hitl)
+
 
 def _checkpoints_db_path() -> Path:
     p = os.environ.get("HYDRA_CHECKPOINT_DB")
@@ -239,15 +251,22 @@ def _tool_handlers() -> dict[str, callable]:
             if st is None:
                 continue
             v = st["values"]
+            has_gate = bool(v.get("pending_hitl"))
+            phase = v.get("phase")
             out.append({
                 "workflow_id": wf,
-                "phase": v.get("phase"),
+                "phase": phase,
                 "root_goal": (v.get("root_goal") or "")[:160],
                 "selected_squads": list(v.get("selected_squads") or []),
-                "has_pending_hitl": bool(v.get("pending_hitl")),
+                "has_pending_hitl": has_gate,
+                "live": _is_live(phase, has_gate),
                 "updated_at": st["ts"],
             })
-        out.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+        # Live (non-terminal / gated) rows first, then most-recent within each
+        # group. Keeps active runs in the limit window regardless of when closed
+        # rows were last re-stamped. Error rows (no 'live' key) sort last.
+        out.sort(key=lambda r: (bool(r.get("live")), r.get("updated_at") or ""),
+                 reverse=True)
         result: dict[str, Any] = {"workflows": out[:limit], "count": len(out)}
         if degraded_reason:
             result["degraded"] = True

@@ -12,6 +12,7 @@ import type { CockpitDialogState } from '../cockpit/types.ts';
 import type { SquadPack } from '../api/client.ts';
 import { previewNonce, launchWorkflow, CockpitWriteError } from '../api/client.ts';
 import { OfflineBanner } from '../components/StateScreens.tsx';
+import { ViewHeader } from '../components/ViewHeader.tsx';
 
 interface LaunchComposerViewProps {
   /** Pre-filled from deep-link ?goal= */
@@ -163,10 +164,7 @@ export function LaunchComposerView({ initialGoal = '', initialSquads = [], onlin
     <div className="launch-composer">
       {!online ? <OfflineBanner /> : null}
 
-      <header className="view-header">
-        <a href="#/" className="back-link">← Launchpad</a>
-        <h1 className="view-title">Launch Composer</h1>
-      </header>
+      <ViewHeader title="Launch Composer" />
 
       {launchError ? (
         <div className="inline-error" role="alert" aria-live="assertive">

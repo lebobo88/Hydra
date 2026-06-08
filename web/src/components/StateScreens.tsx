@@ -5,6 +5,7 @@
  */
 
 import type { ReactNode } from 'react';
+import { useEffect, useState } from 'react';
 
 interface LoadingProps { label?: string }
 export function LoadingScreen({ label = 'Loading…' }: LoadingProps): JSX.Element {
@@ -66,7 +67,16 @@ export function DegradedBanner({ sources, children, message }: DegradedProps): J
 
 interface OfflineProps { since?: number | undefined; children?: ReactNode | undefined }
 export function OfflineBanner({ since, children }: OfflineProps): JSX.Element {
-  const elapsed = since ? Math.round((Date.now() - since) / 1000) : 0;
+  // Tick once a second so the elapsed counter advances live instead of being
+  // frozen at whatever the last parent re-render happened to capture.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!since) return undefined;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [since]);
+
+  const elapsed = since ? Math.max(0, Math.round((now - since) / 1000)) : 0;
   return (
     <div className="offline-banner" role="alert" aria-label="Bridge offline" data-testid="offline-banner">
       <span className="banner-icon" aria-hidden="true">⊗</span>

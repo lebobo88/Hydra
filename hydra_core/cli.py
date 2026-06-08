@@ -622,6 +622,140 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     return 0
 
 
+_TERMINAL_PHASES = frozenset({"done", "surfaced"})
+
+
+def _is_reapable(phase, has_pending_hitl: bool,
+                 age_hours: float | None, older_than_hours: float) -> bool:
+    """Pure predicate: is this workflow an abandoned non-terminal thread that
+    should be swept to a terminal phase? Reapable iff non-terminal AND no
+    pending HITL gate AND idle at least `older_than_hours` (unknown age, i.e.
+    no checkpoint timestamp, counts as old enough to reap)."""
+    if phase in _TERMINAL_PHASES:
+        return False
+    if has_pending_hitl:
+        return False
+    if age_hours is not None and age_hours < older_than_hours:
+        return False
+    return True
+
+
+def _cmd_reap(args) -> int:
+    """Garbage-collect abandoned non-terminal workflows.
+
+    Why this exists: the supervisor runs in-session and `interrupt_before`
+    approval/synthesis/judge_synthesis. A run that is never resumed (test /
+    exploratory) or whose driving session dies leaves a non-terminal LangGraph
+    checkpoint that nothing ever advances — so `workflows_list` reports it as
+    "active" forever. There was no reaper. This sweeps such threads to the
+    terminal `surfaced` phase (the same transition `resume --action reject`
+    uses), recording a reap marker on `hitl_history` for audit.
+
+    Safe by construction:
+      - dry-run by default; only mutates with --apply
+      - skips terminal phases (done / surfaced)
+      - skips workflows with a pending HITL gate (genuinely awaiting a human)
+      - skips workflows touched within --older-than-hours (may still be live)
+      - per-workflow resume-lock so it never races an in-flight resume
+    """
+    import os
+    import sqlite3
+    from datetime import datetime, timezone
+
+    project = Path(args.project) if args.project else Path.cwd()
+    older_than_h = float(getattr(args, "older_than_hours", 24.0))
+    do_apply = bool(getattr(args, "apply", False))
+
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "error": "langgraph unavailable — reap requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+
+    # Enumerate checkpoint threads from the SAME store build_supervisor binds.
+    cp_db = Path(os.environ.get("HYDRA_CHECKPOINT_DB")
+                 or (Path.home() / ".hydra" / "checkpoints.db"))
+    if not cp_db.exists():
+        print(json.dumps({"scanned": 0, "candidates": [], "reaped": [],
+                          "reason": "no_checkpoint_db"}, indent=2))
+        return 0
+    conn = sqlite3.connect(f"file:{cp_db.as_posix()}?mode=ro", uri=True,
+                           check_same_thread=False)
+    try:
+        thread_ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints LIMIT 500").fetchall()]
+    except Exception:  # noqa: BLE001 — schema absent / older langgraph layout
+        thread_ids = []
+    finally:
+        conn.close()
+
+    now = datetime.now(timezone.utc)
+    candidates: list[dict] = []
+    for wf in thread_ids:
+        config = {"configurable": {"thread_id": wf}}
+        try:
+            snap = sup.get_state(config)
+        except Exception:  # noqa: BLE001 — one bad thread must not abort the sweep
+            continue
+        if snap is None or not snap.values:
+            continue
+        v = snap.values
+        phase = v.get("phase")
+        ts = getattr(snap, "created_at", None)
+        age_h = None
+        if ts:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                age_h = (now - dt).total_seconds() / 3600.0
+            except (TypeError, ValueError):
+                age_h = None
+        if not _is_reapable(phase, bool(v.get("pending_hitl")), age_h, older_than_h):
+            continue
+        candidates.append({
+            "workflow_id": wf,
+            "phase": phase,
+            "age_hours": round(age_h, 1) if age_h is not None else None,
+            "root_goal": (v.get("root_goal") or "")[:80],
+        })
+
+    reaped: list[str] = []
+    if do_apply:
+        for c in candidates:
+            wf = c["workflow_id"]
+            lock_fd, lock_path = _acquire_resume_lock(project, wf)
+            if lock_fd is None:
+                c["skipped"] = "resume_in_progress"
+                continue
+            try:
+                config = {"configurable": {"thread_id": wf}}
+                marker = {
+                    "resolution": "reaped",
+                    "reason": (f"abandoned: non-terminal '{c['phase']}', no pending "
+                               f"gate, idle > {older_than_h}h"),
+                    "reaped_at": now.isoformat(),
+                }
+                # Same terminal transition the reject action uses (no graph re-drive).
+                sup.update_state(config, {"phase": "surfaced",
+                                          "hitl_history": [marker]})
+                emit(project, wf, "reaped", marker)
+                reaped.append(wf)
+            finally:
+                _release_resume_lock(lock_fd, lock_path)
+
+    print(json.dumps({
+        "mode": "apply" if do_apply else "dry-run",
+        "older_than_hours": older_than_h,
+        "scanned": len(thread_ids),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "reaped_count": len(reaped),
+        "reaped": reaped,
+    }, indent=2))
+    return 0
+
+
 def _cmd_status(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     base = project / ".hydra"
@@ -1096,6 +1230,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("workflow_id", nargs="?")
     t = sub.add_parser("trace")
     t.add_argument("workflow_id")
+    # Reaper: GC abandoned non-terminal workflows (stuck at approval/synthesis
+    # because their session ended or they were never resumed past an interrupt).
+    rp_reap = sub.add_parser("reap")
+    rp_reap.add_argument("--older-than-hours", dest="older_than_hours",
+                         type=float, default=24.0,
+                         help="Only reap non-terminal workflows idle this long (default 24).")
+    rp_reap.add_argument("--apply", action="store_true",
+                         help="Actually transition stale workflows to 'surfaced' (default: dry-run).")
     ap_approve = sub.add_parser("approve")
     ap_approve.add_argument("workflow_id")
     ap_approve.add_argument("--live", action="store_true",
@@ -1178,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
         "run": _cmd_run,
         "status": _cmd_status,
         "trace": _cmd_trace,
+        "reap": _cmd_reap,
         # C2: approve == resume --action approve (the old stub printed a
         # plugin pointer and did nothing; resume is now first-class).
         "approve": lambda a: _cmd_resume(argparse.Namespace(

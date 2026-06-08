@@ -455,3 +455,34 @@ def test_approve_is_real_resume_now(capsys, tmp_path, monkeypatch):
     payload = json.loads(out)
     assert payload["error"] == "not_found"
     assert payload["workflow_id"] == "fake-id"
+
+
+# --- reap (abandoned-workflow GC) -------------------------------------------
+
+def test_is_reapable_predicate():
+    """The reap selection predicate: only abandoned non-terminal threads."""
+    from hydra_core.cli import _is_reapable
+    # Terminal phases are never reapable.
+    assert _is_reapable("done", False, 999.0, 24.0) is False
+    assert _is_reapable("surfaced", False, 999.0, 24.0) is False
+    # A pending HITL gate means a human is genuinely expected — never reap.
+    assert _is_reapable("approval", True, 999.0, 24.0) is False
+    # Fresh non-terminal work (younger than the threshold) is left alone.
+    assert _is_reapable("synthesis", False, 1.0, 24.0) is False
+    # Stale, non-terminal, no gate → reapable.
+    assert _is_reapable("approval", False, 430.0, 24.0) is True
+    assert _is_reapable("synthesis", False, 25.0, 24.0) is True
+    # Unknown age (no checkpoint timestamp) counts as old enough.
+    assert _is_reapable("approval", False, None, 24.0) is True
+
+
+def test_reap_dry_run_empty_store(capsys, tmp_path, monkeypatch):
+    """reap with no checkpoint DB is a clean no-op (never fabricates work)."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    rc = _run(["reap"], project_root=REPO_ROOT)
+    out = capsys.readouterr().out
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["mode"] == "dry-run"  # default is never destructive
+    assert payload["candidate_count"] == 0
+    assert payload["reaped_count"] == 0

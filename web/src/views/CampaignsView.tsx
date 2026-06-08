@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from 'react';
 import { LoadingScreen, EmptyScreen, ErrorScreen, DegradedBanner, OfflineBanner } from '../components/StateScreens.tsx';
+import { ViewHeader } from '../components/ViewHeader.tsx';
 import { BudgetBar } from '../components/BudgetBar.tsx';
 import type { WorkflowSummary } from '../api/client.ts';
 
@@ -81,10 +82,7 @@ export function CampaignsView({ online }: CampaignsViewProps): JSX.Element {
 
   return (
     <div className="campaigns-view">
-      <header className="view-header">
-        <a href="#/" className="back-link">← Launchpad</a>
-        <h1 className="view-title">Campaigns</h1>
-      </header>
+      <ViewHeader title="Campaigns" />
 
       {!online ? <OfflineBanner /> : null}
       {degraded ? (

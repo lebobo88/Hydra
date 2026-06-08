@@ -20,6 +20,7 @@ import { SynthesisContext } from './cockpit/SynthesisContext.ts';
 import { AmbientField } from './components/AmbientField.tsx';
 import { OracleWordAssembly } from './components/OracleWordAssembly.tsx';
 import { ViewTransition } from './components/ViewTransition.tsx';
+import { crownOf } from './cockpit/crowns.ts';
 
 // ---------------------------------------------------------------------------
 // Crown glyph SVGs (16px inline, aria-hidden)
@@ -56,38 +57,6 @@ function CrownGarlandGlyph(): JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
-// Crown registry — maps squad slugs to Crown family (extend as squads grow)
-// ---------------------------------------------------------------------------
-
-type CrownFamily = 'exec' | 'forge' | 'garland';
-
-const CROWN_MAP: Record<string, CrownFamily> = {
-  // Executive
-  executive: 'exec',
-  legal: 'exec',
-  finance: 'exec',
-  compliance: 'exec',
-  // Forge
-  engineering: 'forge',
-  forge: 'forge',
-  platform: 'forge',
-  infra: 'forge',
-  devops: 'forge',
-  security: 'forge',
-  // Garland
-  garland: 'garland',
-  marketing: 'garland',
-  creative: 'garland',
-  design: 'garland',
-  product: 'garland',
-  research: 'garland',
-};
-
-function crownOf(slug: string): CrownFamily {
-  return CROWN_MAP[slug.toLowerCase()] ?? 'forge';
-}
-
-// ---------------------------------------------------------------------------
 // Global bridge health + pending-gates state (top-bar probe)
 // ---------------------------------------------------------------------------
 
@@ -96,6 +65,8 @@ interface BridgeStatus {
   offline: boolean;
   offlineSince: number | null;
   pendingGates: number;
+  /** Workflow id of the first pending gate, for direct beacon / "G" routing. */
+  firstGateId: string | null;
   budgetPct: number;
 }
 
@@ -105,6 +76,7 @@ function useBridgeStatus(): BridgeStatus {
     offline: false,
     offlineSince: null,
     pendingGates: 0,
+    firstGateId: null,
     budgetPct: 0,
   });
 
@@ -118,13 +90,20 @@ function useBridgeStatus(): BridgeStatus {
       const healthOk = healthRes.status === 'fulfilled' && healthRes.value.ok;
 
       let gates = 0;
+      let firstGateId: string | null = null;
       if (hitlRes.status === 'fulfilled' && hitlRes.value.ok) {
         const body = (await hitlRes.value.json()) as unknown;
-        if (Array.isArray(body)) gates = body.length;
+        let items: unknown[] = [];
+        if (Array.isArray(body)) items = body;
         else if (body && typeof body === 'object' && 'items' in body) {
-          gates = ((body as { items?: unknown[] }).items ?? []).length;
+          items = (body as { items?: unknown[] }).items ?? [];
         } else if (body && typeof body === 'object' && 'count' in body) {
           gates = Number((body as { count?: number }).count ?? 0);
+        }
+        if (items.length > 0) {
+          gates = items.length;
+          const first = items[0] as { workflow_id?: string; hitl_id?: string } | undefined;
+          firstGateId = first?.workflow_id ?? first?.hitl_id ?? null;
         }
       }
 
@@ -133,6 +112,7 @@ function useBridgeStatus(): BridgeStatus {
         offline: !healthOk,
         offlineSince: healthOk ? null : (prev.offlineSince ?? Date.now()),
         pendingGates: gates,
+        firstGateId,
         budgetPct: prev.budgetPct,
       }));
     } catch {
@@ -244,6 +224,7 @@ interface Workflow {
   root_goal?: string;
   has_pending_hitl?: boolean;
   selected_squads?: string[];
+  updated_at?: string;
 }
 
 interface BodyRailProps {
@@ -251,34 +232,67 @@ interface BodyRailProps {
   online: boolean;
 }
 
+// Cap the live Active list so a backlog of in-flight workflows can't push the
+// Crown sections below the fold; the rail itself scrolls, and an overflow
+// affordance links to the full Launchpad constellation.
+const ACTIVE_RAIL_CAP = 8;
+
+// A non-terminal workflow only counts as genuinely "active" if it was touched
+// recently OR is awaiting a human at a gate. Older non-terminal runs are
+// abandoned LangGraph threads (session ended / never resumed past an
+// interrupt) — they're "stale", not live sessions, and are what `hydra reap`
+// sweeps. Honest counts here so 36 orphaned test rows don't read as 36 live runs.
+const LIVE_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+
+function isLiveActive(wf: Workflow): boolean {
+  if (wf.has_pending_hitl) return true; // genuinely awaiting the operator
+  if (!wf.updated_at) return false;
+  const t = Date.parse(wf.updated_at);
+  return Number.isFinite(t) && (Date.now() - t) < LIVE_WINDOW_MS;
+}
+
 function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let active = true;
     async function load(): Promise<void> {
       try {
         const res = await fetch('/api/workflows?limit=50');
-        if (!res.ok) throw new Error('failed');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json()) as unknown;
         let wfs: Workflow[] = [];
         if (Array.isArray(body)) wfs = body as Workflow[];
         else if (body && typeof body === 'object' && 'workflows' in body) {
           wfs = ((body as { workflows?: Workflow[] }).workflows) ?? [];
         }
-        if (active) { setWorkflows(wfs); setLoading(false); }
-      } catch {
-        if (active) setLoading(false);
+        if (active) { setWorkflows(wfs); setError(null); setLoading(false); }
+      } catch (e) {
+        // Surface the failure instead of silently swallowing it — an empty
+        // rail must never be mistaken for "no workflows".
+        if (active) {
+          setError(e instanceof Error ? e.message : 'unreachable');
+          setLoading(false);
+        }
       }
     }
     void load();
     const t = setInterval(() => { void load(); }, 8000);
     return () => { active = false; clearInterval(t); };
-  }, []);
+  }, [reloadKey]);
 
-  // Group active workflows by crown
-  const active = workflows.filter((w) => !['done', 'surfaced'].includes(w.phase ?? ''));
+  // Split non-terminal workflows into genuinely-live vs stale/abandoned so the
+  // ACTIVE count reflects reality (not a pile of orphaned test threads).
+  const nonTerminal = workflows.filter((w) => !['done', 'surfaced'].includes(w.phase ?? ''));
+  const activeAll = nonTerminal.filter(isLiveActive);
+  const staleAll = nonTerminal.filter((w) => !isLiveActive(w));
+  const active = activeAll.slice(0, ACTIVE_RAIL_CAP);
+  const activeOverflow = activeAll.length - active.length;
+  const stale = staleAll.slice(0, ACTIVE_RAIL_CAP);
+  const staleOverflow = staleAll.length - stale.length;
   const recent = workflows.filter((w) => ['done', 'surfaced'].includes(w.phase ?? '')).slice(0, 5);
 
   // Collect unique squads from all workflows
@@ -323,31 +337,93 @@ function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
       data-testid="body-rail"
       role="navigation"
     >
-      {/* Active workflows */}
-      {active.length > 0 ? (
+      {/* Fetch error — never let a failed probe read as "no workflows" */}
+      {error && online ? (
+        <div className="body-rail-error" role="alert">
+          <span aria-hidden="true">▲</span> Workflow list unreachable
+          <button
+            type="button"
+            className="body-rail-retry"
+            onClick={() => { setLoading(true); setReloadKey((k) => k + 1); }}
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {/* Active workflows — only genuinely-live runs (recent, or awaiting a gate) */}
+      {!loading || activeAll.length > 0 ? (
         <section className="crown-section" aria-label="Active workflows">
           <div className="crown-section-header">
             <span className="crown-glyph" aria-hidden="true">◎</span>
-            <span>Active ({active.length})</span>
+            <span>Active ({activeAll.length})</span>
           </div>
-          <ul className="body-tree" role="tree" aria-label="Active workflows">
-            {active.map((wf) => (
-              <li key={wf.workflow_id} role="treeitem" aria-label={`Workflow ${wf.workflow_id.slice(0, 8)}, phase ${wf.phase ?? 'unknown'}`}>
+          {active.length > 0 ? (
+            <ul className="body-tree body-tree--scroll" role="tree" aria-label="Active workflows">
+              {active.map((wf) => (
+                <li key={wf.workflow_id} role="treeitem" aria-label={`Workflow ${wf.workflow_id.slice(0, 8)}${wf.root_goal ? `, ${wf.root_goal}` : ''}, phase ${wf.phase ?? 'unknown'}`}>
+                  <a
+                    href={wf.has_pending_hitl
+                      ? `#/gate/${encodeURIComponent(wf.workflow_id)}`
+                      : `#/workflow/${encodeURIComponent(wf.workflow_id)}`}
+                    className={`body-tree-item${currentWorkflowId === wf.workflow_id ? ' body-tree-item--active' : ''}${wf.has_pending_hitl ? ' body-tree-item--gate' : ''}`}
+                    aria-current={currentWorkflowId === wf.workflow_id ? 'page' : undefined}
+                    title={wf.root_goal ?? wf.workflow_id}
+                  >
+                    <span aria-hidden="true">{phaseIcon(wf.phase)}</span>
+                    <span className="body-tree-item-label">
+                      {wf.root_goal
+                        ? wf.root_goal
+                        : <span className="mono">{wf.workflow_id.slice(0, 8)}…</span>}
+                    </span>
+                    {wf.has_pending_hitl ? <span className="sr-only">— gate pending</span> : null}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="crown-section-empty">No live runs</div>
+          )}
+          {activeOverflow > 0 ? (
+            <a href="#/" className="body-rail-overflow">
+              +{activeOverflow} more on the constellation →
+            </a>
+          ) : null}
+        </section>
+      ) : null}
+
+      {/* Stale / abandoned — non-terminal but untouched; collapsed by default.
+          These are what `hydra reap` sweeps; surfaced honestly, not as "live". */}
+      {staleAll.length > 0 ? (
+        <details className="crown-section body-stale" data-testid="body-stale">
+          <summary className="crown-section-header body-stale-summary">
+            <span aria-hidden="true">⋯</span>
+            <span>Stale ({staleAll.length})</span>
+          </summary>
+          <ul className="body-tree body-tree--scroll" role="tree" aria-label="Stale workflows">
+            {stale.map((wf) => (
+              <li key={wf.workflow_id} role="treeitem" aria-label={`Stale workflow ${wf.workflow_id.slice(0, 8)}${wf.root_goal ? `, ${wf.root_goal}` : ''}, last phase ${wf.phase ?? 'unknown'}`}>
                 <a
-                  href={wf.has_pending_hitl
-                    ? `#/gate/${encodeURIComponent(wf.workflow_id)}`
-                    : `#/workflow/${encodeURIComponent(wf.workflow_id)}`}
-                  className={`body-tree-item${currentWorkflowId === wf.workflow_id ? ' body-tree-item--active' : ''}${wf.has_pending_hitl ? ' body-tree-item--gate' : ''}`}
-                  aria-current={currentWorkflowId === wf.workflow_id ? 'page' : undefined}
+                  href={`#/workflow/${encodeURIComponent(wf.workflow_id)}`}
+                  className="body-tree-item body-tree-item--stale"
+                  title={wf.root_goal ?? wf.workflow_id}
                 >
-                  <span aria-hidden="true">{phaseIcon(wf.phase)}</span>
-                  <span className="mono" style={{ fontSize: '10px' }}>{wf.workflow_id.slice(0, 6)}…</span>
-                  {wf.has_pending_hitl ? <span className="sr-only">— gate pending</span> : null}
+                  <span aria-hidden="true">◌</span>
+                  <span className="body-tree-item-label">
+                    {wf.root_goal
+                      ? wf.root_goal
+                      : <span className="mono">{wf.workflow_id.slice(0, 8)}…</span>}
+                  </span>
                 </a>
               </li>
             ))}
           </ul>
-        </section>
+          {staleOverflow > 0 ? (
+            <div className="body-rail-overflow body-rail-overflow--static">
+              +{staleOverflow} more · run <code>hydra reap</code> to sweep
+            </div>
+          ) : null}
+        </details>
       ) : null}
 
       <div className="body-rail-divider" role="separator" />
@@ -381,7 +457,7 @@ function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
             ))}
           </ul>
         ) : (
-          <div className="body-rail-status" aria-hidden="true">—</div>
+          <div className="crown-section-empty">No active heads</div>
         )}
       </section>
 
@@ -413,7 +489,7 @@ function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
             ))}
           </ul>
         ) : (
-          <div className="body-rail-status" aria-hidden="true">—</div>
+          <div className="crown-section-empty">No active heads</div>
         )}
       </section>
 
@@ -445,7 +521,7 @@ function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
             ))}
           </ul>
         ) : (
-          <div className="body-rail-status" aria-hidden="true">—</div>
+          <div className="crown-section-empty">No active heads</div>
         )}
       </section>
 
@@ -464,10 +540,15 @@ function BodyRail({ currentWorkflowId, online }: BodyRailProps): JSX.Element {
                 <a
                   href={`#/workflow/${encodeURIComponent(wf.workflow_id)}`}
                   className={`body-workflow-item body-workflow-item--${wf.phase === 'done' ? 'done' : 'active'}`}
-                  aria-label={`Workflow ${wf.workflow_id.slice(0, 8)}, ${wf.phase}`}
+                  aria-label={`Workflow ${wf.workflow_id.slice(0, 8)}${wf.root_goal ? `, ${wf.root_goal}` : ''}, ${wf.phase}`}
+                  title={wf.root_goal ?? wf.workflow_id}
                 >
                   <span aria-hidden="true">{wf.phase === 'done' ? '✓' : '⚠'}</span>
-                  <span className="mono" style={{ fontSize: '10px' }}>{wf.workflow_id.slice(0, 6)}…</span>
+                  <span className="body-tree-item-label">
+                    {wf.root_goal
+                      ? wf.root_goal
+                      : <span className="mono">{wf.workflow_id.slice(0, 8)}…</span>}
+                  </span>
                 </a>
               </li>
             ))}
@@ -553,7 +634,10 @@ function OracleRail({ latestSynthesis, isExecuting }: OracleRailProps): JSX.Elem
           ))
         ) : (
           <p className="oracle-placeholder">
-            No synthesis yet.
+            <span className="oracle-placeholder-title">The Oracle is silent.</span>
+            <span className="oracle-placeholder-hint">
+              Hydra’s synthesis will speak here once a run reaches the synthesis phase.
+            </span>
           </p>
         )}
       </div>
@@ -573,7 +657,8 @@ function OracleRail({ latestSynthesis, isExecuting }: OracleRailProps): JSX.Elem
 // ---------------------------------------------------------------------------
 
 export function App(): JSX.Element {
-  const { live, offline, offlineSince: offlineSinceRaw, pendingGates, budgetPct } = useBridgeStatus();
+  const { live, offline, offlineSince: offlineSinceRaw, pendingGates, firstGateId, budgetPct } = useBridgeStatus();
+  const gateHref = firstGateId ? `#/gate/${encodeURIComponent(firstGateId)}` : '#/';
   const offlineSince = offlineSinceRaw ?? undefined;
   const parsed = useHashView();
 
@@ -607,7 +692,9 @@ export function App(): JSX.Element {
           break;
         case 'G': // Next Gate
           e.preventDefault();
-          if (pendingGates > 0) window.location.hash = '#/';
+          if (pendingGates > 0) {
+            window.location.hash = firstGateId ? `#/gate/${encodeURIComponent(firstGateId)}` : '#/';
+          }
           break;
         case 'B': { // Body rail focus
           e.preventDefault();
@@ -622,11 +709,6 @@ export function App(): JSX.Element {
           oracle?.focus();
           break;
         }
-        case 'P': { // Phase Rail (stub — R3)
-          e.preventDefault();
-          // Phase Rail implementation in R3
-          break;
-        }
         case 'M': // Memory
           e.preventDefault();
           window.location.hash = '#/memory';
@@ -635,7 +717,7 @@ export function App(): JSX.Element {
     }
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [pendingGates]);
+  }, [pendingGates, firstGateId]);
 
   // Build nav link className helper
   function navClass(view: string): string {
@@ -789,19 +871,20 @@ export function App(): JSX.Element {
             {live ? 'live' : 'offline'}
           </span>
 
-          {/* Budget sinew band */}
+          {/* Budget sinew band — value label keeps it from reading as a stray
+              line; an explicit idle modifier renders a calm baseline at 0%. */}
           <div
             className="immortal-budget-band"
-            aria-hidden="true"
             title="Global budget utilization"
           >
+            <span className="immortal-budget-caption" aria-hidden="true">budget</span>
             <div
-              className="immortal-budget-track"
+              className={`immortal-budget-track${budgetPct <= 0 ? ' immortal-budget-track--idle' : ''}`}
               role="meter"
               aria-valuenow={Math.round(budgetPct * 100)}
               aria-valuemin={0}
               aria-valuemax={100}
-              aria-label={`Budget: ${Math.round(budgetPct * 100)}% consumed`}
+              aria-label={`Global budget: ${Math.round(budgetPct * 100)}% consumed`}
               style={{ '--budget-pct': budgetPct } as React.CSSProperties}
             >
               <div
@@ -809,12 +892,15 @@ export function App(): JSX.Element {
                 style={{ width: `${Math.min(100, budgetPct * 100)}%` }}
               />
             </div>
+            <span className="immortal-budget-value" aria-hidden="true">
+              {Math.round(budgetPct * 100)}%
+            </span>
           </div>
 
           {/* Pending gate beacon */}
           {pendingGates > 0 ? (
             <a
-              href="#/"
+              href={gateHref}
               className="pending-gates-badge"
               aria-label={`${pendingGates} pending gate${pendingGates !== 1 ? 's' : ''} — action required`}
               data-testid="pending-gates-badge"

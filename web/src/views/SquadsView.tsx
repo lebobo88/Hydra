@@ -6,6 +6,7 @@
 
 import { useEffect, useState } from 'react';
 import { LoadingScreen, EmptyScreen, ErrorScreen, DegradedBanner, OfflineBanner } from '../components/StateScreens.tsx';
+import { ViewHeader } from '../components/ViewHeader.tsx';
 import type { SquadPack } from '../api/client.ts';
 
 interface SquadsViewProps {
@@ -47,10 +48,7 @@ export function SquadsView({ online }: SquadsViewProps): JSX.Element {
 
   return (
     <div className="squads-view">
-      <header className="view-header">
-        <a href="#/" className="back-link">← Launchpad</a>
-        <h1 className="view-title">Squads</h1>
-      </header>
+      <ViewHeader title="Squads" />
 
       {!online ? <OfflineBanner /> : null}
       {degraded ? (

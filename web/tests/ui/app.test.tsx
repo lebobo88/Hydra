@@ -375,7 +375,7 @@ describe('App shell', () => {
     expect(declaration.getAttribute('aria-live')).toBe('polite');
   });
 
-  it('Oracle shows "No synthesis yet" placeholder when no synthesis', async () => {
+  it('Oracle shows the silent placeholder when no synthesis', async () => {
     vi.stubGlobal('fetch', makeFetchMock({
       '/api/health': MOCK_HEALTH,
       '/api/hitl': MOCK_HITL_NONE,
@@ -384,7 +384,7 @@ describe('App shell', () => {
 
     render(<App />);
 
-    expect(screen.getByText(/No synthesis yet/)).toBeTruthy();
+    expect(screen.getByText(/The Oracle is silent/)).toBeTruthy();
   });
 
   it('Working center has id=main-working for skip-link target', async () => {
@@ -441,7 +441,33 @@ describe('App shell', () => {
 
     const meter = document.querySelector('[role="meter"]');
     expect(meter).toBeTruthy();
-    expect(meter?.getAttribute('aria-label')).toContain('Budget');
+    expect(meter?.getAttribute('aria-label')?.toLowerCase()).toContain('budget');
+  });
+
+  it('body rail ACTIVE count is honest: recent/gated = active, old = stale', async () => {
+    const recentIso = new Date(Date.now() - 60_000).toISOString();       // 1 min ago → live
+    const oldIso = new Date(Date.now() - 5 * 86_400_000).toISOString();  // 5 days ago → stale
+    const MIXED = { workflows: [
+      { workflow_id: 'live-recent-0001-0000-000000000000', phase: 'executing', root_goal: 'Fresh run', selected_squads: ['engineering'], has_pending_hitl: false, updated_at: recentIso },
+      { workflow_id: 'live-gated-0002-0000-000000000000', phase: 'approval', root_goal: 'Awaiting gate', selected_squads: ['executive'], has_pending_hitl: true, updated_at: oldIso },
+      { workflow_id: 'stale-aaaa-0003-0000-000000000000', phase: 'approval', root_goal: 'Abandoned A', selected_squads: ['garland'], has_pending_hitl: false, updated_at: oldIso },
+      { workflow_id: 'stale-bbbb-0004-0000-000000000000', phase: 'synthesis', root_goal: 'Abandoned B', selected_squads: ['engineering'], has_pending_hitl: false, updated_at: oldIso },
+    ], count: 4 };
+    vi.stubGlobal('fetch', makeFetchMock({
+      '/api/health': MOCK_HEALTH,
+      '/api/hitl': MOCK_HITL_NONE,
+      '/api/workflows': MIXED,
+    }));
+
+    render(<App />);
+
+    // 2 live (recent + gated), 2 stale (old, no gate)
+    await waitFor(() => {
+      expect(screen.getByText(/Active \(2\)/)).toBeTruthy();
+    }, { timeout: 2000 });
+    const stale = screen.getByTestId('body-stale');
+    expect(stale).toBeTruthy();
+    expect(stale.textContent).toContain('Stale (2)');
   });
 
   it('gate SR beacon elements are in DOM when gates > 0', async () => {

@@ -491,7 +491,7 @@ describe('THE LIVING RUN — LiveWorkflowView R3', () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByText(/No synthesis yet/)).toBeTruthy();
+      expect(screen.getByText(/The Oracle is silent/)).toBeTruthy();
     }, { timeout: 2000 });
   });
 

@@ -211,6 +211,30 @@
   height: 6px;
   background: var(--venom);
 }
+/* Caption + value text so the band never reads as a stray hairline */
+.immortal-budget-caption {
+  font-family: var(--font-covenant);
+  font-size: var(--t-nano);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--bone-mid) 75%, transparent);
+}
+.immortal-budget-value {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--bone-mid);
+  min-width: 3ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+/* Idle baseline — a calm dotted track instead of an empty fill at 0% */
+.immortal-budget-track--idle {
+  background: repeating-linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--bone-mid) 22%, transparent) 0 2px,
+    transparent 2px 6px
+  );
+}
 
 /* Pending gate beacon */
 .pending-gates-badge {
@@ -416,6 +440,105 @@
   font-family: var(--font-mono);
 }
 
+/* Truncating goal/id label inside tree + workflow items */
+.body-tree-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.body-tree-item-label .mono {
+  font-size: var(--t-micro);
+}
+
+/* Active list is capped + scroll-contained so Crowns stay above the fold */
+.body-tree--scroll {
+  max-height: calc(var(--sp-8) * 6);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Overflow affordance → full constellation */
+.body-rail-overflow {
+  display: block;
+  padding: var(--sp-1) var(--sp-5);
+  font-size: var(--t-micro);
+  color: var(--biolume);
+  text-decoration: none;
+}
+.body-rail-overflow:hover,
+.body-rail-overflow:focus {
+  color: var(--bone);
+  text-decoration: underline;
+}
+
+/* Fetch-error banner — an empty rail must never read as "no workflows" */
+.body-rail-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--venom) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--venom) 10%, transparent);
+  color: var(--bone);
+  font-size: var(--t-micro);
+}
+.body-rail-retry {
+  margin-left: auto;
+  padding: 2px var(--sp-2);
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--bone) 25%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--bone);
+  font-size: var(--t-micro);
+  cursor: pointer;
+  min-height: 24px;
+}
+.body-rail-retry:hover,
+.body-rail-retry:focus {
+  background: color-mix(in srgb, var(--bone) 10%, transparent);
+}
+
+/* Quiet empty state for Crown sections (replaces bare em-dash) */
+.crown-section-empty {
+  padding: var(--sp-1) var(--sp-5);
+  font-size: var(--t-micro);
+  font-style: italic;
+  color: color-mix(in srgb, var(--bone-mid) 70%, transparent);
+}
+
+/* Stale / abandoned workflows — collapsed <details>, de-emphasized */
+.body-stale {
+  margin-top: var(--sp-1);
+}
+.body-stale-summary {
+  cursor: pointer;
+  list-style: none;
+  color: color-mix(in srgb, var(--bone-mid) 80%, transparent);
+}
+.body-stale-summary::-webkit-details-marker { display: none; }
+.body-stale-summary:hover,
+.body-stale-summary:focus-visible {
+  color: var(--bone);
+}
+.body-tree-item--stale {
+  color: color-mix(in srgb, var(--bone-mid) 60%, transparent);
+  font-style: italic;
+}
+.body-rail-overflow--static {
+  color: color-mix(in srgb, var(--bone-mid) 70%, transparent);
+  cursor: default;
+}
+.body-rail-overflow--static code {
+  font-family: var(--font-mono);
+  font-size: var(--t-nano);
+  color: var(--bone-mid);
+}
+
 /* =========================================================================
    THE WORKING — center router outlet
 ========================================================================= */
@@ -516,11 +639,23 @@
 
 /* Oracle 8-state */
 .oracle-placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
   font-family: var(--font-oracle);
   font-size: 1.125rem;
   font-style: italic;
   color: var(--bone-mid);
   line-height: 1.5;
+}
+.oracle-placeholder-title {
+  color: color-mix(in srgb, var(--bone) 80%, transparent);
+}
+.oracle-placeholder-hint {
+  font-family: var(--font-ui);
+  font-style: normal;
+  font-size: var(--t-small);
+  color: color-mix(in srgb, var(--bone-mid) 80%, transparent);
 }
 
 .oracle-assembling {
@@ -2164,8 +2299,12 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: var(--sp-4);
-  padding: var(--sp-4) var(--sp-6);
+  /* Center the constellation + speak-intent block in the available height so
+     it no longer floats at the top over a large dead void. The column still
+     scrolls if it outgrows the viewport (working-center is overflow-y:auto). */
+  justify-content: center;
+  gap: var(--sp-5);
+  padding: var(--sp-6);
   min-height: 100%;
   position: relative;
 }
@@ -2178,7 +2317,7 @@
   align-items: center;
   gap: var(--sp-4);
   width: 100%;
-  max-width: 520px;
+  max-width: 600px;
   margin: 0 auto;
 
   /* Glass / covenant-indigo tint */
@@ -2219,7 +2358,7 @@
 /* The SVG constellation canvas */
 .constellation-svg {
   width: 100%;
-  max-width: 420px;
+  max-width: 500px;
   height: auto;
   display: block;
   position: relative;
