@@ -166,9 +166,36 @@ def _via_mcp(
     invoke = pack.invoke or {}
     mode = invoke.get("mode", "pp_run")
 
-    project_path = invoke.get("project_path") or str(state.workflow_id and __import__("pathlib").Path.cwd())
-    if "${project_root}" in str(project_path):
-        project_path = str(__import__("pathlib").Path.cwd())
+    # Repo-targeting: resolve target_repo_id FIRST, before reading any
+    # invoke["project_path"] from squad.yaml — the registry is the only
+    # authoritative path source when a repo override is requested.
+    # resolve_repo_path is called immediately before dispatch (minimal TOCTOU
+    # window) and the registry dirs are operator-trusted config, not user input.
+    # A rejected id (unknown key, raw path, git verification failure, base
+    # escape) short-circuits the dispatch with a "failed" result rather than
+    # silently falling back to the default CWD.
+    # Repo-targeting is only honoured for the engineering squad — other mcp
+    # squads (e.g. executive) must not be retargeted via this mechanism.
+    # resolve_repo_path is called immediately before dispatch (minimal TOCTOU
+    # window); registry dirs are operator-trusted sibling repos so an attacker
+    # who can swap those dirs already owns the host — no further mitigation needed.
+    target_repo_id = getattr(inbound, "target_repo_id", None)
+    if target_repo_id and pack.slug == "engineering":
+        from hydra_core.repo_registry import resolve_repo_path
+        try:
+            project_path = str(resolve_repo_path(target_repo_id))
+        except Exception as e:
+            return SquadResult(
+                envelopes=[], artifacts=[], status="failed",
+                rationale=f"repo-targeting rejected target_repo_id={target_repo_id!r}: {e}",
+            )
+    else:
+        # No repo override (or non-engineering mcp squad) — use the trusted
+        # operator config from squad.yaml, with ${project_root} -> cwd.
+        project_path = invoke.get("project_path") or str(state.workflow_id and __import__("pathlib").Path.cwd())
+        if "${project_root}" in str(project_path):
+            project_path = str(__import__("pathlib").Path.cwd())
+
     args = {
         "request_text": getattr(inbound, "instructions", None)
         or getattr(inbound, "summary", None)

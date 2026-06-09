@@ -88,6 +88,8 @@ class CSuiteDecisionPacket(HydraEnvelope):
     approvals_required: list[str] = Field(default_factory=list)  # e.g. ["human:CFO"]
     dissenting_opinions: list[str] = Field(default_factory=list)
     notes: Optional[str] = None
+    # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
+    target_repo_id: Optional[str] = None
 
 
 # ---------- engineering squad ----------

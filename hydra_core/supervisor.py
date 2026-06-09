@@ -191,6 +191,44 @@ def build_supervisor(
                 replay_summary,
             )
 
+        # --repo <id> extraction: parse an optional --repo token from the goal
+        # text and set state.target_repo_id. An unknown id is a user error —
+        # surface immediately via HITL rather than silently ignoring it. On
+        # success, target_repo_id is set (or left unchanged if already set by
+        # the caller, e.g. a test that pre-seeds HydraState). root_goal is
+        # NOT mutated so the router and planner see the original text.
+        from hydra_core.repo_registry import parse_repo_arg
+        try:
+            _repo_id, _cleaned = parse_repo_arg(state.root_goal)
+        except ValueError as _repo_err:
+            # Unknown --repo id: surface immediately so the operator sees the
+            # problem rather than the dispatch silently targeting the wrong repo.
+            state.phase = "surfaced"
+            _hitl_payload: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": f"--repo argument rejected: {_repo_err}",
+                "options": ["abort"],
+                "default_option": "abort",
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.bad_repo_arg",
+                {"error": str(_repo_err)},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _hitl_payload,
+                "last_event": f"bad --repo arg: {_repo_err}",
+            }
+        # Only set target_repo_id from the goal text if the caller has not
+        # already injected one (e.g. via direct HydraState construction in
+        # tests or a future structured API path).
+        if _repo_id is not None and not state.target_repo_id:
+            state.target_repo_id = _repo_id
+
         # Route the goal text. A pre-seeded non-empty `selected_squads`
         # (CLI `hydra run --squad ...` / operator force-select) wins over
         # the intent router: validate slugs against discovered packs and
@@ -461,6 +499,7 @@ def build_supervisor(
                 # squad still produces N traceable artifacts. Real diversity
                 # comes from the underlying responder's temperature/seed.
                 objective=f"{task.description}\n\n[bon-candidate {i+1}/{n}]",
+                target_repo_id=state.target_repo_id,
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -608,6 +647,7 @@ def build_supervisor(
                 target_squad=pack.slug,
                 origin="BOARDROOM",
                 objective=task.description,
+                target_repo_id=state.target_repo_id,
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -700,6 +740,7 @@ def build_supervisor(
             origin="BOARDROOM",
             objective=retry_obj,
             parent_id=original_env.get("id"),
+            target_repo_id=state.target_repo_id,
         )
 
         try:
@@ -1161,7 +1202,12 @@ def build_supervisor(
                         "supervisor.pp_runs_abort_failed",
                         {"error": repr(e), "surface_reason": verdict.reason},
                     )
-        else:
+        elif state.phase != "surfaced":
+            # Only advance to "done" if the workflow was not already surfaced
+            # before postcheck ran (e.g. intake rejected an unknown --repo and
+            # routed here via the after_intake "halt" edge).  Clobbering an
+            # already-surfaced phase would hide the pending_hitl and report
+            # the workflow as successful.
             state.phase = "done"
 
         # Flush tool usage analytics to disk at workflow end.
@@ -1189,6 +1235,12 @@ def build_supervisor(
         }
 
     # ----- routing edges -----
+
+    def after_intake(state: HydraState) -> str:
+        """Route to postcheck (halt) when intake surfaced — e.g. bad --repo arg.
+        Postcheck handles pending_hitl and reaches END cleanly via after_postcheck.
+        """
+        return "halt" if state.phase == "surfaced" else "planner"
 
     def after_planner(state: HydraState) -> str:
         return "approval" if state.requires_human_approval else "dispatch"
@@ -1224,7 +1276,10 @@ def build_supervisor(
     graph.add_node("postcheck", node_postcheck)
 
     graph.set_entry_point("intake")
-    graph.add_edge("intake", "planner")
+    graph.add_conditional_edges("intake", after_intake, {
+        "planner": "planner",
+        "halt": "postcheck",
+    })
     graph.add_conditional_edges("planner", after_planner, {
         "approval": "approval",
         "dispatch": "dispatch",

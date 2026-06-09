@@ -53,6 +53,7 @@ class HydraState(BaseModel):
     workflow_id: UUID = Field(default_factory=uuid4)
     tenant_id: str = "default"
     root_goal: str = ""
+    target_repo_id: Optional[str] = None  # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",
