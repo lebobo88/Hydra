@@ -7,20 +7,27 @@ Counter persisted at:
 
 Constitution enforcement (defense-in-depth, Article V):
   - customer_ref MUST match ^customer:[0-9a-f]{6,}$  (Article IV identity discipline)
-  - send_response requires [AI-assisted response] + seal: cleared markers unless actor='human'
+  - send_response requires a SIGNED CLEARANCE TOKEN produced by sign.py's mint()
+    scheme (XEN-VHP-2).  Literal-string markers and actor='human' bypass removed.
   - execute_approved reads APPROVAL-<ticket_id>-*.yaml; deny-by-default on any mismatch
   - No monetary execution without a valid, unexpired, action-matching approval artifact
+  - Server-side actor allow-list enforced for send_response and execute_approved (XEN-VHP-3)
+  - Server-side PII scan with normalization on send_response body (XEN-VHP-1)
+  - Approval artifact matching requires exact ticket_id, action, scope and exact
+    approval_id stem (XEN-VHP-3 binding fix)
 
 Tools surface as mcp__hydra_gateway__xenia_tickets__* (server name "xenia-tickets" matches
 hook matcher mcp__.*ticket.*).
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
 import sys
 import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -30,6 +37,7 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 
 from mcp_servers._pack_shim import resolve_root, run_server  # noqa: E402
+from mcp_servers.xenia_tickets.clearance import verify_clearance_token  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -49,7 +57,6 @@ VALID_STATUSES = {"open", "pending", "resolved", "escalated", "closed"}
 VALID_PRIORITIES = {"P1", "P2", "P3", "P4"}
 
 # Legal status transitions — closed is terminal (no resurrect)
-# Maps current_status -> set of allowed next statuses
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "open":      {"open", "pending", "resolved", "escalated", "closed"},
     "pending":   {"open", "pending", "resolved", "escalated", "closed"},
@@ -60,8 +67,187 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
 
 MUTABLE_FIELDS = {"status", "priority", "intent"}
 
-# Counter lock (thread-safety for local use; process-level for the common case)
 _counter_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# XEN-VHP-3: Server-side actor allow-list
+# ---------------------------------------------------------------------------
+# Reconciled against heads.yaml (Xenia canonical head registry):
+#   - xenia-tickets.send_response is listed ONLY for hermes/escalation-handoff.
+#   - xenia-tickets.execute_approved is listed ONLY for hermes/escalation-handoff.
+#   - There is NO "human" role in heads.yaml; "human" has been REMOVED from both
+#     allow-lists (fix #6).  A human-reviewed response is submitted via hermes.
+#
+# FIXME(auth): the actor field is self-reported/spoofable by any MCP caller.
+# Unforgeable caller identity (e.g. mTLS, signed JWT, session binding) is
+# tracked in WS-AUTH.  Until that lands, this allow-list is a defense-in-depth
+# speed bump, not a cryptographic guarantee.
+
+_SEND_RESPONSE_ALLOWED_ACTORS: frozenset[str] = frozenset({
+    "hermes",
+    "escalation-handoff",
+    # "human" REMOVED — heads.yaml grants no tool to a "human" role (fix #6).
+    # A human reviewer acts through the hermes head.
+})
+
+_EXECUTE_APPROVED_ALLOWED_ACTORS: frozenset[str] = frozenset({
+    "hermes",
+    "escalation-handoff",
+    # "human" REMOVED — heads.yaml grants no tool to a "human" role (fix #6).
+})
+
+
+def _check_actor_authz(actor: str, allowed: frozenset[str]) -> dict[str, Any] | None:
+    """Return an _err dict if actor is not in allowed, else None.
+    FIXME(auth): actor is self-reported — see module note above.
+    """
+    if actor not in allowed:
+        return _err(
+            "FORBIDDEN_ACTOR",
+            f"Actor {actor!r} is not authorised to call this tool. "
+            f"Allowed actors: {sorted(allowed)}. "
+            "FIXME(auth): actor field is self-reported; unforgeable identity tracked in WS-AUTH.",
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# XEN-VHP-1: Server-side PII scan with normalization
+# ---------------------------------------------------------------------------
+# Before scanning we apply:
+#   1. HTML-unescaping  (e.g. &lt; -> <, &#64; -> @)
+#   2. NFKC unicode normalization (compatibility decomposition, full-width digits etc.)
+#   3. For SSN / credit-card patterns we also scan a separator-stripped variant
+#      (remove '.', '-', ' ') so dotted/spaced forms are caught.
+#
+# These run server-side regardless of hook state.  The hook is the redaction
+# path; the server is the last-resort block gate.
+
+_PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    # Email address — run on HTML-unescaped + NFKC-normalised text
+    (
+        "EMAIL",
+        re.compile(
+            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
+        ),
+    ),
+    # US Social Security Number (ddd-dd-dddd or ddd.dd.dddd or condensed dddddddddd)
+    # Separator-stripped variant handles 123.45.6789 and 123 45 6789
+    (
+        "US_SSN",
+        re.compile(
+            r"\b(?!000|666|9\d{2})\d{3}[-\s.]?(?!00)\d{2}[-\s.]?(?!0000)\d{4}\b",
+        ),
+    ),
+    # Credit card — 13-19 contiguous or space/dash/dot-grouped digits.
+    # Separator-stripped variant handles 4111.1111.1111.1111 etc.
+    (
+        "CREDIT_CARD",
+        re.compile(
+            r"\b(?:\d[ \-.]?){12,18}\d\b",
+        ),
+    ),
+    # US/Canada/international phone
+    (
+        "PHONE",
+        re.compile(
+            r"(?<!\d)"
+            r"(?:\+?1[\s.\-]?)?"
+            r"(?:\(\d{3}\)|\d{3})"
+            r"[\s.\-]?"
+            r"\d{3}"
+            r"[\s.\-]?"
+            r"\d{4}"
+            r"(?!\d)",
+        ),
+    ),
+]
+
+
+def _normalize_for_pii(text: str) -> str:
+    """HTML-unescape and NFKC-normalize for PII scanning."""
+    unescaped = html.unescape(text)
+    return unicodedata.normalize("NFKC", unescaped)
+
+
+def _scan_pii(text: str) -> list[str]:
+    """Return a deduplicated list of PII category names found in *text*.
+
+    Normalizes the input (HTML-unescape, NFKC) before scanning.  For SSN and
+    credit-card patterns also scans a separator-stripped variant so dotted/spaced
+    forms (123.45.6789, 4111.1111.1111.1111) are caught.
+    """
+    normalized = _normalize_for_pii(text)
+    # Separator-stripped variant for digit-only pattern evasion.
+    # Strip: whitespace, dot, hyphen, forward-slash, and zero-width Unicode
+    # characters (U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM/ZWNBSP)
+    # so that 123/45/6789 and zero-width-separated digits are caught.
+    stripped = re.sub(r"[\s.\-/​‌‍﻿]", "", normalized)
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    for category, pattern in _PII_PATTERNS:
+        if category in seen:
+            continue
+        # Primary scan on normalized text
+        if pattern.search(normalized):
+            found.append(category)
+            seen.add(category)
+            continue
+        # Secondary scan on separator-stripped text for digit-heavy patterns
+        if category in ("US_SSN", "CREDIT_CARD") and pattern.search(stripped):
+            found.append(category)
+            seen.add(category)
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# XEN-VHP-4: Money / commitment lexicon
+# ---------------------------------------------------------------------------
+# NOTE: Regex is intentionally over-inclusive (false-positive tolerant) because
+# a miss means sending an unreviewed money commitment to a customer.
+#
+# IMPORTANT — regex is NOT airtight:
+#   - Adversarial phrasing ("We can provide a monetary adjustment of five hundred
+#     US dollars") may evade word-boundary patterns.
+#   - Robust commitment detection requires SIGNED STRUCTURED COMMITMENT METADATA
+#     (a separate workflow step producing a commitment object, not free text).
+#   - Tracked follow-up: implement structured commitment signing in the
+#     Eunomia/Hermes pipeline so commitments are structurally identified, not
+#     inferred from response text.  This regex layer is defense-in-depth only.
+
+_MONEY_PATTERN = re.compile(
+    r"\b("
+    # Explicit action verbs
+    r"refund|credit|reimburse|reimbursement|compensation|compensate|"
+    r"discount|waive|waiver|remit|remittance|"
+    r"goodwill|adjustment|"
+    # Phrasing — "we will/we'll pay/send you/issue"
+    r"we will pay|we'll pay|we are paying|"
+    r"we will send you|we'll send you|"
+    r"you will receive|you'll receive|"
+    r"pay you|paying you|"
+    r"send you"
+    r")\b"
+    r"|"
+    # Currency amounts: $N, USD N, N dollars/euros/bucks/cents
+    r"\$\s*\d"
+    r"|USD\s*\d"
+    r"|\d+\s*(?:dollars?|cents?|euros?|bucks?|USD)",
+    re.IGNORECASE,
+)
+
+
+def _is_money_commitment(text: str) -> bool:
+    """Return True if the text contains money/commitment language.
+
+    See module-level note: this regex is defense-in-depth only; structured
+    commitment metadata is the correct long-term solution.
+    """
+    return bool(_MONEY_PATTERN.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +351,7 @@ def _parse_flat_yaml(text: str) -> dict[str, str]:
     sentinel _DUPLICATE_KEY_SENTINEL so that callers can fail-closed rather than
     silently last-winning to a potentially attacker-controlled value.
     """
-    # Security-relevant keys where duplicate detection is mandatory.
-    # A YAML file with status: denied / status: approved must NOT silently
-    # resolve to 'approved' via last-wins; it must be rejected by callers.
-    SECURITY_KEYS = {"status", "expires_at", "issued_by", "action", "scope"}
+    SECURITY_KEYS = {"status", "expires_at", "issued_by", "action", "scope", "ticket_id"}
     _DUPLICATE_KEY_SENTINEL = "__DUPLICATE_KEY__"
 
     result: dict[str, str] = {}
@@ -182,14 +365,11 @@ def _parse_flat_yaml(text: str) -> dict[str, str]:
         key_part, _, val_part = line.partition(":")
         key = key_part.strip()
         val = val_part.strip()
-        # Strip inline comments
         if " #" in val:
             val = val[:val.index(" #")].strip()
-        # Strip optional surrounding quotes
         if (val.startswith('"') and val.endswith('"')) or \
            (val.startswith("'") and val.endswith("'")):
             val = val[1:-1]
-        # Duplicate detection on security-relevant keys: mark as sentinel
         if key in SECURITY_KEYS and key in seen_keys:
             result[key] = _DUPLICATE_KEY_SENTINEL
         else:
@@ -207,6 +387,12 @@ def _find_valid_approval(
 ) -> tuple[bool, str, dict[str, str]]:
     """Search approvals_dir for a matching, unexpired, approved artifact.
 
+    XEN-VHP-3 binding fix (issue #3):
+      - ticket_id: EXACT non-empty match required (artifact missing ticket_id -> rejected)
+      - action:    EXACT case-insensitive match, non-empty required
+      - scope:     EXACT match, non-empty required
+      - approval_id: EXACT stem match (no substring/inclusion matching)
+
     Returns (valid: bool, reason: str, parsed_yaml: dict).
     """
     if not approvals_dir.exists():
@@ -220,13 +406,11 @@ def _find_valid_approval(
     now = datetime.now(timezone.utc)
 
     for fpath in candidates:
-        # If a specific approval_id was given, filter by filename stem
+        # EXACT approval_id stem match — stem only, no filename-with-extension
+        # acceptance (fix #3b: tighten to stem so the id is exact and unambiguous).
         if approval_id:
-            # approval_id may be the full stem or partial; check inclusion
-            if approval_id not in fpath.stem and fpath.stem != approval_id:
-                # try exact filename match
-                if fpath.name != approval_id and fpath.stem != approval_id:
-                    continue
+            if fpath.stem != approval_id:
+                continue
 
         try:
             text = fpath.read_text(encoding="utf-8")
@@ -235,47 +419,42 @@ def _find_valid_approval(
 
         parsed = _parse_flat_yaml(text)
 
-        # Must be approved — EXACT lowercase match required (no casing drift).
-        # The sentinel __DUPLICATE_KEY__ is never equal to "approved", so duplicate
-        # status keys automatically fail-closed here without a separate check.
-        # Reject any value that is not the exact lowercase string "approved":
-        #   - "Approved", "APPROVED", " approved " all fail (casing/whitespace drift)
-        #   - __DUPLICATE_KEY__ fails (ambiguous status)
-        #   - anything else fails
+        # Status: exact "approved" required
         raw_status = parsed.get("status", "")
         if raw_status != "approved":
             continue
 
-        # ticket_id must be present in the artifact
+        # ticket_id: must be present and EXACTLY match (fix #3 — no missing allowed)
         art_ticket = parsed.get("ticket_id", "")
-        if art_ticket and art_ticket != ticket_id:
+        if not art_ticket or art_ticket == "__DUPLICATE_KEY__":
+            continue  # missing ticket_id in artifact -> rejected
+        if art_ticket != ticket_id:
             continue
 
-        # action must match (case-insensitive) — but reject sentinel
+        # action: must be present and EXACTLY match (case-sensitive) (fix #3a)
         art_action = parsed.get("action", "")
-        if art_action == "__DUPLICATE_KEY__":
-            continue
-        if art_action and art_action.lower() != action.lower():
+        if not art_action or art_action == "__DUPLICATE_KEY__":
+            continue  # missing action -> rejected
+        if art_action != action:
             continue
 
-        # scope must match if present — reject sentinel
+        # scope: must be present and EXACTLY match (fix #3 — no missing allowed)
         art_scope = parsed.get("scope", "")
-        if art_scope == "__DUPLICATE_KEY__":
-            continue
-        if art_scope and art_scope != scope:
+        if not art_scope or art_scope == "__DUPLICATE_KEY__":
+            continue  # missing scope -> rejected
+        if art_scope != scope:
             continue
 
-        # issued_by must be present — reject sentinel
+        # issued_by: must be present, non-empty, not sentinel
         issued_by = parsed.get("issued_by", "")
         if issued_by == "__DUPLICATE_KEY__" or not issued_by.strip():
             continue
 
-        # expires_at must be present and in the future — reject sentinel
+        # expires_at: must be present, parseable, and in the future
         expires_str = parsed.get("expires_at", "")
         if not expires_str or expires_str == "__DUPLICATE_KEY__":
             continue
         try:
-            # Handle both offset-aware and naive ISO timestamps
             exp = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
             if exp.tzinfo is None:
                 exp = exp.replace(tzinfo=timezone.utc)
@@ -300,11 +479,11 @@ def _tool_handlers() -> dict[str, Any]:
     # xenia-tickets.create
     # ------------------------------------------------------------------
     def create(args: dict[str, Any]) -> dict[str, Any]:
-        subject    = str(args.get("subject") or "").strip()
-        body       = str(args.get("body") or "").strip()
+        subject      = str(args.get("subject") or "").strip()
+        body         = str(args.get("body") or "").strip()
         customer_ref = str(args.get("customer_ref") or "").strip()
-        priority   = str(args.get("priority") or "P3").upper()
-        intent     = args.get("intent")
+        priority     = str(args.get("priority") or "P3").upper()
+        intent       = args.get("intent")
 
         if not subject:
             return _err("MISSING_FIELD", "subject is required")
@@ -313,7 +492,6 @@ def _tool_handlers() -> dict[str, Any]:
         if not customer_ref:
             return _err("MISSING_FIELD", "customer_ref is required")
 
-        # Article IV identity discipline — reject raw emails/names
         if not CUSTOMER_REF_RE.match(customer_ref):
             return _err(
                 "IDENTITY_REQUIRED",
@@ -335,14 +513,14 @@ def _tool_handlers() -> dict[str, Any]:
         ).isoformat()
 
         ticket: dict[str, Any] = {
-            "ticket_id":   ticket_id,
-            "status":      "open",
-            "priority":    priority,
-            "intent":      intent,
+            "ticket_id":    ticket_id,
+            "status":       "open",
+            "priority":     priority,
+            "intent":       intent,
             "customer_ref": customer_ref,
-            "subject":     subject,
-            "created_at":  now,
-            "updated_at":  now,
+            "subject":      subject,
+            "created_at":   now,
+            "updated_at":   now,
             "sla": {
                 "first_response_due": first_response_due,
                 "breached": False,
@@ -394,7 +572,6 @@ def _tool_handlers() -> dict[str, Any]:
                 continue
             tickets.append(t)
 
-        # Sort: P1 first, then by created_at ascending (oldest first = most urgent)
         priority_order = {"P1": 0, "P2": 1, "P3": 2, "P4": 3}
 
         def sort_key(t: dict[str, Any]) -> tuple:
@@ -495,11 +672,21 @@ def _tool_handlers() -> dict[str, Any]:
 
     # ------------------------------------------------------------------
     # xenia-tickets.send_response
+    #
+    # Enforcement order (fail-closed at each step):
+    #   1. Field validation + ticket lookup
+    #   2. VHP-3: actor authz — actor MUST be non-empty, MUST be on allow-list
+    #   3. VHP-2: clearance token (signed dict from sign.py) — HMAC + body binding
+    #   4. VHP-1: PII scan (normalized)
+    #   5. VHP-4: money/commitment -> approval required
+    #   6. Append + save
     # ------------------------------------------------------------------
     def send_response(args: dict[str, Any]) -> dict[str, Any]:
-        ticket_id = str(args.get("ticket_id") or "").strip()
-        body      = str(args.get("body") or "").strip()
-        actor     = str(args.get("actor") or "").strip()
+        ticket_id       = str(args.get("ticket_id") or "").strip()
+        body            = str(args.get("body") or "").strip()
+        actor           = str(args.get("actor") or "").strip()
+        clearance_token = args.get("clearance_token")  # JSON string or dict
+        approval_id     = str(args.get("approval_id") or "").strip()
 
         if not ticket_id:
             return _err("MISSING_FIELD", "ticket_id is required")
@@ -513,24 +700,66 @@ def _tool_handlers() -> dict[str, Any]:
         if ticket is None:
             return _err("NOT_FOUND", f"ticket {ticket_id!r} not found")
 
-        # Article IX / Article III: pipeline markers required unless a human actor
-        if actor != "human":
-            has_ai_marker   = "[AI-assisted response]" in body
-            has_seal_marker = "seal: cleared" in body
-            if not has_ai_marker or not has_seal_marker:
-                missing: list[str] = []
-                if not has_ai_marker:
-                    missing.append("'[AI-assisted response]'")
-                if not has_seal_marker:
-                    missing.append("'seal: cleared'")
+        # ---- VHP-3: actor authorization (unconditional) ----
+        # FIXME(auth): actor is self-reported; unforgeable identity tracked in WS-AUTH.
+        authz_err = _check_actor_authz(actor, _SEND_RESPONSE_ALLOWED_ACTORS)
+        if authz_err:
+            return authz_err
+
+        # ---- VHP-2: signed clearance token ----
+        # Token is a JSON-encoded dict produced by sign.py's mint() containing
+        # a "body" field and a "sig" envelope.  Verification:
+        #   - Parse JSON, check sig.alg == HMAC-SHA256
+        #   - Recompute HMAC over canonical(token_minus_sig) — same as sign.py
+        #   - Assert token["body"] == this request body (constant-time)
+        # Degraded/unsigned tokens REJECTED (no bypass).
+        # actor='human' bypass REMOVED (fix #2, #6).
+        # FIXME(auth): actor is still self-reported; unforgeable identity in WS-AUTH.
+        clearance_result = verify_clearance_token(body, clearance_token)
+        if not clearance_result["ok"]:
+            return _err(
+                "CLEARANCE_INVALID",
+                f"send_response blocked: clearance token invalid. "
+                f"Reason: {clearance_result['reason']}. "
+                "The Themis -> Eunomia pipeline must issue a signed clearance token "
+                "(sign.py mint() dict with body field + sig envelope) "
+                "before send_response is called. "
+                "Degraded/unsigned tokens are not accepted. "
+                "actor='human' bypass has been removed (XEN-VHP-2).",
+            )
+
+        # ---- VHP-1: server-side PII scan (normalized) ----
+        pii_categories = _scan_pii(body)
+        if pii_categories:
+            return _err(
+                "PII_DETECTED",
+                f"send_response blocked: unredacted PII detected in body. "
+                f"Categories: {pii_categories}. "
+                "Redact all PII before sending (hook redaction must run first; "
+                "this server-side check is a last-resort gate, not a substitute).",
+            )
+
+        # ---- VHP-4: money/commitment requires approval artifact ----
+        if _is_money_commitment(body):
+            approvals_dir = _approvals_dir(root)
+            valid, reason, _parsed = _find_valid_approval(
+                approvals_dir,
+                ticket_id=ticket_id,
+                action="send_response",
+                scope="monetary",
+                approval_id=approval_id,
+            )
+            if not valid:
                 return _err(
-                    "PIPELINE_REQUIRED",
-                    "Article IX / Article III: customer-facing response must carry "
-                    f"{' and '.join(missing)} markers. "
-                    "The full Themis → Eunomia pipeline is required before send_response. "
-                    "Only actor='human' bypasses this check."
+                    "APPROVAL_REQUIRED",
+                    f"send_response blocked: body contains monetary/commitment language "
+                    f"but no valid approval artifact found. Reason: {reason}. "
+                    "Required: hearth/approvals/APPROVAL-<ticket_id>-*.yaml with "
+                    "status=approved, action=send_response, scope=monetary, unexpired, "
+                    "issued_by present, ticket_id present. Pass approval_id in args.",
                 )
 
+        # ---- All checks passed: append and save ----
         now = _now_iso()
         ticket["history"].append({
             "ts":    now,
@@ -538,7 +767,6 @@ def _tool_handlers() -> dict[str, Any]:
             "kind":  "response",
             "body":  body,
         })
-        # Sending a response moves ticket to pending if it was open
         if ticket["status"] == "open":
             ticket["status"] = "pending"
         ticket["updated_at"] = now
@@ -592,16 +820,25 @@ def _tool_handlers() -> dict[str, Any]:
 
     # ------------------------------------------------------------------
     # xenia-tickets.execute_approved
+    #
+    # Enforcement order:
+    #   1. Field validation + ticket lookup
+    #   2. VHP-3: actor authz — actor REQUIRED, non-empty, MUST be on allow-list
+    #             (unconditional — fix #1; no optional path)
+    #   3. Article V: approval artifact check (deny-by-default)
     # ------------------------------------------------------------------
     def execute_approved(args: dict[str, Any]) -> dict[str, Any]:
         """DENY-BY-DEFAULT. The server NEVER executes without a valid, unexpired,
         matching approval artifact — even if the hook layer was bypassed.
         (Constitution Article V, defense-in-depth Layer 0.)
+
+        actor is REQUIRED and MUST be on the allow-list (fix #1).
         """
         ticket_id   = str(args.get("ticket_id") or "").strip()
         action      = str(args.get("action") or "").strip()
         scope       = str(args.get("scope") or "").strip()
         approval_id = str(args.get("approval_id") or "").strip()
+        actor       = str(args.get("actor") or "").strip()
 
         if not ticket_id:
             return _err("MISSING_FIELD", "ticket_id is required")
@@ -611,6 +848,20 @@ def _tool_handlers() -> dict[str, Any]:
             return _err("MISSING_FIELD", "scope is required")
         if not approval_id:
             return _err("MISSING_FIELD", "approval_id is required")
+
+        # ---- VHP-3: actor REQUIRED and authorization UNCONDITIONAL (fix #1) ----
+        # actor is never optional for execute_approved — there must always be an
+        # identified, allow-listed caller.  No path may skip this check.
+        # FIXME(auth): actor is self-reported; unforgeable identity tracked in WS-AUTH.
+        if not actor:
+            return _err(
+                "MISSING_FIELD",
+                "actor is required for execute_approved; "
+                "all executions must have an identified, allow-listed caller.",
+            )
+        authz_err = _check_actor_authz(actor, _EXECUTE_APPROVED_ALLOWED_ACTORS)
+        if authz_err:
+            return authz_err
 
         tasks = _tasks_dir(root)
         ticket = _load_ticket(tasks, ticket_id)
@@ -627,7 +878,8 @@ def _tool_handlers() -> dict[str, Any]:
                 "ARTICLE_V_DENY",
                 f"Constitution Article V: deny-by-default. Execution refused. Reason: {reason}. "
                 "Required: hearth/approvals/APPROVAL-<ticket_id>-<seq>.yaml with "
-                "status=approved, unexpired, matching action+scope, issued_by present."
+                "status=approved, unexpired, matching action+scope, issued_by present, "
+                "ticket_id present (exact match)."
             )
 
         now = _now_iso()
@@ -638,7 +890,6 @@ def _tool_handlers() -> dict[str, Any]:
             "body":        f"action={action} scope={scope} approval_id={approval_id} artifact={reason}",
         })
 
-        # Mark matching recommendation as approved
         for rec in ticket.get("recommendations", []):
             if rec.get("action", "").lower() == action.lower() and rec.get("status") == "pending":
                 rec["status"] = "approved"
@@ -667,15 +918,15 @@ def _tool_handlers() -> dict[str, Any]:
         return {"ok": True, "root": str(root), "open_count": open_count}
 
     return {
-        "xenia-tickets.create":          create,
-        "xenia-tickets.get":             get,
-        "xenia-tickets.list":            list_tickets,
-        "xenia-tickets.comment":         comment,
-        "xenia-tickets.update_fields":   update_fields,
-        "xenia-tickets.send_response":   send_response,
-        "xenia-tickets.recommend":       recommend,
+        "xenia-tickets.create":           create,
+        "xenia-tickets.get":              get,
+        "xenia-tickets.list":             list_tickets,
+        "xenia-tickets.comment":          comment,
+        "xenia-tickets.update_fields":    update_fields,
+        "xenia-tickets.send_response":    send_response,
+        "xenia-tickets.recommend":        recommend,
         "xenia-tickets.execute_approved": execute_approved,
-        "xenia-tickets.ping":            ping,
+        "xenia-tickets.ping":             ping,
     }
 
 
