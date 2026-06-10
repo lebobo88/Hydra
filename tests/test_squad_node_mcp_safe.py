@@ -51,8 +51,10 @@ class _FlakyDispatcher:
 
 
 def test_returns_none_after_two_failed_attempts():
+    # WS3b: enrichment reads (roster.list) are idempotent — pass idempotent=True
+    # to get the two-attempt behavior. Non-idempotent callers only get 1 attempt.
     d = _RaisingDispatcher()
-    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {})
+    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, idempotent=True)
     assert out is None
     assert d.calls == 2  # exactly one retry, no exponential storm
 
@@ -65,7 +67,7 @@ def test_on_error_invoked_for_every_failed_attempt():
         events.append((server, tool, attempt, "-32000" in exc_repr))
 
     out = _mcp_call_safe(
-        d, "executive_suite", "es.roster.list", {}, on_error=cb,
+        d, "executive_suite", "es.roster.list", {}, on_error=cb, idempotent=True,
     )
     assert out is None
     assert len(events) == 2
@@ -76,16 +78,18 @@ def test_on_error_invoked_for_every_failed_attempt():
 def test_on_error_none_preserves_silent_legacy_behavior():
     """`on_error=None` is the deliberate opt-out — no exceptions escape."""
     d = _RaisingDispatcher()
-    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=None)
+    out = _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=None, idempotent=True)
     assert out is None
 
 
 def test_retry_recovers_on_transient_failure():
+    # WS3b: roster.list is an idempotent read — pass idempotent=True.
     d = _FlakyDispatcher({"agents": [{"name": "ceo"}]})
     events: list[tuple] = []
     out = _mcp_call_safe(
         d, "executive_suite", "es.roster.list", {},
         on_error=lambda s, t, e, a: events.append((s, a)),
+        idempotent=True,
     )
     assert out == {"agents": [{"name": "ceo"}]}
     assert d.calls == 2
@@ -98,7 +102,8 @@ def test_state_error_counter_increments_via_record_mcp_failure():
     cb = _record_mcp_failure(state)
     assert cb is not None
     d = _RaisingDispatcher()
-    _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=cb)
+    # WS3b: idempotent=True → two failed attempts → counter at 2
+    _mcp_call_safe(d, "executive_suite", "es.roster.list", {}, on_error=cb, idempotent=True)
     # Two failed attempts → counter at 2 (below the configured ceiling of 3).
     assert state.error_counters["mcp_failure:executive_suite"] == 2
     assert state.any_mcp_over_ceiling() == (False, None)
@@ -108,9 +113,10 @@ def test_state_error_counter_crosses_ceiling_after_repeated_calls():
     state = HydraState(root_goal="t", mcp_failure_ceiling=3)
     cb = _record_mcp_failure(state)
     d = _RaisingDispatcher()
+    # WS3b: eights.ceiling.tick is an idempotent read → pass idempotent=True.
     # Two calls × two attempts each = 4 increments. Ceiling = 3 → tripped.
-    _mcp_call_safe(d, "eights", "ceiling.tick", {}, on_error=cb)
-    _mcp_call_safe(d, "eights", "ceiling.tick", {}, on_error=cb)
+    _mcp_call_safe(d, "eights", "ceiling.tick", {}, on_error=cb, idempotent=True)
+    _mcp_call_safe(d, "eights", "ceiling.tick", {}, on_error=cb, idempotent=True)
     assert state.error_counters["mcp_failure:eights"] == 4
     tripped, server = state.any_mcp_over_ceiling()
     assert tripped is True

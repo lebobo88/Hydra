@@ -96,6 +96,11 @@ class HydraState(BaseModel):
     pending_hitl: Optional[dict[str, Any]] = None
     hitl_history: Annotated[list[dict[str, Any]], _append] = Field(default_factory=list)
 
+    # FS-4 — budget downgrade tripwire. Set True when spent_usd/budget_usd >= 80%
+    # and dispatching is still legal (< 100%). WS9 tier-propagation consumes this
+    # flag to downgrade the model tier passed to squads; this module only sets it.
+    budget_downgrade_active: bool = False
+
     # Per-workflow Reflexion ceiling raise (R3-tail post-mortem, 2026-05-21).
     # Default 0 means "no raise — use MAX_RETRY_INDEX". Set by the operator
     # approval handler for a `reflexion_override` HITL request to the new
@@ -133,7 +138,7 @@ class HydraState(BaseModel):
         self.iteration_count += 1
 
     def is_over_budget(self) -> bool:
-        return self.budget.spent_usd > self.budget.budget_usd
+        return self.budget.spent_usd >= self.budget.budget_usd
 
     def is_looping(self) -> bool:
         return self.iteration_count >= self.loop_ceiling or self.depth >= self.depth_ceiling

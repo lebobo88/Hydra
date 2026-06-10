@@ -18,9 +18,13 @@ from uuid import uuid4
 
 from .eights.attestation import EightsAttestor
 from .governance import (
+    charge_and_gate,
     enforce_governance,
     GovernanceVerdict,
+    record_cost,
     redact_for_squad_boundary,
+    should_block_for_budget,
+    should_downgrade_model,
 )
 from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
@@ -55,6 +59,71 @@ except ImportError:                                                        # pra
     SqliteSaver = None                                                      # type: ignore
     END = "__END__"                                                         # type: ignore
     _HAS_LANGGRAPH = False
+
+
+def _extract_squad_cost(result: "Any") -> tuple[float, int]:
+    """FS-4 — extract cost from a SquadResult.
+
+    _via_mcp stores artifacts as:
+        {"kind": "pp_run", "ref": run_id, "raw": <outer_mcp_envelope>, ...}
+
+    The outer MCP envelope returned by MCPStdioDispatcher is:
+        {"status": "done", "tool": "start_run", "result": {"cost_usd": ..., ...}}
+
+    So the cost fields live under raw["result"], NOT in raw itself. We unwrap
+    raw -> inner = raw.get("result", raw) and read from inner. This covers
+    both the real dispatcher (which wraps in "result") and test stubs that
+    put cost fields at the top level (raw == inner in that case).
+
+    Fields (in priority order):
+      - cost_usd  (float) — preferred
+      - cost      (float) — alias used by some pp versions
+      - tokens_in + tokens_out (int) — preferred token counts
+      - tokens    (int) — aggregate alias
+
+    Defaults to (0.0, 0) when no cost field is found; caller emits
+    "cost_unavailable" trace. Always call record_cost even on 0/0 so
+    the ledger is monotonically updated on every squad invocation.
+    """
+    usd: float = 0.0
+    tokens: int = 0
+    for artifact in getattr(result, "artifacts", []):
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("kind") != "pp_run":
+            continue
+        raw = artifact.get("raw") or {}
+        if not isinstance(raw, dict):
+            continue
+        # Fix 3: unwrap the outer MCP envelope — cost fields live under "result".
+        inner = raw.get("result", raw)
+        if not isinstance(inner, dict):
+            inner = raw
+        # Prefer cost_usd; fall back to cost
+        if "cost_usd" in inner:
+            try:
+                usd = max(usd, float(inner["cost_usd"]))
+            except (TypeError, ValueError):
+                pass
+        elif "cost" in inner:
+            try:
+                usd = max(usd, float(inner["cost"]))
+            except (TypeError, ValueError):
+                pass
+        # Token counts
+        tok_raw = 0
+        if "tokens_in" in inner or "tokens_out" in inner:
+            try:
+                tok_raw = int(inner.get("tokens_in") or 0) + int(inner.get("tokens_out") or 0)
+            except (TypeError, ValueError):
+                tok_raw = 0
+        elif "tokens" in inner:
+            try:
+                tok_raw = int(inner["tokens"])
+            except (TypeError, ValueError):
+                tok_raw = 0
+        tokens = max(tokens, tok_raw)
+    return usd, tokens
 
 
 def build_supervisor(
@@ -508,6 +577,52 @@ def build_supervisor(
                     "candidate": i, "error": str(e),
                 })
                 continue
+            # Fix 2b: charge + gate after every best-of-N candidate.
+            _cost_usd, _cost_tok = _extract_squad_cost(result)
+            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            if _cost_usd == 0.0 and _cost_tok == 0:
+                emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
+                    "site": "best_of_n", "candidate": i, "squad": pack.slug,
+                })
+            if _downgrade and not state.budget_downgrade_active:
+                state.budget_downgrade_active = True
+                emit_trace(judge_trace_root, state.workflow_id, "budget.downgrade_tripwire", {
+                    "site": "best_of_n", "candidate": i, "squad": pack.slug,
+                    "percent_consumed": state.budget.percent_consumed,
+                })
+            if _block:
+                # Budget exhausted mid best-of-N — surface to HITL immediately.
+                # Fix 2a: must set state.phase + pending_hitl so that
+                # node_dispatch (the caller) detects the surfaced condition and
+                # returns the surface payload rather than continuing to dispatch
+                # more tasks. A bare `break` was silently swallowed — the state
+                # machine never halted and further squads could still be dispatched.
+                state.budget_downgrade_active = True
+                _bon_hitl: dict[str, Any] = {
+                    "workflow_id": str(state.workflow_id),
+                    "reason": "over_budget",
+                    "gate_node": "dispatch",
+                    "summary": (
+                        f"Budget exhausted mid best-of-N candidate {i+1}/{n} "
+                        f"for squad {pack.slug}: "
+                        f"${state.budget.spent_usd:.4f} of "
+                        f"${state.budget.budget_usd:.2f} spent."
+                    ),
+                    "options": ["approve_override", "abort"],
+                    "default_option": "abort",
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                }
+                state.phase = "surfaced"
+                state.pending_hitl = _bon_hitl
+                eights.hitl_request(_bon_hitl, gate_node="dispatch")
+                emit_trace(judge_trace_root, state.workflow_id, "budget.over_budget_surface", {
+                    "site": "best_of_n", "candidate": i, "squad": pack.slug,
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                })
+                artifacts.extend(result.artifacts)
+                break  # node_dispatch will check state.phase == "surfaced"
             artifacts.extend(result.artifacts)
             # Use the first envelope as the candidate the judge will score.
             if not result.envelopes:
@@ -614,6 +729,35 @@ def build_supervisor(
                 {"count": len(state.envelopes), "ceiling": state.envelope_ceiling},
             )
             return {}
+        # Fix 2c — pre-dispatch budget check. If we are already at or over
+        # budget before dispatching any task this turn, surface immediately
+        # rather than dispatching a squad that would push us further over.
+        if should_block_for_budget(state):
+            state.budget_downgrade_active = True
+            _pre_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "over_budget",
+                "gate_node": "dispatch",
+                "summary": (
+                    f"Pre-dispatch budget check: already at/over budget "
+                    f"(${state.budget.spent_usd:.4f} of ${state.budget.budget_usd:.2f})."
+                ),
+                "options": ["approve_override", "abort"],
+                "default_option": "abort",
+                "spent_usd": state.budget.spent_usd,
+                "budget_usd": state.budget.budget_usd,
+            }
+            eights.hitl_request(_pre_hitl, gate_node="dispatch")
+            emit_trace(judge_trace_root, state.workflow_id, "budget.pre_dispatch_block", {
+                "spent_usd": state.budget.spent_usd,
+                "budget_usd": state.budget.budget_usd,
+            })
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _pre_hitl,
+                "budget_downgrade_active": True,
+            }
+
         state.phase = "executing"
         # For each pending task, drive the squad. The dispatcher is responsible
         # for actually invoking MCP / skills / subprocesses.
@@ -633,6 +777,19 @@ def build_supervisor(
                 winners = _dispatch_best_of_n(
                     state, pack, task, artifacts, bon_verdicts
                 )
+                # Fix 2a: _dispatch_best_of_n sets state.phase="surfaced" when
+                # budget is exhausted mid-N. Detect this and return the surface
+                # payload immediately rather than continuing to dispatch tasks.
+                if state.phase == "surfaced":
+                    return {
+                        "envelopes": new_decisions,
+                        "artifacts": artifacts,
+                        "verdicts": bon_verdicts,
+                        "phase": "surfaced",
+                        "pending_hitl": state.pending_hitl,
+                        "budget_downgrade_active": state.budget_downgrade_active,
+                        "open_pp_runs": state.open_pp_runs,
+                    }
                 if winners:
                     new_decisions.extend(winners)
                     task.status = "done"
@@ -657,6 +814,53 @@ def build_supervisor(
                     state.error_counters.get(task.owner_squad, 0) + 1
                 )
                 continue
+            # Fix 2b: charge + gate via centralized helper.
+            _cost_usd, _cost_tok = _extract_squad_cost(result)
+            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            if _cost_usd == 0.0 and _cost_tok == 0:
+                emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
+                    "site": "dispatch", "squad": pack.slug,
+                })
+            if _downgrade and not state.budget_downgrade_active:
+                state.budget_downgrade_active = True
+                emit_trace(judge_trace_root, state.workflow_id, "budget.downgrade_tripwire", {
+                    "percent_consumed": state.budget.percent_consumed,
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                    "squad": pack.slug,
+                })
+            if _block:
+                # >= 100%: surface to HITL, stop dispatching further tasks.
+                state.budget_downgrade_active = True
+                emit_trace(judge_trace_root, state.workflow_id, "budget.over_budget_surface", {
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                    "squad": pack.slug,
+                })
+                task.status = result.status
+                _hitl_over_budget: dict[str, Any] = {
+                    "workflow_id": str(state.workflow_id),
+                    "reason": "over_budget",
+                    "gate_node": "dispatch",
+                    "summary": (
+                        f"Budget exhausted: ${state.budget.spent_usd:.4f} of "
+                        f"${state.budget.budget_usd:.2f} spent after {pack.slug} dispatch."
+                    ),
+                    "options": ["approve_override", "abort"],
+                    "default_option": "abort",
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                }
+                eights.hitl_request(_hitl_over_budget, gate_node="dispatch")
+                return {
+                    "envelopes": new_decisions,
+                    "artifacts": artifacts,
+                    "verdicts": bon_verdicts,
+                    "phase": "surfaced",
+                    "pending_hitl": _hitl_over_budget,
+                    "budget_downgrade_active": True,
+                    "open_pp_runs": state.open_pp_runs,
+                }
             task.status = result.status
             # Validate and redact envelopes crossing the squad boundary back
             # into the supervisor. Invalid envelopes fail the task.
@@ -748,6 +952,48 @@ def build_supervisor(
         except Exception as e:
             emit_trace(judge_trace_root, state.workflow_id, "judge.reflexion_error", {
                 "origin": origin, "error": str(e),
+            })
+            return [], []
+        # Fix 2b: charge + gate for reflexion retries.
+        _cost_usd, _cost_tok = _extract_squad_cost(result)
+        _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+        if _cost_usd == 0.0 and _cost_tok == 0:
+            emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
+                "site": "reflexion", "origin": origin,
+            })
+        if _downgrade and not state.budget_downgrade_active:
+            state.budget_downgrade_active = True
+            emit_trace(judge_trace_root, state.workflow_id, "budget.downgrade_tripwire", {
+                "site": "reflexion", "origin": origin,
+                "percent_consumed": state.budget.percent_consumed,
+            })
+        if _block:
+            # Budget hit during reflexion — surface to HITL immediately.
+            # Fix 2b: must set state.phase + pending_hitl so after_dispatch
+            # routes to "postcheck" (halt) rather than "judge_per_squad".
+            # A bare `return [], []` was silently swallowed — the caller
+            # (node_judge_per_squad) continued accumulating retries and the
+            # state machine never halted.
+            state.budget_downgrade_active = True
+            _reflexion_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "over_budget",
+                "gate_node": "judge_per_squad",
+                "summary": (
+                    f"Budget exhausted during reflexion retry for squad {origin}: "
+                    f"${state.budget.spent_usd:.4f} of "
+                    f"${state.budget.budget_usd:.2f} spent."
+                ),
+                "options": ["approve_override", "abort"],
+                "default_option": "abort",
+                "spent_usd": state.budget.spent_usd,
+                "budget_usd": state.budget.budget_usd,
+            }
+            state.phase = "surfaced"
+            state.pending_hitl = _reflexion_hitl
+            eights.hitl_request(_reflexion_hitl, gate_node="judge_per_squad")
+            emit_trace(judge_trace_root, state.workflow_id, "budget.reflexion_blocked", {
+                "origin": origin, "spent_usd": state.budget.spent_usd,
             })
             return [], []
 
@@ -873,9 +1119,26 @@ def build_supervisor(
                 if judge_policy.squad_enabled(env.get("origin_squad")):
                     ceiling_blocked.append((env, revise))
                 continue
+            # Fix 2d: skip reflexion if budget is already at/over limit.
+            if should_block_for_budget(state):
+                emit_trace(judge_trace_root, state.workflow_id, "budget.reflexion_skipped", {
+                    "reason": "over_budget", "spent_usd": state.budget.spent_usd,
+                })
+                continue
             r_envs, r_verdicts = _reflexion_retry(state, env, revise, prior_retry)
             retry_envelopes.extend(r_envs)
             retry_verdicts.extend(r_verdicts)
+            # Fix 2b: _reflexion_retry sets state.phase="surfaced" when budget
+            # is exhausted. Detect this and short-circuit the envelope loop —
+            # there is no point judging further envelopes if we must halt.
+            if state.phase == "surfaced":
+                return {
+                    "verdicts": new_verdicts + retry_verdicts,
+                    "envelopes": retry_envelopes,
+                    "phase": "surfaced",
+                    "pending_hitl": state.pending_hitl,
+                    "budget_downgrade_active": state.budget_downgrade_active,
+                }
 
         # R3-tail: also scan the just-completed retry verdicts. If a retry
         # envelope's own re-judge came back `revise`, the next pass would need
@@ -1195,6 +1458,45 @@ def build_supervisor(
                             "surface_reason": verdict.reason,
                         },
                     )
+                    # WS3d — safe salvage: if any entries remain undrained, surface
+                    # an operator HITL listing the run_ids/project_paths that still
+                    # hold locks. NEVER auto force_unlock — that is an operator action.
+                    if state.open_pp_runs:
+                        _undrained_ids = [e.get("run_id", "?") for e in state.open_pp_runs]
+                        _undrained_paths = [e.get("project_path", "?") for e in state.open_pp_runs]
+                        _lock_hitl: dict[str, Any] = {
+                            "workflow_id": str(state.workflow_id),
+                            "reason": "lock_release_pending",
+                            "gate_node": "postcheck",
+                            "summary": (
+                                f"{len(state.open_pp_runs)} pp run(s) could not be finalized "
+                                f"during abort. Locks may still be held. "
+                                f"run_ids={_undrained_ids}; "
+                                f"project_paths={_undrained_paths}. "
+                                "Use `pp_harness.force_unlock` manually to release each lock."
+                            ),
+                            "options": ["acknowledge"],
+                            "default_option": "acknowledge",
+                            "undrained_run_ids": _undrained_ids,
+                            "undrained_project_paths": _undrained_paths,
+                        }
+                        eights.hitl_request(_lock_hitl, gate_node="postcheck")
+                        # Fix 5: lock_release_pending MUST be the active gate so
+                        # the operator actually sees it and can act on the orphaned
+                        # locks. If another gate is already pending, preserve it in
+                        # the lock_hitl metadata so nothing is lost, then overwrite.
+                        if state.pending_hitl:
+                            _lock_hitl["prior_gate"] = state.pending_hitl
+                        state.pending_hitl = _lock_hitl
+                        emit_trace(
+                            judge_trace_root,
+                            state.workflow_id,
+                            "supervisor.pp_runs_lock_pending",
+                            {
+                                "undrained": _undrained_ids,
+                                "paths": _undrained_paths,
+                            },
+                        )
                 except Exception as e:  # noqa: BLE001 — never mask the original surface
                     emit_trace(
                         judge_trace_root,
@@ -1228,11 +1530,15 @@ def build_supervisor(
         except Exception:
             pass
 
-        return {
+        out: dict[str, Any] = {
             "phase": state.phase,
             "last_event": verdict.reason,
             "open_pp_runs": state.open_pp_runs,
+            "budget_downgrade_active": state.budget_downgrade_active,
         }
+        if state.pending_hitl is not None:
+            out["pending_hitl"] = state.pending_hitl
+        return out
 
     # ----- routing edges -----
 
@@ -1244,6 +1550,21 @@ def build_supervisor(
 
     def after_planner(state: HydraState) -> str:
         return "approval" if state.requires_human_approval else "dispatch"
+
+    def after_dispatch(state: HydraState) -> str:
+        """Fix 2d — if dispatch surfaced a budget HITL, route to postcheck
+        (halt) rather than proceeding to judge_per_squad / reflexion.
+        Mirrors the after_intake halt pattern.
+        """
+        return "halt" if state.phase == "surfaced" else "judge_per_squad"
+
+    def after_judge_per_squad(state: HydraState) -> str:
+        """Fix 2b — if judge_per_squad surfaced a budget HITL (reflexion
+        budget block), route to postcheck (halt) rather than synthesis.
+        Without this edge, synthesis runs unconditionally even after
+        node_judge_per_squad sets phase='surfaced' via _reflexion_retry.
+        """
+        return "halt" if state.phase == "surfaced" else "synthesis"
 
     def after_postcheck(state: HydraState) -> str:
         return END
@@ -1285,8 +1606,18 @@ def build_supervisor(
         "dispatch": "dispatch",
     })
     graph.add_edge("approval", "dispatch")
-    graph.add_edge("dispatch", "judge_per_squad")
-    graph.add_edge("judge_per_squad", "synthesis")
+    # Fix 2d: conditional edge from dispatch so a budget surface routes to
+    # postcheck instead of proceeding to judge_per_squad / reflexion.
+    graph.add_conditional_edges("dispatch", after_dispatch, {
+        "judge_per_squad": "judge_per_squad",
+        "halt": "postcheck",
+    })
+    # Fix 2b: conditional edge from judge_per_squad — when reflexion budget
+    # block sets phase='surfaced', route to postcheck (halt) not synthesis.
+    graph.add_conditional_edges("judge_per_squad", after_judge_per_squad, {
+        "synthesis": "synthesis",
+        "halt": "postcheck",
+    })
     graph.add_edge("synthesis", "judge_synthesis")
     graph.add_edge("judge_synthesis", "postcheck")
     graph.add_conditional_edges("postcheck", after_postcheck, {END: END})

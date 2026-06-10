@@ -219,6 +219,57 @@ class AsyncBackendPool:
 
     _TOOL_TIMEOUT = 120.0
 
+    # Fix 1b (revised): classify by the FINAL dotted segment of the tool name,
+    # not by substring/suffix on the whole string.
+    #
+    # Example: "eights.governance.ceiling.tick" -> final segment "tick"
+    #          "pp.workflows_list"              -> final segment "workflows_list"
+    #          "es.roster.list"                 -> final segment "list"
+    #
+    # IDEMPOTENT final segments — curated, confirmed read-only operations.
+    # Any final segment NOT in this allow-list is non-idempotent by default.
+    _IDEMPOTENT_FINAL_SEGMENTS: frozenset[str] = frozenset({
+        "list", "get", "search", "read", "ping", "describe",
+        "discover", "health", "scope", "status_get",
+        # compound read-only names used as final segments in some backends
+        "workflows_list", "workflow_status_get", "memory_search",
+        "atlas_query", "schema_inspect", "roster_query",
+        "attestation_get", "catalogue", "catalog",
+    })
+
+    # NON-IDEMPOTENT override — wins regardless of the allow-list.
+    # If the final segment is in this set, single-attempt no matter what.
+    # "tick" mutates the shared loop counter (eights.governance.ceiling.tick);
+    # "status" alone is too ambiguous and excluded from the allow-list above.
+    _NON_IDEMPOTENT_FINAL_SEGMENTS: frozenset[str] = frozenset({
+        "tick", "charge", "commit", "propose", "write", "send",
+        "execute", "create", "update", "delete", "reset", "register",
+        "attest", "request", "resolve", "unfreeze", "rollback",
+        "approve", "promote", "scaffold", "isolate", "release",
+        # whole-name non-idempotent tools (no dots — they ARE the final segment)
+        "start_run", "finalize_run", "send_response", "execute_approved",
+        "evolution_commit", "evolution_propose",
+    })
+
+    @staticmethod
+    def _is_idempotent_tool(tool: str) -> bool:
+        """Return True iff the tool is safe to retry on transient error.
+
+        Classification is based on the FINAL dotted segment of the tool name
+        so that "eights.governance.ceiling.tick" is classified by "tick" (a
+        mutator) rather than by a suffix match on the full string (which would
+        incorrectly match the "tick" suffix in the old endswith approach).
+
+        Decision order:
+          1. Final segment in _NON_IDEMPOTENT_FINAL_SEGMENTS -> False (mutator wins)
+          2. Final segment in _IDEMPOTENT_FINAL_SEGMENTS -> True
+          3. Otherwise -> False (deny by default)
+        """
+        final = tool.lower().split(".")[-1]
+        if final in AsyncBackendPool._NON_IDEMPOTENT_FINAL_SEGMENTS:
+            return False
+        return final in AsyncBackendPool._IDEMPOTENT_FINAL_SEGMENTS
+
     async def _do_call(self, session: Any, tool: str,
                        args: dict[str, Any]) -> Any:
         """Run session.call_tool in its own coroutine context."""
@@ -226,8 +277,16 @@ class AsyncBackendPool:
 
     async def call_tool(self, server: str, tool: str,
                         args: dict[str, Any]) -> dict[str, Any]:
-        """Forward a tool call to a backend. Retries once on stale session."""
-        for attempt in range(2):
+        """Forward a tool call to a backend.
+
+        Retries once on stale session ONLY for idempotent (read-only) tools.
+        Non-idempotent tools (start_run, finalize_run, writes, venom-class,
+        evolution_commit, execute_approved, send_response) get a single attempt
+        so that a transport hiccup never double-executes a side-effecting call.
+        """
+        idempotent = self._is_idempotent_tool(tool)
+        max_attempts = 2 if idempotent else 1
+        for attempt in range(max_attempts):
             session = await self._connect(server)
             if session is None:
                 return {
@@ -251,8 +310,9 @@ class AsyncBackendPool:
             except (asyncio.CancelledError, Exception) as exc:
                 await self._teardown_backend(server)
                 self._failed.add(server)
-                if attempt == 0:
-                    logger.info("Retrying %s.%s after failure: %s", server, tool, exc)
+                if idempotent and attempt == 0:
+                    logger.info("Retrying idempotent %s.%s after failure: %s",
+                                server, tool, exc)
                     continue
                 return {
                     "status": "failed",

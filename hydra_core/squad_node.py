@@ -351,7 +351,7 @@ def _via_impersonation(
     _on_mcp_err = _record_mcp_failure(state)
     live_roster = _mcp_call_safe(
         dispatcher, "executive_suite", "es.roster.list", {},
-        squad_id=pack.slug, on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err, idempotent=True,
     )
     roster_list = (live_roster or {}).get("agents", []) if isinstance(live_roster, dict) else []
     if roster_list:
@@ -461,7 +461,7 @@ def _via_claude_skill(
     _on_mcp_err = _record_mcp_failure(state)
     catalogue = _mcp_call_safe(
         dispatcher, server, f"{prefix}.command.list", {},
-        squad_id=pack.slug, on_error=_on_mcp_err,
+        squad_id=pack.slug, on_error=_on_mcp_err, idempotent=True,
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
     tool_scope = build_tool_scope_directive(pack)
@@ -532,32 +532,50 @@ def _mcp_call_safe(
     *,
     squad_id: str | None = None,
     on_error: "Callable[[str, str, str, int], None] | None" = None,
+    idempotent: bool = False,
 ) -> dict[str, Any] | None:
     """Best-effort MCP call. Returns the inner result dict, or None on any failure.
 
     The dispatchers wrap the daemon response as
     `{"status": "done", "tool": ..., "result": {...}}`; we unwrap that here.
 
-    Retries exactly once on exception (no exponential backoff — we are a
-    governance layer, not a resilience layer). When `on_error` is supplied
-    it is invoked on every failed attempt with (server, tool, repr(exc),
-    attempt_index) so callers can increment counters / emit telemetry. The
-    supervisor wires this to `state.error_counters["mcp_failure:<server>"]`
-    so postcheck can surface mcp_disconnect:<server> at the configured
-    threshold instead of degrading silently with stale data.
+    WS3b — idempotency-aware retry:
+      idempotent=True  → retry exactly once on exception, with a small deterministic
+                         jitter (derived from server+tool name, not wallclock).
+      idempotent=False → single attempt; never retry, so non-idempotent ops
+                         (start_run, finalize_run, venom-class, writes) cannot
+                         double-execute.
+
+    When `on_error` is supplied it is invoked on every failed attempt with
+    (server, tool, repr(exc), attempt_index) so callers can increment counters
+    / emit telemetry. The supervisor wires this to
+    `state.error_counters["mcp_failure:<server>"]` so postcheck can surface
+    mcp_disconnect:<server> at the configured threshold.
     """
-    last_exc_repr: str | None = None
-    for attempt in (1, 2):
+    attempts = (1, 2) if idempotent else (1,)
+    for attempt in attempts:
         try:
             envelope = dispatcher.call_mcp(server, tool, args,
                                            squad_id=squad_id)
         except Exception as exc:
-            last_exc_repr = repr(exc)
+            exc_repr = repr(exc)
             if on_error is not None:
                 try:
-                    on_error(server, tool, last_exc_repr, attempt)
+                    on_error(server, tool, exc_repr, attempt)
                 except Exception:
                     pass
+            if idempotent and attempt == 1:
+                # Fix 6: deterministic jitter via SHA-256; no process-salted
+                # hash() — same (server, tool) pair always waits the same
+                # amount so replays are stable.
+                import hashlib as _hashlib
+                import time as _time
+                _seed = (server + tool).encode()
+                _n = int.from_bytes(
+                    _hashlib.sha256(_seed).digest()[:4], "big"
+                ) % 100
+                _jitter = 0.05 + _n / 1000.0
+                _time.sleep(_jitter)
             continue
         if not isinstance(envelope, dict):
             return None
@@ -672,7 +690,7 @@ def abort_open_pp_runs(
         if not run_id:
             continue
         try:
-            dispatcher.call_mcp(
+            env = dispatcher.call_mcp(
                 "pp_harness",
                 "finalize_run",
                 {
@@ -683,9 +701,34 @@ def abort_open_pp_runs(
                 },
                 squad_id="engineering",
             )
-            drained.append(entry)
         except Exception:  # noqa: BLE001 — leave the entry so force_unlock can salvage
             remaining.append(entry)
+            continue
+
+        # WS3a/Fix 4 — only count as drained when the MCP envelope indicates
+        # unambiguous success:
+        #   - outer status in {done, ok, complete}         (envelope transport OK)
+        #   - inner result has no "error" field            (no daemon-side error)
+        #   - inner result status (if present) is NOT a failure
+        #     i.e. not in {failed, error, surfaced}
+        # "outer done + inner {status:failed}" is NOT a successful drain.
+        _FAILURE_STATUSES = {"failed", "error", "surfaced"}
+        env_status = env.get("status") if isinstance(env, dict) else None
+        inner = env.get("result", {}) if isinstance(env, dict) else {}
+        if not isinstance(inner, dict):
+            inner = {}
+        inner_error = inner.get("error")
+        inner_status = inner.get("status")
+        success = (
+            env_status in {"done", "ok", "complete"}
+            and not inner_error
+            and inner_status not in _FAILURE_STATUSES
+        )
+        if success:
+            drained.append(entry)
+        else:
+            remaining.append(entry)
+
     # Replace in place so the LangGraph reducer sees the assignment as a
     # full overwrite — `Annotated[..., _append]` would otherwise concat the
     # original list with whatever we set, producing duplicates.

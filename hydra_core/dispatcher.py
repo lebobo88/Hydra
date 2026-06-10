@@ -287,28 +287,123 @@ class MCPStdioDispatcher:
             env=spec.get("env"),
             cwd=spec.get("cwd"),
         )
-        try:
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    if self.verbose:
-                        tools = await session.list_tools()
-                        names = [t.name for t in tools.tools]
-                        if tool not in names:
+
+        # WS3c — connect-retry with deterministic jittered backoff.
+        #
+        # The retry loop covers ONLY the transport connection + session
+        # initialisation (stdio_client + ClientSession.initialize). Once a
+        # session is established, session.call_tool is invoked EXACTLY ONCE.
+        # If call_tool itself raises, we do NOT retry — the tool may have
+        # side-effected (start_run, finalize_run, writes, venom-class) and
+        # re-invoking it is unsafe.
+        #
+        # Fix 1a (R3-tail): A `called` flag guards against the case where
+        # call_tool succeeds but context-manager __aexit__ teardown then raises.
+        # Without the flag, the outer except re-enters the retry loop and
+        # double-executes the tool. With the flag:
+        #   - `called` is set True immediately before session.call_tool().
+        #   - The outer except checks `called`: if True, the call was attempted
+        #     and we must NOT retry — return failed immediately.
+        #   - After call_tool succeeds, the result payload is captured in a local
+        #     variable; __aexit__ teardown exceptions are caught and logged so
+        #     the successful result is still returned.
+        #
+        # Jitter is deterministic: derived via SHA-256 from server+tool+attempt
+        # so the same triple always waits the same amount and replays are stable.
+        import hashlib as _hashlib
+
+        _MAX_CONNECT_ATTEMPTS = 3
+        last_connect_exc: Exception | None = None
+        # Fix 1a: tracks whether session.call_tool was invoked this attempt.
+        # Reset to False at the top of each connection attempt.
+        called = False
+        # Fix 1a: holds the successful payload if call_tool returned before
+        # __aexit__ teardown raised. We return this rather than discarding it.
+        _call_result: dict[str, Any] | None = None
+
+        for _connect_attempt in range(1, _MAX_CONNECT_ATTEMPTS + 1):
+            called = False
+            _call_result = None
+            try:
+                async with stdio_client(params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        if self.verbose:
+                            tools = await session.list_tools()
+                            names = [t.name for t in tools.tools]
+                            if tool not in names:
+                                return {
+                                    "status": "failed",
+                                    "error": f"tool {tool!r} not exposed by {server!r}",
+                                    "available": names[:30],
+                                }
+                        # Connection established — invoke the tool ONCE.
+                        # Any exception from call_tool is NOT retried (see
+                        # outer except guard on `called`).
+                        called = True
+                        try:
+                            result = await session.call_tool(tool, args)
+                        except Exception as call_exc:
                             return {
                                 "status": "failed",
-                                "error": f"tool {tool!r} not exposed by {server!r}",
-                                "available": names[:30],
+                                "error": (
+                                    f"call_tool raised after connect: "
+                                    f"{type(call_exc).__name__}: {call_exc!s}"
+                                ),
+                                "server": server, "tool": tool,
                             }
-                    result = await session.call_tool(tool, args)
-                    payload = _extract_mcp_result(result)
-                    return {"status": "done", "tool": tool, "result": payload}
-        except Exception as e:
-            return {
-                "status": "failed",
-                "error": f"{type(e).__name__}: {e!s}",
-                "server": server, "tool": tool,
-            }
+                        # Capture result BEFORE exiting context managers so a
+                        # teardown exception in __aexit__ does not lose the payload.
+                        _call_result = {"status": "done", "tool": tool,
+                                        "result": _extract_mcp_result(result)}
+                        # Returning here unwinds the `async with` stack; if
+                        # __aexit__ raises it will be caught by the outer except
+                        # which checks `_call_result is not None` and returns it.
+                        return _call_result
+            except Exception as exc:  # noqa: BLE001 — connection/init or teardown failure
+                # Fix 1a: if call_tool was attempted, do NOT retry regardless of
+                # whether the exception is from teardown or the call itself.
+                # If we already captured _call_result, the call succeeded and only
+                # __aexit__ teardown raised — return the successful payload and log.
+                if _call_result is not None:
+                    logger.debug(
+                        "MCP context teardown raised after successful call_tool "
+                        "for %s.%s (%s); returning captured result.",
+                        server, tool, type(exc).__name__,
+                    )
+                    return _call_result
+                if called:
+                    # call_tool was invoked but we have no result (it raised).
+                    # Already returned in the inner except above; reaching here
+                    # means a re-raise path we should not retry.
+                    return {
+                        "status": "failed",
+                        "error": (
+                            f"post-call_tool error (no retry): "
+                            f"{type(exc).__name__}: {exc!s}"
+                        ),
+                        "server": server, "tool": tool,
+                    }
+                last_connect_exc = exc
+                if _connect_attempt < _MAX_CONNECT_ATTEMPTS:
+                    # Fix 6: deterministic jitter via SHA-256; no wallclock/hash().
+                    _seed = (server + tool + str(_connect_attempt)).encode()
+                    _n = int.from_bytes(
+                        _hashlib.sha256(_seed).digest()[:4], "big"
+                    ) % 400
+                    _jitter_s = 0.1 + _n / 1000.0
+                    await asyncio.sleep(_jitter_s)
+                    logger.debug(
+                        "MCP connect attempt %d/%d for %s.%s failed (%s); retrying in %.3fs",
+                        _connect_attempt, _MAX_CONNECT_ATTEMPTS, server, tool,
+                        type(exc).__name__, _jitter_s,
+                    )
+
+        return {
+            "status": "failed",
+            "error": f"{type(last_connect_exc).__name__}: {last_connect_exc!s}",
+            "server": server, "tool": tool,
+        }
 
 
 def _extract_mcp_result(result: Any) -> Any:

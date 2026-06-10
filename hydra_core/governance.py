@@ -34,7 +34,29 @@ def should_downgrade_model(state: HydraState, threshold: float = 0.8) -> bool:
 
 
 def should_block_for_budget(state: HydraState) -> bool:
-    return state.budget.spent_usd > state.budget.budget_usd
+    # >= so that exactly-100% (spent == budget) also blocks. A workflow that
+    # has spent every dollar must not dispatch further squad work.
+    return state.budget.spent_usd >= state.budget.budget_usd
+
+
+def charge_and_gate(
+    state: HydraState,
+    cost_usd: float,
+    cost_tokens: int,
+) -> tuple[bool, bool]:
+    """Record cost then evaluate both budget gates in one call.
+
+    Returns (block, downgrade):
+      block     — True when spent >= budget_usd (>= 100% => stop dispatching)
+      downgrade — True when percent_consumed >= 80% (WS9 tier tripwire)
+
+    Callers at every execute_squad site use this so the logic is not
+    duplicated across best-of-N, single-shot dispatch, and reflexion.
+    """
+    record_cost(state, cost_usd, cost_tokens)
+    block = should_block_for_budget(state)
+    downgrade = should_downgrade_model(state)
+    return block, downgrade
 
 
 # --------- loop ceiling ---------
