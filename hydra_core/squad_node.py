@@ -162,9 +162,36 @@ def _via_mcp(
         mode: pp_run | pp_team | pp_best_of | pp_review
         default_team: feature-team
         forum_for_review: change-advisory-board
+        model_tier: (optional) haiku | sonnet | opus | fable | deep
+
+    WS9 — model_tier propagation:
+        Effective tier = (inbound.model_tier if present) else
+                         invoke.get("model_tier") else None.
+        Validated via normalize_tier; unknown tier -> failed SquadResult (fail-closed).
+        "fable" / "deep" -> FORCE mode="pp_team" + team="deep-reasoning-team".
+        Fable is reachable ONLY by explicit tier; no automatic escalation.
+        Other tiers (haiku/sonnet/opus): keep existing mode/team; tier is
+        recorded in the SquadResult rationale for observability only (pp's
+        start_run schema does not accept a raw model_tier arg).
     """
+    from .tiers import normalize_tier, FABLE_TIERS
+
     invoke = pack.invoke or {}
     mode = invoke.get("mode", "pp_run")
+
+    # WS9: resolve effective model_tier. Envelope wins over squad.yaml default.
+    # Fix 1: use `is not None` guard so that an empty-string inbound tier ("") is
+    # treated as an explicit (invalid) value rather than falling through to the
+    # squad.yaml default — empty string is fail-closed, not silently ignored.
+    inbound_tier = getattr(inbound, "model_tier", None)
+    raw_tier = inbound_tier if inbound_tier is not None else invoke.get("model_tier")
+    try:
+        effective_tier = normalize_tier(raw_tier)
+    except ValueError as tier_err:
+        return SquadResult(
+            envelopes=[], artifacts=[], status="failed",
+            rationale=f"unknown model_tier={raw_tier!r}: {tier_err}",
+        )
 
     # Repo-targeting: resolve target_repo_id FIRST, before reading any
     # invoke["project_path"] from squad.yaml — the registry is the only
@@ -196,6 +223,37 @@ def _via_mcp(
         if "${project_root}" in str(project_path):
             project_path = str(__import__("pathlib").Path.cwd())
 
+    # WS9: Fable routing — explicit tier="fable"/"deep" forces deep-reasoning-team.
+    # This is the ONLY path to Fable; no auto-escalation is performed here.
+    #
+    # Fix 6: Reserve "deep-reasoning-team". The squad.yaml default_team is checked
+    # AFTER tier routing. If the default_team happens to be "deep-reasoning-team"
+    # but the effective tier is NOT fable/deep, we REJECT rather than silently
+    # routing to the Fable team without an explicit tier. Match is case- and
+    # whitespace-insensitive so minor config variants are caught.
+    _DEEP_TEAM = "deep-reasoning-team"
+
+    if effective_tier in FABLE_TIERS:
+        mode = "pp_team"
+        fable_team = _DEEP_TEAM
+    else:
+        fable_team = None  # not a Fable dispatch
+
+    # Fix 6 guard: if default_team points at the reserved Fable team but no fable
+    # tier was given, reject — the deep-reasoning-team is only reachable via an
+    # explicit fable/deep tier.
+    if fable_team is None and mode == "pp_team":
+        default_team = (invoke.get("default_team") or "").strip().lower()
+        if default_team == _DEEP_TEAM:
+            return SquadResult(
+                envelopes=[], artifacts=[], status="failed",
+                rationale=(
+                    f"deep-reasoning-team requires model_tier=fable/deep; "
+                    f"current effective_tier={effective_tier!r}. "
+                    "Set model_tier=fable in the dispatch envelope or squad.yaml invoke."
+                ),
+            )
+
     args = {
         "request_text": getattr(inbound, "instructions", None)
         or getattr(inbound, "summary", None)
@@ -205,7 +263,8 @@ def _via_mcp(
         "mode": "single" if mode == "pp_run" else ("team" if mode == "pp_team" else "single"),
     }
     if mode == "pp_team":
-        args["team"] = invoke.get("default_team")
+        # Fable tier forces deep-reasoning-team; otherwise use squad.yaml default.
+        args["team"] = fable_team if fable_team else invoke.get("default_team")
     if mode == "pp_best_of":
         args["mode"] = "best_of"
         args["n"] = 3
@@ -214,6 +273,8 @@ def _via_mcp(
         args["forum"] = invoke.get("forum_for_review")
     # Drop None values — pp schema rejects them.
     args = {k: v for k, v in args.items() if v is not None}
+    # WS9: record effective tier in rationale for observability.
+    # Do NOT pass model_tier as an arg — pp's start_run schema rejects unknown args.
     try:
         result = dispatcher.call_mcp("pp_harness", "start_run", args,
                                      squad_id=pack.slug)
@@ -267,7 +328,8 @@ def _via_mcp(
         target_squad=inbound.origin_squad,
         decision=f"Engineering work dispatched to pair-programmer (run_id={run_id or '?'})",
         rationale=(
-            f"mode={mode}; pp dispatch status: {pp_status}; "
+            f"mode={mode}; model_tier={effective_tier or 'default'}; "
+            f"pp dispatch status: {pp_status}; "
             f"commit_sha={commit_sha or 'none'}; inner: {str(inner)[:240]}"
         ),
         artifacts=[MemoryRef(tier="episodic", key=f"pp:run:{run_id or 'unknown'}")] if run_id else [],

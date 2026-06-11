@@ -90,6 +90,12 @@ class CSuiteDecisionPacket(HydraEnvelope):
     notes: Optional[str] = None
     # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
     target_repo_id: Optional[str] = None
+    # WS9: model_tier hint from the operator or planner task.  Propagated by
+    # node_dispatch onto each CSuiteDecisionPacket so _via_mcp can read it via
+    # getattr(inbound, "model_tier", None) — mirroring the target_repo_id pattern.
+    # Valid tokens: "haiku" | "sonnet" | "opus" | "fable" | "deep".
+    # None = use squad default.
+    model_tier: Optional[str] = None
 
 
 # ---------- engineering squad ----------
@@ -184,7 +190,9 @@ class HITLRequest(HydraEnvelope):
     type: Literal["HITL_REQUEST"] = "HITL_REQUEST"
     reason: Literal["budget_approval", "prod_deploy", "high_risk", "policy_breach",
                     "campaign_signoff", "schema_conflict", "loop_ceiling",
-                    "constitution_breach", "reflexion_override"]
+                    "constitution_breach", "reflexion_override",
+                    "acceptance_criteria", "lock_release_pending",
+                    "mcp_disconnect", "over_budget", "envelope_ceiling"]
     # `reflexion_override`: emitted by `node_judge_per_squad` when an envelope's
     # `revise` verdict cannot be retried because the Reflexion ×1 ceiling is
     # exhausted. Operator approval raises `state.reflexion_override_granted_until`

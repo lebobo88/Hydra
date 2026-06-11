@@ -361,10 +361,52 @@ def build_supervisor(
 
     def node_planner(state: HydraState) -> dict:
         state.phase = "planning"
-        # If executive squad is in play, ask it to decompose. Otherwise build
-        # a flat task list one-per-selected-squad.
-        new_tasks: list[TaskState] = []
+
+        # -----------------------------------------------------------------------
+        # TASK-LIST LIFECYCLE (holistic — read this before editing):
+        #
+        # HydraState.tasks uses an APPEND reducer (_append in state.py line 15).
+        # That means every dict key "tasks" in a node's return value is APPENDED
+        # onto the existing state list by LangGraph — it is NOT a replace.
+        #
+        # Therefore node_planner must return ONLY net-new synthesised tasks in
+        # its output dict (the fresh defaults added for squads with no pre-seeded
+        # tasks).  Pre-seeded tasks are already in state.tasks and must NOT be
+        # re-emitted; doing so doubles them.
+        #
+        # The gate evaluation (AC gate + high_risk) uses the FULL logical set:
+        #   full_tasks = existing_tasks (already in state) + synthesised_tasks (new)
+        # but only synthesised_tasks goes into the return dict["tasks"].
+        #
+        # Invariants enforced here:
+        #   (i)  One source of truth: full_tasks = existing + synthesised (no dups).
+        #   (ii) One shared per-task risk helper (_task_is_high_risk) drives BOTH
+        #        requires_human_approval and the AC qualifying check.
+        #   (iii) No task is duplicated: synthesised set covers only squads not
+        #         already in pre_seeded_squads, deduped by task_id before return.
+        #   (iv)  No task dropped: every pre-seeded task is in full_tasks; every
+        #         selected squad without a pre-seeded task gets exactly one default.
+        #   (v)   Gates evaluate full_tasks; only net-new go into return["tasks"].
+        # -----------------------------------------------------------------------
+
+        existing_tasks: list[TaskState] = list(state.tasks or [])
+        # Dedup existing by task_id (guard against earlier double-commit).
+        seen_ids: set[str] = set()
+        deduped_existing: list[TaskState] = []
+        for t in existing_tasks:
+            tid = str(t.task_id)
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                deduped_existing.append(t)
+        existing_tasks = deduped_existing
+
+        pre_seeded_squads: set[str] = {t.owner_squad for t in existing_tasks}
+
+        # synthesised_tasks: ONLY the fresh defaults added by this planner run.
+        # These are the tasks returned to the graph (append reducer).
+        synthesised_tasks: list[TaskState] = []
         new_envelopes: list[dict] = []
+
         if "executive" in state.selected_squads:
             packet = CSuiteDecisionPacket(
                 workflow_id=state.workflow_id,
@@ -378,23 +420,82 @@ def build_supervisor(
                 ],
             )
             new_envelopes.append(packet.model_dump(mode="json"))
-            new_tasks.append(TaskState(
-                owner_squad="executive",
-                description="Decompose goal + budget split",
-                envelope_id=packet.id,
-            ))
-        else:
-            for s in state.selected_squads:
-                new_tasks.append(TaskState(owner_squad=s, description=state.root_goal))
 
-        high_risk = any(
-            packs[s].entrypoint != "stub" and any(g.hitl_required for g in packs[s].gates)
-            for s in state.selected_squads if s in packs
-        )
+            # If NO executive task was pre-seeded, synthesise the decompose task.
+            # Pre-seeded executive tasks are already in existing_tasks — do NOT
+            # re-emit them (append reducer would duplicate).
+            if "executive" not in pre_seeded_squads:
+                synthesised_tasks.append(TaskState(
+                    owner_squad="executive",
+                    description="Decompose goal + budget split",
+                    envelope_id=packet.id,
+                ))
+
+            # Fresh defaults for selected non-executive squads with no pre-seeded tasks.
+            for s in state.selected_squads:
+                if s == "executive" or s in pre_seeded_squads:
+                    continue
+                synthesised_tasks.append(TaskState(
+                    owner_squad=s,
+                    description=state.root_goal,
+                ))
+        else:
+            # Non-executive branch: fresh defaults only for squads not already seeded.
+            for s in state.selected_squads:
+                if s in pre_seeded_squads:
+                    continue
+                synthesised_tasks.append(TaskState(
+                    owner_squad=s,
+                    description=state.root_goal,
+                ))
+
+        # Full logical task set for gate evaluation.
+        # Pre-seeded are authoritative; synthesised are appended after.
+        full_tasks: list[TaskState] = existing_tasks + synthesised_tasks
+
+        # -----------------------------------------------------------------------
+        # SHARED PER-TASK RISK HELPER
+        # Used by BOTH (a) requires_human_approval / high_risk HITL and
+        # (b) AC qualifying check.  Evaluates the task's OWN squad against packs
+        # so tasks outside selected_squads are covered (e.g. a pre-seeded security
+        # task whose squad was not in selected_squads still triggers HITL if its
+        # pack has hitl_required=True).
+        # Non-blanket: P2/P3 tasks whose squad has no hitl_required gate → False.
+        # -----------------------------------------------------------------------
+        def _task_has_valid_criteria(t: TaskState) -> bool:
+            crit = t.acceptance_criteria
+            return bool(crit and any(c.strip() for c in crit))
+
+        def _task_is_high_risk(t: TaskState) -> bool:
+            """True when the task is major (P0/P1) OR its squad has an hitl_required gate."""
+            if t.priority in {"P0", "P1"}:
+                return True
+            squad_pack = packs.get(t.owner_squad)
+            return (
+                squad_pack is not None
+                and squad_pack.entrypoint != "stub"
+                and any(g.hitl_required for g in squad_pack.gates)
+            )
+
+        # (a) requires_human_approval: any high-risk task anywhere in full_tasks.
+        high_risk = any(_task_is_high_risk(t) for t in full_tasks)
         state.requires_human_approval = high_risk or state.is_over_budget()
 
+        # (b) AC gate: any HIGH-RISK task (qualifying) is MISSING valid criteria.
+        needs_ac_hitl = any(
+            _task_is_high_risk(t) and not _task_has_valid_criteria(t)
+            for t in full_tasks
+        )
+
+        # Merge: AC gate folds into a single pause.
+        if needs_ac_hitl:
+            state.requires_human_approval = True
+
         out: dict = {
-            "tasks": new_tasks,
+            # APPEND REDUCER: emit only synthesised_tasks (not existing_tasks).
+            # Pre-seeded tasks are already in state.tasks; re-emitting them
+            # would duplicate every task_id.
+            "tasks": synthesised_tasks,
             "envelopes": new_envelopes,
             "requires_human_approval": state.requires_human_approval,
             "phase": "approval" if state.requires_human_approval else "dispatch",
@@ -408,15 +509,36 @@ def build_supervisor(
             # request was only rendered inside node_approval — i.e. AFTER the
             # operator had already resumed — so the approval gate was
             # invisible to both /hydra:status state and the mesh HITL Center.
-            hitl = HITLRequest(
-                workflow_id=state.workflow_id,
-                origin_squad="hydra",
-                target_squad="human",
-                reason="high_risk",
-                summary=f"Approve dispatch of: {state.selected_squads} for goal: {state.root_goal}",
-                options=["approve", "reject", "modify-budget"],
-                default_option="reject",
-            )
+            if needs_ac_hitl:
+                # WS9: acceptance-criteria gate (covers high_risk + missing AC
+                # in one HITL — do not emit a second high_risk gate).
+                hitl_summary = (
+                    f"Major/high-risk task dispatching to {state.selected_squads} "
+                    f"for goal: {state.root_goal!r} — no structured acceptance criteria "
+                    f"provided. Please confirm or supply acceptance criteria before "
+                    f"dispatch proceeds."
+                )
+                hitl = HITLRequest(
+                    workflow_id=state.workflow_id,
+                    origin_squad="hydra",
+                    target_squad="human",
+                    reason="acceptance_criteria",
+                    summary=hitl_summary,
+                    options=["approve_with_criteria", "reject", "modify-budget"],
+                    default_option="reject",
+                )
+            else:
+                # Standard high-risk gate (criteria are present or task is not
+                # flagged as needing AC).
+                hitl = HITLRequest(
+                    workflow_id=state.workflow_id,
+                    origin_squad="hydra",
+                    target_squad="human",
+                    reason="high_risk",
+                    summary=f"Approve dispatch of: {state.selected_squads} for goal: {state.root_goal}",
+                    options=["approve", "reject", "modify-budget"],
+                    default_option="reject",
+                )
             hitl_dict = hitl.model_dump(mode="json")
             hitl_dict["gate_node"] = "approval"  # C2: dedupe key half (workflow_id+gate_node)
             # Required-with-spool: transport failures land in
@@ -559,6 +681,7 @@ def build_supervisor(
         candidates: list[dict] = []
         per_candidate_winners: list[dict] = []
         for i in range(n):
+            # WS9 Fix 2: thread task.model_tier onto best-of-N packets.
             payload = CSuiteDecisionPacket(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra",
@@ -569,6 +692,7 @@ def build_supervisor(
                 # comes from the underlying responder's temperature/seed.
                 objective=f"{task.description}\n\n[bon-candidate {i+1}/{n}]",
                 target_repo_id=state.target_repo_id,
+                model_tier=getattr(task, "model_tier", None),
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -631,6 +755,10 @@ def build_supervisor(
             primary["_bon_candidate_index"] = i
             if result.host_pickup_pending:
                 primary["_host_pickup_pending"] = True
+            # Fix 2 (best-of-N _task_id): stamp originating task_id so
+            # _reflexion_retry can resolve the exact task and source its
+            # model_tier rather than falling back to first-same-squad.
+            primary["_task_id"] = str(task.task_id)
             candidates.append(primary)
             per_candidate_winners.append(primary)
 
@@ -764,7 +892,21 @@ def build_supervisor(
         new_decisions: list[dict] = []
         artifacts: list[dict] = []
         bon_verdicts: list[dict] = []
-        for task in list(state.tasks):
+
+        # Belt-and-suspenders dedup at the dispatch point: state.tasks uses an
+        # append reducer (_append in state.py), so re-plan passes or replay can
+        # accumulate duplicate task_ids. Dispatching the same task_id twice would
+        # double-charge budget and produce redundant envelopes. Keep first
+        # occurrence per task_id (preserves order and all identity fields).
+        _seen_dispatch_ids: set[str] = set()
+        _dispatch_tasks: list[TaskState] = []
+        for _t in state.tasks:
+            _tid = str(_t.task_id)
+            if _tid not in _seen_dispatch_ids:
+                _seen_dispatch_ids.add(_tid)
+                _dispatch_tasks.append(_t)
+
+        for task in _dispatch_tasks:
             if task.status != "pending":
                 continue
             pack = packs.get(task.owner_squad)
@@ -798,6 +940,8 @@ def build_supervisor(
                 continue
 
             # Standard single-shot dispatch.
+            # WS9 Fix 2: thread task.model_tier onto the dispatch packet so
+            # _via_mcp can route to the correct pp team/profile.
             payload = CSuiteDecisionPacket(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra",
@@ -805,6 +949,7 @@ def build_supervisor(
                 origin="BOARDROOM",
                 objective=task.description,
                 target_repo_id=state.target_repo_id,
+                model_tier=getattr(task, "model_tier", None),
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -879,6 +1024,10 @@ def build_supervisor(
                     continue
                 if result.host_pickup_pending:
                     d["_host_pickup_pending"] = True
+                # WS9 Fix 2: tag the envelope with the originating task_id so
+                # _reflexion_retry can source model_tier from the EXACT task,
+                # not just the first same-squad task.
+                d["_task_id"] = str(task.task_id)
                 new_decisions.append(d)
                 eights.envelope_record(d)
             artifacts.extend(result.artifacts)
@@ -937,6 +1086,26 @@ def build_supervisor(
             f"Prior verdict on rubric {revise_verdict.get('rubric_id')}: revise.\n"
             f"Critique to address:\n{revise_verdict.get('critique_md', '')}\n"
         )
+        # WS9 Fix 2 (multi-task-per-squad): source model_tier from the EXACT
+        # originating task identified by _task_id, not just any same-squad task.
+        # Fix A sourced from state.tasks by owner_squad — wrong when a squad has
+        # multiple tasks with different tiers.  The dispatch loop now stamps
+        # `_task_id` onto each produced envelope so we can look up the precise
+        # TaskState here.  Fall back to owner_squad match if _task_id is absent
+        # (e.g. envelopes produced by older code paths), then to None.
+        _tagged_task_id = original_env.get("_task_id")
+        if _tagged_task_id:
+            _retry_task = next(
+                (t for t in state.tasks if str(t.task_id) == _tagged_task_id),
+                None,
+            )
+        else:
+            # Legacy fallback: first same-squad task (pre-_task_id envelopes).
+            _retry_task = next(
+                (t for t in state.tasks if t.owner_squad == origin),
+                None,
+            )
+        _retry_model_tier = getattr(_retry_task, "model_tier", None)
         retry_envelope = CSuiteDecisionPacket(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
@@ -945,6 +1114,7 @@ def build_supervisor(
             objective=retry_obj,
             parent_id=original_env.get("id"),
             target_repo_id=state.target_repo_id,
+            model_tier=_retry_model_tier,
         )
 
         try:
@@ -1008,6 +1178,11 @@ def build_supervisor(
             except (ValueError, Exception):
                 continue
             d["_retry_index"] = packet.retry_index
+            # Propagate _task_id through every retry generation so that a
+            # retry-of-retry still resolves the exact originating task for
+            # tier lookup (not the first-same-squad fallback).
+            if _tagged_task_id:
+                d["_task_id"] = _tagged_task_id
             new_env_dicts.append(d)
 
         emit_trace(judge_trace_root, state.workflow_id, "judge.reflexion", {

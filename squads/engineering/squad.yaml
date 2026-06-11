@@ -90,3 +90,11 @@ invoke:
   forum_for_review: change-advisory-board
   project_path: "${project_root}"
   command_hint: "/pp:run"
+  # WS9: optional model_tier for this squad's default dispatch.
+  # Valid tokens: haiku | sonnet | opus | fable | deep
+  # "fable" and "deep" are aliases — both route to pp's deep-reasoning-team
+  # (cross-vendor judges per WS6). Leave null/absent to use pp's own default.
+  # IMPORTANT: Fable is operator/flag-driven only — Hydra does NOT auto-escalate
+  # to Fable on retry or budget events. Set this only when the operator explicitly
+  # wants every engineering dispatch from this squad to use the deep-reasoning-team.
+  model_tier: ~                      # null — use pp default; override per-workflow via dispatch envelope

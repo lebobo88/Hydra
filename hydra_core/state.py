@@ -45,6 +45,15 @@ class TaskState(BaseModel):
     result_envelope_id: Optional[UUID] = None
     retries: int = 0
     priority: Literal["P0", "P1", "P2", "P3"] = "P2"
+    # WS9: model_tier hint propagated from the dispatch envelope or operator flag.
+    # Valid tokens: "haiku" | "sonnet" | "opus" | "fable" | "deep".
+    # "fable"/"deep" route engineering work to pp's deep-reasoning-team.
+    # None means "use squad default" — existing behaviour is unchanged.
+    model_tier: Optional[str] = None
+    # WS9: structured acceptance criteria for this task.  When a task is
+    # major/high-risk and this list is absent (or empty), the planner gates
+    # on HITL with reason="acceptance_criteria" before dispatch.
+    acceptance_criteria: Optional[list[str]] = None
 
 
 class HydraState(BaseModel):
