@@ -96,6 +96,12 @@ class HydraState(BaseModel):
     pending_hitl: Optional[dict[str, Any]] = None
     hitl_history: Annotated[list[dict[str, Any]], _append] = Field(default_factory=list)
 
+    # WS-AUTH: operator-capability token minted by apply_approval() on each
+    # HITL approval event.  Downstream dispatch nodes can present this token
+    # to verify that the human operator authorised the gated action.
+    # None until the first approval in this workflow.
+    operator_capability: Optional[dict[str, Any]] = None
+
     # FS-4 — budget downgrade tripwire. Set True when spent_usd/budget_usd >= 80%
     # and dispatching is still legal (< 100%). WS9 tier-propagation consumes this
     # flag to downgrade the model tier passed to squads; this module only sets it.

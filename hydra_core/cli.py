@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import warnings
@@ -567,7 +568,77 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "option": option,
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # WS-AUTH: on approve, mint an operator-capability token BEFORE clearing
+    # pending_hitl so the token captures the gate context.  Persisted into the
+    # checkpointed state patch as operator_capability so downstream dispatch
+    # nodes can verify the approval is fresh and from the right actor.
+    # Degraded posture: when HYDRA_OPERATOR_KEY is unset we mint a degraded
+    # token (sig.value=None) and warn — the approval itself is NOT blocked
+    # (WS-AUTH foundation run A; gated consumers enforce in runs B/C).
+    operator_capability_patch: dict | None = None
+    if action == "approve":
+        import logging as _logging
+        _log_cli = _logging.getLogger(__name__)
+        _operator = (
+            getattr(args, "operator", None)
+            or os.environ.get("HYDRA_OPERATOR_ID", "")
+            or ""
+        )
+        # Sentinel check: empty or "unknown" operator identity means we cannot
+        # issue a valid human capability — doing so would let any unidentified
+        # approval bypass the actor_id requirement in verify_operator_capability.
+        # Force degraded mint (sig.value=None) in that case and warn loudly.
+        _UNKNOWN_OPERATORS = {"", "unknown"}
+        _force_degraded = _operator.strip() in _UNKNOWN_OPERATORS
+        if _force_degraded:
+            _log_cli.warning(
+                "operator identity unknown; capability degraded — "
+                "set HYDRA_OPERATOR_ID (or args.operator) to a real operator id "
+                "to issue a verifiable capability token"
+            )
+            # Use a sentinel actor_id for the degraded token payload so the
+            # wire format is consistent; the sig.value=None marks it unusable.
+            _operator = _operator or "unknown"
+        try:
+            from .auth.capability import mint_for_approval
+            if _force_degraded:
+                # Force degraded by temporarily unsetting the key env var.
+                # We do this in a narrow scope to avoid races; the key is
+                # restored immediately after the call returns.
+                _saved_key = os.environ.pop("HYDRA_OPERATOR_KEY", None)
+                try:
+                    _cap_token = mint_for_approval(
+                        workflow_id=wf,
+                        pending_hitl=pending if isinstance(pending, dict) else {},
+                        operator=_operator,
+                    )
+                finally:
+                    if _saved_key is not None:
+                        os.environ["HYDRA_OPERATOR_KEY"] = _saved_key
+            else:
+                _cap_token = mint_for_approval(
+                    workflow_id=wf,
+                    pending_hitl=pending if isinstance(pending, dict) else {},
+                    operator=_operator,
+                )
+            operator_capability_patch = _cap_token
+            if _cap_token.get("sig", {}).get("degraded") and not _force_degraded:
+                # Real operator but no key configured.
+                _log_cli.warning(
+                    "operator capability degraded (no HYDRA_OPERATOR_KEY); "
+                    "gated consumers will reject — set HYDRA_OPERATOR_KEY to enable "
+                    "cryptographic proof of approval"
+                )
+        except Exception as _cap_exc:  # noqa: BLE001 — never block an approval on mint failure
+            _log_cli.warning(
+                "mint_for_approval raised %s: %s — approval proceeds without capability token",
+                type(_cap_exc).__name__, _cap_exc,
+            )
+
     patch: dict = {"pending_hitl": None, "hitl_history": [resolution]}
+    if operator_capability_patch is not None:
+        patch["operator_capability"] = operator_capability_patch
 
     if action == "change-squads":
         if not option:
