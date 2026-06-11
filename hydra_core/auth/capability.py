@@ -44,6 +44,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any
 
@@ -130,7 +131,14 @@ def mint_capability(payload: dict, *, now: int | None = None) -> dict:
     Payload fields
     --------------
     Required: v, actor_id, actor_kind, capability
-    Optional: resource_id, workflow_id, issued_at, exp, ttl_seconds
+    Optional: resource_id, workflow_id, issued_at, exp, ttl_seconds, jti
+
+    jti (JWT ID) — single-use token identifier
+    -------------------------------------------
+    An optional string nonce.  If the caller omits it, mint_capability generates
+    one automatically via secrets.token_hex(16).  Consumers use the VERIFIED jti
+    (from verify_capability / verify_operator_capability result dicts) for
+    single-use enforcement — never re-read it from the raw token.
 
     Timing / expiry (strict)
     ------------------------
@@ -167,6 +175,14 @@ def mint_capability(payload: dict, *, now: int | None = None) -> dict:
 
     # Strip internal helper field — not part of the token wire format.
     ttl = result.pop("ttl_seconds", None)
+
+    # jti: generate if absent; validate type if explicitly supplied.
+    if "jti" not in result or result["jti"] is None:
+        result["jti"] = secrets.token_hex(16)
+    elif type(result["jti"]) is not str or not result["jti"]:
+        raise TypeError(
+            f"jti must be a non-empty str, got {type(result['jti']).__name__!r}"
+        )
 
     ts_now = now if now is not None else int(time.time())
     if "issued_at" not in result:
@@ -233,6 +249,7 @@ def verify_capability(
       reason     : str
       actor_id   : str | None
       actor_kind : str | None
+      jti        : str | None  — VERIFIED jti from the HMAC-verified token (None on failure)
 
     Fail-closed on every error path including:
     - Non-dict / malformed token
@@ -271,7 +288,7 @@ def verify_capability(
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         return {"valid": False, "reason": "verification error",
-                "actor_id": None, "actor_kind": None}
+                "actor_id": None, "actor_kind": None, "jti": None}
 
 
 def _verify_capability_inner(
@@ -284,7 +301,7 @@ def _verify_capability_inner(
     now: int | None,
 ) -> dict:
     def _fail(reason: str, actor_id: str | None = None, actor_kind: str | None = None) -> dict:
-        return {"valid": False, "reason": reason, "actor_id": actor_id, "actor_kind": actor_kind}
+        return {"valid": False, "reason": reason, "actor_id": actor_id, "actor_kind": actor_kind, "jti": None}
 
     # Exact-type guard: require type(token) is dict (not a subclass).
     # dict subclasses can override .get/.items to inject arbitrary behaviour;
@@ -394,7 +411,14 @@ def _verify_capability_inner(
         if token_res != expected_resource_id:
             return _fail("resource_id mismatch", actor_id, actor_kind)
 
-    return {"valid": True, "reason": "signature valid", "actor_id": actor_id, "actor_kind": actor_kind}
+    # Extract and validate jti from the HMAC-verified, JSON-normalized token.
+    # jti is optional in the token; if present it must be a non-empty str.
+    verified_jti: str | None = token.get("jti")
+    if verified_jti is not None:
+        if type(verified_jti) is not str or not verified_jti:
+            return _fail("jti is present but not a non-empty plain str", actor_id, actor_kind)
+
+    return {"valid": True, "reason": "signature valid", "actor_id": actor_id, "actor_kind": actor_kind, "jti": verified_jti}
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +450,7 @@ def verify_operator_capability(
 
     Returns
     -------
-    dict with keys: valid, reason, actor_id, actor_kind  (same schema as
+    dict with keys: valid, reason, actor_id, actor_kind, jti  (same schema as
     verify_capability so callers can use either function interchangeably).
 
     NEVER raises for any input shape.
@@ -443,7 +467,7 @@ def verify_operator_capability(
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         return {"valid": False, "reason": "verification error",
-                "actor_id": None, "actor_kind": None}
+                "actor_id": None, "actor_kind": None, "jti": None}
 
 
 def _verify_operator_capability_inner(
@@ -455,7 +479,7 @@ def _verify_operator_capability_inner(
     now: int | None,
 ) -> dict:
     def _fail(reason: str, actor_id: str | None = None, actor_kind: str | None = None) -> dict:
-        return {"valid": False, "reason": reason, "actor_id": actor_id, "actor_kind": actor_kind}
+        return {"valid": False, "reason": reason, "actor_id": actor_id, "actor_kind": actor_kind, "jti": None}
 
     # Exact-type guard (same as _verify_capability_inner).
     if type(token) is not dict:

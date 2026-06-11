@@ -46,6 +46,7 @@ from mcp_servers.xenia_tickets.server import (
     _EXECUTE_APPROVED_ALLOWED_ACTORS,
     _tool_handlers,
     _find_valid_approval,
+    mint_caller_capability,
 )
 
 
@@ -123,6 +124,9 @@ def _make_approval(
     return p
 
 
+_CAP_KEY_HEX = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+
 def _mint_token(body: str, key: str = "cafebabe", extra: dict | None = None) -> str:
     """Mint a clearance token via clearance.py (mirrors sign.py) and JSON-encode it."""
     with _env(XENIA_CONTEXT_SIGNING_KEY=key):
@@ -131,17 +135,49 @@ def _mint_token(body: str, key: str = "cafebabe", extra: dict | None = None) -> 
     return json.dumps(token_dict)
 
 
+def _mint_cap_token(
+    ticket_id: str = "000001",
+    actor_id: str = "hermes",
+    capability: str = "xenia.send_response",
+    cap_key: str = _CAP_KEY_HEX,
+) -> str:
+    """Mint a caller-capability token for WS-AUTH and JSON-encode it."""
+    with _env(HYDRA_OPERATOR_KEY=cap_key):
+        token_dict = mint_caller_capability(
+            actor_id=actor_id,
+            capability=capability,
+            ticket_id=ticket_id,
+        )
+    return json.dumps(token_dict)
+
+
 def _send(tmp_path: Path, body: str, actor: str = "hermes",
           clearance_token=None, approval_id: str = "",
-          key: str = "cafebabe") -> dict:
-    """Call send_response handler with the given args."""
-    with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY=key):
+          key: str = "cafebabe",
+          capability_token=None,
+          cap_key: str = _CAP_KEY_HEX,
+          ticket_id: str = "000001") -> dict:
+    """Call send_response handler with the given args.
+
+    By default, mints a valid caller-capability token so callers don't need to
+    care about WS-AUTH unless they're explicitly testing that layer.
+    Pass capability_token=False to suppress the token entirely.
+    """
+    if capability_token is None:
+        # Auto-mint a valid cap token for the default allowed actor.
+        capability_token = _mint_cap_token(
+            ticket_id=ticket_id, actor_id=actor, cap_key=cap_key
+        )
+    with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY=key,
+              HYDRA_OPERATOR_KEY=cap_key):
         handlers = _tool_handlers()
-        args: dict = {"ticket_id": "000001", "body": body, "actor": actor}
+        args: dict = {"ticket_id": ticket_id, "body": body, "actor": actor}
         if clearance_token is not None:
             args["clearance_token"] = clearance_token
         if approval_id:
             args["approval_id"] = approval_id
+        if capability_token is not False:
+            args["capability_token"] = capability_token
         return handlers["xenia-tickets.send_response"](args)
 
 
@@ -298,24 +334,33 @@ class TestClearanceToken:
 
 class TestSendResponseClearance:
     def test_missing_token_blocked(self, tmp_path):
+        """Missing clearance_token (but valid capability_token) -> CLEARANCE_INVALID."""
         _make_ticket(tmp_path, "000001")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe"):
+        cap_token = _mint_cap_token()
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
                 "body": "Your ticket is resolved.",
                 "actor": "hermes",
+                "capability_token": cap_token,
+                # no clearance_token
             })
         assert result.get("error", {}).get("code") == "CLEARANCE_INVALID"
 
     def test_invalid_token_blocked(self, tmp_path):
+        """Invalid clearance_token (but valid capability_token) -> CLEARANCE_INVALID."""
         _make_ticket(tmp_path, "000001")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe"):
+        cap_token = _mint_cap_token()
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
                 "body": "Your ticket is resolved.",
                 "actor": "hermes",
+                "capability_token": cap_token,
                 "clearance_token": "totally-wrong-not-json",
             })
         assert result.get("error", {}).get("code") == "CLEARANCE_INVALID"
@@ -329,41 +374,55 @@ class TestSendResponseClearance:
         assert result.get("ok") is True
 
     def test_human_actor_no_token_blocked(self, tmp_path):
-        """actor='human' must now produce FORBIDDEN_ACTOR (human removed from allow-list #6)."""
+        """actor='human' in a capability token -> FORBIDDEN_ACTOR (human not on allow-list).
+        A capability token signed for actor_id='human' is rejected at the authz check."""
         _make_ticket(tmp_path, "000001")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe"):
+        cap_token = _mint_cap_token(actor_id="human")
+        body = "Your ticket is resolved."
+        clearance_token = _mint_token(body)
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
-                "body": "Your ticket is resolved.",
+                "body": body,
                 "actor": "human",
+                "capability_token": cap_token,
+                "clearance_token": clearance_token,
             })
-        # human is NOT on the allow-list anymore -> FORBIDDEN_ACTOR fires first
+        # human is NOT on the allow-list -> FORBIDDEN_ACTOR (verified actor governs)
         assert result.get("error", {}).get("code") == "FORBIDDEN_ACTOR"
 
     def test_no_signing_key_fail_closed(self, tmp_path):
-        """XENIA_CONTEXT_SIGNING_KEY absent -> fail closed regardless of token."""
+        """XENIA_CONTEXT_SIGNING_KEY absent -> CLEARANCE_INVALID after capability passes."""
         _make_ticket(tmp_path, "000001")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY=""):
+        cap_token = _mint_cap_token()
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
                 "body": "Your ticket is resolved.",
                 "actor": "hermes",
+                "capability_token": cap_token,
                 "clearance_token": '{"body":"Your ticket is resolved.","sig":{"alg":"HMAC-SHA256","key_id":"default","value":"AAABBB"}}',
             })
         assert result.get("error", {}).get("code") == "CLEARANCE_INVALID"
 
     def test_degraded_token_blocked(self, tmp_path):
+        """Degraded clearance token -> CLEARANCE_INVALID."""
         _make_ticket(tmp_path, "000001")
         body = "Your ticket is resolved."
         degraded = {"body": body, "sig": {"alg": "HMAC-SHA256", "key_id": "default", "value": None, "degraded": True}}
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe"):
+        cap_token = _mint_cap_token()
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
                 "body": body,
                 "actor": "hermes",
+                "capability_token": cap_token,
                 "clearance_token": json.dumps(degraded),
             })
         assert result.get("error", {}).get("code") == "CLEARANCE_INVALID"
@@ -419,10 +478,27 @@ class TestActorAllowList:
 
 
 class TestExecuteApprovedActorRequired:
-    """Fix #1: execute_approved must require actor unconditionally."""
+    """Fix #1: execute_approved must require actor unconditionally (now via capability token)."""
+
+    def test_missing_capability_token_blocked(self, tmp_path):
+        """No capability_token supplied -> CALLER_CAPABILITY_INVALID."""
+        _make_ticket(tmp_path, "000001")
+        approvals_dir = tmp_path / "hearth" / "approvals"
+        _make_approval(approvals_dir, "000001", action="refund", scope="billing")
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
+            handlers = _tool_handlers()
+            result = handlers["xenia-tickets.execute_approved"]({
+                "ticket_id":   "000001",
+                "action":      "refund",
+                "scope":       "billing",
+                "approval_id": "APPROVAL-000001-001",
+                # No capability_token
+            })
+        assert result.get("error", {}).get("code") == "CALLER_CAPABILITY_INVALID"
 
     def test_missing_actor_blocked(self, tmp_path):
-        """No actor supplied -> MISSING_FIELD (not silently skipped)."""
+        """No actor supplied but no capability token either -> CALLER_CAPABILITY_INVALID.
+        WS-AUTH gate fires before old MISSING_FIELD actor check."""
         _make_ticket(tmp_path, "000001")
         approvals_dir = tmp_path / "hearth" / "approvals"
         _make_approval(approvals_dir, "000001", action="refund", scope="billing")
@@ -433,12 +509,12 @@ class TestExecuteApprovedActorRequired:
                 "action":      "refund",
                 "scope":       "billing",
                 "approval_id": "APPROVAL-000001-001",
-                # No actor
+                # No actor, no capability_token
             })
-        assert result.get("error", {}).get("code") == "MISSING_FIELD"
+        assert result.get("error", {}).get("code") == "CALLER_CAPABILITY_INVALID"
 
     def test_empty_actor_blocked(self, tmp_path):
-        """Empty actor -> MISSING_FIELD."""
+        """Empty actor + no capability token -> CALLER_CAPABILITY_INVALID."""
         _make_ticket(tmp_path, "000001")
         approvals_dir = tmp_path / "hearth" / "approvals"
         _make_approval(approvals_dir, "000001", action="refund", scope="billing")
@@ -451,44 +527,54 @@ class TestExecuteApprovedActorRequired:
                 "approval_id": "APPROVAL-000001-001",
                 "actor":       "",
             })
-        assert result.get("error", {}).get("code") == "MISSING_FIELD"
+        assert result.get("error", {}).get("code") == "CALLER_CAPABILITY_INVALID"
 
     def test_non_allowlisted_actor_forbidden(self, tmp_path):
+        """Capability token signed for non-allow-listed actor -> FORBIDDEN_ACTOR."""
         _make_ticket(tmp_path, "000001")
         approvals_dir = tmp_path / "hearth" / "approvals"
         _make_approval(approvals_dir, "000001", action="refund", scope="billing")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path)):
+        cap_token = _mint_cap_token(actor_id="iris", capability="xenia.execute_approved")
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.execute_approved"]({
-                "ticket_id":   "000001",
-                "action":      "refund",
-                "scope":       "billing",
-                "approval_id": "APPROVAL-000001-001",
-                "actor":       "iris",
+                "ticket_id":      "000001",
+                "action":         "refund",
+                "scope":          "billing",
+                "approval_id":    "APPROVAL-000001-001",
+                "actor":          "iris",
+                "capability_token": cap_token,
             })
         assert result.get("error", {}).get("code") == "FORBIDDEN_ACTOR"
 
     def test_allowlisted_actor_proceeds(self, tmp_path):
+        """Valid capability token for allowed actor -> proceeds to approval check."""
         _make_ticket(tmp_path, "000001")
         approvals_dir = tmp_path / "hearth" / "approvals"
         _make_approval(approvals_dir, "000001", action="refund", scope="billing")
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path)):
+        cap_token = _mint_cap_token(actor_id="hermes", capability="xenia.execute_approved")
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.execute_approved"]({
-                "ticket_id":   "000001",
-                "action":      "refund",
-                "scope":       "billing",
-                "approval_id": "APPROVAL-000001-001",
-                "actor":       "hermes",
+                "ticket_id":      "000001",
+                "action":         "refund",
+                "scope":          "billing",
+                "approval_id":    "APPROVAL-000001-001",
+                "actor":          "hermes",
+                "capability_token": cap_token,
             })
         assert "error" not in result, result
         assert result.get("ok") is True
 
     def test_send_response_non_allowlisted_actor_forbidden(self, tmp_path):
+        """Capability token for non-allow-listed actor (metis) -> FORBIDDEN_ACTOR."""
         _make_ticket(tmp_path, "000001")
         body = "Your ticket is resolved."
         token_json = _mint_token(body)
-        result = _send(tmp_path, body, actor="metis", clearance_token=token_json)
+        # _send auto-mints cap token with actor=actor arg; metis is not on allow-list
+        cap_token = _mint_cap_token(actor_id="metis")
+        result = _send(tmp_path, body, actor="metis", clearance_token=token_json,
+                       capability_token=cap_token)
         assert result.get("error", {}).get("code") == "FORBIDDEN_ACTOR"
 
 
@@ -781,22 +867,40 @@ class TestSendResponseMoneyApproval:
 # ---------------------------------------------------------------------------
 
 class TestEnforcementOrder:
-    def test_forbidden_actor_fires_before_clearance(self, tmp_path):
+    def test_capability_fires_before_forbidden_actor(self, tmp_path):
+        """No capability_token -> CALLER_CAPABILITY_INVALID fires before FORBIDDEN_ACTOR."""
         _make_ticket(tmp_path, "000001")
         body = "Your ticket is resolved."
         token_json = _mint_token(body)
-        result = _send(tmp_path, body, actor="rogue", clearance_token=token_json)
+        # capability_token=False => no token at all
+        result = _send(tmp_path, body, actor="rogue", clearance_token=token_json,
+                       capability_token=False)
+        assert result["error"]["code"] == "CALLER_CAPABILITY_INVALID"
+
+    def test_forbidden_actor_fires_before_clearance(self, tmp_path):
+        """Capability token with non-allow-listed actor -> FORBIDDEN_ACTOR before CLEARANCE."""
+        _make_ticket(tmp_path, "000001")
+        body = "Your ticket is resolved."
+        token_json = _mint_token(body)
+        # Cap token for "rogue" — FORBIDDEN_ACTOR fires; clearance never checked.
+        cap_token = _mint_cap_token(actor_id="rogue")
+        result = _send(tmp_path, body, actor="rogue", clearance_token=token_json,
+                       capability_token=cap_token)
         assert result["error"]["code"] == "FORBIDDEN_ACTOR"
 
     def test_clearance_fires_before_pii(self, tmp_path):
+        """Valid capability, but no clearance_token -> CLEARANCE_INVALID before PII."""
         _make_ticket(tmp_path, "000001")
         body = "Email rob@example.com SSN 123-45-6789"
-        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe"):
+        cap_token = _mint_cap_token()
+        with _env(HYDRA_XENIA_ROOT=str(tmp_path), XENIA_CONTEXT_SIGNING_KEY="cafebabe",
+                  HYDRA_OPERATOR_KEY=_CAP_KEY_HEX):
             handlers = _tool_handlers()
             result = handlers["xenia-tickets.send_response"]({
                 "ticket_id": "000001",
                 "body": body,
                 "actor": "hermes",
+                "capability_token": cap_token,
                 # No clearance_token
             })
         assert result["error"]["code"] == "CLEARANCE_INVALID"

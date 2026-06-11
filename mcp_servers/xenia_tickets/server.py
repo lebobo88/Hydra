@@ -25,6 +25,7 @@ import html
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import unicodedata
@@ -38,6 +39,13 @@ sys.path.insert(0, str(_HERE.parents[2]))
 
 from mcp_servers._pack_shim import resolve_root, run_server  # noqa: E402
 from mcp_servers.xenia_tickets.clearance import verify_clearance_token  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# WS-AUTH: caller-capability enforcement (Run C)
+# ---------------------------------------------------------------------------
+# hydra_core is at <repo_root>/hydra_core; _HERE.parents[2] already puts the
+# repo root on sys.path (see above), so this import always resolves.
+from hydra_core.auth import capability as _cap  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,10 +87,10 @@ _counter_lock = threading.Lock()
 #   - There is NO "human" role in heads.yaml; "human" has been REMOVED from both
 #     allow-lists (fix #6).  A human-reviewed response is submitted via hermes.
 #
-# FIXME(auth): the actor field is self-reported/spoofable by any MCP caller.
-# Unforgeable caller identity (e.g. mTLS, signed JWT, session binding) is
-# tracked in WS-AUTH.  Until that lands, this allow-list is a defense-in-depth
-# speed bump, not a cryptographic guarantee.
+# WS-AUTH (Run C): actor identity is now CRYPTOGRAPHICALLY VERIFIED via a
+# signed caller-capability token (hydra_core.auth.capability.verify_capability).
+# The VERIFIED actor_id from the token REPLACES the self-reported actor arg.
+# The allow-list check now runs against the VERIFIED identity.
 
 _SEND_RESPONSE_ALLOWED_ACTORS: frozenset[str] = frozenset({
     "hermes",
@@ -100,16 +108,158 @@ _EXECUTE_APPROVED_ALLOWED_ACTORS: frozenset[str] = frozenset({
 
 def _check_actor_authz(actor: str, allowed: frozenset[str]) -> dict[str, Any] | None:
     """Return an _err dict if actor is not in allowed, else None.
-    FIXME(auth): actor is self-reported — see module note above.
+
+    WS-AUTH (Run C): callers MUST pass the VERIFIED actor_id from a signed
+    caller-capability token.  The allow-list is now the second gate (after
+    cryptographic identity verification), not a spoofable speed bump.
     """
     if actor not in allowed:
         return _err(
             "FORBIDDEN_ACTOR",
             f"Actor {actor!r} is not authorised to call this tool. "
             f"Allowed actors: {sorted(allowed)}. "
-            "FIXME(auth): actor field is self-reported; unforgeable identity tracked in WS-AUTH.",
+            "Identity is verified via caller-capability token (WS-AUTH Run C).",
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# WS-AUTH: single-use JTI store (sqlite, file-backed)
+# ---------------------------------------------------------------------------
+# One DB per Xenia root.  The table is created lazily on first use.
+# INSERT OR IGNORE atomically marks a jti as consumed; if 0 rows changed,
+# the jti was already used -> replay attack.
+
+_jti_db_lock = threading.Lock()
+_jti_db_conn: sqlite3.Connection | None = None
+_jti_db_root: str = ""
+
+
+def _jti_db(root: Path) -> sqlite3.Connection:
+    """Return (and lazily create) the JTI store DB for *root*."""
+    global _jti_db_conn, _jti_db_root  # noqa: PLW0603
+    root_str = str(root)
+    with _jti_db_lock:
+        if _jti_db_conn is None or _jti_db_root != root_str:
+            db_path = root / "hearth" / "tasks" / ".caller_jti.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS consumed_caller_capabilities "
+                "(jti TEXT PRIMARY KEY, used_at TEXT NOT NULL)"
+            )
+            conn.commit()
+            _jti_db_conn = conn
+            _jti_db_root = root_str
+        return _jti_db_conn
+
+
+def _consume_jti(root: Path, jti: str) -> bool:
+    """Mark *jti* as consumed.  Returns True if first use, False if replay."""
+    conn = _jti_db(root)
+    used_at = datetime.now(timezone.utc).isoformat()
+    with _jti_db_lock:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO consumed_caller_capabilities (jti, used_at) VALUES (?, ?)",
+            (jti, used_at),
+        )
+        conn.commit()
+        return cur.rowcount > 0  # 1 = first use; 0 = already consumed
+
+
+# ---------------------------------------------------------------------------
+# WS-AUTH: caller-capability mint seam (Part 3)
+# ---------------------------------------------------------------------------
+# !!  TRUSTED-IDENTITY CONTRACT  !!
+#
+# mint_caller_capability() MUST be called by a TRUSTED framework/dispatch layer
+# that KNOWS which agent is running — NOT by user code, NOT from the MCP `actor`
+# arg or any other caller-supplied field.  The actor_id passed here is the
+# identity that will be cryptographically signed into the token and become the
+# VERIFIED executor in the audit trail.  If a self-reported value is used here,
+# the caller-capability system provides NO additional identity guarantee.
+#
+# TRUSTED integration seam (tracked follow-up — WS-AUTH Phase 2):
+#   The correct wiring point is the Xenia tool-invocation dispatcher —
+#   specifically the layer that ROUTES which agent gets dispatched to handle
+#   a ticket.  That layer (e.g. hydra_core/dispatch/xenia_tool_invoker.py or
+#   equivalent routing in the Xenia squad pack) knows the agent identity from
+#   its own internal scheduling state, NOT from a field the agent supplied.
+#   That dispatcher should:
+#     1. Determine actor_id from its own routing state (e.g. the head-registry
+#        slug of the agent being dispatched: "hermes", "escalation-handoff").
+#     2. Call mint_caller_capability(actor_id=<framework-known-id>, ...).
+#     3. Attach the signed token as args["capability_token"] before MCP dispatch.
+#
+#   Until that trusted-dispatch wiring is complete, the server-side enforcement
+#   is SAFE (fail-closed) — any call to send_response/execute_approved without
+#   a valid signed capability_token is rejected.  Tests and the dispatcher in
+#   this run use mint_caller_capability() with a known test identity to prove
+#   the e2e path; production wiring is the tracked WS-AUTH Phase 2 task.
+#
+#   DO NOT wire actor_id from args["actor"] or any MCP-supplied field here.
+#
+# Example (Python, trusted dispatcher):
+#
+#   import json
+#   from mcp_servers.xenia_tickets.server import mint_caller_capability
+#   # agent_slug is resolved from the framework's routing state, NOT from args.
+#   token = mint_caller_capability(
+#       actor_id=agent_slug,           # framework-known identity
+#       capability="xenia.send_response",
+#       ticket_id=ticket_id,
+#   )
+#   args["capability_token"] = json.dumps(token)
+#
+# Tests use this helper directly with a hard-coded known test identity
+# (see test_caller_capability.py).
+
+def mint_caller_capability(
+    *,
+    actor_id: str,
+    capability: str,  # "xenia.send_response" or "xenia.execute_approved"
+    ticket_id: str,
+    ttl_seconds: int = 120,
+    jti: str | None = None,
+) -> dict:
+    """Mint a short-lived caller-capability token for a Xenia tool invocation.
+
+    CONTRACT: actor_id MUST come from a TRUSTED framework/dispatch source —
+    the layer that decides which agent runs (e.g. the routing/scheduling state
+    of the Xenia head-dispatcher).  It MUST NOT be sourced from the MCP `actor`
+    arg or any other caller-supplied/self-reported field.  The signed actor_id
+    becomes the cryptographically verified executor in the audit trail.
+
+    Signs with HYDRA_OPERATOR_KEY.  Returns a degraded token (sig.value=None)
+    when the key is not configured — the server will reject degraded tokens
+    (fail-closed), so misconfigured environments surface immediately.
+
+    Parameters
+    ----------
+    actor_id:    TRUSTED agent identity from the framework's routing state.
+                 e.g. "hermes" or "escalation-handoff" as resolved by the
+                 dispatcher — NEVER from MCP args or self-reported inputs.
+    capability:  "xenia.send_response" or "xenia.execute_approved".
+    ticket_id:   The ticket this invocation is bound to (resource_id+workflow_id).
+    ttl_seconds: Token lifetime (default 120 s — short for single-use tokens).
+    jti:         Optional; a fresh unique nonce is generated automatically.
+    """
+    import time as _time
+    ts_now = int(_time.time())
+    payload: dict[str, Any] = {
+        "v": 1,
+        "actor_id": actor_id,
+        "actor_kind": "agent",
+        "capability": capability,
+        "resource_id": ticket_id,
+        "workflow_id": ticket_id,
+        "issued_at": ts_now,
+        "exp": ts_now + ttl_seconds,
+    }
+    if jti is not None:
+        payload["jti"] = jti
+    # mint_capability auto-generates jti when absent.
+    return _cap.mint_capability(payload, now=ts_now)
 
 
 # ---------------------------------------------------------------------------
@@ -675,36 +825,99 @@ def _tool_handlers() -> dict[str, Any]:
     #
     # Enforcement order (fail-closed at each step):
     #   1. Field validation + ticket lookup
-    #   2. VHP-3: actor authz — actor MUST be non-empty, MUST be on allow-list
+    #   2. WS-AUTH: caller-capability token — HMAC-verified identity + single-use
+    #      VERIFIED actor_id REPLACES self-reported actor arg for allow-list check
     #   3. VHP-2: clearance token (signed dict from sign.py) — HMAC + body binding
     #   4. VHP-1: PII scan (normalized)
     #   5. VHP-4: money/commitment -> approval required
     #   6. Append + save
     # ------------------------------------------------------------------
     def send_response(args: dict[str, Any]) -> dict[str, Any]:
-        ticket_id       = str(args.get("ticket_id") or "").strip()
-        body            = str(args.get("body") or "").strip()
-        actor           = str(args.get("actor") or "").strip()
-        clearance_token = args.get("clearance_token")  # JSON string or dict
-        approval_id     = str(args.get("approval_id") or "").strip()
+        ticket_id         = str(args.get("ticket_id") or "").strip()
+        body              = str(args.get("body") or "").strip()
+        # actor arg retained for log/history — but VERIFIED actor_id governs authz.
+        actor             = str(args.get("actor") or "").strip()
+        clearance_token   = args.get("clearance_token")  # JSON string or dict
+        approval_id       = str(args.get("approval_id") or "").strip()
+        capability_token  = args.get("capability_token")  # JSON string or dict
 
         if not ticket_id:
             return _err("MISSING_FIELD", "ticket_id is required")
         if not body:
             return _err("MISSING_FIELD", "body is required")
-        if not actor:
-            return _err("MISSING_FIELD", "actor is required")
 
         tasks = _tasks_dir(root)
         ticket = _load_ticket(tasks, ticket_id)
         if ticket is None:
             return _err("NOT_FOUND", f"ticket {ticket_id!r} not found")
 
-        # ---- VHP-3: actor authorization (unconditional) ----
-        # FIXME(auth): actor is self-reported; unforgeable identity tracked in WS-AUTH.
-        authz_err = _check_actor_authz(actor, _SEND_RESPONSE_ALLOWED_ACTORS)
+        # ---- WS-AUTH: caller-capability verification (FIRST, fail-closed) ----
+        # Requires a signed caller-capability token minted by mint_caller_capability()
+        # (or equivalent). No token / no HYDRA_OPERATOR_KEY -> reject.
+        # The VERIFIED actor_id replaces the self-reported actor arg.
+        if capability_token is None:
+            return _err(
+                "CALLER_CAPABILITY_INVALID",
+                "send_response blocked: capability_token is required (WS-AUTH). "
+                "Mint a caller-capability token via mint_caller_capability() and "
+                "pass it as capability_token in the args.",
+            )
+
+        # Accept dict or JSON string (same flexibility as clearance_token).
+        if isinstance(capability_token, dict):
+            cap_token_dict = capability_token
+        else:
+            try:
+                cap_token_dict = json.loads(str(capability_token))
+            except (json.JSONDecodeError, ValueError) as exc:
+                return _err(
+                    "CALLER_CAPABILITY_INVALID",
+                    f"send_response blocked: capability_token JSON parse error: {exc}",
+                )
+            if not isinstance(cap_token_dict, dict):
+                return _err(
+                    "CALLER_CAPABILITY_INVALID",
+                    "send_response blocked: capability_token must be a JSON object.",
+                )
+
+        import time as _time
+        cap_result = _cap.verify_capability(
+            cap_token_dict,
+            expected_capability="xenia.send_response",
+            expected_actor_kind="agent",
+            expected_resource_id=ticket_id,
+            expected_workflow_id=ticket_id,
+            now=int(_time.time()),
+        )
+        if not cap_result["valid"]:
+            return _err(
+                "CALLER_CAPABILITY_INVALID",
+                f"send_response blocked: caller-capability token invalid. "
+                f"Reason: {cap_result['reason']}. "
+                "Mint a fresh token via mint_caller_capability() bound to this ticket_id.",
+            )
+
+        # Single-use: consume the VERIFIED jti exactly once.
+        verified_jti = cap_result["jti"]
+        if not verified_jti:
+            return _err(
+                "CALLER_CAPABILITY_INVALID",
+                "send_response blocked: capability_token has no jti (single-use enforcement).",
+            )
+        if not _consume_jti(root, verified_jti):
+            return _err(
+                "CALLER_CAPABILITY_REPLAY",
+                f"send_response blocked: capability_token jti already consumed (replay attack). "
+                "Mint a fresh token for each invocation.",
+            )
+
+        # VERIFIED actor_id replaces self-reported actor for authz.
+        verified_actor_id: str = cap_result["actor_id"]  # type: ignore[assignment]
+        authz_err = _check_actor_authz(verified_actor_id, _SEND_RESPONSE_ALLOWED_ACTORS)
         if authz_err:
             return authz_err
+        # Override actor with verified identity for history record.
+        actor = verified_actor_id
 
         # ---- VHP-2: signed clearance token ----
         # Token is a JSON-encoded dict produced by sign.py's mint() containing
@@ -714,7 +927,7 @@ def _tool_handlers() -> dict[str, Any]:
         #   - Assert token["body"] == this request body (constant-time)
         # Degraded/unsigned tokens REJECTED (no bypass).
         # actor='human' bypass REMOVED (fix #2, #6).
-        # FIXME(auth): actor is still self-reported; unforgeable identity in WS-AUTH.
+        # WS-AUTH (Run C): caller identity now VERIFIED above (replaced FIXME(auth)).
         clearance_result = verify_clearance_token(body, clearance_token)
         if not clearance_result["ok"]:
             return _err(
@@ -822,23 +1035,27 @@ def _tool_handlers() -> dict[str, Any]:
     # xenia-tickets.execute_approved
     #
     # Enforcement order:
-    #   1. Field validation + ticket lookup
-    #   2. VHP-3: actor authz — actor REQUIRED, non-empty, MUST be on allow-list
-    #             (unconditional — fix #1; no optional path)
-    #   3. Article V: approval artifact check (deny-by-default)
+    #   1. Field validation
+    #   2. WS-AUTH: caller-capability token — HMAC-verified identity + single-use
+    #      VERIFIED actor_id REPLACES self-reported actor arg for allow-list check
+    #   3. Ticket lookup
+    #   4. Article V: approval artifact check (deny-by-default)
     # ------------------------------------------------------------------
     def execute_approved(args: dict[str, Any]) -> dict[str, Any]:
         """DENY-BY-DEFAULT. The server NEVER executes without a valid, unexpired,
         matching approval artifact — even if the hook layer was bypassed.
         (Constitution Article V, defense-in-depth Layer 0.)
 
-        actor is REQUIRED and MUST be on the allow-list (fix #1).
+        WS-AUTH (Run C): caller identity is VERIFIED via signed capability token.
+        VERIFIED actor_id must be on the allow-list (replaces self-reported actor).
         """
-        ticket_id   = str(args.get("ticket_id") or "").strip()
-        action      = str(args.get("action") or "").strip()
-        scope       = str(args.get("scope") or "").strip()
-        approval_id = str(args.get("approval_id") or "").strip()
-        actor       = str(args.get("actor") or "").strip()
+        ticket_id        = str(args.get("ticket_id") or "").strip()
+        action           = str(args.get("action") or "").strip()
+        scope            = str(args.get("scope") or "").strip()
+        approval_id      = str(args.get("approval_id") or "").strip()
+        # actor arg retained for compatibility — VERIFIED actor_id governs authz.
+        actor            = str(args.get("actor") or "").strip()
+        capability_token = args.get("capability_token")  # JSON string or dict
 
         if not ticket_id:
             return _err("MISSING_FIELD", "ticket_id is required")
@@ -849,19 +1066,72 @@ def _tool_handlers() -> dict[str, Any]:
         if not approval_id:
             return _err("MISSING_FIELD", "approval_id is required")
 
-        # ---- VHP-3: actor REQUIRED and authorization UNCONDITIONAL (fix #1) ----
-        # actor is never optional for execute_approved — there must always be an
-        # identified, allow-listed caller.  No path may skip this check.
-        # FIXME(auth): actor is self-reported; unforgeable identity tracked in WS-AUTH.
-        if not actor:
+        # ---- WS-AUTH: caller-capability verification (FIRST, fail-closed) ----
+        # No token / no HYDRA_OPERATOR_KEY -> reject; actor identity must be proven.
+        # WS-AUTH (Run C) replaces FIXME(auth): actor is no longer self-reported.
+        if capability_token is None:
             return _err(
-                "MISSING_FIELD",
-                "actor is required for execute_approved; "
-                "all executions must have an identified, allow-listed caller.",
+                "CALLER_CAPABILITY_INVALID",
+                "execute_approved blocked: capability_token is required (WS-AUTH). "
+                "Mint a caller-capability token via mint_caller_capability() and "
+                "pass it as capability_token in the args.",
             )
-        authz_err = _check_actor_authz(actor, _EXECUTE_APPROVED_ALLOWED_ACTORS)
+
+        # Accept dict or JSON string.
+        if isinstance(capability_token, dict):
+            cap_token_dict = capability_token
+        else:
+            try:
+                cap_token_dict = json.loads(str(capability_token))
+            except (json.JSONDecodeError, ValueError) as exc:
+                return _err(
+                    "CALLER_CAPABILITY_INVALID",
+                    f"execute_approved blocked: capability_token JSON parse error: {exc}",
+                )
+            if not isinstance(cap_token_dict, dict):
+                return _err(
+                    "CALLER_CAPABILITY_INVALID",
+                    "execute_approved blocked: capability_token must be a JSON object.",
+                )
+
+        import time as _time
+        cap_result = _cap.verify_capability(
+            cap_token_dict,
+            expected_capability="xenia.execute_approved",
+            expected_actor_kind="agent",
+            expected_resource_id=ticket_id,
+            expected_workflow_id=ticket_id,
+            now=int(_time.time()),
+        )
+        if not cap_result["valid"]:
+            return _err(
+                "CALLER_CAPABILITY_INVALID",
+                f"execute_approved blocked: caller-capability token invalid. "
+                f"Reason: {cap_result['reason']}. "
+                "Mint a fresh token via mint_caller_capability() bound to this ticket_id.",
+            )
+
+        # Single-use: consume the VERIFIED jti exactly once.
+        verified_jti = cap_result["jti"]
+        if not verified_jti:
+            return _err(
+                "CALLER_CAPABILITY_INVALID",
+                "execute_approved blocked: capability_token has no jti (single-use enforcement).",
+            )
+        if not _consume_jti(root, verified_jti):
+            return _err(
+                "CALLER_CAPABILITY_REPLAY",
+                "execute_approved blocked: capability_token jti already consumed (replay attack). "
+                "Mint a fresh token for each invocation.",
+            )
+
+        # VERIFIED actor_id replaces self-reported actor for authz.
+        verified_actor_id: str = cap_result["actor_id"]  # type: ignore[assignment]
+        authz_err = _check_actor_authz(verified_actor_id, _EXECUTE_APPROVED_ALLOWED_ACTORS)
         if authz_err:
             return authz_err
+        # Override actor with verified identity for history record.
+        actor = verified_actor_id
 
         tasks = _tasks_dir(root)
         ticket = _load_ticket(tasks, ticket_id)
@@ -883,11 +1153,19 @@ def _tool_handlers() -> dict[str, Any]:
             )
 
         now = _now_iso()
+        # WS-AUTH audit attribution (Run C fix):
+        #   actor     = verified_actor_id — the CRYPTOGRAPHICALLY VERIFIED executor
+        #               (from the signed caller-capability token, NOT self-reported).
+        #   issued_by = the human/process whose approval artifact authorised the action.
+        # Both are recorded distinctly so the audit trail answers:
+        #   "who was verified to have executed this?" (actor) AND
+        #   "who approved the underlying action?" (issued_by).
         ticket["history"].append({
-            "ts":          now,
-            "actor":       parsed.get("issued_by", "approved-human"),
-            "kind":        "approved-action",
-            "body":        f"action={action} scope={scope} approval_id={approval_id} artifact={reason}",
+            "ts":        now,
+            "actor":     verified_actor_id,               # verified executor (WS-AUTH)
+            "issued_by": parsed.get("issued_by", ""),     # approval artifact issuer
+            "kind":      "approved-action",
+            "body":      f"action={action} scope={scope} approval_id={approval_id} artifact={reason}",
         })
 
         for rec in ticket.get("recommendations", []):

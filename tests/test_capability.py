@@ -56,8 +56,19 @@ TEST_KEY_ID = "test-key-1"
 
 _XENIA_SIGN_PATH = Path(r"C:\AiAppDeployments\Xenia\tools\context_token")
 
-# Golden vector: generated 2026-06-11 from Xenia sign.py with key=deadbeef..., key_id="golden-1".
-# Fixed-epoch payload so the vector never drifts with wall-clock time.
+# Golden vector — SHARED with TheEights TS suite (daemon/test/capability.test.ts).
+#
+# These constants are IDENTICAL to the TS golden in capability.test.ts:
+#   GOLDEN_KEY_HEX, GOLDEN_KEY_ID, GOLDEN_PAYLOAD (incl. jti), GOLDEN_EXPECTED_SIG.
+# Both suites assert the same sig literal, proving Python and TypeScript produce
+# byte-identical canonical JSON and HMAC-SHA256 signatures for the same payload.
+#
+# TS source: C:\AiAppDeployments\TheEights\daemon\test\capability.test.ts
+#   GOLDEN_PAYLOAD.jti    = "fixed-golden-jti-001"
+#   GOLDEN_EXPECTED_SIG   = "vwWp9w23fYQIRQG17mR-Uw6-bXrMxzsinPkGjSJv50I"
+#
+# If this assertion ever fails it means Python and TS canonical formats have
+# diverged — a real interop bug that MUST be fixed before either is deployed.
 _GOLDEN_KEY_HEX = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 _GOLDEN_KEY_ID = "golden-1"
 _GOLDEN_PAYLOAD = {
@@ -69,9 +80,10 @@ _GOLDEN_PAYLOAD = {
     "workflow_id": "wf-golden-001",
     "issued_at": 1749600000,
     "exp": 1749600900,
+    "jti": "fixed-golden-jti-001",   # identical to TS GOLDEN_PAYLOAD.jti
 }
-# Xenia sign.py produced this sig value for the payload above + key=deadbeef...
-_GOLDEN_SIG_VALUE = "KH4q-K5PZX2pu2GYbnK9limV29ednS9BkG_KJwspY1Q"
+# Byte-identical to TS GOLDEN_EXPECTED_SIG — shared interop proof.
+_GOLDEN_SIG_VALUE = "vwWp9w23fYQIRQG17mR-Uw6-bXrMxzsinPkGjSJv50I"
 
 
 def _base_payload(now: int | None = None) -> dict:
@@ -1023,6 +1035,148 @@ def test_golden_vector_tampered_rejected(monkeypatch):
     )
     assert result["valid"] is False
 
+
+# ---------------------------------------------------------------------------
+# 15b. jti — mint auto-generates; verify returns verified jti; golden payload
+# ---------------------------------------------------------------------------
+
+def test_mint_auto_generates_jti(monkeypatch):
+    """mint_capability auto-generates a jti when absent in the payload."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = _base_payload()
+    assert "jti" not in payload
+    token = mint_capability(payload)
+    assert "jti" in token
+    assert isinstance(token["jti"], str)
+    assert len(token["jti"]) > 0
+
+
+def test_mint_preserves_explicit_jti(monkeypatch):
+    """mint_capability preserves an explicit jti supplied by the caller."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = {**_base_payload(), "jti": "my-fixed-nonce-abc123"}
+    token = mint_capability(payload)
+    assert token["jti"] == "my-fixed-nonce-abc123"
+
+
+def test_mint_rejects_empty_jti(monkeypatch):
+    """mint_capability raises TypeError for an explicit empty jti."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = {**_base_payload(), "jti": ""}
+    with pytest.raises(TypeError, match="jti must be a non-empty str"):
+        mint_capability(payload)
+
+
+def test_mint_rejects_non_str_jti(monkeypatch):
+    """mint_capability raises TypeError for a non-str jti."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = {**_base_payload(), "jti": 12345}
+    with pytest.raises(TypeError, match="jti must be a non-empty str"):
+        mint_capability(payload)
+
+
+def test_verify_returns_verified_jti(monkeypatch):
+    """verify_capability returns the jti from the HMAC-verified token."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = {**_base_payload(), "jti": "test-jti-12345"}
+    token = mint_capability(payload)
+    result = verify_capability(token, expected_capability="approval")
+    assert result["valid"] is True
+    assert result["jti"] == "test-jti-12345"
+
+
+def test_verify_auto_jti_returned(monkeypatch):
+    """verify_capability returns the auto-generated jti from the verified token."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    token = mint_capability(_base_payload())
+    assert "jti" in token  # auto-generated
+    result = verify_capability(token, expected_capability="approval")
+    assert result["valid"] is True
+    assert result["jti"] == token["jti"]
+    assert isinstance(result["jti"], str)
+    assert len(result["jti"]) > 0
+
+
+def test_verify_jti_none_on_failure(monkeypatch):
+    """verify_capability returns jti=None on any verification failure."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    token = mint_capability(_base_payload())
+    # Tamper to cause failure
+    tampered = dict(token)
+    tampered["actor_id"] = "evil@attacker.com"
+    result = verify_capability(tampered, expected_capability="approval")
+    assert result["valid"] is False
+    assert result["jti"] is None
+
+
+def test_verify_golden_payload_returns_jti(monkeypatch):
+    """Golden payload (with fixed jti) verifies and returns the fixed jti."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", _GOLDEN_KEY_HEX)
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY_ID", _GOLDEN_KEY_ID)
+    token = dict(_GOLDEN_PAYLOAD)
+    token["sig"] = {
+        "alg": "HMAC-SHA256",
+        "key_id": _GOLDEN_KEY_ID,
+        "value": _GOLDEN_SIG_VALUE,
+    }
+    result = verify_capability(
+        token,
+        expected_capability="hitl_approve",
+        now=_GOLDEN_PAYLOAD["issued_at"] + 1,
+    )
+    assert result["valid"] is True
+    # jti value is identical to TS GOLDEN_PAYLOAD.jti — shared interop proof.
+    assert result["jti"] == "fixed-golden-jti-001"
+
+
+def test_verify_old_token_no_jti_still_valid(monkeypatch):
+    """A token without jti (old format, pre-Run-C) must still verify (jti is optional).
+    verify returns jti=None for tokens that predate jti."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    from hydra_core.auth.capability import _canonical_body, _compute_sig, _load_operator_key
+    ts = int(time.time())
+    body = {
+        "v": 1,
+        "actor_id": "rob@example.com",
+        "actor_kind": "human",
+        "capability": "approval",
+        "resource_id": "wf-test-001",
+        "workflow_id": "wf-test-001",
+        "issued_at": ts,
+        "exp": ts + 900,
+        # No jti field — old token format
+    }
+    key_bytes, key_id = _load_operator_key()
+    canonical = _canonical_body(body)
+    sig_val = _compute_sig(canonical, key_bytes)
+    body["sig"] = {"alg": "HMAC-SHA256", "key_id": key_id, "value": sig_val}
+    result = verify_capability(body, expected_capability="approval")
+    assert result["valid"] is True, f"Old token without jti should still verify: {result['reason']}"
+    assert result["jti"] is None  # absent -> None
+
+
+def test_verify_operator_capability_returns_jti(monkeypatch):
+    """verify_operator_capability also returns the verified jti."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    payload = {
+        "v": 1,
+        "actor_id": "rob@example.com",
+        "actor_kind": "human",
+        "capability": "approval",
+        "resource_id": "wf-op-jti",
+        "workflow_id": "wf-op-jti",
+        "exp": int(time.time()) + 900,
+        "jti": "op-jti-abc",
+    }
+    token = mint_capability(payload)
+    result = verify_operator_capability(
+        token,
+        expected_capability="approval",
+        expected_workflow_id="wf-op-jti",
+        expected_resource_id="wf-op-jti",
+    )
+    assert result["valid"] is True
+    assert result["jti"] == "op-jti-abc"
 
 
 # ---------------------------------------------------------------------------
