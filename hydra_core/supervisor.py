@@ -482,6 +482,24 @@ def build_supervisor(
         high_risk = any(_task_is_high_risk(t) for t in full_tasks)
         state.requires_human_approval = high_risk or state.is_over_budget()
 
+        # squad_gate_high_risk: True when any task's squad has an explicit
+        # hitl_required gate (independent of task priority).  This is the
+        # "frozen contract" discriminator: reason="high_risk" is the canonical
+        # value keyed by the mesh console, and it must be preserved whenever a
+        # squad-level HITL gate would have fired regardless of AC.
+        # P0/P1 priority alone does NOT set this flag — those tasks qualify the
+        # AC gate as "high-risk qualifying" but do not set the frozen-contract
+        # squad-gate reason.
+        def _squad_has_hitl_gate(t: "TaskState") -> bool:
+            sp = packs.get(t.owner_squad)
+            return (
+                sp is not None
+                and sp.entrypoint != "stub"
+                and any(g.hitl_required for g in sp.gates)
+            )
+
+        squad_gate_high_risk = any(_squad_has_hitl_gate(t) for t in full_tasks)
+
         # (b) AC gate: any HIGH-RISK task (qualifying) is MISSING valid criteria.
         needs_ac_hitl = any(
             _task_is_high_risk(t) and not _task_has_valid_criteria(t)
@@ -510,11 +528,26 @@ def build_supervisor(
             # request was only rendered inside node_approval — i.e. AFTER the
             # operator had already resumed — so the approval gate was
             # invisible to both /hydra:status state and the mesh HITL Center.
-            if needs_ac_hitl:
-                # WS9: acceptance-criteria gate (covers high_risk + missing AC
-                # in one HITL — do not emit a second high_risk gate).
+            #
+            # REASON PRECEDENCE (WS9 regression fix):
+            # The canonical `reason` field is a FROZEN CONTRACT keyed by
+            # mesh-console consumers and test_mesh_console_surface.py:80.
+            # Rule: `reason="high_risk"` whenever a squad-level hitl_required
+            # gate is present (squad_gate_high_risk=True) — this is the frozen
+            # contract the mesh console and approval gate consumers key off of.
+            # `reason="acceptance_criteria"` is used ONLY when the gate fires
+            # SOLELY because a major (P0/P1) task on a squad WITHOUT a
+            # hitl_required gate is missing criteria — i.e. squad_gate_high_risk
+            # is False (no squad gate independently demands the pause).
+            # Missing-criteria information is always surfaced in the summary
+            # regardless of which reason wins, so the operator is never blind
+            # to missing AC even when `reason="high_risk"`.
+            if needs_ac_hitl and not squad_gate_high_risk:
+                # Pure AC gate: a major (P0/P1) task on a squad without a
+                # hitl_required gate is missing acceptance criteria.
+                # No frozen-contract reason to preserve — use the WS9 reason.
                 hitl_summary = (
-                    f"Major/high-risk task dispatching to {state.selected_squads} "
+                    f"Major task dispatching to {state.selected_squads} "
                     f"for goal: {state.root_goal!r} — no structured acceptance criteria "
                     f"provided. Please confirm or supply acceptance criteria before "
                     f"dispatch proceeds."
@@ -529,14 +562,30 @@ def build_supervisor(
                     default_option="reject",
                 )
             else:
-                # Standard high-risk gate (criteria are present or task is not
-                # flagged as needing AC).
+                # Squad-level hitl_required gate is present (squad_gate_high_risk).
+                # reason="high_risk" is the canonical frozen-contract value.
+                # When the AC gate also contributed (needs_ac_hitl=True), append
+                # missing-criteria info to the summary so the operator is still
+                # informed even though the reason label stays "high_risk".
+                base_summary = (
+                    f"Approve dispatch of: {state.selected_squads} "
+                    f"for goal: {state.root_goal}"
+                )
+                if needs_ac_hitl:
+                    # Identify which tasks are qualifying and missing criteria.
+                    missing_squads = [
+                        t.owner_squad for t in full_tasks
+                        if _task_is_high_risk(t) and not _task_has_valid_criteria(t)
+                    ]
+                    base_summary += (
+                        f"; acceptance criteria missing for: {missing_squads}"
+                    )
                 hitl = HITLRequest(
                     workflow_id=state.workflow_id,
                     origin_squad="hydra",
                     target_squad="human",
                     reason="high_risk",
-                    summary=f"Approve dispatch of: {state.selected_squads} for goal: {state.root_goal}",
+                    summary=base_summary,
                     options=["approve", "reject", "modify-budget"],
                     default_option="reject",
                 )

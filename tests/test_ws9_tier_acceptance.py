@@ -495,7 +495,12 @@ class TestAcceptanceCriteriaGate:
     # -- Fix 4: gate fires on ANY qualifying-missing --
 
     def test_any_qualifying_missing_fires_gate(self):
-        """Fix 4: two qualifying tasks where ONE lacks criteria -> gate FIRES."""
+        """Fix 4: two qualifying tasks where ONE lacks criteria -> gate FIRES.
+
+        WS9 regression fix: both squads are high_risk (hitl_required=True), so
+        reason='high_risk' wins the frozen contract.  The summary must mention
+        missing criteria.
+        """
         from hydra_core.state import HydraState, TaskState
         from hydra_core.squad_loader import SquadPack, GateSpec
 
@@ -528,9 +533,15 @@ class TestAcceptanceCriteriaGate:
         ]
         out = _run_planner(planner, state)
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
-            f"ANY qualifying task missing criteria must fire gate; "
+        # Both squads are high_risk (hitl_required=True) — high_risk wins the reason.
+        assert hitl.get("reason") == "high_risk", (
+            f"High-risk gate must use reason='high_risk' (frozen contract); "
             f"got reason={hitl.get('reason')!r}"
+        )
+        # Missing-criteria info must still surface in the summary.
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     # -- Fix 5: major (P0/P1) tasks qualify regardless of squad risk level --
@@ -603,7 +614,11 @@ class TestAcceptanceCriteriaGate:
     # -- Standard coverage --
 
     def test_high_risk_no_criteria_triggers_ac_hitl(self):
-        """High-risk squad + fresh tasks (no pre-seeded criteria) -> AC gate fires."""
+        """High-risk squad + fresh tasks (no pre-seeded criteria) -> HITL fires.
+
+        WS9 regression fix: when the gate is high_risk, the frozen-contract
+        reason='high_risk' wins.  Missing-criteria info surfaces in the summary.
+        """
         from hydra_core.state import HydraState
         planner = _build_planner(_hi_risk_packs())
 
@@ -617,8 +632,15 @@ class TestAcceptanceCriteriaGate:
 
         assert out["requires_human_approval"] is True
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
-            f"Expected reason='acceptance_criteria', got {hitl.get('reason')!r}"
+        # high_risk wins the canonical reason (frozen contract).
+        assert hitl.get("reason") == "high_risk", (
+            f"High-risk gate must use reason='high_risk' (frozen contract); "
+            f"got {hitl.get('reason')!r}"
+        )
+        # Missing-criteria info must still surface in the summary.
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     def test_criteria_carried_on_task_state(self):
@@ -887,7 +909,12 @@ class TestFixBExecutiveBranchPreservation:
 
     def test_exec_branch_p0_task_missing_criteria_fires_ac_gate(self):
         """Fix B: executive squad selected + pre-seeded P0 engineering task
-        with no criteria -> AC gate FIRES (task is not discarded)."""
+        with no criteria -> HITL gate FIRES (task is not discarded).
+
+        WS9 regression fix: _exec_packs() has hitl_required=True for both
+        executive and engineering, so reason='high_risk' wins the frozen
+        contract.  The summary must mention missing criteria.
+        """
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_exec_packs())
 
@@ -903,10 +930,17 @@ class TestFixBExecutiveBranchPreservation:
         ]
         out = _run_planner(planner, state)
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
+        # Both squads are high_risk — high_risk wins the canonical reason.
+        assert hitl.get("reason") == "high_risk", (
             f"Executive branch must not discard pre-seeded P0 engineering task; "
-            f"AC gate must fire. Got reason={hitl.get('reason')!r}, "
+            f"gate must fire with reason='high_risk'. "
+            f"Got reason={hitl.get('reason')!r}, "
             f"tasks_in_out={[t.owner_squad for t in (out.get('tasks') or [])]!r}"
+        )
+        # Missing-criteria info must surface in summary.
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     def test_exec_branch_preserves_non_exec_task_criteria(self):
@@ -1040,11 +1074,17 @@ class TestFix1MultiTaskPerSquad:
             f"Both pre-seeded engineering tasks must survive; got {len(eng_tasks)}"
         )
 
-        # AC gate must fire because the P0 task is qualifying and missing criteria.
+        # Gate must fire because the P0 task is qualifying and missing criteria.
+        # WS9 regression fix: _hi_risk_packs() has hitl_required=True, so
+        # reason='high_risk' wins the frozen contract.  Summary mentions missing AC.
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
-            f"P0 missing-criteria task must trigger AC gate even when another "
-            f"same-squad task has criteria; got reason={hitl.get('reason')!r}"
+        assert hitl.get("reason") == "high_risk", (
+            f"P0 missing-criteria task on a high-risk squad must use reason='high_risk' "
+            f"(frozen contract); got reason={hitl.get('reason')!r}"
+        )
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     def test_two_same_squad_tasks_both_have_criteria_no_gate(self):
@@ -1262,11 +1302,17 @@ class TestFix1ExecutiveNoCollapse:
         assert str(exec_p0.task_id) in surviving_ids, "P0 executive task must survive"
         assert str(exec_p1.task_id) in surviving_ids, "P1 executive task must survive"
 
-        # AC gate fires because P0 exec task is qualifying and has no criteria.
+        # Gate fires because P0 exec task is qualifying and has no criteria.
+        # WS9 regression fix: _exec_packs() has hitl_required=True for executive,
+        # so reason='high_risk' wins the frozen contract.  Summary mentions missing AC.
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
-            f"AC gate must fire for P0 exec task with no criteria; "
+        assert hitl.get("reason") == "high_risk", (
+            f"High-risk gate must use reason='high_risk' (frozen contract); "
             f"got reason={hitl.get('reason')!r}"
+        )
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     def test_two_exec_tasks_both_criteria_no_ac_gate(self):
@@ -1719,7 +1765,12 @@ class TestRound7AcGateOutsideSelectedSquads:
 
     def test_hi_risk_outside_selected_missing_criteria_fires(self):
         """Pre-seeded task: owner_squad='security' (high-risk, NOT in selected_squads).
-        No acceptance_criteria.  AC gate must FIRE."""
+        No acceptance_criteria.  HITL gate must FIRE.
+
+        WS9 regression fix: both 'security' and synthesised 'engineering' tasks have
+        hitl_required=True (squad_gate_high_risk=True), so reason='high_risk' wins the
+        frozen contract.  The summary must mention missing acceptance criteria.
+        """
         from hydra_core.state import HydraState, TaskState
 
         # packs includes both 'engineering' (selected) and 'security' (not selected).
@@ -1747,10 +1798,16 @@ class TestRound7AcGateOutsideSelectedSquads:
         out = _run_planner(planner, state)
 
         hitl = out.get("pending_hitl") or {}
-        assert hitl.get("reason") == "acceptance_criteria", (
-            f"AC gate must fire: 'security' squad has hitl_required gate but task "
-            f"has no criteria (even though 'security' not in selected_squads); "
-            f"got reason={hitl.get('reason')!r}"
+        # Both squads have hitl_required=True → squad_gate_high_risk=True →
+        # reason='high_risk' wins the frozen contract.
+        assert hitl.get("reason") == "high_risk", (
+            f"High-risk gate must use reason='high_risk' (frozen contract); "
+            f"'security' squad has hitl_required gate and synthesised 'engineering' "
+            f"task also has hitl_required. got reason={hitl.get('reason')!r}"
+        )
+        assert "acceptance criteria" in (hitl.get("summary") or "").lower(), (
+            f"Summary must mention missing acceptance criteria; "
+            f"got summary={hitl.get('summary')!r}"
         )
 
     def test_hi_risk_outside_selected_with_criteria_no_gate(self):
