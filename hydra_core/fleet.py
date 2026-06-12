@@ -1,4 +1,4 @@
-"""hydra_core.fleet — Parallel cross-repo dispatch primitive (WS8 SLICE 1).
+"""hydra_core.fleet — Parallel cross-repo dispatch primitive (WS8 SLICE 1 + 2).
 
 Exposes ``dispatch_fleet``: a bounded-concurrency fan-out that calls
 ``execute_squad`` in parallel across a set of tasks whose target repos are
@@ -14,8 +14,11 @@ DISTINCT.  The key invariants this module enforces are:
 3. **Failure isolation** — one worker's exception does NOT crash the fleet or
    cancel other workers.  A failing task gets a ``SquadResult(status="failed")``.
 4. **Deterministic ordering** — results are returned in the same order as the
-   input ``tasks``, regardless of completion order (futures are indexed, NOT
-   consumed via ``as_completed``).
+   input ``tasks``, regardless of completion order.  The collection loop
+   uses ``concurrent.futures.as_completed`` so cancellation fires on the
+   FIRST surfaced/trigger result regardless of submit order; results are
+   stored by their INPUT INDEX (``futures[future] = idx`` map) so the
+   final list is always in submission order.
 5. **Bounded concurrency** — ``max_workers`` is clamped to ``[1, FLEET_MAX_CAP]``.
 6. **Per-worker dispatcher** — each worker receives a *fresh* ``Dispatcher``
    instance from ``dispatcher_factory()``.  ``MCPStdioDispatcher`` owns a single
@@ -39,16 +42,41 @@ DISTINCT.  The key invariants this module enforces are:
        does not prevent ``.harness/.lock`` collisions.
    Non-eligible tasks submitted to the fleet are rejected with a clear rationale
    and placed back on the sequential path by the caller (node_dispatch).
+8. **Cancellation propagation (WS8 SLICE 2)** — ``dispatch_fleet`` accepts two
+   optional arguments that control early cancellation:
+
+   - ``cancel_event: threading.Event | None`` — an externally-visible flag that
+     any party (caller or the collection loop) can set to signal "stop starting
+     new work".  Workers check this flag AT ENTRY (before calling ``execute_squad``
+     / the expensive pp dispatch): if set, the worker returns a
+     ``SquadResult(status="cancelled")`` immediately without dispatching.
+     Workers that are already past the entry-check complete naturally — threads
+     cannot be force-killed; this is expected and documented.  The OUTPUT
+     STRUCTURE is always deterministic: every index ``[0..n-1]`` holds a result
+     (cancelled-or-not); the shape given the same completion-trigger is stable.
+
+   - ``should_cancel: Callable[[SquadResult], bool] | None`` — called from the
+     **main thread** collection loop for each result that comes back.  If it
+     returns ``True``, ``cancel_event`` is set and ``future.cancel()`` is called
+     on every future that has not yet started.  A cancelled future's slot is
+     filled with a ``SquadResult(status="cancelled")``.  The default ``None``
+     means "never auto-cancel" — all tasks run (previous behaviour; no
+     regression).
+
+   Thread-safety contract: ``cancel_event`` is read-only from worker threads
+   (``.is_set()`` only).  It is set exclusively from the single-threaded
+   collection loop (or by the caller before ``dispatch_fleet`` is invoked).
+   Workers NEVER set it.  This satisfies the slice-1 "no shared-state mutation
+   inside workers" invariant.
 
 Deferred to later slices (NOT in scope here):
   - Per-task budget isolation / partial-rollback
-  - Cancellation propagation (cancel remaining tasks when one fails)
-  - Multi-repo synthesis (collecting cross-repo artifacts into a unified result)
   - Campaign wiring (chaining fleet dispatches across phases)
 """
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 from .squad_loader import SquadPack
@@ -75,6 +103,8 @@ def dispatch_fleet(
     build_payload: Callable[[TaskState], Any],
     packs: dict[str, SquadPack],
     max_concurrency: int | None = None,
+    cancel_event: threading.Event | None = None,
+    should_cancel: Callable[[SquadResult], bool] | None = None,
 ) -> tuple[list[SquadResult], list[Any]]:
     """Fan out *mcp-only* ``tasks`` in parallel, each in its own thread.
 
@@ -106,23 +136,52 @@ def dispatch_fleet(
         ``state.fleet_max_concurrency`` (field added in SLICE 1) which itself
         defaults to ``FLEET_DEFAULT_CONCURRENCY``.  Clamped to
         ``[1, FLEET_MAX_CAP]``.
+    cancel_event:
+        Optional ``threading.Event`` used to propagate cancellation.  If not
+        provided, a fresh event is created internally (caller can pass one to
+        observe or trigger cancellation externally).  Workers check
+        ``cancel_event.is_set()`` AT ENTRY before calling ``execute_squad``.
+        If set, the worker returns immediately with
+        ``SquadResult(status="cancelled")`` without dispatching.
+        In-flight workers that are already past the entry-check complete
+        naturally (threads cannot be force-killed; this is intentional and
+        documented).
+    should_cancel:
+        Optional callable ``(result: SquadResult) -> bool`` evaluated in the
+        **main-thread** collection loop for each future that completes.  If it
+        returns ``True``, ``cancel_event`` is set and ``future.cancel()`` is
+        called on every not-yet-started future.  Futures that return ``True``
+        from ``.cancel()`` have their slot filled with a cancelled result.
+        Default ``None`` means never auto-cancel (all tasks run; no regression
+        from SLICE 1).
 
     Returns
     -------
     tuple[list[SquadResult], list[Any]]
         - ``results``: one entry per input task, in input order.  Rejected /
-          failed tasks have ``SquadResult(status="failed")``.
+          failed tasks have ``SquadResult(status="failed")``.  Cancelled tasks
+          have ``SquadResult(status="cancelled")``.
         - ``worker_trackers``: pre-sized list of length ``n``.  Slot ``i``
           holds the ``ToolUsageTracker`` (or ``None``) that was used by the
-          worker that ran ``tasks[i]``.  Slots for tasks that were rejected
-          before fan-out (same-repo guard, non-mcp pack, payload-build error)
-          are ``None``.  Caller iterates in index order ``0..n-1`` for a
-          deterministic, input-ordered merge into the original tracker.
-          Writing to a distinct pre-allocated index (not ``append``) is
-          race-free even when workers run concurrently.
+          worker that ran ``tasks[i]``.  The tracker is extracted from the
+          worker's return value by the MAIN-THREAD collection loop — workers
+          do NOT write to this list directly (fix 6 / "no worker mutates
+          shared state" invariant is now literally true).  Slots for tasks
+          rejected before fan-out (same-repo guard, non-mcp pack, payload-build
+          error, cancelled) are ``None``.  Caller iterates in index order
+          ``0..n-1`` for a deterministic, input-ordered merge.
     """
     if not tasks:
         return [], []
+
+    # ------------------------------------------------------------------ #
+    # Cancellation setup (WS8 SLICE 2).
+    # The cancel_event is shared read-only to workers (.is_set() only).
+    # It is set exclusively from the main-thread collection loop or by the
+    # caller before dispatch_fleet is invoked.  Workers NEVER set it.
+    # ------------------------------------------------------------------ #
+    if cancel_event is None:
+        cancel_event = threading.Event()
 
     # ------------------------------------------------------------------ #
     # Resolve concurrency cap
@@ -233,7 +292,8 @@ def dispatch_fleet(
     # Each worker also gets its own collector list (Fix: no shared-state write).
     # ------------------------------------------------------------------ #
     collectors: dict[int, list[dict[str, str]]] = {idx: [] for idx in runnable_indices}
-    futures: dict[Future[SquadResult], int] = {}
+    # futures maps Future -> input index.  Used to look up idx after as_completed.
+    futures: dict[Future[tuple[SquadResult, Any]], int] = {}
 
     with ThreadPoolExecutor(max_workers=min(_max_conc, len(runnable_indices))) as pool:
         for idx in runnable_indices:
@@ -242,6 +302,10 @@ def dispatch_fleet(
             payload = stored_payloads[idx]   # pre-built; NOT re-calling build_payload
             collector = collectors[idx]
 
+            # Fix 6: workers RETURN (SquadResult, tracker) tuple; the main-
+            # thread collection loop assigns worker_trackers[idx] from the
+            # return value.  Workers no longer write to worker_trackers at all
+            # — "no worker mutates shared state" invariant is now literally true.
             future = pool.submit(
                 _fleet_worker,
                 idx,
@@ -249,24 +313,79 @@ def dispatch_fleet(
                 payload,
                 dispatcher_factory,   # factory; worker calls it to get its own dispatcher
                 collector,
-                worker_trackers,      # pre-sized; worker writes to slot[idx] — race-free
+                cancel_event,         # read-only from workers (.is_set() only)
             )
             futures[future] = idx
 
-        # Collect results — wait for ALL futures; resolve by index for
-        # deterministic ordering regardless of completion order.
-        for future, idx in futures.items():
+        # ------------------------------------------------------------------ #
+        # Collect results — completion-driven via as_completed (Fix 1).
+        #
+        # Using as_completed() means the loop reacts to whichever future
+        # finishes FIRST, regardless of submission order.  A fast surfaced
+        # result at index N triggers cancellation before slow index 0 would
+        # even be looked at under a sequential dict-order iteration.
+        #
+        # Result slots are written by INPUT INDEX (futures[future] = idx),
+        # so the final results list is always in submission (input) order.
+        #
+        # Cancellation (WS8 SLICE 2): after each completion, if
+        # should_cancel(result) is True: set cancel_event + future.cancel()
+        # on every future whose slot is still empty.  Futures that accept
+        # .cancel() (not yet started) get an immediate cancelled result so
+        # the outer loop never calls .result() on them (CancelledError guard).
+        # In-flight workers past their entry-check complete naturally.
+        # ------------------------------------------------------------------ #
+        for future in as_completed(futures):
+            idx = futures[future]
+            # Skip if already filled by a prior cancel() sweep.
+            if results[idx] is not None:
+                continue
             try:
-                results[idx] = future.result()
+                squad_result, tracker = future.result()
             except Exception as exc:
-                # This should never fire because _fleet_worker swallows all
-                # exceptions, but guard defensively anyway.
-                results[idx] = SquadResult(
-                    envelopes=[],
-                    artifacts=[],
-                    status="failed",
-                    rationale=f"fleet worker error (outer catch): {type(exc).__name__}: {exc}",
-                )
+                # CancelledError: a successful .cancel() made this future
+                # unreachable via .result().  Any other exception is a bug
+                # in _fleet_worker (which normally swallows all exceptions).
+                if "cancel" in type(exc).__name__.lower():
+                    squad_result = SquadResult(
+                        envelopes=[],
+                        artifacts=[],
+                        status="cancelled",
+                        rationale="fleet: future was cancelled (CancelledError on result())",
+                    )
+                else:
+                    squad_result = SquadResult(
+                        envelopes=[],
+                        artifacts=[],
+                        status="failed",
+                        rationale=f"fleet worker error (outer catch): {type(exc).__name__}: {exc}",
+                    )
+                tracker = None
+            results[idx] = squad_result
+            # Fix 6: main thread assigns tracker from return value — no worker
+            # writes to worker_trackers.
+            worker_trackers[idx] = tracker
+
+            # Auto-cancel: if should_cancel triggers, set cancel_event and
+            # call .cancel() on every not-yet-started future.  Only the
+            # main thread ever sets cancel_event here (workers only .is_set()).
+            if should_cancel is not None and should_cancel(squad_result):
+                cancel_event.set()
+                for other_future, other_idx in futures.items():
+                    if other_future is not future and results[other_idx] is None:
+                        if other_future.cancel():
+                            # Future had not started yet — fill its slot now
+                            # to prevent the outer as_completed loop from
+                            # calling .result() (which would raise CancelledError).
+                            results[other_idx] = SquadResult(
+                                envelopes=[],
+                                artifacts=[],
+                                status="cancelled",
+                                rationale=(
+                                    "fleet cancelled: should_cancel triggered by "
+                                    "a completed result; this task had not yet started"
+                                ),
+                            )
 
     # ------------------------------------------------------------------ #
     # Post-join: merge collector entries into state.open_pp_runs (MAIN THREAD).
@@ -286,24 +405,34 @@ def _fleet_worker(
     payload: Any,
     dispatcher_factory: Callable[[], Dispatcher],
     collector: list[dict[str, str]],
-    worker_trackers: list[Any],
-) -> SquadResult:
+    cancel_event: threading.Event,
+) -> tuple[SquadResult, Any]:
     """Single worker function run in a thread pool.
+
+    Returns ``(SquadResult, tracker)`` so the main-thread collection loop can
+    assign ``worker_trackers[idx] = tracker`` without any worker ever writing
+    to the shared list — the "no worker mutates shared state" invariant is now
+    literally true (Fix 6).
 
     Thread-safety contract
     ----------------------
+    - ``cancel_event`` is checked AT ENTRY (before calling
+      ``dispatcher_factory()`` / ``execute_squad``) via ``.is_set()``.  Workers
+      NEVER set the event — only the main-thread collection loop sets it.  This
+      keeps cancel_event as "read-only from workers": one set from the main
+      thread; N ``.is_set()`` reads from worker threads.  No lock is needed
+      because ``threading.Event.is_set()`` is thread-safe.
     - ``dispatcher_factory()`` is called here, inside the worker thread, so the
       returned dispatcher (and its asyncio event loop) is thread-local.  No
       asyncio state is shared across workers.
     - The factory MUST NOT mutate any shared list (no append to a shared
       collection).  It constructs, configures, and returns a fresh dispatcher.
-    - After the factory returns, this worker writes its tracker to
-      ``worker_trackers[idx]``.  Because each worker owns a DISTINCT index and
-      the list is pre-sized, this assignment is race-free without any lock.
+    - Workers do NOT write to ``worker_trackers``; the tracker is RETURNED in
+      the tuple and assigned by the main thread (Fix 6).
     - ``state`` is NOT passed to this function.  All work is done on the
       dispatcher and the pre-built ``payload``.  The only output written back
       is through ``collector`` (a per-worker list owned by the main thread) and
-      the returned ``SquadResult``.
+      the returned tuple.
     - Any exception is caught and returned as a ``failed`` ``SquadResult`` so one
       task's failure cannot propagate to the ThreadPoolExecutor and cancel the
       remaining futures.
@@ -317,21 +446,41 @@ def _fleet_worker(
     (only _via_impersonation / _via_claude_skill call _record_mcp_failure, and
     those are excluded by the mcp-only eligibility guard).
     """
+    # Entry-check: if cancel_event is already set, return immediately without
+    # dispatching.  This is the primary mechanism for preventing not-yet-started
+    # workers from incurring expensive pp/MCP calls after a cancellation trigger.
+    # Workers that are already PAST this check (i.e., inside dispatcher_factory()
+    # or execute_squad()) complete naturally — threads cannot be force-killed.
+    if cancel_event.is_set():
+        return (
+            SquadResult(
+                envelopes=[],
+                artifacts=[],
+                status="cancelled",
+                rationale="fleet cancelled before dispatch (cancel_event was set at worker entry)",
+            ),
+            None,  # no tracker; worker never constructed a dispatcher
+        )
     try:
         # Per-worker fresh dispatcher (Fix 2).  The factory is a pure function:
         # it constructs, configures, and returns — it does NOT append to any
         # shared collection.
         worker_dispatcher = dispatcher_factory()
-        # Record this worker's tracker at its reserved slot.  Pre-sized list +
-        # distinct index = race-free (no lock needed; no shared append).
-        worker_trackers[idx] = getattr(worker_dispatcher, "_tool_tracker", None)
-        return _execute_in_worker(worker_dispatcher, pack, payload, collector)
+        # Extract tracker BEFORE calling execute_squad; return it alongside
+        # the result so the main thread (not this worker) writes it to the
+        # pre-sized worker_trackers list (Fix 6).
+        tracker = getattr(worker_dispatcher, "_tool_tracker", None)
+        squad_result = _execute_in_worker(worker_dispatcher, pack, payload, collector)
+        return squad_result, tracker
     except Exception as exc:
-        return SquadResult(
-            envelopes=[],
-            artifacts=[],
-            status="failed",
-            rationale=f"fleet worker error: {type(exc).__name__}: {exc}",
+        return (
+            SquadResult(
+                envelopes=[],
+                artifacts=[],
+                status="failed",
+                rationale=f"fleet worker error: {type(exc).__name__}: {exc}",
+            ),
+            None,
         )
 
 

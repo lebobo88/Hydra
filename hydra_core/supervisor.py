@@ -45,7 +45,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack, discover_squads
 from .fleet import dispatch_fleet
-from .squad_node import Dispatcher, execute_squad
+from .squad_node import Dispatcher, SquadResult, execute_squad
 from .state import HydraState, TaskState
 
 
@@ -1085,6 +1085,19 @@ def build_supervisor(
             def _stored_payload_builder(task: TaskState) -> Any:
                 return _fleet_candidate_payloads[id(task)]
 
+            # WS8 SLICE 2: cancel-on-surfaced policy.
+            # A "surfaced" result means the task requires HITL or has aborted;
+            # continuing to spend on remaining tasks is wasteful.  Set the
+            # cancel_event so not-yet-started workers skip dispatch immediately.
+            # In-flight workers that already passed their entry-check complete
+            # naturally (threads cannot be force-killed; this is documented).
+            # Note: over-budget cancellation is handled by the post-join pass-2
+            # budget gate (which fires after ALL results are available).  The
+            # cancel-on-surfaced policy is a proactive guard that fires as soon
+            # as any result comes back surfaced — before all workers are done.
+            def _cancel_on_surfaced(result: SquadResult) -> bool:
+                return result.status == "surfaced"
+
             _fleet_results, _fleet_worker_trackers = dispatch_fleet(
                 state,
                 _fleet_candidate_tasks,
@@ -1092,7 +1105,11 @@ def build_supervisor(
                 build_payload=_stored_payload_builder,
                 packs=packs,
                 max_concurrency=getattr(state, "fleet_max_concurrency", None),
+                should_cancel=_cancel_on_surfaced,
             )
+            # WS8 SLICE 2 Fix 4: mark that the fleet path actually ran so
+            # node_synthesis can gate on this flag (not just distinct repo count).
+            state.fleet_dispatched = True
             # Merge per-worker tool tracker calls into the original tracker.
             # Iterate in INPUT INDEX ORDER (0..n-1) so the merge is deterministic
             # regardless of thread completion order.  Writing to a distinct
@@ -1137,37 +1154,61 @@ def build_supervisor(
                     if _block:
                         _fleet_any_block = True
                         _fleet_last_blocking_squad = pack.slug
-                # Now handle the failed/no-pack path AFTER charging.
+                # ── Unconditional artifact + envelope collection (BEFORE any continue) ──
+                # Artifacts are collected from EVERY result — done, failed, AND
+                # cancelled — so no task's artifacts are dropped from state before
+                # synthesis can list them.  A failed task may have produced artifacts
+                # worth surfacing; a cancelled worker produces none but extend([]) is
+                # harmless.  Envelopes are collected here too (when pack is known) so
+                # the task_id tag and eights record are always written regardless of
+                # the status branch below.
+                artifacts.extend(result.artifacts)
+                if pack is not None:
+                    for produced in result.envelopes:
+                        d = produced.model_dump(mode="json")
+                        try:
+                            d = _validate_and_redact_envelope(
+                                d, direction="inbound_from_squad",
+                                squad_id=pack.slug,
+                            )
+                        except (ValueError, Exception):
+                            fleet_task.status = "failed"
+                            state.error_counters[fleet_task.owner_squad] = (
+                                state.error_counters.get(fleet_task.owner_squad, 0) + 1
+                            )
+                            continue
+                        if result.host_pickup_pending:
+                            d["_host_pickup_pending"] = True
+                        d["_task_id"] = str(fleet_task.task_id)
+                        new_decisions.append(d)
+                        eights.envelope_record(d)
+
+                # ── Status-based handling (continues are safe now that artifacts/
+                #    envelopes are already collected above) ──
+                # Invariant: a "failed" set by envelope validation above must
+                # never be overwritten by ANY branch here — cancelled, failed,
+                # or done/surfaced.  Apply the guard at EVERY assignment so the
+                # rule is uniform and impossible to accidentally violate in a
+                # future edit.
+                if result.status == "cancelled":
+                    # Cancelled tasks (WS8 SLICE 2): the worker never dispatched,
+                    # so there are no envelopes or artifacts to collect.  Do NOT
+                    # increment error_counters — cancellation is not an error.
+                    if fleet_task.status != "failed":
+                        fleet_task.status = "cancelled"
+                    continue
                 if pack is None or result.status == "failed":
-                    fleet_task.status = "failed"
+                    if fleet_task.status != "failed":
+                        fleet_task.status = "failed"
                     if pack is not None:
                         state.error_counters[fleet_task.owner_squad] = (
                             state.error_counters.get(fleet_task.owner_squad, 0) + 1
                         )
                     continue
-                # Regardless of _block, record the task status and collect
-                # envelopes/artifacts so the ledger and downstream state are
-                # complete before the budget decision (pass 2).
-                fleet_task.status = result.status
-                for produced in result.envelopes:
-                    d = produced.model_dump(mode="json")
-                    try:
-                        d = _validate_and_redact_envelope(
-                            d, direction="inbound_from_squad",
-                            squad_id=pack.slug,
-                        )
-                    except (ValueError, Exception):
-                        fleet_task.status = "failed"
-                        state.error_counters[fleet_task.owner_squad] = (
-                            state.error_counters.get(fleet_task.owner_squad, 0) + 1
-                        )
-                        continue
-                    if result.host_pickup_pending:
-                        d["_host_pickup_pending"] = True
-                    d["_task_id"] = str(fleet_task.task_id)
-                    new_decisions.append(d)
-                    eights.envelope_record(d)
-                artifacts.extend(result.artifacts)
+                # Record the task status for done/surfaced/running results.
+                # Do NOT clobber a "failed" status set by envelope validation.
+                if fleet_task.status != "failed":
+                    fleet_task.status = result.status
 
             # PASS 2 -- budget block decision, now that ALL spend is charged.
             # The ledger reflects the full fleet spend; the HITL summary is accurate.
@@ -1723,13 +1764,25 @@ def build_supervisor(
 
         This enriched implementation does deterministically (no LLM call)
         what the subagent contract specifies:
-          - Group envelopes by squad.
+          - Group envelopes by squad (non-fleet) OR by repo (fleet).
           - Preserve dissenting opinions verbatim (verdicts with
             outcome='revise' OR explicit dissenting_opinions field).
           - List every artifact id (no drops).
           - Call out budget burn + remaining headroom.
           - Note any HITL gates that fired.
           - Set sealed=False when mutually-exclusive verdicts exist.
+
+        WS8 SLICE 2 — multi-repo fleet synthesis:
+          - When the dispatched tasks span >=2 distinct target_repo_id values
+            the rationale SECTIONS BY REPO (sorted deterministically by repo_id),
+            not just by squad.  Grouping by squad collapses all engineering repos
+            into one section, losing per-repo distinction.
+          - Each repo section: status (done/failed/surfaced/cancelled), key
+            outcome, per-repo dissents (tagged with repo_id, verbatim).
+          - Cancelled repos are explicitly noted.
+          - sealed=False if any repo failed/surfaced/has mutually-exclusive verdict.
+          - Non-fleet runs (single repo / fleet_parallel=False) use the existing
+            squad-grouped synthesis unchanged (no regression).
 
         Cathedral voice for user-facing output; plaza slugs remain in the
         envelope's structured fields. Per the manifesto: "no head speaks
@@ -1756,23 +1809,90 @@ def build_supervisor(
             except (ValueError, Exception):
                 squad_to_envs.setdefault(origin, []).append(env)
 
-        # Preserve dissenting opinions verbatim (R3-tail contract: NEVER paraphrase).
+        # ------------------------------------------------------------------ #
+        # WS8 SLICE 2: detect whether this was a fleet run.
+        # Fix 4: gate on state.fleet_dispatched (set True only when
+        # dispatch_fleet was actually invoked), NOT merely on distinct repo
+        # count.  A sequential multi-repo run has distinct repos but
+        # fleet_dispatched=False -> uses existing per-squad synthesis.
+        # ------------------------------------------------------------------ #
+        distinct_task_repos: set[str] = {
+            t.target_repo_id for t in state.tasks
+            if t.target_repo_id is not None
+        }
+        _is_fleet_run = getattr(state, "fleet_dispatched", False) and len(distinct_task_repos) >= 2
+
+        # Build a task_id -> target_repo_id lookup (for correlating envelopes
+        # tagged with _task_id back to their repo when in fleet mode).
+        _task_id_to_repo: dict[str, str] = {
+            str(t.task_id): t.target_repo_id
+            for t in state.tasks
+            if t.target_repo_id is not None
+        }
+        # Build a task_id -> task status lookup for per-repo status.
+        _task_id_to_status: dict[str, str] = {
+            str(t.task_id): t.status for t in state.tasks
+        }
+        # Build repo -> task_ids mapping.
+        _repo_to_task_ids: dict[str, list[str]] = {}
+        for t in state.tasks:
+            if t.target_repo_id is not None:
+                _repo_to_task_ids.setdefault(t.target_repo_id, []).append(str(t.task_id))
+
+        # ------------------------------------------------------------------ #
+        # Preserve dissenting opinions verbatim (R3-tail contract: NEVER
+        # paraphrase, NEVER truncate).
+        # Fix 3: the complete original string is preserved — no [:480] slice,
+        #   no .strip() on the content.
+        # Fix 5: repo-tag fail-closed — if the envelope can't be correlated to
+        #   a repo (no _task_id or task not in map), tag it [repo:unknown] so
+        #   every fleet dissent carries an explicit, non-empty repo attribution.
+        # Tag format: "[repo:<id>]\n" prepended as a prefix line so the
+        #   verbatim critique text is unmodified.
         # Sources:
-        #   1. Any verdict with outcome='revise' or 'fail' — the dissent is the critique.
-        #   2. CSuiteDecisionPacket.dissenting_opinions field (explicit dissent).
+        #   1. Any verdict with outcome='revise' or 'fail' — dissent = critique.
+        #   2. envelope.dissenting_opinions field (explicit dissent strings).
+        # ------------------------------------------------------------------ #
         dissents: list[str] = []
         for v in state.verdicts:
             if v.get("outcome") in ("revise", "fail"):
-                critique = (v.get("critique_md") or "").strip()
+                critique = v.get("critique_md") or ""
                 if critique:
-                    dissents.append(
-                        f"[{v.get('judge_vendor', '?')}@{v.get('rubric_id', '?')}] "
-                        f"{critique[:480]}"
-                    )
+                    if _is_fleet_run:
+                        target_id = str(v.get("target_envelope_id") or "")
+                        target_env = next(
+                            (e for e in state.envelopes if str(e.get("id")) == target_id),
+                            None,
+                        )
+                        env_task_id = (target_env or {}).get("_task_id") or ""
+                        repo_tag = _task_id_to_repo.get(env_task_id, "unknown")
+                        # Prefix on its own line; critique is verbatim below.
+                        repo_prefix = f"[repo:{repo_tag}]\n"
+                    else:
+                        repo_prefix = ""
+                    # No truncation, no strip — verbatim as received (Fix 3).
+                    # Fleet path: ONLY [repo:<id>] prefix + verbatim critique.
+                    # [vendor@rubric] is NOT inserted into the fleet dissent string.
+                    # Non-fleet path: restore original [vendor@rubric] prefix format.
+                    if _is_fleet_run:
+                        dissents.append(f"{repo_prefix}{critique}")
+                    else:
+                        dissents.append(
+                            f"[{v.get('judge_vendor', '?')}@{v.get('rubric_id', '?')}] "
+                            f"{critique}"
+                        )
         for env in state.envelopes:
             for d in (env.get("dissenting_opinions") or []):
-                if isinstance(d, str) and d.strip():
-                    dissents.append(d.strip())
+                if isinstance(d, str) and d:
+                    if _is_fleet_run:
+                        env_task_id = env.get("_task_id") or ""
+                        repo_tag = _task_id_to_repo.get(env_task_id, "unknown")
+                        # Prefix on its own line; d is verbatim (Fix 3 + Fix 5).
+                        repo_prefix = f"[repo:{repo_tag}]\n"
+                    else:
+                        repo_prefix = ""
+                    # No strip, no truncation — preserve the string as-is.
+                    dissents.append(f"{repo_prefix}{d}")
 
         # Conflict detection: mutually-exclusive verdicts at the synthesis
         # stage = NOT sealed. Per hydra-synthesizer.md "When to Surface
@@ -1787,7 +1907,7 @@ def build_supervisor(
             outcomes_by_squad.setdefault(squad, set()).add(v.get("outcome") or "?")
         # Heuristic: any squad with both 'pass' AND 'fail' verdicts indicates
         # cross-rubric disagreement worth surfacing.
-        for s, outs in outcomes_by_squad.items():
+        for _sq, outs in outcomes_by_squad.items():
             if "pass" in outs and "fail" in outs:
                 has_mutually_exclusive = True
                 break
@@ -1795,42 +1915,141 @@ def build_supervisor(
         # HITL trace: any prior HITL the workflow surfaced.
         hitl_count = len(state.hitl_history or [])
 
-        # Artifact list: every artifact id, no drops.
-        artifact_count = len(state.artifacts or [])
-
-        # Per-squad breakdown for the rationale body.
-        squad_lines = []
-        for squad, envs in sorted(squad_to_envs.items()):
-            squad_lines.append(
-                f"  • {crown_label_for_squad(squad)} ({squad}): "
-                f"{len(envs)} envelope(s)"
+        # Artifact list: every artifact, no drops (Fix 2).
+        # Convert raw artifact dicts to MemoryRef handles for DecisionRecord.
+        # state.artifacts is a list[dict]; each dict may carry a "ref" key
+        # (the pp_run_id) and a "kind" key.  We build a MemoryRef per artifact
+        # using the ref as the key (fallback: the artifact's index as a string)
+        # and tier="episodic" (all squad artifacts are episodic by convention).
+        # Deterministic stable order: matches state.artifacts insertion order.
+        from .schemas import MemoryRef
+        all_artifacts: list[MemoryRef] = []
+        for _i, _art in enumerate(state.artifacts or []):
+            _ref_key = (
+                _art.get("ref")
+                or _art.get("run_id")
+                or _art.get("id")
+                or f"artifact-{_i}"   # stable positional fallback — never id()
             )
-        squad_block = "\n".join(squad_lines) if squad_lines else "  (no squad envelopes)"
+            _summary = _art.get("kind") or _art.get("summary") or None
+            all_artifacts.append(MemoryRef(tier="episodic", key=str(_ref_key), summary=_summary))
+        artifact_count = len(all_artifacts)
 
         budget_pct = (
             int(100 * state.budget.spent_usd / state.budget.budget_usd)
             if state.budget.budget_usd > 0 else 0
         )
-        rationale_lines = [
-            f"Council: {cathedral_roster}.",
-            f"Plaza slugs: {state.selected_squads}.",
-            f"",
-            f"Squad outputs:",
-            squad_block,
-            f"",
-            f"Tasks: {[t.status for t in state.tasks]}.",
-            f"Artifacts: {artifact_count} archived.",
-            f"Budget: ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f} "
-            f"({budget_pct}% used; "
-            f"${state.budget.usd_remaining:.2f} headroom).",
-        ]
-        if hitl_count > 0:
-            rationale_lines.append(f"HITL: {hitl_count} gate(s) fired during workflow.")
-        if has_mutually_exclusive:
-            rationale_lines.append(
-                "CONFLICT: mutually-exclusive verdicts detected — sealed=False, "
-                "operator must reconcile before downstream consumers act on this record."
-            )
+
+        # ------------------------------------------------------------------ #
+        # Build the rationale body.
+        # Fleet path: section-per-repo, ordered deterministically by repo_id.
+        # Non-fleet path: existing squad-grouped block (unchanged behaviour).
+        # ------------------------------------------------------------------ #
+        if _is_fleet_run:
+            # Per-repo sections — sorted by repo_id for determinism.
+            # For each repo: status of its tasks, outcome summary, per-repo
+            # dissents (verbatim, tagged).  Cancelled repos noted explicitly.
+            repo_section_lines: list[str] = []
+            _any_repo_bad = False  # failed/surfaced/cancelled -> sealed=False
+
+            for repo_id in sorted(distinct_task_repos):
+                task_ids_for_repo = _repo_to_task_ids.get(repo_id, [])
+                # Aggregate repo status: worst-case across its tasks.
+                # Priority: surfaced > failed > cancelled > running > done > pending.
+                _status_priority = {
+                    "surfaced": 5, "failed": 4, "cancelled": 3,
+                    "running": 2, "done": 1, "pending": 0,
+                }
+                repo_statuses = [
+                    _task_id_to_status.get(tid, "pending") for tid in task_ids_for_repo
+                ]
+                repo_status = max(
+                    repo_statuses,
+                    key=lambda s: _status_priority.get(s, 0),
+                    default="unknown",
+                )
+                if repo_status in ("failed", "surfaced", "cancelled"):
+                    _any_repo_bad = True
+
+                # Per-repo dissents: filter global dissents by repo tag.
+                repo_dissent_lines = [
+                    d for d in dissents if f"[repo:{repo_id}]" in d
+                ]
+                # Per-repo envelopes: correlate via _task_id tag.
+                repo_env_count = sum(
+                    1 for env in state.envelopes
+                    if _task_id_to_repo.get(env.get("_task_id") or "", "") == repo_id
+                    and (env.get("origin_squad") or "hydra") != "hydra"
+                )
+
+                section = [f"  ── repo: {repo_id} ──"]
+                section.append(f"     status: {repo_status}")
+                section.append(f"     envelopes: {repo_env_count}")
+                if repo_status == "cancelled":
+                    section.append("     CANCELLED: task did not dispatch (fleet was cancelled before this repo's worker started)")
+                if repo_dissent_lines:
+                    section.append("     dissents (verbatim):")
+                    for dline in repo_dissent_lines:
+                        section.append(f"       {dline}")
+                repo_section_lines.extend(section)
+
+            repo_block = "\n".join(repo_section_lines)
+
+            # sealed=False if any repo bad OR mutually-exclusive verdicts.
+            if _any_repo_bad:
+                has_mutually_exclusive = True  # reuse sealed gate
+
+            rationale_lines: list[str] = [
+                f"Council: {cathedral_roster}.",
+                f"Plaza slugs: {state.selected_squads}.",
+                f"Fleet run: {len(distinct_task_repos)} repos dispatched in parallel.",
+                f"",
+                f"Per-repo results (sorted by repo_id):",
+                repo_block,
+                f"",
+                f"Tasks: {[t.status for t in state.tasks]}.",
+                f"Artifacts: {artifact_count} archived.",
+                f"Budget: ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f} "
+                f"({budget_pct}% used; "
+                f"${state.budget.usd_remaining:.2f} headroom).",
+            ]
+            if hitl_count > 0:
+                rationale_lines.append(f"HITL: {hitl_count} gate(s) fired during workflow.")
+            if has_mutually_exclusive:
+                rationale_lines.append(
+                    "CONFLICT or PARTIAL: at least one repo failed/surfaced/cancelled — "
+                    "sealed=False, operator must reconcile before downstream consumers act."
+                )
+        else:
+            # Non-fleet: existing squad-grouped breakdown (unchanged behaviour).
+            squad_lines = []
+            for squad, envs in sorted(squad_to_envs.items()):
+                squad_lines.append(
+                    f"  • {crown_label_for_squad(squad)} ({squad}): "
+                    f"{len(envs)} envelope(s)"
+                )
+            squad_block = "\n".join(squad_lines) if squad_lines else "  (no squad envelopes)"
+
+            rationale_lines = [
+                f"Council: {cathedral_roster}.",
+                f"Plaza slugs: {state.selected_squads}.",
+                f"",
+                f"Squad outputs:",
+                squad_block,
+                f"",
+                f"Tasks: {[t.status for t in state.tasks]}.",
+                f"Artifacts: {artifact_count} archived.",
+                f"Budget: ${state.budget.spent_usd:.2f} of ${state.budget.budget_usd:.2f} "
+                f"({budget_pct}% used; "
+                f"${state.budget.usd_remaining:.2f} headroom).",
+            ]
+            if hitl_count > 0:
+                rationale_lines.append(f"HITL: {hitl_count} gate(s) fired during workflow.")
+            if has_mutually_exclusive:
+                rationale_lines.append(
+                    "CONFLICT: mutually-exclusive verdicts detected — sealed=False, "
+                    "operator must reconcile before downstream consumers act on this record."
+                )
 
         # Decision line: be honest about completeness.
         if has_mutually_exclusive:
@@ -1847,7 +2066,7 @@ def build_supervisor(
             decision=decision_line,
             rationale="\n".join(rationale_lines),
             dissenting_opinions=dissents,
-            artifacts=[],  # MemoryRef list — populated by archivist downstream
+            artifacts=all_artifacts,  # Fix 2: every artifact, no drops
             sealed=not has_mutually_exclusive,
         )
         record_dict = record.model_dump(mode="json")

@@ -40,7 +40,9 @@ class TaskState(BaseModel):
     task_id: UUID = Field(default_factory=uuid4)
     owner_squad: str
     description: str
-    status: Literal["pending", "running", "blocked", "done", "failed", "surfaced"] = "pending"
+    # WS8 SLICE 2: "cancelled" added for fleet tasks that were not dispatched
+    # because cancel_event was set before their worker started.
+    status: Literal["pending", "running", "blocked", "done", "failed", "surfaced", "cancelled"] = "pending"
     envelope_id: Optional[UUID] = None      # the message that triggered it
     result_envelope_id: Optional[UUID] = None
     retries: int = 0
@@ -154,6 +156,11 @@ class HydraState(BaseModel):
     # Clamped to [1, FLEET_MAX_CAP=8] inside fleet.py.
     fleet_parallel: bool = False
     fleet_max_concurrency: int = 4
+    # WS8 SLICE 2 — set True by node_dispatch ONLY when dispatch_fleet was
+    # actually invoked this run.  node_synthesis uses this (not just the count
+    # of distinct repos) to decide between fleet-synthesis and non-fleet-synthesis
+    # so a sequential multi-repo run never accidentally gets fleet sections.
+    fleet_dispatched: bool = False
 
     # B7 — pp-harness lock release on supervisor crash.
     # Tracks pp_harness runs that this workflow started but has not yet
