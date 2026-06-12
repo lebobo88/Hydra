@@ -187,6 +187,148 @@ _REPO_COUNT_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Multi-repo CLI argument parser (--repos / --fleet)
+# ---------------------------------------------------------------------------
+
+# VALUE PATTERN for --repos / --fleet:
+#   Matches a comma-separated list of repo tokens that tolerates optional whitespace
+#   around commas but STOPS at a space that is NOT followed by a comma-separated
+#   continuation.  Pattern: first token, then zero-or-more ( \s*,\s* next-token ).
+#
+#   Per-token class: [^\s,]+ — any run of non-whitespace, non-comma characters.
+#   This is INTENTIONALLY broad: it captures foreign/malformed tokens (e.g.
+#   "foreign/repo", "foo:bar") as a WHOLE token so they reach allow-list validation
+#   and raise ValueError cleanly.  Nothing can bleed into the goal text because the
+#   only terminators are whitespace (not preceded by a comma) and end-of-string.
+#
+#   Examples accepted:
+#     "a,b,c"          "a, b, c"       "a ,b , c"      "a , b , c"
+#   Malformed — captured whole, then rejected by allow-list:
+#     "pair-programmer,foreign/repo"  -> ["pair-programmer","foreign/repo"] -> ValueError
+#   Stopping correctly:
+#     "--repos a, b Fix the bug"  -> value "a, b",  residual "Fix the bug"
+#     "--repos a,b Fix"           -> value "a,b",   residual "Fix"
+#
+# The EQUALS form captures the value in group 2; the SPACE form in group 3.
+# Group 1 is the full flag+value token (used for span removal).
+_REPOS_VALUE_PAT = r"[^\s,]+(?:\s*,\s*[^\s,]+)*"
+_REPOS_ARG_RE = re.compile(
+    r"(?:^|(?<=\s))"                                   # start or preceded by whitespace
+    r"(--(?:repos|fleet)"                              # flag (group 1 opens)
+    r"(?:=\s*(" + _REPOS_VALUE_PAT + r")"             # equals-form: group 2
+    r"|\s+(" + _REPOS_VALUE_PAT + r")"                # space-form:  group 3
+    r"))",                                             # group 1 closes
+    re.IGNORECASE,
+)
+
+# Bare "--repos" or "--fleet" with no value following (space-form: end of string
+# or immediately followed by another flag/whitespace-only).
+_REPOS_BARE_RE = re.compile(
+    r"(?:^|\s)--(?:repos|fleet)(?:\s+--|\s*$)",
+    re.IGNORECASE,
+)
+
+# Count total "--repos" / "--fleet" occurrences (both forms) for duplicate detection.
+_REPOS_COUNT_RE = re.compile(
+    r"(?:^|\s)--(?:repos|fleet)(?:=|\s)",
+    re.IGNORECASE,
+)
+
+
+def parse_repos_arg(text: str) -> tuple[list[str], str]:
+    """Extract an optional ``--repos <id,id,...>`` / ``--fleet <id,id,...>`` token.
+
+    Parses a MULTI-repo token from *text*, validates each id against the allow-list,
+    deduplicates (first-occurrence order), removes the token from the string, and
+    returns ``(list_of_repo_ids, cleaned_text)``.
+
+    Whitespace around commas is tolerated: ``--repos a, b, c`` is equivalent to
+    ``--repos a,b,c``.  The value terminates at the first space-separated word that
+    is NOT preceded by a comma, so ``--repos a, b Fix the bug`` correctly produces
+    ``["a", "b"]`` with ``"Fix the bug"`` left in the cleaned text.
+
+    Supported forms::
+
+        --repos agentsmith,theeights,xenia   Fix fleet
+        --repos agentsmith, theeights, xenia Fix fleet   (spaces after commas)
+        --repos=agentsmith,theeights          (equals-form)
+        --repos=agentsmith, theeights         (equals-form with spaces)
+        --fleet agentsmith,theeights          (synonym)
+        --fleet=agentsmith,theeights          (synonym equals-form)
+
+    Returns:
+        ``([], text)`` unchanged when no ``--repos`` / ``--fleet`` token is present.
+
+        ``(list_of_repo_ids, cleaned_text)`` on success (list has >=1 element).
+
+    Raises:
+        ValueError: if the token is present with no value, if any id is unknown,
+                    or if ``--repos`` / ``--fleet`` appears more than once.
+    """
+    # Equals-form with empty value: "--repos=" or "--fleet=" at end / whitespace only.
+    if re.search(r"(?:^|\s)--(?:repos|fleet)=\s*(?:\s|$)", text, re.IGNORECASE):
+        raise ValueError("--repos/--fleet requires a value")
+
+    # Bare --repos/--fleet with no value (space-form: at end or followed by flag).
+    if _REPOS_BARE_RE.search(text):
+        raise ValueError("--repos/--fleet requires a value")
+
+    # Also catch bare --repos/--fleet at end of string (trailing whitespace variants).
+    stripped = text.strip()
+    if re.search(r"(?:^|\s)--(?:repos|fleet)$", stripped, re.IGNORECASE):
+        raise ValueError("--repos/--fleet requires a value")
+
+    # Count occurrences for duplicate detection.
+    occurrences = len(_REPOS_COUNT_RE.findall(text))
+    if occurrences > 1:
+        raise ValueError(
+            f"--repos/--fleet specified more than once ({occurrences} times); "
+            "only a single multi-repo token is supported per invocation"
+        )
+
+    m = _REPOS_ARG_RE.search(text)
+    if m is None:
+        return [], text
+
+    # Group 2 = equals-form value; group 3 = space-form value.
+    raw_value = ((m.group(2) or "") + (m.group(3) or "")).strip()
+    if not raw_value:
+        raise ValueError("--repos/--fleet requires a value")
+
+    # Comma-split on optional surrounding whitespace; trim each part; drop empties;
+    # dedup preserving first-occurrence order.
+    parts = [p.strip() for p in re.split(r"\s*,\s*", raw_value)]
+    parts = [p for p in parts if p]  # drop empties
+    if not parts:
+        raise ValueError("--repos/--fleet requires at least one non-empty repo id")
+
+    # Validate each id; collect deduplicated list.
+    seen: dict[str, bool] = {}
+    deduped: list[str] = []
+    for raw_id in parts:
+        normalised = raw_id.lower()
+        if normalised in seen:
+            continue  # dedup: keep first occurrence
+        seen[normalised] = True
+        if not is_known_repo(raw_id):
+            raise ValueError(
+                f"--repos/--fleet: {raw_id!r} is not an allow-listed repo_id; "
+                f"known: {sorted(_REPO_DIRNAMES)}"
+            )
+        deduped.append(normalised)
+
+    # Remove the entire matched token (group 1) from text.  m.start(1)/m.end(1)
+    # covers only the flag+value, not any leading whitespace consumed by the
+    # lookbehind — so we slice on the group-1 span and clean surrounding space.
+    token_start = m.start(1)
+    token_end = m.end(1)
+    cleaned = text[:token_start].rstrip() + " " + text[token_end:].lstrip()
+    cleaned = cleaned.strip()
+    cleaned = re.sub(r"  +", " ", cleaned)
+    return deduped, cleaned
+
+
 def parse_repo_arg(text: str) -> tuple[Optional[str], str]:
     """Extract an optional ``--repo <id>`` or ``--repo=<id>`` token from *text*.
 

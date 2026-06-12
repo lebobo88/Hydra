@@ -299,6 +299,98 @@ def build_supervisor(
         if _repo_id is not None and not state.target_repo_id:
             state.target_repo_id = _repo_id
 
+        # --repos / --fleet <id,id,...> extraction: parse an optional multi-repo
+        # token and wire fleet mode when >=2 distinct valid repos are named.
+        # root_goal is NOT mutated so the router and planner see the original text.
+        from hydra_core.repo_registry import parse_repos_arg
+        try:
+            _fleet_repo_ids, _fleet_cleaned = parse_repos_arg(state.root_goal)
+        except ValueError as _repos_err:
+            state.phase = "surfaced"
+            _repos_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": f"--repos argument rejected: {_repos_err}",
+                "options": ["abort"],
+                "default_option": "abort",
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.bad_repos_arg",
+                {"error": str(_repos_err)},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _repos_hitl,
+                "last_event": f"bad --repos arg: {_repos_err}",
+            }
+
+        # Ambiguity guard: --repo AND --repos together is an error.
+        if _repo_id is not None and len(_fleet_repo_ids) >= 1:
+            state.phase = "surfaced"
+            _ambig_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": "ambiguous: use --repo OR --repos/--fleet, not both",
+                "options": ["abort"],
+                "default_option": "abort",
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.ambiguous_repo_args",
+                {"single": _repo_id, "multi": _fleet_repo_ids},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _ambig_hitl,
+                "last_event": "bad --repo/--repos: ambiguous (both set)",
+            }
+
+        # Fleet wiring based on how many distinct repos --repos/--fleet provided.
+        _fleet_tasks: list[TaskState] = []
+        if len(_fleet_repo_ids) >= 2:
+            # FLEET MODE: seed one engineering TaskState per distinct repo.
+            # state.fleet_parallel = True signals node_dispatch to call dispatch_fleet.
+            # selected_squads locked to ["engineering"] — fleet is engineering-only.
+            # The planner preserves pre-seeded tasks (they already appear in
+            # state.tasks via the append reducer); node_dispatch's fleet predicate
+            # (fleet_parallel + >=2 distinct mcp/engineering tasks) routes to
+            # dispatch_fleet; node_synthesis aggregates fleet results.
+            state.fleet_parallel = True
+            state.selected_squads = ["engineering"]
+            for _rid in _fleet_repo_ids:
+                _fleet_tasks.append(TaskState(
+                    owner_squad="engineering",
+                    description=state.root_goal,
+                    target_repo_id=_rid,
+                    priority="P2",
+                ))
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.fleet_mode_activated",
+                {"repos": _fleet_repo_ids, "task_count": len(_fleet_tasks)},
+            )
+        elif len(_fleet_repo_ids) == 1:
+            # Single-target: treat identically to --repo (set target_repo_id,
+            # no fleet, no per-repo task seeding).
+            # Explicitly clear fleet_parallel — a caller that pre-seeded
+            # fleet_parallel=True must NOT remain in fleet mode for a single-repo run.
+            state.fleet_parallel = False
+            if not state.target_repo_id:
+                state.target_repo_id = _fleet_repo_ids[0]
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.single_repo_from_fleet_arg",
+                {"repo": _fleet_repo_ids[0]},
+            )
+        # 0 repos from --repos/--fleet: nothing changes.
+
         # Route the goal text. A pre-seeded non-empty `selected_squads`
         # (CLI `hydra run --squad ...` / operator force-select) wins over
         # the intent router: validate slugs against discovered packs and
@@ -351,6 +443,25 @@ def build_supervisor(
             "iteration_count": state.iteration_count,
             "constitution_hash": constitution.sha256,
         }
+        # Propagate repo targeting and fleet mode into the state update dict.
+        # These are replace-by-default scalars; they must appear in the return
+        # dict (not just be set on state) for LangGraph to persist them.
+        if state.target_repo_id is not None:
+            update["target_repo_id"] = state.target_repo_id
+        if state.fleet_parallel:
+            update["fleet_parallel"] = True
+            update["selected_squads"] = ["engineering"]
+        elif len(_fleet_repo_ids) == 1:
+            # Single-repo via --repos/--fleet: explicitly persist fleet_parallel=False
+            # so a pre-seeded True is overwritten — the state object was already set
+            # to False in the branch above; this makes it durable in the LangGraph patch.
+            update["fleet_parallel"] = False
+        # Pre-seeded per-repo tasks for fleet mode.  The append reducer in
+        # HydraState.tasks (_append in state.py) adds these to any existing tasks;
+        # the planner preserves pre-seeded tasks (dedup path) and emits only
+        # synthesised-only so no task_id is ever duplicated.
+        if _fleet_tasks:
+            update["tasks"] = _fleet_tasks
         receipt = eights.constitution_attest(constitution)
         if isinstance(receipt, dict):
             if isinstance(receipt.get("version"), str):
