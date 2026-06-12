@@ -19,6 +19,7 @@ from uuid import uuid4
 from .eights.attestation import EightsAttestor
 from .governance import (
     charge_and_gate,
+    charge_and_gate_repo,
     enforce_governance,
     GovernanceVerdict,
     record_cost,
@@ -369,11 +370,20 @@ def build_supervisor(
                     target_repo_id=_rid,
                     priority="P2",
                 ))
+            # WS8 SLICE 4 — allocate per-repo budget shares at fleet setup time.
+            # Equal-split: each repo gets budget_usd / len(distinct repos).
+            # Done here (once, deterministically) so charge_and_gate_repo can
+            # compare per-repo spend against repo_budgets at charge time.
+            state.budget.allocate_repos(_fleet_repo_ids)
             emit_trace(
                 judge_trace_root,
                 state.workflow_id,
                 "supervisor.fleet_mode_activated",
-                {"repos": _fleet_repo_ids, "task_count": len(_fleet_tasks)},
+                {
+                    "repos": _fleet_repo_ids,
+                    "task_count": len(_fleet_tasks),
+                    "repo_budgets": dict(state.budget.repo_budgets),
+                },
             )
         elif len(_fleet_repo_ids) == 1:
             # Single-target: treat identically to --repo (set target_repo_id,
@@ -1239,8 +1249,18 @@ def build_supervisor(
             # Charging them one at a time (sequentially in the main thread) keeps
             # the ledger monotonic. We record which tasks blocked and which
             # triggered downgrade, but we do NOT surface HITL until pass 2.
+            #
+            # WS8 SLICE 4 — per-repo fleet budget isolation:
+            # charge_and_gate_repo returns (repo_over, global_block, downgrade).
+            # ISOLATION: repo_over does NOT set _fleet_any_block — only global_block
+            # triggers the fleet-wide HITL. Per-repo over is FLAGGED (collected in
+            # _fleet_repos_over) for the operator breakdown; it is NOT a stop.
+            # The HITL payload includes a per-repo breakdown so the operator can see
+            # which repo(s) exceeded their allocation even when the global budget
+            # was not exhausted.
             _fleet_any_block = False
             _fleet_last_blocking_squad = ""
+            _fleet_repos_over: set[str] = set()  # repos that exceeded per-repo alloc
             for fleet_task, result in zip(_fleet_candidate_tasks, _fleet_results):
                 pack = packs.get(fleet_task.owner_squad)
                 # Always extract and charge cost for EVERY result — even failed ones.
@@ -1249,7 +1269,9 @@ def build_supervisor(
                 # inaccurate (Fix 6 gap: failed results must be charged before continue).
                 _cost_usd, _cost_tok = _extract_squad_cost(result)
                 if pack is not None:
-                    _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+                    _repo_over, _block, _downgrade = charge_and_gate_repo(
+                        state, fleet_task.target_repo_id, _cost_usd, _cost_tok
+                    )
                     if _cost_usd == 0.0 and _cost_tok == 0:
                         emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
                             "site": "dispatch_fleet", "squad": pack.slug,
@@ -1262,6 +1284,26 @@ def build_supervisor(
                             "budget_usd": state.budget.budget_usd,
                             "squad": pack.slug,
                         })
+                    # ISOLATION: repo_over is flagged but does NOT block the fleet.
+                    # Only global_block (spent >= budget_usd) triggers a fleet stop.
+                    if _repo_over and fleet_task.target_repo_id is not None:
+                        _fleet_repos_over.add(fleet_task.target_repo_id)
+                        emit_trace(
+                            judge_trace_root,
+                            state.workflow_id,
+                            "budget.repo_over_allocation",
+                            {
+                                "repo_id": fleet_task.target_repo_id,
+                                "repo_spent": state.budget.repo_spend.get(
+                                    fleet_task.target_repo_id, 0.0
+                                ),
+                                "repo_alloc": state.budget.repo_budgets.get(
+                                    fleet_task.target_repo_id, 0.0
+                                ),
+                                "global_spent": state.budget.spent_usd,
+                                "global_budget": state.budget.budget_usd,
+                            },
+                        )
                     if _block:
                         _fleet_any_block = True
                         _fleet_last_blocking_squad = pack.slug
@@ -1323,6 +1365,32 @@ def build_supervisor(
 
             # PASS 2 -- budget block decision, now that ALL spend is charged.
             # The ledger reflects the full fleet spend; the HITL summary is accurate.
+            #
+            # WS8 SLICE 4 — per-repo breakdown in the HITL payload.
+            # Build breakdown even when no block (the trace above already emitted
+            # repo_over events); include in the HITL payload when global block fires
+            # so the operator can see which repos overspent their allocation.
+            # Per-repo breakdown: iterate allocated repos first, then append
+            # the "(unattributed)" reconciliation bucket when it holds any spend.
+            # This lets the operator see which repos overspent AND verify that
+            # sum(breakdown[*].spent) == global spent_usd (full reconciliation).
+            _fleet_repo_breakdown: list[dict[str, Any]] = [
+                {
+                    "repo_id": rid,
+                    "allocation": state.budget.repo_budgets.get(rid, 0.0),
+                    "spent": state.budget.repo_spend.get(rid, 0.0),
+                    "over": rid in _fleet_repos_over,
+                }
+                for rid in state.budget.repo_budgets
+            ]
+            _unattributed_spend = state.budget.repo_spend.get("(unattributed)", 0.0)
+            if _unattributed_spend > 0.0:
+                _fleet_repo_breakdown.append({
+                    "repo_id": "(unattributed)",
+                    "allocation": None,
+                    "spent": _unattributed_spend,
+                    "over": False,
+                })
             if _fleet_any_block:
                 state.budget_downgrade_active = True
                 emit_trace(judge_trace_root, state.workflow_id, "budget.over_budget_surface", {
@@ -1330,6 +1398,7 @@ def build_supervisor(
                     "budget_usd": state.budget.budget_usd,
                     "site": "dispatch_fleet",
                     "squad": _fleet_last_blocking_squad,
+                    "repos_over": list(_fleet_repos_over),
                 })
                 _hitl_fleet_budget: dict[str, Any] = {
                     "workflow_id": str(state.workflow_id),
@@ -1344,6 +1413,10 @@ def build_supervisor(
                     "default_option": "abort",
                     "spent_usd": state.budget.spent_usd,
                     "budget_usd": state.budget.budget_usd,
+                    # WS8 SLICE 4 — per-repo breakdown so the operator can see
+                    # which repos overspent their allocation even when the global
+                    # budget was the proximate trigger.
+                    "repo_breakdown": _fleet_repo_breakdown,
                 }
                 eights.hitl_request(_hitl_fleet_budget, gate_node="dispatch")
                 return {

@@ -27,6 +27,13 @@ class BudgetLedger(BaseModel):
     spent_usd: float = 0.0
     spent_tokens: int = 0
 
+    # WS8 SLICE 4 — per-repo fleet budget isolation.
+    # repo_budgets: equal-split allocation per fleet repo (set by allocate_repos).
+    # repo_spend:   accumulated spend per fleet repo (updated by charge_and_gate_repo).
+    # These are populated only in fleet mode; empty dicts are safe for sequential runs.
+    repo_budgets: dict[str, float] = Field(default_factory=dict)
+    repo_spend: dict[str, float] = Field(default_factory=dict)
+
     @property
     def usd_remaining(self) -> float:
         return max(self.budget_usd - self.spent_usd, 0.0)
@@ -34,6 +41,78 @@ class BudgetLedger(BaseModel):
     @property
     def percent_consumed(self) -> float:
         return (self.spent_usd / self.budget_usd) if self.budget_usd else 0.0
+
+    def allocate_repos(self, repo_ids: list[str]) -> None:
+        """Equal-split the global budget_usd across distinct fleet repos.
+
+        REPLACES any prior per-repo allocation + resets per-repo spend so a
+        fresh fleet run always starts with a clean per-repo ledger.  The global
+        ledger (spent_usd / spent_tokens) is NOT touched — only the per-repo
+        attribution is reset.
+
+        Guards:
+          - Negative budget_usd raises ValueError — this is a misconfiguration.
+          - Zero budget_usd is valid: every repo allocation is 0.0, and repo_over
+            fires immediately on any spend (correct — the budget is exhausted).
+          - Empty repo_ids is a no-op; neither dict is mutated.
+
+        PRECISION CONTRACT — integer micro-unit split:
+          Allocations are exact to the micro-dollar (1e-6 USD).  budget_usd is
+          converted to integer micro-dollars (round(budget_usd * 1_000_000)).
+          Integer divmod gives an exact micro-sum with zero accumulation error.
+          Remainder micro-units are distributed one-per-repo to the FIRST `rem`
+          repos (fair; still exact at micro-level).
+
+          Contract: sum(int(r * 1e6) for r in repo_budgets.values())
+                      == round(budget_usd * 1_000_000)   [exact integer equality]
+
+          The float sum may differ from budget_usd by at most 1e-6 (one micro-
+          dollar) due to the final / 1_000_000 division introducing sub-micro
+          float noise.  This is the inherent precision of the micro-unit
+          accounting unit and is negligible for USD-range budgets.
+
+          A repo CAN receive 0.0 only when budget_usd is smaller than 1 micro
+          per repo (i.e. budget < n / 1_000_000).  This is documented and tested;
+          in practice Hydra budgets are in the dollar range.
+        """
+        if self.budget_usd < 0:
+            raise ValueError(
+                f"budget_usd must be non-negative, got {self.budget_usd}"
+            )
+        distinct = list(dict.fromkeys(repo_ids))  # preserve first-seen order, drop dups
+        if not distinct:
+            return
+        n = len(distinct)
+        total_micro = round(self.budget_usd * 1_000_000)
+        base_micro, rem = divmod(total_micro, n)
+        new_budgets: dict[str, float] = {}
+        for i, rid in enumerate(distinct):
+            # First `rem` repos get one extra micro-unit each.
+            micro = base_micro + (1 if i < rem else 0)
+            new_budgets[rid] = micro / 1_000_000
+
+        # FULL REPLACE — wipe any stale entries from a prior call so the
+        # HITL breakdown never shows repos that are no longer in the fleet,
+        # and sum(repo_budgets.values()) stays == budget_usd.
+        self.repo_budgets = new_budgets
+        # Reset per-repo spend so the new fleet starts with a clean slate.
+        # Global spent_usd is intentionally preserved (it tracks total cost
+        # across the workflow lifetime, not just this fleet run).
+        self.repo_spend = {}
+
+    def repo_remaining(self, rid: str) -> float:
+        """Return remaining budget for a specific repo.
+
+        Returns math.inf when the repo has no per-repo allocation (i.e. it is
+        not a fleet repo or allocate_repos was not called yet).  This matches
+        the semantics used by charge_and_gate_repo: a repo with no allocation
+        never triggers repo_over.
+        """
+        import math
+        alloc = self.repo_budgets.get(rid)
+        if alloc is None:
+            return math.inf
+        return alloc - self.repo_spend.get(rid, 0.0)
 
 
 class TaskState(BaseModel):

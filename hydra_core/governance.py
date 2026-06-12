@@ -52,11 +52,73 @@ def charge_and_gate(
 
     Callers at every execute_squad site use this so the logic is not
     duplicated across best-of-N, single-shot dispatch, and reflexion.
+    Sequential (non-fleet) path only — do NOT replace with charge_and_gate_repo.
     """
     record_cost(state, cost_usd, cost_tokens)
     block = should_block_for_budget(state)
     downgrade = should_downgrade_model(state)
     return block, downgrade
+
+
+def charge_and_gate_repo(
+    state: HydraState,
+    repo_id: str | None,
+    cost_usd: float,
+    cost_tokens: int,
+) -> tuple[bool, bool, bool]:
+    """WS8 SLICE 4 — per-repo fleet budget isolation.
+
+    Record cost (global ledger, unchanged) then evaluate:
+      - repo_over:    this repo has exceeded its per-repo allocation.
+      - global_block: GLOBAL ledger hit 100% (the only fleet-wide stop).
+      - downgrade:    global percent_consumed >= 80% (WS9 tier tripwire).
+
+    Returns (repo_over, global_block, downgrade).
+
+    ISOLATION SEMANTICS:
+      repo_over True does NOT imply global_block.  A repo spending past its
+      equal-split allocation is FLAGGED for the operator breakdown but does NOT
+      block the rest of the fleet.  Only global_block triggers a fleet-wide HITL.
+
+    NOTE on future multi-task-per-repo:
+      A repo_over event COULD cancel that repo's not-yet-started tasks.
+      With one-task-per-repo there are none, so no per-repo cancellation fires.
+      Design the data (repo_over flagging, per-repo spend tracking) so this
+      extension is addable without schema changes.  Per-repo over must NEVER be
+      wired into the fleet-WIDE cancel_event — that would break isolation.
+    """
+    record_cost(state, cost_usd, cost_tokens)
+
+    # Per-repo spend tracking.
+    # If repo_id is None OR the repo has no per-repo allocation (not a fleet
+    # repo), the charge is routed to the reserved "(unattributed)" bucket so
+    # that sum(repo_spend.values()) == global spent_usd and the HITL breakdown
+    # can reconcile.  The "(unattributed)" key is never in repo_budgets, so it
+    # can never trigger repo_over — it is a reconciliation bucket only.
+    _UNATTRIBUTED = "(unattributed)"
+    if repo_id is not None and repo_id in state.budget.repo_budgets:
+        # Attributed spend: repo is a known fleet repo with an allocation.
+        state.budget.repo_spend[repo_id] = (
+            state.budget.repo_spend.get(repo_id, 0.0) + cost_usd
+        )
+    else:
+        # Unattributed: repo_id is None, or it is not a fleet repo.
+        # Route into the explicit unattributed bucket for reconciliation.
+        state.budget.repo_spend[_UNATTRIBUTED] = (
+            state.budget.repo_spend.get(_UNATTRIBUTED, 0.0) + cost_usd
+        )
+
+    # Per-repo over: only flagged for repos WITH an allocation.
+    # "(unattributed)" is never in repo_budgets so this is always False for it.
+    repo_over = (
+        repo_id is not None
+        and repo_id in state.budget.repo_budgets
+        and state.budget.repo_spend[repo_id] >= state.budget.repo_budgets[repo_id]
+    )
+
+    global_block = should_block_for_budget(state)
+    downgrade = should_downgrade_model(state)
+    return repo_over, global_block, downgrade
 
 
 # --------- loop ceiling ---------
