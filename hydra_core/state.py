@@ -54,6 +54,17 @@ class TaskState(BaseModel):
     # major/high-risk and this list is absent (or empty), the planner gates
     # on HITL with reason="acceptance_criteria" before dispatch.
     acceptance_criteria: Optional[list[str]] = None
+    # WS8 SLICE 1 — per-task repo targeting.
+    # When set, this task is dispatched to a specific allow-listed repo (distinct
+    # from the workflow-level state.target_repo_id).  node_dispatch's _build_payload
+    # picks task.target_repo_id first; falls back to state.target_repo_id when None.
+    # This is what makes the fleet's distinct-repo predicate work in production:
+    # a campaign that targets multiple repos sets per-task target_repo_id on each
+    # TaskState at planning time (or via the /hydra:run --repo <id> routing).
+    # Preserved across planner rebuilds (node_planner carries existing tasks
+    # through the dedup path unchanged) and retries (_reflexion_retry does not
+    # overwrite this field).
+    target_repo_id: Optional[str] = None
 
 
 class HydraState(BaseModel):
@@ -134,6 +145,15 @@ class HydraState(BaseModel):
     constitution_hash: Optional[str] = None
     constitution_version: Optional[str] = None
     constitution_receipt: Optional[str] = None
+
+    # WS8 SLICE 1 — parallel fleet dispatch.
+    # fleet_parallel: when True, node_dispatch fans out tasks across DISTINCT
+    # target repos in parallel via hydra_core.fleet.dispatch_fleet.  Default
+    # False preserves the original sequential behaviour — zero regression risk.
+    # fleet_max_concurrency: per-workflow worker cap passed to dispatch_fleet.
+    # Clamped to [1, FLEET_MAX_CAP=8] inside fleet.py.
+    fleet_parallel: bool = False
+    fleet_max_concurrency: int = 4
 
     # B7 — pp-harness lock release on supervisor crash.
     # Tracks pp_harness runs that this workflow started but has not yet

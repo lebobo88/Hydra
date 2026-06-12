@@ -44,6 +44,7 @@ from .schemas import (
     validate_envelope,
 )
 from .squad_loader import SquadPack, discover_squads
+from .fleet import dispatch_fleet
 from .squad_node import Dispatcher, execute_squad
 from .state import HydraState, TaskState
 
@@ -906,6 +907,257 @@ def build_supervisor(
                 _seen_dispatch_ids.add(_tid)
                 _dispatch_tasks.append(_t)
 
+        # WS8 SLICE 1 — shared payload factory used by BOTH the sequential loop
+        # and the fleet path so construction is never duplicated.
+        # WS9 Fix 2: thread task.model_tier onto the dispatch packet so
+        # _via_mcp can route to the correct pp team/profile.
+        def _build_payload(task: TaskState) -> CSuiteDecisionPacket:
+            # WS8 SLICE 1: per-task repo wins over workflow-level target_repo_id.
+            # task.target_repo_id is set by the planner (or /hydra:run --repo) to
+            # enable distinct-repo fleet dispatch.  Falls back to the workflow root.
+            pack_for_task = packs.get(task.owner_squad)
+            _task_repo_id = getattr(task, "target_repo_id", None)
+            return CSuiteDecisionPacket(
+                workflow_id=state.workflow_id,
+                origin_squad="hydra",
+                target_squad=pack_for_task.slug if pack_for_task else task.owner_squad,
+                origin="BOARDROOM",
+                objective=task.description,
+                target_repo_id=_task_repo_id if _task_repo_id is not None else state.target_repo_id,
+                model_tier=getattr(task, "model_tier", None),
+            )
+
+        # WS8 Fix 5: build EVERY pending task's payload EXACTLY ONCE, up-front,
+        # before the fleet/sequential branch decision. Both paths consume
+        # _all_task_payloads; _build_payload is never called a second time.
+        # A build failure for a task produces None in the map; that task falls
+        # to the sequential path and fails there (pack missing or exception).
+        _all_task_payloads: dict[int, Any] = {}
+        for _pt in _dispatch_tasks:
+            if _pt.status == "pending":
+                try:
+                    _all_task_payloads[id(_pt)] = _build_payload(_pt)
+                except Exception:
+                    pass  # None entry; sequential loop will mark task failed
+
+        # WS8 SLICE 1: fleet gating predicate.
+        # Eligibility: fleet_parallel flag AND >=2 pending tasks that are:
+        #   (a) NOT best-of-N, (b) pack.entrypoint == "mcp" (engineering only),
+        #   (c) have DISTINCT non-None task.target_repo_id values.
+        # Non-mcp tasks (impersonation/claude-skill/stub) are never fleet-eligible
+        # because they race on state.error_counters and ignore target_repo_id
+        # (fleet.py engineering-only eligibility). They remain on the sequential path.
+        _fleet_candidate_tasks: list[TaskState] = [
+            t for t in _dispatch_tasks
+            if t.status == "pending"
+            and packs.get(t.owner_squad) is not None
+            and not (packs[t.owner_squad].best_of_n and packs[t.owner_squad].best_of_n >= 2)
+            and packs[t.owner_squad].entrypoint == "mcp"  # Fix 3+4: mcp-only
+            and id(t) in _all_task_payloads  # skip tasks whose payload build failed
+        ]
+        # Alias: fleet candidates share the already-built payloads.
+        _fleet_candidate_payloads: dict[int, Any] = {
+            id(t): _all_task_payloads[id(t)] for t in _fleet_candidate_tasks
+        }
+
+        _distinct_non_none_repo_ids: set[str] = {
+            str(_fleet_candidate_payloads[id(t)].target_repo_id)
+            for t in _fleet_candidate_tasks
+            if id(t) in _fleet_candidate_payloads
+            and _fleet_candidate_payloads[id(t)].target_repo_id is not None
+        }
+
+        _use_fleet = (
+            state.fleet_parallel
+            and len(_fleet_candidate_tasks) >= 2
+            and len(_distinct_non_none_repo_ids) >= 2
+        )
+
+        if _use_fleet:
+            # WS8 SLICE 1: parallel fleet path.
+            # Dispatcher factory: each worker gets a FRESH dispatcher with its OWN
+            # asyncio event loop (Fix 2 -- no shared loop race).
+            # MCPStdioDispatcher._run calls run_until_complete on self._loop; two
+            # threads sharing one loop would raise "This event loop is already running".
+            # Constructing per-worker MCPStdioDispatcher instances (same project_root
+            # + verbose setting) gives each worker an independent _loop=None baseline.
+            if hasattr(dispatcher, "project_root"):
+                _pr = dispatcher.project_root
+                _vb = getattr(dispatcher, "verbose", False)
+                _dcls = dispatcher.__class__
+                # RBAC: capture the allow-list map and active handoffs from the
+                # original (already-configured) dispatcher so each worker dispatcher
+                # enforces IDENTICAL tool allow-lists. A blank _squad_packs={} would
+                # let fleet MCP calls bypass per-squad RBAC entirely.
+                _squad_packs_snapshot: dict[str, Any] = dict(
+                    getattr(dispatcher, "_squad_packs", {}) or {}
+                )
+                _handoffs_snapshot: list[dict[str, Any]] = list(
+                    getattr(dispatcher, "_active_handoffs", []) or []
+                )
+                # _tool_tracker is MUTATED on every MCP call (appends to _calls
+                # list on each invocation) so it MUST NOT be shared across worker
+                # threads.  Each worker gets a FRESH tracker; the original tracker
+                # is only referenced here to copy its _packs config (read-only).
+                _orig_tracker: Any = getattr(dispatcher, "_tool_tracker", None)
+                _tracker_packs: Any = (
+                    getattr(_orig_tracker, "_packs", {}) if _orig_tracker is not None else {}
+                )
+
+                def _dispatcher_factory(
+                    _cls: type = _dcls,
+                    _root: Any = _pr,
+                    _v: bool = _vb,
+                    _sp: dict[str, Any] = _squad_packs_snapshot,
+                    _ho: list[dict[str, Any]] = _handoffs_snapshot,
+                    _tp: Any = _tracker_packs,
+                ) -> Dispatcher:
+                    d = _cls(project_root=_root, verbose=_v)
+                    # RBAC: shared read-only state (packs + handoffs are not mutated
+                    # during dispatch — only read by _check_tool_rbac).
+                    if hasattr(d, "set_squad_packs"):
+                        d.set_squad_packs(_sp)
+                    if hasattr(d, "_active_handoffs"):
+                        d._active_handoffs = list(_ho)
+                    # Tool tracker: FRESH instance per worker (not the shared ref)
+                    # so concurrent .record() calls never race on one list.
+                    # The factory does NOT append to any shared list — pure
+                    # construct+configure+return (no side effects on shared state).
+                    if hasattr(d, "_tool_tracker") and _orig_tracker is not None:
+                        from .tool_analytics import ToolUsageTracker
+                        d._tool_tracker = ToolUsageTracker(packs=_tp)
+                    return d
+            else:
+                # Stub/mock dispatchers have no asyncio loop; safe to share.
+                def _dispatcher_factory(_d: Dispatcher = dispatcher) -> Dispatcher:  # type: ignore[misc]
+                    return _d
+
+            # Wrap stored payloads so dispatch_fleet never calls build_payload again.
+            def _stored_payload_builder(task: TaskState) -> Any:
+                return _fleet_candidate_payloads[id(task)]
+
+            _fleet_results, _fleet_worker_trackers = dispatch_fleet(
+                state,
+                _fleet_candidate_tasks,
+                _dispatcher_factory,
+                build_payload=_stored_payload_builder,
+                packs=packs,
+                max_concurrency=getattr(state, "fleet_max_concurrency", None),
+            )
+            # Merge per-worker tool tracker calls into the original tracker.
+            # Iterate in INPUT INDEX ORDER (0..n-1) so the merge is deterministic
+            # regardless of thread completion order.  Writing to a distinct
+            # pre-allocated slot (in dispatch_fleet) means no shared list.append
+            # ever ran from a worker thread — race-free by design.
+            _orig_tt = getattr(dispatcher, "_tool_tracker", None)
+            if _orig_tt is not None:
+                for _wt in _fleet_worker_trackers:
+                    if _wt is not None:
+                        _orig_tt._calls.extend(_wt._calls)
+                        _wt._calls = []  # free memory; worker is done
+
+            # Fix 6 (two-pass fleet merge):
+            # PASS 1 -- charge ALL fleet results before making any budget decision.
+            # Since all workers have already joined, every result is available.
+            # Charging them one at a time (sequentially in the main thread) keeps
+            # the ledger monotonic. We record which tasks blocked and which
+            # triggered downgrade, but we do NOT surface HITL until pass 2.
+            _fleet_any_block = False
+            _fleet_last_blocking_squad = ""
+            for fleet_task, result in zip(_fleet_candidate_tasks, _fleet_results):
+                pack = packs.get(fleet_task.owner_squad)
+                # Always extract and charge cost for EVERY result — even failed ones.
+                # A failed paid MCP call may still have incurred spend; skipping the
+                # charge produces ledger undercount and makes the HITL budget summary
+                # inaccurate (Fix 6 gap: failed results must be charged before continue).
+                _cost_usd, _cost_tok = _extract_squad_cost(result)
+                if pack is not None:
+                    _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+                    if _cost_usd == 0.0 and _cost_tok == 0:
+                        emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
+                            "site": "dispatch_fleet", "squad": pack.slug,
+                        })
+                    if _downgrade and not state.budget_downgrade_active:
+                        state.budget_downgrade_active = True
+                        emit_trace(judge_trace_root, state.workflow_id, "budget.downgrade_tripwire", {
+                            "percent_consumed": state.budget.percent_consumed,
+                            "spent_usd": state.budget.spent_usd,
+                            "budget_usd": state.budget.budget_usd,
+                            "squad": pack.slug,
+                        })
+                    if _block:
+                        _fleet_any_block = True
+                        _fleet_last_blocking_squad = pack.slug
+                # Now handle the failed/no-pack path AFTER charging.
+                if pack is None or result.status == "failed":
+                    fleet_task.status = "failed"
+                    if pack is not None:
+                        state.error_counters[fleet_task.owner_squad] = (
+                            state.error_counters.get(fleet_task.owner_squad, 0) + 1
+                        )
+                    continue
+                # Regardless of _block, record the task status and collect
+                # envelopes/artifacts so the ledger and downstream state are
+                # complete before the budget decision (pass 2).
+                fleet_task.status = result.status
+                for produced in result.envelopes:
+                    d = produced.model_dump(mode="json")
+                    try:
+                        d = _validate_and_redact_envelope(
+                            d, direction="inbound_from_squad",
+                            squad_id=pack.slug,
+                        )
+                    except (ValueError, Exception):
+                        fleet_task.status = "failed"
+                        state.error_counters[fleet_task.owner_squad] = (
+                            state.error_counters.get(fleet_task.owner_squad, 0) + 1
+                        )
+                        continue
+                    if result.host_pickup_pending:
+                        d["_host_pickup_pending"] = True
+                    d["_task_id"] = str(fleet_task.task_id)
+                    new_decisions.append(d)
+                    eights.envelope_record(d)
+                artifacts.extend(result.artifacts)
+
+            # PASS 2 -- budget block decision, now that ALL spend is charged.
+            # The ledger reflects the full fleet spend; the HITL summary is accurate.
+            if _fleet_any_block:
+                state.budget_downgrade_active = True
+                emit_trace(judge_trace_root, state.workflow_id, "budget.over_budget_surface", {
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                    "site": "dispatch_fleet",
+                    "squad": _fleet_last_blocking_squad,
+                })
+                _hitl_fleet_budget: dict[str, Any] = {
+                    "workflow_id": str(state.workflow_id),
+                    "reason": "over_budget",
+                    "gate_node": "dispatch",
+                    "summary": (
+                        f"Budget exhausted (fleet): ${state.budget.spent_usd:.4f} of "
+                        f"${state.budget.budget_usd:.2f} (all {len(_fleet_results)} "
+                        f"fleet results charged before surface)."
+                    ),
+                    "options": ["approve_override", "abort"],
+                    "default_option": "abort",
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                }
+                eights.hitl_request(_hitl_fleet_budget, gate_node="dispatch")
+                return {
+                    "envelopes": new_decisions,
+                    "artifacts": artifacts,
+                    "verdicts": bon_verdicts,
+                    "phase": "surfaced",
+                    "pending_hitl": _hitl_fleet_budget,
+                    "budget_downgrade_active": True,
+                    "open_pp_runs": state.open_pp_runs,
+                }
+            # Fleet tasks now have status != "pending"; the sequential loop
+            # below skips them. Non-mcp and best-of-N tasks are still pending.
+
+        # --- Original sequential dispatch path (default; unchanged) ----------
         for task in _dispatch_tasks:
             if task.status != "pending":
                 continue
@@ -940,17 +1192,15 @@ def build_supervisor(
                 continue
 
             # Standard single-shot dispatch.
-            # WS9 Fix 2: thread task.model_tier onto the dispatch packet so
-            # _via_mcp can route to the correct pp team/profile.
-            payload = CSuiteDecisionPacket(
-                workflow_id=state.workflow_id,
-                origin_squad="hydra",
-                target_squad=pack.slug,
-                origin="BOARDROOM",
-                objective=task.description,
-                target_repo_id=state.target_repo_id,
-                model_tier=getattr(task, "model_tier", None),
-            )
+            # Fix 5: consume the pre-built payload; never call _build_payload again.
+            payload = _all_task_payloads.get(id(task))
+            if payload is None:
+                # Payload build failed up-front; fail the task now.
+                task.status = "failed"
+                state.error_counters[task.owner_squad] = (
+                    state.error_counters.get(task.owner_squad, 0) + 1
+                )
+                continue
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
             except Exception as e:

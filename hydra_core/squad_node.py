@@ -70,6 +70,7 @@ def execute_squad(
     dispatcher: Dispatcher,
     *,
     allow_archived: bool = False,
+    collect_open_runs: list | None = None,
 ) -> SquadResult:
     """Single entry point. Selects strategy by `pack.entrypoint`.
 
@@ -103,7 +104,8 @@ def execute_squad(
     if pack.entrypoint == "stub":
         result = _stub(pack, inbound)
     elif pack.entrypoint == "mcp":
-        result = _via_mcp(state, pack, inbound, dispatcher)
+        result = _via_mcp(state, pack, inbound, dispatcher,
+                          collect_open_runs=collect_open_runs)
     elif pack.entrypoint == "agent-impersonation":
         result = _via_impersonation(state, pack, inbound, dispatcher)
     elif pack.entrypoint == "claude-skill":
@@ -155,6 +157,8 @@ def _via_mcp(
     pack: SquadPack,
     inbound: HydraEnvelope,
     dispatcher: Dispatcher,
+    *,
+    collect_open_runs: list | None = None,
 ) -> SquadResult:
     """Wire into the pair-programmer harness (engineering squad).
 
@@ -299,7 +303,16 @@ def _via_mcp(
     # finalize.
     if run_id and isinstance(run_id, str) and project_path:
         try:
-            state.open_pp_runs.append({"run_id": run_id, "project_path": str(project_path)})
+            _entry: dict[str, str] = {"run_id": run_id, "project_path": str(project_path)}
+            if collect_open_runs is not None:
+                # Fleet path: caller owns a per-task collector; the fleet merges
+                # all collectors into state.open_pp_runs in the MAIN thread after
+                # the parallel join so workers never mutate shared state.
+                collect_open_runs.append(_entry)
+            else:
+                # Sequential / non-fleet path: mutate state directly (safe —
+                # single-threaded node_dispatch context).
+                state.open_pp_runs.append(_entry)
         except Exception:  # noqa: BLE001 — never crash dispatch on state writes
             pass
 
