@@ -43,6 +43,7 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 - Type-annotate everything in `hydra_core/`.
 - Keep `hydra_core/` runtime-agnostic — dispatchers are injected, no provider SDK imports.
 - Tests under `tests/` use `pytest`. Avoid network or LLM calls in unit tests.
+- **no-premature-done**: do not declare a task done until `pytest` (the full relevant suite, not just the new test) passes and the build is clean. A frozen contract in a sibling module can break silently if only the new test is checked.
 
 ## Security
 
