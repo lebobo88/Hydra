@@ -266,6 +266,42 @@ still work when backends are absent from `~/.claude.json`.
 
 See `docs/MCP_SETUP.md` for migration and setup instructions.
 
+### 6f. AgentMesh enrollment (the binding control plane)
+
+Hydra is an enrolled member of **[AgentMesh](https://github.com/lebobo88/AgentMesh)**,
+the thin governed control plane that binds the nine sibling AI systems
+into one mesh. AgentMesh provides one registry (SQLite
+`~/.agentmesh/state.db`, the **sole writer** of `~/.hydra/backends.json`),
+one lifecycle supervisor, one observability plane, one federated
+read-only audit timeline, one external protocol edge (A2A, REST,
+MCP-over-HTTP), and one operator console. It **enforces no governance of
+its own** — authority remains with TheEights → AgentSmith → Hydra; the
+mesh routes and observes, it does not arbitrate.
+
+Hydra enrolls via the root **`mesh-manifest.yaml`** (`kind: SiblingManifest`),
+which AgentMesh validates fail-closed: JSON-Schema validation against
+`mesh-manifest.schema.json`, constitution attestation through TheEights
+(`eights.constitution.attest` with `consumer="hydra"`, per the
+TheEights → AgentSmith → Hydra precedence order), and AgentSmith
+structural inspection must all pass before enrollment.
+
+The manifest surfaces Hydra's MCP servers to the mesh:
+
+| Manifest field | Value | Notes |
+|----------------|-------|-------|
+| `metadata.id` / `backendsKey` | `hydra` / `hydra_memory` | gateway registry key the mesh manages in `~/.hydra/backends.json` |
+| `runtime.entrypoint` | `mcp_servers/hydra_memory/__main__.py` | the enrolled `hydra_memory` surface |
+| `healthProbe.tool` | `hydra-mem.ping` | no-arg liveness probe |
+| `audit.exportTool` | `hydra-mem.list_workflow` | episodic records exported for federated audit stitching (authoritative chain stays in TheEights) |
+| `governance.attestTool` | `hydra-mem.read_episodic` | governance-connectivity probe; formal hash attestation routes through TheEights |
+
+The read-only workflow/squad/HITL surface (`hydra-mem.workflows_list`,
+`.workflow_status`, `.squad_list`, `.hitl_pending`) and the
+`hydra_control` resume/audit server (§6a) are what the unified mesh
+console reads and acts through. The mesh is the sole writer of
+`~/.hydra/backends.json`; Hydra's gateway and internal dispatcher (§6e)
+remain its readers.
+
 ## 7. Governance plane
 
 `hydra_core/governance.py` is intentionally small and pure. The key

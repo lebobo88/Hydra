@@ -25,46 +25,62 @@ Hydra does not re-implement the squads' work. It sits above them: classifying go
 
 ## The Ecosystem
 
-Hydra is one node in a governed constellation of six sibling projects. Each is independently shippable; together they form a unified AI operating system:
+Hydra is one node in a mesh of **nine sibling AI systems bound together by a tenth layer, [AgentMesh](https://github.com/lebobo88/AgentMesh)**. Each system is independently shippable; together they form a unified AI operating system. Several of the siblings below — ExecutiveSuite, RLM-Creative, MarketBliss, [Senate](https://github.com/lebobo88/Senate), and [Xenia](https://github.com/lebobo88/Xenia-Support) — are also Hydra *squads* (see [Squad topology](#what-hydra-is)); they appear here as ecosystem members in their own right.
 
 ```mermaid
 graph TD
-    HYDRA["🐍 Hydra<br/><em>Supervisor · Router · Synthesizer</em>"]
+    subgraph MESH["🕸️ AgentMesh — binding control plane (the tenth layer)"]
+      direction TB
+      HYDRA["🐍 Hydra<br/><em>Supervisor · Router · Synthesizer</em>"]
 
-    ES["👔 ExecutiveSuite<br/><em>20 C-suite agents · 4 orchestrators</em>"]
-    PP["⚙️ pair-programmer<br/><em>Best-of-N harness · 39 sub-agents</em>"]
-    RLM["🎨 RLM-Creative<br/><em>8 Garland Heads · Helios sub-crew</em>"]
-    MB["📣 MarketBliss<br/><em>5 marketing squads</em>"]
+      ES["👔 ExecutiveSuite<br/><em>20 C-suite agents · 4 orchestrators</em>"]
+      PP["⚙️ pair-programmer<br/><em>Best-of-N harness · 39 sub-agents</em>"]
+      RLM["🎨 RLM-Creative<br/><em>8 Garland Heads · Helios sub-crew</em>"]
+      MB["📣 MarketBliss<br/><em>5 marketing squads</em>"]
+      SENATE["⚖️ Senate<br/><em>12-jurist Curia · legal-compliance</em>"]
+      XENIA["🔥 Xenia<br/><em>11-agent Hearth · customer-support</em>"]
 
-    SMITH["🛡️ AgentSmith<br/><em>Meta-governance · N1–N10 invariants</em>"]
-    EIGHTS["∞ TheEights<br/><em>Hybrid memory · Gated self-evolution</em>"]
+      SMITH["🛡️ AgentSmith<br/><em>Meta-governance · N1–N10 invariants</em>"]
+      EIGHTS["∞ TheEights<br/><em>Root of trust · memory · self-evolution</em>"]
+    end
 
     HYDRA -->|"CSuiteDecisionPacket"| ES
     HYDRA -->|"PRD · DevTask"| PP
     HYDRA -->|"CreativeBrief · ShotList"| RLM
     HYDRA -->|"CreativeBrief"| MB
+    HYDRA -->|"LegalReview"| SENATE
+    HYDRA -->|"SupportTask"| XENIA
 
     ES -->|"DecisionRecord"| HYDRA
     PP -->|"DecisionRecord"| HYDRA
     RLM -->|"DecisionRecord"| HYDRA
+    SENATE -->|"DecisionRecord"| HYDRA
+    XENIA -->|"DecisionRecord"| HYDRA
 
     SMITH -.->|"validates"| HYDRA
     SMITH -.->|"validates"| ES
     SMITH -.->|"validates"| PP
     SMITH -.->|"validates"| RLM
 
+    EIGHTS -.->|"root of trust · MemoryRef"| SMITH
     EIGHTS -.->|"MemoryRef handles"| HYDRA
     EIGHTS -.->|"memory"| ES
     EIGHTS -.->|"memory"| PP
     EIGHTS -.->|"memory"| RLM
 
+    MESH -.->|"enroll · route · observe (no governance of its own)"| EIGHTS
+
     click ES "https://github.com/lebobo88/ExecutiveSuite"
     click PP "https://github.com/lebobo88/pair-programmer"
     click RLM "https://github.com/lebobo88/RLM-Creative"
     click MB "https://github.com/lebobo88/MarketBliss"
+    click SENATE "https://github.com/lebobo88/Senate"
+    click XENIA "https://github.com/lebobo88/Xenia-Support"
     click SMITH "https://github.com/lebobo88/AgentSmith"
     click EIGHTS "https://github.com/lebobo88/TheEights"
 ```
+
+**AgentMesh — binding control plane.** The tenth layer, [AgentMesh](https://github.com/lebobo88/AgentMesh), is the thin, governed control plane that binds the nine systems into one mesh: ONE registry (SQLite `~/.agentmesh/state.db`; sole writer of `~/.hydra/backends.json`), ONE lifecycle supervisor (Win32 Job Objects + crash-loop breaker + health probes), ONE observability plane (OTEL + structured logs), ONE federated read-only audit timeline (stitched from TheEights / AgentSmith / Hydra chains), ONE external protocol edge (A2A, REST, MCP-over-HTTP), and ONE operator web console. Systems **enroll** by installing a root `mesh-manifest.yaml` validated against AgentMesh's `mesh-manifest.schema.json` — fail-closed: JSON-Schema validation + constitution attestation (via TheEights) + AgentSmith structural inspection must all pass. AgentMesh **enforces no governance of its own**; authority stays with TheEights → AgentSmith → Hydra (precedence order). It routes and observes; it does not arbitrate. Hydra ships its own `mesh-manifest.yaml` at the repo root (enrolling the `hydra_memory` surface).
 
 | Project | Role | Link |
 |---|---|---|
@@ -73,8 +89,11 @@ graph TD
 | **[pair-programmer](https://github.com/lebobo88/pair-programmer)** | Engineering harness — best-of-N, cross-vendor judging, 39 sub-agents, 16 profiles | [GitHub](https://github.com/lebobo88/pair-programmer) |
 | **[RLM-Creative](https://github.com/lebobo88/RLM-Creative)** | Eight Garland Heads studio — 8 Muses + Helios photo/cinema sub-crew | [GitHub](https://github.com/lebobo88/RLM-Creative) |
 | **[MarketBliss](https://github.com/lebobo88/MarketBliss)** | Marketing operations — 5 squads (strategy, creative, research, production, ops) | [GitHub](https://github.com/lebobo88/MarketBliss) |
+| **[Senate](https://github.com/lebobo88/Senate)** | Legal wing — "the Curia": 12 jurists under the Twelve Tables, Law of Citations + Tribune's Veto (HITL); Hydra's **legal-compliance** squad | [GitHub](https://github.com/lebobo88/Senate) |
+| **[Xenia](https://github.com/lebobo88/Xenia-Support)** | Customer-support "Hearth" — 11-agent crew for triage, recommendation, VoC, approval-gated execution with WS-AUTH; Hydra's **customer-support** squad | [GitHub](https://github.com/lebobo88/Xenia-Support) |
 | **[AgentSmith](https://github.com/lebobo88/AgentSmith)** | Meta-governance daemon — Factory / Inspector / Sentinel / Archivist, N1–N10 invariants | [GitHub](https://github.com/lebobo88/AgentSmith) |
-| **[TheEights](https://github.com/lebobo88/TheEights)** | Persistent hybrid memory + governance + gated self-evolution substrate (optional) | [GitHub](https://github.com/lebobo88/TheEights) |
+| **[TheEights](https://github.com/lebobo88/TheEights)** | Root of trust — persistent hybrid memory + governance + gated self-evolution substrate (optional) | [GitHub](https://github.com/lebobo88/TheEights) |
+| **[AgentMesh](https://github.com/lebobo88/AgentMesh)** | Binding control plane (the tenth layer) — one registry, lifecycle supervisor, observability, federated audit, protocol edge, operator console; enforces no governance of its own | [GitHub](https://github.com/lebobo88/AgentMesh) |
 
 ---
 
