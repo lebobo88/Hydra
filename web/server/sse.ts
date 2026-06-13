@@ -53,38 +53,14 @@ import {
   type Stats,
 } from 'node:fs';
 import { stat as statAsync } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
-import { existsSync as existsSyncFs } from 'node:fs';
+import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { checkpointsReader } from './checkpoints-reader.js';
+import { findHydraRoot } from './hydra-root.js';
 
 // ---------------------------------------------------------------------------
-// Hydra root resolution (mirrors hydra-mem-client.ts)
+// Hydra root resolution (shared — see ./hydra-root.ts)
 // ---------------------------------------------------------------------------
-
-function findHydraRoot(): string {
-  const envRoot = process.env['HYDRA_ROOT'];
-  if (typeof envRoot === 'string' && envRoot.length > 0 && existsSyncFs(envRoot)) return envRoot;
-
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    const candidates = [
-      resolve(__dirname, '..', '..'),
-      resolve(__dirname, '..', '..', '..'),
-    ];
-    for (const c of candidates) {
-      if (existsSyncFs(join(c, 'hydra_core', 'telemetry.py'))) return c;
-    }
-  } catch {
-    // import.meta.url unavailable — fall through
-  }
-
-  return 'C:/AiAppDeployments/Hydra';
-}
 
 export const HYDRA_ROOT = findHydraRoot();
 

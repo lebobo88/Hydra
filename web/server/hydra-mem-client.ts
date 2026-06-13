@@ -11,10 +11,11 @@
  *   - Graceful child shutdown.
  *   - Child-died surfaces as a clean degraded error; never hangs.
  *
- * Launch resolution order (HYDRA_ROOT env var → repo-relative fallback → absolute):
- *   1. HYDRA_ROOT env var (operator override)
- *   2. ../.. relative to web/ directory (C:\AiAppDeployments\Hydra)
- *   3. Absolute fallback: C:/AiAppDeployments/Hydra
+ * Launch resolution order (see findHydraRoot in ./hydra-root.ts):
+ *   1. HYDRA_ROOT env var (operator override, existence-gated)
+ *   2. anchor-relative discovery from import.meta.url (fixed candidates + upward walk)
+ *   3. existence-gated ~/AiAppDeployments/Hydra convenience path
+ *   If none resolve, findHydraRoot THROWS — there is no hardcoded absolute fallback.
  *
  * The server is launched as:
  *   python -m mcp_servers.hydra_memory
@@ -29,46 +30,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { Writable, Readable } from 'node:stream';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { cockpitEnvelope } from './operator.js';
-
-// ---------------------------------------------------------------------------
-// Hydra root discovery
-// ---------------------------------------------------------------------------
-
-function findHydraRoot(): string {
-  // 1. Explicit env override
-  const envRoot = process.env['HYDRA_ROOT'];
-  if (envRoot && existsSync(envRoot)) return envRoot;
-
-  // 2. Repo-relative: web/server/hydra-mem-client.ts → ../../ = Hydra root
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    // Running from dist-server/: two levels up is web/, three is Hydra root
-    // Running from server/ (tsx): two levels up is Hydra root
-    const candidates = [
-      resolve(__dirname, '..', '..'),         // server/ → web/ → Hydra/
-      resolve(__dirname, '..', '..', '..'),   // dist-server/ → web/ → Hydra/
-    ];
-    for (const c of candidates) {
-      if (existsSync(join(c, 'mcp_servers', 'hydra_memory', 'server.py'))) {
-        return c;
-      }
-    }
-  } catch {
-    // import.meta.url unavailable — fall through
-  }
-
-  // 3. Absolute fallback
-  const abs = join(homedir(), 'AiAppDeployments', 'Hydra');
-  if (existsSync(abs)) return abs;
-
-  return 'C:/AiAppDeployments/Hydra';
-}
+import { findHydraRoot } from './hydra-root.js';
 
 // ---------------------------------------------------------------------------
 // Fixed cockpit envelope (injected on every call — browser cannot override)

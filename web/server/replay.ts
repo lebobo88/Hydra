@@ -26,13 +26,12 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, openSync, constants as fsConstants, existsSync } from 'node:fs';
+import { mkdirSync, openSync, constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
 import { buildSpawnOptions, WORKFLOW_ID_RE, type SpawnFn, type DetachOptions } from './launch.js';
+import { findHydraRoot } from './hydra-root.js';
 
 // ---------------------------------------------------------------------------
 // Validation alphabets — matching _KNOWN_PHASES and _MODEL_ID_RE in cli.py
@@ -55,31 +54,6 @@ export type KnownPhase = (typeof KNOWN_PHASES)[number];
  * Mirrors _MODEL_ID_RE in cli.py.
  */
 export const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9\-_./:]{0,127}$/;
-
-// ---------------------------------------------------------------------------
-// Hydra root resolution (mirrors launch.ts)
-// ---------------------------------------------------------------------------
-
-function findHydraRoot(): string {
-  const envRoot = process.env['HYDRA_ROOT'];
-  if (envRoot && existsSync(envRoot)) return envRoot;
-
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    const candidates = [
-      resolve(__dirname, '..', '..'),
-      resolve(__dirname, '..', '..', '..'),
-    ];
-    for (const c of candidates) {
-      if (existsSync(join(c, 'hydra_core', 'cli.py'))) return c;
-    }
-  } catch {
-    // import.meta.url unavailable
-  }
-
-  return 'C:/AiAppDeployments/Hydra';
-}
 
 // ---------------------------------------------------------------------------
 // Validation error

@@ -29,9 +29,7 @@ import { mkdirSync, openSync, constants as fsConstants } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { findHydraRoot } from './hydra-root.js';
 
 // ---------------------------------------------------------------------------
 // Validation alphabets — BYTE-IDENTICAL to hydra_control/server.py
@@ -49,31 +47,6 @@ export const WORKFLOW_ID_RE = /^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$/;
  * Squads are internal names like 'engineering', 'creative-ds', 'executive'.
  */
 const SQUAD_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-
-// ---------------------------------------------------------------------------
-// Hydra root resolution (mirrors hydra-mem-client.ts)
-// ---------------------------------------------------------------------------
-
-function findHydraRoot(): string {
-  const envRoot = process.env['HYDRA_ROOT'];
-  if (envRoot && existsSync(envRoot)) return envRoot;
-
-  try {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    const candidates = [
-      resolve(__dirname, '..', '..'),
-      resolve(__dirname, '..', '..', '..'),
-    ];
-    for (const c of candidates) {
-      if (existsSync(join(c, 'hydra_core', 'cli.py'))) return c;
-    }
-  } catch {
-    // import.meta.url unavailable
-  }
-
-  return 'C:/AiAppDeployments/Hydra';
-}
 
 // ---------------------------------------------------------------------------
 // Detach-options builder (exported for unit tests)
