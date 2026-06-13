@@ -92,9 +92,29 @@ python -m hydra_core.cli gateway-rollback
 
 ## Fresh Machine Setup
 
+Run the portability bootstrap, which resolves `AIAPP_BASE`/`HYDRA_ROOT`
+dynamically (no hardcoded paths) and generates `~/.hydra/backends.json` from
+`scripts/backends.template.json`:
+
+```powershell
+# Windows / PowerShell
+cd <AIAPP_BASE>\Hydra
+.\scripts\setup.ps1
+```
+
 ```bash
+# macOS / Linux / Git Bash
+cd <AIAPP_BASE>/Hydra
+bash scripts/setup.sh
+```
+
+This also (re)creates the `squads/marketing-*` symlinks. See
+[`PORTABILITY.md`](./PORTABILITY.md) for the full `AIAPP_BASE` convention and
+resolution order.
+
+```bash
+# Alternatively, detect-and-generate via the CLI (legacy path):
 python -m hydra_core.cli gateway-setup
-# Detects which sibling projects exist, generates backends.json
 ```
 
 ## Two-Layer Registry Architecture
@@ -105,6 +125,8 @@ python -m hydra_core.cli gateway-setup
 | Backend registry | `~/.hydra/backends.json` | Hydra gateway + internal dispatcher |
 
 In gateway mode, `~/.claude.json` contains only `hydra_gateway`. The actual backend specs live in `~/.hydra/backends.json`, which the gateway reads to discover and proxy to backends. Hydra's internal dispatcher (supervisor, judge, squad_node) also reads `backends.json` as a fallback, so internal Python-level calls still work.
+
+`~/.hydra/backends.json` is machine-local and **never committed** (it holds resolved absolute paths). The committed source of truth is `scripts/backends.template.json`, which uses `{{AIAPP_BASE}}` / `{{HYDRA_ROOT}}` placeholders. Regenerate it by re-running `scripts/setup.{ps1,sh}` — never hand-edit absolute paths into the registry. See [`PORTABILITY.md`](./PORTABILITY.md).
 
 ## Available Backends
 

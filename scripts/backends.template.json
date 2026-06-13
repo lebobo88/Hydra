@@ -1,0 +1,174 @@
+{
+  "pp_harness": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{AIAPP_BASE}}/pair-programmer/daemon/dist/index.js",
+      "mcp"
+    ]
+  },
+  "pp_codex": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{AIAPP_BASE}}/pair-programmer/daemon/dist/index.js",
+      "mcp-codex"
+    ],
+    "env": {}
+  },
+  "pp_gemini": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{AIAPP_BASE}}/pair-programmer/daemon/dist/index.js",
+      "mcp-gemini"
+    ],
+    "env": {}
+  },
+  "eights": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{AIAPP_BASE}}/TheEights/daemon/dist/index.js"
+    ]
+  },
+  "agentsmith": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{AIAPP_BASE}}/AgentSmith/daemon/dist/index.js"
+    ]
+  },
+  "hydra_memory": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.hydra_memory"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_EPISODIC_DB": "${USERPROFILE}/.hydra/episodic.db",
+      "HYDRA_VECTOR_DIR": "${USERPROFILE}/.hydra/vectors",
+      "HYDRA_MEM_FEDERATE_EIGHTS": "1",
+      "HYDRA_MEM_FEDERATE_TIMEOUT": "8"
+    }
+  },
+  "executive_suite": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.executive_suite"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_ES_ROOT": "{{AIAPP_BASE}}/ExecutiveSuite"
+    }
+  },
+  "rlm_creative": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.rlm_creative"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_RLM_ROOT": "{{AIAPP_BASE}}/RLM-Creative"
+    }
+  },
+  "xenia": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.xenia"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_XENIA_ROOT": "{{AIAPP_BASE}}/Xenia"
+    }
+  },
+  "senate": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.senate"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_SENATE_ROOT": "{{AIAPP_BASE}}/Senate"
+    }
+  },
+  "xenia_kb": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.xenia_kb"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_XENIA_ROOT": "{{AIAPP_BASE}}/Xenia"
+    }
+  },
+  "xenia_tickets": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.xenia_tickets"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_XENIA_ROOT": "{{AIAPP_BASE}}/Xenia"
+    }
+  },
+  "marketbliss": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.marketbliss"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_MB_ROOT": "{{AIAPP_BASE}}/MarketBliss"
+    }
+  },
+  "hydra_control": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.hydra_control"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_ROOT": "{{HYDRA_ROOT}}"
+    }
+  },
+  "hydra-cockpit": {
+    "type": "stdio",
+    "command": "node",
+    "args": [
+      "{{HYDRA_ROOT}}/web/web/server/index.ts"
+    ],
+    "env": {
+      "HYDRA_COCKPIT_BRIDGE_PORT": "8795",
+      "HYDRA_ROOT": "{{HYDRA_ROOT}}",
+      "PYTHONPATH": "{{HYDRA_ROOT}}"
+    }
+  }
+}
