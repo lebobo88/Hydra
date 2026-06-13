@@ -45,10 +45,17 @@ modes a contributor should expect.
 | executive    |    | hydra_memory   |   | ~/.hydra/      |
 | engineering  |    | executive_suite|   |   episodic.db  |
 | garland      |    | rlm_creative   |   |   vectors/     |
-| 5 marketing  |    | hydra_toolshed |   |   checkpoints  |
-| 5 stubs      |    | hydra_gateway  |   |                |
+| legal/Curia  |    | hydra_control  |   |   checkpoints  |
+| customer-sup |    | xenia_tickets  |   |                |
+| 5 marketing  |    | hydra_toolshed |   |                |
+| 3 stubs      |    | hydra_gateway  |   |                |
 +--------------+    +----------------+   +----------------+
 ```
+
+Squad census: **13 packs, 10 active** (executive, engineering, garland,
+legal-compliance/Curia, customer-support/Xenia Hearth, and the 5 `marketing-*`
+packs — the latter are filesystem symlinks into the MarketBliss checkout) **and
+3 stubs** (healthcare, sales-gtm, research-ds).
 
 A Claude Code session loads the plugin. The plugin's hooks initialize the
 registry and start the supervisor on `/hydra:run`. The supervisor compiles
@@ -189,12 +196,21 @@ The servers fall into three categories:
 | `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of RLM-Creative's `.claude/` directory |
 | `hydra_toolshed` | `mcp_servers/hydra_toolshed/server.py` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
 | `hydra_gateway` | `mcp_servers/hydra_gateway/server.py` | Unified proxy — consolidates all backend servers behind a single MCP registration with static tool catalog and on-demand backend connections |
+| `hydra_control` | `mcp_servers/hydra_control/server.py` | Workflow-resume gate + cockpit audit filing. 3 tools: `hydra.control.ping`, `hydra.workflow.resume` (launches the CLI resume path for a paused HITL gate — approve/reject/modify-budget/force-dispatch), `hydra.cockpit.audit` (files a `cockpit_write` audit envelope through the attestor for actions taken from the mesh console) |
+| `xenia_tickets` | `mcp_servers/xenia_tickets/server.py` | Customer-support ticket filing for the Xenia Hearth squad. 9 tools: `xenia-tickets.create`, `.get`, `.list`, `.comment`, `.update_fields`, `.recommend`, `.send_response`, `.execute_approved`, `.ping`. Mutating tools (`send_response`, `execute_approved`) verify a server-side WS-AUTH operator/agent capability token (`mint_for_tool.py` + `clearance.py`) before acting — actor identity is taken from the dispatcher binding, never self-reported |
+
+(Other shipped pack-shim servers — `xenia`, `xenia_kb`, `senate`,
+`marketbliss` — follow the same read-only-introspection pattern as
+`executive_suite`/`rlm_creative`.)
 
 These are pack-shim servers that read filesystem state from sibling
 projects. They are **not** the primary execution path for their
 respective squads — `executive_suite` and `rlm_creative` provide
 enrichment data (live roster, skill catalogue) while the actual work
 flows through `agent-impersonation` and `claude-skill` entrypoints.
+`hydra_control` and `xenia_tickets` are the exception: they perform
+real side-effecting writes (workflow resume, audit filing, ticket
+mutation) and therefore enforce HITL-capability / WS-AUTH gating.
 
 ### 6b. Externally registered sibling servers (operator must install)
 
@@ -267,6 +283,29 @@ enforce_governance(state, ...) -> GovernanceVerdict
 Behaviour:
 
 - **HITL**: `interrupt_before=["approval", "synthesis", "judge_synthesis"]`.
+  The planner builds and files the `pending_hitl` request *before* the
+  interrupt (so a paused workflow already carries the gate for
+  `/hydra:status` and TheEights' HITL queue). Three triggers raise the
+  approval gate:
+  - **high_risk** — any P0/P1 task, or any task whose squad has an explicit
+    `hitl_required` gate. `reason="high_risk"` is a frozen-contract value the
+    mesh console keys off of.
+  - **acceptance_criteria** (WS9) — a major (P0/P1) task on a squad *without*
+    its own `hitl_required` gate is dispatching with no structured
+    `TaskState.acceptance_criteria`. The gate pauses with
+    `reason="acceptance_criteria"` and options
+    `[approve_with_criteria, reject, modify-budget]`, asking the operator to
+    confirm or supply criteria before dispatch. When a squad gate already
+    fired (`reason="high_risk"` wins), missing-criteria detail is still
+    appended to the summary so the operator is never blind to it.
+  - **over_budget** — see Budget below.
+- **Model tier propagation** (WS9): `TaskState.model_tier` (`haiku | sonnet |
+  opus | fable | deep`, normalised by `hydra_core/tiers.py#normalize_tier`,
+  fail-closed on unknown tokens) is threaded from the dispatch envelope /
+  operator flag onto every per-squad dispatch packet and onto best-of-N and
+  Reflexion-retry packets (`supervisor.py`). `fable`/`deep` route to
+  pair-programmer's deep-reasoning team and are operator/flag-driven only —
+  there is no automatic escalation path.
 - **Budget**: enforced per workflow. At 80% consumption Hydra signals the
   current squad to downgrade model tier (mirrors PP's cost router); at
   100% it blocks dispatch and raises an HITL.
@@ -314,6 +353,97 @@ invokes `/rlm-team` (or fallbacks `/creative-campaign`,
 through the Claude Code skill mechanism. The garland squad emits
 `SHOT_LIST`, `ASSET_JOB`, and `DECISION_RECORD`. Outputs land under
 `RLM/output/{phase}/{topic}-{date}.md` per the squad yaml.
+
+## 8a. Cross-repo fleet dispatch (WS8)
+
+A single workflow can fan out engineering work across *distinct sibling
+repos* in parallel. Three `hydra_core` modules cooperate.
+
+### Sibling-repo registry (`hydra_core/repo_registry.py`)
+
+`target_repo_id` on `HydraState` directs pair-programmer at a sibling
+repository. Resolution is **allow-list-only** — raw path strings are
+rejected (the allow-list is the injection guard). The allow-list maps
+nine `repo_id`s (`hydra`, `pair-programmer`, `agentsmith`, `theeights`,
+`xenia`, `executivesuite`, `senate`, `marketbliss`, `rlm-creative`) to
+exact on-disk folder names under a shared base dir
+(`…/AiAppDeployments/`, overridable via `HYDRA_REPO_BASE`).
+`resolve_repo_path()` layers three guards: allow-list lookup → base-escape
+check (`candidate.is_relative_to(base)` defeats symlink traversal) → a real
+local `git -C <path> rev-parse --show-toplevel` (10 s timeout, no network)
+that must round-trip to the same path. CLI parsing helpers:
+`parse_repo_arg` (single `--repo <id>` / `--repo=<id>`) and
+`parse_repos_arg` (`--repos`/`--fleet <id,id,…>`, comma-list with
+whitespace tolerance, dedup preserving first-occurrence order).
+
+### Parallel fan-out (`hydra_core/fleet.py`)
+
+`dispatch_fleet()` is a bounded-concurrency `ThreadPoolExecutor` fan-out
+over `execute_squad`. Invariants:
+
+- **Distinct-repo guard** — two tasks sharing a `target_repo_id` (including
+  two both `None`) would collide on the per-project `.harness/.lock`;
+  duplicates are rejected *before* fan-out.
+- **mcp-only eligibility** — only `entrypoint="mcp"` packs are fleet-eligible.
+  Non-mcp packs race on `state.error_counters` or ignore `target_repo_id`,
+  so they stay on the sequential path.
+- **No shared-state mutation in workers** — each worker gets a *fresh*
+  `Dispatcher` from `dispatcher_factory()` (own asyncio loop, no shared
+  `run_until_complete()` races) and a per-call collector list; the main
+  thread merges `open_pp_runs` and the per-task `ToolUsageTracker` slots
+  after the join.
+- **Per-repo budget isolation** — each repo's run is scoped to its own
+  `.harness` budget; one repo overrunning does not charge another.
+- **Deterministic ordering** — results are collected via `as_completed`
+  (so cancellation fires on the first surfaced result regardless of submit
+  order) but stored by **input index**, so `results[i]` always corresponds
+  to `tasks[i]`.
+- **Cancellation tokens** — an optional `cancel_event` (read-only to
+  workers; set only by the main-thread collection loop) plus a
+  `should_cancel(result)` predicate. On trigger, `cancel_event` is set and
+  `future.cancel()` is called on every not-yet-started future, whose slot is
+  filled with `status="cancelled"`. In-flight workers past their entry-check
+  complete naturally — threads cannot be force-killed.
+- **Failure isolation** — one worker's exception yields a
+  `SquadResult(status="failed")` for that slot only; it never crashes the
+  fleet or cancels siblings.
+
+Concurrency is clamped to `[1, FLEET_MAX_CAP=8]` (default 4 via
+`state.fleet_max_concurrency`). Campaign wiring chains fleet dispatches
+across phases with deterministic multi-repo synthesis.
+
+### Operator-capability tokens (`hydra_core/auth/capability.py`)
+
+WS-AUTH mints HMAC-SHA256 operator-capability tokens that gate HITL
+resume and cross-system writes. Format is byte-identical to Xenia's signer
+so one token verifies in both systems on a shared key:
+
+```
+canonical = json.dumps({all fields except "sig"}, sort_keys=True,
+                        separators=(",",":"), ensure_ascii=True)
+sig.value = base64url-nopad( HMAC-SHA256(HYDRA_OPERATOR_KEY, canonical) )
+```
+
+- **Mint** — `mint_capability(payload)` requires `v, actor_id, actor_kind,
+  capability`; auto-generates a `jti` nonce and enforces strict expiry (`exp`
+  must be an exact `int`; default TTL 900 s). `mint_for_approval()` /
+  `apply_approval(state, operator)` derive the capability + `resource_id`
+  from the pending HITL gate and stash the token on
+  `state.operator_capability`. The seam is invoked by `cli.py`
+  `_cmd_resume_locked` on approve and by the `hydra-hitl-gate` agent.
+- **Inject** — the minted token rides on the resume / dispatch path to the
+  consuming system.
+- **Verify** — `verify_capability` (lower-level) and
+  `verify_operator_capability` (strict: `v==1`, `actor_kind=="human"`,
+  non-sentinel `actor_id`, required `workflow_id`/`resource_id` binding for
+  replay-prevention). Both **fail closed** on every error path including
+  degraded tokens, expiry (`now >= exp`), and signature mismatch
+  (constant-time compare), and never raise for any input shape.
+- **Degraded mode** — when `HYDRA_OPERATOR_KEY` is unset the token is still
+  produced with `sig.value=None, degraded=True` (instrument-first posture);
+  the approval is not blocked on Hydra's side, but consumers that call the
+  verifiers (TheEights and Xenia enforce them server-side on governance /
+  ticket writes) reject degraded tokens. The CLI logs a warning.
 
 ## 9. Failure modes and recovery
 

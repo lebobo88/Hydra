@@ -26,6 +26,16 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 | sales-gtm | (stub) | stub |
 | research-ds | (stub) | stub |
 
+**13 squads: 10 active, 3 stubs (healthcare, sales-gtm, research-ds).** The five
+`marketing-*` packs are filesystem symlinks into the MarketBliss checkout.
+`legal-compliance` is the **Curia** — Senate's Law-of-Citations council (9 jurists:
+Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian, +
+consilium Paulus/Modestinus/Janus); it deliberates by majority with Papinian's
+tiebreak and halts at the Tribune's Veto. `customer-support` is the **Xenia
+Hearth** — an active consumer squad (not a stub) for ticket triage, recommendation,
+and approval-gated execution, with server-side WS-AUTH capability enforcement on
+`send_response` / `execute_approved`.
+
 ## Hard Rules
 
 1. **Never edit `CONSTITUTION.md`.** It is the immortal head — the cryptographically hashed rule of faith. The user authors it; agents read it; the SHA-256 must be stable across a session. Proposed edits surface as HITL with reason=`constitution_breach`. See `hydra_core/immortal_head.py`.

@@ -41,6 +41,9 @@ description: >
 source_pack: <absolute path to upstream pack, or null for stub>
 entrypoint: <mcp | subprocess | agent-impersonation | claude-skill | stub>
 industries: [tag, tag, tag]            # used by router industry-boost
+version: <semver, default 1.0.0>       # optional
+deprecated_after: <ISO date or null>   # optional; Iolaus refuses dispatch on/after
+best_of_n: <int, default 0>            # optional; 0/1 = off, N>=2 = best-of-N (see below)
 
 agents:
   - slug: <kebab>
@@ -78,6 +81,28 @@ invoke:
 `industries` are normalized lowercase tags. They feed the router's
 industry-boost — pre-classified workflows (e.g. via a tenant profile)
 will up-weight squads whose `industries` overlap.
+
+`best_of_n` — **opt-in best-of-N sampling.** The loader
+(`squad_loader.py#_coerce_pack`) parses it as `int(data.get("best_of_n", 0)
+or 0)`, so `0`, `1`, or an absent field all mean *no best-of-N* (single-shot
+dispatch). A value of **N ≥ 2** makes the supervisor route the squad through
+`_dispatch_best_of_n` (`supervisor.py`): it produces N candidate outputs,
+judges each with the cross-vendor critique client, Borda-ranks them
+(`hydra_core/judge/borda.py` — meaningful tie-breaking needs N ≥ 3), returns
+the winner, and archives the losers to artifacts. Two extra guards apply:
+
+- Real judging only fires when the squad is in `judge_policy.enabled_squads`
+  (the Phase-2 allowlist) — otherwise N ≥ 2 would burn judge calls for no
+  gain; the branch falls back to single-shot.
+- best-of-N tasks are **excluded from the cross-repo fleet** fan-out
+  (`supervisor.py` filters `pack.best_of_n >= 2`), since N parallel
+  candidates against one repo would collide on the `.harness/.lock`.
+
+If anything in the best-of-N path errors, it falls back safely to single
+dispatch. Currently `executive` and `garland` set `best_of_n: 3`. (Note:
+this squad-level Borda field is distinct from the engineering squad's
+`invoke.mode: pp_best_of`, which selects best-of inside the pair-programmer
+harness rather than via Hydra's `_dispatch_best_of_n`.)
 
 ## c) Choosing an entrypoint
 

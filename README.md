@@ -390,7 +390,7 @@ Verify:
 
 ```
 /mcp                   # in gateway mode: expect hydra_gateway connected; standalone: expect individual servers
-/hydra:hydra-squads    # expect 13 squads listed (3 crowns active, 5 marketing active, 5 stubs)
+/hydra:hydra-squads    # expect 13 squads (10 active: 3 crowns + Curia + Xenia Hearth + 5 marketing; 3 stubs)
 /doctor                # expect 0 plugin errors
 ```
 

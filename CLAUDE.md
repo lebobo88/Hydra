@@ -20,7 +20,7 @@ Hydra dispatches to pair-programmer via the engineering squad internally.
 ### Available Hydra Commands
 
 - `/hydra:run` — primary entry point, routes to correct squad(s)
-- `/hydra:campaign` — multi-squad campaign with dependency wiring
+- `/hydra:campaign` — multi-squad campaign with dependency wiring; also the cross-repo fleet entry point (see below)
 - `/hydra:status` — show workflows or specific workflow state
 - `/hydra:squads` — list available squads
 - `/hydra:approve` — resume HITL-paused workflow
@@ -28,6 +28,28 @@ Hydra dispatches to pair-programmer via the engineering squad internally.
 - `/hydra:replay` — deterministic replay from checkpoint
 - `/hydra:budget` — show or set budget consumption
 - `/hydra:add-squad` — scaffold new squad pack
+
+### Multi-repo campaign contract (`/hydra:campaign --repos`)
+
+`/hydra:campaign` accepts `--repos <id,id,...>` (synonym `--fleet`) to launch
+a **parallel engineering fleet** across allow-listed sibling repos:
+
+- **Syntax:** `/hydra:campaign "goal --repos agentsmith,theeights,xenia"`. Ids
+  are comma-separated; `>=2` distinct ids enter fleet mode (exactly 1 behaves
+  like `--repo`). `--repos` and `--repo` are mutually exclusive.
+- **Repo targeting:** ids resolve through `hydra_core/repo_registry.py` (allow-list
+  + base-escape guard + real `git rev-parse`); raw paths are rejected. Unknown
+  ids surface an intake HITL. Fleet runs lock `selected_squads=["engineering"]`
+  (mcp-entrypoint only).
+- **Per-repo budget scoping:** the global `--budget` is equal-split across repos
+  (`HydraState.allocate_repos`, micro-dollar exact); each repo charges its own
+  `repo_budgets`/`repo_spend` ledger — budgets are isolated, not shared.
+- **Deterministic result merge:** `dispatch_fleet` collects via `as_completed`
+  (cancellation fires on first surfaced result) but stores by input index, so
+  results merge in submission order into one `DECISION_RECORD`. Cancellation
+  propagates to not-yet-started repo runs.
+
+Full reference: `.claude/commands/hydra-campaign.md` and `ARCHITECTURE.md` §8a.
 
 ### Hard Rules
 

@@ -5,27 +5,49 @@ third-party Claude Desktop / Cursor / Kiro users can plug into individual
 heads."* This is the interoperability bet — Hydra speaks MCP outward as
 well as inward.
 
-## Current state (Stage 5)
+## Current state (Stage 5+)
 
-Hydra ships four MCP servers, wired via `.mcp.json`:
+Hydra ships the following in-repo MCP servers under `mcp_servers/`, wired
+via `.mcp.json` (gateway mode consolidates them behind `hydra_gateway`):
 
 | Server | Module | Status | Crown affinity |
 |---|---|---|---|
 | `pp-daemon` | external (pair-programmer daemon) | shipped | Forge |
 | `hydra-memory` | `mcp_servers.hydra_memory` | shipped | substrate (TheEights) |
 | `executive-suite` | `mcp_servers.executive_suite` | shipped | Executive |
-| `rlm-creative` | `mcp_servers.rlm_creative` | shipped (stub-backed) | Garland (pending RLM-Creative) |
+| `rlm-creative` | `mcp_servers.rlm_creative` | shipped | Garland |
+| `senate` | `mcp_servers.senate` | shipped | Curia (legal-compliance) |
+| `marketbliss` | `mcp_servers.marketbliss` | shipped | Marketing |
+| `xenia` / `xenia-kb` | `mcp_servers.xenia`, `mcp_servers.xenia_kb` | shipped | Hearth (customer-support) — roster + knowledge-base read |
+| `xenia-tickets` | `mcp_servers.xenia_tickets` | shipped | Hearth — customer-support ticket filing (side-effecting) |
+| `hydra-control` | `mcp_servers.hydra_control` | shipped | supervisor — workflow-resume gate + cockpit audit filing |
+| `hydra-toolshed` | `mcp_servers.hydra_toolshed` | shipped | meta — search/describe/execute over large catalogs |
+| `hydra-gateway` | `mcp_servers.hydra_gateway` | shipped | meta — unified backend proxy |
 
-Tools exposed today:
+Tools exposed today (verified against `server.py#_tool_handlers`):
 
 - **hydra-memory**: `hydra-mem.write_episodic`,
   `hydra-mem.read_episodic`, `hydra-mem.list_workflow`,
   `hydra-mem.semantic_search`, `hydra-mem.query_eights`,
-  `hydra-mem.tag_memory`.
+  `hydra-mem.tag_memory`, `hydra-mem.ping` (+ mesh-console read surface:
+  `workflows_list`, `workflow_status`, `squad_list`, `hitl_pending`).
 - **executive-suite**: roster lookup, skill catalog, command catalog,
   output write — agent-impersonation pattern.
-- **rlm-creative**: skill catalog, command catalog, output write — stub
-  pattern until RLM-Creative ships.
+- **rlm-creative**: skill catalog, command catalog, output write.
+- **hydra-control** (3 tools): `hydra.control.ping` (no-arg liveness),
+  `hydra.workflow.resume` (launches the CLI resume path for a paused HITL
+  gate — `approve | reject | modify-budget | force-dispatch`),
+  `hydra.cockpit.audit` (files a `cockpit_write` audit envelope through the
+  attestor for an action taken from the mesh console). This is the
+  **workflow-resume gate + cockpit audit filing** server.
+- **xenia-tickets** (9 tools): `xenia-tickets.create`, `.get`, `.list`,
+  `.comment`, `.update_fields`, `.recommend`, `.send_response`,
+  `.execute_approved`, `.ping`. This is the **customer-support ticket
+  filing** server for the Xenia Hearth squad. The two mutating tools
+  (`send_response`, `execute_approved`) **verify a server-side WS-AUTH
+  capability token** (`mint_for_tool.py` + `clearance.py`,
+  `verify_operator_capability` semantics) before acting; the executor's
+  `actor_id` is taken from the dispatcher binding, never self-reported.
 - **pp-daemon**: 42+ tools exposed by the pair-programmer harness.
 
 ## What Stage 6 (LIT-4) adds

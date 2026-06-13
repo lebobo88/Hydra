@@ -23,10 +23,22 @@ The architecture is grounded in `Enterprise Master AI Orchestration System Archi
 | Engineering & Product | `engineering` | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | active |
 | Garland (Creative & Production) | `garland` | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | active |
 | Senate — Legal & Compliance (Curia) | `legal-compliance` | [`Senate`](https://github.com/lebobo88/Senate) | active |
+| Customer Support (Xenia Hearth) | `customer-support` | [`Xenia`](https://github.com/lebobo88/Xenia-Support) | active |
+| Marketing — Strategy | `marketing-strategy` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
+| Marketing — Creative | `marketing-creative` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
+| Marketing — Research | `marketing-research` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
+| Marketing — Production | `marketing-production` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
+| Marketing — Ops | `marketing-ops` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
 | Healthcare / Clinical | `healthcare` | (stub) | scaffold |
 | Sales & GTM | `sales-gtm` | (stub) | scaffold |
 | Research & Data-Science | `research-ds` | (stub) | scaffold |
-| Customer Support (Xenia Hearth) | `customer-support` | Xenia (local pack) | active |
+
+The five `marketing-*` packs are filesystem symlinks into the
+[`MarketBliss`](https://github.com/lebobo88/MarketBliss) checkout
+(`squads/marketing-* → MarketBliss/squads/marketing-*`), so they share that
+pack's source of truth while registering under Hydra's covenant. **13 squads
+total: 10 active (3 crowns + legal-compliance/Curia + customer-support/Xenia
+Hearth + 5 marketing) and 3 stubs (healthcare, sales-gtm, research-ds).**
 
 Every squad declares — in its `squad.yaml`:
 - `agents:` the roster (slugs + role description + authority bounds)
