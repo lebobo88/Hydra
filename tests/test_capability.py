@@ -26,6 +26,7 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -54,7 +55,13 @@ from hydra_core.state import HydraState
 TEST_KEY_HEX = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 TEST_KEY_ID = "test-key-1"
 
-_XENIA_SIGN_PATH = Path(r"C:\AiAppDeployments\Xenia\tools\context_token")
+# Portable resolution: HYDRA_XENIA_ROOT env override -> sibling of the Hydra
+# repo root (this file is <repo>/tests/test_capability.py, so parents[1] is the
+# repo root and .parent is the AI-app base that also holds the Xenia checkout).
+_XENIA_ROOT = Path(
+    os.environ.get("HYDRA_XENIA_ROOT", str(Path(__file__).resolve().parents[1].parent / "Xenia"))
+)
+_XENIA_SIGN_PATH = _XENIA_ROOT / "tools" / "context_token"
 
 # Golden vector — SHARED with TheEights TS suite (daemon/test/capability.test.ts).
 #
@@ -63,7 +70,7 @@ _XENIA_SIGN_PATH = Path(r"C:\AiAppDeployments\Xenia\tools\context_token")
 # Both suites assert the same sig literal, proving Python and TypeScript produce
 # byte-identical canonical JSON and HMAC-SHA256 signatures for the same payload.
 #
-# TS source: C:\AiAppDeployments\TheEights\daemon\test\capability.test.ts
+# TS source: TheEights/daemon/test/capability.test.ts (sibling repo checkout)
 #   GOLDEN_PAYLOAD.jti    = "fixed-golden-jti-001"
 #   GOLDEN_EXPECTED_SIG   = "vwWp9w23fYQIRQG17mR-Uw6-bXrMxzsinPkGjSJv50I"
 #

@@ -413,7 +413,7 @@ def _err(code: str, message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _root() -> Path:
-    return resolve_root("HYDRA_XENIA_ROOT", "C:/AiAppDeployments/Xenia")
+    return resolve_root("HYDRA_XENIA_ROOT", str(_HERE.parents[2].parent / "Xenia"))
 
 
 def _tasks_dir(root: Path) -> Path:

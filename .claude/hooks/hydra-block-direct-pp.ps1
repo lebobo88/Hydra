@@ -24,7 +24,21 @@ if ($json.tool_name -ne 'Skill') { exit 0 }
 # Working directly in the PP repo with /pp:* stays legal. Equality or
 # prefix-plus-separator only — a bare StartsWith would also exempt siblings
 # like pair-programmer-old.
-$ppRepo = 'c:\aiappdeployments\pair-programmer'
+# Resolve the AI-app base dynamically so the path is portable across machines.
+# Preference order: AIAPP_BASE env -> parent of CLAUDE_PROJECT_DIR -> parent of
+# the Hydra repo root derived from $PSScriptRoot. The hook lives at
+# <HydraRoot>/.claude/hooks/, so three Split-Ups give HydraRoot and one more
+# gives the base directory that holds both Hydra and pair-programmer.
+$base = $null
+if ($env:AIAPP_BASE) {
+    $base = $env:AIAPP_BASE
+} elseif ($env:CLAUDE_PROJECT_DIR) {
+    $base = Split-Path $env:CLAUDE_PROJECT_DIR
+} else {
+    $hydraRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot))
+    $base = Split-Path $hydraRoot
+}
+$ppRepo = (Join-Path $base 'pair-programmer').Replace('/', '\').TrimEnd('\').ToLowerInvariant()
 $cwd = $json.cwd
 if (-not $cwd) { $cwd = (Get-Location).Path }
 if ($cwd) {

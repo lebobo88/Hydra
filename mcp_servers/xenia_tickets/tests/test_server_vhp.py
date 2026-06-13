@@ -31,10 +31,19 @@ import pytest
 # Path setup: Hydra root AND Xenia root so we can import sign.py directly.
 # ---------------------------------------------------------------------------
 HYDRA_ROOT = Path(__file__).resolve().parents[4]
-XENIA_ROOT = Path("C:/AiAppDeployments/Xenia")
+# Portable: HYDRA_XENIA_ROOT env override -> Xenia checked out beside the Hydra repo.
+XENIA_ROOT = Path(os.environ.get("HYDRA_XENIA_ROOT", str(HYDRA_ROOT.parent / "Xenia")))
 sys.path.insert(0, str(HYDRA_ROOT))
 # Insert Xenia root so `from tools.context_token.sign import mint` works
 sys.path.insert(0, str(XENIA_ROOT))
+
+# sign.py interop tests need the Xenia checkout on disk; skip them gracefully
+# on machines without Xenia (CI, contributor laptops) rather than ImportError.
+_XENIA_SIGN_AVAILABLE = (XENIA_ROOT / "tools" / "context_token" / "sign.py").exists()
+_skip_no_xenia = pytest.mark.skipif(
+    not _XENIA_SIGN_AVAILABLE,
+    reason=f"Xenia sign.py not found under {XENIA_ROOT} (set HYDRA_XENIA_ROOT)",
+)
 
 from mcp_servers.xenia_tickets.clearance import mint_clearance_token, verify_clearance_token
 from mcp_servers.xenia_tickets.server import (
@@ -188,6 +197,7 @@ def _send(tmp_path: Path, body: str, actor: str = "hermes",
 # by sign.py verifies through clearance.py's verify_clearance_token, and that
 # a token minted for body A rejects body B.
 
+@_skip_no_xenia
 class TestSignPyInterop:
     """Interop: token minted by sign.py must verify via clearance.py and vice-versa."""
 
@@ -917,6 +927,7 @@ class TestEnforcementOrder:
 # 2a: Raw dict token acceptance (sign.py mint() returns a dict, not a JSON str)
 # ---------------------------------------------------------------------------
 
+@_skip_no_xenia
 class TestRawDictTokenAcceptance:
     """fix 2a — verify_clearance_token accepts a raw dict without str() coercion."""
 

@@ -1,7 +1,7 @@
 # Curia Crown — cathedral overlay for the Senate legal wing.
 #
 # Canonical source-of-truth for the jurists lives at the Senate repo
-# (https://github.com/lebobo88/Senate — C:\AiAppDeployments\Senate). This
+# (https://github.com/lebobo88/Senate). This
 # Hydra-side file is the alias overlay that Hydra's synthesizer reads to
 # render mythic names in user-facing output. Keep the two in sync; the
 # Senate repo is authoritative.

@@ -10,7 +10,7 @@ description: >
   quality/fairness review, compliance/redaction, and human escalation with a
   structured approval contract. Xun converts Kan into Dui. Replaces the
   customer-support stub; wired to the Xenia source pack.
-source_pack: C:\AiAppDeployments\Xenia
+source_pack: https://github.com/lebobo88/Xenia
 entrypoint: claude-skill
 industries: [customer-support, success, helpdesk, contact-center]
 

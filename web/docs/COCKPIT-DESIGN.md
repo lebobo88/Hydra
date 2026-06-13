@@ -3,8 +3,8 @@
 > **Status:** Stage 1 deliverable (design, reviewable). Stage 2 (build, chunks C0–C8) requires a **separate operator approval** after this document is reviewed.
 > **Initiative:** hydra-cockpit
 > **Hydra workflow (Stage 1):** `5ebd4268-5de0-4dbf-a82d-42c596d4818e`
-> **Approved plan:** `C:\Users\robob\.claude\plans\explain-the-ui-for-tidy-trinket.md`
-> **Target app root:** `C:\AiAppDeployments\Hydra\web\`
+> **Approved plan:** operator-approved cockpit UI plan (Stage 1)
+> **Target app root:** `<repo-root>/web/`
 > **Authoring agent:** `docs-author` (typed producer, engineering squad, pp_harness run `run_665s1xz7U3RN`)
 
 ---

@@ -14,12 +14,12 @@ metadata:
 runtime:
   type: python-langgraph
   entrypoint: "mcp_servers/hydra_memory/__main__.py"
-  cwd: "C:/AiAppDeployments/Hydra"
+  cwd: "${HYDRA_ROOT}"
   # OPTIONAL runtime.env: written into the gateway spawn spec for this sibling.
   # NO secrets (AM-EDGE-007). Copied from the real ~/.hydra/backends.json hydra_memory entry.
   # Amendment 2026-06-04: added so BackendsJsonWriter can produce correct gateway spawn specs.
   env:
-    PYTHONPATH: "C:/AiAppDeployments/Hydra"
+    PYTHONPATH: "${HYDRA_ROOT}"
     HYDRA_EPISODIC_DB: "${USERPROFILE}/.hydra/episodic.db"
     HYDRA_VECTOR_DIR: "${USERPROFILE}/.hydra/vectors"
     HYDRA_MEM_FEDERATE_EIGHTS: "1"
@@ -75,8 +75,8 @@ audit:
   dedupeKeyField: "key"
 
 governance:
-  # Constitution file path relative to runtime.cwd (C:/AiAppDeployments/Hydra).
-  # Verified to exist: C:/AiAppDeployments/Hydra/CONSTITUTION.md
+  # Constitution file path relative to runtime.cwd (${HYDRA_ROOT}).
+  # Verified to exist: ${HYDRA_ROOT}/CONSTITUTION.md
   constitutionPath: "CONSTITUTION.md"
   # Hydra's hydra_memory server does not expose a dedicated constitution attestation tool.
   # hydra-mem.read_episodic is used as the governance-connectivity probe: meshd calls this

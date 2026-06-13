@@ -1,6 +1,6 @@
 # Hydra Manifesto Ingestion Roadmap
 
-Distilled from the approved plan at `C:\Users\robob\.claude\plans\c-aiappdeployments-hydra-hydra-a-manife-enchanted-taco.md` and the manifesto's own Stage 1–6 recommendations. Stages are ordered as the manifesto requires (immortal head before cauterization, cauterization before memory, memory before heads, heads before venom, venom before launch).
+Distilled from the approved manifesto-ingestion plan and the manifesto's own Stage 1–6 recommendations. Stages are ordered as the manifesto requires (immortal head before cauterization, cauterization before memory, memory before heads, heads before venom, venom before launch).
 
 **Locked decisions** (from clarifying Q&A on 2026-05-19):
 - Scope: full six-stage roadmap; Stage 1 shipped in initial run.

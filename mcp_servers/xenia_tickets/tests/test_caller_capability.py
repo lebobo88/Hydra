@@ -29,7 +29,8 @@ import pytest
 # Path setup
 # ---------------------------------------------------------------------------
 HYDRA_ROOT = Path(__file__).resolve().parents[4]
-XENIA_ROOT = Path("C:/AiAppDeployments/Xenia")
+# Portable: HYDRA_XENIA_ROOT env override -> Xenia checked out beside the Hydra repo.
+XENIA_ROOT = Path(os.environ.get("HYDRA_XENIA_ROOT", str(HYDRA_ROOT.parent / "Xenia")))
 sys.path.insert(0, str(HYDRA_ROOT))
 sys.path.insert(0, str(XENIA_ROOT))
 
