@@ -117,3 +117,33 @@ tokens in the env blocks are intentionally left intact — they are expanded at
 runtime by the consuming process, not by the setup script.
 
 To regenerate after moving repos or editing the template, just re-run setup.
+
+## Cross-platform hooks (Windows + POSIX)
+
+Path resolution across the ecosystem is OS-agnostic (env override → anchor-relative
+→ sibling → fail loud, with forward slashes). The one remaining OS-specific surface
+is the Claude Code **hooks**, which are authored in PowerShell (`.claude/hooks/*.ps1`)
+and registered with `pwsh -NoProfile -File "$CLAUDE_PROJECT_DIR/.claude/hooks/<name>.ps1"`.
+
+- The hook **commands no longer hardcode absolute paths** — every repo's hook
+  registration now uses `$CLAUDE_PROJECT_DIR`, which Claude Code injects at
+  hook-execution time. So the *path* is portable.
+- To **run** the PowerShell hooks on macOS/Linux you need **PowerShell 7+ (`pwsh`)**
+  installed and on `PATH` (`brew install powershell` / `apt install powershell`).
+  `pwsh` is itself cross-platform, so the existing `.ps1` hooks run unmodified.
+- Some repos already ship `.sh` siblings for their hooks (e.g. **Xenia**); **RLM-Creative**
+  hooks already resolve their root via `$PSScriptRoot` and are portable as-is.
+  Porting every `.ps1` hook to bash is intentionally **out of scope** here — the
+  path-portability goal is met, and `pwsh` covers POSIX execution without
+  duplicating hook logic.
+
+## Known limitations / follow-ups
+
+- **`pair-programmer/.claude/settings.json` is git-ignored** (machine-local), so its
+  hook-path fix (`$CLAUDE_PROJECT_DIR/daemon/dist/index.js`) was applied to the local
+  working copy but is **not tracked**. A fresh clone gets its own ignored copy. To
+  propagate the portable form via git, the repo would need a tracked
+  `settings.template.json` (or to un-ignore `settings.json`) that the daemon's hook
+  installer renders with `$CLAUDE_PROJECT_DIR`. Flagged for a follow-up in that repo.
+- A few `*.mcp.json.example` templates (e.g. in TheEights) still show an illustrative
+  absolute path. They are examples, not runtime config; templatizing them is optional.
