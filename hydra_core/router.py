@@ -100,6 +100,29 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "director of photography", "storyboard", "scheduling", "production budget",
         "production schedule", "permit", "crew", "gaffer", "grip",
     ),
+    "rlm-gaming": (
+        # core game-dev vocabulary
+        "game", "gameplay", "game design", "gdd", "game studio", "video game",
+        "level design", "level", "boss", "encounter", "enemy", "mechanic",
+        "core loop", "playtest", "balance", "difficulty", "progression",
+        "quest", "narrative", "dialogue", "loot", "loot box", "gacha",
+        "economy", "monetization", "live service", "live-ops", "liveops",
+        "season", "battle pass", "matchmaking", "netcode", "multiplayer",
+        "anti-cheat", "anticheat", "speedrun", "roguelite", "roguelike",
+        "fps", "rpg", "rts", "platformer", "metroidvania", "soulslike",
+        "deckbuilder", "esports", "vertical slice", "greenlight",
+        # engines
+        "unity", "unreal", "unreal engine", "godot", "gamemaker",
+        "babylon.js", "babylonjs", "phaser", "playcanvas", "spring rts",
+        "recoil engine", "behavior tree", "navmesh", "blueprint",
+        # ratings / cert
+        "esrb", "pegi", "iarc", "cero", "lotcheck", "trc", "steamworks",
+        # arcade-crown mythic routing keys (Garland precedent)
+        "arcade", "the director", "the systemsmith", "the loremaster",
+        "the cartographer", "the duelist", "the economist", "the warden",
+        "the arbiter", "the sentinel", "the custodian", "the forgemaster",
+        "rlm-gaming", "game crew", "studio crew",
+    ),
 }
 
 

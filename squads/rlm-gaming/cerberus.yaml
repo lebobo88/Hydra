@@ -1,0 +1,103 @@
+# The Sentinel — the Arcade Crown's dedicated fair-play security gate.
+#
+# Cerberus-equivalent for RLM-Gaming. Distinct from the generic QA gate
+# (The Warden). The Sentinel owns the *venom-class* capabilities specific to
+# shipping a game: anything that grants a client authority the server must keep,
+# any unsigned generative asset, any online build without an anti-cheat plan,
+# and any data path that could exfiltrate player PII. The Python-layer
+# enforcement reuses hydra_core/venom.py; this file configures the persona.
+#
+# Per the manifesto Part III §5 — pour the venom before any external-facing
+# capability ships. The Sentinel's refusal patterns load here and register with
+# the venom registry at supervisor build. Mirrors squads/engineering/cerberus.yaml.
+
+plaza: game-security-gate
+mythic: The Sentinel
+crown: arcade
+register: "The warded gate of fair play. Refuses what would let a cheat, a leak, or an unsigned asset ship."
+
+# --- venom-class capabilities The Sentinel owns ------------------------------
+# Each entry becomes a register_venom() call at process start. These fire on top
+# of the constitution gate (Stage 1) and the MCP-attack scanner (Stage 5).
+venoms:
+  - name: game.client_authority
+    description: >
+      Designs or code-deltas that place authoritative game state (health, score,
+      currency, loot, hit registration, position truth) on the client instead of
+      the server. The classic cheat surface.
+    refusal_patterns:
+      - 'client[ _-]?authoritative'
+      - 'trust(ed)?\s+client'
+      - '(damage|loot|currency|score|inventory)\s+(calc|applied|granted)\s+(on|by)\s+client'
+    requires_human: true
+
+  - name: game.anticheat_absent
+    description: >
+      Shipping an online / competitive build with no anti-cheat plan or with
+      anti-cheat explicitly disabled in a release config.
+    refusal_patterns:
+      - 'disable\s+(anti[- ]?cheat|eac|battleye|vac)'
+      - 'anti[- ]?cheat\s*:\s*(false|off|none)'
+    requires_human: true
+
+  - name: game.unsigned_genai_asset
+    description: >
+      Shipping a generative-AI-produced asset (art, audio, model, text) without
+      C2PA provenance. Generation + signing is Garland's job; this gate refuses
+      the SHIP of an unsigned one.
+    refusal_patterns:
+      - 'ship.*(genai|ai[- ]?generated).*asset'
+      - 'c2pa\s*:\s*(false|skip|none)'
+    requires_human: true
+
+  - name: game.pii_telemetry
+    description: >
+      Telemetry / analytics events that capture player PII (real name, email,
+      precise location, chat content) without consent + minimization, or that
+      route minors' data outside COPPA/GDPR-K bounds.
+    refusal_patterns:
+      - 'telemetry.*(email|real[ _-]?name|precise[ _-]?location|chat[ _-]?log)'
+      - 'collect.*(minor|child).*data'
+    requires_human: true
+
+  - name: game.exploit_economy
+    description: >
+      Changes to a live economy (drop rates, prices, currency grants) pushed
+      without a balance simulation or without the loot-box-jurisdiction gate.
+    refusal_patterns:
+      - '(drop[ _-]?rate|price|grant).*hotfix.*prod'
+      - 'economy.*push.*(live|prod).*no[ _-]?sim'
+    requires_human: true
+
+# --- mcp tool allowlist ------------------------------------------------------
+# The Sentinel enforces a per-squad allowlist over which MCP servers the Arcade
+# crown can call. Anything not listed requires explicit Sentinel pass.
+mcp_allowlist:
+  rlm_creative:
+    privileges: [read]
+    # Garland produces + signs assets; the Arcade crown only reads roster/skill
+    # metadata and writes hand-off outputs. It must NOT drive ComfyUI directly.
+  eights:
+    privileges: [read, write]
+  hydra_memory:
+    privileges: [read, write]
+  pp_harness:
+    privileges: [read]
+    cross_tool_combinations_forbidden:
+      - ["pp.harness.start_run", "pp.harness.archive_artifact"]
+        # the Arcade crown delegates runs via DEV_TASK envelopes, it does not
+        # start + archive PP runs itself — that is the engineering squad's job.
+  executive_suite:
+    privileges: [read]
+
+# --- audit sink --------------------------------------------------------------
+audit:
+  cell: kan
+  sink: default                  # 'default' = Kan-cell episodic write
+  external_siem: null
+
+# --- refusal voice -----------------------------------------------------------
+refusal_voice: >
+  The Sentinel refuses. This action is on the Arcade venom list and the gate did
+  not open — it would let a cheat, a leak, or an unsigned asset reach players.
+  The attempt is logged to Kan; clear the fair-play review before retrying.

@@ -461,6 +461,139 @@ _register(Rubric(
     ),
 ))
 
+# ---------- arcade (rlm-gaming) ----------
+# Native game-studio gates. Bodies mirror squads/rlm-gaming/rubrics/<id>.md
+# (authoritative). The two pp-library rubrics this squad also names
+# (game-perf-budget, game-accessibility-guidelines) are judged DOWNSTREAM by the
+# pair-programmer harness during the delegated engineering run, so they are not
+# registered here.
+
+_register(Rubric(
+    rubric_id="game-design-pillars-testable@1",
+    kind="arcade",
+    body_md=(
+        "# Game Design Pillars — Testable (v1) — The Director's gate\n"
+        "Mirrors squads/rlm-gaming/rubrics/game-design-pillars-testable.md.\n"
+        "Auto-fail on vibe pillars / generic verbs / unmeasurable adjectives.\n"
+        "- **falsifiable** (0-5): each pillar can be proven wrong by a build\n"
+        "- **decision_content** (0-5): each pillar excludes some design\n"
+        "- **audience_singular** (0-5): one named target player, not casual+hardcore\n"
+        "- **comp_set** (0-5): 2-4 references with share/differ deltas\n"
+        "- **usp** (0-5): a claim the comp set cannot make\n"
+        "- **anti_pillars** (0-5): at least one named 'we will NOT'\n"
+        "- **traceability** (0-5): every pillar maps to a planned mechanic/system\n"
+    ),
+    score_dimensions=(
+        "falsifiable", "decision_content", "audience_singular", "comp_set",
+        "usp", "anti_pillars", "traceability",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="loot-box-jurisdiction@1",
+    kind="arcade",
+    body_md=(
+        "# Loot-box & Randomized-reward Jurisdiction (v1) — The Economist + The Arbiter\n"
+        "Mirrors squads/rlm-gaming/rubrics/loot-box-jurisdiction.md. HITL required.\n"
+        "Auto-fail: BE not handled, odds unpublished where required, kompu-gacha (JP).\n"
+        "- **region_matrix** (0-5): complete, dated, disable/alternate path per region\n"
+        "- **odds_published** (0-5): real drop rates published in-client + pre-purchase\n"
+        "- **pity_floor** (0-5): pity/hard floor documented + player-visible\n"
+        "- **age_gate** (0-5): per-region age verification; minors blocked where required\n"
+        "- **no_kompu_gacha** (0-5): no complete-gacha mechanic\n"
+        "- **spend_safeguards** (0-5): spend caps / parental controls / refund path\n"
+        "- **alternate_offering** (0-5): a non-random direct-purchase path exists\n"
+    ),
+    score_dimensions=(
+        "region_matrix", "odds_published", "pity_floor", "age_gate",
+        "no_kompu_gacha", "spend_safeguards", "alternate_offering",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="esrb-pegi-iarc-rating@1",
+    kind="arcade",
+    body_md=(
+        "# Rating Consistency: ESRB/PEGI/IARC/CERO (v1) — The Arbiter\n"
+        "Mirrors squads/rlm-gaming/rubrics/esrb-pegi-iarc-rating.md. HITL required.\n"
+        "Note: CERO (JP) + ACB (AU) are NOT IARC authorities — separate submissions.\n"
+        "- **content_inventory** (0-5): violence/language/sexual/gambling/IAP/UGC inventoried\n"
+        "- **iarc_questionnaire** (0-5): answers derivable + internally consistent\n"
+        "- **target_rating_feasible** (0-5): declared target achievable; gaps flagged\n"
+        "- **interactive_elements_disclosed** (0-5): IAP-random / UGC / internet descriptors\n"
+        "- **regional_edits** (0-5): CN/JP/DE etc. content cuts identified with variant plan\n"
+        "- **marketing_consistency** (0-5): store art/trailers respect the target rating\n"
+    ),
+    score_dimensions=(
+        "content_inventory", "iarc_questionnaire", "target_rating_feasible",
+        "interactive_elements_disclosed", "regional_edits", "marketing_consistency",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="platform-cert-readiness@1",
+    kind="arcade",
+    body_md=(
+        "# Platform Certification Readiness (v1) — The Arbiter\n"
+        "Mirrors squads/rlm-gaming/rubrics/platform-cert-readiness.md. HITL required.\n"
+        "PS=TRC, Xbox=XR/XGSP, Nintendo=Lotcheck, Steam=Steamworks/Deck, mobile=store review.\n"
+        "- **lifecycle** (0-5): suspend/resume/sleep/wake/PLM without state loss\n"
+        "- **input** (0-5): all controller modes + disconnect/reconnect handled\n"
+        "- **save_integrity** (0-5): atomic saves, corruption recovery, cloud conflict\n"
+        "- **account_store** (0-5): sign-in, entitlement, IAP restore, store flows\n"
+        "- **error_messaging** (0-5): platform-mandated error strings/codes present\n"
+        "- **accessibility_cert** (0-5): platform a11y requirements met\n"
+        "- **trc_evidence** (0-5): per-requirement pass/fail log with evidence\n"
+    ),
+    score_dimensions=(
+        "lifecycle", "input", "save_integrity", "account_store",
+        "error_messaging", "accessibility_cert", "trc_evidence",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="server-authority-fairplay@1",
+    kind="arcade",
+    body_md=(
+        "# Server-authority & Fair-play (v1) — The Sentinel\n"
+        "Mirrors squads/rlm-gaming/rubrics/server-authority-fairplay.md. HITL required.\n"
+        "Carve-out: P2P/deterministic-rollback/co-op need a documented trust model,\n"
+        "not necessarily a dedicated server. Fail on UNJUSTIFIED client trust.\n"
+        "- **server_authority** (0-5): value-bearing truth server-side (or justified trust model)\n"
+        "- **input_validation** (0-5): every client->server message validated\n"
+        "- **anticheat_plan** (0-5): named approach + update path (N/A allowed for non-competitive PvE)\n"
+        "- **netcode_model_safe** (0-5): no desync-exploit; lockstep RNG server-seeded\n"
+        "- **rate_abuse** (0-5): matchmaking/trade/chat/economy rate-limited\n"
+        "- **telemetry_privacy** (0-5): PII minimization + minors' data rules\n"
+        "- **report_and_ban** (0-5): player report path + enforcement pipeline\n"
+    ),
+    score_dimensions=(
+        "server_authority", "input_validation", "anticheat_plan",
+        "netcode_model_safe", "rate_abuse", "telemetry_privacy", "report_and_ban",
+    ),
+))
+
+_register(Rubric(
+    rubric_id="ai-content-provenance@1",
+    kind="arcade",
+    body_md=(
+        "# AI Content Provenance (v1) — The Artisan + The Sentinel\n"
+        "Mirrors squads/rlm-gaming/rubrics/ai-content-provenance.md. HITL required.\n"
+        "C2PA proves tamper-evident provenance, NOT IP ownership — lineage is separate.\n"
+        "- **c2pa_signed** (0-5): every gen-AI binary carries a C2PA manifest (Garland-signed)\n"
+        "- **model_licensing** (0-5): model license permits commercial game shipping\n"
+        "- **base_asset_lineage** (0-5): conditioning/reference assets owned or licensed\n"
+        "- **style_bible_conformity** (0-5): asset matches the art bible\n"
+        "- **human_review** (0-5): a human approved the asset for ship (no autonomous ship)\n"
+        "- **disclosure** (0-5): gen-AI usage disclosed where platform/region requires\n"
+        "- **takedown_path** (0-5): documented path to replace/remove on an IP claim\n"
+    ),
+    score_dimensions=(
+        "c2pa_signed", "model_licensing", "base_asset_lineage",
+        "style_bible_conformity", "human_review", "disclosure", "takedown_path",
+    ),
+))
+
 
 def get_rubric(rubric_id: str) -> Rubric:
     if rubric_id not in _REGISTRY:

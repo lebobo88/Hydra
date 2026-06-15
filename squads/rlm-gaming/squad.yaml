@@ -1,0 +1,307 @@
+name: "RLM-Gaming — The Arcade Crown"
+version: 1.0.0
+deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
+description: >
+  Senior multi-agent game studio. The Arcade crown owns the studio-brain layers
+  — vision/greenlight, design (systems, narrative, level/world, encounter,
+  economy), production, runtime-AI & netcode direction, art/audio direction,
+  QA/balance, live-ops, ratings/cert/compliance, and fair-play security. It is
+  an ORCHESTRATOR: it produces design, plans, specs, and gates, then DELEGATES
+  implementation — engine code to the `engineering` squad (pair-programmer game
+  teams) via PRD/DEV_TASK, and art/audio/video binaries to the `garland` squad
+  (RLM-Creative / Helios) via CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB. It never writes
+  engine source or media binaries itself. Crown lead: The Director. Security
+  gate (Cerberus-equivalent): The Sentinel. See cerberus.yaml + heads.yaml.
+source_pack: https://github.com/lebobo88/RLM-Gaming
+entrypoint: claude-skill
+best_of_n: 0   # design work is single-shot; greenlight uses HITL, not Borda
+industries:
+  - games
+  - game-development
+  - interactive-entertainment
+  - live-service-games
+  - mobile-games
+  - aaa-games
+  - indie-games
+  - esports
+
+# ---------------------------------------------------------------------------
+# Agents — 20 Arcade heads. agent_file paths are relative to source_pack.
+# ---------------------------------------------------------------------------
+agents:
+  # ---- Executive layer ----
+  - slug: game-director
+    mythic: The Director
+    role: "Game Director — vision, pillars, greenlight, scope/quality/schedule. Crown Lead."
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/the-director.md
+    notes: "Owns the master DECISION_RECORD. Fails closed to HITL greenlight."
+  - slug: producer
+    mythic: The Producer
+    role: "Producer — backlog, milestones, sprints, cross-squad coordination, HITL control points."
+    authority: gatekeeper
+    model_tier: sonnet
+    agent_file: .claude/agents/the-producer.md
+  - slug: tech-director
+    mythic: The Forgemaster
+    role: "Technical Director — engine architecture, tech standards, perf budgets, build-vs-buy."
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/the-forgemaster.md
+    notes: "Delegates implementation to engineering; owns game-perf-budget gate."
+
+  # ---- Design layer ----
+  - slug: systems-designer
+    mythic: The Systemsmith
+    role: "Systems Designer — mechanics, combat math, systemic interactions, exploit-resistance."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-systemsmith.md
+  - slug: narrative-director
+    mythic: The Loremaster
+    role: "Narrative Director — world bibles, branching narrative, quest graphs, dialogue, themes."
+    authority: advisory
+    model_tier: opus
+    agent_file: .claude/agents/the-loremaster.md
+  - slug: level-design-director
+    mythic: The Cartographer
+    role: "Level/World Design Director — levels, mission flow, pacing, PCG, navigation, streaming."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-cartographer.md
+  - slug: encounter-designer
+    mythic: The Duelist
+    role: "Encounter/Combat Designer — encounters, bosses, enemy archetypes, AI tuning targets."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-duelist.md
+  - slug: economy-designer
+    mythic: The Economist
+    role: "Economy/Monetization Designer — currencies, sinks/sources, gacha math, balance sim, retention."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-economist.md
+    notes: "Co-owns loot-box-jurisdiction gate with The Arbiter."
+
+  # ---- Technical layer (delegates to engineering) ----
+  - slug: game-ai-director
+    mythic: The Puppeteer
+    role: "Runtime AI Director — BT/GOAP/HTN/Utility/EQS/perception design. Delegates code to game-ai-programmer."
+    authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/the-puppeteer.md
+  - slug: netcode-lead
+    mythic: The Netweaver
+    role: "Netcode Lead — replication topology, server-authority, rollback/lockstep, host migration. Delegates to game-netcode-team."
+    authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/the-netweaver.md
+  - slug: tools-pipeline
+    mythic: The Toolwright
+    role: "Tools/Pipeline — editor tooling, import/build pipelines, asset processors, CI hooks."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-toolwright.md
+
+  # ---- Creative layer (delegates to garland) ----
+  - slug: art-director
+    mythic: The Artisan
+    role: "Art Director — style bible, art direction, LOD/poly budgets. Emits CREATIVE_BRIEF/ASSET_JOB to Garland."
+    authority: advisory
+    model_tier: opus
+    agent_file: .claude/agents/the-artisan.md
+    notes: "Co-owns ai-content-provenance gate with The Sentinel."
+  - slug: 3d-modeling-director
+    mythic: The Sculptor
+    role: "3D Modeling & DCC Director — geometry/topology standards, retopo/UV/PBR/LOD, axis/scale, the Blender/DCC commission contract. Commissions Garland blender-model/blender-rig (existing blender-mcp)."
+    authority: advisory
+    model_tier: opus
+    agent_file: .claude/agents/the-sculptor.md
+    notes: "Owns mesh-topology-budget gate. Hands deformation-ready topology to The Choreographer."
+  - slug: audio-director
+    mythic: The Conductor
+    role: "Audio Director — adaptive audio, mix tiers, Wwise/FMOD middleware. Emits ASSET_JOB to Garland audio sub-crew."
+    authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/the-conductor.md
+  - slug: animation-director
+    mythic: The Choreographer
+    role: "Animation Director — rigs, IK, blend trees, anim state machines, root-motion decisions."
+    authority: advisory
+    model_tier: sonnet
+    agent_file: .claude/agents/the-choreographer.md
+
+  # ---- Evaluation layer ----
+  - slug: qa-balance-lead
+    mythic: The Warden
+    role: "QA & Balance Lead — test strategy, bot playthroughs, balance Monte Carlo, telemetry tuning. QA gate."
+    authority: gatekeeper
+    model_tier: sonnet
+    agent_file: .claude/agents/the-warden.md
+    notes: "Owns game-accessibility-guidelines gate."
+  - slug: playtest-sim
+    mythic: The Playtester
+    role: "Playtest Simulation — synthetic players / persona simulation, fun-proxy metrics, friction reports."
+    authority: execute
+    model_tier: sonnet
+    agent_file: .claude/agents/the-playtester.md
+  - slug: liveops-director
+    mythic: The Custodian
+    role: "Live-Ops Director — seasons, events, store A/B, hotfix flow, retention loops."
+    authority: gatekeeper
+    model_tier: sonnet
+    agent_file: .claude/agents/the-custodian.md
+  - slug: compliance-cert
+    mythic: The Arbiter
+    role: "Ratings/Cert/Compliance — ESRB/PEGI/IARC/CERO, platform cert (TRC/XR/Lotcheck/Steamworks), loot-box law, CVAA."
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/the-arbiter.md
+  - slug: game-security-gate
+    mythic: The Sentinel
+    role: "Fair-play Security Gate — server authority, anti-cheat, exploit threat models. Cerberus-equivalent for the Arcade crown."
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: .claude/agents/the-sentinel.md
+    notes: "Venom owner — see cerberus.yaml."
+
+# ---------------------------------------------------------------------------
+# Tools — skills (read) + the delegation targets (execute via cross-squad)
+# ---------------------------------------------------------------------------
+tools:
+  - name: game-studio-pipeline
+    privilege: read
+  - name: game-vision-and-pillars
+    privilege: read
+  - name: game-systems-design
+    privilege: read
+  - name: game-narrative-design
+    privilege: read
+  - name: level-and-world-design
+    privilege: read
+  - name: game-economy-and-monetization
+    privilege: read
+  - name: game-ai-behavior
+    privilege: read
+  - name: game-netcode-and-multiplayer
+    privilege: read
+  - name: game-art-and-audio-direction
+    privilege: read
+  - name: game-3d-modeling-and-dcc
+    privilege: read
+  - name: game-rigging-and-animation-pipeline
+    privilege: read
+  - name: game-qa-and-balance
+    privilege: read
+  - name: game-liveops-and-telemetry
+    privilege: read
+  - name: game-cert-and-compliance
+    privilege: read
+  - name: game-engine-targets
+    privilege: read
+  - name: game-security-and-anticheat
+    privilege: read
+  # delegation: produce envelopes consumed by sibling squads
+  - name: rlm.output.read
+    mcp_server: rlm_creative
+    privilege: read
+    notes: "Read Garland roster/skill/output metadata when composing CREATIVE_BRIEF/ASSET_JOB hand-offs. The Arcade crown reads from garland; it never writes garland's store."
+  - name: blender
+    mcp_server: blender
+    privilege: read
+    notes: >
+      The Arcade crown READS 3D-asset metadata from the existing blender-mcp (scene
+      summary, object info, validation reports) to compose the dcc_contract and judge
+      mesh-topology-budget / rig-quality. It does NOT execute Blender — modeling/rigging
+      EXECUTION is garland's blender-model/blender-rig (privilege execute). Server
+      registered in hydra_core/gateway_templates.json as "blender" (socket :9876 / bridge :7700).
+  - name: eights.memory.search
+    mcp_server: eights
+    privilege: read
+    notes: "Recall prior-project wisdom before greenlight/design. (gateway tool: eights_memory_search)"
+  - name: eights.memory.add
+    mcp_server: eights
+    privilege: write
+    notes: "Encode project episodes after a DECISION_RECORD closes. (gateway tool: eights_memory_add)"
+  - name: rlmgaming.output.write
+    mcp_server: rlm_gaming
+    privilege: write
+    notes: "Persist the Arcade crown's own design artifacts + DECISION_RECORD under RLM/output/gaming/. Backed by the rlm_gaming shim (mcp_servers/rlm_gaming)."
+
+accepts:
+  - C_SUITE_DECISION_PACKET   # greenlight from executive
+  - PRD                       # a feature framing handed in
+  - CREATIVE_BRIEF            # creative direction handed in
+  - DEV_TASK                  # an engineering task to design-spec
+  - DECISION_RECORD           # results returned by engineering / garland delegations
+  - HANDOFF
+  - HITL_REQUEST
+
+emits:
+  - PRD                       # → engineering (feature framing + design payload)
+  - DEV_TASK                  # → engineering (scoped implementation task)
+  - CREATIVE_BRIEF            # → garland (art/audio direction)
+  - SHOT_LIST                 # → garland (cinematics / trailers)
+  - ASSET_JOB                 # → garland (concept/3D/VO/music/SFX)
+  - DECISION_RECORD           # master synthesis artifact
+  - HITL_REQUEST              # greenlight / content-lock / ship / monetization
+  - HANDOFF
+
+# ---------------------------------------------------------------------------
+# Gates — see squads/rlm-gaming/rubrics/ ; two reuse the pp rubric library.
+# ---------------------------------------------------------------------------
+# Gate `when` expressions are evaluated against HydraState + the inbound
+# envelope's `constraints`. ONLY fields that exist on Constraints
+# (risk_tolerance, priority, industries, budget_usd, ...) and valid HydraState
+# phases (intake|planning|approval|dispatch|executing|judge_per_squad|
+# synthesis|judge_synthesis|postcheck|done|surfaced) are legal here. Game-stage
+# scoping (greenlight/cert/submission) is NOT a Hydra phase — those gates fire
+# inside the squad's own pipeline (owned by the named head) and are marked
+# hitl_required so the supervisor halts when the head escalates. See
+# game-studio-pipeline skill §"Phase → gate map".
+gates:
+  - rubric_id: game-design-pillars-testable
+    hitl_required: false
+  - rubric_id: game-perf-budget                 # reused from pair-programmer rubric library
+    hitl_required: false
+  - rubric_id: game-accessibility-guidelines    # reused from pair-programmer rubric library
+    hitl_required: false
+  - rubric_id: loot-box-jurisdiction            # The Economist/The Arbiter escalate when monetized
+    hitl_required: true
+    when: "constraints.risk_tolerance != 'high'"
+  - rubric_id: esrb-pegi-iarc-rating            # The Arbiter escalates at cert/submission (pipeline-internal)
+    hitl_required: true
+    when: "constraints.risk_tolerance != 'high'"
+  - rubric_id: platform-cert-readiness          # The Arbiter escalates at cert (pipeline-internal)
+    hitl_required: true
+    when: "constraints.risk_tolerance != 'high'"
+  - rubric_id: server-authority-fairplay        # The Sentinel escalates for online titles (pipeline-internal)
+    hitl_required: true
+    when: "constraints.risk_tolerance != 'high'"
+  - rubric_id: ai-content-provenance            # The Artisan/The Sentinel escalate for any shipped gen-AI asset (incl. 3D)
+    hitl_required: true
+    when: "constraints.risk_tolerance != 'high'"
+  - rubric_id: mesh-topology-budget             # The Sculptor — any returned 3D mesh (pipeline-internal)
+    hitl_required: false
+  - rubric_id: rig-quality                      # The Choreographer — any returned rig/animation (pipeline-internal)
+    hitl_required: false
+
+invoke:
+  command_hint: "/game-studio"
+  fallback_commands:
+    - "/game-greenlight"
+    - "/game-vertical-slice"
+    - "/game-feature"
+    - "/game-liveops-season"
+    - "/game-balance-pass"
+    - "/game-cert-review"
+    - "/game-roster"
+  output_dir: "RLM/output/gaming/{phase}/{topic-kebab}-{date}.md"
+  # Delegation routing hints read by the supervisor when fanning out:
+  delegate:
+    code_to: engineering          # PRD / DEV_TASK
+    assets_to: garland            # CREATIVE_BRIEF / SHOT_LIST / ASSET_JOB
+    legal_to: legal-compliance    # IP / age-rating-law escalation (Senate / curia)
+    strategy_from: executive      # C_SUITE_DECISION_PACKET greenlight
+  model_tier: ~                   # null — use default; override per-workflow via dispatch envelope

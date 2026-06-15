@@ -3,9 +3,9 @@ version: 1.0.0
 deprecated_after: null   # ISO date or null; Iolaus refuses dispatch on/after this date
 description: >
   Eight Garland Heads crew (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio,
-  Urania, Helios) plus five Helios sub-agents (video-synth, audio-foley, music-score,
-  dialogue-mix, governance-c2pa). Canonical source-of-truth lives at the RLM-Creative
-  repo; this file is the Hydra-side copy kept in sync with it.
+  Urania, Helios) plus seven Helios sub-agents (video-synth, audio-foley, music-score,
+  dialogue-mix, blender-model, blender-rig, governance-c2pa). Canonical source-of-truth
+  lives at the RLM-Creative repo; this file is the Hydra-side copy kept in sync with it.
 source_pack: https://github.com/lebobo88/RLM-Creative
 entrypoint: claude-skill
 best_of_n: 3   # produce 3 candidate creative drafts, judge each, Borda-rank
@@ -104,6 +104,22 @@ agents:
     model_tier: haiku
     agent_file: .claude/agents/helios-crew/dialogue-mix.md
 
+  - slug: blender-model
+    parent: photo-cinema
+    role: "3D Modeling (Blender)"
+    authority: execute
+    model_tier: sonnet
+    notes: "Executes mesh ASSET_JOBs (model_type=mesh) on the existing blender-mcp to The Sculptor's dcc_contract; self-checks mesh-topology-budget; signs via governance-c2pa."
+    agent_file: .claude/agents/helios-crew/blender-model.md
+
+  - slug: blender-rig
+    parent: photo-cinema
+    role: "Rigging & Animation (Blender)"
+    authority: execute
+    model_tier: sonnet
+    notes: "Executes rig ASSET_JOBs (model_type=rig) on the existing blender-mcp to The Choreographer's rig contract; self-checks rig-quality; signs via governance-c2pa."
+    agent_file: .claude/agents/helios-crew/blender-rig.md
+
   - slug: governance-c2pa
     parent: photo-cinema
     role: "IP Governance & C2PA Signing"
@@ -120,7 +136,16 @@ tools:
       ComfyUI node-based image/video generation pipeline.
       Use for: image generation, video synthesis, visual asset production.
       Not for: text content or copy — use gemini-content instead.
-      Restricted to: Helios and video-synth agents only.
+      Restricted to: Helios, video-synth, blender-model, blender-rig agents only.
+  - name: blender
+    privilege: execute
+    notes: >
+      The EXISTING/3rd-party blender-mcp backend (socket :9876 / MCP bridge :7700),
+      registered in hydra_core/gateway_templates.json as "blender". Garland reuses this
+      server; it does not host Blender. Use for: 3D mesh modeling, retopo, UV/PBR,
+      rigging, skinning, mocap retargeting, FBX/glTF/USD export.
+      Restricted to: Helios, blender-model, and blender-rig only (enforced by Helios
+      PreToolUse hook). All other agents prohibited.
   - name: gemini-image
     privilege: execute
     notes: >

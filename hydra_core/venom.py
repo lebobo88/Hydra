@@ -149,21 +149,11 @@ def clear_registry() -> None:
         _REGISTRY.clear()
 
 
-def load_cerberus_venoms(
-    project_root: Path | None = None,
-    *,
-    cerberus_yaml: Path | None = None,
-) -> list[VenomCapability]:
-    """Discover and register every venom declared in
-    `squads/engineering/cerberus.yaml` (or a custom path).
-
-    Called once at supervisor build. Returns the registered capabilities so
-    callers can log or assert on the boot inventory.
-    """
+def _register_one_cerberus(path: Path) -> list[VenomCapability]:
+    """Register every venom declared in a single cerberus.yaml. Returns the
+    capabilities registered (empty list if the file is absent)."""
     import yaml  # local — keep optional dep optional
 
-    root = project_root or Path.cwd()
-    path = cerberus_yaml or (root / "squads" / "engineering" / "cerberus.yaml")
     if not path.is_file():
         return []
     try:
@@ -184,6 +174,41 @@ def load_cerberus_venoms(
             requires_human=bool(entry.get("requires_human", False)),
         )
         registered.append(cap)
+    return registered
+
+
+def load_cerberus_venoms(
+    project_root: Path | None = None,
+    *,
+    cerberus_yaml: Path | None = None,
+) -> list[VenomCapability]:
+    """Discover and register every venom declared in any squad's `cerberus.yaml`.
+
+    When `cerberus_yaml` is given, only that file is loaded (test/legacy path).
+    Otherwise EVERY `squads/*/cerberus.yaml` under the project root is scanned —
+    so per-crown gates (engineering's Cerberus, the Arcade crown's The Sentinel,
+    and any future squad's venom head) all register at supervisor build.
+    Behavior for the engineering squad is unchanged; additional squads are
+    purely additive.
+
+    Called once at supervisor build. Returns the registered capabilities so
+    callers can log or assert on the boot inventory.
+    """
+    if cerberus_yaml is not None:
+        return _register_one_cerberus(cerberus_yaml)
+
+    root = project_root or Path.cwd()
+    squads_dir = root / "squads"
+    if not squads_dir.is_dir():
+        return []
+    # Deterministic order; engineering first to preserve historical ordering.
+    paths = sorted(
+        squads_dir.glob("*/cerberus.yaml"),
+        key=lambda p: (p.parent.name != "engineering", p.parent.name),
+    )
+    registered: list[VenomCapability] = []
+    for path in paths:
+        registered.extend(_register_one_cerberus(path))
     return registered
 
 

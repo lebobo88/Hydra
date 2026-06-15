@@ -85,6 +85,20 @@ heads:
     crown: garland
     register: "Helios sub-agent — dialogue mix and mastering."
 
+  - plaza: blender-model
+    mythic: blender-model
+    crown: garland
+    register: >
+      Helios sub-agent — 3D mesh/prop/environment modeling on the existing blender-mcp
+      (retopo, UV/PBR, LOD, FBX/glTF/USD export) to The Sculptor's DCC contract.
+
+  - plaza: blender-rig
+    mythic: blender-rig
+    crown: garland
+    register: >
+      Helios sub-agent — rigging, skinning, FK/IK, mocap retarget, NLA on the existing
+      blender-mcp to The Choreographer's rig contract; self-checks rig-quality.
+
   - plaza: governance-c2pa
     mythic: governance-c2pa
     crown: garland

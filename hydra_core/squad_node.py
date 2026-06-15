@@ -512,6 +512,10 @@ _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
         "server": "senate", "prefix": "senate", "default_cmd": "/senate",
         "path_key": "domain", "label": "Legal counsel", "artifact_kind": "legal_output",
     },
+    "rlm-gaming": {
+        "server": "rlm_gaming", "prefix": "rlmgaming", "default_cmd": "/game-studio",
+        "path_key": "phase", "label": "Game studio", "artifact_kind": "game_design_output",
+    },
 }
 
 

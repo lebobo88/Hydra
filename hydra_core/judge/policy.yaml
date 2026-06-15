@@ -45,9 +45,16 @@ enabled_squads:
   - garland
   - healthcare
   - legal-compliance
+  - rlm-gaming
 
 # Severity escalation: rubrics that trigger HITL on `fail` outcome.
 hitl_on_fail:
   - constitution-alignment@1
   - phi-redaction-completeness@1
   - financial-hardcoding@1
+  # arcade (rlm-gaming) — the human-approval gates from squads/rlm-gaming/squad.yaml
+  - loot-box-jurisdiction@1
+  - esrb-pegi-iarc-rating@1
+  - platform-cert-readiness@1
+  - server-authority-fairplay@1
+  - ai-content-provenance@1

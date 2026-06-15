@@ -62,6 +62,15 @@ tools:
       Judge/critique artifacts via Google Gemini.
       Use for: cross-vendor review of generated artifacts.
       Not for: code generation — use pp.codex.generate instead.
+  - name: blender
+    mcp_server: blender
+    privilege: read
+    notes: >
+      The existing blender-mcp backend (socket :9876 / bridge :7700), registered in
+      hydra_core/gateway_templates.json. Engineering uses it READ/VALIDATE-only — the
+      tech-animator / technical-artist inspect and validate garland's exported 3D rig/
+      mesh assets against dcc-asset-validation@1 (engine-import correctness). 3D asset
+      EXECUTION is garland's blender-model/blender-rig, not engineering.
 
 accepts:
   - PRD

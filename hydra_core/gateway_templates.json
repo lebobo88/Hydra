@@ -88,5 +88,17 @@
     },
     "required": false,
     "description": "Senate legal pack introspection (the Curia Crown)"
+  },
+  "blender": {
+    "_comment": "EXISTING/3rd-party blender-mcp — reused, not built here. The stdio `uvx blender-mcp` process connects to the running Blender add-on socket on BLENDER_MCP_PORT (default 9876). If your blender-mcp instead exposes an SSE/HTTP MCP endpoint on :7700, swap to {\"type\":\"sse\",\"url\":\"http://127.0.0.1:7700/sse\"}. Restricted in garland/rlm-gaming squads to Helios + blender-model + blender-rig (garland) and read-only to the Arcade crown.",
+    "type": "stdio",
+    "command": "uvx",
+    "args": ["blender-mcp"],
+    "env_template": {
+      "BLENDER_MCP_HOST": "127.0.0.1",
+      "BLENDER_MCP_PORT": "9876"
+    },
+    "required": false,
+    "description": "Blender 3D modeling / rigging / animation / export automation (existing blender-mcp backend)"
   }
 }

@@ -86,6 +86,36 @@ _LEGAL_TOPIC_RUBRICS = [
 ]
 
 
+# Topic-specific rubric additions for rlm-gaming (Arcade Crown) envelopes.
+# game-design-pillars-testable@1 binds unconditionally at the squad boundary;
+# these are content-conditional (mirrors the gate `when:` clauses in
+# squads/rlm-gaming/squad.yaml). The two pp-library rubrics the squad also names
+# (game-perf-budget, game-accessibility-guidelines) are judged downstream by the
+# pair-programmer harness, not here.
+_GAMING_TOPIC_RUBRICS = [
+    (re.compile(r"\bloot\s?box\b|\bgacha\b|\bmonetiz|\bmicrotransaction\b|\bbattle pass\b|"
+                r"\bin[- ]app purchase\b|\biap\b|\blive[- ]?service\b|\bf2p\b|\bfree[- ]to[- ]play\b",
+                re.IGNORECASE),
+     "loot-box-jurisdiction@1"),
+    (re.compile(r"\brating\b|\besrb\b|\bpegi\b|\biarc\b|\bcero\b|\busk\b|\bage[- ]gate\b|"
+                r"\bcontent rating\b",
+                re.IGNORECASE),
+     "esrb-pegi-iarc-rating@1"),
+    (re.compile(r"\bcert(ification)?\b|\btrc\b|\blotcheck\b|\bsubmission\b|\bsteamworks\b|"
+                r"\bdeck[- ]verified\b|\bplatform requirement",
+                re.IGNORECASE),
+     "platform-cert-readiness@1"),
+    (re.compile(r"\bonline\b|\bmultiplayer\b|\bnetcode\b|\bserver[- ]auth|\banti[- ]?cheat\b|"
+                r"\bmatchmaking\b|\bpvp\b|\bcompetitive\b|\bcheat\b",
+                re.IGNORECASE),
+     "server-authority-fairplay@1"),
+    (re.compile(r"\bgen(erative)?[- ]?ai\b|\bai[- ]generated\b|\bdiffusion\b|\bgenai\b|"
+                r"\bc2pa\b|\bprovenance\b|\bai asset",
+                re.IGNORECASE),
+     "ai-content-provenance@1"),
+]
+
+
 @dataclass
 class JudgeRoute:
     tier: JudgeTier
@@ -185,6 +215,10 @@ def route_judge(
         rubrics.append("research-rigor@1")
     if origin_squad == "customer-support" or (envelope.get("target_squad") == "customer-support"):
         rubrics.append("support-deflection-quality@1")
+    if origin_squad == "rlm-gaming" or (envelope.get("target_squad") == "rlm-gaming"):
+        # Arcade Crown boundary: pillars-testable binds unconditionally;
+        # topic-conditional gaming rubrics attach below.
+        rubrics.append("game-design-pillars-testable@1")
 
     # Content-aware escalation + executive topic rubrics.
     text = _payload_text(envelope)
@@ -199,6 +233,10 @@ def route_judge(
                 rubrics.append(rid)
     if origin_squad == "legal-compliance" or (envelope.get("target_squad") == "legal-compliance"):
         for pat, rid in _LEGAL_TOPIC_RUBRICS:
+            if pat.search(text) and rid not in rubrics:
+                rubrics.append(rid)
+    if origin_squad == "rlm-gaming" or (envelope.get("target_squad") == "rlm-gaming"):
+        for pat, rid in _GAMING_TOPIC_RUBRICS:
             if pat.search(text) and rid not in rubrics:
                 rubrics.append(rid)
 
