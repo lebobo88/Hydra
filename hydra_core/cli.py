@@ -295,6 +295,9 @@ def _cmd_run(args) -> int:
         # Reuse the same dispatcher for cross-vendor judge calls; pp_codex /
         # pp_gemini servers must be registered at user scope (~/.claude.json).
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
+        # Live path drives pp to actual code generation (start_run alone only
+        # scaffolds). The skill/gateway path leaves this flag unset.
+        dispatcher.drive_pp_loop = True
     else:
         dispatcher = _NullDispatcher()
     # Lazy import: pulls in langgraph (and the langchain_core warning). Keeping
@@ -530,6 +533,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         from .judge import MCPCritiqueClient
         dispatcher = MCPStdioDispatcher(project, verbose=getattr(args, "verbose", False))
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
+        # Resume re-enters dispatch — drive pp to real codegen on the live path.
+        dispatcher.drive_pp_loop = True
     else:
         dispatcher = _NullDispatcher()
 

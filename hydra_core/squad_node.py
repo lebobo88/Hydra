@@ -61,6 +61,14 @@ class SquadResult:
     # NOT score these — there's no substance yet. The host (Claude Code)
     # fulfils the prompt out-of-band and a follow-up envelope arrives later.
     host_pickup_pending: bool = False
+    # True when the engineering live drive loop already drove a cross-vendor
+    # pp critique to a verdict (start_stage→generate→critique→record_verdict→
+    # finalize). The supervisor's NoOp judge plane must NOT re-judge this
+    # DecisionRecord — doing so downgrades a vacuous "pass" to "revise" and
+    # re-dispatches engineering, spawning a fresh start_run loop. Unlike
+    # host_pickup_pending the work is DONE, not awaited, so synthesis still
+    # treats it as a real candidate.
+    pp_loop_judged: bool = False
 
 
 def execute_squad(
@@ -150,6 +158,238 @@ def _stub(pack: SquadPack, inbound: HydraEnvelope) -> SquadResult:
         status="surfaced",
         rationale="stub squad — surfaced for human follow-up",
     )
+
+
+def _pp_inner(res: Any) -> dict[str, Any]:
+    """Unwrap an MCP envelope's inner result dict, tolerating bare payloads."""
+    if not isinstance(res, dict):
+        return {}
+    inner = res.get("result", res)
+    return inner if isinstance(inner, dict) else {}
+
+
+def _pp_ok(res: Any) -> bool:
+    """True when an MCP envelope reports unambiguous success."""
+    return (
+        isinstance(res, dict)
+        and res.get("status") in {"done", "ok", "complete"}
+        and not _pp_inner(res).get("error")
+    )
+
+
+def _build_engineer_prompt(request_text: str, project_path: str) -> str:
+    """Prompt contract for headless code generation.
+
+    Replaces what the typed Claude `engineer` agent supplies on the skill path:
+    stage intent, the working directory, repo-convention awareness, and a
+    request for a change summary + smoke evidence.
+    """
+    return (
+        "You are the engineering implementation agent for a Hydra-dispatched task. "
+        f"The working directory is the target repo ({project_path}). Implement the "
+        "request by editing files DIRECTLY in this directory, following existing "
+        "conventions (read AGENTS.md / CLAUDE.md first). Keep the change minimal and "
+        "focused. After implementing, summarize the files you changed and any "
+        "tests / smoke checks you ran and their result.\n\n"
+        f"REQUEST:\n{request_text}"
+    )
+
+
+def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
+    """Reflexion ×1: fold the prior critique back into the retry prompt."""
+    return (
+        f"{base_prompt}\n\n"
+        "A prior attempt was judged and needs revision. Address this critique "
+        "specifically, then re-summarize your changes:\n"
+        f"<critique>\n{critique_md[:3000]}\n</critique>"
+    )
+
+
+def _rubric_md(rubric_id: str) -> str:
+    """Resolve a rubric body for the judge; degrade to a minimal rubric."""
+    try:
+        from .judge.registry import get_rubric
+        return get_rubric(rubric_id).body_md
+    except Exception:  # noqa: BLE001 — never block the loop on a registry miss
+        return (
+            "Evaluate the change for correctness, adherence to the stated request, "
+            "and absence of regressions. Output outcome (pass/revise/fail), a "
+            "critique, and per-dimension scores."
+        )
+
+
+def _drop_open_run(
+    state: "HydraState", collect_open_runs: list | None, run_id: str
+) -> None:
+    """Remove a finalized run from the open-runs ledger so node_postcheck's
+    abort path does not try to finalize an already-closed run."""
+    try:
+        if collect_open_runs is not None:
+            collect_open_runs[:] = [
+                e for e in collect_open_runs if e.get("run_id") != run_id
+            ]
+        else:
+            state.open_pp_runs = [
+                e for e in state.open_pp_runs if e.get("run_id") != run_id
+            ]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _drive_pp_stage_loop(
+    dispatcher: Dispatcher,
+    *,
+    run_id: str,
+    project_path: str,
+    request_text: str,
+    model_tier: str | None = None,
+    judge_rubric_id: str = "rfc-2119-normative",
+) -> dict[str, Any]:
+    """Drive a pp `code` stage to a finalized run, headless (no Claude driver).
+
+    The pp daemon is a pure state machine — ``start_run`` only scaffolds. On the
+    skill path the Claude session drives the lifecycle; on the headless live /
+    fleet path THIS function is that driver. It calls only tools the engineering
+    squad declares (RBAC-safe):
+
+        start_stage → pp_codex.generate (codex edits the worktree directly)
+                    → archive_artifact + record_attempt
+                    → pp_gemini.critique (cross-vendor) + record_verdict
+                    → [Reflexion ×1 on revise]
+                    → finalize_stage(winner_attempt_id) → finalize_run
+
+    Fail-soft: ANY exception triggers a best-effort ``finalize_run(aborted)`` to
+    release the project lock, and returns ``final_status="aborted"``. NEVER
+    raises — dispatch must not crash on a daemon hiccup.
+    """
+    sq = "engineering"
+    cm = dispatcher.call_mcp
+    out: dict[str, Any] = {
+        "final_status": "aborted", "stage_outcome": None,
+        "attempt_id": None, "critique": "", "error": None, "finalized": False,
+    }
+    try:
+        st = cm("pp_harness", "start_stage",
+                {"run_id": run_id, "kind": "code", "gate_type": "code"},
+                squad_id=sq)
+        stage_id = _pp_inner(st).get("stage_id")
+        if not stage_id:
+            raise RuntimeError(f"start_stage returned no stage_id: {st!r}")
+
+        base_prompt = _build_engineer_prompt(request_text, project_path)
+        attempt_id: str | None = None
+        outcome: str | None = None
+        critique_md = ""
+        rubric_body = _rubric_md(judge_rubric_id)
+
+        # Reflexion ×1 → at most two attempts.
+        for retry_index in range(2):
+            prompt = (base_prompt if retry_index == 0
+                      else _augment_with_critique(base_prompt, critique_md))
+            gen = cm("pp_codex", "generate",
+                     {"prompt": prompt, "cwd": project_path}, squad_id=sq)
+            gi = _pp_inner(gen)
+            gen_text = str(gi.get("text") or "")
+
+            # codex writes files in cwd directly; archive the producer summary
+            # as the stage's code-record artifact (best-effort).
+            try:
+                cm("pp_harness", "archive_artifact", {
+                    "run_id": run_id,
+                    "relative_path": f"code/codex-attempt-{retry_index}.md",
+                    "bytes": gen_text or "(no summary returned)",
+                    "stage_id": stage_id, "kind": "code", "encoding": "utf8",
+                }, squad_id=sq)
+            except Exception:  # noqa: BLE001
+                pass
+
+            att = cm("pp_harness", "record_attempt", {
+                "stage_id": stage_id,
+                "producer": "codex",
+                "model_id": str(gi.get("model") or model_tier or "codex-default"),
+                "tokens_in": int(gi.get("tokens_in") or 0),
+                "tokens_out": int(gi.get("tokens_out") or 0),
+                "cost_usd": float(gi.get("cost_usd") or 0.0),
+                "wall_ms": int(gi.get("wall_ms") or 0),
+                "status": "ok",
+                "retry_index": retry_index,
+                **({"parent_attempt_id": attempt_id} if attempt_id else {}),
+            }, squad_id=sq)
+            attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
+
+            # Cross-vendor critique: gemini judges codex's output.
+            crit = cm("pp_gemini", "critique", {
+                "artifact_text": gen_text or "(no diff summary returned)",
+                "rubric_md": rubric_body,
+                "cwd": project_path,
+            }, squad_id=sq)
+            ci = _pp_inner(crit)
+            parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
+            if not isinstance(parsed, dict):
+                parsed = {}
+            outcome = parsed.get("outcome") or parsed.get("verdict") or "revise"
+            critique_md = parsed.get("critique_md") or parsed.get("critique") or ""
+            score_json = parsed.get("score") or parsed.get("score_json") or {}
+
+            if attempt_id:
+                try:
+                    cm("pp_harness", "record_verdict", {
+                        "attempt_id": attempt_id,
+                        "judge_producer": "gemini",
+                        "judge_model_id": str(ci.get("model") or "gemini-default"),
+                        "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
+                        "critique_md": str(critique_md)[:4000],
+                        "score_json": score_json,
+                        "rubric_id": judge_rubric_id,
+                    }, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if outcome == "pass":
+                break  # accept; no Reflexion needed
+
+        out["attempt_id"] = attempt_id
+        out["stage_outcome"] = outcome
+        out["critique"] = str(critique_md)[:1000]
+        passed = outcome == "pass"
+
+        try:
+            cm("pp_harness", "finalize_stage", {
+                "stage_id": stage_id,
+                "status": "passed" if passed else "surfaced",
+                **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
+            }, squad_id=sq)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # finalize_run runs PP gates server-side and may downgrade — don't
+        # assume success; reflect the returned status.
+        fin = cm("pp_harness", "finalize_run", {
+            "run_id": run_id,
+            "status": "complete" if passed else "surfaced",
+            "summary_md": f"Headless drive loop: stage_outcome={outcome}.",
+        }, squad_id=sq)
+        out["finalized"] = True
+        fin_status = _pp_inner(fin).get("status")
+        if passed and (fin_status in {"complete", "done", "ok"} or _pp_ok(fin)) \
+                and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
+            out["final_status"] = "complete"
+        else:
+            out["final_status"] = "surfaced"
+        return out
+    except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
+        out["error"] = repr(e)
+        try:
+            cm("pp_harness", "finalize_run", {
+                "run_id": run_id, "status": "aborted",
+                "reason": f"drive_loop_error: {e!r}",
+                "project_path": project_path,
+            }, squad_id=sq)
+            out["finalized"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        out["final_status"] = "aborted"
+        return out
 
 
 def _via_mcp(
@@ -316,6 +556,30 @@ def _via_mcp(
         except Exception:  # noqa: BLE001 — never crash dispatch on state writes
             pass
 
+    # Headless drive loop: the live CLI / fleet dispatcher sets drive_pp_loop so
+    # the engineering squad DRIVES pp to actual code generation (start_run alone
+    # only scaffolds). On the skill path drive_pp_loop is absent/False and we
+    # keep the legacy "scaffold + return running" behavior unchanged.
+    loop_outcome: dict[str, Any] | None = None
+    # `is True` (not just truthy) so a Mock/stub dispatcher whose attribute
+    # access auto-vivifies a truthy object does NOT accidentally engage the
+    # loop. Real callers (cli.py live path, fleet factory) set a literal True.
+    if getattr(dispatcher, "drive_pp_loop", False) is True and run_id and pp_status == "done":
+        loop_outcome = _drive_pp_stage_loop(
+            dispatcher,
+            run_id=str(run_id),
+            project_path=str(project_path),
+            request_text=str(args.get("request_text", "")),
+            model_tier=effective_tier,
+        )
+        # The loop already finalized the run (complete/surfaced/aborted) → the
+        # project lock is released. Drop the ledger entry so node_postcheck's
+        # abort path does not double-finalize a closed run.
+        if loop_outcome.get("finalized"):
+            _drop_open_run(state, collect_open_runs, str(run_id))
+        # Drive the downstream harvest + status mapping off the loop's result.
+        pp_status = loop_outcome.get("final_status", pp_status)
+
     # Worktree handoff: when the inbound envelope ran on its own project_path
     # (i.e. the planner allocated a worktree per the pp_harness_project_lock
     # rule) and pp-harness reported a terminal status, harvest the archived
@@ -334,6 +598,20 @@ def _via_mcp(
         except Exception:  # noqa: BLE001 — never crash dispatch on a git failure
             commit_sha = None
 
+    # Status mapping. Drive-loop runs report a terminal final_status; legacy
+    # scaffold-only dispatch reports "running" (the pp daemon owns the rest).
+    if loop_outcome is not None:
+        fs = loop_outcome.get("final_status")
+        result_status = "done" if fs == "complete" else ("failed" if fs == "aborted" else "surfaced")
+        loop_summary = (
+            f"; drive_loop: final_status={fs}, stage_outcome="
+            f"{loop_outcome.get('stage_outcome')}"
+            + (f", error={loop_outcome.get('error')}" if loop_outcome.get("error") else "")
+        )
+    else:
+        result_status = "running" if pp_status == "done" and run_id else pp_status
+        loop_summary = ""
+
     decision = DecisionRecord(
         workflow_id=inbound.workflow_id,
         parent_id=inbound.id,
@@ -343,14 +621,18 @@ def _via_mcp(
         rationale=(
             f"mode={mode}; model_tier={effective_tier or 'default'}; "
             f"pp dispatch status: {pp_status}; "
-            f"commit_sha={commit_sha or 'none'}; inner: {str(inner)[:240]}"
+            f"commit_sha={commit_sha or 'none'}{loop_summary}; inner: {str(inner)[:240]}"
         ),
         artifacts=[MemoryRef(tier="episodic", key=f"pp:run:{run_id or 'unknown'}")] if run_id else [],
     )
     return SquadResult(
         envelopes=[decision],
-        artifacts=[{"kind": "pp_run", "ref": run_id, "raw": result, "commit_sha": commit_sha}],
-        status="running" if pp_status == "done" and run_id else pp_status,
+        artifacts=[{"kind": "pp_run", "ref": run_id, "raw": result, "commit_sha": commit_sha,
+                    "drive_loop": loop_outcome}],
+        status=result_status,
+        # A driven run has already been cross-vendor judged inside pp — exempt
+        # its DecisionRecord from the supervisor's NoOp re-judge / retry loop.
+        pp_loop_judged=loop_outcome is not None,
     )
 
 

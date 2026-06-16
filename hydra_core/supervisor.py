@@ -926,6 +926,8 @@ def build_supervisor(
             primary["_bon_candidate_index"] = i
             if result.host_pickup_pending:
                 primary["_host_pickup_pending"] = True
+            if getattr(result, "pp_loop_judged", False):
+                primary["_pp_loop_judged"] = True
             # Fix 2 (best-of-N _task_id): stamp originating task_id so
             # _reflexion_retry can resolve the exact task and source its
             # model_tier rather than falling back to first-same-squad.
@@ -1173,6 +1175,9 @@ def build_supervisor(
                 _tracker_packs: Any = (
                     getattr(_orig_tracker, "_packs", {}) if _orig_tracker is not None else {}
                 )
+                # Propagate the live drive flag so fleet workers also drive pp to
+                # real codegen (not just scaffold) on each target repo.
+                _drive_pp: bool = bool(getattr(dispatcher, "drive_pp_loop", False))
 
                 def _dispatcher_factory(
                     _cls: type = _dcls,
@@ -1181,6 +1186,7 @@ def build_supervisor(
                     _sp: dict[str, Any] = _squad_packs_snapshot,
                     _ho: list[dict[str, Any]] = _handoffs_snapshot,
                     _tp: Any = _tracker_packs,
+                    _drive: bool = _drive_pp,
                 ) -> Dispatcher:
                     d = _cls(project_root=_root, verbose=_v)
                     # RBAC: shared read-only state (packs + handoffs are not mutated
@@ -1189,6 +1195,8 @@ def build_supervisor(
                         d.set_squad_packs(_sp)
                     if hasattr(d, "_active_handoffs"):
                         d._active_handoffs = list(_ho)
+                    if _drive:
+                        d.drive_pp_loop = True
                     # Tool tracker: FRESH instance per worker (not the shared ref)
                     # so concurrent .record() calls never race on one list.
                     # The factory does NOT append to any shared list — pure
@@ -1332,6 +1340,8 @@ def build_supervisor(
                             continue
                         if result.host_pickup_pending:
                             d["_host_pickup_pending"] = True
+                        if getattr(result, "pp_loop_judged", False):
+                            d["_pp_loop_judged"] = True
                         d["_task_id"] = str(fleet_task.task_id)
                         new_decisions.append(d)
                         eights.envelope_record(d)
@@ -1548,6 +1558,8 @@ def build_supervisor(
                     continue
                 if result.host_pickup_pending:
                     d["_host_pickup_pending"] = True
+                if getattr(result, "pp_loop_judged", False):
+                    d["_pp_loop_judged"] = True
                 # WS9 Fix 2: tag the envelope with the originating task_id so
                 # _reflexion_retry can source model_tier from the EXACT task,
                 # not just the first same-squad task.
@@ -1783,6 +1795,18 @@ def build_supervisor(
                     "envelope_id": env.get("id"),
                     "envelope_type": env.get("type"),
                     "rationale": "host_pickup_pending: real response awaited",
+                })
+                continue
+            # Skip engineering DecisionRecords whose pp run already drove a
+            # cross-vendor critique to a verdict. Re-judging them here would
+            # force the NoOp client → pragmatic-pass guard → synthetic "revise"
+            # → re-dispatch (a fresh start_run loop). The real verdict already
+            # lives in the pp run record.
+            if env.get("_pp_loop_judged"):
+                emit_trace(judge_trace_root, state.workflow_id, "judge.skipped", {
+                    "envelope_id": env.get("id"),
+                    "envelope_type": env.get("type"),
+                    "rationale": "pp_loop_judged: cross-vendor verdict already recorded in pp run",
                 })
                 continue
             env_verdicts = _judge_envelope(state, env, is_post_synthesis=False)

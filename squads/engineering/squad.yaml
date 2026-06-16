@@ -27,41 +27,85 @@ agents:
     authority: gatekeeper
 
 tools:
-  - name: pp.harness.start_run
+  # RBAC matching rule (hydra_core/dispatcher.py:_check_tool_rbac): for a live
+  # call to (server, tool) the dispatcher builds tool_key = f"{server}.{tool}"
+  # and authorizes a declared tool when EITHER:
+  #   (a) `name` == tool_key  — the exact dotted key, e.g. "pp_harness.start_run"
+  #       (note: underscore server segment, since server is "pp_harness"), OR
+  #   (b) `name` == bare tool AND (`mcp_server` is absent or == server).
+  # We use form (b) — bare names + an explicit `mcp_server`. The historical
+  # "pp.harness.start_run" form matched NEITHER (its server segment "pp.harness"
+  # uses a dot, not the underscore of the real server "pp_harness"), so live
+  # dispatch was RBAC-rejected. Keep these bare. Every tool the live drive loop
+  # in squad_node._via_mcp calls (start_run, start_stage, archive_artifact,
+  # record_attempt, record_verdict, finalize_stage, finalize_run on pp_harness;
+  # generate on pp_codex; critique on pp_gemini) MUST be declared here or RBAC
+  # rejects it mid-run.
+  - name: start_run
     mcp_server: pp_harness
     privilege: execute
     notes: >
       Start a pair-programmer run (single/team/best-of/review mode).
       Use for: initiating engineering work dispatched by Hydra.
       Not for: read-only queries or status checks.
-  - name: pp.harness.start_stage
+  - name: finalize_run
+    mcp_server: pp_harness
+    privilege: execute
+    notes: >
+      Finalize (or abort) an active PP run; releases the project lock.
+      Use for: cleanup/teardown of an open run on completion or abort.
+      Not for: starting a run — use start_run instead.
+  - name: start_stage
     mcp_server: pp_harness
     privilege: execute
     notes: >
       Start a specific stage within an active PP run.
       Use for: advancing through taxonomy stages (spec, design, code, test).
-      Not for: starting a new run — use pp.harness.start_run instead.
-  - name: pp.harness.archive_artifact
+      Not for: starting a new run — use start_run instead.
+  - name: archive_artifact
     mcp_server: pp_harness
     privilege: write
     notes: >
       Archive a produced artifact to the run's .harness directory.
       Use for: persisting spec/design/code/test artifacts after generation.
       Not for: reading or listing existing artifacts.
-  - name: pp.codex.generate
+  - name: record_attempt
     mcp_server: pp_harness
+    privilege: write
+    notes: >
+      Record a generation attempt against a stage (producer, model, tokens/cost,
+      retry index, parent attempt). Returns the attempt_id used by record_verdict
+      and finalize_stage. Use for: logging each drive-loop generation.
+      Not for: scoring — that is record_verdict.
+  - name: record_verdict
+    mcp_server: pp_harness
+    privilege: write
+    notes: >
+      Record a judge verdict (pass/revise/fail + critique + score) against an
+      attempt. Use for: persisting the cross-vendor critique result in the
+      drive loop. Not for: producing the critique — that is the gemini/codex
+      critique tool.
+  - name: finalize_stage
+    mcp_server: pp_harness
+    privilege: execute
+    notes: >
+      Close a stage (passed/surfaced/skipped). A "passed" status requires
+      winner_attempt_id. Use for: completing a stage in the drive loop before
+      finalize_run. Not for: closing the whole run — use finalize_run.
+  - name: generate
+    mcp_server: pp_codex
     privilege: execute
     notes: >
       Generate code or artifacts via OpenAI Codex.
       Use for: code generation when cross-vendor diversity is needed.
-      Not for: critique/review — use pp.gemini.critique instead.
-  - name: pp.gemini.critique
-    mcp_server: pp_harness
+      Not for: critique/review — use the gemini critique tool instead.
+  - name: critique
+    mcp_server: pp_gemini
     privilege: execute
     notes: >
       Judge/critique artifacts via Google Gemini.
       Use for: cross-vendor review of generated artifacts.
-      Not for: code generation — use pp.codex.generate instead.
+      Not for: code generation — use the codex generate tool instead.
   - name: blender
     mcp_server: blender
     privilege: read
