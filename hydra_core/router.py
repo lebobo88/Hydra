@@ -102,19 +102,27 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "rlm-gaming": (
         # core game-dev vocabulary
+        # NOTE: bare ambient words (level/narrative/dialogue/economy/balance/
+        # season/progression/difficulty/mechanic) were REMOVED — they collide
+        # with garland/executive/marketing vocabulary and let rlm-gaming siphon
+        # routes from other squads. The game intent is carried by the dozens of
+        # unambiguous terms below; generic concepts use game-qualified bigrams.
         "game", "gameplay", "game design", "gdd", "game studio", "video game",
-        "level design", "level", "boss", "encounter", "enemy", "mechanic",
-        "core loop", "playtest", "balance", "difficulty", "progression",
-        "quest", "narrative", "dialogue", "loot", "loot box", "gacha",
-        "economy", "monetization", "live service", "live-ops", "liveops",
-        "season", "battle pass", "matchmaking", "netcode", "multiplayer",
+        "level design", "boss fight", "boss battle", "encounter design",
+        "enemy design", "enemy ai", "game mechanic",
+        "core loop", "playtest", "game balance", "difficulty curve",
+        "progression curve",
+        "quest", "narrative design", "dialogue tree", "loot", "loot box", "gacha",
+        "game economy", "game monetization", "live service", "live-ops", "liveops",
+        "season pass", "battle pass", "matchmaking", "netcode", "multiplayer",
         "anti-cheat", "anticheat", "speedrun", "roguelite", "roguelike",
-        "fps", "rpg", "rts", "platformer", "metroidvania", "soulslike",
-        "deckbuilder", "esports", "vertical slice", "greenlight",
-        # engines
-        "unity", "unreal", "unreal engine", "godot", "gamemaker",
+        "fps", "rpg", "rts", "mmo", "mmorpg", "platformer", "metroidvania",
+        "soulslike", "deckbuilder", "esports", "vertical slice", "greenlight",
+        # engines — qualified: bare "unity"/"unreal"/"blueprint" are ambient
+        # (team unity, unreal results, architecture blueprint) and were dropped.
+        "unity3d", "unity engine", "unreal engine", "godot", "gamemaker",
         "babylon.js", "babylonjs", "phaser", "playcanvas", "spring rts",
-        "recoil engine", "behavior tree", "navmesh", "blueprint",
+        "recoil engine", "behavior tree", "navmesh", "unreal blueprint",
         # ratings / cert
         "esrb", "pegi", "iarc", "cero", "lotcheck", "trc", "steamworks",
         # arcade-crown mythic routing keys (Garland precedent)

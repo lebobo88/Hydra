@@ -88,9 +88,13 @@ def _reset_fed(server, monkeypatch, *, enabled=True, timeout="8"):
 
 
 def test_federation_disabled_by_default(monkeypatch):
+    # Disabled federation is "not attempted": a non-degraded envelope with no hits
+    # (the caller distinguishes this from a degraded backend). See server.py:582.
     import mcp_servers.hydra_memory.server as srv
     _reset_fed(srv, monkeypatch, enabled=False)
-    assert srv._maybe_federate_search("q", {}) is None
+    assert srv._maybe_federate_search("q", {}) == {
+        "hits": None, "degraded": False, "reason": None,
+    }
 
 
 def test_federation_runs_off_async_thread_and_returns_hits(monkeypatch):
@@ -104,7 +108,12 @@ def test_federation_runs_off_async_thread_and_returns_hits(monkeypatch):
 
     srv._EIGHTS_ATTESTOR = _FakeAtt()
     out = srv._maybe_federate_search("quasar", {"k": 3, "workflow_id": "wf-9"})
-    assert out == {"hits": [{"id": "e1", "q": "quasar", "k": 3, "wf": "wf-9"}]}
+    # Success wraps the attestor payload under "hits" in a non-degraded envelope.
+    assert out == {
+        "hits": {"hits": [{"id": "e1", "q": "quasar", "k": 3, "wf": "wf-9"}]},
+        "degraded": False,
+        "reason": None,
+    }
 
 
 def test_federation_times_out_to_local(monkeypatch):
@@ -120,5 +129,8 @@ def test_federation_times_out_to_local(monkeypatch):
 
     srv._EIGHTS_ATTESTOR = _SlowAtt()
     t0 = time.time()
-    assert srv._maybe_federate_search("slow", {}) is None
+    # Timeout degrades to local-only: no hits, degraded flag set, reason surfaced.
+    assert srv._maybe_federate_search("slow", {}) == {
+        "hits": None, "degraded": True, "reason": "timeout",
+    }
     assert time.time() - t0 < 3  # bounded by the ~1s timeout, not the 5s sleep
