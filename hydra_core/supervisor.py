@@ -63,6 +63,41 @@ except ImportError:                                                        # pra
     _HAS_LANGGRAPH = False
 
 
+# RC1 — delegation routing: which squad consumes each emitted envelope type
+# when the producing orchestrator (e.g. rlm-gaming) does not name an explicit
+# target_squad. DEV_TASK/PRD/ARCH_RFC -> engineering (pair-programmer);
+# CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland (RLM-Creative / Helios).
+_FORWARD_TARGET_BY_TYPE: dict[str, str] = {
+    "DEV_TASK": "engineering",
+    "PRD": "engineering",
+    "ARCH_RFC": "engineering",
+    "CREATIVE_BRIEF": "garland",
+    "SHOT_LIST": "garland",
+    "ASSET_JOB": "garland",
+}
+
+
+def _resolve_forward_target(env: "Any", producer_slug: str) -> "str | None":
+    """Resolve the squad an emitted delegation envelope should forward to.
+
+    An explicit ``target_squad`` (when it names a real, non-producer squad) wins;
+    otherwise fall back to the type map. Returns None for a self-forward
+    (target == producer) so the single forwarding sweep cannot loop.
+    """
+    explicit = getattr(env, "target_squad", None)
+    etype = getattr(env, "type", None)
+    valid_targets = set(_FORWARD_TARGET_BY_TYPE.values())
+    # Honor an explicit target only when it is a recognised delegation target;
+    # otherwise fall back to the type map (a stray target_squad like "hydra"
+    # must not suppress the correct default).
+    if explicit in valid_targets and explicit != producer_slug:
+        return explicit
+    target = _FORWARD_TARGET_BY_TYPE.get(etype)
+    if not target or target == producer_slug:
+        return None
+    return target
+
+
 def _extract_squad_cost(result: "Any") -> tuple[float, int]:
     """FS-4 — extract cost from a SquadResult.
 
@@ -158,6 +193,32 @@ def build_supervisor(
     # shared PendingSpool; `node_intake` calls `replay_pending()` once per
     # workflow start so the spool drains the next time eights is healthy.
     eights = EightsAttestor(dispatcher=dispatcher)
+
+    # RC3/RC4 — autonomous codegen + real judge on every real-dispatcher run.
+    # Historically only the cli `--live` path set drive_pp_loop and wired
+    # MCPCritiqueClient; the interactive skill / gateway / host-bound paths left
+    # them unset, so engineering dispatch only scaffolded (no codegen) and the
+    # judge fell back to the NoOp skeleton (every verdict downgraded to "revise"
+    # → pointless Reflexion churn). We now key off the dispatcher's
+    # `live_execution` marker (set by MCPStdioDispatcher) so ANY run against a
+    # real dispatcher drives pp to real code generation AND scores with a real
+    # cross-vendor critique — no `--live` flag required. Stub/test dispatchers
+    # lack the marker and keep their dry behaviour. Explicit caller-supplied
+    # values win (we only fill in when unset).
+    if getattr(dispatcher, "live_execution", False):
+        if not getattr(dispatcher, "drive_pp_loop", False):
+            try:
+                dispatcher.drive_pp_loop = True
+            except Exception:  # noqa: BLE001 — never crash build on a frozen dispatcher
+                pass
+        if critique_client is None:
+            try:
+                from .judge import MCPCritiqueClient
+                critique_client = MCPCritiqueClient(
+                    dispatcher=dispatcher, cwd=judge_trace_root,
+                )
+            except Exception:  # noqa: BLE001 — degrade to skeleton (traced at judge time)
+                critique_client = None
 
     # Cerberus' venom registry is hydrated from cerberus.yaml at boot.
     # Capabilities not pre-registered raise VenomUnregistered when invoked
@@ -770,7 +831,26 @@ def build_supervisor(
 
         # Squad gating: use NoOp for squads not yet rolled out.
         squad_enabled = judge_policy.squad_enabled(origin if not is_post_synthesis else None)
-        use_client = critique_client if squad_enabled else NoOpCritiqueClient()
+        if squad_enabled and critique_client is not None:
+            use_client = critique_client
+        else:
+            # RC4 fail-loud: a skeleton verdict is NOT a real evaluation. When the
+            # squad IS enabled but no real critique client is wired (dry run, or
+            # pp_codex/pp_gemini unconfigured on a live run), surface that the
+            # verdict is a no-op skeleton rather than silently downgrading to
+            # "revise" and churning Reflexion. On a real dispatcher run RC3/RC4
+            # auto-wiring means critique_client is never None here.
+            use_client = NoOpCritiqueClient()
+            if squad_enabled and critique_client is None:
+                emit_trace(judge_trace_root, state.workflow_id, "judge.skeleton_fallback", {
+                    "envelope_id": env.get("id"),
+                    "envelope_type": env.get("type"),
+                    "rationale": (
+                        "squad enabled but no real critique client wired — verdict is a "
+                        "NoOp skeleton, not a real evaluation. Wire MCPCritiqueClient "
+                        "(real dispatcher) or expect Reflexion churn."
+                    ),
+                })
 
         out: list[dict] = []
         judge_vendor = (route.preferred_judge_vendors or ["gemini"])[0]
@@ -1097,6 +1177,8 @@ def build_supervisor(
                 objective=task.description,
                 target_repo_id=_task_repo_id if _task_repo_id is not None else state.target_repo_id,
                 model_tier=getattr(task, "model_tier", None),
+                pp_team=getattr(task, "pp_team", None),
+                pp_profile=getattr(task, "pp_profile", None),
             )
 
         # WS8 Fix 5: build EVERY pending task's payload EXACTLY ONCE, up-front,
@@ -1442,6 +1524,10 @@ def build_supervisor(
             # below skips them. Non-mcp and best-of-N tasks are still pending.
 
         # --- Original sequential dispatch path (default; unchanged) ----------
+        # RC1: delegation envelopes emitted by an orchestrator squad during this
+        # loop are collected here and forwarded to their target squad in a single
+        # sweep after the loop. Each entry: (envelope_obj, producer_slug, target_slug).
+        _forward_queue: list[tuple[Any, str, str]] = []
         for task in _dispatch_tasks:
             if task.status != "pending":
                 continue
@@ -1566,11 +1652,138 @@ def build_supervisor(
                 d["_task_id"] = str(task.task_id)
                 new_decisions.append(d)
                 eights.envelope_record(d)
+                # RC1: queue delegation envelopes (DEV_TASK/PRD -> engineering,
+                # CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland) emitted by an
+                # orchestrator squad (e.g. rlm-gaming) for an in-pass forward to
+                # the target squad. Skip self-forwards (target == producer) and
+                # already-forwarded envelopes so the single sweep cannot recurse.
+                if (
+                    getattr(produced, "type", None) in _FORWARD_TARGET_BY_TYPE
+                    and not d.get("_forwarded")
+                ):
+                    _fwd_target = _resolve_forward_target(produced, pack.slug)
+                    if _fwd_target is not None:
+                        _forward_queue.append((produced, pack.slug, _fwd_target))
             artifacts.extend(result.artifacts)
+
+        # RC1 — single forwarding sweep. Execute each queued delegation envelope
+        # against its target squad (engineering/garland) IN THIS dispatch pass so
+        # rlm-gaming's design work actually reaches pair-programmer / Helios. The
+        # forwarded inbound IS the emitted DEV_TASK/PRD/brief, so _via_mcp reads
+        # its instructions + pp_team and auto-defaults the game team off
+        # origin_squad="rlm-gaming". Forwarded results are tagged `_forwarded`
+        # and never re-queued (no recursion). Budget is charged per forward; a
+        # block surfaces exactly like the main loop.
+        _seen_forward_ids: set[str] = set()
+        # New tasks are returned in the patch (the `tasks` channel has an append
+        # reducer) rather than mutated in-place, so they persist in both the
+        # LangGraph and pure-python runners.
+        _forwarded_tasks: list[TaskState] = []
+        for _src_env, _producer, _target in _forward_queue:
+            _eid = str(getattr(_src_env, "id", ""))
+            if _eid in _seen_forward_ids:
+                continue
+            _seen_forward_ids.add(_eid)
+            _target_pack = packs.get(_target)
+            if _target_pack is None:
+                continue
+            _fwd_task = TaskState(
+                owner_squad=_target,
+                description=(
+                    getattr(_src_env, "instructions", None)
+                    or getattr(_src_env, "objective", None)
+                    or getattr(_src_env, "summary", None)
+                    or f"forwarded {getattr(_src_env, 'type', '?')} from {_producer}"
+                ),
+                envelope_id=getattr(_src_env, "id", None),
+                target_repo_id=getattr(_src_env, "target_repo_id", None) or state.target_repo_id,
+            )
+            _forwarded_tasks.append(_fwd_task)
+            # Redact at the squad boundary BEFORE engineering/garland sees it —
+            # the emitted envelope is semi-trusted skill output, so PII/PHI/
+            # financial data + MCP-injection strings must be neutralised here
+            # (mirrors the inbound-from-squad redaction). Pass the reconstructed,
+            # redacted envelope object to execute_squad, not the raw original.
+            try:
+                _src_safe_dict = _validate_and_redact_envelope(
+                    _src_env.model_dump(mode="json"),
+                    direction="outbound_to_squad", squad_id=_target,
+                )
+                _src_env_safe = validate_envelope(_src_safe_dict)
+            except (ValueError, Exception):
+                _fwd_task.status = "failed"
+                state.error_counters[_target] = state.error_counters.get(_target, 0) + 1
+                continue
+            try:
+                _fwd_result = execute_squad(state, _target_pack, _src_env_safe, dispatcher)
+            except Exception:  # noqa: BLE001
+                _fwd_task.status = "failed"
+                state.error_counters[_target] = state.error_counters.get(_target, 0) + 1
+                continue
+            _fc_usd, _fc_tok = _extract_squad_cost(_fwd_result)
+            _fblock, _fdown = charge_and_gate(state, _fc_usd, _fc_tok)
+            if _fdown and not state.budget_downgrade_active:
+                state.budget_downgrade_active = True
+            emit_trace(judge_trace_root, state.workflow_id, "dispatch.forwarded", {
+                "from_squad": _producer,
+                "to_squad": _target,
+                "envelope_type": getattr(_src_env, "type", None),
+                "status": _fwd_result.status,
+            })
+            # _via_mcp already registered any pp run on state.open_pp_runs.
+            _fwd_task.status = _fwd_result.status
+            for _produced in _fwd_result.envelopes:
+                _fd = _produced.model_dump(mode="json")
+                try:
+                    _fd = _validate_and_redact_envelope(
+                        _fd, direction="inbound_from_squad", squad_id=_target,
+                    )
+                except (ValueError, Exception):
+                    _fwd_task.status = "failed"
+                    state.error_counters[_target] = state.error_counters.get(_target, 0) + 1
+                    continue
+                _fd["_forwarded"] = True
+                _fd["_task_id"] = str(_fwd_task.task_id)
+                if _fwd_result.host_pickup_pending:
+                    _fd["_host_pickup_pending"] = True
+                if getattr(_fwd_result, "pp_loop_judged", False):
+                    _fd["_pp_loop_judged"] = True
+                new_decisions.append(_fd)
+                eights.envelope_record(_fd)
+            artifacts.extend(_fwd_result.artifacts)
+            if _fblock:
+                state.budget_downgrade_active = True
+                _hitl_fwd_budget: dict[str, Any] = {
+                    "workflow_id": str(state.workflow_id),
+                    "reason": "over_budget",
+                    "gate_node": "dispatch",
+                    "summary": (
+                        f"Budget exhausted: ${state.budget.spent_usd:.4f} of "
+                        f"${state.budget.budget_usd:.2f} spent after forwarded "
+                        f"{getattr(_src_env, 'type', '?')} -> {_target}."
+                    ),
+                    "options": ["approve_override", "abort"],
+                    "default_option": "abort",
+                    "spent_usd": state.budget.spent_usd,
+                    "budget_usd": state.budget.budget_usd,
+                }
+                eights.hitl_request(_hitl_fwd_budget, gate_node="dispatch")
+                return {
+                    "envelopes": new_decisions,
+                    "artifacts": artifacts,
+                    "verdicts": bon_verdicts,
+                    "tasks": _forwarded_tasks,
+                    "phase": "surfaced",
+                    "pending_hitl": _hitl_fwd_budget,
+                    "budget_downgrade_active": True,
+                    "open_pp_runs": state.open_pp_runs,
+                }
+
         return {
             "envelopes": new_decisions,
             "artifacts": artifacts,
             "verdicts": bon_verdicts,
+            "tasks": _forwarded_tasks,
             "phase": "judge_per_squad",
         }
 

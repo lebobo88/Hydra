@@ -95,6 +95,14 @@ def test_is_known_repo_true() -> None:
     assert is_known_repo("agentsmith") is True
 
 
+def test_candc_and_rlm_gaming_allow_listed() -> None:
+    # RC6: the game project repo + RLM-Gaming source pack are allow-listed so
+    # `/hydra:run --repo candc` (and --repos) resolve instead of being rejected.
+    assert is_known_repo("candc") is True
+    assert is_known_repo("CandC") is True  # case-insensitive
+    assert is_known_repo("rlm-gaming") is True
+
+
 def test_is_known_repo_false() -> None:
     assert is_known_repo("nope") is False
     assert is_known_repo("C:/AiAppDeployments/Hydra") is False

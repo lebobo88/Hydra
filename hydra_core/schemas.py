@@ -96,6 +96,13 @@ class CSuiteDecisionPacket(HydraEnvelope):
     # Valid tokens: "haiku" | "sonnet" | "opus" | "fable" | "deep".
     # None = use squad default.
     model_tier: Optional[str] = None
+    # pp team / profile selection for engineering dispatch.  Propagated by
+    # node_dispatch from TaskState so `_via_mcp` can route to the correct
+    # pair-programmer team (e.g. "game-feature-team") and project profile.
+    # None = fall back to the engineering squad.yaml default / auto-detect.
+    # Read via getattr(inbound, "pp_team", None) — same pattern as model_tier.
+    pp_team: Optional[str] = None
+    pp_profile: Optional[str] = None
 
 
 # ---------- engineering squad ----------
@@ -143,6 +150,17 @@ class DevTask(HydraEnvelope):
     test_plan: list[str] = Field(default_factory=list)
     status: Literal["pending", "in_progress", "done", "blocked", "surfaced"] = "pending"
     pr_url: Optional[str] = None
+    # allow-listed repo_id for engineering dispatch targeting (None = workflow
+    # project_root). When an orchestrator emits a DEV_TASK whose `repo` names an
+    # allow-listed repo, the dispatcher mirrors it here so _via_mcp resolves the
+    # real path (the `repo` free-text field is NOT used for path resolution).
+    target_repo_id: Optional[str] = None
+    # pp team / profile selection. An orchestrator squad (e.g. rlm-gaming) sets
+    # these when handing implementation to engineering so the run uses the right
+    # pair-programmer team (e.g. "game-feature-team") and project profile.
+    # None = engineering squad.yaml default / auto-detect in `_via_mcp`.
+    pp_team: Optional[str] = None
+    pp_profile: Optional[str] = None
 
 
 # ---------- garland squad ----------

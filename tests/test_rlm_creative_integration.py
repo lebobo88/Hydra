@@ -1,7 +1,8 @@
 """Integration tests for the RLM-Creative Garland Crown wiring.
 
 After RLM-Creative shipped externally on 2026-05-19, these tests pin the
-Hydra-side contract: the garland squad loads with all 13 agents, the
+Hydra-side contract: the garland squad loads with all 15 agents (8 Muses +
+7 Helios sub-agents, including the bd664c3 blender-model/blender-rig pair), the
 Garland sub-agents declare their Helios parent, the C2PA governance head
 carries the HITL trigger, and the router fires on Muse keywords.
 """
@@ -28,11 +29,14 @@ def packs():
 
 # --- squad-loader: AgentSpec / ToolSpec accept new fields --------------------
 
-def test_creative_squad_loads_with_thirteen_agents(packs):
+def test_creative_squad_loads_with_fifteen_agents(packs):
+    # 8 Muses + 7 Helios sub-agents. The 7 include blender-model + blender-rig,
+    # added when bd664c3 wired the Blender 3D pipeline into garland (the squad
+    # rlm-gaming commissions for 3D assets). Was 13 before the blender subs.
     garland = packs["garland"]
     assert garland.entrypoint == "claude-skill"
     assert "RLM-Creative" in (garland.source_pack or "")
-    assert len(garland.agents) == 13
+    assert len(garland.agents) == 15
 
 
 def test_creative_agents_carry_mythic_names(packs):
@@ -50,6 +54,8 @@ def test_helios_sub_agents_have_photo_cinema_parent(packs):
     assert sub_slugs == {
         "video-synth", "audio-foley", "music-score",
         "dialogue-mix", "governance-c2pa",
+        # bd664c3: Blender 3D pipeline sub-agents under Helios.
+        "blender-model", "blender-rig",
     }
 
 

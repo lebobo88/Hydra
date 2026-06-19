@@ -41,6 +41,8 @@ _REPO_DIRNAMES: dict[str, str] = {
     "senate": "Senate",
     "marketbliss": "MarketBliss",
     "rlm-creative": "RLM-Creative",
+    "rlm-gaming": "RLM-Gaming",
+    "candc": "CandC",
 }
 
 # ---------------------------------------------------------------------------

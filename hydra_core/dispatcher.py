@@ -120,6 +120,14 @@ class MCPStdioDispatcher:
     envelopes (printed to stderr) — those execute in Claude Code, not here.
     """
 
+    # RC3/RC4: marks this as a REAL dispatcher that talks to live MCP servers.
+    # `build_supervisor` keys off this to auto-enable autonomous pp codegen
+    # (drive_pp_loop) and a real cross-vendor judge (MCPCritiqueClient) on EVERY
+    # run against a real dispatcher — the interactive skill / gateway / host-bound
+    # paths, not only the cli `--live` flag. Stub/test dispatchers omit it and
+    # keep their dry, scaffold-only, skeleton-judge behaviour unchanged.
+    live_execution: bool = True
+
     def __init__(self, project_root: Path, *, verbose: bool = False):
         self.project_root = project_root
         self.verbose = verbose

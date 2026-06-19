@@ -33,6 +33,7 @@ from .schemas import (
     HITLRequest,
     HydraEnvelope,
     MemoryRef,
+    validate_envelope,
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
@@ -392,6 +393,53 @@ def _drive_pp_stage_loop(
         return out
 
 
+# Industries (Constraints.industries / squad.yaml industries) that signal game
+# work and auto-default engineering dispatch to a pair-programmer game team.
+_GAME_INDUSTRIES: frozenset[str] = frozenset({
+    "games", "game-development", "interactive-entertainment",
+    "live-service-games", "mobile-games", "aaa-games", "indie-games", "esports",
+})
+# Originating squads whose handed-off engineering work defaults to a game team.
+_GAME_ORIGIN_SQUADS: frozenset[str] = frozenset({"rlm-gaming"})
+# The default pp team for auto-detected game work. rlm-gaming sets a more
+# specific team (game-netcode-team / game-cert-team / …) explicitly via pp_team
+# when the DEV_TASK warrants it; this is only the safety-net default.
+_DEFAULT_GAME_TEAM = "game-feature-team"
+
+
+def _resolve_pp_team(inbound: HydraEnvelope) -> tuple[str | None, str]:
+    """Resolve the pair-programmer team for an engineering dispatch.
+
+    Precedence (per operator decision: explicit + auto-default):
+      1. An explicit ``inbound.pp_team`` (set by the orchestrator squad, e.g.
+         rlm-gaming on a forwarded DEV_TASK) always wins.
+      2. Otherwise auto-default to a game team when the work originates from a
+         game squad (``origin_squad in _GAME_ORIGIN_SQUADS``) or the envelope's
+         ``constraints.industries`` intersect ``_GAME_INDUSTRIES``.
+      3. Otherwise ``None`` — the caller falls back to the engineering
+         ``squad.yaml`` default (unchanged legacy behaviour).
+
+    Returns ``(team_or_None, reason)``; ``reason`` is recorded in the
+    SquadResult rationale for observability.
+    """
+    explicit = getattr(inbound, "pp_team", None)
+    if explicit:
+        return str(explicit), f"explicit pp_team={explicit!r}"
+    origin = getattr(inbound, "origin_squad", None)
+    industries: set[str] = set()
+    try:
+        raw = getattr(getattr(inbound, "constraints", None), "industries", None) or []
+        industries = {str(i).strip().lower() for i in raw}
+    except Exception:  # noqa: BLE001 — never crash dispatch on a malformed envelope
+        industries = set()
+    if origin in _GAME_ORIGIN_SQUADS or (industries & _GAME_INDUSTRIES):
+        return _DEFAULT_GAME_TEAM, (
+            f"auto-default game team (origin={origin!r}, "
+            f"game_industries={sorted(industries & _GAME_INDUSTRIES)})"
+        )
+    return None, "no game signal; squad default"
+
+
 def _via_mcp(
     state: HydraState,
     pack: SquadPack,
@@ -480,13 +528,22 @@ def _via_mcp(
     if effective_tier in FABLE_TIERS:
         mode = "pp_team"
         fable_team = _DEEP_TEAM
+        resolved_team: str | None = None
+        team_reason = "fable/deep tier -> deep-reasoning-team"
     else:
         fable_team = None  # not a Fable dispatch
+        # Game-team routing (explicit pp_team or auto-default for game work).
+        # A resolved team forces team-mode and overrides the squad.yaml default;
+        # a None result preserves the legacy mode/default_team behaviour.
+        resolved_team, team_reason = _resolve_pp_team(inbound)
+        if resolved_team is not None:
+            mode = "pp_team"
 
     # Fix 6 guard: if default_team points at the reserved Fable team but no fable
     # tier was given, reject — the deep-reasoning-team is only reachable via an
-    # explicit fable/deep tier.
-    if fable_team is None and mode == "pp_team":
+    # explicit fable/deep tier. Only relevant when we'd fall back to the
+    # squad.yaml default_team (no fable team, no resolved game team).
+    if fable_team is None and resolved_team is None and mode == "pp_team":
         default_team = (invoke.get("default_team") or "").strip().lower()
         if default_team == _DEEP_TEAM:
             return SquadResult(
@@ -507,8 +564,9 @@ def _via_mcp(
         "mode": "single" if mode == "pp_run" else ("team" if mode == "pp_team" else "single"),
     }
     if mode == "pp_team":
-        # Fable tier forces deep-reasoning-team; otherwise use squad.yaml default.
-        args["team"] = fable_team if fable_team else invoke.get("default_team")
+        # Precedence: Fable tier -> deep-reasoning-team; else a resolved game
+        # team (explicit pp_team or auto-default); else the squad.yaml default.
+        args["team"] = fable_team or resolved_team or invoke.get("default_team")
     if mode == "pp_best_of":
         args["mode"] = "best_of"
         args["n"] = 3
@@ -619,7 +677,9 @@ def _via_mcp(
         target_squad=inbound.origin_squad,
         decision=f"Engineering work dispatched to pair-programmer (run_id={run_id or '?'})",
         rationale=(
-            f"mode={mode}; model_tier={effective_tier or 'default'}; "
+            f"mode={mode}; team={args.get('team', 'n/a')} ({team_reason}); "
+            f"pp_profile={getattr(inbound, 'pp_profile', None) or 'default'}; "
+            f"model_tier={effective_tier or 'default'}; "
             f"pp dispatch status: {pp_status}; "
             f"commit_sha={commit_sha or 'none'}{loop_summary}; inner: {str(inner)[:240]}"
         ),
@@ -801,6 +861,69 @@ _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
 }
 
 
+# Envelope types a claude-skill orchestrator (e.g. rlm-gaming) may emit for
+# delegation to a sibling squad. The supervisor routes these onward
+# (DEV_TASK/PRD -> engineering; CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland).
+_DELEGATION_EMIT_TYPES: frozenset[str] = frozenset({
+    "PRD", "DEV_TASK", "ARCH_RFC",
+    "CREATIVE_BRIEF", "SHOT_LIST", "ASSET_JOB", "HANDOFF",
+})
+
+
+def _extract_emitted_envelopes(
+    result: Any, inbound: HydraEnvelope, producer_slug: str,
+) -> list[HydraEnvelope]:
+    """Pull typed delegation envelopes out of a claude-skill result.
+
+    RC1: the skill adapter historically returned ONLY a DecisionRecord, so the
+    PRD/DEV_TASK/CREATIVE_BRIEF envelopes a game-studio run emits to delegate
+    implementation never reached engineering/garland. When the host / gateway
+    actually runs the skill it returns those envelopes under ``emitted_envelopes``
+    (or ``envelopes``); we validate each, stamp the producing squad as
+    ``origin_squad`` (so engineering auto-defaults to a game pp team) and the
+    parent/workflow ids, and surface them so the supervisor can route them.
+
+    Defensive: a malformed entry is skipped, never crashes dispatch. Non-dict
+    results (e.g. a bare host-pickup stub) yield ``[]``.
+    """
+    if not isinstance(result, dict):
+        return []
+    raw = result.get("emitted_envelopes")
+    if raw is None:
+        raw = result.get("envelopes")
+    if not isinstance(raw, list):
+        return []
+    from .repo_registry import is_known_repo
+    out: list[HydraEnvelope] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in _DELEGATION_EMIT_TYPES:
+            continue
+        env = dict(item)
+        # FORCE origin_squad to the producing squad — never trust a skill-set
+        # value (audit integrity + game-team auto-default both key off it, so a
+        # spoofed origin must not slip through). workflow_id/parent_id are
+        # inherited from the inbound only when absent.
+        env["origin_squad"] = producer_slug
+        env.setdefault("workflow_id", str(inbound.workflow_id))
+        env.setdefault("parent_id", str(inbound.id))
+        # Repo targeting: a DEV_TASK whose `repo` names an allow-listed repo_id
+        # gets target_repo_id mirrored so _via_mcp resolves the real path (e.g.
+        # repo="candc" -> the CandC checkout) instead of the workflow CWD.
+        if (
+            env.get("type") == "DEV_TASK"
+            and not env.get("target_repo_id")
+            and is_known_repo(env.get("repo") or "")
+        ):
+            env["target_repo_id"] = str(env["repo"]).strip().lower()
+        try:
+            out.append(validate_envelope(env))
+        except Exception:  # noqa: BLE001 — skip malformed; never crash dispatch
+            continue
+    return out
+
+
 def _via_claude_skill(
     state: HydraState,
     pack: SquadPack,
@@ -826,12 +949,20 @@ def _via_claude_skill(
     )
     available_cmds = [c["name"] for c in (catalogue or {}).get("commands", [])] if isinstance(catalogue, dict) else []
     tool_scope = build_tool_scope_directive(pack)
+    # RC5: cross-squad delegation priming so the host-run skill emits properly
+    # typed DEV_TASK/CREATIVE_BRIEF envelopes (with pp_team + game context) for
+    # Hydra to forward — instead of returning prose that strands implementation.
+    from .node_context import get_squad_dispatch_priming
+    priming = get_squad_dispatch_priming(pack.slug)
+    skill_args: dict[str, Any] = {
+        "envelope": inbound.model_dump(mode="json"),
+        "available_commands": available_cmds,
+        "tool_scope": tool_scope,
+    }
+    if priming:
+        skill_args["priming"] = priming
     try:
-        result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), {
-            "envelope": inbound.model_dump(mode="json"),
-            "available_commands": available_cmds,
-            "tool_scope": tool_scope,
-        })
+        result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), skill_args)
     except Exception as e:
         return SquadResult(
             envelopes=[], artifacts=[], status="failed",
@@ -875,8 +1006,12 @@ def _via_claude_skill(
         isinstance(result, dict)
         and result.get("status") == "host_pickup_required"
     )
+    # RC1: surface any delegation envelopes the skill emitted (DEV_TASK/PRD ->
+    # engineering, CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland) so the
+    # supervisor can route them onward. The DecisionRecord stays first.
+    emitted = _extract_emitted_envelopes(result, inbound, pack.slug)
     return SquadResult(
-        envelopes=[decision],
+        envelopes=[decision, *emitted],
         artifacts=[{"kind": shim["artifact_kind"], "raw": result, "persisted": write_result}],
         status=result.get("status", "done"),
         host_pickup_pending=host_pickup,

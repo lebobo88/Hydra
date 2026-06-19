@@ -88,6 +88,48 @@ _NODE_IRRELEVANT_TOPICS: dict[str, set[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Per-squad dispatch priming (RC5).
+#
+# A claude-skill orchestrator receives this directive (alongside the envelope +
+# tool scope) when it is dispatched, so the host-run skill knows the cross-squad
+# DELEGATION CONTRACT: what to emit, with which fields, to hand work to its
+# implementing squads. Without it the skill returned prose and its DEV_TASKs
+# never carried a pp team or game context — engineering then ran the generic
+# single-engineer template. Keyed by squad slug; absent = no extra priming.
+# ---------------------------------------------------------------------------
+_SQUAD_DISPATCH_PRIMING: dict[str, str] = {
+    "rlm-gaming": (
+        "You are the RLM-Gaming Arcade crown — an ORCHESTRATOR. Do the design, "
+        "then DELEGATE implementation; never write engine source or media binaries "
+        "yourself.\n"
+        "DELEGATION CONTRACT — return delegated work as typed envelopes under the "
+        "`emitted_envelopes` key of your result (a JSON list), in addition to your "
+        "DECISION_RECORD:\n"
+        "  • Engine/gameplay code -> a DEV_TASK per scoped unit, target_squad="
+        "\"engineering\". REQUIRED fields: owner, repo (the game repo, e.g. "
+        "\"candc\"), branch, instructions. SET pp_team to the right pair-programmer "
+        "game team — game-feature-team (default), game-netcode-team (online), "
+        "game-cert-team (submission/ratings), game-live-ops-team (seasons/events), "
+        "game-bug-fix-team, game-refactor-team, game-accessibility-team, or "
+        "game-art-pipeline-team. PACK the game context INTO instructions: design "
+        "pillars, perf budget, engine/runtime target, and any determinism/"
+        "server-authority constraints (engineering does not see your design docs "
+        "otherwise).\n"
+        "  • Art/audio/3D binaries -> a CREATIVE_BRIEF / SHOT_LIST / ASSET_JOB, "
+        "target_squad=\"garland\".\n"
+        "Hydra forwards each emitted envelope to its target squad automatically; an "
+        "envelope missing target_squad routes by type (DEV_TASK->engineering, "
+        "CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB->garland)."
+    ),
+}
+
+
+def get_squad_dispatch_priming(squad_slug: str) -> str:
+    """Return the cross-squad delegation priming for a squad (``""`` if none)."""
+    return _SQUAD_DISPATCH_PRIMING.get(squad_slug, "")
+
+
 def build_node_context(
     node_name: str,
     *,

@@ -146,6 +146,13 @@ class TaskState(BaseModel):
     # through the dedup path unchanged) and retries (_reflexion_retry does not
     # overwrite this field).
     target_repo_id: Optional[str] = None
+    # pp team / profile selection for engineering dispatch.  The planner sets
+    # these (or they ride in on a forwarded DEV_TASK) so node_dispatch's
+    # _build_payload can stamp them onto the CSuiteDecisionPacket and _via_mcp
+    # can route to the correct pair-programmer team/profile.  None = squad
+    # default / auto-detect.  Preserved across planner rebuilds and retries.
+    pp_team: Optional[str] = None
+    pp_profile: Optional[str] = None
 
 
 class HydraState(BaseModel):
