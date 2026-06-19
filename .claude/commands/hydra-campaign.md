@@ -19,6 +19,8 @@ executive (strategy + pricing + comms approval)
 
 Use this when a campaign explicitly needs creative AND engineering AND executive coordination. For single-squad work, prefer `/hydra:run`.
 
+**Engineering in a campaign routes supervisor → pp-harness stages, never raw `Agent({subagent_type: "engineer"})` fan-out.** The engineering leg decomposes into one typed envelope (`PRD`/`DEV_TASK`) **per subsystem**; each runs a full pp-harness stage cycle (`start_stage → archive_artifact → record_attempt → record_verdict → finalize_stage → finalize_run`) via `/pp:team feature-team`, with cross-vendor judges every stage and best-of-N when the squad's `invoke.mode` is `pp_best_of`. See `.claude/agents/hydra-supervisor.md` § Engineering Execution Contract and Hard Rule #9 in `AGENTS.md`.
+
 ## Cross-repo fleet
 
 Use `--repos <id,id,...>` (or the synonym `--fleet`) to launch a **parallel engineering fleet** across multiple allow-listed sibling repos. Each named repo receives its own pair-programmer run dispatched concurrently; all results are aggregated into one `DECISION_RECORD`.

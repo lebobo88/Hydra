@@ -46,6 +46,7 @@ and approval-gated execution, with server-side WS-AUTH capability enforcement on
 6. **Always log** to the per-workflow trace via `hydra_core.telemetry.emit`.
 7. **Always gate procedural-memory updates and venom-class capabilities** through `hydra_core.governance.enforce_constitution` before commit/execute.
 8. **Never modify a rubric's `@<version>` body in `hydra_core/judge/registry.py`.** Past verdicts pin `rubric_id@N` for replay determinism. To change a rubric, register `@N+1` and update consumers to opt in.
+9. **Never execute engineering via raw `Agent({subagent_type: "engineer", …})` fan-out.** Engineering work is the pair-programmer harness stage protocol: emit one typed envelope (`PRD`/`ARCH_RFC`/`DEV_TASK`) per subsystem → the dispatcher runs `start_stage → archive_artifact → record_attempt → record_verdict → finalize_stage → finalize_run` via `_drive_pp_stage_loop`, with cross-vendor judges every stage and best-of-N when the squad's `invoke.mode` is `pp_best_of`. The typed `engineer` agent is the generator the harness invokes inside a stage, not a supervisor-level executor. Parallelism uses planner `phase_batch_index` or the cross-repo fleet — never a fan-out around the supervisor. See `.claude/agents/hydra-supervisor.md` § Engineering Execution Contract.
 
 ## Engineering Standards
 
