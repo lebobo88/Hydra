@@ -287,8 +287,14 @@ def _drive_pp_stage_loop(
         for retry_index in range(2):
             prompt = (base_prompt if retry_index == 0
                       else _augment_with_critique(base_prompt, critique_md))
+            # sandbox=workspace-write so codex can actually edit the worktree.
+            # Without it the generate call defaults to read-only (codex-server
+            # GenerateSchema), apply_patch is rejected, and the engineering
+            # drive loop produces a patch *plan* but never writes code — the
+            # stage then fails with nothing committed.
             gen = cm("pp_codex", "generate",
-                     {"prompt": prompt, "cwd": project_path}, squad_id=sq)
+                     {"prompt": prompt, "cwd": project_path,
+                      "sandbox": "workspace-write"}, squad_id=sq)
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
 

@@ -44,6 +44,13 @@ class MCPCritiqueClient:
     """
     dispatcher: Any  # MCPStdioDispatcher (kept untyped to avoid a hard import)
     cwd: str | Path
+    # Per-call wall-clock budget (ms) forwarded to the critique tool. Defaults
+    # to 30 min so a large-artifact judge is not truncated. On the gateway path
+    # this also raises the gateway's per-call cap (see AsyncBackendPool
+    # ._resolve_tool_timeout); on the direct-dispatch path it flows into the pp
+    # daemon CLI runner's own timeout_ms (otherwise capped at the daemon's
+    # 5-min default).
+    timeout_ms: int = 1_800_000
 
     def critique(
         self,
@@ -65,6 +72,7 @@ class MCPCritiqueClient:
                 "artifact_text": artifact_text,
                 "rubric_md": rubric_md,
                 "cwd": str(self.cwd),
+                "timeout_ms": self.timeout_ms,
             },
         )
         if not isinstance(envelope, dict) or envelope.get("status") == "failed":

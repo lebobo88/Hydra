@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -44,6 +45,53 @@ _SELF_NAMES = frozenset({"hydra_gateway", "hydra_toolshed"})
 # marked failed. Per-server locking (see _connect) prevents concurrent callers
 # from all paying this latency at once.
 _CONNECT_TIMEOUT = 20.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive float from the environment, falling back to ``default``.
+
+    Invalid, non-positive, or NaN values fall back to the default so a typo in
+    an override env var can never *disable* a timeout (e.g. set it to 0 and
+    wedge every call). Read live (not cached at import) so an operator can
+    export a new value and have it apply to the next call.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0.0 or value != value:  # reject <=0 and NaN
+        return default
+    return value
+
+
+def _coerce_timeout_seconds(value: Any, *, milliseconds: bool) -> float | None:
+    """Parse a caller-supplied timeout into positive seconds, or ``None``.
+
+    Accepts int / float / numeric-string; ignores bools, ``None``, junk, and
+    non-positive / NaN values. With ``milliseconds=True`` the value is divided
+    by 1000. Defensive on purpose: a caller's ``timeout_ms`` arrives through the
+    permissive MCP boundary and ``_coerce_args_to_schema`` leaves an unknown
+    ``timeout_s`` as a raw string.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if parsed <= 0.0 or parsed != parsed:  # reject <=0 and NaN
+        return None
+    if milliseconds:
+        parsed /= 1000.0
+    return parsed if parsed > 0.0 else None
 
 
 class AsyncBackendPool:
@@ -217,7 +265,33 @@ class AsyncBackendPool:
             self._failed.add(server)
             return []
 
-    _TOOL_TIMEOUT = 120.0
+    # Per-tool-class wall-clock caps. All three are env-overridable and read
+    # LIVE in _resolve_tool_timeout (not cached at import) so an operator can
+    # raise them without restarting the gateway:
+    #   HYDRA_GATEWAY_TOOL_TIMEOUT_S       — ordinary/quick tools (default 120s)
+    #   HYDRA_GATEWAY_LONG_TOOL_TIMEOUT_S  — LLM generate/critique (default 1800s)
+    #   HYDRA_GATEWAY_MAX_TOOL_TIMEOUT_S   — hard ceiling on any caller override
+    #
+    # The flat 120s ceiling used to truncate cross-vendor codex/gemini judge &
+    # generate calls on large artifacts (they legitimately run for minutes). A
+    # caller may extend a single call with timeout_ms (preferred — it is also in
+    # the pp critique/generate schemas, so the same value flows to the backend
+    # CLI runner) or timeout_s; the request only ever *raises* the base and is
+    # clamped to the hard max so a hung backend can never wedge the gateway
+    # forever. The long timeout does NOT hold the per-server connect lock, but a
+    # genuinely hung in-flight call occupies that backend's shared session until
+    # the cap fires (call_tool then tears the backend down).
+    _DEFAULT_TOOL_TIMEOUT = 120.0
+    _DEFAULT_LONG_TOOL_TIMEOUT = 1800.0
+    _DEFAULT_MAX_TOOL_TIMEOUT = 3600.0
+
+    # Backend tools whose FINAL dotted segment names an LLM generate/critique
+    # call get the long default. Classified the same way as _is_idempotent_tool
+    # so "pp_codex.critique" / "pp_gemini.generate" resolve by "critique" /
+    # "generate" rather than a substring match on the whole name.
+    _LONG_TOOL_FINAL_SEGMENTS: frozenset[str] = frozenset({
+        "generate", "critique", "best_of",
+    })
 
     # Fix 1b (revised): classify by the FINAL dotted segment of the tool name,
     # not by substring/suffix on the whole string.
@@ -270,6 +344,42 @@ class AsyncBackendPool:
             return False
         return final in AsyncBackendPool._IDEMPOTENT_FINAL_SEGMENTS
 
+    def _resolve_tool_timeout(self, server: str, tool: str,
+                              args: dict[str, Any]) -> float:
+        """Resolve the wall-clock cap (seconds) for one proxied tool call.
+
+        base = the long default when the tool's final dotted segment is an LLM
+        generate/critique call, else the short default (both env-overridable,
+        read live). A caller may extend a single call via ``timeout_ms``
+        (preferred) or ``timeout_s`` in ``args``; the request only ever *raises*
+        the base, and the result is clamped to the env-overridable hard max (and
+        floored at the short default so a misconfigured long<short env can't drop
+        a call below the ordinary cap).
+        """
+        final = tool.lower().split(".")[-1]
+        short = _env_float("HYDRA_GATEWAY_TOOL_TIMEOUT_S",
+                           self._DEFAULT_TOOL_TIMEOUT)
+        long = _env_float("HYDRA_GATEWAY_LONG_TOOL_TIMEOUT_S",
+                          self._DEFAULT_LONG_TOOL_TIMEOUT)
+        hard_max = _env_float("HYDRA_GATEWAY_MAX_TOOL_TIMEOUT_S",
+                              self._DEFAULT_MAX_TOOL_TIMEOUT)
+        base = long if final in self._LONG_TOOL_FINAL_SEGMENTS else short
+
+        override: float | None = None
+        if isinstance(args, dict):
+            override = _coerce_timeout_seconds(args.get("timeout_ms"),
+                                               milliseconds=True)
+            if override is None:
+                override = _coerce_timeout_seconds(args.get("timeout_s"),
+                                                   milliseconds=False)
+        if override is not None:
+            base = max(base, override)
+        # Never below the short floor; never above the hard ceiling. Normalize a
+        # misconfigured hard_max < short up to short so an undersized cap can't
+        # regress ordinary tools below their own class default.
+        hard_max = max(hard_max, short)
+        return min(max(base, short), hard_max)
+
     async def _do_call(self, session: Any, tool: str,
                        args: dict[str, Any]) -> Any:
         """Run session.call_tool in its own coroutine context."""
@@ -294,8 +404,9 @@ class AsyncBackendPool:
                     "error": f"backend {server!r} not connected",
                 }
             try:
+                effective_timeout = self._resolve_tool_timeout(server, tool, args)
                 task = asyncio.ensure_future(self._do_call(session, tool, args))
-                result = await asyncio.wait_for(task, timeout=self._TOOL_TIMEOUT)
+                result = await asyncio.wait_for(task, timeout=effective_timeout)
                 return _extract_result(result)
             except (TimeoutError, asyncio.TimeoutError):
                 task.cancel()
@@ -303,7 +414,7 @@ class AsyncBackendPool:
                 self._failed.add(server)
                 return {
                     "status": "failed",
-                    "error": f"tool {tool} on {server} timed out after {self._TOOL_TIMEOUT}s",
+                    "error": f"tool {tool} on {server} timed out after {effective_timeout}s",
                     "server": server,
                     "tool": tool,
                 }
