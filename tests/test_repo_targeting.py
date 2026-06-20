@@ -352,7 +352,8 @@ def _make_stub_dispatcher() -> tuple[MagicMock, list[dict]]:
 
     stub = MagicMock()
     def _call_mcp(server: str, tool: str, args: dict[str, Any], **_kw: Any) -> dict:
-        captured.append(dict(args))
+        if tool == "start_run":
+            captured.append(dict(args))
         return {"status": "done", "result": {"run_id": "r1"}}
 
     stub.call_mcp.side_effect = _call_mcp

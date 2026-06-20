@@ -25,17 +25,19 @@ from hydra_core.squad_loader import discover_squads
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# (server, tool) pairs the live drive loop in squad_node._via_mcp invokes with
-# squad_id="engineering". Every one of these MUST authorize or the loop is
-# RBAC-rejected mid-run.
+# (server, tool) pairs the live engineering path in squad_node._via_mcp invokes
+# with squad_id="engineering". Every one of these MUST authorize or the
+# bootstrap/drive path is RBAC-rejected mid-run.
 LOOP_TOOLS = [
     ("pp_harness", "start_run"),
+    ("pp_harness", "ensure_agents_md"),
     ("pp_harness", "start_stage"),
     ("pp_harness", "archive_artifact"),
     ("pp_harness", "record_attempt"),
     ("pp_harness", "record_verdict"),
     ("pp_harness", "finalize_stage"),
     ("pp_harness", "finalize_run"),
+    ("pp_harness", "record_smoke_status"),
     ("pp_codex", "generate"),
     ("pp_gemini", "critique"),
 ]

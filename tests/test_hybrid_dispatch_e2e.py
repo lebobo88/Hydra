@@ -41,7 +41,8 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
         ("pp_harness", "start_run"): {"status": "done", "result": {"run_id": "run_T"}},
         ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
         ("pp_codex", "generate"): {"status": "done", "result": {
-            "text": "edited foo.py", "model": "codex-1",
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"pytest -q -> exit 0\"}",
+            "model": "codex-1",
             "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02, "wall_ms": 100}},
         ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
         ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},

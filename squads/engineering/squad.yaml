@@ -37,10 +37,11 @@ tools:
   # "pp.harness.start_run" form matched NEITHER (its server segment "pp.harness"
   # uses a dot, not the underscore of the real server "pp_harness"), so live
   # dispatch was RBAC-rejected. Keep these bare. Every tool the live drive loop
-  # in squad_node._via_mcp calls (start_run, start_stage, archive_artifact,
-  # record_attempt, record_verdict, finalize_stage, finalize_run on pp_harness;
-  # generate on pp_codex; critique on pp_gemini) MUST be declared here or RBAC
-  # rejects it mid-run.
+  # in squad_node._via_mcp calls (start_run, ensure_agents_md, start_stage,
+  # archive_artifact, record_attempt, record_verdict, record_smoke_status,
+  # finalize_stage, finalize_run on pp_harness; generate on pp_codex;
+  # critique on pp_gemini)
+  # MUST be declared here or RBAC rejects it mid-run.
   - name: start_run
     mcp_server: pp_harness
     privilege: execute
@@ -48,6 +49,13 @@ tools:
       Start a pair-programmer run (single/team/best-of/review mode).
       Use for: initiating engineering work dispatched by Hydra.
       Not for: read-only queries or status checks.
+  - name: ensure_agents_md
+    mcp_server: pp_harness
+    privilege: write
+    notes: >
+      Scaffold the AGENTS.md/CLAUDE.md contract create-if-absent at run start.
+      Use for: ensuring the repo-level agent contract exists before PP work runs.
+      Not for: editing an existing contract body in place.
   - name: finalize_run
     mcp_server: pp_harness
     privilege: execute
@@ -92,6 +100,14 @@ tools:
       Close a stage (passed/surfaced/skipped). A "passed" status requires
       winner_attempt_id. Use for: completing a stage in the drive loop before
       finalize_run. Not for: closing the whole run — use finalize_run.
+  - name: record_smoke_status
+    mcp_server: pp_harness
+    privilege: write
+    notes: >
+      Record the real runtime smoke result for the winning candidate slot
+      (pass/fail/infra_error/skipped). Required by PP-VG-5 before finalize_stage
+      can mark a code stage passed. Use for: persisting the drive loop's
+      independent smoke verdict. Not for: scoring — that is record_verdict.
   - name: generate
     mcp_server: pp_codex
     privilege: execute

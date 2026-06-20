@@ -178,6 +178,93 @@ def _pp_ok(res: Any) -> bool:
     )
 
 
+# Markers in a generate response (or its text) that mean codex never wrote
+# code -- a genuine failure to surface, not a low-quality attempt to judge.
+_GEN_FAIL_MARKERS: tuple[str, ...] = (
+    "read-only sandbox", "rejected by user approval", "approval settings",
+    "usage limit", "rate limit", "quota", "timed out", "permission denied",
+)
+
+
+def _generate_failure_reason(gen: Any, gen_text: str) -> str | None:
+    """Reason a ``pp_codex.generate`` call produced no code, else ``None``.
+
+    The drive loop used to treat a timeout / quota / read-only-sandbox / empty
+    result identically to a real low-quality attempt: it fabricated a default
+    ``revise`` verdict and surfaced the run with a misleading ``stage_outcome``,
+    hiding the true cause (e.g. ``workspace read-only``). When this returns a
+    reason the loop records a failed attempt and surfaces with that reason
+    instead of judging or burning a Reflexion retry on a condition a retry
+    cannot fix.
+    """
+    if isinstance(gen, dict):
+        if gen.get("timeout"):
+            return f"codex generate timed out: {str(gen.get('error') or gen)[:300]}"
+        if not _pp_ok(gen):
+            inner_err = _pp_inner(gen).get("error") or gen.get("error")
+            if inner_err:
+                return f"codex generate failed: {str(inner_err)[:300]}"
+            status = gen.get("status")
+            if status and status not in {"done", "ok", "complete"}:
+                return f"codex generate returned status={status!r}"
+    low = (gen_text or "").lower()
+    for marker in _GEN_FAIL_MARKERS:
+        if marker in low:
+            return f"codex generate blocked ({marker}): {gen_text.strip()[:300]}"
+    if not (gen_text or "").strip():
+        return "codex generate returned no output (no code written)"
+    return None
+
+
+# Independent smoke: codex RUNS the project's build/test command and reports its
+# real exit code. This is an execution, not self-attestation about the diff --
+# which is what PP-VG-5's anti-gaming gate requires before a code stage may
+# finalize 'complete'. Any failure to obtain a clear pass degrades to 'skipped'
+# (run stays honestly surfaced), never a forged 'pass'.
+_SMOKE_PROMPT = (
+    "Run this project's smoke check from the working directory. Detect and run "
+    "the standard build/test command (e.g. `pytest -q`, `npm test` or `npm run "
+    "build`, `node --check <entry>`, `go build ./...`). Do NOT modify any files. "
+    "Report the REAL result from the command's exit code. Output ONLY a single "
+    "JSON object as the LAST line: "
+    '{"status":"pass"|"fail"|"skipped","reason":"<command + exit code>"}. '
+    'Use "skipped" only if the project has no runnable smoke/test/build command.'
+)
+
+
+def _parse_smoke_verdict(text: str) -> tuple[str, str]:
+    """Extract the last ``{"status": ...}`` JSON object from smoke output.
+
+    Conservative: anything not explicitly ``pass`` / ``fail`` / ``infra_error``
+    degrades to ``skipped`` so an unparseable smoke can never forge a pass.
+    """
+    import json as _json
+    import re as _re
+    for blob in reversed(_re.findall(r'\{[^{}]*"status"[^{}]*\}', text or "")):
+        try:
+            obj = _json.loads(blob)
+        except Exception:  # noqa: BLE001
+            continue
+        st = str(obj.get("status") or "").strip().lower()
+        if st in {"pass", "fail", "infra_error", "skipped"}:
+            return st, str(obj.get("reason") or "")[:300]
+    return "skipped", "no parseable smoke verdict"
+
+
+def _run_smoke(
+    dispatcher: "Dispatcher", *, project_path: str, stage_id: str
+) -> tuple[str, str]:
+    """Run an independent smoke via codex and return ``(status, reason)``."""
+    try:
+        res = dispatcher.call_mcp("pp_codex", "generate", {
+            "prompt": _SMOKE_PROMPT, "cwd": project_path,
+            "sandbox": "workspace-write",
+        }, squad_id="engineering")
+    except Exception as e:  # noqa: BLE001 -- a smoke that cannot run is 'skipped'
+        return "skipped", f"smoke run errored: {e!r}"[:300]
+    return _parse_smoke_verdict(str(_pp_inner(res).get("text") or ""))
+
+
 def _build_engineer_prompt(request_text: str, project_path: str) -> str:
     """Prompt contract for headless code generation.
 
@@ -282,6 +369,7 @@ def _drive_pp_stage_loop(
         outcome: str | None = None
         critique_md = ""
         rubric_body = _rubric_md(judge_rubric_id)
+        gen_failed = False
 
         # Reflexion ×1 → at most two attempts.
         for retry_index in range(2):
@@ -297,6 +385,39 @@ def _drive_pp_stage_loop(
                       "sandbox": "workspace-write"}, squad_id=sq)
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
+
+            gen_fail = _generate_failure_reason(gen, gen_text)
+            if gen_fail:
+                # Real generate failure (timeout / quota / read-only sandbox /
+                # empty): surface the TRUE reason instead of fabricating an empty
+                # 'revise' verdict, and don't spend a Reflexion retry on a
+                # condition a retry cannot fix.
+                out["error"] = gen_fail
+                out["stage_outcome"] = "error"
+                gen_failed = True
+                fail_status = ("timeout" if (isinstance(gen, dict)
+                               and gen.get("timeout")) else "error")
+                try:
+                    cm("pp_harness", "archive_artifact", {
+                        "run_id": run_id,
+                        "relative_path": f"code/codex-attempt-{retry_index}.failed.md",
+                        "bytes": f"GENERATE FAILED: {gen_fail}\n\n{gen_text or '(no output)'}",
+                        "stage_id": stage_id, "kind": "code", "encoding": "utf8",
+                    }, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    att = cm("pp_harness", "record_attempt", {
+                        "stage_id": stage_id, "producer": "codex",
+                        "model_id": str(gi.get("model") or model_tier or "codex-default"),
+                        "status": fail_status, "retry_index": retry_index,
+                        "notes": {"candidate_index": 1},
+                        **({"parent_attempt_id": attempt_id} if attempt_id else {}),
+                    }, squad_id=sq)
+                    attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
+                except Exception:  # noqa: BLE001
+                    pass
+                break
 
             # codex writes files in cwd directly; archive the producer summary
             # as the stage's code-record artifact (best-effort).
@@ -320,6 +441,7 @@ def _drive_pp_stage_loop(
                 "wall_ms": int(gi.get("wall_ms") or 0),
                 "status": "ok",
                 "retry_index": retry_index,
+                "notes": {"candidate_index": 1},
                 **({"parent_attempt_id": attempt_id} if attempt_id else {}),
             }, squad_id=sq)
             attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
@@ -356,9 +478,30 @@ def _drive_pp_stage_loop(
                 break  # accept; no Reflexion needed
 
         out["attempt_id"] = attempt_id
-        out["stage_outcome"] = outcome
-        out["critique"] = str(critique_md)[:1000]
-        passed = outcome == "pass"
+
+        # PP-VG-5 (anti-gaming): a code stage may finalize 'complete' only when a
+        # real smoke result is recorded for the winning candidate. Run an
+        # INDEPENDENT smoke (codex executes the project's build/test command and
+        # reports its true exit code) and record it -- never a forged 'pass'.
+        passed = False
+        smoke_status = "skipped"
+        smoke_reason = ""
+        if not gen_failed:
+            out["stage_outcome"] = outcome
+            out["critique"] = str(critique_md)[:1000]
+            if outcome == "pass" and attempt_id:
+                smoke_status, smoke_reason = _run_smoke(
+                    dispatcher, project_path=project_path, stage_id=stage_id)
+                try:
+                    cm("pp_harness", "record_smoke_status", {
+                        "stage_id": stage_id, "candidate_index": 1,
+                        "status": smoke_status,
+                        "reason": (smoke_reason or "headless drive-loop smoke")[:300],
+                    }, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+                passed = smoke_status == "pass"
+        out["smoke_status"] = smoke_status
 
         try:
             cm("pp_harness", "finalize_stage", {
@@ -369,12 +512,20 @@ def _drive_pp_stage_loop(
         except Exception:  # noqa: BLE001
             pass
 
-        # finalize_run runs PP gates server-side and may downgrade — don't
+        if gen_failed:
+            summary = f"Headless drive loop: generate failed -- {out.get('error')}"
+        elif passed:
+            summary = f"Headless drive loop: stage_outcome=pass; smoke={smoke_status}."
+        else:
+            summary = (f"Headless drive loop: stage_outcome={outcome}; "
+                       f"smoke={smoke_status} ({smoke_reason[:120]}).")
+
+        # finalize_run runs PP gates server-side and may downgrade -- don't
         # assume success; reflect the returned status.
         fin = cm("pp_harness", "finalize_run", {
             "run_id": run_id,
             "status": "complete" if passed else "surfaced",
-            "summary_md": f"Headless drive loop: stage_outcome={outcome}.",
+            "summary_md": summary,
         }, squad_id=sq)
         out["finalized"] = True
         fin_status = _pp_inner(fin).get("status")
@@ -444,6 +595,15 @@ def _resolve_pp_team(inbound: HydraEnvelope) -> tuple[str | None, str]:
             f"game_industries={sorted(industries & _GAME_INDUSTRIES)})"
         )
     return None, "no game signal; squad default"
+
+
+def _maybe_write_claude_shim(project_path: str) -> None:
+    """Backfill the tool-specific shim when AGENTS.md exists but CLAUDE.md does not."""
+    root = Path(project_path)
+    agents_md = root / "AGENTS.md"
+    claude_md = root / "CLAUDE.md"
+    if agents_md.is_file() and not claude_md.exists():
+        claude_md.write_text("@AGENTS.md\n", encoding="utf-8")
 
 
 def _via_mcp(
@@ -625,6 +785,18 @@ def _via_mcp(
                 # single-threaded node_dispatch context).
                 state.open_pp_runs.append(_entry)
         except Exception:  # noqa: BLE001 — never crash dispatch on state writes
+            pass
+
+    if run_id and isinstance(run_id, str) and pp_status == "done" and project_path:
+        try:
+            dispatcher.call_mcp(
+                "pp_harness",
+                "ensure_agents_md",
+                {"project_path": str(project_path)},
+                squad_id=pack.slug,
+            )
+            _maybe_write_claude_shim(str(project_path))
+        except Exception:  # noqa: BLE001 — AGENTS/CLAUDE bootstrap is fail-soft
             pass
 
     # Headless drive loop: the live CLI / fleet dispatcher sets drive_pp_loop so

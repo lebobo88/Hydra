@@ -20,6 +20,7 @@ test fixtures.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -72,6 +73,48 @@ def _get_base() -> Path:
     return Path(__file__).resolve().parents[1].parent
 
 
+def _load_extra_repos() -> dict[str, Path]:
+    """Operator-registered repos beyond the hardcoded allow-list.
+
+    Two trusted sources are merged (env overrides file):
+      - ``~/.hydra/repos.json`` -- a JSON object ``{"<id>": "<abs-path>"}``.
+      - ``HYDRA_EXTRA_REPOS`` -- the same shape as a JSON string.
+
+    The registration *is* the allow-list (same trust level as
+    ``HYDRA_REPO_BASE``), so values may be absolute paths anywhere on disk,
+    including a git repo nested under an unrelated parent. Ids are lower-cased.
+    Malformed entries are skipped fail-soft so a bad config never breaks
+    resolution of the built-in repos.
+    """
+    extra: dict[str, Path] = {}
+    sources: list[str] = []
+    cfg = Path.home() / ".hydra" / "repos.json"
+    try:
+        if cfg.is_file():
+            sources.append(cfg.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 -- a bad config never breaks resolution
+        pass
+    env_val = os.environ.get("HYDRA_EXTRA_REPOS")
+    if env_val and env_val.strip():
+        sources.append(env_val)
+    for raw in sources:
+        try:
+            data = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        for rid, rpath in data.items():
+            key = str(rid).strip().lower()
+            if not key or not isinstance(rpath, str) or not rpath.strip():
+                continue
+            try:
+                extra[key] = Path(rpath).expanduser()
+            except Exception:  # noqa: BLE001
+                continue
+    return extra
+
+
 def resolve_repo_path(repo_id: str) -> Path:
     """Return the absolute path for *repo_id*, validated as an existing git repo.
 
@@ -105,21 +148,28 @@ def resolve_repo_path(repo_id: str) -> Path:
             f"Got: {repo_id!r}"
         )
 
-    if repo_id not in _REPO_DIRNAMES:
+    extra = _load_extra_repos()
+    if repo_id in extra:
+        # Operator-registered (trusted config, same level as HYDRA_REPO_BASE).
+        # May live anywhere on disk -- incl. a git repo nested under an unrelated
+        # parent -- so the base-escape guard does NOT apply. The git-root
+        # verification below still confirms it is a genuine repo root.
+        candidate = extra[repo_id].resolve()
+    elif repo_id in _REPO_DIRNAMES:
+        base = _get_base().resolve()
+        candidate = (base / _REPO_DIRNAMES[repo_id]).resolve()
+
+        # Base-escape guard: the resolved candidate must live under the resolved
+        # base. Catches symlink traversal and unusual HYDRA_REPO_BASE values.
+        if not candidate.is_relative_to(base):
+            raise ValueError(
+                f"resolved path {candidate} escapes repo base {base}; "
+                f"repo_id={repo_id!r} rejected"
+            )
+    else:
         raise ValueError(
             f"unknown repo_id {repo_id!r}; "
-            f"allow-listed: {sorted(_REPO_DIRNAMES)}"
-        )
-
-    base = _get_base().resolve()
-    candidate = (base / _REPO_DIRNAMES[repo_id]).resolve()
-
-    # Base-escape guard: the resolved candidate must live under the resolved base.
-    # Catches symlink traversal and unusual HYDRA_REPO_BASE values.
-    if not candidate.is_relative_to(base):
-        raise ValueError(
-            f"resolved path {candidate} escapes repo base {base}; "
-            f"repo_id={repo_id!r} rejected"
+            f"allow-listed: {sorted(set(_REPO_DIRNAMES) | set(extra))}"
         )
 
     # Real git verification: run `git -C <candidate> rev-parse --show-toplevel`
@@ -158,7 +208,7 @@ def is_known_repo(repo_id: str) -> bool:
     """Return ``True`` if *repo_id* is in the allow-list, without raising."""
     try:
         normalised = (repo_id or "").strip().lower()
-        return normalised in _REPO_DIRNAMES
+        return normalised in _REPO_DIRNAMES or normalised in _load_extra_repos()
     except Exception:  # noqa: BLE001
         return False
 

@@ -34,7 +34,8 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
         ("pp_harness", "start_run"): {"status": "done", "result": {"run_id": "run_T"}},
         ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
         ("pp_codex", "generate"): {"status": "done", "result": {
-            "text": "edited foo.py", "model": "codex-1",
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"pytest -q -> exit 0\"}",
+            "model": "codex-1",
             "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02, "wall_ms": 100}},
         ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
         ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},
@@ -180,6 +181,8 @@ def test_via_mcp_drive_marks_judged_and_drains_run(monkeypatch) -> None:
     assert result.pp_loop_judged is True
     # The driven run was finalized → drained from the open-run ledger.
     assert all(e.get("run_id") != "run_T" for e in state.open_pp_runs)
+    # The repo contract bootstrap runs before the driven stage loop.
+    assert disp.tool_seq()[:2] == ["start_run", "ensure_agents_md"]
     # The loop actually ran (generate happened).
     assert "generate" in disp.tool_seq()
 
@@ -196,7 +199,98 @@ def test_via_mcp_without_drive_flag_is_unchanged(monkeypatch) -> None:
 
     assert result.status == "running"
     assert result.pp_loop_judged is False
-    # No drive loop ran — only start_run was called.
-    assert disp.tool_seq() == ["start_run"]
+    # No drive loop ran — only the scaffold + AGENTS/CLAUDE bootstrap happened.
+    assert disp.tool_seq() == ["start_run", "ensure_agents_md"]
     # The run stays registered for the daemon / abort path to finalize.
     assert any(e.get("run_id") == "run_T" for e in state.open_pp_runs)
+
+
+# --------------------------------------------------------------------------- #
+# Fix 1: generate-failure detection   |   Fix 3: PP-VG-5 real-smoke close
+# --------------------------------------------------------------------------- #
+
+def test_generate_failure_surfaces_reason_and_skips_judge() -> None:
+    """A read-only / quota / timeout generate is surfaced with its TRUE reason,
+    not masked as an empty 'revise' attempt; no critique, no Reflexion retry."""
+    resp = _happy_responses("pass")
+    resp[("pp_codex", "generate")] = {"status": "done", "result": {
+        "text": "writing is blocked by read-only sandbox; rejected by user approval settings"}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["final_status"] == "surfaced"
+    assert out["stage_outcome"] == "error"
+    assert "read-only" in (out["error"] or "")
+    seq = disp.tool_seq()
+    # No Reflexion retry on an unfixable failure, and no judge on empty output.
+    assert seq.count("generate") == 1
+    assert "critique" not in seq
+    assert "record_verdict" not in seq
+    # The failed attempt is recorded honestly (status error/timeout, not "ok").
+    ra = next(a for (s, t, a) in disp.calls if t == "record_attempt")
+    assert ra["status"] in {"error", "timeout"}
+    # The run still closes (lock released) and surfaces the reason.
+    fr = next(a for (s, t, a) in disp.calls if t == "finalize_run")
+    assert fr["status"] == "surfaced"
+    assert "read-only" in fr["summary_md"]
+
+
+def test_timeout_generate_is_detected() -> None:
+    """A dispatcher-level timeout payload is surfaced, not judged as 'revise'."""
+    resp = _happy_responses("pass")
+    resp[("pp_codex", "generate")] = {
+        "status": "failed", "timeout": True,
+        "error": "pp_codex.generate timed out after 1800s"}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    assert out["final_status"] == "surfaced"
+    assert "timed out" in (out["error"] or "")
+    ra = next(a for (s, t, a) in disp.calls if t == "record_attempt")
+    assert ra["status"] == "timeout"
+
+
+def test_pass_records_real_smoke_and_completes() -> None:
+    """On a passing verdict the loop runs an independent smoke, records it tied
+    to candidate_index=1, and only then finalizes complete (PP-VG-5)."""
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["final_status"] == "complete"
+    assert out["smoke_status"] == "pass"
+    # The winning attempt carries candidate_index=1 (VG-5 prerequisite).
+    ra = next(a for (s, t, a) in disp.calls
+              if t == "record_attempt" and a.get("status") == "ok")
+    assert ra["notes"]["candidate_index"] == 1
+    # An independent smoke result is recorded for that candidate slot.
+    rs = next(a for (s, t, a) in disp.calls if t == "record_smoke_status")
+    assert rs["candidate_index"] == 1
+    assert rs["status"] == "pass"
+    # smoke is recorded BEFORE finalize_stage so the gate can read it.
+    seq = disp.tool_seq()
+    assert seq.index("record_smoke_status") < seq.index("finalize_stage")
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+    assert fs["winner_attempt_id"] == "att_T"
+
+
+def test_pass_verdict_but_failing_smoke_surfaces() -> None:
+    """A passing judge verdict with a FAILING smoke must NOT finalize complete —
+    the anti-gaming gate keeps it surfaced (no forged pass)."""
+    resp = _happy_responses("pass")
+    resp[("pp_codex", "generate")] = {"status": "done", "result": {
+        "text": "edited foo.py\n{\"status\": \"fail\", \"reason\": \"pytest -q -> 1 failed\"}",
+        "model": "codex-1"}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["smoke_status"] == "fail"
+    assert out["final_status"] == "surfaced"
+    rs = next(a for (s, t, a) in disp.calls if t == "record_smoke_status")
+    assert rs["status"] == "fail"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "surfaced"
+    assert "winner_attempt_id" not in fs
