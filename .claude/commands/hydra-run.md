@@ -6,17 +6,40 @@ model: opus
 
 # /hydra:run
 
-Drive the user goal through `hydra_core.supervisor.build_supervisor`. Lifecycle:
+Drive the user goal through Hydra's supervisor lifecycle:
 
 `intake → planning → approval(?) → dispatch → executing → synthesis → postcheck`
 
+## Hybrid execution model (READ FIRST)
+
+Hydra runs **hybrid**: the deterministic Python engine drives engineering
+dispatch + execution; you (the LLM) are the conversational front and the **only**
+executor of claude-skill squads (rlm-gaming, garland) — because skills cannot run
+headlessly. **You never hand-write engine source.** Engineering code is produced
+by the pair-programmer harness, in Python, through the pp stage loop. The
+`hydra-block-direct-write` hook enforces this (blocks your direct Write/Edit to
+engine source when `HYDRA_ENFORCE_ROUTING=1`).
+
+The deterministic engine is reachable via the `hydra_control` MCP tools (or the
+CLI they wrap):
+
+- `hydra.workflow.launch` — start a workflow (`hydra run --live`); engineering
+  dispatches through the full pp stage cycle (`start_stage → generate →
+  archive_artifact → record_attempt → record_verdict → finalize_stage →
+  finalize_run`) with cross-vendor judges. **This is how engineering executes.**
+- `hydra.workflow.submit_envelopes` — inject host-completed skill envelopes
+  (DEV_TASK/PRD/ARCH_RFC) back into a running workflow so the engine forwards
+  them to engineering and runs the pp loop. **This is the rlm-gaming → engineering
+  seam** (see Skill-squad path below).
+- `hydra.workflow.resume` — resolve a pending HITL gate.
+
 ## Steps
 
-1. Parse `$ARGUMENTS` into `{goal, squad?, budget?, risk?, repo?, repos?}`. The optional `--repo <repo_id>` argument sets `HydraState.target_repo_id`; the engineering squad resolves it via the allow-list in `hydra_core.repo_registry` before invoking pair-programmer. Raw paths are rejected — only allow-listed ids are accepted.
-2. Adopt the `hydra-supervisor` agent persona (`.claude/agents/hydra-supervisor.md`).
-3. Run the supervisor graph via the host-bound dispatcher (which proxies to `pp_harness`, `hydra_memory`, `executive_suite` filesystem MCP, `rlm_creative` filesystem MCP).
-4. If an HITL request fires, STOP and surface the request — operator resumes with `/hydra:approve` or `/hydra:resume`.
-5. On completion, print the final `DECISION_RECORD` summary + paths to the trace and archived artifacts.
+1. Parse `$ARGUMENTS` into `{goal, squad?, budget?, risk?, repo?, repos?}`. `--repo <id>` / `--repos <id,id>` resolve through the allow-list in `hydra_core.repo_registry` (raw paths rejected); `--budget <usd>` caps spend.
+2. **Engineering / mcp-squad work** (or "uncertain — let the router decide"): call `hydra.workflow.launch` with `{goal, squad?, budget?}`. It returns a `workflow_id` immediately (fire-and-attach). The Python engine routes, dispatches, and drives the pp stage loop — **do not** invoke `Agent({subagent_type:"engineer"})` or write code yourself.
+3. **Skill-squad work** (rlm-gaming game design, garland creative): run the squad's **Skill in-host** (only you can). Capture its `DECISION_RECORD` + `emitted_envelopes`. For each emitted engineering envelope (DEV_TASK/PRD), call `hydra.workflow.submit_envelopes({workflow_id, envelopes})` so the engine dispatches engineering deterministically. Garland-bound envelopes (CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB) are returned as `deferred_to_host` — run the garland Skill in-host for those.
+4. **HITL**: when a launch/ingest surfaces a pending gate, STOP and render it — operator resumes with `/hydra:approve` or `/hydra:resume` (which call `hydra.workflow.resume`).
+5. **Synthesis**: on completion, read the workflow `trace.jsonl` + the final `DECISION_RECORD` and present a conversational summary + artifact paths.
 
 ## Cross-repo fleet
 

@@ -57,7 +57,7 @@ Full reference: `.claude/commands/hydra-campaign.md` and `ARCHITECTURE.md` §8a.
 - NEVER invoke /pp:run, /pp:team, or any /pp:* command directly
 - NEVER say "you could use /hydra:run" — ACTUALLY invoke it
 - NEVER provide code for the user to apply manually
-- PreToolUse hooks WILL BLOCK Edit/Write outside a workflow
+- NEVER hand-write engine source (.ts/.py/.html/.css/...) yourself — the pair-programmer harness writes code (via `/hydra:run` → engineering dispatch / the ingest bridge). The `hydra-block-direct-write` PreToolUse hook BLOCKS direct Write/Edit to engine-source files when `HYDRA_ENFORCE_ROUTING=1` (design docs / `.md` are allowed; the harness engineer sets `HYDRA_PP_STAGE_ACTIVE=1` to bypass).
 
 ### Connected Systems (use proactively on every interaction)
 

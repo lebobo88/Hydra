@@ -330,9 +330,15 @@ def test_resume_still_validates_action():
     assert result["error"] == "invalid_action"
 
 
-def test_all_three_tools_in_handlers():
+def test_all_tools_in_handlers():
     handlers = _tool_handlers()
     assert "hydra.control.ping" in handlers
     assert "hydra.workflow.resume" in handlers
     assert "hydra.cockpit.audit" in handlers
-    assert len(handlers) == 3
+    # Hybrid continuation transport: the host->engine launch + ingest surfaces.
+    assert "hydra.workflow.launch" in handlers
+    assert "hydra.workflow.submit_envelopes" in handlers
+    assert len(handlers) == 5
+    # Every handler has a published schema.
+    from mcp_servers.hydra_control.server import _TOOL_SCHEMAS
+    assert set(handlers) == set(_TOOL_SCHEMAS)

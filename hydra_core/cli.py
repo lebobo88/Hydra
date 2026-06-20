@@ -284,9 +284,26 @@ def _cmd_run(args) -> int:
                 workflow_id = uuid4()
     else:
         workflow_id = uuid4()
-    initial = HydraState(workflow_id=workflow_id, root_goal=args.goal)
+    # Explicit --repo/--repos flags are folded into the goal text so the
+    # supervisor's intake parser (parse_repo_arg / parse_repos_arg) handles them
+    # through the single, tested code path — no second parser. Mutually exclusive
+    # (intake surfaces an HITL if both end up present).
+    _goal = args.goal
+    if getattr(args, "repo", None):
+        _goal = f"{_goal} --repo {args.repo}"
+    if getattr(args, "repos", None):
+        _goal = f"{_goal} --repos {args.repos}"
+    initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
+    # --budget: set the workflow budget cap (the genuinely-missing wire — the
+    # slash commands advertise it but the CLI run parser never accepted it).
+    if getattr(args, "budget", None) is not None:
+        initial.budget.budget_usd = float(args.budget)
+    # --risk: recorded for audit / downstream gating. There is no dedicated
+    # HydraState risk field yet, so we surface it on the start event rather than
+    # silently dropping the operator's intent.
+    _risk = getattr(args, "risk", None)
     critique_client = None
     if args.live:
         from .dispatcher import MCPStdioDispatcher
@@ -309,7 +326,8 @@ def _cmd_run(args) -> int:
         critique_client=critique_client,
         force_pure_python=getattr(args, "no_checkpoint", False),
     )
-    emit(project, workflow_id, "workflow_start", {"goal": args.goal})
+    emit(project, workflow_id, "workflow_start",
+         {"goal": _goal, "budget_usd": initial.budget.budget_usd, "risk": _risk})
     from .supervisor import _PurePythonRunner
     if isinstance(sup, _PurePythonRunner):
         final = sup.invoke(initial)
@@ -695,6 +713,212 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "phase": phase,
         "trace": str(trace_path(project, wf)),
     }, indent=2))
+    return 0
+
+
+def _load_envelopes_file(path: Path) -> list[dict]:
+    """Load a JSON file of envelope dicts. Accepts a bare list or
+    {"envelopes": [...]} / {"emitted_envelopes": [...]}."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        return [e for e in raw if isinstance(e, dict)]
+    if isinstance(raw, dict):
+        for key in ("envelopes", "emitted_envelopes"):
+            seq = raw.get(key)
+            if isinstance(seq, list):
+                return [e for e in seq if isinstance(e, dict)]
+    raise ValueError(
+        "envelopes file must be a JSON list or an object with an "
+        "'envelopes'/'emitted_envelopes' list"
+    )
+
+
+def _cmd_ingest(args) -> int:
+    """Inject host-completed skill envelopes into a running workflow and
+    dispatch the engineering leg deterministically through the pp stage loop.
+
+    This is the continuation transport (the seam between a host-run claude-skill
+    squad like rlm-gaming and the deterministic engineering engine). The host
+    runs the skill, captures its emitted DEV_TASK/PRD/ARCH_RFC, and calls this
+    with the SAME workflow_id so engineering dispatches exactly once.
+
+    Exactly-once: serialized by the same atomic resume lock `hydra resume` uses,
+    and claim-before-dispatch against the per-workflow ingest ledger so a crash
+    or a retried submit never double-dispatches (which would leak a pp lock).
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+
+    if not _WORKFLOW_ID_RE.match(wf):
+        print(json.dumps({"error": f"invalid workflow_id {wf!r}"}), file=sys.stderr)
+        return 1
+
+    try:
+        envelopes = _load_envelopes_file(Path(args.envelopes))
+    except (OSError, ValueError) as e:
+        print(json.dumps({"error": f"could not read --envelopes: {e}"}), file=sys.stderr)
+        return 1
+    if not envelopes:
+        print(json.dumps({"workflow_id": wf, "ingested": False,
+                          "reason": "no_envelopes"}))
+        return 0
+
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({"workflow_id": wf, "ingested": False,
+                          "reason": "resume_in_progress", "lock": str(lock_path)}))
+        return 0
+    try:
+        return _cmd_ingest_locked(args, project, wf, envelopes)
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> int:
+    from .ingest import (
+        claim_ingested_ids,
+        dispatch_ingested_envelopes,
+        load_ingested_ids,
+    )
+
+    critique_client = None
+    if getattr(args, "live", False):
+        from .dispatcher import MCPStdioDispatcher
+        from .judge import MCPCritiqueClient
+        dispatcher = MCPStdioDispatcher(project, verbose=getattr(args, "verbose", False))
+        critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
+        # Ingest re-enters engineering dispatch — drive pp to real codegen.
+        dispatcher.drive_pp_loop = True
+    else:
+        dispatcher = _NullDispatcher()
+
+    packs = discover_squads(project)
+    if hasattr(dispatcher, "set_squad_packs"):
+        dispatcher.set_squad_packs(packs)
+
+    # Ingest is a CONTINUATION of an existing workflow — it must run against the
+    # workflow's checkpoint so engineering inherits target_repo_id/budget/task
+    # ledger AND so budget gating + the over_budget HITL park are durable. If the
+    # checkpoint is unavailable we FAIL LOUD rather than fabricate a fresh,
+    # budget-blind state (codex follow-up: a silent non-checkpoint path was
+    # ungated). Mirrors `hydra resume`.
+    config = {"configurable": {"thread_id": wf}}
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(project_root=project, dispatcher=dispatcher,
+                           critique_client=critique_client)
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "workflow_id": wf, "ingested": False,
+            "error": "langgraph unavailable — ingest requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+    snap = sup.get_state(config)
+    if snap is None or not snap.values:
+        print(json.dumps({"workflow_id": wf, "ingested": False, "error": "not_found",
+                          "detail": "no checkpoint for this workflow_id"}), file=sys.stderr)
+        return 1
+    try:
+        state = HydraState.model_validate(snap.values)
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"workflow_id": wf, "ingested": False,
+                          "error": f"checkpoint_invalid: {e}"}), file=sys.stderr)
+        return 1
+
+    def _emit_ingest(event: str, payload: dict) -> None:
+        emit(project, wf, event, payload)
+
+    def _persist(new_tasks, new_envelopes) -> None:
+        """Persist incrementally so open_pp_runs (the lock-release ledger),
+        tasks, and budget are durable after EACH item — not deferred to the end
+        of the batch (codex review item 1: deferral could leak a pp lock on a
+        mid-batch crash)."""
+        try:
+            sup.update_state(config, {
+                "tasks": new_tasks,
+                "envelopes": new_envelopes,
+                "open_pp_runs": state.open_pp_runs,
+                "budget": state.budget.model_dump(mode="json"),
+            })
+        except Exception as e:  # noqa: BLE001 — never lose the dispatch result on a persist miss
+            emit(project, wf, "ingest.persist_failed", {"error": str(e)})
+
+    # PER-ITEM claim-before-dispatch (codex review item 1): claim each id to the
+    # ledger immediately before dispatching THAT item, then persist incrementally.
+    # A mid-batch crash therefore (a) only claims the in-flight item — items not
+    # yet reached stay un-claimed and are dispatched on retry (no silent drop),
+    # and (b) leaves open_pp_runs durable up to the prior item. The in-flight
+    # item is at-most-once; its pp run, if started, is finalize-aborted by the
+    # drive loop's own exception handler or drained by `hydra reap`.
+    from .ingest import IngestItemResult, release_ingested_ids
+    # Only un-claim a status that PROVABLY never reached execute_squad, so a
+    # corrected re-submit with the same id is not suppressed. `unknown_target`
+    # qualifies (routing rejected it before any squad call). `failed` does NOT —
+    # it can be a post-`start_run` drive-loop abort that already registered an
+    # open pp run, and un-claiming that would make it re-dispatchable (double
+    # run). A `failed` id stays claimed; retry with a fresh envelope id (codex
+    # follow-up: at-most-once must never re-dispatch a started run).
+    _NOT_DISPATCHED = {"unknown_target"}
+    processed: set[str] = set(load_ingested_ids(project, wf))
+    agg_items: list = []
+    over_budget = False
+    for env_dict in envelopes:
+        eid = env_dict.get("id")
+        eid = str(eid) if eid is not None else None
+        if eid and eid in processed:
+            agg_items.append(IngestItemResult(
+                envelope_id=eid, envelope_type=env_dict.get("type"), target=None,
+                status="skipped_duplicate", detail="already in ingest ledger"))
+            continue
+        if eid:
+            claim_ingested_ids(project, wf, [eid])  # claim BEFORE dispatch
+        out_i = dispatch_ingested_envelopes(
+            state, [env_dict], packs=packs, dispatcher=dispatcher,
+            already_ingested=processed, emit_fn=_emit_ingest,
+        )
+        # Un-claim if this envelope never reached a squad (wrong type/parse fail)
+        # so it can be re-submitted after correction; otherwise mark it processed.
+        item_status = out_i.items[-1].status if out_i.items else "failed"
+        if eid and item_status in _NOT_DISPATCHED:
+            release_ingested_ids(project, wf, [eid])
+        elif eid:
+            processed.add(eid)
+        agg_items.extend(out_i.items)
+        _persist(out_i.new_tasks, out_i.new_envelopes)  # incremental durability
+        if out_i.over_budget:
+            over_budget = True
+            break
+
+    # Over-budget: surface an over_budget HITL via the checkpoint so the workflow
+    # parks for /hydra:approve, matching the in-graph dispatch budget gate.
+    if over_budget:
+        hitl = {
+            "workflow_id": wf, "reason": "over_budget", "gate_node": "ingest",
+            "summary": (f"Budget exhausted during ingest: "
+                        f"${state.budget.spent_usd:.4f} of ${state.budget.budget_usd:.2f}."),
+            "options": ["approve_override", "abort"], "default_option": "abort",
+            "spent_usd": state.budget.spent_usd, "budget_usd": state.budget.budget_usd,
+        }
+        try:
+            sup.update_state(config, {"phase": "surfaced", "pending_hitl": hitl,
+                                      "budget_downgrade_active": True})
+        except Exception as e:  # noqa: BLE001
+            emit(project, wf, "ingest.persist_failed", {"error": str(e)})
+
+    summary = {
+        "items": [vars(it) for it in agg_items],
+        "dispatched": [it.envelope_id for it in agg_items if it.status in ("done", "running")],
+        "failed": [it.envelope_id for it in agg_items if it.status in ("failed", "surfaced")],
+        "skipped_duplicate": [it.envelope_id for it in agg_items if it.status == "skipped_duplicate"],
+        "deferred_to_host": [it.envelope_id for it in agg_items if it.status == "deferred_to_host"],
+        "over_budget": over_budget,
+        "spent_usd": state.budget.spent_usd,
+        "budget_usd": state.budget.budget_usd,
+    }
+    emit(project, wf, "ingest.complete", summary)
+    print(json.dumps({
+        "workflow_id": wf, "ingested": True, **summary,
+        "trace": str(trace_path(project, wf)),
+    }, indent=2, default=str))
     return 0
 
 
@@ -1278,6 +1502,16 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run")
     r.add_argument("goal")
     r.add_argument("--squad", help="Comma-separated squad slugs to force-select")
+    r.add_argument("--budget", type=float, default=None,
+                   help="Workflow budget cap in USD (sets BudgetLedger.budget_usd).")
+    r.add_argument("--risk", choices=["low", "medium", "high"], default=None,
+                   help="Operator risk tolerance hint (recorded on the start event).")
+    r.add_argument("--repo", default=None, metavar="ID",
+                   help="Single allow-listed repo id for engineering targeting "
+                        "(folded into the goal; resolved by hydra_core.repo_registry).")
+    r.add_argument("--repos", default=None, metavar="ID,ID,...",
+                   help="Comma-separated allow-listed repo ids for fleet mode "
+                        "(>=2 distinct ids). Mutually exclusive with --repo.")
     r.add_argument("--live", action="store_true", help="Use the live MCP dispatcher (talks to pp_harness etc.)")
     r.add_argument("--verbose", action="store_true", help="Verbose MCP tool list / errors")
     r.add_argument(
@@ -1330,6 +1564,19 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--live", action="store_true",
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
     rs.add_argument("--verbose", action="store_true")
+
+    # Continuation transport: inject host-completed skill envelopes into a
+    # running workflow and dispatch engineering deterministically.
+    ing = sub.add_parser("ingest", help=(
+        "Inject host-completed skill envelopes (DEV_TASK/PRD/ARCH_RFC) into a "
+        "workflow and dispatch the engineering leg through the pp stage loop."))
+    ing.add_argument("workflow_id")
+    ing.add_argument("--envelopes", required=True, metavar="PATH",
+                     help="JSON file: a list of envelope dicts, or "
+                          "{'envelopes': [...]} / {'emitted_envelopes': [...]}.")
+    ing.add_argument("--live", action="store_true",
+                     help="Use the live MCP dispatcher (drives real pp codegen+judge).")
+    ing.add_argument("--verbose", action="store_true")
 
     # C6: replay subcommand
     rp = sub.add_parser("replay", help="Replay a workflow from a LangGraph checkpoint")
@@ -1403,6 +1650,7 @@ def main(argv: list[str] | None = None) -> int:
             project=a.project, workflow_id=a.workflow_id, action="approve",
             option=None, live=getattr(a, "live", False), verbose=False)),
         "resume": _cmd_resume,
+        "ingest": _cmd_ingest,
         "replay": _cmd_replay,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,

@@ -24,6 +24,26 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-block-direct-write.ps1\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-block-direct-pp.ps1\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
         "matcher": "mcp__hydra_memory__.*",
         "hooks": [
           {

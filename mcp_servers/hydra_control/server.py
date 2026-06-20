@@ -185,6 +185,119 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
     }
 
 
+def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist the host-completed skill envelopes to the workflow dir and launch
+    a DETACHED `hydra ingest` so the deterministic engine dispatches engineering.
+
+    Detached for the same reason as resume: the pp stage loop (start_run ->
+    generate -> judge -> finalize) is long-running and cannot complete inside an
+    MCP tool call without blowing the caller's per-call timeout. The CLI is
+    idempotent (claim-before-dispatch ledger), so a retried submit never
+    double-dispatches.
+    """
+    wf_dir = _HYDRA_ROOT / ".hydra" / workflow_id
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    # Unique per-submit filename so two concurrent submits to the SAME workflow
+    # never overwrite each other's payload before the detached child reads it
+    # (codex review item 5). The CLI's resume lock still serializes the actual
+    # dispatch; this just keeps each child's input intact.
+    env_path = wf_dir / f"ingest_envelopes_{uuid.uuid4().hex}.json"
+    env_path.write_text(json.dumps({"envelopes": envelopes}, indent=2), encoding="utf-8")
+    log_path = wf_dir / "ingest.log"
+
+    cmd = [
+        sys.executable, "-m", "hydra_core.cli",
+        "ingest", workflow_id,
+        "--envelopes", str(env_path),
+        "--live",
+    ]
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+
+    creationflags = 0
+    start_new_session = False
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:  # pragma: no cover — Windows-first deployment
+        start_new_session = True
+
+    with open(log_path, "ab") as log_f:
+        log_f.write(
+            f"\n--- ingest launch {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+            f"envelopes={len(envelopes)} ---\n".encode()
+        )
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, validated token
+            cmd,
+            cwd=str(_HYDRA_ROOT),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=log_f,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
+        )
+    return {
+        "ok": True,
+        "launched": True,
+        "pid": proc.pid,
+        "workflow_id": workflow_id,
+        "envelope_count": len(envelopes),
+        "log": str(log_path),
+    }
+
+
+def _launch_run(goal: str, *, squad: str | None, budget: float | None,
+                workflow_id: str | None) -> dict[str, Any]:
+    """Launch a NEW workflow via a DETACHED `hydra run --live`.
+
+    The host-facing deterministic launch surface (generalises web/server's
+    launcher). The supervisor LLM calls this instead of hand-orchestrating /
+    hand-writing code: engineering then dispatches through the pp stage loop in
+    Python. Pre-allocates the workflow_id so the caller can attach immediately.
+    """
+    wf = workflow_id or str(uuid.uuid4())
+    log_dir = _HYDRA_ROOT / ".hydra" / wf
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "run.log"
+
+    cmd = [sys.executable, "-m", "hydra_core.cli", "run", goal,
+           "--live", "--workflow-id", wf]
+    if squad:
+        cmd.extend(["--squad", squad])
+    if budget is not None:
+        cmd.extend(["--budget", str(budget)])
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+
+    creationflags = 0
+    start_new_session = False
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:  # pragma: no cover — Windows-first deployment
+        start_new_session = True
+
+    with open(log_path, "ab") as log_f:
+        log_f.write(
+            f"\n--- run launch {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+            f"wf={wf} squad={squad!r} budget={budget!r} ---\n".encode()
+        )
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv, validated tokens
+            cmd, cwd=str(_HYDRA_ROOT), env=env,
+            stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+            creationflags=creationflags, start_new_session=start_new_session,
+        )
+    return {"ok": True, "launched": True, "pid": proc.pid,
+            "workflow_id": wf, "log": str(log_path)}
+
+
 def _tool_handlers() -> dict[str, Any]:
     def ping(args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -271,9 +384,66 @@ def _tool_handlers() -> dict[str, Any]:
             # Return ok=True with spooled=True — audit degraded, action proceeds
             return {"ok": True, "spooled": True, "reason": f"exception:{type(e).__name__}"}
 
+    def workflow_submit_envelopes(args: dict[str, Any]) -> dict[str, Any]:
+        """Inject host-completed skill envelopes back into a running workflow.
+
+        The seam between a host-run claude-skill squad (rlm-gaming/garland, which
+        cannot run headlessly) and the deterministic engineering engine. Launches
+        a detached `hydra ingest` that forwards DEV_TASK/PRD/ARCH_RFC to the
+        engineering squad and runs the pp stage loop. Idempotent at the CLI layer.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        envelopes = args.get("envelopes")
+        if not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        if not isinstance(envelopes, list) or not envelopes:
+            return {"ok": False, "error": "envelopes must be a non-empty list"}
+        if not all(isinstance(e, dict) for e in envelopes):
+            return {"ok": False, "error": "each envelope must be an object"}
+        if len(envelopes) > 100:
+            return {"ok": False, "error": "too many envelopes (max 100)"}
+        try:
+            return _launch_ingest(workflow_id, envelopes)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("ingest launch failed")
+            return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
+
+    def workflow_launch(args: dict[str, Any]) -> dict[str, Any]:
+        """Launch a NEW workflow deterministically (detached `hydra run --live`).
+
+        The sanctioned engineering launch surface for the hybrid supervisor: the
+        host LLM hands the goal here instead of hand-writing code, so engineering
+        runs through the pp stage loop in Python.
+        """
+        goal = str(args.get("goal") or "").strip()
+        if not goal:
+            return {"ok": False, "error": "goal is required"}
+        if len(goal) > 8000:
+            return {"ok": False, "error": "goal too long (max 8000 chars)"}
+        squad = args.get("squad")
+        squad = str(squad) if squad not in (None, "") else None
+        if squad is not None and not re.match(r"^[A-Za-z0-9_\-,]{1,200}$", squad):
+            return {"ok": False, "error": "invalid_squad"}
+        budget = args.get("budget")
+        try:
+            budget = float(budget) if budget not in (None, "") else None
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "budget must be numeric"}
+        workflow_id = args.get("workflow_id")
+        workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
+        if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        try:
+            return _launch_run(goal, squad=squad, budget=budget, workflow_id=workflow_id)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("run launch failed")
+            return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
+
     return {
         "hydra.control.ping": ping,
+        "hydra.workflow.launch": workflow_launch,
         "hydra.workflow.resume": workflow_resume,
+        "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
         "hydra.cockpit.audit": cockpit_audit,
     }
 
@@ -298,6 +468,53 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "option": {"type": "string"},
             },
             "required": ["workflow_id", "action"],
+        },
+    },
+    "hydra.workflow.launch": {
+        "description": (
+            "Launch a NEW Hydra workflow deterministically (detached "
+            "`hydra run --live`). The sanctioned engineering launch surface for "
+            "the hybrid supervisor — hand the goal here instead of hand-writing "
+            "code; engineering runs through the pair-programmer stage loop in "
+            "Python. Returns immediately ({ok, launched, pid, workflow_id, log}). "
+            "Pre-allocates the workflow_id so the caller can attach + resume."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string"},
+                "squad": {"type": "string",
+                          "description": "Comma-separated squad slugs to force-select (optional)."},
+                "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
+                "workflow_id": {"type": "string",
+                                "description": "Pre-allocated workflow id (optional)."},
+            },
+            "required": ["goal"],
+        },
+    },
+    "hydra.workflow.submit_envelopes": {
+        "description": (
+            "Inject host-completed skill envelopes (DEV_TASK/PRD/ARCH_RFC from a "
+            "host-run rlm-gaming/garland skill) back into a running workflow. "
+            "Launches a DETACHED `hydra ingest` that forwards them to the "
+            "engineering squad and drives the pair-programmer stage loop "
+            "(real codegen + cross-vendor judge). Returns immediately "
+            "({ok, launched, pid, log}). Idempotent at the CLI layer — a retried "
+            "submit never double-dispatches (claim-before-dispatch ledger). "
+            "WRITE tool: only reachable via the sanctioned host bridge."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "envelopes": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Typed Hydra envelopes the host-run skill emitted "
+                        "(each with id/type/origin_squad/workflow_id, e.g. a "
+                        "DEV_TASK with instructions/repo/pp_team)."),
+                },
+            },
+            "required": ["workflow_id", "envelopes"],
         },
     },
     "hydra.cockpit.audit": {

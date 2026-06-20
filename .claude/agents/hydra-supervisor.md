@@ -42,17 +42,19 @@ The pp-harness runtime guard (`record_attempt` rejects `agent_type="general-purp
 
 ## Engineering Execution Contract (READ BEFORE DISPATCHING ANY ENGINEERING WORK)
 
-Engineering execution is **always** the pair-programmer harness stage protocol, **never** a supervisor-level `Agent({subagent_type: "engineer", ...})` fan-out. The two are not interchangeable: a raw `engineer` fan-out produces files with **no** `start_stage` / `record_attempt` / `archive_artifact` / `finalize_stage` records, **no** judge verdicts, and **no** `DECISION_RECORD` — exactly the ~80% off-Hydra dispatch rate the RLMplatform bootstrap suffered.
+Engineering execution is **always** the pair-programmer harness stage protocol, driven by the **deterministic Python engine** — **never** a supervisor-level `Agent({subagent_type: "engineer", ...})` fan-out and **never** your own `Write`/`Edit` of engine source. A raw `engineer` fan-out (or hand-writing code) produces files with **no** `start_stage` / `record_attempt` / `archive_artifact` / `finalize_stage` records, **no** judge verdicts, and **no** `DECISION_RECORD` — exactly the ~80% off-Hydra dispatch rate the RLMplatform bootstrap suffered. The `hydra-block-direct-write` hook blocks direct engine-source writes when `HYDRA_ENFORCE_ROUTING=1`.
+
+**Hybrid model.** You (the LLM) are the conversational front and the only executor of claude-skill squads (they cannot run headlessly). Engineering, by contrast, runs deterministically in Python. You reach it through the `hydra_control` MCP tools (or the CLI they wrap), **not** by emulating the stage loop yourself:
 
 **Affirmative pattern — what you MUST do:**
 
-1. Emit one typed envelope (`PRD` / `ARCH_RFC` / `DEV_TASK`) **per subsystem**. Decompose "pricing page + telemetry + flag rollout" into three envelopes, not one giant task and not N `Agent()` calls.
-2. The dispatcher (`hydra_core/squad_node.py::_via_mcp`) routes each envelope to the `engineering` squad per its `squad.yaml` `invoke` block (`mode` ∈ `pp_run | pp_team | pp_best_of | pp_review`, `default_team: feature-team`) and the **harness runs one full stage cycle per subsystem** (canonical driver: `hydra_core/squad_node.py::_drive_pp_stage_loop`):
+1. **Direct engineering goal** → call `hydra.workflow.launch({goal, squad?, budget?})` (wraps `hydra run --live`). The engine routes, decomposes per subsystem, and runs one full stage cycle per subsystem — canonical driver `hydra_core/squad_node.py::_drive_pp_stage_loop`:
    `start_stage → (generate) → archive_artifact → record_attempt → (cross-vendor critique) → record_verdict → [Reflexion ×1 on revise] → finalize_stage → finalize_run`.
-3. **Judges and best-of-N run inside the stage, orchestrated by the dispatcher** — cross-vendor critique → `record_verdict` happens every stage; best-of-N runs when the squad's `invoke.mode` is `pp_best_of` (the dispatcher sets `mode="best_of"`, `n=3` and Borda-ranks). Do **NOT** decompose a best-of-N intent into N sibling envelopes or N `Agent()` calls.
-4. The typed `engineer` agent is the **generator the harness invokes once per candidate INSIDE a stage** — it is not a supervisor-level parallel executor. You never call `Agent({subagent_type: "engineer"})` yourself to "build subsystem X"; you emit the envelope and the harness invokes the generator under the stage contract.
+2. **Engineering emitted by a host-run skill** (rlm-gaming DEV_TASK/PRD, etc.) → run the skill in-host, then call `hydra.workflow.submit_envelopes({workflow_id, envelopes})`. The engine (`hydra_core/ingest.py::dispatch_ingested_envelopes`) validates + redacts each envelope, forwards DEV_TASK/PRD/ARCH_RFC to `engineering`, and runs the same stage loop. Idempotent (claim-before-dispatch ledger) — submitting twice never double-dispatches or leaks a pp lock.
+3. **Judges and best-of-N run inside the stage, orchestrated by the dispatcher** — cross-vendor critique → `record_verdict` every stage; best-of-N when the squad's `invoke.mode` is `pp_best_of` (dispatcher sets `mode="best_of"`, `n=3`, Borda-ranks). Do **NOT** decompose a best-of-N intent into N sibling envelopes or N `Agent()` calls.
+4. The typed `engineer` agent is the **generator the harness invokes once per candidate INSIDE a stage** — never a supervisor-level executor. You never call `Agent({subagent_type: "engineer"})` yourself.
 
-**If a phase legitimately needs parallel engineering** (multiple subsystems or repos at once): use planner `phase_batch_index` batching against the supervisor (same-repo), or the cross-repo fleet (`/hydra:campaign --repos …`, one pp run per repo) — both keep every subsystem inside a governed stage cycle. Parallelism never means bypassing the harness.
+**If a phase legitimately needs parallel engineering** (multiple subsystems or repos at once): use planner `phase_batch_index` batching, or the cross-repo fleet (`/hydra:campaign --repos …`, one pp run per repo) — both keep every subsystem inside a governed stage cycle. Parallelism never means bypassing the harness.
 
 ## Output Contract
 

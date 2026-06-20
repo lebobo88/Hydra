@@ -19,7 +19,7 @@ executive (strategy + pricing + comms approval)
 
 Use this when a campaign explicitly needs creative AND engineering AND executive coordination. For single-squad work, prefer `/hydra:run`.
 
-**Engineering in a campaign routes supervisor → pp-harness stages, never raw `Agent({subagent_type: "engineer"})` fan-out.** The engineering leg decomposes into one typed envelope (`PRD`/`DEV_TASK`) **per subsystem**; each runs a full pp-harness stage cycle (`start_stage → archive_artifact → record_attempt → record_verdict → finalize_stage → finalize_run`) via `/pp:team feature-team`, with cross-vendor judges every stage and best-of-N when the squad's `invoke.mode` is `pp_best_of`. See `.claude/agents/hydra-supervisor.md` § Engineering Execution Contract and Hard Rule #9 in `AGENTS.md`.
+**Engineering in a campaign routes through the deterministic engine, never raw `Agent({subagent_type: "engineer"})` fan-out and never your own Write.** Hybrid model (see `/hydra:run` § Hybrid execution model): you run the claude-skill legs in-host (executive framing, garland creative, rlm-gaming game design) and capture their emitted envelopes; the **engineering leg is dispatched deterministically in Python** — either by `hydra.workflow.launch` (a direct engineering goal) or by `hydra.workflow.submit_envelopes` (engineering envelopes a host-run skill emitted). Each engineering subsystem then runs a full pp-harness stage cycle (`start_stage → archive_artifact → record_attempt → record_verdict → finalize_stage → finalize_run`) with cross-vendor judges, and best-of-N when the squad's `invoke.mode` is `pp_best_of`. See `.claude/agents/hydra-supervisor.md` § Engineering Execution Contract and Hard Rule #9 in `AGENTS.md`.
 
 ## Cross-repo fleet
 

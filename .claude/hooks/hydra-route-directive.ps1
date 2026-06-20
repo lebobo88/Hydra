@@ -85,7 +85,7 @@ if ($isAction) {
         Write-Output "  /hydra:run `"goal`" — primary entry point (routes to engineering, executive, garland, or multi-squad)"
         Write-Output "  /hydra:campaign `"goal`" — for cross-functional work spanning multiple squads"
         Write-Output "Do NOT invoke /pp:run, /pp:team, or other PP commands directly. Hydra dispatches to pair-programmer via the engineering squad."
-        Write-Output "Direct Edit/Write calls WILL BE BLOCKED without an active workflow."
+        Write-Output "Direct Edit/Write to ENGINE SOURCE (.ts/.py/.html/.css/...) is BLOCKED when HYDRA_ENFORCE_ROUTING=1 — the pair-programmer harness writes code, not you. Route engineering via /hydra:run. (Design docs / .md are allowed.)"
         Write-Output ""
         Write-Output "Also use proactively during the workflow:"
         Write-Output "  AgentSmith (mcp__agentsmith__*) — artifact validation, audit, inspection"
