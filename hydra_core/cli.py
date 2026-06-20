@@ -293,6 +293,8 @@ def _cmd_run(args) -> int:
         _goal = f"{_goal} --repo {args.repo}"
     if getattr(args, "repos", None):
         _goal = f"{_goal} --repos {args.repos}"
+    if getattr(args, "subdir", None):
+        _goal = f"{_goal} --subdir {args.subdir}"
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
@@ -1512,6 +1514,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--repos", default=None, metavar="ID,ID,...",
                    help="Comma-separated allow-listed repo ids for fleet mode "
                         "(>=2 distinct ids). Mutually exclusive with --repo.")
+    r.add_argument("--subdir", default=None, metavar="PATH",
+                   help="Repo-relative engineering target under --repo/--repos, "
+                        "for example 'test-5' or 'games/minecraft-hd'.")
     r.add_argument("--live", action="store_true", help="Use the live MCP dispatcher (talks to pp_harness etc.)")
     r.add_argument("--verbose", action="store_true", help="Verbose MCP tool list / errors")
     r.add_argument(

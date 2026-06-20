@@ -379,6 +379,20 @@ class TestNodeIntakeFleet:
         tasks = result.get("tasks", [])
         assert len(tasks) == 0, f"unexpected tasks for single-repo: {tasks}"
 
+    def test_single_repo_subdir_sets_target_repo_subpath(self):
+        result, state = _node_intake_result(f"Goal --repos {_R1} --subdir test-5")
+        assert (result.get("target_repo_subpath") or state.target_repo_subpath) == "test-5"
+
+    def test_fleet_tasks_inherit_shared_repo_subpath(self):
+        result, state = _node_intake_result(f"Goal --repos {_R1},{_R2} --subdir test-5")
+        tasks = result.get("tasks", [])
+        assert tasks, "expected seeded fleet tasks"
+        subpaths = {
+            (t.target_repo_subpath if isinstance(t, TaskState) else t.get("target_repo_subpath"))
+            for t in tasks
+        }
+        assert subpaths == {"test-5"}
+
     def test_single_repo_clears_pre_seeded_fleet_parallel(self):
         """Fix 2: a state pre-seeded with fleet_parallel=True + single --repos id
         must exit intake with fleet_parallel=False and no per-repo task seeding.

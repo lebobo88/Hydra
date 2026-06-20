@@ -121,7 +121,7 @@ class TaskState(BaseModel):
     description: str
     # WS8 SLICE 2: "cancelled" added for fleet tasks that were not dispatched
     # because cancel_event was set before their worker started.
-    status: Literal["pending", "running", "blocked", "done", "failed", "surfaced", "cancelled"] = "pending"
+    status: Literal["pending", "running", "blocked", "done", "failed", "surfaced", "cancelled", "deferred_to_host"] = "pending"
     envelope_id: Optional[UUID] = None      # the message that triggered it
     result_envelope_id: Optional[UUID] = None
     retries: int = 0
@@ -146,6 +146,10 @@ class TaskState(BaseModel):
     # through the dedup path unchanged) and retries (_reflexion_retry does not
     # overwrite this field).
     target_repo_id: Optional[str] = None
+    # Optional repo-relative engineering target under target_repo_id.
+    # Example: target_repo_id="mc-test", target_repo_subpath="test-5".
+    # Validated by hydra_core.repo_registry.normalize_repo_subpath.
+    target_repo_subpath: Optional[str] = None
     # pp team / profile selection for engineering dispatch.  The planner sets
     # these (or they ride in on a forwarded DEV_TASK) so node_dispatch's
     # _build_payload can stamp them onto the CSuiteDecisionPacket and _via_mcp
@@ -162,6 +166,7 @@ class HydraState(BaseModel):
     tenant_id: str = "default"
     root_goal: str = ""
     target_repo_id: Optional[str] = None  # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
+    target_repo_subpath: Optional[str] = None  # optional repo-relative engineering subdir under target_repo_id
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",

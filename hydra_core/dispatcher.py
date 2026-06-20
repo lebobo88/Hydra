@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -37,6 +38,18 @@ logger = logging.getLogger(__name__)
 
 def _strip_comments(spec: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in spec.items() if not k.startswith("_")}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive float from env; fall back to default on unset/invalid/<=0."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
 
 
 def _load_user_scope_mcp() -> dict[str, dict[str, Any]]:
@@ -128,6 +141,23 @@ class MCPStdioDispatcher:
     # keep their dry, scaffold-only, skeleton-judge behaviour unchanged.
     live_execution: bool = True
 
+    # --- live MCP call timeouts (env-tunable) --------------------------------
+    # Bound every await against a backend MCP server so a hung/wedged server
+    # surfaces as a failed result instead of freezing the supervisor at 0 CPU.
+    # The gateway hardened this already (mcp_servers/hydra_gateway/server.py);
+    # this direct dispatcher — used by `hydra run --live` — had no timeout.
+    _DEFAULT_CONNECT_TIMEOUT = 20.0
+    _DEFAULT_TOOL_TIMEOUT = 120.0
+    _DEFAULT_LONG_TOOL_TIMEOUT = 1800.0
+    _DEFAULT_MAX_TOOL_TIMEOUT = 3600.0
+    # Calls that are an LLM generate/critique (slow) get the long timeout.
+    _LONG_TOOL_SERVERS = frozenset({"pp_codex", "pp_gemini"})
+    _LONG_TOOL_NAMES = frozenset({"generate", "critique"})
+    _LONG_PP_HARNESS_TOOLS = frozenset({
+        "start_stage", "start_best_of_stage", "record_attempt",
+        "retry_with_critique",
+    })
+
     def __init__(self, project_root: Path, *, verbose: bool = False):
         self.project_root = project_root
         self.verbose = verbose
@@ -151,6 +181,28 @@ class MCPStdioDispatcher:
             "granted_tools": granted_tools,
             "expires_at": expires_at,
         })
+
+    def _connect_timeout(self) -> float:
+        return _env_float("HYDRA_DISPATCH_CONNECT_TIMEOUT_S",
+                          self._DEFAULT_CONNECT_TIMEOUT)
+
+    def _resolve_tool_timeout(self, server: str, tool: str) -> float:
+        """Wall-clock cap for a single tool call. Env-tunable; LLM
+        generate/critique calls get the long timeout, everything else short.
+        """
+        short = _env_float("HYDRA_DISPATCH_TOOL_TIMEOUT_S",
+                           self._DEFAULT_TOOL_TIMEOUT)
+        long = _env_float("HYDRA_DISPATCH_LONG_TOOL_TIMEOUT_S",
+                          self._DEFAULT_LONG_TOOL_TIMEOUT)
+        hard_max = _env_float("HYDRA_DISPATCH_MAX_TOOL_TIMEOUT_S",
+                              self._DEFAULT_MAX_TOOL_TIMEOUT)
+        base = tool.rsplit(".", 1)[-1] if tool else tool
+        is_long = (
+            server in self._LONG_TOOL_SERVERS
+            or base in self._LONG_TOOL_NAMES
+            or (server == "pp_harness" and base in self._LONG_PP_HARNESS_TOOLS)
+        )
+        return min(long if is_long else short, hard_max)
 
     def _check_tool_rbac(self, server: str, tool: str,
                          squad_id: str | None) -> str | None:
@@ -335,9 +387,13 @@ class MCPStdioDispatcher:
             try:
                 async with stdio_client(params) as (read, write):
                     async with ClientSession(read, write) as session:
-                        await session.initialize()
+                        await asyncio.wait_for(
+                            session.initialize(), self._connect_timeout()
+                        )
                         if self.verbose:
-                            tools = await session.list_tools()
+                            tools = await asyncio.wait_for(
+                                session.list_tools(), self._connect_timeout()
+                            )
                             names = [t.name for t in tools.tools]
                             if tool not in names:
                                 return {
@@ -349,8 +405,26 @@ class MCPStdioDispatcher:
                         # Any exception from call_tool is NOT retried (see
                         # outer except guard on `called`).
                         called = True
+                        _eff_timeout = self._resolve_tool_timeout(server, tool)
                         try:
-                            result = await session.call_tool(tool, args)
+                            result = await asyncio.wait_for(
+                                session.call_tool(tool, args), _eff_timeout
+                            )
+                        except (asyncio.TimeoutError, TimeoutError):
+                            # Hung backend — do NOT retry (the tool may have
+                            # side-effected; `called` is already True). Surface a
+                            # failed result so the supervisor moves on / HITLs
+                            # instead of freezing the engine at 0 CPU.
+                            return {
+                                "status": "failed",
+                                "timeout": True,
+                                "error": (
+                                    f"tool {tool!r} on {server!r} timed out "
+                                    f"after {_eff_timeout}s"
+                                ),
+                                "server": server, "tool": tool,
+                                "phase": "call_tool", "timeout_s": _eff_timeout,
+                            }
                         except Exception as call_exc:
                             return {
                                 "status": "failed",

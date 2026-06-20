@@ -90,6 +90,8 @@ class CSuiteDecisionPacket(HydraEnvelope):
     notes: Optional[str] = None
     # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
     target_repo_id: Optional[str] = None
+    # Optional repo-relative engineering target under target_repo_id.
+    target_repo_subpath: Optional[str] = None
     # WS9: model_tier hint from the operator or planner task.  Propagated by
     # node_dispatch onto each CSuiteDecisionPacket so _via_mcp can read it via
     # getattr(inbound, "model_tier", None) — mirroring the target_repo_id pattern.
@@ -155,6 +157,8 @@ class DevTask(HydraEnvelope):
     # allow-listed repo, the dispatcher mirrors it here so _via_mcp resolves the
     # real path (the `repo` free-text field is NOT used for path resolution).
     target_repo_id: Optional[str] = None
+    # Optional repo-relative engineering target under target_repo_id.
+    target_repo_subpath: Optional[str] = None
     # pp team / profile selection. An orchestrator squad (e.g. rlm-gaming) sets
     # these when handing implementation to engineering so the run uses the right
     # pair-programmer team (e.g. "game-feature-team") and project profile.

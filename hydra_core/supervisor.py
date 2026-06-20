@@ -412,6 +412,36 @@ def build_supervisor(
                 "last_event": "bad --repo/--repos: ambiguous (both set)",
             }
 
+        # Optional repo-relative engineering subdir, shared across the targeted
+        # repo(s). This stays scoped to engineering repo targeting only; it
+        # never retargets non-engineering squads.
+        from hydra_core.repo_registry import parse_repo_subpath_arg
+        try:
+            _repo_subpath, _subdir_cleaned = parse_repo_subpath_arg(state.root_goal)
+        except ValueError as _subdir_err:
+            state.phase = "surfaced"
+            _subdir_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": f"--subdir/--repo-subpath argument rejected: {_subdir_err}",
+                "options": ["abort"],
+                "default_option": "abort",
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.bad_repo_subpath_arg",
+                {"error": str(_subdir_err)},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _subdir_hitl,
+                "last_event": f"bad --subdir arg: {_subdir_err}",
+            }
+        if _repo_subpath is not None and not state.target_repo_subpath:
+            state.target_repo_subpath = _repo_subpath
+
         # Fleet wiring based on how many distinct repos --repos/--fleet provided.
         _fleet_tasks: list[TaskState] = []
         if len(_fleet_repo_ids) >= 2:
@@ -429,6 +459,7 @@ def build_supervisor(
                     owner_squad="engineering",
                     description=state.root_goal,
                     target_repo_id=_rid,
+                    target_repo_subpath=state.target_repo_subpath,
                     priority="P2",
                 ))
             # WS8 SLICE 4 — allocate per-repo budget shares at fleet setup time.
@@ -519,6 +550,8 @@ def build_supervisor(
         # dict (not just be set on state) for LangGraph to persist them.
         if state.target_repo_id is not None:
             update["target_repo_id"] = state.target_repo_id
+        if state.target_repo_subpath is not None:
+            update["target_repo_subpath"] = state.target_repo_subpath
         if state.fleet_parallel:
             update["fleet_parallel"] = True
             update["selected_squads"] = ["engineering"]
@@ -943,6 +976,7 @@ def build_supervisor(
                 # comes from the underlying responder's temperature/seed.
                 objective=f"{task.description}\n\n[bon-candidate {i+1}/{n}]",
                 target_repo_id=state.target_repo_id,
+                target_repo_subpath=getattr(task, "target_repo_subpath", None) or state.target_repo_subpath,
                 model_tier=getattr(task, "model_tier", None),
             )
             try:
@@ -1169,6 +1203,7 @@ def build_supervisor(
             # enable distinct-repo fleet dispatch.  Falls back to the workflow root.
             pack_for_task = packs.get(task.owner_squad)
             _task_repo_id = getattr(task, "target_repo_id", None)
+            _task_repo_subpath = getattr(task, "target_repo_subpath", None)
             return CSuiteDecisionPacket(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra",
@@ -1176,6 +1211,11 @@ def build_supervisor(
                 origin="BOARDROOM",
                 objective=task.description,
                 target_repo_id=_task_repo_id if _task_repo_id is not None else state.target_repo_id,
+                target_repo_subpath=(
+                    _task_repo_subpath
+                    if _task_repo_subpath is not None
+                    else state.target_repo_subpath
+                ),
                 model_tier=getattr(task, "model_tier", None),
                 pp_team=getattr(task, "pp_team", None),
                 pp_profile=getattr(task, "pp_profile", None),
@@ -1536,6 +1576,23 @@ def build_supervisor(
                 task.status = "failed"
                 continue
 
+            # Fix B: the deterministic live engine cannot run non-mcp squads
+            # (agent-impersonation / claude-skill) — the live dispatcher only
+            # returns host_pickup_required placeholders, which strand work and
+            # emit misleading judge.bon_all_pending / RBAC / cost noise. Defer
+            # them to the host (mirrors ingest.py policy); the host runs the
+            # skill and re-injects emitted envelopes via the continuation
+            # transport (hydra.workflow.submit_envelopes -> ingest). Stub/test
+            # dispatchers (live_execution=False) keep the legacy in-graph path.
+            if getattr(dispatcher, "live_execution", False) and pack.entrypoint != "mcp":
+                emit_trace(judge_trace_root, state.workflow_id, "dispatch.deferred_to_host", {
+                    "squad": pack.slug,
+                    "entrypoint": pack.entrypoint,
+                    "task_id": str(task.task_id),
+                })
+                task.status = "deferred_to_host"
+                continue
+
             # Best-of-N branch (pack opt-in via squad.yaml `best_of_n: N`).
             if pack.best_of_n and pack.best_of_n >= 2:
                 winners = _dispatch_best_of_n(
@@ -1697,6 +1754,10 @@ def build_supervisor(
                 ),
                 envelope_id=getattr(_src_env, "id", None),
                 target_repo_id=getattr(_src_env, "target_repo_id", None) or state.target_repo_id,
+                target_repo_subpath=(
+                    getattr(_src_env, "target_repo_subpath", None)
+                    or state.target_repo_subpath
+                ),
             )
             _forwarded_tasks.append(_fwd_task)
             # Redact at the squad boundary BEFORE engineering/garland sees it —
@@ -1863,6 +1924,9 @@ def build_supervisor(
             objective=retry_obj,
             parent_id=original_env.get("id"),
             target_repo_id=state.target_repo_id,
+            target_repo_subpath=(
+                getattr(_retry_task, "target_repo_subpath", None) or state.target_repo_subpath
+            ),
             model_tier=_retry_model_tier,
         )
 

@@ -40,6 +40,7 @@ _REPO_DIRNAMES: dict[str, str] = {
     "executivesuite": "ExecutiveSuite",
     "senate": "Senate",
     "marketbliss": "MarketBliss",
+    "mc-test": "mc-test",
     "rlm-creative": "RLM-Creative",
     "rlm-gaming": "RLM-Gaming",
     "candc": "CandC",
@@ -162,6 +163,43 @@ def is_known_repo(repo_id: str) -> bool:
         return False
 
 
+def normalize_repo_subpath(subpath: str) -> str:
+    """Validate and normalize a repo-relative target subpath.
+
+    The result always uses forward slashes for stable transport in state/envelopes.
+    Absolute paths, drive-qualified paths, and parent traversal are rejected.
+    """
+    raw = (subpath or "").strip()
+    if not raw:
+        raise ValueError("repo subpath requires a value")
+    if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
+        raise ValueError(f"repo subpath must be relative, got {subpath!r}")
+    if ":" in raw:
+        raise ValueError(f"repo subpath must not contain ':'; got {subpath!r}")
+
+    parts = [p for p in re.split(r"[\\/]+", raw) if p and p != "."]
+    if not parts:
+        raise ValueError("repo subpath requires at least one path segment")
+    if any(p == ".." for p in parts):
+        raise ValueError(f"repo subpath must not escape via '..': {subpath!r}")
+    return "/".join(parts)
+
+
+def resolve_repo_project_path(repo_id: str, subpath: str | None = None) -> Path:
+    """Resolve an allow-listed repo root, optionally narrowed to a safe subpath."""
+    root = resolve_repo_path(repo_id)
+    if subpath is None:
+        return root
+    normalized = normalize_repo_subpath(subpath)
+    candidate = (root / Path(normalized)).resolve(strict=False)
+    if not candidate.is_relative_to(root):
+        raise ValueError(
+            f"resolved project path {candidate} escapes repo root {root}; "
+            f"repo_id={repo_id!r}, subpath={subpath!r} rejected"
+        )
+    return candidate
+
+
 # ---------------------------------------------------------------------------
 # CLI argument parser
 # ---------------------------------------------------------------------------
@@ -185,6 +223,21 @@ _REPO_BARE_RE = re.compile(
 # Count total "--repo" occurrences (both forms) for duplicate detection.
 _REPO_COUNT_RE = re.compile(
     r"(?:^|\s)--repo(?:=|\s)",
+    re.IGNORECASE,
+)
+
+
+_SUBDIR_FLAG = r"--(?:subdir|repo-subpath)"
+_SUBDIR_ARG_RE = re.compile(
+    rf"(?:^|\s)({_SUBDIR_FLAG}(?:=(\S+)|\s+(\S+))?)(?=\s|$)",
+    re.IGNORECASE,
+)
+_SUBDIR_BARE_RE = re.compile(
+    rf"(?:^|\s){_SUBDIR_FLAG}(?:\s+--|\s*$)",
+    re.IGNORECASE,
+)
+_SUBDIR_COUNT_RE = re.compile(
+    rf"(?:^|\s){_SUBDIR_FLAG}(?:=|\s)",
     re.IGNORECASE,
 )
 
@@ -329,6 +382,37 @@ def parse_repos_arg(text: str) -> tuple[list[str], str]:
     cleaned = cleaned.strip()
     cleaned = re.sub(r"  +", " ", cleaned)
     return deduped, cleaned
+
+
+def parse_repo_subpath_arg(text: str) -> tuple[Optional[str], str]:
+    """Extract ``--subdir <path>`` / ``--repo-subpath <path>`` from *text*."""
+    if re.search(rf"(?:^|\s){_SUBDIR_FLAG}=\s*(?:\s|$)", text, re.IGNORECASE):
+        raise ValueError("--subdir/--repo-subpath requires a value")
+    if _SUBDIR_BARE_RE.search(text):
+        raise ValueError("--subdir/--repo-subpath requires a value")
+    stripped = text.strip()
+    if re.search(rf"(?:^|\s){_SUBDIR_FLAG}$", stripped, re.IGNORECASE):
+        raise ValueError("--subdir/--repo-subpath requires a value")
+
+    occurrences = len(_SUBDIR_COUNT_RE.findall(text))
+    if occurrences > 1:
+        raise ValueError(
+            f"--subdir/--repo-subpath specified more than once ({occurrences} times); "
+            "only a single repo subpath is supported per invocation"
+        )
+
+    m = _SUBDIR_ARG_RE.search(text)
+    if m is None:
+        return None, text
+
+    raw = ((m.group(2) or "") + (m.group(3) or "")).strip()
+    normalized = normalize_repo_subpath(raw)
+
+    token_start = m.start(1)
+    token_end = m.end(1)
+    cleaned = text[:token_start].rstrip() + " " + text[token_end:].lstrip()
+    cleaned = re.sub(r"  +", " ", cleaned.strip())
+    return normalized, cleaned
 
 
 def parse_repo_arg(text: str) -> tuple[Optional[str], str]:

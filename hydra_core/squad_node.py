@@ -505,14 +505,21 @@ def _via_mcp(
     # window); registry dirs are operator-trusted sibling repos so an attacker
     # who can swap those dirs already owns the host — no further mitigation needed.
     target_repo_id = getattr(inbound, "target_repo_id", None)
+    target_repo_subpath = getattr(inbound, "target_repo_subpath", None)
     if target_repo_id and pack.slug == "engineering":
-        from hydra_core.repo_registry import resolve_repo_path
+        from hydra_core.repo_registry import resolve_repo_project_path
         try:
-            project_path = str(resolve_repo_path(target_repo_id))
+            project_path = str(resolve_repo_project_path(target_repo_id, target_repo_subpath))
+            if target_repo_subpath:
+                Path(project_path).mkdir(parents=True, exist_ok=True)
         except Exception as e:
             return SquadResult(
                 envelopes=[], artifacts=[], status="failed",
-                rationale=f"repo-targeting rejected target_repo_id={target_repo_id!r}: {e}",
+                rationale=(
+                    "repo-targeting rejected "
+                    f"target_repo_id={target_repo_id!r} "
+                    f"target_repo_subpath={target_repo_subpath!r}: {e}"
+                ),
             )
     else:
         # No repo override (or non-engineering mcp squad) — use the trusted
@@ -899,7 +906,7 @@ def _extract_emitted_envelopes(
         raw = result.get("envelopes")
     if not isinstance(raw, list):
         return []
-    from .repo_registry import is_known_repo
+    from .repo_registry import is_known_repo, normalize_repo_subpath
     out: list[HydraEnvelope] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -923,6 +930,20 @@ def _extract_emitted_envelopes(
             and is_known_repo(env.get("repo") or "")
         ):
             env["target_repo_id"] = str(env["repo"]).strip().lower()
+        if env.get("type") == "DEV_TASK":
+            raw_subpath = (
+                env.get("target_repo_subpath")
+                or env.get("repo_subpath")
+                or env.get("subdir")
+            )
+            if raw_subpath:
+                try:
+                    env["target_repo_subpath"] = normalize_repo_subpath(str(raw_subpath))
+                except ValueError:
+                    # Fail closed later in _via_mcp if an explicit target_repo_subpath
+                    # is malformed; aliases are ignored unless they normalize cleanly.
+                    if env.get("target_repo_subpath"):
+                        env["target_repo_subpath"] = str(raw_subpath)
         try:
             out.append(validate_envelope(env))
         except Exception:  # noqa: BLE001 — skip malformed; never crash dispatch

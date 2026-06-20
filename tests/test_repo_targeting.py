@@ -13,7 +13,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hydra_core.repo_registry import is_known_repo, parse_repo_arg, resolve_repo_path
+from hydra_core.repo_registry import (
+    is_known_repo,
+    normalize_repo_subpath,
+    parse_repo_arg,
+    parse_repo_subpath_arg,
+    resolve_repo_path,
+    resolve_repo_project_path,
+)
 from hydra_core.schemas import CSuiteDecisionPacket
 from hydra_core.squad_loader import SquadPack
 from hydra_core.squad_node import _via_mcp
@@ -103,6 +110,10 @@ def test_candc_and_rlm_gaming_allow_listed() -> None:
     assert is_known_repo("rlm-gaming") is True
 
 
+def test_mc_test_allow_listed() -> None:
+    assert is_known_repo("mc-test") is True
+
+
 def test_is_known_repo_false() -> None:
     assert is_known_repo("nope") is False
     assert is_known_repo("C:/AiAppDeployments/Hydra") is False
@@ -157,6 +168,30 @@ def test_monkeypatched_base_resolves(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
     path = resolve_repo_path("hydra")
     assert path == fake_hydra.resolve()
+
+
+def test_resolve_repo_project_path_under_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_hydra = tmp_path / "Hydra"
+    fake_hydra.mkdir()
+    _git_init(fake_hydra)
+
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
+    path = resolve_repo_project_path("hydra", "sandboxes/test-5")
+    assert path == (fake_hydra / "sandboxes" / "test-5").resolve(strict=False)
+
+
+def test_resolve_repo_project_path_rejects_parent_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_hydra = tmp_path / "Hydra"
+    fake_hydra.mkdir()
+    _git_init(fake_hydra)
+
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
+    with pytest.raises(ValueError, match="must not escape"):
+        resolve_repo_project_path("hydra", "../escape")
 
 
 def test_monkeypatched_base_missing_git_raises(
@@ -234,6 +269,44 @@ def test_parse_repo_arg_case_insensitive() -> None:
     repo_id, rest = parse_repo_arg("--repo HYDRA do the thing")
     assert repo_id == "hydra"
     assert "HYDRA" not in rest
+
+
+def test_parse_repo_subpath_arg_space_form() -> None:
+    subpath, rest = parse_repo_subpath_arg("Build it --subdir test-5 now")
+    assert subpath == "test-5"
+    assert "--subdir" not in rest
+    assert "Build it" in rest
+
+
+def test_parse_repo_subpath_arg_equals_form_normalizes_backslashes() -> None:
+    subpath, rest = parse_repo_subpath_arg(r"Build it --repo-subpath sandbox\test-5 now")
+    assert subpath == "sandbox/test-5"
+    assert "sandbox\\test-5" not in rest
+
+
+def test_parse_repo_subpath_arg_bare_raises() -> None:
+    with pytest.raises(ValueError, match="requires a value"):
+        parse_repo_subpath_arg("Build it --subdir")
+
+
+def test_parse_repo_subpath_arg_equals_empty_raises() -> None:
+    with pytest.raises(ValueError, match="requires a value"):
+        parse_repo_subpath_arg("Build it --repo-subpath=")
+
+
+def test_parse_repo_subpath_arg_duplicate_raises() -> None:
+    with pytest.raises(ValueError, match="specified more than once"):
+        parse_repo_subpath_arg("Build it --subdir test-5 --repo-subpath sandbox/test-6")
+
+
+def test_parse_repo_subpath_arg_rejects_parent_escape() -> None:
+    with pytest.raises(ValueError, match="must not escape"):
+        parse_repo_subpath_arg("Build it --subdir ../test-5")
+
+
+def test_normalize_repo_subpath_rejects_absolute_path() -> None:
+    with pytest.raises(ValueError, match="must be relative"):
+        normalize_repo_subpath(r"C:\AiAppDeployments\mc-test\test-5")
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +401,35 @@ def test_via_mcp_with_target_repo_id_uses_registry_path() -> None:
     assert captured[0]["project_path"] == expected_path, (
         f"Expected project_path={expected_path!r}, got {captured[0]['project_path']!r}"
     )
+
+
+def test_via_mcp_with_target_repo_subpath_uses_bounded_project_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "Hydra"
+    repo_root.mkdir()
+    _git_init(repo_root)
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
+
+    state = HydraState(root_goal="Fix something")
+    pack = _make_engineering_pack()
+    inbound = CSuiteDecisionPacket(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        origin="BOARDROOM",
+        objective="Fix something",
+        target_repo_id="hydra",
+        target_repo_subpath="sandboxes/test-5",
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
+    expected_path = str((repo_root / "sandboxes" / "test-5").resolve(strict=False))
+    assert captured[0]["project_path"] == expected_path
+    assert Path(expected_path).is_dir(), "engineering target subdir should be created on demand"
 
 
 def test_via_mcp_without_target_repo_id_falls_back_to_cwd() -> None:

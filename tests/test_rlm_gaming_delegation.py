@@ -104,6 +104,22 @@ def test_extract_maps_known_repo_to_target_repo_id() -> None:
     assert envs2[0].target_repo_id is None
 
 
+def test_extract_maps_repo_subpath_alias_to_target_repo_subpath() -> None:
+    inbound = CSuiteDecisionPacket(workflow_id=HydraState().workflow_id,
+                                   origin_squad="hydra", origin="BOARDROOM",
+                                   objective="x")
+    envs = _extract_emitted_envelopes(
+        {"emitted_envelopes": [_dev_task_dict(
+            repo="mc-test",
+            subdir=r"test-3d\prototype",
+        )]},
+        inbound,
+        "rlm-gaming",
+    )
+    assert envs[0].target_repo_id == "mc-test"
+    assert envs[0].target_repo_subpath == "test-3d/prototype"
+
+
 def test_resolve_forward_target_suppresses_self_forward() -> None:
     from hydra_core.supervisor import _resolve_forward_target
     from hydra_core.schemas import DevTask
@@ -194,6 +210,28 @@ def test_dispatch_forwards_dev_task_to_engineering(monkeypatch, tmp_path) -> Non
     assert fwd, "no forwarded engineering envelope recorded"
 
 
+def test_dispatch_forwards_repo_subpath_to_engineering(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    repo_path = _hermetic_repo(monkeypatch, tmp_path / "mc-test-root")
+
+    class _SubdirDispatcher(_SkillToEngDispatcher):
+        def invoke_claude_skill(self, skill: str, args: dict) -> dict:
+            return {"status": "done", "summary": "game design complete",
+                    "emitted_envelopes": [_dev_task_dict(repo="mc-test", subdir="test-3d")]}
+
+    disp = _SubdirDispatcher()
+    runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
+                              force_pure_python=True)
+    initial = HydraState(root_goal="Build the voxel sandbox",
+                         selected_squads=["rlm-gaming"])
+    runner.invoke(initial, stop_before="judge_per_squad")
+
+    start_run = next(a for (_s, t, a) in disp.calls if t == "start_run")
+    assert start_run["project_path"] == str(repo_path / "test-3d")
+    assert (repo_path / "test-3d").is_dir()
+
+
 def test_forwarded_envelope_is_redacted_before_engineering(monkeypatch, tmp_path) -> None:
     """RC1/security: the emitted DEV_TASK is semi-trusted skill output; PII and
     MCP-injection strings must be scrubbed before engineering (and pp) see it."""
@@ -279,6 +317,7 @@ def test_rlm_gaming_skill_receives_delegation_priming(monkeypatch) -> None:
     assert "DELEGATION CONTRACT" in priming
     assert "pp_team" in priming
     assert "engineering" in priming and "garland" in priming
+    assert "target_repo_subpath" in priming and "mc-test" in priming
 
 
 def test_get_squad_dispatch_priming() -> None:
