@@ -81,6 +81,19 @@
       "HYDRA_RLM_ROOT": "{{AIAPP_BASE}}/RLM-Creative"
     }
   },
+  "rlm_gaming": {
+    "type": "stdio",
+    "command": "python",
+    "args": [
+      "-m",
+      "mcp_servers.rlm_gaming"
+    ],
+    "cwd": "{{HYDRA_ROOT}}",
+    "env": {
+      "PYTHONPATH": "{{HYDRA_ROOT}}",
+      "HYDRA_RLM_GAMING_ROOT": "{{AIAPP_BASE}}/RLM-Gaming"
+    }
+  },
   "xenia": {
     "type": "stdio",
     "command": "python",

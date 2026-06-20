@@ -368,6 +368,18 @@ RLM_CREATIVE_TOOLS = [
     "rlm.ping",
 ]
 
+RLM_GAMING_TOOLS = [
+    "rlmgaming.skill.list", "rlmgaming.skill.get", "rlmgaming.command.list",
+    "rlmgaming.command.get", "rlmgaming.agent.list", "rlmgaming.agent.get",
+    "rlmgaming.output.write", "rlmgaming.output.read", "rlmgaming.ping",
+]
+
+MARKETBLISS_TOOLS = [
+    "mb.roster.list", "mb.agent.get", "mb.skill.list", "mb.skill.get",
+    "mb.command.list", "mb.command.get", "mb.output.write", "mb.output.read",
+    "mb.ping",
+]
+
 SENATE_TOOLS = [
     "senate.roster.list", "senate.agent.get", "senate.skill.list",
     "senate.skill.get", "senate.command.list", "senate.command.get",
@@ -381,11 +393,22 @@ XENIA_KB_TOOLS = [
     "xenia-kb.search", "xenia-kb.get", "xenia-kb.list", "xenia-kb.ping",
 ]
 
+XENIA_TOOLS = [
+    "xenia.skill.list", "xenia.skill.get", "xenia.command.list",
+    "xenia.command.get", "xenia.agent.list", "xenia.agent.get",
+    "xenia.output.write", "xenia.output.read", "xenia.ping",
+]
+
 XENIA_TICKETS_TOOLS = [
     "xenia-tickets.create", "xenia-tickets.get", "xenia-tickets.list",
     "xenia-tickets.comment", "xenia-tickets.update_fields",
     "xenia-tickets.send_response", "xenia-tickets.recommend",
     "xenia-tickets.execute_approved", "xenia-tickets.ping",
+]
+
+HYDRA_CONTROL_TOOLS = [
+    "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.resume",
+    "hydra.workflow.submit_envelopes", "hydra.cockpit.audit",
 ]
 
 
@@ -627,11 +650,107 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             },
         },
     },
+    "hydra_control": {
+        "hydra.control.ping": {
+            "type": "object",
+            "properties": {},
+        },
+        "hydra.workflow.resume": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "approve",
+                        "reject",
+                        "modify-budget",
+                        "force-dispatch",
+                        "change-squads",
+                    ],
+                },
+                "option": {"type": "string"},
+            },
+            "required": ["workflow_id", "action"],
+        },
+        "hydra.workflow.launch": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string"},
+                "squad": {
+                    "type": "string",
+                    "description": "Comma-separated squad slugs to force-select (optional).",
+                },
+                "budget": {
+                    "type": "number",
+                    "description": "Budget cap in USD (optional).",
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Pre-allocated workflow id (optional).",
+                },
+            },
+            "required": ["goal"],
+        },
+        "hydra.workflow.submit_envelopes": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "envelopes": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Typed Hydra envelopes the host-run skill emitted "
+                        "(each with id/type/origin_squad/workflow_id, e.g. a "
+                        "DEV_TASK with instructions/repo/pp_team)."
+                    ),
+                },
+            },
+            "required": ["workflow_id", "envelopes"],
+        },
+        "hydra.cockpit.audit": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "The cockpit write action (e.g. launch, approve, reject).",
+                },
+                "actor": {
+                    "type": "string",
+                    "description": "Fixed server-side actor identity (e.g. 'hydra-cockpit').",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Fixed server-side project (e.g. 'Hydra').",
+                },
+                "trace_id": {
+                    "type": "string",
+                    "description": "Per-action trace id for audit lineage (fresh per write).",
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": (
+                        "Hydra workflow id (optional — present for resume/launch actions). "
+                        "Validated with _WORKFLOW_ID_RE when supplied."
+                    ),
+                },
+                "option": {
+                    "type": "string",
+                    "description": "Optional action option (e.g. budget amount, squad list).",
+                },
+                "detail": {
+                    "type": "string",
+                    "description": "Optional human-readable detail for the audit ledger.",
+                },
+            },
+            "required": ["action", "actor", "project", "trace_id"],
+        },
+    },
 }
 
 
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
-    """Build a ToolShed pre-loaded with static catalogs for all 11 backends."""
+    """Build a ToolShed pre-loaded with static catalogs for all 15 backends."""
     shed = ToolShed(dispatcher=dispatcher)
     shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS,
                                  schemas=SCHEMA_OVERRIDES.get("pp_harness"))
@@ -642,6 +761,11 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
                                  schemas=SCHEMA_OVERRIDES.get("hydra_memory"))
     shed.register_static_catalog("executive_suite", EXECUTIVE_SUITE_TOOLS)
     shed.register_static_catalog("rlm_creative", RLM_CREATIVE_TOOLS)
+    shed.register_static_catalog("rlm_gaming", RLM_GAMING_TOOLS)
+    shed.register_static_catalog("marketbliss", MARKETBLISS_TOOLS)
+    shed.register_static_catalog("hydra_control", HYDRA_CONTROL_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("hydra_control"))
+    shed.register_static_catalog("xenia", XENIA_TOOLS)
     shed.register_static_catalog("senate", SENATE_TOOLS)
     shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
     shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
