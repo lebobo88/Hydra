@@ -19,12 +19,15 @@ performed by an injected `Dispatcher` strategy so unit tests and other hosts
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 import subprocess
 from pathlib import Path
+
+_log = logging.getLogger("hydra.engineering")
 
 from .iolaus import post_dispatch, pre_dispatch
 from .schemas import (
@@ -186,7 +189,44 @@ _GEN_FAIL_MARKERS: tuple[str, ...] = (
 )
 
 
-def _generate_failure_reason(gen: Any, gen_text: str) -> str | None:
+def _worktree_dirty_set(project_path: str | None) -> set[str]:
+    """Set of porcelain paths with uncommitted changes in the project tree.
+
+    Fail-soft: a non-git root or any git error returns an empty set. Used to
+    scope the drive loop's "did THIS run write code?" signal and the harvest
+    commit — so we never attribute (or commit) changes a run did not make.
+    """
+    if not project_path:
+        return set()
+    root = Path(project_path)
+    if not root.is_dir():
+        return set()
+    if not (root / ".git").exists() and not (root.parent / ".git").exists():
+        return set()
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+    except Exception:  # noqa: BLE001 — never crash on a git hiccup
+        return set()
+    if res.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for line in res.stdout.splitlines():
+        # porcelain v1: "XY <path>" (path may be quoted / a "old -> new" rename).
+        path = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        if path:
+            out.add(path)
+    return out
+
+
+def _generate_failure_reason(
+    gen: Any, gen_text: str, wrote_changes: bool = False
+) -> str | None:
     """Reason a ``pp_codex.generate`` call produced no code, else ``None``.
 
     The drive loop used to treat a timeout / quota / read-only-sandbox / empty
@@ -196,6 +236,18 @@ def _generate_failure_reason(gen: Any, gen_text: str) -> str | None:
     reason the loop records a failed attempt and surfaces with that reason
     instead of judging or burning a Reflexion retry on a condition a retry
     cannot fix.
+
+    Diff-aware: the soft text markers (``permission denied`` etc.) describe what
+    codex narrated, and under ``--sandbox workspace-write`` codex CAN edit the
+    worktree but CANNOT ``git commit`` (``.git/index.lock`` is read-only in that
+    sandbox) or spawn child test runners (``spawn EPERM``). When codex honestly
+    reports "commit/test blocked" AFTER writing files (``wrote_changes=True``,
+    computed run-scoped by the caller), that is NOT a generate failure — the
+    harness owns commit + smoke outside the sandbox (see
+    ``harvest_pp_run_artifacts`` / ``_run_smoke``). So a text marker only counts
+    as a failure when this run wrote NOTHING. The hard cases (timeout /
+    transport error / empty output) remain failures regardless, since they mean
+    no code was produced.
     """
     if isinstance(gen, dict):
         if gen.get("timeout"):
@@ -207,12 +259,20 @@ def _generate_failure_reason(gen: Any, gen_text: str) -> str | None:
             status = gen.get("status")
             if status and status not in {"done", "ok", "complete"}:
                 return f"codex generate returned status={status!r}"
+    if not (gen_text or "").strip():
+        return "codex generate returned no output (no code written)"
     low = (gen_text or "").lower()
     for marker in _GEN_FAIL_MARKERS:
         if marker in low:
+            # Suppress when THIS run actually wrote code: the marker is about the
+            # commit/test/browser steps the harness now performs itself.
+            if wrote_changes:
+                _log.info(
+                    "codex narrated %r but the run wrote changes — treating "
+                    "generate as success (harness owns commit/smoke)", marker,
+                )
+                return None
             return f"codex generate blocked ({marker}): {gen_text.strip()[:300]}"
-    if not (gen_text or "").strip():
-        return "codex generate returned no output (no code written)"
     return None
 
 
@@ -251,18 +311,71 @@ def _parse_smoke_verdict(text: str) -> tuple[str, str]:
     return "skipped", "no parseable smoke verdict"
 
 
+def _detect_smoke_command(project_path: str) -> list[str] | None:
+    """Detect the project's build/test command, or ``None`` if there isn't one.
+
+    Heuristic, ordered by specificity. Returns argv (no shell). Node projects
+    prefer a declared ``test`` script, else ``build``; Python projects prefer
+    pytest. Keep this conservative — an undetected project degrades to
+    ``skipped`` (an honest non-pass), never a forged pass.
+    """
+    import json as _json
+    root = Path(project_path)
+    pkg = root / "package.json"
+    if pkg.is_file():
+        try:
+            scripts = (_json.loads(pkg.read_text(encoding="utf-8")) or {}).get("scripts", {})
+        except Exception:  # noqa: BLE001
+            scripts = {}
+        if isinstance(scripts, dict):
+            if scripts.get("test"):
+                return ["npm", "test", "--silent"]
+            if scripts.get("build"):
+                return ["npm", "run", "build", "--silent"]
+    if (root / "pyproject.toml").is_file() or (root / "pytest.ini").is_file() \
+            or (root / "tox.ini").is_file() or (root / "setup.cfg").is_file() \
+            or (root / "tests").is_dir():
+        return ["pytest", "-q"]
+    if (root / "go.mod").is_file():
+        return ["go", "build", "./..."]
+    if (root / "Cargo.toml").is_file():
+        return ["cargo", "build"]
+    return None
+
+
 def _run_smoke(
     dispatcher: "Dispatcher", *, project_path: str, stage_id: str
 ) -> tuple[str, str]:
-    """Run an independent smoke via codex and return ``(status, reason)``."""
+    """Run an independent smoke OUTSIDE the codex sandbox; return ``(status, reason)``.
+
+    PP-VG-5 (anti-gaming) requires a real execution before a code stage may
+    finalize ``complete``. This used to run the build/test command *through*
+    ``pp_codex.generate`` under ``--sandbox workspace-write`` — but that sandbox
+    forbids spawning child processes (e.g. vitest/esbuild → ``spawn EPERM``), so
+    the smoke could never produce a real ``pass`` on a target repo and always
+    degraded to ``skipped``. We now detect and run the command directly on the
+    host. Exit code is authoritative: 0 → ``pass``, non-zero → ``fail``. No
+    runnable command → ``skipped`` (an honest non-pass, never a forged pass).
+
+    The ``dispatcher`` parameter is retained for call-site stability and possible
+    future use; the host-side runner does not need it.
+    """
+    cmd = _detect_smoke_command(project_path)
+    if not cmd:
+        return "skipped", "no runnable build/test command detected"
     try:
-        res = dispatcher.call_mcp("pp_codex", "generate", {
-            "prompt": _SMOKE_PROMPT, "cwd": project_path,
-            "sandbox": "workspace-write",
-        }, squad_id="engineering")
+        res = subprocess.run(
+            cmd, cwd=project_path, capture_output=True, text=True,
+            check=False, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return "skipped", f"smoke timed out after 600s: {' '.join(cmd)}"
     except Exception as e:  # noqa: BLE001 -- a smoke that cannot run is 'skipped'
-        return "skipped", f"smoke run errored: {e!r}"[:300]
-    return _parse_smoke_verdict(str(_pp_inner(res).get("text") or ""))
+        return "skipped", f"smoke run errored ({' '.join(cmd)}): {e!r}"[:300]
+    label = " ".join(cmd)
+    status = "pass" if res.returncode == 0 else "fail"
+    tail = (res.stderr or res.stdout or "").strip().splitlines()[-1:] or [""]
+    return status, f"`{label}` exit={res.returncode} :: {tail[0]}"[:300]
 
 
 def _build_engineer_prompt(request_text: str, project_path: str) -> str:
@@ -355,7 +468,12 @@ def _drive_pp_stage_loop(
     out: dict[str, Any] = {
         "final_status": "aborted", "stage_outcome": None,
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
+        "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
+        "harvest_sha": None, "harvest_error": None, "changed_paths": [],
     }
+    # Snapshot the working tree BEFORE any generation so we can attribute (and
+    # later commit) ONLY the files this run touches — never pre-existing dirt.
+    pre_dirty = _worktree_dirty_set(project_path)
     try:
         st = cm("pp_harness", "start_stage",
                 {"run_id": run_id, "kind": "code", "gate_type": "code"},
@@ -386,12 +504,25 @@ def _drive_pp_stage_loop(
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
 
-            gen_fail = _generate_failure_reason(gen, gen_text)
+            # Run-scoped: paths dirtied since the pre-generate snapshot. Excludes
+            # any files that were already modified before this run started.
+            run_changed = _worktree_dirty_set(project_path) - pre_dirty
+            wrote_changes = bool(run_changed)
+            out["wrote_changes"] = out["wrote_changes"] or wrote_changes
+            out["changed_paths"] = sorted(set(out["changed_paths"]) | run_changed)
+            gen_fail = _generate_failure_reason(gen, gen_text, wrote_changes)
             if gen_fail:
-                # Real generate failure (timeout / quota / read-only sandbox /
-                # empty): surface the TRUE reason instead of fabricating an empty
-                # 'revise' verdict, and don't spend a Reflexion retry on a
-                # condition a retry cannot fix.
+                # Real generate failure (timeout / transport error / read-only
+                # sandbox with NO diff / empty): surface the TRUE reason instead
+                # of fabricating an empty 'revise' verdict, and don't spend a
+                # Reflexion retry on a condition a retry cannot fix. Note: a
+                # "commit/test blocked" narration AFTER codex wrote files is NOT
+                # a failure here — _generate_failure_reason suppresses it because
+                # the harness owns commit + smoke outside the sandbox.
+                _log.warning(
+                    "drive_loop generate failed (run=%s wrote_changes=%s): %s",
+                    run_id, wrote_changes, gen_fail,
+                )
                 out["error"] = gen_fail
                 out["stage_outcome"] = "error"
                 gen_failed = True
@@ -501,7 +632,12 @@ def _drive_pp_stage_loop(
                 except Exception:  # noqa: BLE001
                     pass
                 passed = smoke_status == "pass"
+                _log.info(
+                    "drive_loop smoke (run=%s): status=%s reason=%s",
+                    run_id, smoke_status, smoke_reason[:200],
+                )
         out["smoke_status"] = smoke_status
+        out["smoke_reason"] = smoke_reason
 
         try:
             cm("pp_harness", "finalize_stage", {
@@ -831,15 +967,27 @@ def _via_mcp(
     # visible on a branch — Discovery agent E2's research artifacts hit this
     # exact failure mode in the bootstrap session.
     commit_sha: str | None = None
-    if run_id and pp_status in {"done", "complete", "surfaced"} and project_path:
+    # Harvest when pp reported a terminal status, OR when the drive loop reports
+    # codex wrote changes (covers the case where codex produced good code but its
+    # own commit was blocked by the workspace-write sandbox — the harness must
+    # land those edits itself, outside the sandbox).
+    wrote = bool(loop_outcome and loop_outcome.get("wrote_changes"))
+    if run_id and project_path and (pp_status in {"done", "complete", "surfaced"} or wrote):
         try:
             commit_sha = harvest_pp_run_artifacts(
                 project_path=str(project_path),
                 run_id=str(run_id),
                 workflow_id=inbound.workflow_id,
+                changed_paths=(loop_outcome or {}).get("changed_paths"),
             )
-        except Exception:  # noqa: BLE001 — never crash dispatch on a git failure
+            if loop_outcome is not None:
+                loop_outcome["harvest_sha"] = commit_sha
+            _log.info("harvest committed run=%s sha=%s", run_id, commit_sha or "none")
+        except Exception as e:  # noqa: BLE001 — never crash dispatch on a git failure
             commit_sha = None
+            if loop_outcome is not None:
+                loop_outcome["harvest_error"] = repr(e)[:300]
+            _log.warning("harvest failed for run=%s: %r", run_id, e)
 
     # Status mapping. Drive-loop runs report a terminal final_status; legacy
     # scaffold-only dispatch reports "running" (the pp daemon owns the rest).
@@ -849,6 +997,12 @@ def _via_mcp(
         loop_summary = (
             f"; drive_loop: final_status={fs}, stage_outcome="
             f"{loop_outcome.get('stage_outcome')}"
+            f", wrote_changes={loop_outcome.get('wrote_changes')}"
+            f", smoke={loop_outcome.get('smoke_status')}"
+            + (f", harvest_sha={loop_outcome.get('harvest_sha')}"
+               if loop_outcome.get("harvest_sha") else "")
+            + (f", harvest_error={loop_outcome.get('harvest_error')}"
+               if loop_outcome.get("harvest_error") else "")
             + (f", error={loop_outcome.get('error')}" if loop_outcome.get("error") else "")
         )
     else:
@@ -886,27 +1040,36 @@ def harvest_pp_run_artifacts(
     project_path: str,
     run_id: str,
     workflow_id: str,
+    changed_paths: list[str] | None = None,
 ) -> str | None:
-    """Stage and commit any artifacts pp-harness archived under ``.harness/<run_id>``.
+    """Stage and commit the pp run's outputs into the project tree.
 
     Returns the commit SHA on success, or ``None`` when there is nothing to
     commit, the project isn't a git repo, or any git invocation fails. The
     helper is deliberately fail-soft — Hydra's dispatch path must never
     crash because the operator chose a non-git project root.
 
-    Why this exists: pp-harness writes archived artifacts into
-    ``<project>/.harness/<run_id>/...`` and stops there. When Hydra ran the
-    work in a worktree, those bytes are stranded if no one commits them.
-    This helper bundles the bytes into a single ``chore(hydra): harvest pp
-    run <run_id>`` commit so synthesis + the upstream merge see them.
+    Why this exists: codex (the headless generator) edits files DIRECTLY in the
+    project tree under ``--sandbox workspace-write`` but CANNOT ``git commit``
+    itself — that sandbox makes ``.git`` read-only (``.git/index.lock`` →
+    Permission denied). pp-harness additionally archives metadata under
+    ``<project>/.harness/<run_id>/``. Both are stranded if no one commits them.
+    This helper lands them, OUTSIDE the sandbox, in one
+    ``chore(hydra): harvest pp run <run_id>`` commit so synthesis + the upstream
+    merge see the work.
+
+    Scope (RUN-SCOPED — never a blanket ``git add -u``): stages exactly
+    ``changed_paths`` (the files THIS run dirtied, computed by the drive loop as
+    the delta from a pre-generate snapshot — so pre-existing uncommitted edits in
+    the operator's tree are never swept in) plus the run's archived metadata
+    under ``.harness/<run_id>``. When ``changed_paths`` is None/empty only the
+    archived metadata is committed. Paths are added with explicit pathspecs so
+    git respects ``.gitignore`` and we never touch unrelated files.
     """
     root = Path(project_path)
     if not root.is_dir():
         return None
     if not (root / ".git").exists() and not (root.parent / ".git").exists():
-        return None
-    harness_dir = root / ".harness" / run_id
-    if not harness_dir.is_dir():
         return None
 
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -918,12 +1081,20 @@ def harvest_pp_run_artifacts(
             check=False,
         )
 
-    add = _git("add", "--", str(harness_dir))
-    if add.returncode != 0:
-        return None
-    status = _git("status", "--porcelain", "--", str(harness_dir))
-    if not status.stdout.strip():
+    # 1) archived run metadata (best-effort — may not exist on every path).
+    harness_dir = root / ".harness" / run_id
+    if harness_dir.is_dir():
+        _git("add", "--", str(harness_dir))
+    # 2) ONLY the files this run touched (explicit pathspecs, .gitignore-aware).
+    for rel in (changed_paths or []):
+        rel = str(rel).strip()
+        if rel and ".." not in rel:  # defensive: no path escape
+            _git("add", "--", rel)
+
+    # Anything staged? `git diff --cached --quiet` exits 1 when there is.
+    if _git("diff", "--cached", "--quiet").returncode == 0:
         return None  # nothing new to commit
+
     commit = _git(
         "-c", "user.name=hydra-dispatcher",
         "-c", "user.email=hydra@local",

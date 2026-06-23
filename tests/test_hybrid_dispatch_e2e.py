@@ -102,6 +102,10 @@ def packs():
 def _no_git_harvest(monkeypatch):
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # Smoke now runs host-side (outside the codex sandbox); stub it to a pass so
+    # the wiring tests stay deterministic. _run_smoke has its own unit tests.
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
 
 
 # --------------------------------------------------------------------------- #

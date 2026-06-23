@@ -82,7 +82,11 @@ class _ScriptedDispatcher:
 # _drive_pp_stage_loop
 # --------------------------------------------------------------------------- #
 
-def test_happy_path_drives_full_loop() -> None:
+def test_happy_path_drives_full_loop(monkeypatch) -> None:
+    # Smoke now runs host-side (outside the codex sandbox); stub it to a pass so
+    # this wiring test stays deterministic. _run_smoke has its own unit tests.
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
     disp = _ScriptedDispatcher(_happy_responses("pass"))
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
@@ -171,6 +175,9 @@ def test_via_mcp_drive_marks_judged_and_drains_run(monkeypatch) -> None:
     # Don't touch git in the harvest step.
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # Host-side smoke stubbed to a pass (its own unit tests cover the mechanism).
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
     state = HydraState(root_goal="t")
     pack = _eng_pack()
     disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
@@ -251,9 +258,11 @@ def test_timeout_generate_is_detected() -> None:
     assert ra["status"] == "timeout"
 
 
-def test_pass_records_real_smoke_and_completes() -> None:
+def test_pass_records_real_smoke_and_completes(monkeypatch) -> None:
     """On a passing verdict the loop runs an independent smoke, records it tied
     to candidate_index=1, and only then finalizes complete (PP-VG-5)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "`pytest -q` exit=0"))
     disp = _ScriptedDispatcher(_happy_responses("pass"))
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
@@ -276,13 +285,15 @@ def test_pass_records_real_smoke_and_completes() -> None:
     assert fs["winner_attempt_id"] == "att_T"
 
 
-def test_pass_verdict_but_failing_smoke_surfaces() -> None:
+def test_pass_verdict_but_failing_smoke_surfaces(monkeypatch) -> None:
     """A passing judge verdict with a FAILING smoke must NOT finalize complete —
     the anti-gaming gate keeps it surfaced (no forged pass)."""
+    # Host-side smoke returns a real failure (non-zero exit).
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("fail", "`pytest -q` exit=1 :: 1 failed"))
     resp = _happy_responses("pass")
     resp[("pp_codex", "generate")] = {"status": "done", "result": {
-        "text": "edited foo.py\n{\"status\": \"fail\", \"reason\": \"pytest -q -> 1 failed\"}",
-        "model": "codex-1"}}
+        "text": "edited foo.py", "model": "codex-1"}}
     disp = _ScriptedDispatcher(resp)
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")

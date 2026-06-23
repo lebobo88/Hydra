@@ -27,6 +27,15 @@ from hydra_core.squad_node import _via_mcp
 from hydra_core.state import HydraState
 
 
+@pytest.fixture(autouse=True)
+def _no_git_harvest(monkeypatch):
+    """Some tests dispatch _via_mcp against the LIVE Hydra repo; never let the
+    harvest step touch real git there (it is exercised hermetically in
+    tests/test_drive_loop_harvest_smoke.py)."""
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
