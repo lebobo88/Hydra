@@ -13,6 +13,16 @@ dist/
 .harness/
 ~/.hydra/
 
+# Scratch / verification temp dirs (machine-local; never commit)
+.tmp/
+.tmp_*
+
+# Ad-hoc cross-repo junctions/symlinks planted at repo root (never commit;
+# remove with `cmd /c rmdir` only — recursive delete follows them into sibling repos)
+/.candc_link
+/_space_sim_link
+*_link
+
 # Editor / OS
 .vscode/
 .idea/

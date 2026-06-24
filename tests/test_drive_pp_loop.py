@@ -39,7 +39,7 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
             "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02, "wall_ms": 100}},
         ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
         ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},
-        ("pp_gemini", "critique"): {"status": "done", "result": {"parsed": {
+        ("pp_codex", "critique"): {"status": "done", "result": {"parsed": {
             "outcome": outcome, "critique_md": "c" * 90, "score": {"correctness": 9}}}},
         ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
         ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
@@ -108,9 +108,12 @@ def test_happy_path_drives_full_loop(monkeypatch) -> None:
     assert fs["status"] == "passed"
     assert fs["winner_attempt_id"] == "att_T"
 
-    # cross-vendor: codex generated, gemini judged.
+    # Producer fell back to codex (no host engineer in the scripted dispatcher);
+    # codex judges (Gemini retired). Same-vendor here, marked degraded — see the
+    # _cross_vendor flag wired into the recorded verdict's score_json.
     assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
-    assert ("pp_gemini", "critique") in {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_codex", "critique") in {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_gemini", "critique") not in {(s, t) for (s, t, _a) in disp.calls}
 
 
 def test_revise_triggers_one_reflexion_then_surfaces() -> None:
@@ -305,3 +308,59 @@ def test_pass_verdict_but_failing_smoke_surfaces(monkeypatch) -> None:
     fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
     assert fs["status"] == "surfaced"
     assert "winner_attempt_id" not in fs
+
+
+# --------------------------------------------------------------------------- #
+# Host-driven Claude generation seam (Phase 2 re-vendor)
+# --------------------------------------------------------------------------- #
+class _HostDispatcher(_ScriptedDispatcher):
+    """Scripted dispatcher that ALSO provides a host `engineer` executor."""
+
+    def __init__(self, responses, host_result, **kw):
+        super().__init__(responses, **kw)
+        self.host_result = host_result
+        self.host_calls: list[tuple[str, str | None]] = []
+
+    def run_host_agent(self, agent_type, prompt, *, cwd=None, timeout_s=None):
+        self.host_calls.append((agent_type, cwd))
+        return self.host_result
+
+
+def test_drive_generate_prefers_host_engineer_and_codex_is_cross_vendor(monkeypatch) -> None:
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    host = {"result": {
+        "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+        "model": "claude-x", "cost_usd": 0.05, "tokens_in": 3, "tokens_out": 4}}
+    disp = _HostDispatcher(_happy_responses("pass"), host)
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    # Host engineer produced the code → producer=claude, codex NOT used to generate.
+    assert out.get("producer") == "claude"
+    assert disp.host_calls and disp.host_calls[0][0] == "engineer"
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _a) in disp.calls}
+    # Codex judged → genuine cross-vendor (claude generated, codex judged).
+    assert ("pp_codex", "critique") in {(s, t) for (s, t, _a) in disp.calls}
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is True
+    # Host generate cost flows into the budget charge.
+    assert out["cost_usd"] >= 0.05
+
+
+def test_drive_generate_falls_back_to_codex_when_no_host(monkeypatch) -> None:
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))  # no run_host_agent
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    # No host → codex generated → same-vendor codex judge, marked degraded.
+    assert out.get("producer") == "codex"
+    assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["score_json"].get("_cross_vendor") is False
+    assert rv["score_json"].get("_judge_degraded") is True

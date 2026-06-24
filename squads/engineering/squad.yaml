@@ -154,7 +154,7 @@ gates:
     when: "phase == 'release'"
 
 invoke:
-  mode: pp_run                       # one of: pp_run | pp_team | pp_best_of | pp_review
+  mode: pp_best_of                   # one of: pp_run | pp_team | pp_best_of | pp_review  (set to pp_best_of: Claude producer writes files locally; codex is sandboxed off the local repo this env)
   default_team: feature-team
   forum_for_review: change-advisory-board
   project_path: "${project_root}"

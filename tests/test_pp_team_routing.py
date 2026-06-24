@@ -120,10 +120,14 @@ def test_via_mcp_rlm_gaming_autodefaults_game_team(monkeypatch) -> None:
 
 
 def test_via_mcp_plain_engineering_unchanged(monkeypatch) -> None:
-    # A normal hydra-origin packet with no game signal: single mode, no team key.
+    # A normal hydra-origin packet with no game signal: the engineering squad.yaml
+    # declares invoke.mode=pp_best_of (Claude producer writes files locally; codex
+    # is the sandboxed cross-vendor critic in this env), so the dispatched mode is
+    # best_of with n=3 and NO team key.
     env = CSuiteDecisionPacket(workflow_id=HydraState().workflow_id,
                                origin_squad="hydra", origin="BOARDROOM",
                                objective="add idempotency keys to the payments API")
     args = _run(monkeypatch, env)
-    assert args["mode"] == "single"
+    assert args["mode"] == "best_of"
+    assert args["n"] == 3
     assert "team" not in args

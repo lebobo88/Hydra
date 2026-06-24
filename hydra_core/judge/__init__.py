@@ -18,7 +18,12 @@ Real verdicts wired in Phase 2.
 from .schemas import JudgeVerdict, RubricRef
 from .registry import get_rubric, list_rubrics
 from .router import route_judge, JudgeRoute
-from .dispatcher import dispatch_judge, JudgeDispatchError
+from .dispatcher import (
+    dispatch_judge,
+    dispatch_judge_with_fallback,
+    JudgeDispatchError,
+    classify_judge_error,
+)
 from .borda import borda_winner
 from .reflexion import package_retry, ReflexionPacket
 from .mcp_client import MCPCritiqueClient
@@ -38,7 +43,9 @@ __all__ = [
     "route_judge",
     "JudgeRoute",
     "dispatch_judge",
+    "dispatch_judge_with_fallback",
     "JudgeDispatchError",
+    "classify_judge_error",
     "borda_winner",
     "package_retry",
     "ReflexionPacket",

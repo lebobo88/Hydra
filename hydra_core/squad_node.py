@@ -50,6 +50,16 @@ class Dispatcher(Protocol):
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]: ...
     def emit_claude_prompt(self, prompt: str, *, agent: str | None = None) -> dict[str, Any]: ...
     def invoke_claude_skill(self, skill: str, args: dict[str, Any]) -> dict[str, Any]: ...
+    # Shared host-executor seam (engineering Claude generation + headless skill
+    # executor). Run a host-driven Claude subagent SYNCHRONOUSLY and return its
+    # result envelope, or None when no Claude Code host is attached (pure
+    # headless) so callers fall back. Implementations are INJECTED at the host
+    # boundary; callers MUST treat it as optional via getattr so dispatchers /
+    # test doubles that don't provide it keep working.
+    def run_host_agent(
+        self, agent_type: str, prompt: str, *,
+        cwd: str | None = None, timeout_s: int | None = None,
+    ) -> dict[str, Any] | None: ...
 
 
 @dataclass
@@ -292,6 +302,17 @@ _SMOKE_PROMPT = (
 )
 
 
+# F10: markers that mean a smoke runner FAILED for infra reasons (not a real
+# test failure) — host EPERM/ENOENT, esbuild/bundler crash, native segfault, or
+# a child-process spawn failure. A non-zero exit carrying any of these is an
+# `infra_error`, not a `fail` (the artifact was not actually evaluated).
+_INFRA_SMOKE_RE = __import__("re").compile(
+    r"\bEPERM\b|\bENOENT\b|\besbuild\b|\bsegfault\b|\bspawn\b|"
+    r"command not found|is not recognized|ModuleNotFoundError|No module named",
+    __import__("re").IGNORECASE,
+)
+
+
 def _parse_smoke_verdict(text: str) -> tuple[str, str]:
     """Extract the last ``{"status": ...}`` JSON object from smoke output.
 
@@ -335,7 +356,12 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
     if (root / "pyproject.toml").is_file() or (root / "pytest.ini").is_file() \
             or (root / "tox.ini").is_file() or (root / "setup.cfg").is_file() \
             or (root / "tests").is_dir():
-        return ["pytest", "-q"]
+        # F3: resolve pytest via the running interpreter. A bare `pytest` is
+        # frequently NOT on PATH (esp. on Windows) → subprocess raises
+        # FileNotFoundError at LAUNCH (before pytest starts), which the old code
+        # laundered into "skipped". `sys.executable -m pytest` is always runnable.
+        import sys as _sys
+        return [_sys.executable, "-m", "pytest", "-q"]
     if (root / "go.mod").is_file():
         return ["go", "build", "./..."]
     if (root / "Cargo.toml").is_file():
@@ -362,6 +388,7 @@ def _run_smoke(
     """
     cmd = _detect_smoke_command(project_path)
     if not cmd:
+        # Genuinely no command — an honest non-pass that is NOT an infra failure.
         return "skipped", "no runnable build/test command detected"
     try:
         res = subprocess.run(
@@ -369,10 +396,20 @@ def _run_smoke(
             check=False, timeout=600,
         )
     except subprocess.TimeoutExpired:
-        return "skipped", f"smoke timed out after 600s: {' '.join(cmd)}"
-    except Exception as e:  # noqa: BLE001 -- a smoke that cannot run is 'skipped'
-        return "skipped", f"smoke run errored ({' '.join(cmd)}): {e!r}"[:300]
+        # F10: a timeout is an INFRA failure, NOT "skipped" (which reads as
+        # "nothing to run") and NOT "pass". Distinct class so PP-VG-5 never
+        # finalizes complete on it, and triage can tell it apart from no-command.
+        return "infra_error", f"smoke timed out after 600s: {' '.join(cmd)}"
+    except Exception as e:  # noqa: BLE001 — launch failure (ENOENT/EPERM) is infra
+        return "infra_error", f"smoke could not launch ({' '.join(cmd)}): {e!r}"[:300]
     label = " ".join(cmd)
+    combined = f"{res.stderr or ''}\n{res.stdout or ''}"
+    # F10: a runner that STARTED then exited non-zero for an INFRA reason
+    # (host EPERM/ENOENT, esbuild crash, segfault, spawn failure, missing
+    # toolchain) is mislabeled `fail` — pattern-match those markers → infra_error.
+    if res.returncode != 0 and _INFRA_SMOKE_RE.search(combined):
+        tail = combined.strip().splitlines()[-1:] or [""]
+        return "infra_error", f"`{label}` exit={res.returncode} (infra) :: {tail[0]}"[:300]
     status = "pass" if res.returncode == 0 else "fail"
     tail = (res.stderr or res.stdout or "").strip().splitlines()[-1:] or [""]
     return status, f"`{label}` exit={res.returncode} :: {tail[0]}"[:300]
@@ -404,6 +441,46 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
         "specifically, then re-summarize your changes:\n"
         f"<critique>\n{critique_md[:3000]}\n</critique>"
     )
+
+
+def _drive_generate(
+    dispatcher: "Dispatcher", *, prompt: str, project_path: str,
+    model_tier: str | None, sq: str,
+) -> tuple[dict[str, Any], str]:
+    """Produce one code attempt for the engineering drive loop.
+
+    Producer precedence honours the engineering ``squad.yaml`` intent ("Claude
+    producer writes files locally; codex is sandboxed off the local repo this
+    env"):
+      1. A host-driven Claude ``engineer`` subagent via
+         ``dispatcher.run_host_agent`` — the INTENDED producer; it edits the
+         worktree in-place. ``producer="claude"`` so the downstream codex critique
+         is genuinely CROSS-vendor.
+      2. Fallback: ``pp_codex.generate`` under ``--sandbox workspace-write`` when
+         no Claude Code host is attached (pure headless). ``producer="codex"`` —
+         the codex critique is then SAME-vendor (marked degraded).
+
+    Returns ``(gen_envelope, producer)`` where ``gen_envelope`` matches the
+    ``pp_codex.generate`` MCP shape (``{"status","result":{text,cost_usd,...}}``)
+    the loop already consumes via ``_pp_inner``.
+    """
+    run_host = getattr(dispatcher, "run_host_agent", None)
+    if callable(run_host):
+        try:
+            hosted = run_host("engineer", prompt, cwd=project_path)
+        except Exception:  # noqa: BLE001 — never crash the loop on a host hiccup
+            hosted = None
+        if isinstance(hosted, dict):
+            inner = hosted.get("result", hosted)
+            if not isinstance(inner, dict):
+                inner = {"text": str(inner)}
+            return {"status": hosted.get("status", "done"), "result": inner}, "claude"
+    gen = dispatcher.call_mcp(
+        "pp_codex", "generate",
+        {"prompt": prompt, "cwd": project_path, "sandbox": "workspace-write"},
+        squad_id=sq,
+    )
+    return gen, "codex"
 
 
 def _rubric_md(rubric_id: str) -> str:
@@ -453,9 +530,11 @@ def _drive_pp_stage_loop(
     fleet path THIS function is that driver. It calls only tools the engineering
     squad declares (RBAC-safe):
 
-        start_stage → pp_codex.generate (codex edits the worktree directly)
+        start_stage → _drive_generate (host Claude `engineer` writes locally,
+                       else pp_codex.generate fallback)
                     → archive_artifact + record_attempt
-                    → pp_gemini.critique (cross-vendor) + record_verdict
+                    → pp_codex.critique (cross-vendor when producer=claude;
+                       same-vendor+degraded when producer=codex) + record_verdict
                     → [Reflexion ×1 on revise]
                     → finalize_stage(winner_attempt_id) → finalize_run
 
@@ -470,6 +549,11 @@ def _drive_pp_stage_loop(
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
+        # F6: real codegen cost is captured here per-attempt and surfaced on the
+        # SquadResult artifact so _extract_squad_cost can charge the budget ledger
+        # (start_run only SCAFFOLDS at cost 0 — reading cost from it left the 80%
+        # downgrade + 100% HITL tripwires dead for all engineering work).
+        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
     }
     # Snapshot the working tree BEFORE any generation so we can attribute (and
     # later commit) ONLY the files this run touches — never pre-existing dirt.
@@ -493,14 +577,14 @@ def _drive_pp_stage_loop(
         for retry_index in range(2):
             prompt = (base_prompt if retry_index == 0
                       else _augment_with_critique(base_prompt, critique_md))
-            # sandbox=workspace-write so codex can actually edit the worktree.
-            # Without it the generate call defaults to read-only (codex-server
-            # GenerateSchema), apply_patch is rejected, and the engineering
-            # drive loop produces a patch *plan* but never writes code — the
-            # stage then fails with nothing committed.
-            gen = cm("pp_codex", "generate",
-                     {"prompt": prompt, "cwd": project_path,
-                      "sandbox": "workspace-write"}, squad_id=sq)
+            # Producer precedence: a host-driven Claude `engineer` subagent (writes
+            # files locally — the intended producer) else pp_codex.generate under
+            # --sandbox workspace-write (codex CAN edit the worktree; without it the
+            # call defaults to read-only and never writes code). See _drive_generate.
+            gen, producer = _drive_generate(
+                dispatcher, prompt=prompt, project_path=project_path,
+                model_tier=model_tier, sq=sq)
+            out["producer"] = producer
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
 
@@ -531,7 +615,7 @@ def _drive_pp_stage_loop(
                 try:
                     cm("pp_harness", "archive_artifact", {
                         "run_id": run_id,
-                        "relative_path": f"code/codex-attempt-{retry_index}.failed.md",
+                        "relative_path": f"code/{producer}-attempt-{retry_index}.failed.md",
                         "bytes": f"GENERATE FAILED: {gen_fail}\n\n{gen_text or '(no output)'}",
                         "stage_id": stage_id, "kind": "code", "encoding": "utf8",
                     }, squad_id=sq)
@@ -539,8 +623,8 @@ def _drive_pp_stage_loop(
                     pass
                 try:
                     att = cm("pp_harness", "record_attempt", {
-                        "stage_id": stage_id, "producer": "codex",
-                        "model_id": str(gi.get("model") or model_tier or "codex-default"),
+                        "stage_id": stage_id, "producer": producer,
+                        "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
                         "status": fail_status, "retry_index": retry_index,
                         "notes": {"candidate_index": 1},
                         **({"parent_attempt_id": attempt_id} if attempt_id else {}),
@@ -555,7 +639,7 @@ def _drive_pp_stage_loop(
             try:
                 cm("pp_harness", "archive_artifact", {
                     "run_id": run_id,
-                    "relative_path": f"code/codex-attempt-{retry_index}.md",
+                    "relative_path": f"code/{producer}-attempt-{retry_index}.md",
                     "bytes": gen_text or "(no summary returned)",
                     "stage_id": stage_id, "kind": "code", "encoding": "utf8",
                 }, squad_id=sq)
@@ -564,8 +648,8 @@ def _drive_pp_stage_loop(
 
             att = cm("pp_harness", "record_attempt", {
                 "stage_id": stage_id,
-                "producer": "codex",
-                "model_id": str(gi.get("model") or model_tier or "codex-default"),
+                "producer": producer,
+                "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
                 "tokens_in": int(gi.get("tokens_in") or 0),
                 "tokens_out": int(gi.get("tokens_out") or 0),
                 "cost_usd": float(gi.get("cost_usd") or 0.0),
@@ -576,27 +660,43 @@ def _drive_pp_stage_loop(
                 **({"parent_attempt_id": attempt_id} if attempt_id else {}),
             }, squad_id=sq)
             attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
+            # F6: accumulate real generate cost so the budget ledger is charged.
+            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
+            out["tokens_in"] += int(gi.get("tokens_in") or 0)
+            out["tokens_out"] += int(gi.get("tokens_out") or 0)
 
-            # Cross-vendor critique: gemini judges codex's output.
-            crit = cm("pp_gemini", "critique", {
+            # Judge with codex (Gemini retired — free tier dropped, 2026-06).
+            # When the producer is Claude (host engineer) codex is a genuine
+            # CROSS-vendor judge; when generation fell back to codex the critique
+            # is SAME-vendor (different model id where available) at same-or-higher
+            # tier — marked degraded so the weaker guarantee is visible downstream.
+            cross_vendor = producer != "codex"
+            crit = cm("pp_codex", "critique", {
                 "artifact_text": gen_text or "(no diff summary returned)",
                 "rubric_md": rubric_body,
                 "cwd": project_path,
             }, squad_id=sq)
             ci = _pp_inner(crit)
+            # F6: critique cost counts toward the run's budget charge too.
+            out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
+            out["tokens_in"] += int(ci.get("tokens_in") or 0)
+            out["tokens_out"] += int(ci.get("tokens_out") or 0)
             parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
             if not isinstance(parsed, dict):
                 parsed = {}
             outcome = parsed.get("outcome") or parsed.get("verdict") or "revise"
             critique_md = parsed.get("critique_md") or parsed.get("critique") or ""
-            score_json = parsed.get("score") or parsed.get("score_json") or {}
+            score_json = dict(parsed.get("score") or parsed.get("score_json") or {})
+            score_json["_cross_vendor"] = cross_vendor
+            if not cross_vendor:
+                score_json["_judge_degraded"] = True
 
             if attempt_id:
                 try:
                     cm("pp_harness", "record_verdict", {
                         "attempt_id": attempt_id,
-                        "judge_producer": "gemini",
-                        "judge_model_id": str(ci.get("model") or "gemini-default"),
+                        "judge_producer": "codex",
+                        "judge_model_id": str(ci.get("model") or "codex-default"),
                         "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
                         "critique_md": str(critique_md)[:4000],
                         "score_json": score_json,
@@ -665,7 +765,14 @@ def _drive_pp_stage_loop(
         }, squad_id=sq)
         out["finalized"] = True
         fin_status = _pp_inner(fin).get("status")
-        if passed and (fin_status in {"complete", "done", "ok"} or _pp_ok(fin)) \
+        # PP-VG-5 honesty: finalize "complete" ONLY when the finalize envelope is
+        # unambiguously successful. The old `fin_status in {complete,done,ok} or
+        # _pp_ok(fin)` short-circuited `_pp_ok` on the inner status alone, so an
+        # inner error ({"status":"done","result":{"status":"complete","error":..}})
+        # or a failed OUTER envelope ({"status":"failed","result":{"status":
+        # "complete"}}) was laundered into "complete". `_pp_ok` already checks the
+        # OUTER status in {done,ok,complete} AND inner has no error — gate on it.
+        if passed and _pp_ok(fin) \
                 and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
             out["final_status"] = "complete"
         else:
@@ -674,14 +781,17 @@ def _drive_pp_stage_loop(
     except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
         out["error"] = repr(e)
         try:
-            cm("pp_harness", "finalize_run", {
+            abort_fin = cm("pp_harness", "finalize_run", {
                 "run_id": run_id, "status": "aborted",
                 "reason": f"drive_loop_error: {e!r}",
                 "project_path": project_path,
             }, squad_id=sq)
-            out["finalized"] = True
+            # Don't claim the run was finalized unless the abort envelope itself
+            # succeeded — a failed finalize_run leaves the project lock held, and
+            # a false `finalized=True` hides that from postcheck's lock cleanup.
+            out["finalized"] = isinstance(abort_fin, dict) and abort_fin.get("status") != "failed"
         except Exception:  # noqa: BLE001
-            pass
+            out["finalized"] = False
         out["final_status"] = "aborted"
         return out
 
@@ -1199,8 +1309,9 @@ def _via_impersonation(
 # Per-squad shim registry for claude-skill packs. Each entry names the MCP
 # shim server, its tool prefix (`<prefix>.command.list`, `<prefix>.output.write`),
 # how the output-write path is keyed ("phase" → _phase_for, "domain" →
-# _domain_for), and the user-facing labels. Unknown claude-skill squads fall
-# back to the RLM entry (the original behavior) so legacy packs keep working.
+# _domain_for), and the user-facing labels. An UNKNOWN claude-skill squad is a
+# routing bug (it would write to the wrong server/path); _resolve_skill_shim
+# logs loudly and falls back to garland only so legacy packs don't hard-crash.
 _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
     "garland": {
         "server": "rlm_creative", "prefix": "rlm", "default_cmd": "/rlm-team",
@@ -1214,7 +1325,51 @@ _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
         "server": "rlm_gaming", "prefix": "rlmgaming", "default_cmd": "/game-studio",
         "path_key": "phase", "label": "Game studio", "artifact_kind": "game_design_output",
     },
+    # customer-support → Xenia. xenia/server.py output_write honors ONLY `phase`
+    # (it ignores `domain`); output lands in hearth/output/{phase}/.
+    "customer-support": {
+        "server": "xenia", "prefix": "xenia", "default_cmd": "/support-ticket",
+        "path_key": "phase", "label": "Customer Support", "artifact_kind": "support_output",
+    },
+    # marketing-* → MarketBliss. The shim prefix is `mb` (mb.command.list /
+    # mb.output.write read `domain`); each squad.yaml supplies its own
+    # invoke.command_hint, so default_cmd is only a fallback.
+    "marketing-creative": {
+        "server": "marketbliss", "prefix": "mb", "default_cmd": "/campaign-brief",
+        "path_key": "domain", "label": "Marketing creative", "artifact_kind": "marketing_output",
+    },
+    "marketing-ops": {
+        "server": "marketbliss", "prefix": "mb", "default_cmd": "/marketing-board",
+        "path_key": "domain", "label": "Marketing ops", "artifact_kind": "marketing_output",
+    },
+    "marketing-production": {
+        "server": "marketbliss", "prefix": "mb", "default_cmd": "/production-brief",
+        "path_key": "domain", "label": "Marketing production", "artifact_kind": "marketing_output",
+    },
+    "marketing-research": {
+        "server": "marketbliss", "prefix": "mb", "default_cmd": "/market-research",
+        "path_key": "domain", "label": "Marketing research", "artifact_kind": "marketing_output",
+    },
+    "marketing-strategy": {
+        "server": "marketbliss", "prefix": "mb", "default_cmd": "/marketing-board",
+        "path_key": "domain", "label": "Marketing strategy", "artifact_kind": "marketing_output",
+    },
 }
+
+
+def _resolve_skill_shim(slug: str) -> dict[str, str]:
+    """Resolve the MCP shim for a claude-skill squad. An unknown slug is a
+    routing bug — log loudly (it would otherwise silently write to garland's
+    rlm_creative server + wrong path) and fall back to garland so we don't crash."""
+    shim = _SKILL_PACK_SHIMS.get(slug)
+    if shim is None:
+        _log.warning(
+            "claude-skill squad %r has no _SKILL_PACK_SHIMS entry — falling back to "
+            "garland (rlm_creative). Output will land in the WRONG pack; add a shim.",
+            slug,
+        )
+        return _SKILL_PACK_SHIMS["garland"]
+    return shim
 
 
 # Envelope types a claude-skill orchestrator (e.g. rlm-gaming) may emit for
@@ -1228,6 +1383,7 @@ _DELEGATION_EMIT_TYPES: frozenset[str] = frozenset({
 
 def _extract_emitted_envelopes(
     result: Any, inbound: HydraEnvelope, producer_slug: str,
+    state: "HydraState | None" = None,
 ) -> list[HydraEnvelope]:
     """Pull typed delegation envelopes out of a claude-skill result.
 
@@ -1240,8 +1396,35 @@ def _extract_emitted_envelopes(
     parent/workflow ids, and surface them so the supervisor can route them.
 
     Defensive: a malformed entry is skipped, never crashes dispatch. Non-dict
-    results (e.g. a bare host-pickup stub) yield ``[]``.
+    results (e.g. a bare host-pickup stub) yield ``[]``. F8: drops are no longer
+    SILENT — a VALIDATION drop (a delegation-typed envelope that failed schema)
+    is a real loss of work and is logged + counted into
+    ``state.error_counters['emitted_envelope_drop']`` so postcheck/synthesis can
+    surface stranded delegation. Benign type-filtering (a DECISION_RECORD that is
+    not a delegation type) is only DEBUG-logged.
     """
+    dropped_validation = 0
+    skipped_type = 0
+    skipped_shape = 0
+
+    def _finish(out_list: list[HydraEnvelope]) -> list[HydraEnvelope]:
+        if state is not None and dropped_validation:
+            try:
+                state.error_counters["emitted_envelope_drop"] = (
+                    state.error_counters.get("emitted_envelope_drop", 0)
+                    + dropped_validation
+                )
+            except Exception:  # noqa: BLE001 — never crash dispatch on a counter
+                pass
+        if dropped_validation:
+            _log.warning(
+                "emitted-envelope drop (producer=%s workflow=%s): %d validation, "
+                "%d wrong-shape, %d non-delegation-type — stranded delegation.",
+                producer_slug, getattr(inbound, "workflow_id", "?"),
+                dropped_validation, skipped_shape, skipped_type,
+            )
+        return out_list
+
     if not isinstance(result, dict):
         return []
     raw = result.get("emitted_envelopes")
@@ -1251,10 +1434,12 @@ def _extract_emitted_envelopes(
         return []
     from .repo_registry import is_known_repo, normalize_repo_subpath
     out: list[HydraEnvelope] = []
-    for item in raw:
+    for idx, item in enumerate(raw):
         if not isinstance(item, dict):
+            skipped_shape += 1
             continue
         if item.get("type") not in _DELEGATION_EMIT_TYPES:
+            skipped_type += 1
             continue
         env = dict(item)
         # FORCE origin_squad to the producing squad — never trust a skill-set
@@ -1289,9 +1474,17 @@ def _extract_emitted_envelopes(
                         env["target_repo_subpath"] = str(raw_subpath)
         try:
             out.append(validate_envelope(env))
-        except Exception:  # noqa: BLE001 — skip malformed; never crash dispatch
+        except Exception as exc:  # noqa: BLE001 — skip malformed; never crash dispatch
+            dropped_validation += 1
+            # Sanitized metadata only — NEVER the raw envelope content (PII /
+            # redaction hazard at the squad boundary).
+            _log.warning(
+                "emitted-envelope[%d] from %s FAILED validation (type=%s): %s: %s",
+                idx, producer_slug, str(item.get("type")),
+                type(exc).__name__, str(exc)[:200],
+            )
             continue
-    return out
+    return _finish(out)
 
 
 def _via_claude_skill(
@@ -1307,7 +1500,7 @@ def _via_claude_skill(
     `<prefix>.output.write`. The returned `MemoryRef.key` points at the real
     on-disk path. Squads without a shim entry use the RLM shim (legacy default).
     """
-    shim = _SKILL_PACK_SHIMS.get(pack.slug, _SKILL_PACK_SHIMS["garland"])
+    shim = _resolve_skill_shim(pack.slug)
     server, prefix = shim["server"], shim["prefix"]
     invoke = pack.invoke or {}
     cmd = invoke.get("command_hint", shim["default_cmd"])
@@ -1331,13 +1524,32 @@ def _via_claude_skill(
     }
     if priming:
         skill_args["priming"] = priming
-    try:
-        result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), skill_args)
-    except Exception as e:
-        return SquadResult(
-            envelopes=[], artifacts=[], status="failed",
-            rationale=f"claude-skill {cmd} failed: {e!r}",
-        )
+    # LOCKED decision 1 — a host-driven executor runs the skill SYNCHRONOUSLY when
+    # a Claude Code host is attached (real DECISION_RECORD + delegation envelopes),
+    # else we fall back to the host_pickup continuation (the documented async path
+    # that ingest.py re-injects when the host fulfils the skill out-of-band).
+    result: dict[str, Any] | None = None
+    run_host = getattr(dispatcher, "run_host_agent", None)
+    if callable(run_host):
+        import json as _json
+        try:
+            hosted = run_host(
+                f"skill:{cmd.lstrip('/')}",
+                _json.dumps({"command": cmd, "squad": pack.slug, **skill_args}, default=str),
+                cwd=getattr(state, "project_root", None),
+            )
+        except Exception:  # noqa: BLE001 — never crash dispatch on a host hiccup
+            hosted = None
+        if isinstance(hosted, dict):
+            result = hosted
+    if result is None:
+        try:
+            result = dispatcher.invoke_claude_skill(cmd.lstrip("/"), skill_args)
+        except Exception as e:
+            return SquadResult(
+                envelopes=[], artifacts=[], status="failed",
+                rationale=f"claude-skill {cmd} failed: {e!r}",
+            )
 
     path_val = (_domain_for(pack, inbound) if shim["path_key"] == "domain"
                 else _phase_for(inbound))
@@ -1379,7 +1591,7 @@ def _via_claude_skill(
     # RC1: surface any delegation envelopes the skill emitted (DEV_TASK/PRD ->
     # engineering, CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland) so the
     # supervisor can route them onward. The DecisionRecord stays first.
-    emitted = _extract_emitted_envelopes(result, inbound, pack.slug)
+    emitted = _extract_emitted_envelopes(result, inbound, pack.slug, state)
     return SquadResult(
         envelopes=[decision, *emitted],
         artifacts=[{"kind": shim["artifact_kind"], "raw": result, "persisted": write_result}],

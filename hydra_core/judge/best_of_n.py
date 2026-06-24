@@ -16,7 +16,7 @@ from typing import Any, Callable, Sequence
 from uuid import UUID
 
 from .borda import borda_winner
-from .dispatcher import CritiqueClient, dispatch_judge
+from .dispatcher import CritiqueClient, dispatch_judge_with_fallback
 from .schemas import JudgeVendor, JudgeVerdict
 
 
@@ -34,36 +34,42 @@ def judge_and_rank(
     *,
     rubric_ids: Sequence[str],
     workflow_id: UUID,
-    judge_vendor: JudgeVendor = "gemini",
+    judge_vendor: JudgeVendor = "codex",
+    judge_vendors: Sequence[JudgeVendor] | None = None,
     client: CritiqueClient | None = None,
     generator_vendor: str = "unknown",
 ) -> BestOfNOutcome:
     """Judge N candidate envelopes against the rubrics and return the winner.
 
     Each rubric is applied to each candidate (so total judge calls = N × R).
-    Borda count aggregates across rubrics.
+    Borda count aggregates across rubrics. Each judge call iterates the preferred
+    vendors (``judge_vendors``, default ``[judge_vendor]``) and degrades to an
+    honest ``skip`` if every vendor is unavailable; ``skip`` verdicts are recorded
+    but EXCLUDED from Borda ranking (an infra outage is not a quality signal).
 
     Raises ValueError if `candidates` is empty.
     """
     if not candidates:
         raise ValueError("judge_and_rank requires at least one candidate")
 
+    vendors = list(judge_vendors) if judge_vendors else [judge_vendor]
     verdicts: list[JudgeVerdict] = []
     cand_ids: list[str] = []
     for env in candidates:
         cand_ids.append(str(env.get("id")))
         for rubric_id in rubric_ids:
-            v = dispatch_judge(
+            v, _attempts = dispatch_judge_with_fallback(
                 envelope=env,
                 rubric_id=rubric_id,
-                judge_vendor=judge_vendor,
+                judge_vendors=vendors,
                 workflow_id=workflow_id,
                 generator_vendor=generator_vendor,
                 client=client,
             )
             verdicts.append(v)
 
-    winner_id, leaderboard = borda_winner(cand_ids, verdicts)
+    rankable = [v for v in verdicts if v.outcome != "skip"]
+    winner_id, leaderboard = borda_winner(cand_ids, rankable)
     by_id = {str(env.get("id")): env for env in candidates}
     winner = by_id[winner_id]
     losers = [env for cid, env in by_id.items() if cid != winner_id]
@@ -83,7 +89,8 @@ def best_of_n_run(
     produce: Callable[[int], dict[str, Any]],
     rubric_ids: Sequence[str],
     workflow_id: UUID,
-    judge_vendor: JudgeVendor = "gemini",
+    judge_vendor: JudgeVendor = "codex",
+    judge_vendors: Sequence[JudgeVendor] | None = None,
     client: CritiqueClient | None = None,
     generator_vendor: str = "unknown",
 ) -> BestOfNOutcome:
@@ -101,6 +108,7 @@ def best_of_n_run(
         rubric_ids=rubric_ids,
         workflow_id=workflow_id,
         judge_vendor=judge_vendor,
+        judge_vendors=judge_vendors,
         client=client,
         generator_vendor=generator_vendor,
     )

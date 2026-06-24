@@ -46,7 +46,7 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
             "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02, "wall_ms": 100}},
         ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
         ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},
-        ("pp_gemini", "critique"): {"status": "done", "result": {"parsed": {
+        ("pp_codex", "critique"): {"status": "done", "result": {"parsed": {
             "outcome": outcome, "critique_md": "c" * 90, "score": {"correctness": 9}}}},
         ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
         ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},

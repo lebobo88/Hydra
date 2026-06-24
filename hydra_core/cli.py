@@ -58,6 +58,8 @@ class _NullDispatcher:
         return {"status": "stub", "summary": prompt[:200], "agent": agent}
     def invoke_claude_skill(self, skill, args):
         return {"status": "stub", "summary": f"would invoke /{skill}", "args": args}
+    def run_host_agent(self, agent_type, prompt, *, cwd=None, timeout_s=None):
+        return None
 
 
 def _cmd_doctor(args) -> int:
@@ -1434,6 +1436,9 @@ def _cmd_gateway_setup(args) -> int:
         "ES_ROOT": str(hydra_root.parent / "ExecutiveSuite"),
         "RLM_ROOT": str(hydra_root.parent / "RLM-Creative"),
         "SENATE_ROOT": str(hydra_root.parent / "Senate"),
+        "RLM_GAMING_ROOT": str(hydra_root.parent / "RLM-Gaming"),
+        "MB_ROOT": str(hydra_root.parent / "MarketBliss"),
+        "XENIA_ROOT": str(hydra_root.parent / "Xenia"),
         "USERPROFILE": os.environ.get("USERPROFILE", str(Path.home())),
     }
 
@@ -1460,7 +1465,13 @@ def _cmd_gateway_setup(args) -> int:
         elif "env" in template:
             spec["env"] = template["env"]
 
-        check_path = spec["args"][0] if spec["args"] else spec.get("cwd", "")
+        # Existence check: prefer an explicit check_path_template (the pack ROOT),
+        # since python pack-shims have args[0]=="-m" which is never a real path and
+        # would otherwise always SKIP. Fall back to args[0]/cwd for legacy entries.
+        if "check_path_template" in template:
+            check_path = _interpolate(template["check_path_template"], default_paths)
+        else:
+            check_path = spec["args"][0] if spec["args"] else spec.get("cwd", "")
         exists = Path(check_path).exists() if check_path else False
 
         if exists or required:

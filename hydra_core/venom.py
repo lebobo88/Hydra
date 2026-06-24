@@ -254,6 +254,81 @@ def scan_mcp_attacks(text: str) -> list[tuple[str, str]]:
     return hits
 
 
+# --- runtime classifier + gate (the missing execution-time enforcement) ------
+# F11: the gate above was loaded at boot but NEVER invoked at execution — RBAC
+# was the only check on call_mcp, and spawn_subprocess ran argv unchecked. These
+# classifiers map an action's stringified (server tool args) / argv to an
+# abstract venom capability by SIGNATURE (per the manifesto: the dangerous signal
+# is in the ARGS, not the tool name). Deliberately CONSERVATIVE — only genuinely
+# venom-class shapes match; require_cerberus_pass then applies the capability's
+# own (narrower) refusal_patterns + requires_human gate. Names MUST match the
+# capabilities declared in squads/*/cerberus.yaml.
+_RUNTIME_VENOM_SIGNATURES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("shell.destructive",
+     re.compile(r"\brm\s+-rf\b|\bdd\s+if=|\bmkfs\b|\bformat\s+[a-z]:|rmdir\s+/s|>\s*/dev/(sd|nvme|hd)", re.I)),
+    ("git.force_push",
+     re.compile(r"\bgit\s+push\b[^\n]*(--force\b|-f\b|--force-with-lease)|\bforce[- ]push\b", re.I)),
+    ("deploy.production",
+     re.compile(r"\bdeploy\b[^\n]*\bprod(uction)?\b|kubectl\s+apply\b[^\n]*\bprod\b|\bterraform\s+apply\b|\bhelm\s+upgrade\b[^\n]*prod", re.I)),
+    ("payment.charge",
+     re.compile(r"charge[ _-]?card|wire[ _-]?transfer|stripe[^\n]*charges?\.create|\bpayment\b[^\n]*\bcharge\b|\bcharge\b[^\n]*\bcard\b", re.I)),
+    ("email.autonomous",
+     re.compile(r"\bsendmail\b|smtp[^\n]*send|sendgrid[^\n]*send|ses[^\n]*send_email", re.I)),
+    ("browser.third_party_auth",
+     re.compile(r"(login|auth)[^\n]*\b(bank|broker|brokerage|investment)\b", re.I)),
+)
+
+
+def classify_runtime_venoms(text: str) -> list[str]:
+    """Return REGISTERED venom capability names whose runtime signature matches
+    ``text``. Unregistered matches are skipped (the registry is the opt-in)."""
+    out: list[str] = []
+    for name, pat in _RUNTIME_VENOM_SIGNATURES:
+        if name not in out and pat.search(text) and get_venom(name) is not None:
+            out.append(name)
+    return out
+
+
+def gate_runtime_action(
+    *,
+    server: str | None = None,
+    tool: str | None = None,
+    args: Any = None,
+    cmd: Any = None,
+    workflow_id: Optional[str | UUID] = None,
+    raise_on_refuse: bool = True,
+) -> list[VenomVerdict]:
+    """Cerberus gate for a runtime MCP call or subprocess. Classifies the action
+    by ARGS signature, then runs ``require_cerberus_pass`` for each matched +
+    registered venom capability (whose own refusal_patterns + constitution +
+    mcp-attack scan decide pass/refuse, and whose ``requires_human`` forces HITL).
+
+    Returns the verdicts (empty when nothing classified — the common, fast path).
+    Raises ``VenomRefused`` on a hard refusal when ``raise_on_refuse`` is True.
+    """
+    parts: list[str] = []
+    if server:
+        parts.append(str(server))
+    if tool:
+        parts.append(str(tool))
+    if cmd is not None:
+        parts.append(_stringify(cmd))
+    if args is not None:
+        parts.append(_stringify(args))
+    text = " ".join(parts)
+    if not text.strip():
+        return []
+    verdicts: list[VenomVerdict] = []
+    for cap_name in classify_runtime_venoms(text):
+        verdicts.append(require_cerberus_pass(
+            cap_name,
+            {"server": server, "tool": tool, "args": args, "cmd": cmd},
+            workflow_id=workflow_id,
+            raise_on_refuse=raise_on_refuse,
+        ))
+    return verdicts
+
+
 # --- audit sink (Kan-cell by default) ----------------------------------------
 
 def _default_kan_audit(record: dict[str, Any]) -> str:

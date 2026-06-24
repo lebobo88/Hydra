@@ -105,8 +105,11 @@ def test_detect_npm_build_when_no_test(tmp_path):
 
 
 def test_detect_pytest(tmp_path):
+    import sys
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
-    assert _detect_smoke_command(str(tmp_path)) == ["pytest", "-q"]
+    # F3: pytest is resolved via the running interpreter (bare `pytest` is often
+    # not on PATH → FileNotFoundError at launch).
+    assert _detect_smoke_command(str(tmp_path)) == [sys.executable, "-m", "pytest", "-q"]
 
 
 def test_detect_none_for_empty_project(tmp_path):
@@ -186,3 +189,48 @@ def test_worktree_dirty_set_reports_modified_paths(tmp_path):
 
 def test_worktree_dirty_set_empty_on_non_git(tmp_path):
     assert _worktree_dirty_set(str(tmp_path)) == set()
+
+
+# ─── F10: smoke infra_error classification ─────────────────────────────────
+def test_run_smoke_launch_failure_is_infra_error(tmp_path, monkeypatch):
+    import subprocess as _sp
+    from hydra_core import squad_node
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+
+    def _boom(*_a, **_k):
+        raise FileNotFoundError(2, "The system cannot find the file specified")
+    monkeypatch.setattr(squad_node.subprocess, "run", _boom)
+    status, reason = squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="s")
+    assert status == "infra_error"  # NOT "skipped"
+
+
+def test_run_smoke_eperm_exit_is_infra_error(tmp_path, monkeypatch):
+    from hydra_core import squad_node
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+
+    class _Res:
+        returncode = 1
+        stderr = "Error: spawn EPERM\n"
+        stdout = ""
+    monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
+    status, _ = squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="s")
+    assert status == "infra_error"  # started then crashed for infra reason, not a real fail
+
+
+def test_run_smoke_genuine_test_failure_is_fail(tmp_path, monkeypatch):
+    from hydra_core import squad_node
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+
+    class _Res:
+        returncode = 1
+        stderr = "1 failed, 3 passed\n"
+        stdout = ""
+    monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
+    status, _ = squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="s")
+    assert status == "fail"  # real assertion failure stays a fail
+
+
+def test_run_smoke_no_command_is_skipped(tmp_path):
+    from hydra_core import squad_node
+    status, _ = squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="s")
+    assert status == "skipped"  # genuinely nothing to run

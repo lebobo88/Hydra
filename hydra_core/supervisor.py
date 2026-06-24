@@ -29,7 +29,7 @@ from .governance import (
 )
 from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
-from .judge import dispatch_judge, route_judge, load_policy
+from .judge import dispatch_judge, dispatch_judge_with_fallback, route_judge, load_policy
 from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
@@ -160,6 +160,25 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
             except (TypeError, ValueError):
                 tok_raw = 0
         tokens = max(tokens, tok_raw)
+
+        # F6: a DRIVEN engineering run captures the real codegen + critique cost
+        # inside the headless drive loop (start_run, read above, only SCAFFOLDS at
+        # cost 0). That total is surfaced on the artifact as `drive_loop`. Without
+        # this, charge_and_gate received 0.0 for every engineering dispatch and
+        # the 80% tier-downgrade / 100% HITL-block tripwires never armed.
+        dl = artifact.get("drive_loop")
+        if isinstance(dl, dict) and (
+            "cost_usd" in dl or "tokens_in" in dl or "tokens_out" in dl
+        ):
+            try:
+                usd = max(usd, float(dl.get("cost_usd") or 0.0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                dl_tok = int(dl.get("tokens_in") or 0) + int(dl.get("tokens_out") or 0)
+                tokens = max(tokens, dl_tok)
+            except (TypeError, ValueError):
+                pass
     return usd, tokens
 
 
@@ -886,58 +905,77 @@ def build_supervisor(
                 })
 
         out: list[dict] = []
-        judge_vendor = (route.preferred_judge_vendors or ["gemini"])[0]
+        judge_vendors = list(route.preferred_judge_vendors or ["codex"])
         for rubric_id in route.rubric_ids:
             emit_trace(judge_trace_root, state.workflow_id, "judge.invoked", {
                 "envelope_id": env.get("id"),
                 "envelope_type": env.get("type"),
                 "rubric_id": rubric_id,
-                "judge_vendor": judge_vendor,
+                "judge_vendor": judge_vendors[0],
+                "judge_vendors": judge_vendors,
                 "tier": route.tier,
                 "squad_enabled": squad_enabled,
                 "is_post_synthesis": is_post_synthesis,
             })
             try:
-                verdict = dispatch_judge(
+                verdict, attempts = dispatch_judge_with_fallback(
                     envelope=env,
                     rubric_id=rubric_id,
-                    judge_vendor=judge_vendor,
+                    judge_vendors=judge_vendors,
                     workflow_id=state.workflow_id,
                     generator_vendor=origin or "unknown",
                     client=use_client,
                 )
-                out.append(verdict.model_dump(mode="json"))
-                emit_trace(judge_trace_root, state.workflow_id, "judge.verdict", {
-                    "envelope_id": env.get("id"),
-                    "rubric_id": rubric_id,
-                    "outcome": verdict.outcome,
-                    "judge_vendor": verdict.judge_vendor,
-                    "score_json": verdict.score_json,
-                })
             except Exception as e:
+                # Defensive: the fallback helper converts every vendor/infra
+                # failure to an honest `skip` and only propagates a TRUE bug.
+                # Keep the run alive and honest — record a `skip` (NOT a
+                # fabricated `fail`, which would spuriously trip HITL / Borda)
+                # and trace the error for triage.
                 from .judge.schemas import JudgeVerdict
                 from uuid import UUID, uuid4
                 target_id = env.get("id")
                 target_id = UUID(target_id) if isinstance(target_id, str) else (target_id or uuid4())
-                synth = JudgeVerdict(
+                verdict = JudgeVerdict(
                     workflow_id=state.workflow_id,
                     origin_squad="hydra-judge",
                     target_squad=origin,
                     target_envelope_id=target_id,
-                    outcome="fail",
+                    outcome="skip",
                     rubric_id=rubric_id,
-                    judge_vendor=judge_vendor,
+                    judge_vendor=judge_vendors[0],
                     generator_vendor=origin or "unknown",
-                    critique_md=f"judge dispatch error: {e}",
+                    critique_md=f"judge dispatch error (unexpected): {e}",
                     score_json={"_error": True},
                 )
-                out.append(synth.model_dump(mode="json"))
-                emit_trace(judge_trace_root, state.workflow_id, "judge.verdict", {
+                attempts = [{"vendor": judge_vendors[0], "ok": False, "reason": "unknown"}]
+                emit_trace(judge_trace_root, state.workflow_id, "judge.error", {
                     "envelope_id": env.get("id"),
                     "rubric_id": rubric_id,
-                    "outcome": "fail",
                     "error": str(e),
                 })
+            # Per-attempt traces: which vendor was tried, and why we fell through.
+            for att in attempts:
+                emit_trace(
+                    judge_trace_root, state.workflow_id,
+                    "judge.attempt" if att.get("ok") else "judge.fallback", {
+                        "envelope_id": env.get("id"),
+                        "rubric_id": rubric_id,
+                        "vendor": att.get("vendor"),
+                        "ok": att.get("ok", False),
+                        "reason": att.get("reason"),
+                        "retryable": att.get("retryable"),
+                    },
+                )
+            out.append(verdict.model_dump(mode="json"))
+            emit_trace(judge_trace_root, state.workflow_id, "judge.verdict", {
+                "envelope_id": env.get("id"),
+                "rubric_id": rubric_id,
+                "outcome": verdict.outcome,
+                "judge_vendor": verdict.judge_vendor,
+                "degraded": bool((verdict.score_json or {}).get("_judge_degraded")),
+                "score_json": verdict.score_json,
+            })
         return out
 
     def _dispatch_best_of_n(
@@ -1073,11 +1111,14 @@ def build_supervisor(
             bon_rubrics.extend(["brand-consistency@1", "audience-fit@1"])
 
         try:
+            # Gemini retired (2026-06): codex is the cross-vendor judge. Pass the
+            # full preferred-vendor list so a vendor outage degrades to an honest
+            # `skip` (excluded from Borda) rather than wedging best-of-N.
             outcome = judge_and_rank(
                 candidates,
                 rubric_ids=bon_rubrics,
                 workflow_id=state.workflow_id,
-                judge_vendor="gemini",
+                judge_vendors=["codex"],
                 client=client_for_bon,
                 generator_vendor=pack.slug,
             )

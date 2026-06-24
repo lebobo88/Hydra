@@ -89,6 +89,84 @@
     "required": false,
     "description": "Senate legal pack introspection (the Curia Crown)"
   },
+  "rlm_gaming": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.rlm_gaming"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_RLM_GAMING_ROOT": "{RLM_GAMING_ROOT}"
+    },
+    "check_path_template": "{RLM_GAMING_ROOT}",
+    "required": false,
+    "description": "RLM-Gaming Arcade pack introspection (game-studio squad)"
+  },
+  "marketbliss": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.marketbliss"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_MB_ROOT": "{MB_ROOT}"
+    },
+    "check_path_template": "{MB_ROOT}",
+    "required": false,
+    "description": "MarketBliss pack introspection (marketing-* squads)"
+  },
+  "xenia": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.xenia"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_XENIA_ROOT": "{XENIA_ROOT}"
+    },
+    "check_path_template": "{XENIA_ROOT}",
+    "required": false,
+    "description": "Xenia Hearth pack introspection (customer-support squad)"
+  },
+  "xenia_kb": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.xenia_kb"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_XENIA_ROOT": "{XENIA_ROOT}"
+    },
+    "check_path_template": "{XENIA_ROOT}",
+    "required": false,
+    "description": "Xenia knowledge-base FTS search (customer-support RAG)"
+  },
+  "xenia_tickets": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.xenia_tickets"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_XENIA_ROOT": "{XENIA_ROOT}"
+    },
+    "check_path_template": "{XENIA_ROOT}",
+    "required": false,
+    "description": "Xenia ticket store with WS-AUTH capability enforcement"
+  },
+  "hydra_control": {
+    "type": "stdio",
+    "command": "python",
+    "args": ["-m", "mcp_servers.hydra_control"],
+    "cwd_template": "{HYDRA_ROOT}",
+    "env_template": {
+      "PYTHONPATH": "{HYDRA_ROOT}",
+      "HYDRA_ROOT": "{HYDRA_ROOT}"
+    },
+    "check_path_template": "{HYDRA_ROOT}",
+    "required": true,
+    "description": "Hydra workflow launch / resume / submit_envelopes / cockpit audit"
+  },
   "blender": {
     "_comment": "EXISTING/3rd-party blender-mcp — reused, not built here. The stdio `uvx blender-mcp` process connects to the running Blender add-on socket on BLENDER_MCP_PORT (default 9876). If your blender-mcp instead exposes an SSE/HTTP MCP endpoint on :7700, swap to {\"type\":\"sse\",\"url\":\"http://127.0.0.1:7700/sse\"}. Restricted in garland/rlm-gaming squads to Helios + blender-model + blender-rig (garland) and read-only to the Arcade crown.",
     "type": "stdio",

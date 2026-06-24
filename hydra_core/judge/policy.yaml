@@ -3,6 +3,12 @@
 # Override per-project by placing a `.hydra/judge_policy.yaml` at the workflow
 # project root. Unknown keys are ignored; missing keys fall back to these defaults.
 
+# REFERENCE ONLY — NOT parsed by load_policy(). The authoritative tier-by-type
+# logic lives in router.py (`_BASE_TIER_BY_TYPE` + the `_has_passing_pp_verdict`
+# short-circuit that implements the `skip_if_pp_judged` semantic). This block is
+# kept as documentation of intent; editing it changes nothing. `skip_if_pp_judged`
+# is NOT a valid JudgeTier literal (cross_vendor|same_vendor|skip) — do not feed
+# it to JudgeRoute.tier.
 default_tier_by_envelope:
   C_SUITE_DECISION_PACKET: cross_vendor
   CREATIVE_BRIEF: same_vendor
@@ -27,12 +33,13 @@ escalation_keywords:
   - constitution
   - production_deploy
 
+# (generator, judge) allowed pairs — judge must differ from generator for
+# cross_vendor. NOT YET parsed/enforced by load_policy (tracked: Phase-2
+# hardening / F1-vendor-rule). Gemini retired (2026-06) so the live pair is
+# (claude, codex); (codex, codex) is same-vendor-degraded fallback only.
 vendor_pairs:
-  # (generator, judge) — judge must differ from generator for cross_vendor.
-  - [codex, gemini]
-  - [gemini, codex]
-  - [claude, gemini]
   - [claude, codex]
+  - [codex, codex]   # same-vendor degraded fallback (no host Claude producer)
 
 # Per-workflow tripwire. When the running judge cost exceeds this, the
 # dispatcher downgrades cross_vendor → single_vendor (Phase-2 hook).

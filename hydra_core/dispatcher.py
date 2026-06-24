@@ -256,6 +256,14 @@ class MCPStdioDispatcher:
                 pass
             self._record_tool_usage(server, tool, squad_id, "rejected")
             return {"status": "rejected", "error": rejection}
+        # F11: Cerberus venom gate AFTER RBAC, BEFORE dispatch. RBAC governs
+        # *which tool* a squad may call; the venom gate governs *what the args
+        # do* (rm -rf, force-push to main, prod deploy, card charge). A hard
+        # refusal or a requires-human verdict short-circuits the call.
+        venom_block = self._venom_gate(server=server, tool=tool, args=args)
+        if venom_block is not None:
+            self._record_tool_usage(server, tool, squad_id, "rejected")
+            return venom_block
         import time as _time
         _t0 = _time.monotonic()
         result = self._run(self._async_call(server, tool, args))
@@ -282,7 +290,52 @@ class MCPStdioDispatcher:
         except Exception:
             pass
 
+    def _venom_gate(
+        self, *, server: str | None = None, tool: str | None = None,
+        args: Any = None, cmd: Any = None,
+    ) -> dict[str, Any] | None:
+        """Run the Cerberus venom gate over a runtime action. Returns a rejection
+        envelope when the action is REFUSED or REQUIRES HUMAN approval, else None.
+        No registered venom matching the signature → None (fast common path).
+        Fail-OPEN on an unexpected gate-internal error (never wedge dispatch), but
+        fail-CLOSED on an explicit VenomRefused / requires_human."""
+        try:
+            from .venom import gate_runtime_action, VenomRefused
+        except Exception:  # noqa: BLE001 — venom module optional
+            return None
+        try:
+            verdicts = gate_runtime_action(
+                server=server, tool=tool, args=args, cmd=cmd, raise_on_refuse=True,
+            )
+        except VenomRefused as vr:
+            # A venom-class action is BLOCKED pending human review (the constitution's
+            # `unguarded_venom` refusal means "requires HITL review", not a silent
+            # hard-deny). Surface it so the supervisor routes a constitution_breach
+            # HITL; the human approves or denies. Autonomous execution stops here.
+            logger.warning("Cerberus blocked %s (HITL): %s", vr.capability, "; ".join(vr.reasons))
+            return {"status": "rejected", "error": str(vr),
+                    "venom_refused": True, "hitl_required": True,
+                    "capability": vr.capability, "reasons": list(vr.reasons),
+                    "audit_key": vr.audit_key}
+        except Exception as exc:  # noqa: BLE001 — gate bug must not wedge dispatch
+            logger.debug("venom gate internal error (fail-open): %r", exc)
+            return None
+        # Defensive: a capability configured to PASS-with-requires_human (no
+        # constitution breach) also blocks autonomously and routes to HITL.
+        hil = [v for v in verdicts if getattr(v, "requires_human", False)]
+        if hil:
+            action = ".".join(c for c in (server, tool) if c) or "subprocess"
+            logger.warning("Cerberus requires human approval for venom-class action %s", action)
+            return {"status": "rejected",
+                    "error": "venom-class action requires human approval",
+                    "hitl_required": True,
+                    "audit_keys": [v.audit_key for v in hil]}
+        return None
+
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
+        venom_block = self._venom_gate(cmd=cmd)
+        if venom_block is not None:
+            return venom_block
         try:
             res = subprocess.run(
                 cmd, env=env, capture_output=True, text=True, timeout=300,
@@ -313,6 +366,19 @@ class MCPStdioDispatcher:
             "skill": skill,
             "args_preview": {k: str(v)[:120] for k, v in args.items()},
         }
+
+    # Host-executor seam: the base MCP/stdio dispatcher is HEADLESS — there is no
+    # Claude Code host to spawn a subagent — so it returns None, signaling callers
+    # to fall back (codex generation for engineering; host_pickup for skills). A
+    # host-attached integration subclasses/wraps this with a real implementation
+    # (sets supports_host_agent=True and runs the named Claude subagent).
+    supports_host_agent: bool = False
+
+    def run_host_agent(
+        self, agent_type: str, prompt: str, *,
+        cwd: str | None = None, timeout_s: int | None = None,
+    ) -> dict[str, Any] | None:
+        return None
 
     # --- async core ---
 
@@ -436,8 +502,32 @@ class MCPStdioDispatcher:
                             }
                         # Capture result BEFORE exiting context managers so a
                         # teardown exception in __aexit__ does not lose the payload.
-                        _call_result = {"status": "done", "tool": tool,
-                                        "result": _extract_mcp_result(result)}
+                        # Gate on the RAW CallToolResult.isError: an MCP tool that
+                        # returns a structured error (without raising) sets
+                        # isError=True but still carries content — flattening it
+                        # into a "done" payload (the old behavior) masked tool-level
+                        # failures as success downstream (judge/codex/skill all read
+                        # status). We key off the boolean BEFORE _extract_mcp_result
+                        # drops it. (We do NOT scan the flattened content for an
+                        # "error" key — that would false-fail any legitimate success
+                        # payload carrying an `error_rate`/`error` metric field.)
+                        _extracted = _extract_mcp_result(result)
+                        # `is True` (not just truthy): the MCP SDK's
+                        # CallToolResult.isError is a real bool, so this matches a
+                        # genuine tool error while ignoring test doubles whose
+                        # auto-created mock attributes are truthy-but-not-True.
+                        if getattr(result, "isError", False) is True:
+                            _call_result = {
+                                "status": "failed", "tool": tool, "server": server,
+                                "result": _extracted,
+                                "error": (
+                                    _extracted if isinstance(_extracted, str)
+                                    else str(_extracted)
+                                ),
+                            }
+                        else:
+                            _call_result = {"status": "done", "tool": tool,
+                                            "result": _extracted}
                         # Returning here unwinds the `async with` stack; if
                         # __aexit__ raises it will be caught by the outer except
                         # which checks `_call_result is not None` and returns it.

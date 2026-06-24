@@ -13,17 +13,68 @@ Phase 2 will inject `MCPCritiqueClient` that calls the actual tools.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from .registry import get_rubric
 from .schemas import JudgeOutcome, JudgeVendor, JudgeVerdict
 
 
+JudgeErrorReason = Literal[
+    "ineligible_tier", "quota", "timeout", "tool_failed", "bad_response", "unknown"
+]
+
+
 class JudgeDispatchError(RuntimeError):
     """Raised when the underlying critique tool fails. We surface — never
     silently pass — to preserve PP's invariant that judge failures are visible.
+
+    Carries a classified ``reason`` and a ``retryable`` flag so callers (the
+    supervisor's per-rubric loop, best-of-N) can tell an INFRA/auth failure
+    (vendor down, tier ineligible, quota, timeout) from a genuine rubric
+    outcome, fall through to the next preferred vendor, and ultimately record an
+    honest ``skip`` rather than a fabricated ``fail``.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        vendor: str | None = None,
+        rubric_id: str | None = None,
+        reason: JudgeErrorReason = "unknown",
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.vendor = vendor
+        self.rubric_id = rubric_id
+        self.reason = reason
+        self.retryable = retryable
+
+
+def classify_judge_error(text: str) -> tuple[JudgeErrorReason, bool]:
+    """Classify a raw critique-failure message into ``(reason, retryable)``.
+
+    Infra/auth failures (ineligible tier, server missing/misconfigured) are NOT
+    retryable and NOT a rubric outcome — they must fall through to another vendor
+    and ultimately an honest ``skip``. Quota / timeout are transient (retryable
+    on a later run, not within the same loop).
+    """
+    t = (text or "").lower()
+    if ("ineligibletier" in t or "no longer supported" in t
+            or "unsupported_client" in t or "migrate to" in t):
+        return "ineligible_tier", False
+    if "usage limit" in t or "rate limit" in t or "quota" in t or " 429" in t:
+        return "quota", True
+    if "timed out" in t or "timeout" in t or "deadline" in t:
+        return "timeout", True
+    if (("server" in t and ("not found" in t or "missing" in t))
+            or "not configured" in t or "does not support vendor" in t):
+        return "tool_failed", False
+    if ("missing valid outcome" in t or "unexpected critique payload" in t
+            or "non-dict" in t or "parsed block" in t):
+        return "bad_response", False
+    return "unknown", False
 
 
 # Per PP's `harness-server.ts:115-132` pragmatic-pass guard.
@@ -143,8 +194,11 @@ def dispatch_judge(
             rubric_md=rubric.body_md,
         )
     except Exception as e:
+        reason, retryable = classify_judge_error(str(e))
         raise JudgeDispatchError(
-            f"critique call failed (vendor={judge_vendor}, rubric={rubric_id}): {e}"
+            f"critique call failed (vendor={judge_vendor}, rubric={rubric_id}): {e}",
+            vendor=judge_vendor, rubric_id=rubric_id,
+            reason=reason, retryable=retryable,
         ) from e
 
     outcome, critique, scores = _apply_pragmatic_pass_guard(raw)
@@ -168,4 +222,116 @@ def dispatch_judge(
         score_json=scores,
         retry_index=retry_index,
         parent_verdict_id=parent_verdict_id,
+    )
+
+
+def _skip_verdict(
+    *,
+    envelope: dict[str, Any],
+    rubric_id: str,
+    judge_vendor: JudgeVendor,
+    generator_vendor: str,
+    workflow_id: UUID,
+    attempts: list[dict[str, Any]],
+    last_error: Exception | None,
+    retry_index: int = 0,
+) -> JudgeVerdict:
+    """Build an honest ``skip`` verdict for when every preferred judge vendor is
+    unavailable. ``skip`` (not ``fail``) so the failure is visible/traceable but
+    is excluded from HITL escalation and Borda ranking — an infra outage is not a
+    quality judgment about the artifact.
+    """
+    target_id = envelope.get("id")
+    if isinstance(target_id, str):
+        target_id = UUID(target_id)
+    elif target_id is None:
+        target_id = uuid4()
+    reasons = "; ".join(
+        f"{a.get('vendor')}:{a.get('reason', '?')}" for a in attempts if not a.get("ok")
+    )
+    return JudgeVerdict(
+        workflow_id=workflow_id,
+        origin_squad="hydra-judge",
+        target_squad=envelope.get("origin_squad"),
+        target_envelope_id=target_id,
+        outcome="skip",
+        rubric_id=rubric_id,
+        judge_vendor=judge_vendor,
+        generator_vendor=generator_vendor,
+        critique_md=(
+            "[judge skipped — all preferred vendors unavailable] "
+            f"{reasons}. Last error: {last_error}"
+        ),
+        score_json={"_error": True, "_infra": True, "_judge_attempts": attempts},
+        retry_index=retry_index,
+    )
+
+
+def dispatch_judge_with_fallback(
+    *,
+    envelope: dict[str, Any],
+    rubric_id: str,
+    judge_vendors: Sequence[JudgeVendor],
+    workflow_id: UUID,
+    generator_vendor: str = "unknown",
+    client: CritiqueClient | None = None,
+    retry_index: int = 0,
+    parent_verdict_id: UUID | None = None,
+) -> tuple[JudgeVerdict, list[dict[str, Any]]]:
+    """Apply one rubric to one envelope, trying each preferred judge vendor in
+    order. On a :class:`JudgeDispatchError` (infra/auth/quota/timeout) record the
+    attempt and fall through to the next vendor. The first vendor that returns a
+    real verdict wins. If ALL vendors fail, return an honest ``skip`` verdict
+    (NOT ``fail``).
+
+    Returns ``(verdict, attempts)`` where ``attempts`` is an ordered list of
+    ``{vendor, ok, outcome|reason|retryable}`` dicts for per-attempt tracing and
+    replay determinism (which vendor was attempted, which was chosen).
+    """
+    vendors: list[JudgeVendor] = list(judge_vendors) or ["codex"]
+    attempts: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    for idx, vendor in enumerate(vendors):
+        try:
+            verdict = dispatch_judge(
+                envelope=envelope,
+                rubric_id=rubric_id,
+                judge_vendor=vendor,
+                workflow_id=workflow_id,
+                generator_vendor=generator_vendor,
+                client=client,
+                retry_index=retry_index,
+                parent_verdict_id=parent_verdict_id,
+            )
+            attempts.append({"vendor": vendor, "ok": True, "outcome": verdict.outcome})
+            if idx > 0:
+                # Fell back from an earlier preferred vendor: the cross-vendor
+                # guarantee may be weakened — mark the verdict degraded so audit
+                # / replay can see the judge plane ran in a fallback posture.
+                degraded = {
+                    **(verdict.score_json or {}),
+                    "_judge_degraded": True,
+                    "_judge_attempts": attempts,
+                }
+                verdict = verdict.model_copy(update={"score_json": degraded})
+            return verdict, attempts
+        except JudgeDispatchError as e:
+            attempts.append({
+                "vendor": vendor, "ok": False,
+                "reason": e.reason, "retryable": e.retryable,
+            })
+            last_error = e
+            continue
+    return (
+        _skip_verdict(
+            envelope=envelope,
+            rubric_id=rubric_id,
+            judge_vendor=vendors[0],
+            generator_vendor=generator_vendor,
+            workflow_id=workflow_id,
+            attempts=attempts,
+            last_error=last_error,
+            retry_index=retry_index,
+        ),
+        attempts,
     )

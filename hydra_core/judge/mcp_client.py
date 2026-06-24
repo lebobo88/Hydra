@@ -121,7 +121,7 @@ def _normalize_pp_response(raw: Any) -> dict[str, Any]:
         or {}
     )
 
-    if outcome not in {"pass", "revise", "fail"}:
+    if outcome not in {"pass", "revise", "fail", "skip"}:
         raise RuntimeError(
             f"critique response missing valid outcome/verdict; "
             f"got {outcome!r} in parsed keys={sorted(judgment)}"
