@@ -42,3 +42,4 @@ squads/marketing-ops
 squads/marketing-production
 squads/marketing-research
 squads/marketing-strategy
+.tmp-pytest/
