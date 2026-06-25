@@ -31,6 +31,32 @@ VALID_MODEL_TIERS: frozenset[str] = frozenset({
 # Tokens that route to pp's deep-reasoning-team.
 FABLE_TIERS: frozenset[str] = frozenset({"fable", "deep"})
 
+# Capability ordering (low → high). Used to enforce the same-vendor judging rule:
+# a same-vendor judge must run at the SAME or a HIGHER tier than the generator —
+# a weaker model rubber-stamping a stronger one's output is not a real check.
+_TIER_RANK: dict[str, int] = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3, "deep": 3}
+
+
+def tier_rank(tier: str | None) -> int | None:
+    """Capability rank of a tier (higher = more capable), or None if unknown/None."""
+    if tier is None:
+        return None
+    return _TIER_RANK.get(tier.strip().lower())
+
+
+def is_same_or_higher_tier(judge_tier: str | None, generator_tier: str | None) -> bool:
+    """True when ``judge_tier`` is at least as capable as ``generator_tier``.
+
+    The same-vendor judging rule: a same-vendor judge MUST run at the same or a
+    higher tier than the generator. Unknown/None tiers are PERMISSIVE (return
+    True) — we cannot prove a violation without both ranks, and must not block on
+    a tier we don't recognise (fail-open for observability, not enforcement).
+    """
+    jr, gr = tier_rank(judge_tier), tier_rank(generator_tier)
+    if jr is None or gr is None:
+        return True
+    return jr >= gr
+
 
 def normalize_tier(tier: str | None) -> str | None:
     """Return the canonical lowercase tier token, or None if tier is None.

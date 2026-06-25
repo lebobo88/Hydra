@@ -23,6 +23,10 @@ class JudgePolicy:
     hitl_on_fail: set[str] = field(default_factory=set)
     budget_cap_per_workflow_usd: float = 2.50
     escalation_keywords: tuple[str, ...] = ()
+    # Allowed (generator_vendor, judge_vendor) pairs. Empty = permissive (no
+    # policy configured). For cross_vendor the judge MUST differ from the
+    # generator; this set additionally constrains which differing pairs are valid.
+    vendor_pairs: frozenset = field(default_factory=frozenset)
 
     def squad_enabled(self, squad: str | None) -> bool:
         """True when the squad opts in to real cross-vendor judging.
@@ -38,6 +42,26 @@ class JudgePolicy:
 
     def is_hitl_severity(self, rubric_id: str) -> bool:
         return rubric_id in self.hitl_on_fail
+
+    def vendor_pair_allowed(self, generator_vendor: str, judge_vendor: str) -> bool:
+        """True when (generator, judge) is an allowed pair. Empty vendor_pairs is
+        permissive (no policy configured → nothing to enforce)."""
+        if not self.vendor_pairs:
+            return True
+        return (generator_vendor, judge_vendor) in self.vendor_pairs
+
+    @staticmethod
+    def cross_vendor_distinct(generator_vendor: str, judge_vendor: str) -> bool:
+        """The cross_vendor invariant: the judge MUST be a different vendor than
+        the generator (a vendor judging its own output is not cross-vendor)."""
+        return judge_vendor != generator_vendor
+
+    @staticmethod
+    def same_vendor_tier_ok(judge_tier: str | None, generator_tier: str | None) -> bool:
+        """Same-vendor judging must run at the SAME or a HIGHER tier than the
+        generator (delegates to tiers.is_same_or_higher_tier)."""
+        from ..tiers import is_same_or_higher_tier
+        return is_same_or_higher_tier(judge_tier, generator_tier)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -67,4 +91,9 @@ def load_policy(project_root: Path | None = None) -> JudgePolicy:
         hitl_on_fail=set(merged.get("hitl_on_fail") or []),
         budget_cap_per_workflow_usd=float(merged.get("budget_cap_per_workflow_usd", 2.50)),
         escalation_keywords=tuple(merged.get("escalation_keywords") or []),
+        vendor_pairs=frozenset(
+            (str(p[0]), str(p[1]))
+            for p in (merged.get("vendor_pairs") or [])
+            if isinstance(p, (list, tuple)) and len(p) == 2
+        ),
     )

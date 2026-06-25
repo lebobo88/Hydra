@@ -282,6 +282,12 @@ def _generate_failure_reason(
                     "generate as success (harness owns commit/smoke)", marker,
                 )
                 return None
+            # Tag quota/rate-limit distinctly (an account/credits condition, not a
+            # code or sandbox problem) so the surfaced reason + traces can be
+            # triaged apart from read-only/approval blocks. Quota is ACTIVE/recurring.
+            if marker in ("usage limit", "rate limit", "quota"):
+                _log.warning("codex quota exhausted during generate (marker=%r)", marker)
+                return f"codex quota exhausted ({marker}): {gen_text.strip()[:200]}"
             return f"codex generate blocked ({marker}): {gen_text.strip()[:300]}"
     return None
 
