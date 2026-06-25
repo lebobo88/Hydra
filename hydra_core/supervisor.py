@@ -927,33 +927,22 @@ def build_supervisor(
                     client=use_client,
                 )
             except Exception as e:
-                # Defensive: the fallback helper converts every vendor/infra
-                # failure to an honest `skip` and only propagates a TRUE bug.
-                # Keep the run alive and honest — record a `skip` (NOT a
-                # fabricated `fail`, which would spuriously trip HITL / Borda)
-                # and trace the error for triage.
-                from .judge.schemas import JudgeVerdict
-                from uuid import UUID, uuid4
-                target_id = env.get("id")
-                target_id = UUID(target_id) if isinstance(target_id, str) else (target_id or uuid4())
-                verdict = JudgeVerdict(
-                    workflow_id=state.workflow_id,
-                    origin_squad="hydra-judge",
-                    target_squad=origin,
-                    target_envelope_id=target_id,
-                    outcome="skip",
-                    rubric_id=rubric_id,
-                    judge_vendor=judge_vendors[0],
-                    generator_vendor=origin or "unknown",
-                    critique_md=f"judge dispatch error (unexpected): {e}",
-                    score_json={"_error": True},
-                )
-                attempts = [{"vendor": judge_vendors[0], "ok": False, "reason": "unknown"}]
-                emit_trace(judge_trace_root, state.workflow_id, "judge.error", {
+                # JUDGE-004: `dispatch_judge_with_fallback` ALREADY converts every
+                # vendor/infra failure (JudgeDispatchError) to an honest `skip`
+                # internally and never re-raises it. So anything escaping here is a
+                # GENUINE bug (e.g. an unknown rubric_id → KeyError, a Pydantic
+                # ValidationError), NOT an infra outage. The old code fabricated a
+                # `skip` for it — and because `skip` is excluded from both Borda and
+                # fail-triggered HITL, that SILENTLY removed a judge from the
+                # governance plane while the run reported success. Surface the bug
+                # loudly instead of masking it: trace `judge.bug` then re-raise.
+                emit_trace(judge_trace_root, state.workflow_id, "judge.bug", {
                     "envelope_id": env.get("id"),
                     "rubric_id": rubric_id,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                 })
+                raise
             # Per-attempt traces: which vendor was tried, and why we fell through.
             for att in attempts:
                 emit_trace(
@@ -994,7 +983,7 @@ def build_supervisor(
         Returns the WINNING envelopes (loser envelopes archived in artifacts).
         Falls back to single-shot dispatch if anything goes wrong.
         """
-        from .judge.best_of_n import judge_and_rank
+        from .judge.best_of_n import judge_and_rank, NoRankableVerdictsError
 
         n = pack.best_of_n
         squad_enabled = judge_policy.squad_enabled(pack.slug)
@@ -1122,6 +1111,22 @@ def build_supervisor(
                 client=client_for_bon,
                 generator_vendor=pack.slug,
             )
+        except NoRankableVerdictsError as e:
+            # JUDGE-001: every candidate verdict was `skip` (judge vendor outage).
+            # Do NOT anoint a lexicographically-arbitrary winner. Surface it
+            # distinctly (judge_unavailable) and return the candidates unranked so
+            # downstream can route a human review rather than trust a phantom pick.
+            emit_trace(judge_trace_root, state.workflow_id, "judge.bon_no_rankable_verdicts", {
+                "squad": pack.slug, "n": len(candidates), "reason": "judge_unavailable",
+                "error": str(e),
+            })
+            try:
+                state.error_counters["judge_unavailable"] = (
+                    state.error_counters.get("judge_unavailable", 0) + 1
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return candidates
         except Exception as e:
             emit_trace(judge_trace_root, state.workflow_id, "judge.bon_rank_error", {
                 "error": str(e),

@@ -20,6 +20,13 @@ from .dispatcher import CritiqueClient, dispatch_judge_with_fallback
 from .schemas import JudgeVendor, JudgeVerdict
 
 
+class NoRankableVerdictsError(RuntimeError):
+    """Every candidate verdict was ``skip`` (judge vendors unavailable), so there
+    is NO quality signal to rank on. Best-of-N must not silently pick a
+    lexicographically-arbitrary winner — the caller surfaces this for human
+    review (judge_unavailable). Raised only when there are >=2 candidates."""
+
+
 @dataclass
 class BestOfNOutcome:
     winner_envelope: dict[str, Any]
@@ -69,6 +76,14 @@ def judge_and_rank(
             verdicts.append(v)
 
     rankable = [v for v in verdicts if v.outcome != "skip"]
+    if not rankable and len(candidates) >= 2:
+        # All verdicts were skip (vendor outage). borda_winner would still return
+        # the lexicographically-first candidate as the "winner" with zero signal —
+        # surface instead of silently anointing one (JUDGE-001).
+        raise NoRankableVerdictsError(
+            f"all {len(verdicts)} verdict(s) across {len(candidates)} candidates "
+            "were skip (judge vendors unavailable) — cannot rank a winner"
+        )
     winner_id, leaderboard = borda_winner(cand_ids, rankable)
     by_id = {str(env.get("id")): env for env in candidates}
     winner = by_id[winner_id]

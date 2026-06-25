@@ -364,3 +364,20 @@ def test_drive_generate_falls_back_to_codex_when_no_host(monkeypatch) -> None:
     rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
     assert rv["score_json"].get("_cross_vendor") is False
     assert rv["score_json"].get("_judge_degraded") is True
+
+
+def test_cost_accumulated_even_when_generate_fails() -> None:
+    """COST_LOSS fix: a soft-block generate that wrote nothing but consumed
+    tokens/cost must STILL charge the budget ledger (cost is accumulated before
+    the gen_fail branch, not only on the success path)."""
+    resp = _happy_responses("pass")
+    resp[("pp_codex", "generate")] = {"status": "done", "result": {
+        "text": "writing is blocked by read-only sandbox; rejected by user approval settings",
+        "model": "codex-1", "tokens_in": 5, "tokens_out": 3, "cost_usd": 0.03}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"   # generate failed -> surfaced
+    assert out["stage_outcome"] == "error"
+    assert out["cost_usd"] >= 0.03             # cost STILL charged (the fix)
+    assert out["tokens_in"] >= 5

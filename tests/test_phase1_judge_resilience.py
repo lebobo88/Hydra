@@ -104,6 +104,19 @@ def test_fallback_all_fail_returns_skip_not_fail():
     assert [a["ok"] for a in attempts] == [False, False]
 
 
+def test_fallback_propagates_non_dispatch_errors():
+    # JUDGE-004 invariant: the helper swallows ONLY JudgeDispatchError (infra) →
+    # skip. A genuine bug (unknown rubric → KeyError from get_rubric) must
+    # PROPAGATE, not be masked as a skip that silently drops a judge.
+    good = {"outcome": "pass", "critique_md": "x" * 100, "score_json": {"q": 9}}
+    client = _ScriptedClient({"codex": good})
+    with pytest.raises(KeyError):
+        dispatch_judge_with_fallback(
+            envelope=_envelope(), rubric_id="not-a-real-rubric@99",
+            judge_vendors=["codex"], workflow_id=uuid4(), client=client,
+        )
+
+
 def test_fallback_single_vendor_success_not_degraded():
     good = {"outcome": "pass", "critique_md": "y" * 100, "score_json": {"q": 8}}
     client = _ScriptedClient({"codex": good})
@@ -116,23 +129,35 @@ def test_fallback_single_vendor_success_not_degraded():
 
 
 # --------------------------------------------------------------------------- #
-# judge_and_rank excludes skip from Borda
+# judge_and_rank excludes skip from Borda; all-skip surfaces (JUDGE-001)
 # --------------------------------------------------------------------------- #
-def test_judge_and_rank_excludes_skip_from_borda():
+def test_judge_and_rank_all_skip_raises_no_rankable():
+    from hydra_core.judge.best_of_n import NoRankableVerdictsError
     a, b = _envelope(), _envelope()
-    # codex down for candidate A's judge -> skip; B passes with a high score.
-    def behavior(vendor):
-        return RuntimeError("usage limit")
-    # All judge calls go to codex; make codex fail so every verdict is a skip.
+    # Every judge call goes to codex; make codex fail so EVERY verdict is skip.
     client = _ScriptedClient({"codex": RuntimeError("usage limit")})
+    # With >=2 candidates and no rankable verdict, best-of-N must NOT silently
+    # anoint a lexicographically-arbitrary winner — it raises so the caller
+    # surfaces judge_unavailable.
+    with pytest.raises(NoRankableVerdictsError):
+        judge_and_rank(
+            [a, b], rubric_ids=[RUBRIC], workflow_id=uuid4(),
+            judge_vendors=["codex"], client=client,
+        )
+
+
+def test_judge_and_rank_excludes_skip_keeps_real_winner():
+    a, b = _envelope(), _envelope()
+    good = {"outcome": "pass", "critique_md": "z" * 100, "score_json": {"q": 9}}
+    # b's id sorts after a's only sometimes; we just assert the rankable (real)
+    # verdict drives the winner and skips don't crash or dominate.
+    client = _ScriptedClient({"codex": good})
     outcome = judge_and_rank(
         [a, b], rubric_ids=[RUBRIC], workflow_id=uuid4(),
         judge_vendors=["codex"], client=client,
     )
-    # Both verdicts recorded, both skip, none rankable -> deterministic winner,
-    # no crash.
     assert len(outcome.verdicts) == 2
-    assert all(v.outcome == "skip" for v in outcome.verdicts)
+    assert all(v.outcome == "pass" for v in outcome.verdicts)
     assert outcome.winner_id in (str(a["id"]), str(b["id"]))
 
 

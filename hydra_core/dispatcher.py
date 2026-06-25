@@ -297,8 +297,9 @@ class MCPStdioDispatcher:
         """Run the Cerberus venom gate over a runtime action. Returns a rejection
         envelope when the action is REFUSED or REQUIRES HUMAN approval, else None.
         No registered venom matching the signature → None (fast common path).
-        Fail-OPEN on an unexpected gate-internal error (never wedge dispatch), but
-        fail-CLOSED on an explicit VenomRefused / requires_human."""
+        Fail-CLOSED on an explicit VenomRefused / requires_human AND on a
+        gate-internal error (a matched venom whose gate errored must not slip
+        through). Only a missing venom MODULE (ImportError) fails open."""
         try:
             from .venom import gate_runtime_action, VenomRefused
         except Exception:  # noqa: BLE001 — venom module optional
@@ -317,9 +318,19 @@ class MCPStdioDispatcher:
                     "venom_refused": True, "hitl_required": True,
                     "capability": vr.capability, "reasons": list(vr.reasons),
                     "audit_key": vr.audit_key}
-        except Exception as exc:  # noqa: BLE001 — gate bug must not wedge dispatch
-            logger.debug("venom gate internal error (fail-open): %r", exc)
-            return None
+        except Exception as exc:  # noqa: BLE001
+            # FAIL-CLOSED. This branch is reached ONLY when a venom signature
+            # already matched (gate_runtime_action calls require_cerberus_pass for
+            # a registered capability) and the gate itself errored — e.g. a
+            # degraded/locked episodic audit store throwing inside the gate. A
+            # venom-class action whose gate could not complete must NOT proceed
+            # unchecked (the old fail-open silently converted a pending refusal
+            # into an allow). Block + route to HITL. Non-venom actions never reach
+            # here, so this cannot wedge ordinary dispatch.
+            logger.warning("venom gate internal error (fail-CLOSED → HITL): %r", exc)
+            return {"status": "rejected",
+                    "error": f"venom gate internal error: {exc}",
+                    "hitl_required": True, "gate_error": True}
         # Defensive: a capability configured to PASS-with-requires_human (no
         # constitution breach) also blocks autonomously and routes to HITL.
         hil = [v for v in verdicts if getattr(v, "requires_human", False)]

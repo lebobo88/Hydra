@@ -235,6 +235,7 @@ def _skip_verdict(
     attempts: list[dict[str, Any]],
     last_error: Exception | None,
     retry_index: int = 0,
+    parent_verdict_id: UUID | None = None,
 ) -> JudgeVerdict:
     """Build an honest ``skip`` verdict for when every preferred judge vendor is
     unavailable. ``skip`` (not ``fail``) so the failure is visible/traceable but
@@ -264,6 +265,7 @@ def _skip_verdict(
         ),
         score_json={"_error": True, "_infra": True, "_judge_attempts": attempts},
         retry_index=retry_index,
+        parent_verdict_id=parent_verdict_id,
     )
 
 
@@ -332,6 +334,7 @@ def dispatch_judge_with_fallback(
             attempts=attempts,
             last_error=last_error,
             retry_index=retry_index,
+            parent_verdict_id=parent_verdict_id,
         ),
         attempts,
     )

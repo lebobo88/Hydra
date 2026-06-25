@@ -420,8 +420,15 @@ def require_cerberus_pass(
         "alignment_rationale": alignment.rationale,
         "audit_id": str(uuid4()),
     }
+    # Defense-in-depth (VENOM-001): the audit write must NOT be able to convert a
+    # pending refusal into a thrown allow. A degraded/locked episodic store is a
+    # documented recurring condition; if the sink raises, audit best-effort and
+    # let the refusal/verdict below still stand.
     sink = cap.audit_sink or _default_kan_audit
-    audit_key = sink(record)
+    try:
+        audit_key = sink(record)
+    except Exception as _audit_exc:  # noqa: BLE001
+        audit_key = f"audit-failed:{type(_audit_exc).__name__}"
 
     verdict = VenomVerdict(
         allowed=not refusal_reasons,

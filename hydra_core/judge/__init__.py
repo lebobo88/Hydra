@@ -28,7 +28,9 @@ from .borda import borda_winner
 from .reflexion import package_retry, ReflexionPacket
 from .mcp_client import MCPCritiqueClient
 from .policy import JudgePolicy, load_policy
-from .best_of_n import BestOfNOutcome, best_of_n_run, judge_and_rank
+from .best_of_n import (
+    BestOfNOutcome, best_of_n_run, judge_and_rank, NoRankableVerdictsError,
+)
 
 # Register JudgeVerdict in the parent schema registry. Done here (not in
 # schemas.py) to avoid a schemas ↔ judge import cycle.
@@ -55,4 +57,5 @@ __all__ = [
     "BestOfNOutcome",
     "best_of_n_run",
     "judge_and_rank",
+    "NoRankableVerdictsError",
 ]

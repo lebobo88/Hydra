@@ -587,6 +587,15 @@ def _drive_pp_stage_loop(
             out["producer"] = producer
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
+            # F6 / cost-loss fix: accumulate real generate cost BEFORE the
+            # gen_fail branch. A soft-block / empty-output failure can still be a
+            # SUCCESSFUL token-consuming generate envelope — charging it only on
+            # the success path (and break-ing out on failure) under-charged the
+            # budget ledger and weakened the 80%/100% tripwires. Hard failures
+            # (timeout/transport) carry no cost fields → add 0, harmless.
+            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
+            out["tokens_in"] += int(gi.get("tokens_in") or 0)
+            out["tokens_out"] += int(gi.get("tokens_out") or 0)
 
             # Run-scoped: paths dirtied since the pre-generate snapshot. Excludes
             # any files that were already modified before this run started.
@@ -660,10 +669,7 @@ def _drive_pp_stage_loop(
                 **({"parent_attempt_id": attempt_id} if attempt_id else {}),
             }, squad_id=sq)
             attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
-            # F6: accumulate real generate cost so the budget ledger is charged.
-            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(gi.get("tokens_in") or 0)
-            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            # (generate cost already accumulated above, before the gen_fail branch)
 
             # Judge with codex (Gemini retired — free tier dropped, 2026-06).
             # When the producer is Claude (host engineer) codex is a genuine
