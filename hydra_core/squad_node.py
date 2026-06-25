@@ -75,14 +75,16 @@ class SquadResult:
     # NOT score these — there's no substance yet. The host (Claude Code)
     # fulfils the prompt out-of-band and a follow-up envelope arrives later.
     host_pickup_pending: bool = False
-    # True when the engineering live drive loop already drove a cross-vendor
-    # pp critique to a verdict (start_stage→generate→critique→record_verdict→
-    # finalize). The supervisor's NoOp judge plane must NOT re-judge this
-    # DecisionRecord — doing so downgrades a vacuous "pass" to "revise" and
-    # re-dispatches engineering, spawning a fresh start_run loop. Unlike
-    # host_pickup_pending the work is DONE, not awaited, so synthesis still
+    # True when the engineering live drive loop reached a TERMINAL outcome for
+    # this DecisionRecord — it already drove generate→critique→record_verdict→
+    # finalize itself, so the supervisor's NoOp judge plane must NOT re-judge it
+    # (re-judging would downgrade a vacuous "pass" to "revise" via the
+    # pragmatic-pass guard and re-dispatch engineering, spawning a fresh start_run
+    # loop). The name is "terminal", not "judged": a non-passing outcome is
+    # surfaced via SquadResult.status, not represented as a judge verdict here.
+    # Unlike host_pickup_pending the work is DONE, not awaited, so synthesis still
     # treats it as a real candidate.
-    pp_loop_judged: bool = False
+    pp_loop_terminal: bool = False
 
 
 def execute_squad(
@@ -528,6 +530,7 @@ def _drive_pp_stage_loop(
     request_text: str,
     model_tier: str | None = None,
     judge_rubric_id: str = "rfc-2119-normative",
+    workflow_id: str | None = None,
 ) -> dict[str, Any]:
     """Drive a pp `code` stage to a finalized run, headless (no Claude driver).
 
@@ -561,6 +564,19 @@ def _drive_pp_stage_loop(
         # downgrade + 100% HITL tripwires dead for all engineering work).
         "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
     }
+
+    def _trace(kind: str, payload: dict[str, Any]) -> None:
+        # F11-trace: the driven engineering run bypasses the supervisor judge
+        # plane (pp_loop_terminal), so its judge/stage outcomes were invisible in
+        # the hydra trace. Emit them here when a workflow_id is wired (cli/fleet).
+        if not workflow_id:
+            return
+        try:
+            from . import telemetry as _tel
+            _tel.emit(Path(project_path), workflow_id, kind, {"run_id": run_id, **payload})
+        except Exception:  # noqa: BLE001 — never crash the loop on a trace write
+            pass
+
     # Snapshot the working tree BEFORE any generation so we can attribute (and
     # later commit) ONLY the files this run touches — never pre-existing dirt.
     pre_dirty = _worktree_dirty_set(project_path)
@@ -716,6 +732,13 @@ def _drive_pp_stage_loop(
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
                     pass
+            # F11-trace: per-attempt verdict event (Reflexion×1 → up to 2 attempts).
+            _trace("judge.verdict", {
+                "stage_id": stage_id, "rubric_id": judge_rubric_id,
+                "retry_index": retry_index, "attempt_id": attempt_id,
+                "producer": producer, "judge_producer": "codex",
+                "outcome": outcome, "cross_vendor": cross_vendor,
+            })
 
             if outcome == "pass":
                 break  # accept; no Reflexion needed
@@ -789,6 +812,11 @@ def _drive_pp_stage_loop(
             out["final_status"] = "complete"
         else:
             out["final_status"] = "surfaced"
+        _trace("stage_outcome_set", {
+            "stage_id": stage_id, "final_status": out["final_status"],
+            "stage_outcome": out.get("stage_outcome"), "smoke_status": out.get("smoke_status"),
+            "producer": out.get("producer"), "cost_usd": out.get("cost_usd"),
+        })
         return out
     except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
         out["error"] = repr(e)
@@ -1072,6 +1100,7 @@ def _via_mcp(
             project_path=str(project_path),
             request_text=str(args.get("request_text", "")),
             model_tier=effective_tier,
+            workflow_id=str(getattr(inbound, "workflow_id", "") or ""),
         )
         # The loop already finalized the run (complete/surfaced/aborted) → the
         # project lock is released. Drop the ledger entry so node_postcheck's
@@ -1153,7 +1182,7 @@ def _via_mcp(
         status=result_status,
         # A driven run has already been cross-vendor judged inside pp — exempt
         # its DecisionRecord from the supervisor's NoOp re-judge / retry loop.
-        pp_loop_judged=loop_outcome is not None,
+        pp_loop_terminal=loop_outcome is not None,
     )
 
 

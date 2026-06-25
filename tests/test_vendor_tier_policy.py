@@ -73,3 +73,13 @@ def test_generate_failure_non_quota_block_not_tagged_quota():
     assert reason is not None
     assert "quota" not in reason.lower()
     assert "blocked" in reason.lower()
+
+
+# --- generator-vendor provenance resolver ----------------------------------- #
+def test_resolve_generator_vendor():
+    from hydra_core.supervisor import _resolve_generator_vendor
+    # Host-produced squad envelopes default to claude (NOT the squad slug).
+    assert _resolve_generator_vendor({"origin_squad": "executive"}) == "claude"
+    # An explicit generator_vendor (e.g. engineering drive loop) wins.
+    assert _resolve_generator_vendor({"generator_vendor": "codex"}) == "codex"
+    assert _resolve_generator_vendor({"generator_vendor": "  Claude "}) == "claude"

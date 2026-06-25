@@ -128,7 +128,7 @@ def test_ingest_dev_task_drives_full_pp_loop_and_drains_lock(packs) -> None:
     assert all(e.get("run_id") != "run_T" for e in state.open_pp_runs)
     # One engineering task; the engineering DecisionRecord is tagged _ingested.
     assert [t.owner_squad for t in outcome.new_tasks] == ["engineering"]
-    assert any(e.get("_ingested") and e.get("_pp_loop_judged")
+    assert any(e.get("_ingested") and e.get("_pp_loop_terminal")
                for e in outcome.new_envelopes)
     # The workflow ledger was charged via the same helper node_dispatch uses
     # (>= 0: the drive loop may not surface a pp_run cost artifact, matching

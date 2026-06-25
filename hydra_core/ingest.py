@@ -274,8 +274,8 @@ def dispatch_ingested_envelopes(
             d["_task_id"] = str(task.task_id)
             if getattr(result, "host_pickup_pending", False):
                 d["_host_pickup_pending"] = True
-            if getattr(result, "pp_loop_judged", False):
-                d["_pp_loop_judged"] = True
+            if getattr(result, "pp_loop_terminal", False):
+                d["_pp_loop_terminal"] = True
             outcome.new_envelopes.append(d)
 
         for art in getattr(result, "artifacts", []):

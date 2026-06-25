@@ -182,6 +182,22 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
     return usd, tokens
 
 
+# Map an envelope's ORIGIN to the real model vendor that produced it (NOT the
+# squad slug — the slug is not a vendor). Squads routed through Hydra's host
+# (executive impersonation, claude-skill packs, best-of-N candidates) are
+# Claude-produced; engineering's driven DecisionRecords carry an explicit
+# `generator_vendor` (claude|codex) from the drive loop (and skip this plane via
+# pp_loop_terminal anyway). Used to enforce the cross_vendor distinctness rule
+# (judge must differ from generator) at the judge plane — without this the old
+# code compared the judge vendor against a squad slug, which is trivially
+# distinct and never caught a same-vendor collision.
+def _resolve_generator_vendor(env: dict) -> str:
+    explicit = env.get("generator_vendor")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().lower()
+    return "claude"
+
+
 def build_supervisor(
     *,
     project_root: Path | None = None,
@@ -906,6 +922,7 @@ def build_supervisor(
 
         out: list[dict] = []
         judge_vendors = list(route.preferred_judge_vendors or ["codex"])
+        gen_vendor = _resolve_generator_vendor(env)
         for rubric_id in route.rubric_ids:
             emit_trace(judge_trace_root, state.workflow_id, "judge.invoked", {
                 "envelope_id": env.get("id"),
@@ -923,7 +940,7 @@ def build_supervisor(
                     rubric_id=rubric_id,
                     judge_vendors=judge_vendors,
                     workflow_id=state.workflow_id,
-                    generator_vendor=origin or "unknown",
+                    generator_vendor=gen_vendor,
                     client=use_client,
                 )
             except Exception as e:
@@ -956,6 +973,30 @@ def build_supervisor(
                         "retryable": att.get("retryable"),
                     },
                 )
+            # Cross-vendor distinctness: on a cross_vendor gate the judge MUST be
+            # a different vendor than the GENERATOR (resolved real vendor, not the
+            # squad slug). If they collide (e.g. a future misconfig), the gate is
+            # not actually cross-vendor — surface it and mark the verdict degraded.
+            if (route.tier == "cross_vendor"
+                    and not judge_policy.cross_vendor_distinct(gen_vendor, verdict.judge_vendor)):
+                verdict = verdict.model_copy(update={
+                    "score_json": {**(verdict.score_json or {}),
+                                   "_judge_degraded": True, "_vendor_violation": True},
+                })
+                emit_trace(judge_trace_root, state.workflow_id, "judge.vendor_violation", {
+                    "envelope_id": env.get("id"),
+                    "rubric_id": rubric_id,
+                    "generator_vendor": gen_vendor,
+                    "judge_vendor": verdict.judge_vendor,
+                    "tier": route.tier,
+                })
+            # Also flag a disallowed (generator, judge) pair when a policy is set.
+            elif not judge_policy.vendor_pair_allowed(gen_vendor, verdict.judge_vendor):
+                emit_trace(judge_trace_root, state.workflow_id, "judge.vendor_pair_unlisted", {
+                    "envelope_id": env.get("id"),
+                    "generator_vendor": gen_vendor,
+                    "judge_vendor": verdict.judge_vendor,
+                })
             out.append(verdict.model_dump(mode="json"))
             emit_trace(judge_trace_root, state.workflow_id, "judge.verdict", {
                 "envelope_id": env.get("id"),
@@ -1067,8 +1108,8 @@ def build_supervisor(
             primary["_bon_candidate_index"] = i
             if result.host_pickup_pending:
                 primary["_host_pickup_pending"] = True
-            if getattr(result, "pp_loop_judged", False):
-                primary["_pp_loop_judged"] = True
+            if getattr(result, "pp_loop_terminal", False):
+                primary["_pp_loop_terminal"] = True
             # Fix 2 (best-of-N _task_id): stamp originating task_id so
             # _reflexion_retry can resolve the exact task and source its
             # model_tier rather than falling back to first-same-squad.
@@ -1109,7 +1150,10 @@ def build_supervisor(
                 workflow_id=state.workflow_id,
                 judge_vendors=["codex"],
                 client=client_for_bon,
-                generator_vendor=pack.slug,
+                # Real generator vendor (best-of-N candidates are Claude-produced
+                # by the executive/garland squads), not the squad slug — so codex
+                # judging them is genuinely cross-vendor.
+                generator_vendor="claude",
             )
         except NoRankableVerdictsError as e:
             # JUDGE-001: every candidate verdict was `skip` (judge vendor outage).
@@ -1508,8 +1552,8 @@ def build_supervisor(
                             continue
                         if result.host_pickup_pending:
                             d["_host_pickup_pending"] = True
-                        if getattr(result, "pp_loop_judged", False):
-                            d["_pp_loop_judged"] = True
+                        if getattr(result, "pp_loop_terminal", False):
+                            d["_pp_loop_terminal"] = True
                         d["_task_id"] = str(fleet_task.task_id)
                         new_decisions.append(d)
                         eights.envelope_record(d)
@@ -1747,8 +1791,8 @@ def build_supervisor(
                     continue
                 if result.host_pickup_pending:
                     d["_host_pickup_pending"] = True
-                if getattr(result, "pp_loop_judged", False):
-                    d["_pp_loop_judged"] = True
+                if getattr(result, "pp_loop_terminal", False):
+                    d["_pp_loop_terminal"] = True
                 # WS9 Fix 2: tag the envelope with the originating task_id so
                 # _reflexion_retry can source model_tier from the EXACT task,
                 # not just the first same-squad task.
@@ -1853,8 +1897,8 @@ def build_supervisor(
                 _fd["_task_id"] = str(_fwd_task.task_id)
                 if _fwd_result.host_pickup_pending:
                     _fd["_host_pickup_pending"] = True
-                if getattr(_fwd_result, "pp_loop_judged", False):
-                    _fd["_pp_loop_judged"] = True
+                if getattr(_fwd_result, "pp_loop_terminal", False):
+                    _fd["_pp_loop_terminal"] = True
                 new_decisions.append(_fd)
                 eights.envelope_record(_fd)
             artifacts.extend(_fwd_result.artifacts)
@@ -2125,11 +2169,11 @@ def build_supervisor(
             # force the NoOp client → pragmatic-pass guard → synthetic "revise"
             # → re-dispatch (a fresh start_run loop). The real verdict already
             # lives in the pp run record.
-            if env.get("_pp_loop_judged"):
+            if env.get("_pp_loop_terminal"):
                 emit_trace(judge_trace_root, state.workflow_id, "judge.skipped", {
                     "envelope_id": env.get("id"),
                     "envelope_type": env.get("type"),
-                    "rationale": "pp_loop_judged: cross-vendor verdict already recorded in pp run",
+                    "rationale": "pp_loop_terminal: cross-vendor verdict already recorded in pp run",
                 })
                 continue
             env_verdicts = _judge_envelope(state, env, is_post_synthesis=False)

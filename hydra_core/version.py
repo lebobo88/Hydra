@@ -11,7 +11,7 @@ but not full PEP-440 ceremony. `parse_version("1.0.0") < parse_version("1.0.1")`
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Optional
 
 
@@ -88,5 +88,9 @@ def is_deprecated(
 ) -> bool:
     if deprecated_after is None:
         return False
-    today = now or datetime.now(timezone.utc).date()
+    # Deprecation dates are authored as plain, tz-less calendar dates, so compare
+    # against the local calendar date. (Defaulting to UTC here caused an off-by-one
+    # against callers/tests using date.today() during the UTC/local midnight
+    # window — a real boundary bug.)
+    today = now or date.today()
     return today >= deprecated_after

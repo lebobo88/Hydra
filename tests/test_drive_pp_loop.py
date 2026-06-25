@@ -9,7 +9,7 @@ scaffolds) and its integration into ``_via_mcp``:
   - a "revise" verdict triggers exactly one Reflexion retry, then surfaces
   - any exception finalizes the run as "aborted" (lock always released)
   - ``_via_mcp`` only drives when the dispatcher sets ``drive_pp_loop``; the
-    driven DecisionRecord is marked ``pp_loop_judged`` and the open-run ledger
+    driven DecisionRecord is marked ``pp_loop_terminal`` and the open-run ledger
     is drained
   - without the flag, behavior is unchanged (status="running", not judged,
     run left registered for the daemon to finish)
@@ -188,7 +188,7 @@ def test_via_mcp_drive_marks_judged_and_drains_run(monkeypatch) -> None:
     result = _via_mcp(state, pack, _inbound(state), disp)
 
     assert result.status == "done"
-    assert result.pp_loop_judged is True
+    assert result.pp_loop_terminal is True
     # The driven run was finalized → drained from the open-run ledger.
     assert all(e.get("run_id") != "run_T" for e in state.open_pp_runs)
     # The repo contract bootstrap runs before the driven stage loop.
@@ -208,7 +208,7 @@ def test_via_mcp_without_drive_flag_is_unchanged(monkeypatch) -> None:
     result = _via_mcp(state, pack, _inbound(state), disp)
 
     assert result.status == "running"
-    assert result.pp_loop_judged is False
+    assert result.pp_loop_terminal is False
     # No drive loop ran — only the scaffold + AGENTS/CLAUDE bootstrap happened.
     assert disp.tool_seq() == ["start_run", "ensure_agents_md"]
     # The run stays registered for the daemon / abort path to finalize.
@@ -381,3 +381,38 @@ def test_cost_accumulated_even_when_generate_fails() -> None:
     assert out["stage_outcome"] == "error"
     assert out["cost_usd"] >= 0.03             # cost STILL charged (the fix)
     assert out["tokens_in"] >= 5
+
+
+def test_drive_loop_emits_trace_events_when_workflow_id_set(monkeypatch) -> None:
+    """F11-trace: with a workflow_id wired, the driven loop emits per-attempt
+    judge.verdict + a terminal stage_outcome_set (it bypasses the supervisor
+    judge plane, so these were previously invisible in the hydra trace)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr("hydra_core.telemetry.emit",
+                        lambda _root, _wf, kind, payload: events.append((kind, payload)))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+
+    _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x",
+        workflow_id="wf-123")
+
+    kinds = [k for (k, _p) in events]
+    assert "judge.verdict" in kinds
+    assert "stage_outcome_set" in kinds
+    # The verdict event carries producer + cross_vendor for audit.
+    jv = next(p for (k, p) in events if k == "judge.verdict")
+    assert jv["judge_producer"] == "codex"
+    assert "cross_vendor" in jv
+
+
+def test_drive_loop_no_trace_without_workflow_id(monkeypatch) -> None:
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    events: list = []
+    monkeypatch.setattr("hydra_core.telemetry.emit",
+                        lambda *_a, **_k: events.append(1))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    _drive_pp_stage_loop(disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert events == []   # no workflow_id -> no trace writes
