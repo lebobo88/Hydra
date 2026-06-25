@@ -19,7 +19,9 @@ performed by an injected `Dispatcher` strategy so unit tests and other hosts
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -451,6 +453,54 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
     )
 
 
+def _run_claude_cli(
+    prompt: str, *, cwd: str, model: str | None = None, timeout_s: int = 1800,
+) -> str:
+    """Headless Claude engineer — run the `claude` CLI to write code in ``cwd``.
+
+    Claude-tier generation for the pp engineering stage (no codex). Opt-in via
+    ``HYDRA_CLAUDE_ENGINEER=1``; model from ``HYDRA_CLAUDE_MODEL`` (default opus).
+    Inherits the env (incl. ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write
+    block sanctions the engineer's edits).
+    """
+    mdl = model or os.environ.get("HYDRA_CLAUDE_MODEL") or "claude-opus-4-8"
+    try:
+        res = subprocess.run(
+            ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
+             "--model", mdl, "--add-dir", cwd],
+            cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+        )
+        txt = res.stdout or ""
+        if res.returncode != 0 and res.stderr:
+            txt += f"\n[claude stderr] {res.stderr[-800:]}"
+        return txt or "(claude returned no output)"
+    except Exception as e:  # noqa: BLE001 — never crash the loop on a CLI hiccup
+        return f"[claude-cli error] {e!r}"
+
+
+def _claude_critique(artifact_text: str, rubric_md: str, cwd: str) -> dict[str, Any]:
+    """Same-vendor Claude judge — critique the change, return the pp critique
+    shape (``{parsed:{outcome,critique_md,score}}``). Uses a DIFFERENT Claude
+    model from the generator (sonnet) so it is same-vendor / different-model."""
+    prompt = (
+        "You are a SAME-VENDOR code judge. Do NOT edit any files. Evaluate the "
+        "engineering change summary below against the rubric. Respond with ONLY a "
+        'single-line JSON object: {"outcome":"pass|revise|fail","critique_md":'
+        '"<=400 chars","score":{"correctness":0-1,"adherence":0-1,'
+        '"absence_of_regressions":0-1}}.\n\n'
+        f"RUBRIC:\n{rubric_md}\n\nCHANGE SUMMARY:\n{artifact_text[:6000]}"
+    )
+    raw = _run_claude_cli(
+        prompt, cwd=cwd, model="claude-sonnet-4-6", timeout_s=300)
+    try:
+        s = raw[raw.index("{"): raw.rindex("}") + 1]
+        parsed = json.loads(s)
+    except Exception:  # noqa: BLE001 — degrade to revise on unparseable judge output
+        parsed = {"outcome": "revise", "critique_md": raw[:1000], "score": {}}
+    return {"parsed": parsed, "model": "claude-sonnet-4-6",
+            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
+
+
 def _drive_generate(
     dispatcher: "Dispatcher", *, prompt: str, project_path: str,
     model_tier: str | None, sq: str,
@@ -472,6 +522,12 @@ def _drive_generate(
     ``pp_codex.generate`` MCP shape (``{"status","result":{text,cost_usd,...}}``)
     the loop already consumes via ``_pp_inner``.
     """
+    # Claude-tier generation (opt-in HYDRA_CLAUDE_ENGINEER=1): run the `claude`
+    # CLI headlessly as the engineer — Claude writes code in the worktree, no
+    # codex. Keeps Hydra→pp intact; producer="claude".
+    if os.environ.get("HYDRA_CLAUDE_ENGINEER") == "1":
+        txt = _run_claude_cli(prompt, cwd=project_path)
+        return {"status": "done", "result": {"text": txt, "cost_usd": 0.0}}, "claude"
     run_host = getattr(dispatcher, "run_host_agent", None)
     if callable(run_host):
         try:
@@ -699,12 +755,21 @@ def _drive_pp_stage_loop(
             # is SAME-vendor (different model id where available) at same-or-higher
             # tier — marked degraded so the weaker guarantee is visible downstream.
             cross_vendor = producer != "codex"
-            crit = cm("pp_codex", "critique", {
-                "artifact_text": gen_text or "(no diff summary returned)",
-                "rubric_md": rubric_body,
-                "cwd": project_path,
-            }, squad_id=sq)
-            ci = _pp_inner(crit)
+            claude_judge = os.environ.get("HYDRA_CLAUDE_ENGINEER") == "1"
+            if claude_judge:
+                # Same-vendor Claude judging (operator directive): a Claude
+                # critique (sonnet) of the Claude-generated change. No codex.
+                cross_vendor = False
+                ci = _claude_critique(
+                    gen_text or "(no diff summary returned)",
+                    rubric_body, project_path)
+            else:
+                crit = cm("pp_codex", "critique", {
+                    "artifact_text": gen_text or "(no diff summary returned)",
+                    "rubric_md": rubric_body,
+                    "cwd": project_path,
+                }, squad_id=sq)
+                ci = _pp_inner(crit)
             # F6: critique cost counts toward the run's budget charge too.
             out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
             out["tokens_in"] += int(ci.get("tokens_in") or 0)
@@ -723,7 +788,7 @@ def _drive_pp_stage_loop(
                 try:
                     cm("pp_harness", "record_verdict", {
                         "attempt_id": attempt_id,
-                        "judge_producer": "codex",
+                        "judge_producer": "claude" if claude_judge else "codex",
                         "judge_model_id": str(ci.get("model") or "codex-default"),
                         "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
                         "critique_md": str(critique_md)[:4000],
