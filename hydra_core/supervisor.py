@@ -77,6 +77,17 @@ _FORWARD_TARGET_BY_TYPE: dict[str, str] = {
 }
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def _resolve_forward_target(env: "Any", producer_slug: str) -> "str | None":
     """Resolve the squad an emitted delegation envelope should forward to.
 
@@ -346,17 +357,23 @@ def build_supervisor(
         # best-effort — if the daemon is still down, the spool stays and
         # the next workflow will retry.
         eights.workflow_id = str(state.workflow_id)
+        replay_cap = _env_positive_int("HYDRA_EIGHTS_REPLAY_MAX_REPLAYS", 1)
         try:
-            replay_summary = eights.replay_pending()
-        except Exception:  # noqa: BLE001 — never crash intake on replay
-            replay_summary = {"sent": 0, "failed": 0, "skipped": 0}
-        if any(replay_summary.values()):
-            emit_trace(
-                judge_trace_root,
-                state.workflow_id,
-                "supervisor.eights_replay",
-                replay_summary,
+            eights.replay_pending_async(
+                max_replays=replay_cap,
+                on_complete=lambda replay_summary: (
+                    emit_trace(
+                        judge_trace_root,
+                        state.workflow_id,
+                        "supervisor.eights_replay",
+                        replay_summary,
+                    )
+                    if any(replay_summary.values())
+                    else None
+                ),
             )
+        except Exception:  # noqa: BLE001 — never crash intake on replay
+            pass
 
         # --repo <id> extraction: parse an optional --repo token from the goal
         # text and set state.target_repo_id. An unknown id is a user error —

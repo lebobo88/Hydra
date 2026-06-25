@@ -159,3 +159,73 @@ def test_success_then_teardown_error_still_returns_done(monkeypatch, disp):
     # call_tool succeeded; __aexit__ raising must NOT lose the captured result.
     assert res["status"] == "done"
     assert sess.call_count == 1
+
+
+def test_eights_calls_reuse_one_pooled_session(monkeypatch, disp):
+    sess = _FakeSession()
+    enters = {"stdio": 0}
+    disp._servers["eights"] = {"command": "noop", "args": []}
+
+    class _CountingStdioCtx:
+        async def __aenter__(self):
+            enters["stdio"] += 1
+            return (None, None)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    mcp = types.ModuleType("mcp")
+    mcp.ClientSession = lambda read, write: sess
+    mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
+    client = types.ModuleType("mcp.client")
+    stdio = types.ModuleType("mcp.client.stdio")
+    stdio.stdio_client = lambda params: _CountingStdioCtx()
+    monkeypatch.setitem(sys.modules, "mcp", mcp)
+    monkeypatch.setitem(sys.modules, "mcp.client", client)
+    monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
+
+    first = disp.call_mcp("eights", "eights.constitution.attest", {})
+    second = disp.call_mcp("eights", "eights.hydra.envelope.record", {})
+
+    assert first["status"] == "done"
+    assert second["status"] == "done"
+    assert enters["stdio"] == 1
+    assert sess.init_count == 1
+    assert sess.call_count == 2
+
+
+def test_eights_concurrent_connect_is_single_flight(monkeypatch, disp):
+    sess = _FakeSession()
+    enters = {"stdio": 0}
+    disp._servers["eights"] = {"command": "noop", "args": []}
+
+    class _CountingStdioCtx:
+        async def __aenter__(self):
+            enters["stdio"] += 1
+            await asyncio.sleep(0)
+            return (None, None)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    mcp = types.ModuleType("mcp")
+    mcp.ClientSession = lambda read, write: sess
+    mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
+    client = types.ModuleType("mcp.client")
+    stdio = types.ModuleType("mcp.client.stdio")
+    stdio.stdio_client = lambda params: _CountingStdioCtx()
+    monkeypatch.setitem(sys.modules, "mcp", mcp)
+    monkeypatch.setitem(sys.modules, "mcp.client", client)
+    monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
+
+    async def _concurrent_connect():
+        return await asyncio.gather(
+            disp._get_or_connect_pooled_session("eights"),
+            disp._get_or_connect_pooled_session("eights"),
+        )
+
+    first, second = disp._run(_concurrent_connect())
+
+    assert first is second
+    assert enters["stdio"] == 1
+    assert sess.init_count == 1

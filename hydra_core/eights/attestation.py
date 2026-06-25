@@ -22,12 +22,13 @@ Per `AGENTS.md` layering:
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..immortal_head import ConstitutionSnapshot
-from .pending_spool import PendingSpool
+from .pending_spool import PendingSpool, SpooledCall
 
 
 # MCP server slug the eights-daemon registers under. The user-scope
@@ -46,6 +47,9 @@ _SPOOLABLE_TOOLS = frozenset({
     "eights.governance.hitl.request",
     "eights.evolution.propose",
 })
+
+_REPLAY_THREADS: dict[str, threading.Thread] = {}
+_REPLAY_THREADS_LOCK = threading.Lock()
 
 
 @dataclass
@@ -66,6 +70,43 @@ class EightsAttestor:
     enabled: bool = True
     workflow_id: Optional[str] = None
     spool: PendingSpool = field(default_factory=PendingSpool)
+    _dispatch_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+
+    @staticmethod
+    def _is_success_envelope(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        status = result.get("status")
+        if status is None:
+            return True
+        return status in {"done", "ok", "complete"}
+
+    @staticmethod
+    def _is_advisory_constitution_rejection(tool: str, result: Any) -> bool:
+        if tool != "eights.constitution.attest" or not isinstance(result, dict):
+            return False
+        if result.get("status") != "rejected":
+            return False
+        if result.get("hitl_required") is True:
+            return True
+        err = str(result.get("error") or "").lower()
+        return "operator capability" in err or "capability token" in err
+
+    @staticmethod
+    def _failure_reason(result: Any) -> str:
+        if not isinstance(result, dict):
+            return "daemon_unavailable"
+        status = str(result.get("status") or "daemon_unavailable")
+        if result.get("hitl_required") is True:
+            return f"{status}:hitl_required"
+        err = str(result.get("error") or "").strip()
+        if err:
+            return f"{status}:{err[:120]}"
+        return status
 
     def _eights_envelope(self, *, workflow_id: Optional[str] = None) -> dict[str, Any]:
         """Build a TheEights-compatible envelope from workflow context.
@@ -85,21 +126,24 @@ class EightsAttestor:
             "trace_id": str(workflow_id or self.workflow_id or "no-workflow"),
         }
 
+    def _dispatch_call(self, tool: str, args: dict[str, Any]) -> Any:
+        with self._dispatch_lock:
+            return self.dispatcher.call_mcp(self.server, tool, args)
+
     def _call(self, tool: str, args: dict) -> Optional[dict]:
         if not self.enabled or self.dispatcher is None:
             self._maybe_spool(tool, args, reason="eights_disabled_or_no_dispatcher")
             return None
         call_args = {"envelope": self._eights_envelope(), **args}
         try:
-            result = self.dispatcher.call_mcp(self.server, tool, call_args)
+            result = self._dispatch_call(tool, call_args)
         except Exception as exc:  # noqa: BLE001 — fail-soft, spool the payload
             self._maybe_spool(tool, args, reason=f"exception:{type(exc).__name__}")
             return None
-        if not isinstance(result, dict):
-            self._maybe_spool(tool, args, reason="non_dict_result")
+        if self._is_advisory_constitution_rejection(tool, result):
             return None
-        if result.get("status") == "failed":
-            self._maybe_spool(tool, args, reason="daemon_status_failed")
+        if not self._is_success_envelope(result):
+            self._maybe_spool(tool, args, reason=self._failure_reason(result))
             return None
         inner = result.get("result", result)
         return inner if isinstance(inner, dict) else None
@@ -119,7 +163,13 @@ class EightsAttestor:
         except Exception:  # noqa: BLE001 — spool write must never crash dispatch
             pass
 
-    def replay_pending(self) -> dict[str, int]:
+    def replay_pending(
+        self,
+        *,
+        max_replays: int | None = None,
+        max_attempts: int = 5,
+        max_age_hours: float = 24.0,
+    ) -> dict[str, int]:
         """Drain the pending-call spool by re-issuing each call to the daemon.
 
         Called by `node_intake` at the start of every workflow so the spool
@@ -130,18 +180,73 @@ class EightsAttestor:
         if not self.enabled or self.dispatcher is None:
             return {"sent": 0, "failed": 0, "skipped": 0}
 
-        def _send(tool: str, args: dict[str, Any]) -> Any:
-            envelope = self.dispatcher.call_mcp(self.server, tool, args)
-            if not isinstance(envelope, dict):
-                return None
-            if envelope.get("status") == "failed":
+        def _send(spooled_call: SpooledCall) -> Any:
+            args = {
+                "envelope": self._eights_envelope(workflow_id=spooled_call.workflow_id),
+                **dict(spooled_call.args or {}),
+            }
+            envelope = self._dispatch_call(spooled_call.tool, args)
+            if self._is_advisory_constitution_rejection(spooled_call.tool, envelope):
+                return {"status": "done", "advisory_degraded": True}
+            if not self._is_success_envelope(envelope):
                 return None
             return envelope
 
         try:
-            return self.spool.replay(_send)
+            return self.spool.replay(
+                _send,
+                max_replays=max_replays,
+                max_attempts=max_attempts,
+                max_age_hours=max_age_hours,
+            )
         except Exception:  # noqa: BLE001
             return {"sent": 0, "failed": 0, "skipped": 0}
+
+    def replay_pending_async(
+        self,
+        *,
+        max_replays: int | None = None,
+        max_attempts: int = 5,
+        max_age_hours: float = 24.0,
+        on_complete: Callable[[dict[str, int]], None] | None = None,
+    ) -> bool:
+        """Kick off a single-flight background replay for this spool root.
+
+        Intake uses this so a slow eights drain never stalls the workflow.
+        At most one replay worker runs per spool root inside this process.
+        """
+        if not self.enabled or self.dispatcher is None:
+            return False
+        spool_key = str(self.spool.root.resolve(strict=False))
+
+        def _worker() -> None:
+            summary = self.replay_pending(
+                max_replays=max_replays,
+                max_attempts=max_attempts,
+                max_age_hours=max_age_hours,
+            )
+            if on_complete is not None:
+                try:
+                    on_complete(summary)
+                except Exception:  # noqa: BLE001 — replay completion must stay fail-soft
+                    pass
+            with _REPLAY_THREADS_LOCK:
+                current = _REPLAY_THREADS.get(spool_key)
+                if current is threading.current_thread():
+                    _REPLAY_THREADS.pop(spool_key, None)
+
+        with _REPLAY_THREADS_LOCK:
+            current = _REPLAY_THREADS.get(spool_key)
+            if current is not None and current.is_alive():
+                return False
+            thread = threading.Thread(
+                target=_worker,
+                name=f"hydra-eights-replay-{Path(spool_key).name}",
+                daemon=True,
+            )
+            _REPLAY_THREADS[spool_key] = thread
+        thread.start()
+        return True
 
     def pending_count(self) -> int:
         try:

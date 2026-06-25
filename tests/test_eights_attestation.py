@@ -1,7 +1,10 @@
 """Tests for the eights-attestation adapter and supervisor wiring."""
 from __future__ import annotations
 
+import time
+import threading
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 from hydra_core.eights.attestation import EightsAttestor, EIGHTS_MCP_SERVER
@@ -176,6 +179,69 @@ def test_supervisor_calls_eights_envelope_record():
     assert "eights.constitution.attest" in tools_called
     assert "eights.governance.ceiling.tick" in tools_called
     assert "eights.hydra.envelope.record" in tools_called
+
+
+def test_supervisor_intake_replay_is_bounded(monkeypatch):
+    from hydra_core.supervisor import build_supervisor
+
+    class _BoundedReplayEights:
+        workflow_id = ""
+
+        def __init__(self) -> None:
+            self.kwargs: dict[str, int] | None = None
+
+        def replay_pending_async(self, **kwargs):
+            self.kwargs = kwargs
+            return True
+
+        def constitution_attest(self, *a, **kw): return {}
+        def ceiling_tick(self, **kw): return None
+        def envelope_record(self, *a, **kw): return None
+        def hitl_request(self, *a, **kw): return None
+
+    fake_eights = _BoundedReplayEights()
+    monkeypatch.setenv("HYDRA_EIGHTS_REPLAY_MAX_REPLAYS", "2")
+
+    with patch("hydra_core.supervisor.EightsAttestor", return_value=fake_eights):
+        sup = build_supervisor(
+            project_root=HYDRA_ROOT,
+            dispatcher=_NullDispatcher(),
+            critique_client=_PassClient(),
+            force_pure_python=True,
+        )
+        state = HydraState(root_goal="quick refresh")
+        sup.invoke(state)
+
+    assert fake_eights.kwargs is not None
+    assert fake_eights.kwargs["max_replays"] == 2
+    assert callable(fake_eights.kwargs["on_complete"])
+
+
+def test_replay_pending_async_is_single_flight_and_non_blocking():
+    attestor = EightsAttestor(dispatcher=_NullDispatcher())
+    release = threading.Event()
+
+    def _slow_replay(**_kwargs):
+        release.wait(timeout=1.0)
+        return {"sent": 1, "failed": 0, "skipped": 0}
+
+    with patch.object(attestor, "replay_pending", side_effect=_slow_replay) as replay:
+        started = time.perf_counter()
+        first = attestor.replay_pending_async(max_replays=1)
+        elapsed = time.perf_counter() - started
+        second = attestor.replay_pending_async(max_replays=1)
+        deadline = time.time() + 1.0
+        while replay.call_count == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        release.set()
+        deadline = time.time() + 1.0
+        while replay.call_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+
+    assert first is True
+    assert second is False
+    assert elapsed < 0.05
+    assert replay.call_count == 1
 
 
 # ---------------- memory federation ----------------

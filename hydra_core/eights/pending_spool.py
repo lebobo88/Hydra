@@ -33,12 +33,13 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
 DEFAULT_SPOOL_ROOT = Path.home() / ".hydra" / "eights-pending"
+DEFAULT_DEAD_LETTER_ROOT = Path.home() / ".hydra" / "eights-pending-dead"
 
 
 @dataclass
@@ -52,6 +53,7 @@ class SpooledCall:
     tool: str
     args: dict[str, Any]
     spooled_at: str  # ISO-8601 UTC
+    attempts: int = 0
     workflow_id: str | None = None
     reason: str = ""
 
@@ -62,6 +64,7 @@ class SpooledCall:
                 "tool": self.tool,
                 "args": self.args,
                 "spooled_at": self.spooled_at,
+                "attempts": self.attempts,
                 "workflow_id": self.workflow_id,
                 "reason": self.reason,
             },
@@ -78,6 +81,7 @@ class SpooledCall:
             tool=str(d["tool"]),
             args=dict(d.get("args") or {}),
             spooled_at=str(d.get("spooled_at") or ""),
+            attempts=int(d.get("attempts") or 0),
             workflow_id=d.get("workflow_id"),
             reason=str(d.get("reason") or ""),
         )
@@ -91,8 +95,18 @@ class PendingSpool:
     files gracefully so two workflows draining the same spool race-safely.
     """
 
-    def __init__(self, root: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        *,
+        dead_letter_root: Path | str | None = None,
+    ) -> None:
         self.root = Path(root) if root is not None else DEFAULT_SPOOL_ROOT
+        self.dead_letter_root = (
+            Path(dead_letter_root)
+            if dead_letter_root is not None
+            else DEFAULT_DEAD_LETTER_ROOT
+        )
         # Lazy mkdir — the spool only materializes when something is spooled
         # so a clean install with healthy eights never creates the directory.
 
@@ -153,27 +167,32 @@ class PendingSpool:
 
     def replay(
         self,
-        send_fn: Callable[[str, dict[str, Any]], Any],
+        send_fn: Callable[[SpooledCall], Any],
         *,
         max_replays: int | None = None,
+        max_attempts: int = 5,
+        max_age_hours: float = 24.0,
     ) -> dict[str, int]:
-        """Drain the spool by invoking send_fn(tool, args) per record.
+        """Drain the spool by invoking ``send_fn(spooled_call)`` per record.
 
         send_fn must return a truthy value on success or raise / return None
         on failure. On success the spool file is deleted. On failure the
-        file is left in place for the next replay attempt.
+        file is left in place for the next replay attempt until ``attempts``
+        exceeds ``max_attempts``. Entries older than ``max_age_hours`` or
+        entries that exceed ``max_attempts`` are moved to the dead-letter
+        directory instead of retrying forever.
 
         Returns a summary dict: ``{"sent": N, "failed": M, "skipped": K}``.
         ``skipped`` counts files that were corrupt or already deleted by
-        a concurrent replay.
+        a concurrent replay, plus entries dead-lettered without a replay
+        attempt because they expired their TTL.
         """
         sent = failed = skipped = 0
         if not self.root.is_dir():
             return {"sent": sent, "failed": failed, "skipped": skipped}
 
-        for i, path in enumerate(self._iter_pending_files()):
-            if max_replays is not None and i >= max_replays:
-                break
+        replayed = 0
+        for path in self._iter_pending_files():
             try:
                 raw = path.read_text(encoding="utf-8")
                 sc = SpooledCall.from_json(raw)
@@ -183,13 +202,29 @@ class PendingSpool:
             except Exception:  # noqa: BLE001
                 skipped += 1
                 continue
+            if self._is_expired(sc, max_age_hours=max_age_hours):
+                try:
+                    self._dead_letter(path, sc)
+                except FileNotFoundError:
+                    skipped += 1
+                    continue
+                except Exception:  # noqa: BLE001 — fail-soft; preserve for inspection
+                    skipped += 1
+                    continue
+                skipped += 1
+                continue
+            if max_replays is not None and replayed >= max_replays:
+                break
+            replayed += 1
             try:
-                result = send_fn(sc.tool, sc.args)
+                result = send_fn(sc)
             except Exception:  # noqa: BLE001 — leave on disk for next replay
                 failed += 1
+                self._record_failure(path, sc, max_attempts=max_attempts)
                 continue
             if not result:
                 failed += 1
+                self._record_failure(path, sc, max_attempts=max_attempts)
                 continue
             try:
                 path.unlink()
@@ -205,3 +240,35 @@ class PendingSpool:
         if not self.root.is_dir():
             return iter(())
         return iter(sorted(p for p in self.root.iterdir() if p.suffix == ".json"))
+
+    def _record_failure(self, path: Path, sc: SpooledCall, *, max_attempts: int) -> None:
+        sc.attempts += 1
+        if sc.attempts > max_attempts:
+            self._write_call(path, sc)
+            self._dead_letter(path, sc)
+            return
+        self._write_call(path, sc)
+
+    def _write_call(self, path: Path, sc: SpooledCall) -> None:
+        partial_path = path.with_suffix(f"{path.suffix}.partial")
+        partial_path.write_text(sc.to_json(), encoding="utf-8")
+        os.replace(partial_path, path)
+
+    def _dead_letter(self, path: Path, sc: SpooledCall) -> None:
+        self.dead_letter_root.mkdir(parents=True, exist_ok=True)
+        target = self.dead_letter_root / path.name
+        if target.exists():
+            target = self.dead_letter_root / f"{sc.id}-{uuid.uuid4().hex}.json"
+        os.replace(path, target)
+
+    def _is_expired(self, sc: SpooledCall, *, max_age_hours: float) -> bool:
+        if max_age_hours <= 0:
+            return False
+        try:
+            spooled_at = datetime.fromisoformat(sc.spooled_at)
+        except ValueError:
+            return False
+        if spooled_at.tzinfo is None:
+            spooled_at = spooled_at.replace(tzinfo=timezone.utc)
+        age_limit = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        return spooled_at < age_limit

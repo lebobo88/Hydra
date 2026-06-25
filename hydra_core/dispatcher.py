@@ -34,6 +34,14 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _PooledMcpSession:
+    stdio_cm: Any
+    session_cm: Any
+    session: Any
+    tools: set[str] | None = None
+
+
 # --------- helpers ---------
 
 def _strip_comments(spec: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +165,7 @@ class MCPStdioDispatcher:
         "start_stage", "start_best_of_stage", "record_attempt",
         "retry_with_critique",
     })
+    _POOLED_SERVERS = frozenset({"eights"})
 
     def __init__(self, project_root: Path, *, verbose: bool = False):
         self.project_root = project_root
@@ -168,6 +177,8 @@ class MCPStdioDispatcher:
         self._squad_packs: dict[str, Any] = {}
         self._active_handoffs: list[dict[str, Any]] = []
         self._tool_tracker: Any = None
+        self._pooled_sessions: dict[str, _PooledMcpSession] = {}
+        self._pooled_session_locks: dict[str, asyncio.Lock] = {}
 
     def set_squad_packs(self, packs: dict[str, Any]) -> None:
         """Inject discovered squad packs for RBAC enforcement."""
@@ -266,7 +277,10 @@ class MCPStdioDispatcher:
             return venom_block
         import time as _time
         _t0 = _time.monotonic()
-        result = self._run(self._async_call(server, tool, args))
+        if server in self._POOLED_SERVERS:
+            result = self._run(self._async_call_pooled(server, tool, args))
+        else:
+            result = self._run(self._async_call(server, tool, args))
         _dur = (_time.monotonic() - _t0) * 1000
         status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
         self._record_tool_usage(server, tool, squad_id, status, _dur)
@@ -399,6 +413,13 @@ class MCPStdioDispatcher:
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)
+
+    def _pooled_session_lock(self, server: str) -> asyncio.Lock:
+        lock = self._pooled_session_locks.get(server)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pooled_session_locks[server] = lock
+        return lock
 
     async def _async_call(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -587,6 +608,168 @@ class MCPStdioDispatcher:
             "error": f"{type(last_connect_exc).__name__}: {last_connect_exc!s}",
             "server": server, "tool": tool,
         }
+
+    async def _async_call_pooled(self, server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            pooled = await self._get_or_connect_pooled_session(server)
+        except ImportError as e:
+            return {"status": "failed", "error": f"mcp SDK not installed: {e!r}"}
+        except KeyError:
+            return {
+                "status": "failed",
+                "error": (
+                    f"server {server!r} not registered in backends.json, "
+                    f"~/.claude.json, or .mcp.json. "
+                    f"Known: {sorted(self._servers)[:10]}"
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc!s}",
+                "server": server,
+                "tool": tool,
+            }
+
+        if self.verbose and pooled.tools is None:
+            try:
+                tools = await asyncio.wait_for(
+                    pooled.session.list_tools(), self._connect_timeout()
+                )
+                pooled.tools = {t.name for t in tools.tools}
+            except Exception:  # noqa: BLE001 — fail-soft; the call itself still proceeds
+                pooled.tools = None
+        if self.verbose and pooled.tools is not None and tool not in pooled.tools:
+            return {
+                "status": "failed",
+                "error": f"tool {tool!r} not exposed by {server!r}",
+                "available": sorted(pooled.tools)[:30],
+            }
+
+        _eff_timeout = self._resolve_tool_timeout(server, tool)
+        try:
+            result = await asyncio.wait_for(
+                pooled.session.call_tool(tool, args), _eff_timeout
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            await self._drop_pooled_session(server)
+            return {
+                "status": "failed",
+                "timeout": True,
+                "error": (
+                    f"tool {tool!r} on {server!r} timed out "
+                    f"after {_eff_timeout}s"
+                ),
+                "server": server, "tool": tool,
+                "phase": "call_tool", "timeout_s": _eff_timeout,
+            }
+        except Exception as call_exc:
+            await self._drop_pooled_session(server)
+            return {
+                "status": "failed",
+                "error": (
+                    f"call_tool raised after connect: "
+                    f"{type(call_exc).__name__}: {call_exc!s}"
+                ),
+                "server": server, "tool": tool,
+            }
+
+        _extracted = _extract_mcp_result(result)
+        if getattr(result, "isError", False) is True:
+            return {
+                "status": "failed", "tool": tool, "server": server,
+                "result": _extracted,
+                "error": (
+                    _extracted if isinstance(_extracted, str)
+                    else str(_extracted)
+                ),
+            }
+        return {"status": "done", "tool": tool, "result": _extracted}
+
+    async def _get_or_connect_pooled_session(self, server: str) -> _PooledMcpSession:
+        cached = self._pooled_sessions.get(server)
+        if cached is not None:
+            return cached
+        async with self._pooled_session_lock(server):
+            cached = self._pooled_sessions.get(server)
+            if cached is not None:
+                return cached
+
+            try:
+                from mcp import ClientSession, StdioServerParameters  # type: ignore
+                from mcp.client.stdio import stdio_client  # type: ignore
+            except ImportError:
+                raise
+
+            spec = self._servers.get(server)
+            if spec is None:
+                raise KeyError(server)
+
+            params = StdioServerParameters(
+                command=spec["command"],
+                args=list(spec.get("args", [])),
+                env=spec.get("env"),
+                cwd=spec.get("cwd"),
+            )
+
+            import hashlib as _hashlib
+
+            _MAX_CONNECT_ATTEMPTS = 3
+            last_connect_exc: Exception | None = None
+            for _connect_attempt in range(1, _MAX_CONNECT_ATTEMPTS + 1):
+                stdio_cm = None
+                session_cm = None
+                try:
+                    stdio_cm = stdio_client(params)
+                    read, write = await asyncio.wait_for(
+                        stdio_cm.__aenter__(), self._connect_timeout()
+                    )
+                    session_cm = ClientSession(read, write)
+                    session = await session_cm.__aenter__()
+                    await asyncio.wait_for(
+                        session.initialize(), self._connect_timeout()
+                    )
+                    pooled = _PooledMcpSession(
+                        stdio_cm=stdio_cm,
+                        session_cm=session_cm,
+                        session=session,
+                    )
+                    self._pooled_sessions[server] = pooled
+                    return pooled
+                except Exception as exc:  # noqa: BLE001
+                    last_connect_exc = exc
+                    await self._close_partial_pool(stdio_cm, session_cm)
+                    if _connect_attempt < _MAX_CONNECT_ATTEMPTS:
+                        _seed = (server + str(_connect_attempt)).encode()
+                        _n = int.from_bytes(
+                            _hashlib.sha256(_seed).digest()[:4], "big"
+                        ) % 400
+                        _jitter_s = 0.1 + _n / 1000.0
+                        await asyncio.sleep(_jitter_s)
+                        logger.debug(
+                            "MCP pooled connect attempt %d/%d for %s failed (%s); retrying in %.3fs",
+                            _connect_attempt, _MAX_CONNECT_ATTEMPTS, server,
+                            type(exc).__name__, _jitter_s,
+                        )
+            raise RuntimeError(f"{type(last_connect_exc).__name__}: {last_connect_exc!s}")
+
+    async def _drop_pooled_session(self, server: str) -> None:
+        pooled = self._pooled_sessions.pop(server, None)
+        if pooled is None:
+            return
+        await self._close_partial_pool(pooled.stdio_cm, pooled.session_cm)
+
+    async def _close_partial_pool(self, stdio_cm: Any, session_cm: Any) -> None:
+        if session_cm is not None:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+        if stdio_cm is not None:
+            try:
+                await stdio_cm.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _extract_mcp_result(result: Any) -> Any:
