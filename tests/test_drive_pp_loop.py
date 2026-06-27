@@ -16,6 +16,7 @@ scaffolds) and its integration into ``_via_mcp``:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -416,3 +417,115 @@ def test_drive_loop_no_trace_without_workflow_id(monkeypatch) -> None:
     disp = _ScriptedDispatcher(_happy_responses("pass"))
     _drive_pp_stage_loop(disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
     assert events == []   # no workflow_id -> no trace writes
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1: Claude is the generator whenever a Claude capability is attached;
+# codex is reserved for cross-vendor judging (never generation) in that case.
+# --------------------------------------------------------------------------- #
+from hydra_core.squad_node import (  # noqa: E402
+    _claude_cli_generation_enabled,
+    _drive_generate,
+    _parse_claude_cli_result,
+)
+
+
+class _LiveDispatcher(_ScriptedDispatcher):
+    """Scripted dispatcher that reports a real live-execution capability
+    (mirrors MCPStdioDispatcher.live_execution=True)."""
+
+    def __init__(self, responses, **kw):
+        super().__init__(responses, **kw)
+        self.live_execution = True
+
+
+def test_claude_cli_gate_precedence(monkeypatch) -> None:
+    live = _LiveDispatcher(_happy_responses())
+    testd = _ScriptedDispatcher(_happy_responses())  # no live_execution
+
+    # Disable flag beats everything (true-headless CI where codex is the only gen).
+    monkeypatch.setenv("HYDRA_DISABLE_CLAUDE_ENGINEER", "1")
+    monkeypatch.setenv("HYDRA_CLAUDE_ENGINEER", "1")
+    assert _claude_cli_generation_enabled(live) is False
+    monkeypatch.delenv("HYDRA_DISABLE_CLAUDE_ENGINEER", raising=False)
+
+    # Explicit force-on works regardless of live/claude detection.
+    assert _claude_cli_generation_enabled(testd) is True
+    monkeypatch.delenv("HYDRA_CLAUDE_ENGINEER", raising=False)
+
+    # Auto: requires BOTH a live dispatcher AND `claude` on PATH.
+    monkeypatch.setattr("hydra_core.squad_node.shutil.which",
+                        lambda _n: "/usr/bin/claude")
+    assert _claude_cli_generation_enabled(live) is True
+    assert _claude_cli_generation_enabled(testd) is False   # not a live dispatcher
+    monkeypatch.setattr("hydra_core.squad_node.shutil.which", lambda _n: None)
+    assert _claude_cli_generation_enabled(live) is False     # claude absent
+
+
+def test_drive_generate_uses_claude_cli_when_enabled(monkeypatch) -> None:
+    disp = _ScriptedDispatcher(_happy_responses())
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {
+            "text": "edited foo.py", "model": "claude-opus-4-8",
+            "cost_usd": 0.07, "tokens_in": 9, "tokens_out": 11, "status": "done"})
+
+    gen, producer = _drive_generate(
+        disp, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+
+    assert producer == "claude"
+    inner = gen["result"]
+    assert inner["cost_usd"] == 0.07 and inner["model"] == "claude-opus-4-8"
+    # Generation NEVER touched codex.
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_drive_generate_host_none_falls_through_to_claude_cli(monkeypatch) -> None:
+    """A host capability that is present but returns None (host bridge not ready)
+    must fall through to the Claude CLI when available — NEVER to codex."""
+    host = _HostDispatcher(_happy_responses(), host_result=None)
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {"text": "edited", "model": "claude-x",
+                                "cost_usd": 0.01, "status": "done"})
+
+    gen, producer = _drive_generate(
+        host, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+
+    assert producer == "claude"
+    assert host.host_calls            # the host engineer was attempted first
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _a) in host.calls}
+
+
+def test_drive_generate_codex_only_when_no_claude(monkeypatch) -> None:
+    disp = _ScriptedDispatcher(_happy_responses())
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: False)
+    gen, producer = _drive_generate(
+        disp, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+    assert producer == "codex"
+    assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_parse_claude_cli_result_extracts_cost_and_degrades() -> None:
+    j = json.dumps({"result": "did it", "total_cost_usd": 0.12,
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "model": "claude-opus-4-8"})
+    out = _parse_claude_cli_result(j, "", 0, "fallback-model")
+    assert out["text"] == "did it"
+    assert out["cost_usd"] == 0.12
+    assert out["tokens_in"] == 100 and out["tokens_out"] == 50
+    assert out["model"] == "claude-opus-4-8"
+    assert out["status"] == "done"
+
+    # Non-JSON stdout degrades to raw text (cost 0 — budget blind) without crashing.
+    deg = _parse_claude_cli_result("plain text out", "", 0, "m")
+    assert deg["text"] == "plain text out" and deg["cost_usd"] == 0.0
+
+    # Non-zero exit appends the stderr tail and marks the attempt errored.
+    err = _parse_claude_cli_result("", "boom", 1, "m")
+    assert err["status"] == "error" and "boom" in err["text"]
