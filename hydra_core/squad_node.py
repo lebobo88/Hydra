@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 from uuid import uuid4
@@ -453,15 +454,57 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
     )
 
 
+def _parse_claude_cli_result(
+    stdout: str, stderr: str, returncode: int, model: str,
+) -> dict[str, Any]:
+    """Parse ``claude -p --output-format json`` into the pp-generate inner shape.
+
+    The JSON result object carries ``result`` (the final assistant text — a change
+    summary; the file edits already happened as tool side-effects), plus
+    ``total_cost_usd`` and ``usage.{input,output}_tokens``. Real model id + spend
+    flow into the budget ledger so the 80%/100% tripwires stay live. Degrade to
+    raw stdout (cost 0 — budget blind on this attempt) when the output isn't JSON.
+    """
+    text = stdout or "(claude returned no output)"
+    cost = 0.0
+    tin = tout = 0
+    mdl = model
+    try:
+        obj = json.loads(stdout)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict):
+        text = str(obj.get("result") or obj.get("text") or stdout
+                   or "(claude returned no output)")
+        cost = float(obj.get("total_cost_usd") or obj.get("cost_usd") or 0.0)
+        usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+        tin = int(usage.get("input_tokens") or 0)
+        tout = int(usage.get("output_tokens") or 0)
+        mdl = str(obj.get("model") or model)
+    if returncode != 0 and stderr:
+        text += f"\n[claude stderr] {stderr[-800:]}"
+    return {"text": text, "model": mdl, "cost_usd": cost,
+            "tokens_in": tin, "tokens_out": tout,
+            "status": "done" if returncode == 0 else "error"}
+
+
 def _run_claude_cli(
     prompt: str, *, cwd: str, model: str | None = None, timeout_s: int = 1800,
-) -> str:
-    """Headless Claude engineer — run the `claude` CLI to write code in ``cwd``.
+    read_only: bool = False,
+) -> dict[str, Any]:
+    """Headless Claude CLI in ``cwd``. Returns the pp-generate-shaped inner dict
+    ``{text, model, cost_usd, tokens_in, tokens_out, status}`` (a plain-text
+    return would leave ``cost_usd=0`` and blind the budget tripwires).
 
-    Claude-tier generation for the pp engineering stage (no codex). Opt-in via
-    ``HYDRA_CLAUDE_ENGINEER=1``; model from ``HYDRA_CLAUDE_MODEL`` (default opus).
-    Inherits the env (incl. ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write
-    block sanctions the engineer's edits).
+    Two modes:
+      - generation (``read_only=False``): ``--permission-mode acceptEdits`` so the
+        engineer writes code (model from ``HYDRA_CLAUDE_MODEL``, default opus).
+      - critique (``read_only=True``): all mutating tools are DISALLOWED so a
+        same-vendor judge can read but NEVER edit the repo (a write-capable judge
+        would contaminate the run's diff/smoke/retry).
+
+    Inherits the env (incl. ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write block
+    sanctions the engineer's edits).
     """
     mdl = model or os.environ.get("HYDRA_CLAUDE_MODEL") or "claude-opus-4-8"
     # PP-BV-ISO: the headless engineer's browser-validator must NEVER drive the
@@ -473,42 +516,76 @@ def _run_claude_cli(
     sub_env = os.environ.copy()
     sub_env.setdefault("PP_BROWSER_ENGINE", "playwright")
     sub_env.setdefault("HYDRA_PP_STAGE_ACTIVE", "1")
+    cmd = ["claude", "-p", prompt, "--model", mdl,
+           "--add-dir", cwd, "--output-format", "json"]
+    if read_only:
+        # Judge/critique must NOT mutate the repo — block every writing tool.
+        cmd += ["--disallowedTools", "Edit Write MultiEdit NotebookEdit Bash"]
+    else:
+        cmd += ["--permission-mode", "acceptEdits"]
     try:
         res = subprocess.run(
-            ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
-             "--model", mdl, "--add-dir", cwd],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
             env=sub_env,
         )
-        txt = res.stdout or ""
-        if res.returncode != 0 and res.stderr:
-            txt += f"\n[claude stderr] {res.stderr[-800:]}"
-        return txt or "(claude returned no output)"
+        return _parse_claude_cli_result(res.stdout, res.stderr, res.returncode, mdl)
     except Exception as e:  # noqa: BLE001 — never crash the loop on a CLI hiccup
-        return f"[claude-cli error] {e!r}"
+        return {"text": f"[claude-cli error] {e!r}", "model": mdl,
+                "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                "status": "error"}
 
 
 def _claude_critique(artifact_text: str, rubric_md: str, cwd: str) -> dict[str, Any]:
     """Same-vendor Claude judge — critique the change, return the pp critique
-    shape (``{parsed:{outcome,critique_md,score}}``). Uses a DIFFERENT Claude
-    model from the generator (sonnet) so it is same-vendor / different-model."""
+    shape (``{parsed:{outcome,critique_md,score}, model, cost_usd, ...}``). Uses a
+    DIFFERENT Claude model from the generator (sonnet) so it is same-vendor /
+    different-model. Used by the drive loop when pp's ``gate_eligible_judges``
+    selects a same-vendor tier for a Claude-produced change (codex is not spent)."""
     prompt = (
         "You are a SAME-VENDOR code judge. Do NOT edit any files. Evaluate the "
-        "engineering change summary below against the rubric. Respond with ONLY a "
+        "engineering change below against the rubric. Respond with ONLY a "
         'single-line JSON object: {"outcome":"pass|revise|fail","critique_md":'
         '"<=400 chars","score":{"correctness":0-1,"adherence":0-1,'
         '"absence_of_regressions":0-1}}.\n\n'
-        f"RUBRIC:\n{rubric_md}\n\nCHANGE SUMMARY:\n{artifact_text[:6000]}"
+        f"RUBRIC:\n{rubric_md}\n\nCHANGE:\n{artifact_text[:8000]}"
     )
-    raw = _run_claude_cli(
-        prompt, cwd=cwd, model="claude-sonnet-4-6", timeout_s=300)
+    res = _run_claude_cli(prompt, cwd=cwd, model="claude-sonnet-4-6", timeout_s=300,
+                          read_only=True)
+    raw = res.get("text", "")
     try:
         s = raw[raw.index("{"): raw.rindex("}") + 1]
         parsed = json.loads(s)
     except Exception:  # noqa: BLE001 — degrade to revise on unparseable judge output
         parsed = {"outcome": "revise", "critique_md": raw[:1000], "score": {}}
-    return {"parsed": parsed, "model": "claude-sonnet-4-6",
-            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
+    return {"parsed": parsed, "model": res.get("model") or "claude-sonnet-4-6",
+            "cost_usd": float(res.get("cost_usd") or 0.0),
+            "tokens_in": int(res.get("tokens_in") or 0),
+            "tokens_out": int(res.get("tokens_out") or 0)}
+
+
+def _claude_cli_generation_enabled(dispatcher: "Dispatcher") -> bool:
+    """True when engineering generation should run on the headless ``claude`` CLI
+    (Claude writes the code; codex is reserved for cross-vendor judging).
+
+    Precedence:
+      - ``HYDRA_DISABLE_CLAUDE_ENGINEER=1`` → never (true-headless CI/cron where
+        codex is the only generator available).
+      - ``HYDRA_CLAUDE_ENGINEER=1`` → always (explicit operator force-on).
+      - else AUTO: only on a real live dispatcher (``live_execution`` — not a
+        unit-test / scaffold double) with the ``claude`` CLI actually installed.
+
+    This keeps codex out of the GENERATOR role whenever a genuine Claude
+    capability is attached, without ever spawning a subprocess inside unit tests
+    (the scripted test dispatchers set no ``live_execution`` and so resolve to
+    codex, preserving the documented headless-fallback path).
+    """
+    if os.environ.get("HYDRA_DISABLE_CLAUDE_ENGINEER") == "1":
+        return False
+    if os.environ.get("HYDRA_CLAUDE_ENGINEER") == "1":
+        return True
+    if not getattr(dispatcher, "live_execution", False):
+        return False
+    return shutil.which("claude") is not None
 
 
 def _drive_generate(
@@ -517,27 +594,26 @@ def _drive_generate(
 ) -> tuple[dict[str, Any], str]:
     """Produce one code attempt for the engineering drive loop.
 
-    Producer precedence honours the engineering ``squad.yaml`` intent ("Claude
-    producer writes files locally; codex is sandboxed off the local repo this
-    env"):
+    Producer precedence (Claude generates; codex is a judge, not a generator,
+    whenever a Claude capability is attached — the engineering ``squad.yaml``
+    intent "Claude producer writes files locally; codex is sandboxed"):
       1. A host-driven Claude ``engineer`` subagent via
-         ``dispatcher.run_host_agent`` — the INTENDED producer; it edits the
-         worktree in-place. ``producer="claude"`` so the downstream codex critique
-         is genuinely CROSS-vendor.
-      2. Fallback: ``pp_codex.generate`` under ``--sandbox workspace-write`` when
-         no Claude Code host is attached (pure headless). ``producer="codex"`` —
-         the codex critique is then SAME-vendor (marked degraded).
+         ``dispatcher.run_host_agent`` — the INTENDED producer (Phase 2; edits
+         the worktree in-place). ``producer="claude"``.
+      2. The headless ``claude`` CLI engineer (``_run_claude_cli``) whenever a
+         real Claude capability is attached (``_claude_cli_generation_enabled``).
+         ``producer="claude"`` so the downstream codex critique is genuinely
+         CROSS-vendor — and generation spends NO codex quota.
+      3. Fallback: ``pp_codex.generate`` under ``--sandbox workspace-write`` ONLY
+         when no Claude capability exists (true headless CI). ``producer="codex"``
+         — the codex critique is then SAME-vendor (marked degraded) and this
+         SPENDS codex quota, so emit a warning.
 
     Returns ``(gen_envelope, producer)`` where ``gen_envelope`` matches the
     ``pp_codex.generate`` MCP shape (``{"status","result":{text,cost_usd,...}}``)
     the loop already consumes via ``_pp_inner``.
     """
-    # Claude-tier generation (opt-in HYDRA_CLAUDE_ENGINEER=1): run the `claude`
-    # CLI headlessly as the engineer — Claude writes code in the worktree, no
-    # codex. Keeps Hydra→pp intact; producer="claude".
-    if os.environ.get("HYDRA_CLAUDE_ENGINEER") == "1":
-        txt = _run_claude_cli(prompt, cwd=project_path)
-        return {"status": "done", "result": {"text": txt, "cost_usd": 0.0}}, "claude"
+    # (1) Host-driven Claude engineer subagent — the intended producer.
     run_host = getattr(dispatcher, "run_host_agent", None)
     if callable(run_host):
         try:
@@ -549,6 +625,18 @@ def _drive_generate(
             if not isinstance(inner, dict):
                 inner = {"text": str(inner)}
             return {"status": hosted.get("status", "done"), "result": inner}, "claude"
+    # (2) Headless Claude CLI engineer — default when a Claude capability is
+    #     attached. Claude writes the code; no codex spend on generation.
+    if _claude_cli_generation_enabled(dispatcher):
+        res = _run_claude_cli(prompt, cwd=project_path)
+        return {"status": res.get("status", "done"), "result": res}, "claude"
+    # (3) True-headless fallback: codex generates (and SPENDS codex quota). Warn
+    #     so the degraded, quota-consuming mode is visible in the logs/trace.
+    _log.warning(
+        "engineering generate falling back to CODEX (no Claude capability "
+        "attached) — this consumes codex quota and makes the judge same-vendor. "
+        "Install the `claude` CLI or set HYDRA_CLAUDE_ENGINEER=1 to generate "
+        "with Claude.")
     gen = dispatcher.call_mcp(
         "pp_codex", "generate",
         {"prompt": prompt, "cwd": project_path, "sandbox": "workspace-write"},
@@ -568,6 +656,81 @@ def _rubric_md(rubric_id: str) -> str:
             "and absence of regressions. Output outcome (pass/revise/fail), a "
             "critique, and per-dimension scores."
         )
+
+
+# pp's gate_eligible_judges accepts a STRICT gate_type enum; start_stage accepts
+# free-form. Map a Hydra stage kind/gate to the nearest pp gate_type.
+_PP_GATE_TYPES = frozenset(
+    {"spec", "design", "security", "contract", "code_style", "docs_polish", "lint_class"})
+_PP_GATE_TYPE_BY_KIND = {
+    "code": "code_style", "spec": "spec", "design": "design",
+    "architecture": "design", "contracts": "contract", "security": "security",
+    "tests": "lint_class", "docs": "docs_polish",
+}
+
+
+def _pp_gate_type(kind: str, gate_type: str | None = None) -> str:
+    """Map a Hydra stage to pp's strict gate_type enum for gate_eligible_judges
+    (which rejects anything outside the enum, unlike the loose start_stage)."""
+    if gate_type in _PP_GATE_TYPES:
+        return gate_type  # already a valid pp gate type
+    return _PP_GATE_TYPE_BY_KIND.get(kind, "code_style")
+
+
+def _judge_artifact_text(
+    project_path: str, changed_paths: list[str], gen_text: str,
+    max_chars: int = 14000,
+) -> str:
+    """Build the judge's artifact text: the generator summary PLUS the real
+    verbatim code — the unified diff of MODIFIED tracked files AND the full
+    content of NEW/untracked files (``git diff`` omits untracked, so a judge that
+    saw only the diff would miss brand-new files entirely). This gives the judge
+    real code instead of a prose summary, which causes false gate FAILs. Falls
+    back to the summary alone when nothing is readable. All read-only."""
+    summary = (gen_text or "").strip()
+    if not changed_paths:
+        return summary or "(no diff summary returned)"
+    parts: list[str] = []
+    budget = max_chars  # bound INTERMEDIATE accumulation, not just the final slice
+    # Modified tracked files → a real unified diff.
+    try:
+        res = subprocess.run(
+            ["git", "-C", project_path, "diff", "--", *changed_paths],
+            capture_output=True, text=True, timeout=30,
+        )
+        diff = (res.stdout or "").strip()[:budget]
+        if diff:
+            parts.append("UNIFIED DIFF (modified):\n" + diff)
+            budget -= len(diff)
+    except Exception:  # noqa: BLE001 — never block the loop on a git hiccup
+        pass
+    # New/untracked files → include their content (git diff omits them).
+    try:
+        u = subprocess.run(
+            ["git", "-C", project_path, "ls-files", "--others",
+             "--exclude-standard", "--", *changed_paths],
+            capture_output=True, text=True, timeout=15,
+        )
+        for rel in (u.stdout or "").splitlines():
+            if budget <= 0:
+                break
+            rel = rel.strip()
+            if not rel:
+                continue
+            try:
+                with open(os.path.join(project_path, rel), "r",
+                          encoding="utf-8", errors="replace") as fh:
+                    body = fh.read(min(8000, budget))
+                parts.append(f"NEW FILE {rel}:\n{body}")
+                budget -= len(body)
+            except Exception:  # noqa: BLE001 — unreadable/binary new file; skip
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    if not parts:
+        return summary or "(no diff summary returned)"
+    head = (summary + "\n\n") if summary else ""
+    return (head + "\n\n".join(parts))[:max_chars]
 
 
 def _drop_open_run(
@@ -616,7 +779,21 @@ def _drive_pp_stage_loop(
     Fail-soft: ANY exception triggers a best-effort ``finalize_run(aborted)`` to
     release the project lock, and returns ``final_status="aborted"``. NEVER
     raises — dispatch must not crash on a daemon hiccup.
+
+    Opt-in best-of-N: when ``HYDRA_BEST_OF_N=<2..8>`` is set, delegate the stage
+    to ``_drive_best_of_loop`` (N Claude candidates → Borda → merge winner). If
+    that path can't open the best-of stage it returns None and we fall through to
+    the single-candidate body below (unchanged).
     """
+    if _best_of_n():
+        _bo = _drive_best_of_loop(
+            dispatcher, run_id=run_id, project_path=project_path,
+            request_text=request_text, n=_best_of_n(), model_tier=model_tier,
+            judge_rubric_id=judge_rubric_id, workflow_id=workflow_id)
+        if _bo is not None:
+            return _bo
+        _log.warning("best-of-N could not open; falling back to single-candidate "
+                     "(run=%s)", run_id)
     sq = "engineering"
     # PP-BV-ISO: this headless driver (and every pp/codex/validator subprocess it
     # spawns) isolates browser validation from the operator's live Chrome — the
@@ -727,6 +904,12 @@ def _drive_pp_stage_loop(
                     att = cm("pp_harness", "record_attempt", {
                         "stage_id": stage_id, "producer": producer,
                         "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
+                        # A soft-block/empty failure can still be a token-consuming
+                        # generate (esp. the Claude CLI path); record its real spend
+                        # so the pp ledger matches the budget charge accrued above.
+                        "tokens_in": int(gi.get("tokens_in") or 0),
+                        "tokens_out": int(gi.get("tokens_out") or 0),
+                        "cost_usd": float(gi.get("cost_usd") or 0.0),
                         "status": fail_status, "retry_index": retry_index,
                         "notes": {"candidate_index": 1},
                         **({"parent_attempt_id": attempt_id} if attempt_id else {}),
@@ -764,27 +947,56 @@ def _drive_pp_stage_loop(
             attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
             # (generate cost already accumulated above, before the gen_fail branch)
 
-            # Judge with codex (Gemini retired — free tier dropped, 2026-06).
-            # When the producer is Claude (host engineer) codex is a genuine
-            # CROSS-vendor judge; when generation fell back to codex the critique
-            # is SAME-vendor (different model id where available) at same-or-higher
-            # tier — marked degraded so the weaker guarantee is visible downstream.
-            cross_vendor = producer != "codex"
-            claude_judge = os.environ.get("HYDRA_CLAUDE_ENGINEER") == "1"
-            if claude_judge:
-                # Same-vendor Claude judging (operator directive): a Claude
-                # critique (sonnet) of the Claude-generated change. No codex.
-                cross_vendor = False
-                ci = _claude_critique(
-                    gen_text or "(no diff summary returned)",
-                    rubric_body, project_path)
+            # Judge per pair-programmer's OWN routing rather than a hardcoded
+            # vendor. gate_eligible_judges decides cross- vs same-vendor for this
+            # gate (pp: "Driver MUST call this before invoking any judge"); we
+            # follow it. Default when the gate tool is unavailable (no daemon /
+            # scripted): prefer cross-vendor. Gemini retired 2026-06, so the
+            # cross-vendor judge is always codex.
+            gate_dec: dict[str, Any] = {}
+            try:
+                gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
+                    "gate_type": _pp_gate_type("code", "code_style"),
+                    "generator_producer": producer,
+                    "prompt_keywords": request_text[:1000],
+                }, squad_id=sq))
+            except Exception:  # noqa: BLE001 — never block the loop on a policy miss
+                gate_dec = {}
+            required_cross = bool(gate_dec.get("required_cross_vendor", True))
+            gate_rubric = str(gate_dec.get("rubric_id") or judge_rubric_id)
+            rubric_body = _rubric_md(gate_rubric)
+
+            # The judge reads the REAL diff (verbatim code), not just the
+            # generator's prose summary — a condensed summary causes false gate
+            # FAILs. Falls back to the summary when no diff is available.
+            judge_text = _judge_artifact_text(
+                project_path, sorted(run_changed), gen_text)
+
+            # Vendor selection follows the gate decision:
+            #   same-vendor + Claude producer -> a Claude critique (different
+            #     model) judges it — codex is NOT spent (the common path; keeps
+            #     scarce codex quota for the gates that truly need cross-vendor).
+            #   else -> codex critique (a genuine CROSS-vendor judge when the
+            #     producer is Claude; a SAME-vendor degraded judge only on the
+            #     true-headless codex-generated path).
+            use_claude_judge = (not required_cross) and producer == "claude"
+            if use_claude_judge:
+                ci = _claude_critique(judge_text, rubric_body, project_path)
+                judge_producer = "claude"
             else:
-                crit = cm("pp_codex", "critique", {
-                    "artifact_text": gen_text or "(no diff summary returned)",
+                ci = _pp_inner(cm("pp_codex", "critique", {
+                    "artifact_text": judge_text,
                     "rubric_md": rubric_body,
                     "cwd": project_path,
-                }, squad_id=sq)
-                ci = _pp_inner(crit)
+                }, squad_id=sq))
+                judge_producer = "codex"
+            # cross_vendor := the judge vendor differs from the producer vendor.
+            cross_vendor = judge_producer != producer
+            # _judge_degraded: cross-vendor was REQUIRED but unattainable — only
+            # when codex generated AND must self-judge (Gemini being retired). A
+            # gate-sanctioned same-vendor Claude judge is NOT degraded.
+            degraded = required_cross and not cross_vendor
+
             # F6: critique cost counts toward the run's budget charge too.
             out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
             out["tokens_in"] += int(ci.get("tokens_in") or 0)
@@ -796,27 +1008,30 @@ def _drive_pp_stage_loop(
             critique_md = parsed.get("critique_md") or parsed.get("critique") or ""
             score_json = dict(parsed.get("score") or parsed.get("score_json") or {})
             score_json["_cross_vendor"] = cross_vendor
-            if not cross_vendor:
+            score_json["_judge_tier"] = (
+                "cross_vendor" if required_cross else "same_vendor")
+            if degraded:
                 score_json["_judge_degraded"] = True
 
             if attempt_id:
                 try:
                     cm("pp_harness", "record_verdict", {
                         "attempt_id": attempt_id,
-                        "judge_producer": "claude" if claude_judge else "codex",
-                        "judge_model_id": str(ci.get("model") or "codex-default"),
+                        "judge_producer": judge_producer,
+                        "judge_model_id": str(
+                            ci.get("model") or f"{judge_producer}-default"),
                         "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
                         "critique_md": str(critique_md)[:4000],
                         "score_json": score_json,
-                        "rubric_id": judge_rubric_id,
+                        "rubric_id": gate_rubric,
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
                     pass
             # F11-trace: per-attempt verdict event (Reflexion×1 → up to 2 attempts).
             _trace("judge.verdict", {
-                "stage_id": stage_id, "rubric_id": judge_rubric_id,
+                "stage_id": stage_id, "rubric_id": gate_rubric,
                 "retry_index": retry_index, "attempt_id": attempt_id,
-                "producer": producer, "judge_producer": "codex",
+                "producer": producer, "judge_producer": judge_producer,
                 "outcome": outcome, "cross_vendor": cross_vendor,
             })
 
@@ -854,6 +1069,47 @@ def _drive_pp_stage_loop(
         out["smoke_status"] = smoke_status
         out["smoke_reason"] = smoke_reason
 
+        # PP readiness preflight: honour pair-programmer's OWN finalize gate
+        # (verdict / validator / smoke / findings-closure / hallucination rules)
+        # before claiming the stage passed. finalize_stage enforces these
+        # server-side anyway, but checking first lets us SURFACE the real blocker
+        # instead of swallowing a finalize_stage refusal. Safe default: when the
+        # tool is unavailable (no daemon / scripted) `can_pass` is absent → we do
+        # NOT downgrade (keep the smoke-based decision). For a standalone code
+        # stage (no tests_pre predecessor) pp requires no TDD rows, so a passing
+        # verdict + smoke resolves to can_pass=true.
+        if passed and not gen_failed:
+            try:
+                rd = _pp_inner(cm("pp_harness", "get_stage_finalize_readiness",
+                                  {"stage_id": stage_id}, squad_id=sq))
+            except Exception:  # noqa: BLE001
+                rd = {}
+            if rd.get("can_pass") is False:
+                na = rd.get("next_action") or "not_ready"
+                # finalize_stage AUTO-RUNS missing validator / TDD gate rows, so a
+                # "missing row" next_action is NOT a real block — defer it to
+                # finalize_stage. Only surface on TERMINAL blockers the headless
+                # loop cannot resolve here (Reflexion ×1 is already spent).
+                _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
+                                  "run_tdd_post_check", "record_smoke_or_assertion"}
+                if na in _auto_resolved:
+                    _log.info(
+                        "drive_loop readiness defers '%s' to finalize_stage "
+                        "auto-run (run=%s)", na, run_id)
+                else:
+                    passed = False
+                    blockers = rd.get("blockers") or []
+                    btxt = "; ".join(
+                        str(b.get("reason") or b.get("kind") or b)
+                        if isinstance(b, dict) else str(b)
+                        for b in blockers[:3]) if blockers else ""
+                    out["stage_outcome"] = "surfaced"
+                    out["error"] = (f"pp readiness: not ready "
+                                    f"(next_action={na})"
+                                    f"{f' :: {btxt}' if btxt else ''}")
+                    _log.warning("drive_loop readiness blocked (run=%s): %s",
+                                 run_id, out["error"])
+
         try:
             cm("pp_harness", "finalize_stage", {
                 "stage_id": stage_id,
@@ -868,8 +1124,10 @@ def _drive_pp_stage_loop(
         elif passed:
             summary = f"Headless drive loop: stage_outcome=pass; smoke={smoke_status}."
         else:
-            summary = (f"Headless drive loop: stage_outcome={outcome}; "
-                       f"smoke={smoke_status} ({smoke_reason[:120]}).")
+            extra = f" :: {out['error']}" if out.get("error") else ""
+            summary = (f"Headless drive loop: "
+                       f"stage_outcome={out.get('stage_outcome') or outcome}; "
+                       f"smoke={smoke_status} ({smoke_reason[:120]}){extra}.")
 
         # finalize_run runs PP gates server-side and may downgrade -- don't
         # assume success; reflect the returned status.
@@ -879,7 +1137,13 @@ def _drive_pp_stage_loop(
             "summary_md": summary,
         }, squad_id=sq)
         out["finalized"] = True
-        fin_status = _pp_inner(fin).get("status")
+        fin_inner = _pp_inner(fin)
+        # finalize_run (PP-VG-7) returns {effective_status, requested_status,
+        # downgraded, surfaced_stage_count}; older/scripted shapes use {status}.
+        # Read the REAL effective status and honour an explicit downgrade so a
+        # server-side surface is never laundered into "complete".
+        fin_status = fin_inner.get("effective_status") or fin_inner.get("status")
+        fin_downgraded = bool(fin_inner.get("downgraded"))
         # PP-VG-5 honesty: finalize "complete" ONLY when the finalize envelope is
         # unambiguously successful. The old `fin_status in {complete,done,ok} or
         # _pp_ok(fin)` short-circuited `_pp_ok` on the inner status alone, so an
@@ -887,7 +1151,7 @@ def _drive_pp_stage_loop(
         # or a failed OUTER envelope ({"status":"failed","result":{"status":
         # "complete"}}) was laundered into "complete". `_pp_ok` already checks the
         # OUTER status in {done,ok,complete} AND inner has no error — gate on it.
-        if passed and _pp_ok(fin) \
+        if passed and _pp_ok(fin) and not fin_downgraded \
                 and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
             out["final_status"] = "complete"
         else:
@@ -910,6 +1174,350 @@ def _drive_pp_stage_loop(
             # succeeded — a failed finalize_run leaves the project lock held, and
             # a false `finalized=True` hides that from postcheck's lock cleanup.
             out["finalized"] = isinstance(abort_fin, dict) and abort_fin.get("status") != "failed"
+        except Exception:  # noqa: BLE001
+            out["finalized"] = False
+        out["final_status"] = "aborted"
+        return out
+
+
+def _best_of_n() -> int | None:
+    """Operator opt-in: ``HYDRA_BEST_OF_N=<2..8>`` turns the headless engineering
+    stage into a real best-of-N (N Claude candidates → judge each → Borda → merge
+    winner). Unset / out-of-range → None (single-candidate + Reflexion×1, the
+    default). Sequential here (no Task parallelism), so N× codegen cost + time."""
+    raw = os.environ.get("HYDRA_BEST_OF_N")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if 2 <= n <= 8 else None
+
+
+def _rank_key(outcome: str, score: dict[str, Any], smoke_status: str) -> float:
+    """Scalar rank for a best-of candidate. Verdict DOMINATES absolutely (scaled
+    by 1000 so it outranks any rubric scale), then smoke-pass, then mean rubric
+    score. A `fail` can never outrank a `revise`/`pass` regardless of score
+    magnitude (rubrics may be 0-1 or 0-10). Booleans (e.g. _cross_vendor) are
+    excluded from the mean."""
+    base = {"pass": 2, "revise": 1, "fail": 0}.get(outcome, 0)
+    nums = [float(v) for v in (score or {}).values()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    mean = (sum(nums) / len(nums)) if nums else 0.0
+    return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + min(mean, 999.0)
+
+
+def _drive_best_of_loop(
+    dispatcher: Dispatcher, *, run_id: str, project_path: str, request_text: str,
+    n: int, model_tier: str | None = None,
+    judge_rubric_id: str = "rfc-2119-normative", workflow_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Real best-of-N for the headless engineering stage (opt-in HYDRA_BEST_OF_N).
+
+    start_best_of_stage(n) allocates N candidate worktrees; each is generated by
+    Claude (``_drive_generate``, producer=claude in its own worktree) and judged
+    via pp's gate routing; Borda picks the winner; archive_winner_and_losers
+    merges it; teardown_candidates cleans up. Returns the same ``out`` shape as
+    ``_drive_pp_stage_loop`` — or ``None`` when the best-of stage cannot be opened
+    (the caller then falls back to the single-candidate path). Fail-soft: any
+    exception finalizes the run aborted (lock released)."""
+    sq = "engineering"
+    os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
+    cm = dispatcher.call_mcp
+    out: dict[str, Any] = {
+        "final_status": "aborted", "stage_outcome": None,
+        "attempt_id": None, "critique": "", "error": None, "finalized": False,
+        "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
+        "harvest_sha": None, "harvest_error": None, "changed_paths": [],
+        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "best_of_n": n,
+    }
+
+    def _trace(kind: str, payload: dict[str, Any]) -> None:
+        if not workflow_id:
+            return
+        try:
+            from . import telemetry as _tel
+            _tel.emit(Path(project_path), workflow_id, kind,
+                      {"run_id": run_id, **payload})
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Open the best-of stage. pp requires a non-Claude judge vendor (codex)
+    # reachable to open it; if it can't open, signal the caller to fall back to
+    # the single-candidate path (return None) rather than abort the whole run.
+    try:
+        bo = _pp_inner(cm("pp_harness", "start_best_of_stage", {
+            "run_id": run_id, "kind": "code",
+            "gate_type": _pp_gate_type("code", "code_style"), "n": n,
+        }, squad_id=sq))
+    except Exception as e:  # noqa: BLE001
+        _log.warning("start_best_of_stage raised (run=%s): %r", run_id, e)
+        return None
+    stage_id = bo.get("stage_id")
+    candidates = bo.get("candidates") or []
+    if not stage_id or not candidates:
+        _log.warning("start_best_of_stage opened no candidates (run=%s): %r",
+                     run_id, bo)
+        return None
+
+    try:
+        base_prompt = _build_engineer_prompt(request_text, project_path)
+        scored: list[dict[str, Any]] = []
+        for c in candidates:
+            ci_idx = int(c.get("candidate_index") or 0)
+            wt = str(c.get("worktree_path") or project_path)
+            slot = c.get("attempt_slot_id")
+            pre = _worktree_dirty_set(wt)
+            gen, producer = _drive_generate(
+                dispatcher, prompt=base_prompt, project_path=wt,
+                model_tier=model_tier, sq=sq)
+            gi = _pp_inner(gen)
+            gen_text = str(gi.get("text") or "")
+            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
+            out["tokens_in"] += int(gi.get("tokens_in") or 0)
+            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            out["producer"] = producer
+            run_changed = _worktree_dirty_set(wt) - pre
+            wrote = bool(run_changed)
+            out["wrote_changes"] = out["wrote_changes"] or wrote
+            gen_fail = _generate_failure_reason(gen, gen_text, wrote)
+            try:
+                cm("pp_harness", "archive_artifact", {
+                    "run_id": run_id,
+                    "relative_path": f"code/candidate-{ci_idx}.md",
+                    "bytes": (f"GENERATE FAILED: {gen_fail}\n\n{gen_text}"
+                              if gen_fail else (gen_text or "(no summary)")),
+                    "stage_id": stage_id, "kind": "code", "encoding": "utf8",
+                }, squad_id=sq)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                att = cm("pp_harness", "record_attempt", {
+                    "stage_id": stage_id, "producer": producer,
+                    "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
+                    "tokens_in": int(gi.get("tokens_in") or 0),
+                    "tokens_out": int(gi.get("tokens_out") or 0),
+                    "cost_usd": float(gi.get("cost_usd") or 0.0),
+                    "status": "error" if gen_fail else "ok",
+                    **({"attempt_slot_id": slot} if slot else {}),
+                    "notes": {"candidate_index": ci_idx},
+                }, squad_id=sq)
+                att_id = _pp_inner(att).get("attempt_id")
+            except Exception:  # noqa: BLE001
+                att_id = None
+            if gen_fail:
+                scored.append({"ci": ci_idx, "att": att_id, "outcome": "fail",
+                               "rank": -1.0, "smoke": "skipped", "critique": gen_fail})
+                continue
+            # Judge per pp's routing (identical policy to the single path).
+            gate: dict[str, Any] = {}
+            try:
+                gate = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
+                    "gate_type": _pp_gate_type("code", "code_style"),
+                    "generator_producer": producer,
+                    "prompt_keywords": request_text[:1000],
+                }, squad_id=sq))
+            except Exception:  # noqa: BLE001
+                gate = {}
+            required_cross = bool(gate.get("required_cross_vendor", True))
+            gate_rubric = str(gate.get("rubric_id") or judge_rubric_id)
+            rubric_body = _rubric_md(gate_rubric)
+            judge_text = _judge_artifact_text(wt, sorted(run_changed), gen_text)
+            if (not required_cross) and producer == "claude":
+                jci = _claude_critique(judge_text, rubric_body, wt)
+                jp = "claude"
+            else:
+                jci = _pp_inner(cm("pp_codex", "critique", {
+                    "artifact_text": judge_text, "rubric_md": rubric_body,
+                    "cwd": wt}, squad_id=sq))
+                jp = "codex"
+            out["cost_usd"] += float(jci.get("cost_usd") or 0.0)
+            out["tokens_in"] += int(jci.get("tokens_in") or 0)
+            out["tokens_out"] += int(jci.get("tokens_out") or 0)
+            parsed = jci.get("parsed") if isinstance(jci.get("parsed"), dict) else jci
+            if not isinstance(parsed, dict):
+                parsed = {}
+            v_outcome = parsed.get("outcome") or parsed.get("verdict") or "revise"
+            v_crit = parsed.get("critique_md") or parsed.get("critique") or ""
+            score = dict(parsed.get("score") or parsed.get("score_json") or {})
+            cross_vendor = jp != producer
+            score["_cross_vendor"] = cross_vendor
+            score["_judge_tier"] = "cross_vendor" if required_cross else "same_vendor"
+            if required_cross and not cross_vendor:
+                score["_judge_degraded"] = True
+            if att_id:
+                try:
+                    cm("pp_harness", "record_verdict", {
+                        "attempt_id": att_id, "judge_producer": jp,
+                        "judge_model_id": str(jci.get("model") or f"{jp}-default"),
+                        "outcome": v_outcome if v_outcome in {"pass", "revise", "fail"} else "revise",
+                        "critique_md": str(v_crit)[:4000], "score_json": score,
+                        "rubric_id": gate_rubric,
+                    }, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+            smoke_status, _smoke_reason = _run_smoke(
+                dispatcher, project_path=wt, stage_id=stage_id)
+            try:
+                cm("pp_harness", "record_smoke_status", {
+                    "stage_id": stage_id, "candidate_index": ci_idx,
+                    "status": smoke_status,
+                    "reason": (_smoke_reason or "best-of candidate smoke")[:300],
+                }, squad_id=sq)
+            except Exception:  # noqa: BLE001
+                pass
+            scored.append({"ci": ci_idx, "att": att_id, "outcome": v_outcome,
+                           "rank": _rank_key(v_outcome, score, smoke_status),
+                           "smoke": smoke_status, "critique": v_crit})
+            _trace("best_of.candidate", {
+                "stage_id": stage_id, "candidate_index": ci_idx,
+                "attempt_id": att_id, "producer": producer, "judge_producer": jp,
+                "outcome": v_outcome, "smoke": smoke_status,
+                "cross_vendor": cross_vendor})
+
+        # Rank + Borda: highest rank first; Borda aggregates the judge order.
+        ranked = sorted(scored, key=lambda s: s["rank"], reverse=True)
+        ranking_atts = [s["att"] for s in ranked if s["att"]]
+        cand_atts = [s["att"] for s in scored if s["att"]]
+        winner_att = ranking_atts[0] if ranking_atts else None
+        if len(cand_atts) >= 2 and ranking_atts:
+            try:
+                br = _pp_inner(cm("pp_harness", "borda_count", {
+                    "candidate_ids": cand_atts, "rankings": [ranking_atts],
+                }, squad_id=sq))
+                winner_att = br.get("winner") or winner_att
+            except Exception:  # noqa: BLE001
+                pass
+        # Resolve the winner: trust Borda only when its id matches EXACTLY one
+        # candidate (real pp returns unique attempt ids); otherwise fall back to
+        # the top-RANKED candidate so a duplicate / missing id can't pick the
+        # wrong one regardless of rank.
+        winner = None
+        if winner_att:
+            matches = [s for s in scored if s["att"] == winner_att]
+            if len(matches) == 1:
+                winner = matches[0]
+        if winner is None:
+            winner = ranked[0] if ranked else None
+        if winner is None:
+            raise RuntimeError("best-of produced no candidates")
+
+        out["attempt_id"] = winner["att"]
+        out["stage_outcome"] = winner["outcome"]
+        out["critique"] = str(winner["critique"])[:1000]
+        out["smoke_status"] = winner["smoke"]
+
+        # Merge winner worktree; archive losers. pp refuses the merge if the
+        # winner's recorded smoke failed (merge_status="smoke_failed").
+        candidate_paths = [str(c.get("worktree_path") or project_path)
+                           for c in sorted(candidates,
+                                           key=lambda c: int(c.get("candidate_index") or 0))]
+        merge_status = "unknown"
+        try:
+            aw = _pp_inner(cm("pp_harness", "archive_winner_and_losers", {
+                "run_id": run_id, "stage_id": stage_id, "stage_kind": "code",
+                "winner_candidate_index": int(winner["ci"]),
+                "candidate_paths": candidate_paths,
+            }, squad_id=sq))
+            merge_status = str(aw.get("merge_status") or "unknown")
+            wdp = aw.get("winner_diff_path")
+            if wdp:
+                out["changed_paths"] = sorted(set(out["changed_paths"]) | {wdp})
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"archive_winner_and_losers failed: {e!r}"
+            merge_status = "error"
+
+        # Teardown candidate worktrees (best-effort; pp preserves artifacts
+        # first). A non-ok teardown (preserve_failed / partial) means orphaned
+        # worktrees or un-preserved artifacts — surface it (pp's contract says the
+        # caller MUST). We do NOT discard a successfully-merged winner over a
+        # cleanup gap, but we make the gap visible in out + the trace + the log.
+        try:
+            td = _pp_inner(cm("pp_harness", "teardown_candidates", {
+                "project_path": project_path, "candidate_paths": candidate_paths,
+                "run_id": run_id, "stage_kind": "code",
+            }, squad_id=sq))
+            td_status = str(td.get("teardown_status") or "ok")
+            if td_status != "ok":
+                out["teardown_status"] = td_status
+                out["teardown_not_torn_down"] = td.get("not_torn_down") or []
+                _log.warning(
+                    "best-of teardown not clean (run=%s): status=%s not_torn_down=%s",
+                    run_id, td_status, out["teardown_not_torn_down"])
+        except Exception as e:  # noqa: BLE001
+            out["teardown_status"] = "error"
+            _log.warning("best-of teardown raised (run=%s): %r", run_id, e)
+
+        # "merged" (git merge) and "copy" (copy-mode merge-back on a non-git
+        # project) are BOTH successful applies; everything else is a real block.
+        # A passed stage also requires a real winner attempt id (finalize_stage
+        # rejects a 'passed' status without winner_attempt_id).
+        merge_ok = merge_status in {"merged", "copy"}
+        passed = (winner["outcome"] == "pass" and winner["smoke"] == "pass"
+                  and bool(winner.get("att")) and merge_ok)
+        if not passed and not out.get("error"):
+            out["error"] = (f"best-of: winner outcome={winner['outcome']} "
+                            f"smoke={winner['smoke']} merge={merge_status}")
+
+        # Readiness preflight (same terminal-blocker handling as the single path).
+        if passed:
+            try:
+                rd = _pp_inner(cm("pp_harness", "get_stage_finalize_readiness",
+                                  {"stage_id": stage_id}, squad_id=sq))
+            except Exception:  # noqa: BLE001
+                rd = {}
+            if rd.get("can_pass") is False:
+                na = rd.get("next_action") or "not_ready"
+                if na not in {"run_artifact_validate", "run_tdd_pre_check",
+                              "run_tdd_post_check", "record_smoke_or_assertion"}:
+                    passed = False
+                    out["stage_outcome"] = "surfaced"
+                    out["error"] = f"pp readiness: not ready (next_action={na})"
+
+        try:
+            cm("pp_harness", "finalize_stage", {
+                "stage_id": stage_id,
+                "status": "passed" if passed else "surfaced",
+                **({"winner_attempt_id": winner["att"]}
+                   if (passed and winner["att"]) else {}),
+            }, squad_id=sq)
+        except Exception:  # noqa: BLE001
+            pass
+
+        td_note = (f" teardown={out['teardown_status']}"
+                   if out.get("teardown_status") else "")
+        summary = (f"Headless best-of-{n}: winner candidate={winner['ci']} "
+                   f"outcome={winner['outcome']} smoke={winner['smoke']} "
+                   f"merge={merge_status}{td_note}"
+                   f"{f' :: {out['error']}' if out.get('error') and not passed else ''}.")
+        fin = cm("pp_harness", "finalize_run", {
+            "run_id": run_id, "status": "complete" if passed else "surfaced",
+            "summary_md": summary,
+        }, squad_id=sq)
+        out["finalized"] = True
+        fin_inner = _pp_inner(fin)
+        fin_status = fin_inner.get("effective_status") or fin_inner.get("status")
+        fin_downgraded = bool(fin_inner.get("downgraded"))
+        if passed and _pp_ok(fin) and not fin_downgraded \
+                and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
+            out["final_status"] = "complete"
+        else:
+            out["final_status"] = "surfaced"
+        _trace("best_of.stage_outcome", {
+            "stage_id": stage_id, "final_status": out["final_status"],
+            "winner_candidate": winner["ci"], "merge_status": merge_status,
+            "n": n, "cost_usd": out.get("cost_usd")})
+        return out
+    except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
+        out["error"] = repr(e)
+        try:
+            abort_fin = cm("pp_harness", "finalize_run", {
+                "run_id": run_id, "status": "aborted",
+                "reason": f"best_of_error: {e!r}", "project_path": project_path,
+            }, squad_id=sq)
+            out["finalized"] = (isinstance(abort_fin, dict)
+                                and abort_fin.get("status") != "failed")
         except Exception:  # noqa: BLE001
             out["finalized"] = False
         out["final_status"] = "aborted"

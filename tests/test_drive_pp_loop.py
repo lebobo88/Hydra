@@ -16,6 +16,7 @@ scaffolds) and its integration into ``_via_mcp``:
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -416,3 +417,469 @@ def test_drive_loop_no_trace_without_workflow_id(monkeypatch) -> None:
     disp = _ScriptedDispatcher(_happy_responses("pass"))
     _drive_pp_stage_loop(disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
     assert events == []   # no workflow_id -> no trace writes
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1: Claude is the generator whenever a Claude capability is attached;
+# codex is reserved for cross-vendor judging (never generation) in that case.
+# --------------------------------------------------------------------------- #
+from hydra_core.squad_node import (  # noqa: E402
+    _claude_cli_generation_enabled,
+    _drive_generate,
+    _judge_artifact_text,
+    _parse_claude_cli_result,
+    _pp_gate_type,
+)
+
+
+class _LiveDispatcher(_ScriptedDispatcher):
+    """Scripted dispatcher that reports a real live-execution capability
+    (mirrors MCPStdioDispatcher.live_execution=True)."""
+
+    def __init__(self, responses, **kw):
+        super().__init__(responses, **kw)
+        self.live_execution = True
+
+
+def test_claude_cli_gate_precedence(monkeypatch) -> None:
+    live = _LiveDispatcher(_happy_responses())
+    testd = _ScriptedDispatcher(_happy_responses())  # no live_execution
+
+    # Disable flag beats everything (true-headless CI where codex is the only gen).
+    monkeypatch.setenv("HYDRA_DISABLE_CLAUDE_ENGINEER", "1")
+    monkeypatch.setenv("HYDRA_CLAUDE_ENGINEER", "1")
+    assert _claude_cli_generation_enabled(live) is False
+    monkeypatch.delenv("HYDRA_DISABLE_CLAUDE_ENGINEER", raising=False)
+
+    # Explicit force-on works regardless of live/claude detection.
+    assert _claude_cli_generation_enabled(testd) is True
+    monkeypatch.delenv("HYDRA_CLAUDE_ENGINEER", raising=False)
+
+    # Auto: requires BOTH a live dispatcher AND `claude` on PATH.
+    monkeypatch.setattr("hydra_core.squad_node.shutil.which",
+                        lambda _n: "/usr/bin/claude")
+    assert _claude_cli_generation_enabled(live) is True
+    assert _claude_cli_generation_enabled(testd) is False   # not a live dispatcher
+    monkeypatch.setattr("hydra_core.squad_node.shutil.which", lambda _n: None)
+    assert _claude_cli_generation_enabled(live) is False     # claude absent
+
+
+def test_drive_generate_uses_claude_cli_when_enabled(monkeypatch) -> None:
+    disp = _ScriptedDispatcher(_happy_responses())
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {
+            "text": "edited foo.py", "model": "claude-opus-4-8",
+            "cost_usd": 0.07, "tokens_in": 9, "tokens_out": 11, "status": "done"})
+
+    gen, producer = _drive_generate(
+        disp, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+
+    assert producer == "claude"
+    inner = gen["result"]
+    assert inner["cost_usd"] == 0.07 and inner["model"] == "claude-opus-4-8"
+    # Generation NEVER touched codex.
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_drive_generate_host_none_falls_through_to_claude_cli(monkeypatch) -> None:
+    """A host capability that is present but returns None (host bridge not ready)
+    must fall through to the Claude CLI when available — NEVER to codex."""
+    host = _HostDispatcher(_happy_responses(), host_result=None)
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {"text": "edited", "model": "claude-x",
+                                "cost_usd": 0.01, "status": "done"})
+
+    gen, producer = _drive_generate(
+        host, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+
+    assert producer == "claude"
+    assert host.host_calls            # the host engineer was attempted first
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _a) in host.calls}
+
+
+def test_drive_generate_codex_only_when_no_claude(monkeypatch) -> None:
+    disp = _ScriptedDispatcher(_happy_responses())
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: False)
+    gen, producer = _drive_generate(
+        disp, prompt="p", project_path="/tmp/p", model_tier=None, sq="engineering")
+    assert producer == "codex"
+    assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_parse_claude_cli_result_extracts_cost_and_degrades() -> None:
+    j = json.dumps({"result": "did it", "total_cost_usd": 0.12,
+                    "usage": {"input_tokens": 100, "output_tokens": 50},
+                    "model": "claude-opus-4-8"})
+    out = _parse_claude_cli_result(j, "", 0, "fallback-model")
+    assert out["text"] == "did it"
+    assert out["cost_usd"] == 0.12
+    assert out["tokens_in"] == 100 and out["tokens_out"] == 50
+    assert out["model"] == "claude-opus-4-8"
+    assert out["status"] == "done"
+
+    # Non-JSON stdout degrades to raw text (cost 0 — budget blind) without crashing.
+    deg = _parse_claude_cli_result("plain text out", "", 0, "m")
+    assert deg["text"] == "plain text out" and deg["cost_usd"] == 0.0
+
+    # Non-zero exit appends the stderr tail and marks the attempt errored.
+    err = _parse_claude_cli_result("", "boom", 1, "m")
+    assert err["status"] == "error" and "boom" in err["text"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 (contract-safe): judge routing follows pp's gate_eligible_judges
+# (cross-vendor codex vs same-vendor Claude), and the judge reads the real diff.
+# --------------------------------------------------------------------------- #
+def _claude_gen(monkeypatch) -> None:
+    """Force Claude generation (no real subprocess) for a drive-loop test."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+            "model": "claude-opus-4-8", "cost_usd": 0.02, "status": "done"})
+
+
+def test_judge_same_vendor_claude_when_gate_allows(monkeypatch) -> None:
+    """Claude generated + pp gate says same-vendor → a Claude critique judges it
+    and codex is NOT spent. (This is the common path that conserves codex.)"""
+    _claude_gen(monkeypatch)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._claude_critique",
+        lambda text, rubric, cwd: {
+            "parsed": {"outcome": "pass", "critique_md": "c" * 90, "score": {}},
+            "model": "claude-sonnet-4-6", "cost_usd": 0.01})
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+    disp = _LiveDispatcher(resp)
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["producer"] == "claude"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "claude"
+    assert rv["score_json"].get("_cross_vendor") is False
+    assert rv["score_json"].get("_judge_tier") == "same_vendor"
+    assert "_judge_degraded" not in rv["score_json"]   # same-vendor by rule != degraded
+    assert rv["rubric_id"] == "rfc-2119-normative"
+    # codex was NOT used as a judge.
+    assert ("pp_codex", "critique") not in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_judge_cross_vendor_codex_when_gate_requires(monkeypatch) -> None:
+    """Claude generated + pp gate REQUIRES cross-vendor → codex judges it as a
+    genuine cross-vendor judge, using the gate's rubric."""
+    _claude_gen(monkeypatch)
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": True, "rubric_id": "owasp-asvs-l1"}}
+    disp = _LiveDispatcher(resp)
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["producer"] == "claude"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is True
+    assert rv["score_json"].get("_judge_tier") == "cross_vendor"
+    assert rv["rubric_id"] == "owasp-asvs-l1"
+    assert ("pp_codex", "critique") in {(s, t) for (s, t, _a) in disp.calls}
+    # The driver consulted pp's gate policy before judging.
+    assert ("pp_harness", "gate_eligible_judges") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_pp_gate_type_mapping() -> None:
+    assert _pp_gate_type("code", "code") == "code_style"      # invalid -> mapped
+    assert _pp_gate_type("code", "code_style") == "code_style"  # already valid -> kept
+    assert _pp_gate_type("spec", None) == "spec"
+    assert _pp_gate_type("tests", "weird") == "lint_class"
+    assert _pp_gate_type("unknown-kind", None) == "code_style"  # safe default
+
+
+def test_judge_artifact_text_falls_back_to_summary() -> None:
+    # No changed paths → just the summary (never crashes).
+    assert _judge_artifact_text("/nonexistent", [], "summary text") == "summary text"
+    # Non-repo path → git diff fails → falls back to the summary.
+    out = _judge_artifact_text("/nonexistent", ["foo.py"], "the summary")
+    assert out == "the summary"
+
+
+def test_judge_defaults_cross_vendor_codex_when_gate_unavailable(monkeypatch) -> None:
+    """Claude generated but the gate tool returns nothing (no daemon) → default
+    to cross-vendor codex (conservative); gate_eligible_judges is still called."""
+    _claude_gen(monkeypatch)
+    disp = _LiveDispatcher(_happy_responses("pass"))  # no gate_eligible_judges response
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    assert out["producer"] == "claude"
+    assert ("pp_harness", "gate_eligible_judges") in {(s, t) for (s, t, _a) in disp.calls}
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is True
+    assert rv["score_json"].get("_judge_tier") == "cross_vendor"
+
+
+def test_judge_codex_same_vendor_not_degraded_when_gate_allows(monkeypatch) -> None:
+    """Codex generated (true-headless) + pp gate says same-vendor → codex judges
+    same-vendor, and that is NOT flagged degraded (the gate sanctioned it)."""
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+    disp = _ScriptedDispatcher(resp)  # no live_execution -> codex generates
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    assert out["producer"] == "codex"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is False
+    assert rv["score_json"].get("_judge_tier") == "same_vendor"
+    assert "_judge_degraded" not in rv["score_json"]   # gate-sanctioned same-vendor
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2b: honour pp's finalize readiness + finalize_run downgrade signal.
+# --------------------------------------------------------------------------- #
+def test_readiness_can_pass_false_surfaces(monkeypatch) -> None:
+    """A passing verdict + passing smoke must STILL surface if pp's readiness
+    preflight says the stage is not ready (e.g. a server-side gate violation)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "get_stage_finalize_readiness")] = {"status": "done", "result": {
+        "can_pass": False, "next_action": "surface_stage",
+        "blockers": [{"kind": "verdict", "reason": "latest verdict fail"}]}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "surfaced"        # readiness downgraded it
+    assert "winner_attempt_id" not in fs
+    assert "readiness" in (out.get("error") or "")
+
+
+def test_readiness_absent_does_not_block(monkeypatch) -> None:
+    """When the readiness tool is unavailable (no daemon / scripted default {}),
+    the smoke-based decision stands — a passing stage still completes."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))  # no readiness response
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    # The preflight was still attempted (read-only).
+    assert ("pp_harness", "get_stage_finalize_readiness") in {
+        (s, t) for (s, t, _a) in disp.calls}
+
+
+def test_finalize_run_downgraded_flag_is_honored(monkeypatch) -> None:
+    """finalize_run's PP-VG-7 shape {effective_status, downgraded} must be read:
+    a downgraded='complete' must surface, not be laundered into complete."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "finalize_run")] = {"status": "done", "result": {
+        "effective_status": "surfaced", "requested_status": "complete",
+        "downgraded": True, "surfaced_stage_count": 1}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+
+
+def test_readiness_auto_resolvable_action_does_not_surface(monkeypatch) -> None:
+    """A can_pass=False whose next_action is an auto-resolvable missing row
+    (finalize_stage runs it) must NOT pre-surface — defer to finalize_stage."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "get_stage_finalize_readiness")] = {"status": "done", "result": {
+        "can_pass": False, "next_action": "run_artifact_validate", "blockers": []}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    # Deferred, not surfaced: finalize_stage still attempts passed.
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2c: opt-in best-of-N (HYDRA_BEST_OF_N). Default OFF; single-candidate
+# behavior is unchanged when the flag is absent (covered by every test above).
+# --------------------------------------------------------------------------- #
+from hydra_core.squad_node import _best_of_n, _rank_key  # noqa: E402
+
+
+def _best_of_responses(n_candidates: int = 2, merge_status: str = "merged") -> dict:
+    resp = _happy_responses("pass")
+    cands = [{"candidate_index": i, "judge_position": i,
+              "attempt_slot_id": f"slot{i}", "worktree_path": f"/tmp/c{i}",
+              "worktree_mode": "copy"} for i in range(1, n_candidates + 1)]
+    resp[("pp_harness", "start_best_of_stage")] = {"status": "done", "result": {
+        "stage_id": "st_BO", "candidates": cands, "shuffle_seed": 1}}
+    resp[("pp_harness", "borda_count")] = {"status": "done", "result": {
+        "winner": "att_T", "scores": []}}
+    resp[("pp_harness", "archive_winner_and_losers")] = {"status": "done", "result": {
+        "merge_status": merge_status, "winner_diff_path": "code/winner.diff",
+        "losers_archived": n_candidates - 1}}
+    resp[("pp_harness", "teardown_candidates")] = {"status": "done", "result": {
+        "teardown_status": "ok"}}
+    return resp
+
+
+def test_best_of_n_off_by_default_uses_single_candidate(monkeypatch) -> None:
+    """No HYDRA_BEST_OF_N → the single-candidate path runs (no best-of tools)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses())  # responses present but unused
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    assert out.get("best_of_n") is None
+    assert ("pp_harness", "start_best_of_stage") not in {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_stage") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_best_of_n_drives_candidates_and_merges_winner(monkeypatch) -> None:
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(n_candidates=2, merge_status="merged"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["final_status"] == "complete"
+    assert out.get("best_of_n") == 2
+    seq = {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_best_of_stage") in seq
+    assert ("pp_harness", "archive_winner_and_losers") in seq
+    assert ("pp_harness", "teardown_candidates") in seq
+    # Two candidates generated + judged.
+    assert disp.tool_seq().count("generate") == 2
+    assert disp.tool_seq().count("record_smoke_status") == 2
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+    assert fs["winner_attempt_id"] == "att_T"
+
+
+def test_best_of_n_merge_conflict_surfaces(monkeypatch) -> None:
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(merge_status="conflict"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "surfaced"
+    assert "merge=conflict" in (out.get("error") or "")
+
+
+def test_best_of_n_falls_back_to_single_when_cannot_open(monkeypatch) -> None:
+    """If start_best_of_stage can't open (e.g. no cross-vendor judge), fall back
+    to the single-candidate path rather than aborting the run."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "3")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "start_best_of_stage")] = {
+        "status": "failed", "error": "no non-Claude judge vendor reachable"}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    seq = {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_stage") in seq          # single-candidate fallback ran
+    assert disp.tool_seq().count("generate") == 1
+
+
+def test_best_of_n_env_parsing() -> None:
+    import os as _os
+    for val, exp in [("2", 2), ("8", 8), ("1", None), ("9", None),
+                     ("", None), ("x", None), ("0", None)]:
+        _os.environ["HYDRA_BEST_OF_N"] = val
+        try:
+            assert _best_of_n() == exp, val
+        finally:
+            _os.environ.pop("HYDRA_BEST_OF_N", None)
+    assert _best_of_n() is None  # unset
+
+
+def test_rank_key_orders_pass_over_revise_over_fail() -> None:
+    p = _rank_key("pass", {"correctness": 0.9}, "pass")
+    r = _rank_key("revise", {"correctness": 0.9}, "pass")
+    f = _rank_key("fail", {"correctness": 0.9}, "skipped")
+    assert p > r > f
+    # Booleans in score (e.g. _cross_vendor) are ignored in the mean.
+    assert _rank_key("pass", {"_cross_vendor": True, "x": 1.0}, "pass") > 0
+
+
+def test_best_of_n_copy_merge_passes(monkeypatch) -> None:
+    """merge_status='copy' (copy-mode merge-back on a non-git project) is a valid
+    successful apply — must complete, not surface."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(merge_status="copy"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+
+
+def test_best_of_n_teardown_partial_surfaced_but_not_fatal(monkeypatch) -> None:
+    """A non-ok teardown (orphaned worktrees) is SURFACED in the result, but does
+    not discard a successfully-merged winner."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _best_of_responses(merge_status="merged")
+    resp[("pp_harness", "teardown_candidates")] = {"status": "done", "result": {
+        "teardown_status": "partial", "not_torn_down": [2]}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"        # merged winner still lands
+    assert out.get("teardown_status") == "partial"  # ... but the gap is visible
+    assert out.get("teardown_not_torn_down") == [2]
+
+
+def test_rank_key_verdict_dominates_high_score_fail() -> None:
+    """A fail with a high rubric score must NEVER outrank a pass with a low one
+    (rubrics may be 0-1 or 0-10; verdict dominates absolutely)."""
+    assert _rank_key("pass", {"x": 0.5}, "skipped") > _rank_key("fail", {"x": 9.0}, "pass")
+    assert _rank_key("revise", {"x": 0.0}, "skipped") > _rank_key("fail", {"x": 10.0}, "pass")
+
+
+def test_best_of_n_unknown_borda_winner_falls_back_to_ranked(monkeypatch) -> None:
+    """If Borda returns an id that matches NO candidate (or multiple), the winner
+    falls back to the top-RANKED candidate rather than guessing — the run still
+    finalizes against a real winner attempt id."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _best_of_responses(merge_status="merged")
+    resp[("pp_harness", "borda_count")] = {"status": "done", "result": {
+        "winner": "NONEXISTENT_ID", "scores": []}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+    assert fs["winner_attempt_id"] == "att_T"   # ranked[0]'s real attempt id
