@@ -464,11 +464,21 @@ def _run_claude_cli(
     block sanctions the engineer's edits).
     """
     mdl = model or os.environ.get("HYDRA_CLAUDE_MODEL") or "claude-opus-4-8"
+    # PP-BV-ISO: the headless engineer's browser-validator must NEVER drive the
+    # operator's live Chrome (a second CDP controller on the operator's tab
+    # crashes with "Headless commands are not compatible with remote debugging").
+    # Force isolated headless Playwright for any browser validation this
+    # subprocess runs, and mark the engineer stage active so the in-tree write
+    # block sanctions the engineer's edits.
+    sub_env = os.environ.copy()
+    sub_env.setdefault("PP_BROWSER_ENGINE", "playwright")
+    sub_env.setdefault("HYDRA_PP_STAGE_ACTIVE", "1")
     try:
         res = subprocess.run(
             ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
              "--model", mdl, "--add-dir", cwd],
             cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+            env=sub_env,
         )
         txt = res.stdout or ""
         if res.returncode != 0 and res.stderr:
@@ -608,6 +618,11 @@ def _drive_pp_stage_loop(
     raises — dispatch must not crash on a daemon hiccup.
     """
     sq = "engineering"
+    # PP-BV-ISO: this headless driver (and every pp/codex/validator subprocess it
+    # spawns) isolates browser validation from the operator's live Chrome — the
+    # browser-validator agent honours PP_BROWSER_ENGINE=playwright and skips the
+    # claude-in-chrome probe entirely. Set, don't override an explicit operator value.
+    os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
     cm = dispatcher.call_mcp
     out: dict[str, Any] = {
         "final_status": "aborted", "stage_outcome": None,
