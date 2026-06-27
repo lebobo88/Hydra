@@ -43,3 +43,6 @@ squads/marketing-production
 squads/marketing-research
 squads/marketing-strategy
 .tmp-pytest/
+
+# Ephemeral scratch artifacts (never track)
+.scratch/
