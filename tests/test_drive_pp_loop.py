@@ -426,7 +426,9 @@ def test_drive_loop_no_trace_without_workflow_id(monkeypatch) -> None:
 from hydra_core.squad_node import (  # noqa: E402
     _claude_cli_generation_enabled,
     _drive_generate,
+    _judge_artifact_text,
     _parse_claude_cli_result,
+    _pp_gate_type,
 )
 
 
@@ -529,3 +531,119 @@ def test_parse_claude_cli_result_extracts_cost_and_degrades() -> None:
     # Non-zero exit appends the stderr tail and marks the attempt errored.
     err = _parse_claude_cli_result("", "boom", 1, "m")
     assert err["status"] == "error" and "boom" in err["text"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 (contract-safe): judge routing follows pp's gate_eligible_judges
+# (cross-vendor codex vs same-vendor Claude), and the judge reads the real diff.
+# --------------------------------------------------------------------------- #
+def _claude_gen(monkeypatch) -> None:
+    """Force Claude generation (no real subprocess) for a drive-loop test."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: {
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+            "model": "claude-opus-4-8", "cost_usd": 0.02, "status": "done"})
+
+
+def test_judge_same_vendor_claude_when_gate_allows(monkeypatch) -> None:
+    """Claude generated + pp gate says same-vendor → a Claude critique judges it
+    and codex is NOT spent. (This is the common path that conserves codex.)"""
+    _claude_gen(monkeypatch)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._claude_critique",
+        lambda text, rubric, cwd: {
+            "parsed": {"outcome": "pass", "critique_md": "c" * 90, "score": {}},
+            "model": "claude-sonnet-4-6", "cost_usd": 0.01})
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+    disp = _LiveDispatcher(resp)
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["producer"] == "claude"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "claude"
+    assert rv["score_json"].get("_cross_vendor") is False
+    assert rv["score_json"].get("_judge_tier") == "same_vendor"
+    assert "_judge_degraded" not in rv["score_json"]   # same-vendor by rule != degraded
+    assert rv["rubric_id"] == "rfc-2119-normative"
+    # codex was NOT used as a judge.
+    assert ("pp_codex", "critique") not in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_judge_cross_vendor_codex_when_gate_requires(monkeypatch) -> None:
+    """Claude generated + pp gate REQUIRES cross-vendor → codex judges it as a
+    genuine cross-vendor judge, using the gate's rubric."""
+    _claude_gen(monkeypatch)
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": True, "rubric_id": "owasp-asvs-l1"}}
+    disp = _LiveDispatcher(resp)
+
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["producer"] == "claude"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is True
+    assert rv["score_json"].get("_judge_tier") == "cross_vendor"
+    assert rv["rubric_id"] == "owasp-asvs-l1"
+    assert ("pp_codex", "critique") in {(s, t) for (s, t, _a) in disp.calls}
+    # The driver consulted pp's gate policy before judging.
+    assert ("pp_harness", "gate_eligible_judges") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_pp_gate_type_mapping() -> None:
+    assert _pp_gate_type("code", "code") == "code_style"      # invalid -> mapped
+    assert _pp_gate_type("code", "code_style") == "code_style"  # already valid -> kept
+    assert _pp_gate_type("spec", None) == "spec"
+    assert _pp_gate_type("tests", "weird") == "lint_class"
+    assert _pp_gate_type("unknown-kind", None) == "code_style"  # safe default
+
+
+def test_judge_artifact_text_falls_back_to_summary() -> None:
+    # No changed paths → just the summary (never crashes).
+    assert _judge_artifact_text("/nonexistent", [], "summary text") == "summary text"
+    # Non-repo path → git diff fails → falls back to the summary.
+    out = _judge_artifact_text("/nonexistent", ["foo.py"], "the summary")
+    assert out == "the summary"
+
+
+def test_judge_defaults_cross_vendor_codex_when_gate_unavailable(monkeypatch) -> None:
+    """Claude generated but the gate tool returns nothing (no daemon) → default
+    to cross-vendor codex (conservative); gate_eligible_judges is still called."""
+    _claude_gen(monkeypatch)
+    disp = _LiveDispatcher(_happy_responses("pass"))  # no gate_eligible_judges response
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    assert out["producer"] == "claude"
+    assert ("pp_harness", "gate_eligible_judges") in {(s, t) for (s, t, _a) in disp.calls}
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is True
+    assert rv["score_json"].get("_judge_tier") == "cross_vendor"
+
+
+def test_judge_codex_same_vendor_not_degraded_when_gate_allows(monkeypatch) -> None:
+    """Codex generated (true-headless) + pp gate says same-vendor → codex judges
+    same-vendor, and that is NOT flagged degraded (the gate sanctioned it)."""
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+    disp = _ScriptedDispatcher(resp)  # no live_execution -> codex generates
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    assert out["producer"] == "codex"
+    rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
+    assert rv["judge_producer"] == "codex"
+    assert rv["score_json"].get("_cross_vendor") is False
+    assert rv["score_json"].get("_judge_tier") == "same_vendor"
+    assert "_judge_degraded" not in rv["score_json"]   # gate-sanctioned same-vendor

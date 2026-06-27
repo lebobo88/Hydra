@@ -122,6 +122,23 @@ tools:
       Judge/critique artifacts via Google Gemini.
       Use for: cross-vendor review of generated artifacts.
       Not for: code generation — use the codex generate tool instead.
+  - name: critique
+    mcp_server: pp_codex
+    privilege: execute
+    notes: >
+      Judge/critique artifacts via OpenAI Codex — the live CROSS-vendor judge
+      (Gemini retired 2026-06). Use for: cross-vendor critique of a Claude-produced
+      change in the drive loop. The RBAC matcher keys on (name, mcp_server), so this
+      entry is REQUIRED for pp_codex.critique — the pp_gemini entry above does not
+      cover it. Not for: code generation — use the codex generate tool instead.
+  - name: gate_eligible_judges
+    mcp_server: pp_harness
+    privilege: read
+    notes: >
+      Read pp's judge-tier policy for a gate (required_cross_vendor, rubric_id,
+      allowed_judges). The drive loop MUST call this before invoking a judge so
+      cross- vs same-vendor selection follows pair-programmer's own rules rather
+      than a hardcoded vendor. Read-only policy lookup; no side effects.
   - name: blender
     mcp_server: blender
     privilege: read

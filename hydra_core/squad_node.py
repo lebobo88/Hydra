@@ -490,15 +490,21 @@ def _parse_claude_cli_result(
 
 def _run_claude_cli(
     prompt: str, *, cwd: str, model: str | None = None, timeout_s: int = 1800,
+    read_only: bool = False,
 ) -> dict[str, Any]:
-    """Headless Claude engineer — run the `claude` CLI to write code in ``cwd``.
-
-    Claude-tier generation for the pp engineering stage (no codex). Model from
-    ``HYDRA_CLAUDE_MODEL`` (default opus). Inherits the env (incl.
-    ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write block sanctions the
-    engineer's edits). Returns the pp-generate-shaped inner dict
+    """Headless Claude CLI in ``cwd``. Returns the pp-generate-shaped inner dict
     ``{text, model, cost_usd, tokens_in, tokens_out, status}`` (a plain-text
     return would leave ``cost_usd=0`` and blind the budget tripwires).
+
+    Two modes:
+      - generation (``read_only=False``): ``--permission-mode acceptEdits`` so the
+        engineer writes code (model from ``HYDRA_CLAUDE_MODEL``, default opus).
+      - critique (``read_only=True``): all mutating tools are DISALLOWED so a
+        same-vendor judge can read but NEVER edit the repo (a write-capable judge
+        would contaminate the run's diff/smoke/retry).
+
+    Inherits the env (incl. ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write block
+    sanctions the engineer's edits).
     """
     mdl = model or os.environ.get("HYDRA_CLAUDE_MODEL") or "claude-opus-4-8"
     # PP-BV-ISO: the headless engineer's browser-validator must NEVER drive the
@@ -510,11 +516,16 @@ def _run_claude_cli(
     sub_env = os.environ.copy()
     sub_env.setdefault("PP_BROWSER_ENGINE", "playwright")
     sub_env.setdefault("HYDRA_PP_STAGE_ACTIVE", "1")
+    cmd = ["claude", "-p", prompt, "--model", mdl,
+           "--add-dir", cwd, "--output-format", "json"]
+    if read_only:
+        # Judge/critique must NOT mutate the repo — block every writing tool.
+        cmd += ["--disallowedTools", "Edit Write MultiEdit NotebookEdit Bash"]
+    else:
+        cmd += ["--permission-mode", "acceptEdits"]
     try:
         res = subprocess.run(
-            ["claude", "-p", prompt, "--permission-mode", "acceptEdits",
-             "--model", mdl, "--add-dir", cwd, "--output-format", "json"],
-            cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
             env=sub_env,
         )
         return _parse_claude_cli_result(res.stdout, res.stderr, res.returncode, mdl)
@@ -522,6 +533,34 @@ def _run_claude_cli(
         return {"text": f"[claude-cli error] {e!r}", "model": mdl,
                 "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
                 "status": "error"}
+
+
+def _claude_critique(artifact_text: str, rubric_md: str, cwd: str) -> dict[str, Any]:
+    """Same-vendor Claude judge — critique the change, return the pp critique
+    shape (``{parsed:{outcome,critique_md,score}, model, cost_usd, ...}``). Uses a
+    DIFFERENT Claude model from the generator (sonnet) so it is same-vendor /
+    different-model. Used by the drive loop when pp's ``gate_eligible_judges``
+    selects a same-vendor tier for a Claude-produced change (codex is not spent)."""
+    prompt = (
+        "You are a SAME-VENDOR code judge. Do NOT edit any files. Evaluate the "
+        "engineering change below against the rubric. Respond with ONLY a "
+        'single-line JSON object: {"outcome":"pass|revise|fail","critique_md":'
+        '"<=400 chars","score":{"correctness":0-1,"adherence":0-1,'
+        '"absence_of_regressions":0-1}}.\n\n'
+        f"RUBRIC:\n{rubric_md}\n\nCHANGE:\n{artifact_text[:8000]}"
+    )
+    res = _run_claude_cli(prompt, cwd=cwd, model="claude-sonnet-4-6", timeout_s=300,
+                          read_only=True)
+    raw = res.get("text", "")
+    try:
+        s = raw[raw.index("{"): raw.rindex("}") + 1]
+        parsed = json.loads(s)
+    except Exception:  # noqa: BLE001 — degrade to revise on unparseable judge output
+        parsed = {"outcome": "revise", "critique_md": raw[:1000], "score": {}}
+    return {"parsed": parsed, "model": res.get("model") or "claude-sonnet-4-6",
+            "cost_usd": float(res.get("cost_usd") or 0.0),
+            "tokens_in": int(res.get("tokens_in") or 0),
+            "tokens_out": int(res.get("tokens_out") or 0)}
 
 
 def _claude_cli_generation_enabled(dispatcher: "Dispatcher") -> bool:
@@ -617,6 +656,81 @@ def _rubric_md(rubric_id: str) -> str:
             "and absence of regressions. Output outcome (pass/revise/fail), a "
             "critique, and per-dimension scores."
         )
+
+
+# pp's gate_eligible_judges accepts a STRICT gate_type enum; start_stage accepts
+# free-form. Map a Hydra stage kind/gate to the nearest pp gate_type.
+_PP_GATE_TYPES = frozenset(
+    {"spec", "design", "security", "contract", "code_style", "docs_polish", "lint_class"})
+_PP_GATE_TYPE_BY_KIND = {
+    "code": "code_style", "spec": "spec", "design": "design",
+    "architecture": "design", "contracts": "contract", "security": "security",
+    "tests": "lint_class", "docs": "docs_polish",
+}
+
+
+def _pp_gate_type(kind: str, gate_type: str | None = None) -> str:
+    """Map a Hydra stage to pp's strict gate_type enum for gate_eligible_judges
+    (which rejects anything outside the enum, unlike the loose start_stage)."""
+    if gate_type in _PP_GATE_TYPES:
+        return gate_type  # already a valid pp gate type
+    return _PP_GATE_TYPE_BY_KIND.get(kind, "code_style")
+
+
+def _judge_artifact_text(
+    project_path: str, changed_paths: list[str], gen_text: str,
+    max_chars: int = 14000,
+) -> str:
+    """Build the judge's artifact text: the generator summary PLUS the real
+    verbatim code — the unified diff of MODIFIED tracked files AND the full
+    content of NEW/untracked files (``git diff`` omits untracked, so a judge that
+    saw only the diff would miss brand-new files entirely). This gives the judge
+    real code instead of a prose summary, which causes false gate FAILs. Falls
+    back to the summary alone when nothing is readable. All read-only."""
+    summary = (gen_text or "").strip()
+    if not changed_paths:
+        return summary or "(no diff summary returned)"
+    parts: list[str] = []
+    budget = max_chars  # bound INTERMEDIATE accumulation, not just the final slice
+    # Modified tracked files → a real unified diff.
+    try:
+        res = subprocess.run(
+            ["git", "-C", project_path, "diff", "--", *changed_paths],
+            capture_output=True, text=True, timeout=30,
+        )
+        diff = (res.stdout or "").strip()[:budget]
+        if diff:
+            parts.append("UNIFIED DIFF (modified):\n" + diff)
+            budget -= len(diff)
+    except Exception:  # noqa: BLE001 — never block the loop on a git hiccup
+        pass
+    # New/untracked files → include their content (git diff omits them).
+    try:
+        u = subprocess.run(
+            ["git", "-C", project_path, "ls-files", "--others",
+             "--exclude-standard", "--", *changed_paths],
+            capture_output=True, text=True, timeout=15,
+        )
+        for rel in (u.stdout or "").splitlines():
+            if budget <= 0:
+                break
+            rel = rel.strip()
+            if not rel:
+                continue
+            try:
+                with open(os.path.join(project_path, rel), "r",
+                          encoding="utf-8", errors="replace") as fh:
+                    body = fh.read(min(8000, budget))
+                parts.append(f"NEW FILE {rel}:\n{body}")
+                budget -= len(body)
+            except Exception:  # noqa: BLE001 — unreadable/binary new file; skip
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    if not parts:
+        return summary or "(no diff summary returned)"
+    head = (summary + "\n\n") if summary else ""
+    return (head + "\n\n".join(parts))[:max_chars]
 
 
 def _drop_open_run(
@@ -819,23 +933,56 @@ def _drive_pp_stage_loop(
             attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
             # (generate cost already accumulated above, before the gen_fail branch)
 
-            # Judge with codex (Gemini retired — free tier dropped, 2026-06).
-            # When the producer is Claude (host engineer) codex is a genuine
-            # CROSS-vendor judge; when generation fell back to codex the critique
-            # is SAME-vendor (different model id where available) at same-or-higher
-            # tier — marked degraded so the weaker guarantee is visible downstream.
-            # Same-vendor CLAUDE judging is NOT hand-rolled here: it follows
-            # pair-programmer's own gate_eligible_judges rules and is wired via
-            # pp's host-driven lifecycle in Phase 2. Here codex is the judge — a
-            # genuine CROSS-vendor judge when the producer is Claude, or a
-            # SAME-vendor (degraded) judge only on the true-headless codex path.
-            cross_vendor = producer != "codex"
-            crit = cm("pp_codex", "critique", {
-                "artifact_text": gen_text or "(no diff summary returned)",
-                "rubric_md": rubric_body,
-                "cwd": project_path,
-            }, squad_id=sq)
-            ci = _pp_inner(crit)
+            # Judge per pair-programmer's OWN routing rather than a hardcoded
+            # vendor. gate_eligible_judges decides cross- vs same-vendor for this
+            # gate (pp: "Driver MUST call this before invoking any judge"); we
+            # follow it. Default when the gate tool is unavailable (no daemon /
+            # scripted): prefer cross-vendor. Gemini retired 2026-06, so the
+            # cross-vendor judge is always codex.
+            gate_dec: dict[str, Any] = {}
+            try:
+                gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
+                    "gate_type": _pp_gate_type("code", "code_style"),
+                    "generator_producer": producer,
+                    "prompt_keywords": request_text[:1000],
+                }, squad_id=sq))
+            except Exception:  # noqa: BLE001 — never block the loop on a policy miss
+                gate_dec = {}
+            required_cross = bool(gate_dec.get("required_cross_vendor", True))
+            gate_rubric = str(gate_dec.get("rubric_id") or judge_rubric_id)
+            rubric_body = _rubric_md(gate_rubric)
+
+            # The judge reads the REAL diff (verbatim code), not just the
+            # generator's prose summary — a condensed summary causes false gate
+            # FAILs. Falls back to the summary when no diff is available.
+            judge_text = _judge_artifact_text(
+                project_path, sorted(run_changed), gen_text)
+
+            # Vendor selection follows the gate decision:
+            #   same-vendor + Claude producer -> a Claude critique (different
+            #     model) judges it — codex is NOT spent (the common path; keeps
+            #     scarce codex quota for the gates that truly need cross-vendor).
+            #   else -> codex critique (a genuine CROSS-vendor judge when the
+            #     producer is Claude; a SAME-vendor degraded judge only on the
+            #     true-headless codex-generated path).
+            use_claude_judge = (not required_cross) and producer == "claude"
+            if use_claude_judge:
+                ci = _claude_critique(judge_text, rubric_body, project_path)
+                judge_producer = "claude"
+            else:
+                ci = _pp_inner(cm("pp_codex", "critique", {
+                    "artifact_text": judge_text,
+                    "rubric_md": rubric_body,
+                    "cwd": project_path,
+                }, squad_id=sq))
+                judge_producer = "codex"
+            # cross_vendor := the judge vendor differs from the producer vendor.
+            cross_vendor = judge_producer != producer
+            # _judge_degraded: cross-vendor was REQUIRED but unattainable — only
+            # when codex generated AND must self-judge (Gemini being retired). A
+            # gate-sanctioned same-vendor Claude judge is NOT degraded.
+            degraded = required_cross and not cross_vendor
+
             # F6: critique cost counts toward the run's budget charge too.
             out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
             out["tokens_in"] += int(ci.get("tokens_in") or 0)
@@ -847,27 +994,30 @@ def _drive_pp_stage_loop(
             critique_md = parsed.get("critique_md") or parsed.get("critique") or ""
             score_json = dict(parsed.get("score") or parsed.get("score_json") or {})
             score_json["_cross_vendor"] = cross_vendor
-            if not cross_vendor:
+            score_json["_judge_tier"] = (
+                "cross_vendor" if required_cross else "same_vendor")
+            if degraded:
                 score_json["_judge_degraded"] = True
 
             if attempt_id:
                 try:
                     cm("pp_harness", "record_verdict", {
                         "attempt_id": attempt_id,
-                        "judge_producer": "codex",
-                        "judge_model_id": str(ci.get("model") or "codex-default"),
+                        "judge_producer": judge_producer,
+                        "judge_model_id": str(
+                            ci.get("model") or f"{judge_producer}-default"),
                         "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
                         "critique_md": str(critique_md)[:4000],
                         "score_json": score_json,
-                        "rubric_id": judge_rubric_id,
+                        "rubric_id": gate_rubric,
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
                     pass
             # F11-trace: per-attempt verdict event (Reflexion×1 → up to 2 attempts).
             _trace("judge.verdict", {
-                "stage_id": stage_id, "rubric_id": judge_rubric_id,
+                "stage_id": stage_id, "rubric_id": gate_rubric,
                 "retry_index": retry_index, "attempt_id": attempt_id,
-                "producer": producer, "judge_producer": "codex",
+                "producer": producer, "judge_producer": judge_producer,
                 "outcome": outcome, "cross_vendor": cross_vendor,
             })
 
