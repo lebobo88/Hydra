@@ -16,3 +16,6 @@ def _isolate_claude_engineer_env(monkeypatch):
     """
     monkeypatch.delenv("HYDRA_CLAUDE_ENGINEER", raising=False)
     monkeypatch.delenv("HYDRA_DISABLE_CLAUDE_ENGINEER", raising=False)
+    # Opt-in best-of-N must not leak in and silently turn single-candidate drive
+    # tests into best-of runs (which would spawn real worktrees/subprocesses).
+    monkeypatch.delenv("HYDRA_BEST_OF_N", raising=False)

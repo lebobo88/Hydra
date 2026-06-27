@@ -147,6 +147,33 @@ tools:
       validator / smoke / findings-closure / hallucination gate logic. The drive
       loop calls this before finalize so a not-ready stage SURFACES with the real
       blocker instead of swallowing a finalize_stage refusal. No side effects.
+  - name: start_best_of_stage
+    mcp_server: pp_harness
+    privilege: execute
+    notes: >
+      Open a best-of-N stage (allocates N candidate worktrees + judge-position
+      shuffle). Used ONLY when the operator opts in via HYDRA_BEST_OF_N=<2..8>;
+      the default headless drive is single-candidate + Reflexion×1. Requires a
+      non-Claude judge vendor (codex) reachable.
+  - name: borda_count
+    mcp_server: pp_harness
+    privilege: read
+    notes: >
+      Aggregate judge rankings across best-of-N candidates into a winner
+      (Borda points). Read-only ranking computation; no side effects.
+  - name: archive_winner_and_losers
+    mcp_server: pp_harness
+    privilege: execute
+    notes: >
+      Merge the best-of-N winner's worktree into the project tree and archive the
+      losers. Refuses the merge if the winner's recorded smoke failed. Returns
+      merge_status (merged|conflict|empty|smoke_failed) the loop branches on.
+  - name: teardown_candidates
+    mcp_server: pp_harness
+    privilege: execute
+    notes: >
+      Remove best-of-N candidate worktrees after the winner is merged, preserving
+      each candidate's archived artifacts first. Best-effort cleanup.
   - name: blender
     mcp_server: blender
     privilege: read

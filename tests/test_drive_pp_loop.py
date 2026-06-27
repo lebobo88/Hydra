@@ -715,3 +715,171 @@ def test_readiness_auto_resolvable_action_does_not_surface(monkeypatch) -> None:
     assert out["final_status"] == "complete"
     fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
     assert fs["status"] == "passed"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2c: opt-in best-of-N (HYDRA_BEST_OF_N). Default OFF; single-candidate
+# behavior is unchanged when the flag is absent (covered by every test above).
+# --------------------------------------------------------------------------- #
+from hydra_core.squad_node import _best_of_n, _rank_key  # noqa: E402
+
+
+def _best_of_responses(n_candidates: int = 2, merge_status: str = "merged") -> dict:
+    resp = _happy_responses("pass")
+    cands = [{"candidate_index": i, "judge_position": i,
+              "attempt_slot_id": f"slot{i}", "worktree_path": f"/tmp/c{i}",
+              "worktree_mode": "copy"} for i in range(1, n_candidates + 1)]
+    resp[("pp_harness", "start_best_of_stage")] = {"status": "done", "result": {
+        "stage_id": "st_BO", "candidates": cands, "shuffle_seed": 1}}
+    resp[("pp_harness", "borda_count")] = {"status": "done", "result": {
+        "winner": "att_T", "scores": []}}
+    resp[("pp_harness", "archive_winner_and_losers")] = {"status": "done", "result": {
+        "merge_status": merge_status, "winner_diff_path": "code/winner.diff",
+        "losers_archived": n_candidates - 1}}
+    resp[("pp_harness", "teardown_candidates")] = {"status": "done", "result": {
+        "teardown_status": "ok"}}
+    return resp
+
+
+def test_best_of_n_off_by_default_uses_single_candidate(monkeypatch) -> None:
+    """No HYDRA_BEST_OF_N → the single-candidate path runs (no best-of tools)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses())  # responses present but unused
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    assert out.get("best_of_n") is None
+    assert ("pp_harness", "start_best_of_stage") not in {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_stage") in {(s, t) for (s, t, _a) in disp.calls}
+
+
+def test_best_of_n_drives_candidates_and_merges_winner(monkeypatch) -> None:
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(n_candidates=2, merge_status="merged"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+
+    assert out["final_status"] == "complete"
+    assert out.get("best_of_n") == 2
+    seq = {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_best_of_stage") in seq
+    assert ("pp_harness", "archive_winner_and_losers") in seq
+    assert ("pp_harness", "teardown_candidates") in seq
+    # Two candidates generated + judged.
+    assert disp.tool_seq().count("generate") == 2
+    assert disp.tool_seq().count("record_smoke_status") == 2
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+    assert fs["winner_attempt_id"] == "att_T"
+
+
+def test_best_of_n_merge_conflict_surfaces(monkeypatch) -> None:
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(merge_status="conflict"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "surfaced"
+    assert "merge=conflict" in (out.get("error") or "")
+
+
+def test_best_of_n_falls_back_to_single_when_cannot_open(monkeypatch) -> None:
+    """If start_best_of_stage can't open (e.g. no cross-vendor judge), fall back
+    to the single-candidate path rather than aborting the run."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "3")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "start_best_of_stage")] = {
+        "status": "failed", "error": "no non-Claude judge vendor reachable"}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    seq = {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_harness", "start_stage") in seq          # single-candidate fallback ran
+    assert disp.tool_seq().count("generate") == 1
+
+
+def test_best_of_n_env_parsing() -> None:
+    import os as _os
+    for val, exp in [("2", 2), ("8", 8), ("1", None), ("9", None),
+                     ("", None), ("x", None), ("0", None)]:
+        _os.environ["HYDRA_BEST_OF_N"] = val
+        try:
+            assert _best_of_n() == exp, val
+        finally:
+            _os.environ.pop("HYDRA_BEST_OF_N", None)
+    assert _best_of_n() is None  # unset
+
+
+def test_rank_key_orders_pass_over_revise_over_fail() -> None:
+    p = _rank_key("pass", {"correctness": 0.9}, "pass")
+    r = _rank_key("revise", {"correctness": 0.9}, "pass")
+    f = _rank_key("fail", {"correctness": 0.9}, "skipped")
+    assert p > r > f
+    # Booleans in score (e.g. _cross_vendor) are ignored in the mean.
+    assert _rank_key("pass", {"_cross_vendor": True, "x": 1.0}, "pass") > 0
+
+
+def test_best_of_n_copy_merge_passes(monkeypatch) -> None:
+    """merge_status='copy' (copy-mode merge-back on a non-git project) is a valid
+    successful apply — must complete, not surface."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_best_of_responses(merge_status="copy"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+
+
+def test_best_of_n_teardown_partial_surfaced_but_not_fatal(monkeypatch) -> None:
+    """A non-ok teardown (orphaned worktrees) is SURFACED in the result, but does
+    not discard a successfully-merged winner."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _best_of_responses(merge_status="merged")
+    resp[("pp_harness", "teardown_candidates")] = {"status": "done", "result": {
+        "teardown_status": "partial", "not_torn_down": [2]}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"        # merged winner still lands
+    assert out.get("teardown_status") == "partial"  # ... but the gap is visible
+    assert out.get("teardown_not_torn_down") == [2]
+
+
+def test_rank_key_verdict_dominates_high_score_fail() -> None:
+    """A fail with a high rubric score must NEVER outrank a pass with a low one
+    (rubrics may be 0-1 or 0-10; verdict dominates absolutely)."""
+    assert _rank_key("pass", {"x": 0.5}, "skipped") > _rank_key("fail", {"x": 9.0}, "pass")
+    assert _rank_key("revise", {"x": 0.0}, "skipped") > _rank_key("fail", {"x": 10.0}, "pass")
+
+
+def test_best_of_n_unknown_borda_winner_falls_back_to_ranked(monkeypatch) -> None:
+    """If Borda returns an id that matches NO candidate (or multiple), the winner
+    falls back to the top-RANKED candidate rather than guessing — the run still
+    finalizes against a real winner attempt id."""
+    monkeypatch.setenv("HYDRA_BEST_OF_N", "2")
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _best_of_responses(merge_status="merged")
+    resp[("pp_harness", "borda_count")] = {"status": "done", "result": {
+        "winner": "NONEXISTENT_ID", "scores": []}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"
+    assert fs["winner_attempt_id"] == "att_T"   # ranked[0]'s real attempt id
