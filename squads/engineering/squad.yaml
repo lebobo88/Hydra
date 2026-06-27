@@ -139,6 +139,14 @@ tools:
       allowed_judges). The drive loop MUST call this before invoking a judge so
       cross- vs same-vendor selection follows pair-programmer's own rules rather
       than a hardcoded vendor. Read-only policy lookup; no side effects.
+  - name: get_stage_finalize_readiness
+    mcp_server: pp_harness
+    privilege: read
+    notes: >
+      Read-only preflight for finalize_stage(passed): pp's own verdict / artifact-
+      validator / smoke / findings-closure / hallucination gate logic. The drive
+      loop calls this before finalize so a not-ready stage SURFACES with the real
+      blocker instead of swallowing a finalize_stage refusal. No side effects.
   - name: blender
     mcp_server: blender
     privilege: read

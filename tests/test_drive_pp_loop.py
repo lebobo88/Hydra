@@ -647,3 +647,71 @@ def test_judge_codex_same_vendor_not_degraded_when_gate_allows(monkeypatch) -> N
     assert rv["score_json"].get("_cross_vendor") is False
     assert rv["score_json"].get("_judge_tier") == "same_vendor"
     assert "_judge_degraded" not in rv["score_json"]   # gate-sanctioned same-vendor
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2b: honour pp's finalize readiness + finalize_run downgrade signal.
+# --------------------------------------------------------------------------- #
+def test_readiness_can_pass_false_surfaces(monkeypatch) -> None:
+    """A passing verdict + passing smoke must STILL surface if pp's readiness
+    preflight says the stage is not ready (e.g. a server-side gate violation)."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "get_stage_finalize_readiness")] = {"status": "done", "result": {
+        "can_pass": False, "next_action": "surface_stage",
+        "blockers": [{"kind": "verdict", "reason": "latest verdict fail"}]}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "surfaced"        # readiness downgraded it
+    assert "winner_attempt_id" not in fs
+    assert "readiness" in (out.get("error") or "")
+
+
+def test_readiness_absent_does_not_block(monkeypatch) -> None:
+    """When the readiness tool is unavailable (no daemon / scripted default {}),
+    the smoke-based decision stands — a passing stage still completes."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))  # no readiness response
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "complete"
+    # The preflight was still attempted (read-only).
+    assert ("pp_harness", "get_stage_finalize_readiness") in {
+        (s, t) for (s, t, _a) in disp.calls}
+
+
+def test_finalize_run_downgraded_flag_is_honored(monkeypatch) -> None:
+    """finalize_run's PP-VG-7 shape {effective_status, downgraded} must be read:
+    a downgraded='complete' must surface, not be laundered into complete."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "finalize_run")] = {"status": "done", "result": {
+        "effective_status": "surfaced", "requested_status": "complete",
+        "downgraded": True, "surfaced_stage_count": 1}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    assert out["final_status"] == "surfaced"
+
+
+def test_readiness_auto_resolvable_action_does_not_surface(monkeypatch) -> None:
+    """A can_pass=False whose next_action is an auto-resolvable missing row
+    (finalize_stage runs it) must NOT pre-surface — defer to finalize_stage."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "ok"))
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "get_stage_finalize_readiness")] = {"status": "done", "result": {
+        "can_pass": False, "next_action": "run_artifact_validate", "blockers": []}}
+    disp = _ScriptedDispatcher(resp)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
+    # Deferred, not surfaced: finalize_stage still attempts passed.
+    assert out["final_status"] == "complete"
+    fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
+    assert fs["status"] == "passed"

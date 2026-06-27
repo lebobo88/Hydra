@@ -1055,6 +1055,47 @@ def _drive_pp_stage_loop(
         out["smoke_status"] = smoke_status
         out["smoke_reason"] = smoke_reason
 
+        # PP readiness preflight: honour pair-programmer's OWN finalize gate
+        # (verdict / validator / smoke / findings-closure / hallucination rules)
+        # before claiming the stage passed. finalize_stage enforces these
+        # server-side anyway, but checking first lets us SURFACE the real blocker
+        # instead of swallowing a finalize_stage refusal. Safe default: when the
+        # tool is unavailable (no daemon / scripted) `can_pass` is absent → we do
+        # NOT downgrade (keep the smoke-based decision). For a standalone code
+        # stage (no tests_pre predecessor) pp requires no TDD rows, so a passing
+        # verdict + smoke resolves to can_pass=true.
+        if passed and not gen_failed:
+            try:
+                rd = _pp_inner(cm("pp_harness", "get_stage_finalize_readiness",
+                                  {"stage_id": stage_id}, squad_id=sq))
+            except Exception:  # noqa: BLE001
+                rd = {}
+            if rd.get("can_pass") is False:
+                na = rd.get("next_action") or "not_ready"
+                # finalize_stage AUTO-RUNS missing validator / TDD gate rows, so a
+                # "missing row" next_action is NOT a real block — defer it to
+                # finalize_stage. Only surface on TERMINAL blockers the headless
+                # loop cannot resolve here (Reflexion ×1 is already spent).
+                _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
+                                  "run_tdd_post_check", "record_smoke_or_assertion"}
+                if na in _auto_resolved:
+                    _log.info(
+                        "drive_loop readiness defers '%s' to finalize_stage "
+                        "auto-run (run=%s)", na, run_id)
+                else:
+                    passed = False
+                    blockers = rd.get("blockers") or []
+                    btxt = "; ".join(
+                        str(b.get("reason") or b.get("kind") or b)
+                        if isinstance(b, dict) else str(b)
+                        for b in blockers[:3]) if blockers else ""
+                    out["stage_outcome"] = "surfaced"
+                    out["error"] = (f"pp readiness: not ready "
+                                    f"(next_action={na})"
+                                    f"{f' :: {btxt}' if btxt else ''}")
+                    _log.warning("drive_loop readiness blocked (run=%s): %s",
+                                 run_id, out["error"])
+
         try:
             cm("pp_harness", "finalize_stage", {
                 "stage_id": stage_id,
@@ -1069,8 +1110,10 @@ def _drive_pp_stage_loop(
         elif passed:
             summary = f"Headless drive loop: stage_outcome=pass; smoke={smoke_status}."
         else:
-            summary = (f"Headless drive loop: stage_outcome={outcome}; "
-                       f"smoke={smoke_status} ({smoke_reason[:120]}).")
+            extra = f" :: {out['error']}" if out.get("error") else ""
+            summary = (f"Headless drive loop: "
+                       f"stage_outcome={out.get('stage_outcome') or outcome}; "
+                       f"smoke={smoke_status} ({smoke_reason[:120]}){extra}.")
 
         # finalize_run runs PP gates server-side and may downgrade -- don't
         # assume success; reflect the returned status.
@@ -1080,7 +1123,13 @@ def _drive_pp_stage_loop(
             "summary_md": summary,
         }, squad_id=sq)
         out["finalized"] = True
-        fin_status = _pp_inner(fin).get("status")
+        fin_inner = _pp_inner(fin)
+        # finalize_run (PP-VG-7) returns {effective_status, requested_status,
+        # downgraded, surfaced_stage_count}; older/scripted shapes use {status}.
+        # Read the REAL effective status and honour an explicit downgrade so a
+        # server-side surface is never laundered into "complete".
+        fin_status = fin_inner.get("effective_status") or fin_inner.get("status")
+        fin_downgraded = bool(fin_inner.get("downgraded"))
         # PP-VG-5 honesty: finalize "complete" ONLY when the finalize envelope is
         # unambiguously successful. The old `fin_status in {complete,done,ok} or
         # _pp_ok(fin)` short-circuited `_pp_ok` on the inner status alone, so an
@@ -1088,7 +1137,7 @@ def _drive_pp_stage_loop(
         # or a failed OUTER envelope ({"status":"failed","result":{"status":
         # "complete"}}) was laundered into "complete". `_pp_ok` already checks the
         # OUTER status in {done,ok,complete} AND inner has no error — gate on it.
-        if passed and _pp_ok(fin) \
+        if passed and _pp_ok(fin) and not fin_downgraded \
                 and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
             out["final_status"] = "complete"
         else:
