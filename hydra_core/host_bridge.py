@@ -383,7 +383,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "tokens_out": int(result.get("tokens_out") or 0),
                 "cost_usd": float(result.get("cost_usd") or 0.0),
                 "status": "error", "retry_index": 0,
-                "notes": {"candidate_index": 1, "attended": True},
+                "notes": {"candidate_index": 1},
             }, squad_id=_SQ)
             cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
         except Exception:  # noqa: BLE001
@@ -408,7 +408,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         "tokens_out": int(result.get("tokens_out") or 0),
         "cost_usd": float(result.get("cost_usd") or 0.0),
         "status": "ok", "retry_index": 0,
-        "notes": {"candidate_index": 1, "attended": True},
+        "notes": {"candidate_index": 1},
     }, squad_id=_SQ)
     cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
 

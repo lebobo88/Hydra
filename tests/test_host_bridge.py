@@ -136,6 +136,24 @@ def test_generate_then_judge_then_finalize_complete(tmp_path):
     assert all(q == "engineering" for _s, _t, _a, q in disp.calls)
 
 
+def test_record_attempt_notes_only_allowed_keys(tmp_path):
+    """Regression: the pp daemon's record_attempt rejects unrecognized `notes`
+    keys (zod strict). The attended driver must send only the allowed shape —
+    `{candidate_index}` — never a custom marker like `attended`. (A live smoke
+    caught this: an `attended` key made record_attempt fail → no attempt_id →
+    no verdict/smoke → surfaced.)"""
+    disp = FakeDispatcher()
+    res = _begin(disp, tmp_path)
+    host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py"})
+    notes = [a.get("notes") for _s, t, a, _q in disp.calls if t == "record_attempt"]
+    assert notes, "expected a record_attempt call"
+    for n in notes:
+        assert set(n.keys()) <= {"candidate_index"}, (
+            f"record_attempt notes must not carry unrecognized keys: {n}")
+
+
 def test_same_vendor_judge_routing(tmp_path):
     """When gate_eligible_judges does NOT require cross-vendor, the host is told
     to spawn the same-vendor judge."""
