@@ -17,9 +17,28 @@ Hydra dispatches to pair-programmer via the engineering squad internally.
 | Read-only question about the codebase | Answer directly |
 | Uncertain what it needs | `/hydra:run "goal"` (the router classifies) |
 
+### Execution modes (attended vs detached)
+
+Engineering runs in one of two modes — SAME engine + governance, differing only
+in WHERE the pp stage loop runs:
+
+- **Attended (default, `HYDRA_HOST_DRIVEN=1`)** — the host session drives the
+  lifecycle IN-CONTEXT so you follow along; generate + judge surface as visible
+  `Agent` subagents. The Python engine stays authoritative (ledger, budget,
+  judge routing, finalize gates). Use `/hydra:drive` (or `/hydra:run`, which
+  takes the attended branch when the toggle is on). Runbook: `hydra.workflow.plan`
+  → loop `hydra.workflow.step` + spawn `Agent` + `hydra.workflow.submit_host_result`.
+- **Detached (`HYDRA_HOST_DRIVEN` unset/`0`)** — `hydra.workflow.launch` detaches
+  `hydra run --live`; the stage loop runs headlessly in the background.
+
+The toggle lives in `.claude/settings.json` (`env.HYDRA_HOST_DRIVEN`). Attended
+engineering is single-stream; parallel/fleet work uses the detached path.
+
 ### Available Hydra Commands
 
 - `/hydra:run` — primary entry point, routes to correct squad(s)
+- `/hydra:drive` — attended (host-bridged) execution: drive the lifecycle
+  in-context with visible engineer/judge subagents (follow-along)
 - `/hydra:campaign` — multi-squad campaign with dependency wiring; also the cross-repo fleet entry point (see below)
 - `/hydra:status` — show workflows or specific workflow state
 - `/hydra:squads` — list available squads

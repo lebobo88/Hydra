@@ -20,6 +20,23 @@ by the pair-programmer harness, in Python, through the pp stage loop. The
 `hydra-block-direct-write` hook enforces this (blocks your direct Write/Edit to
 engine source when `HYDRA_ENFORCE_ROUTING=1`).
 
+### Two execution modes (the `HYDRA_HOST_DRIVEN` toggle)
+
+- **Attended (default, `HYDRA_HOST_DRIVEN=1`)** — drive the lifecycle IN-CONTEXT
+  so the operator follows along: `hydra.workflow.plan` → loop
+  `hydra.workflow.step` (spawn the visible `engineer`/judge `Agent`) →
+  `hydra.workflow.submit_host_result`. The engine stays authoritative (ledger,
+  budget, judge routing, finalize gates); the engineer writes into an isolated
+  `.harness/worktrees/` worktree merged back on pass. **This is exactly
+  `/hydra:drive`** — see that command for the full runbook.
+- **Detached (`HYDRA_HOST_DRIVEN` unset/`0`)** — hand the goal to
+  `hydra.workflow.launch` (detached `hydra run --live`); the engine runs the pp
+  stage loop headlessly in a background subprocess (no follow-along).
+
+Both modes use the SAME engine + governance; they differ only in WHERE the stage
+loop runs (your context vs a detached subprocess). When attended, follow the
+`/hydra:drive` steps below instead of step 2's `launch`.
+
 The deterministic engine is reachable via the `hydra_control` MCP tools (or the
 CLI they wrap):
 

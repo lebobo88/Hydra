@@ -189,6 +189,66 @@ def test_run_smoke_with_stub_dispatcher(capsys):
     assert payload["workflow_id"]
 
 
+# --- plan (non-detaching attended planning surface) --------------------------
+
+def _extract_json(out: str):
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("{"):
+            try:
+                return json.loads("\n".join(lines[i:]))
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def test_plan_halts_before_dispatch_without_executing(capsys, tmp_path, monkeypatch):
+    """`hydra plan` runs intake+planner and HALTS before dispatch — it returns
+    the TaskState plan with the task still `pending` (never executed). This is
+    the non-detaching surface attended (host-bridged) mode drives."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp.db"))
+    rc = _run(["plan", "fix a small typo in the README", "--squad", "engineering"],
+              project_root=REPO_ROOT)
+    out = capsys.readouterr().out
+    payload = _extract_json(out)
+    assert payload is not None, f"no JSON found in: {out[-500:]}"
+    assert rc == 0
+    assert payload["ok"] is True
+    # Single-squad, no approval needed → halts at the dispatch interrupt.
+    assert payload["phase"] == "dispatch"
+    assert payload["requires_human_approval"] is False
+    assert payload["pending_hitl"] is None
+    assert "engineering" in payload["selected_squads"]
+    # The plan was produced but NOTHING dispatched: the task is still pending
+    # and budget is unspent.
+    assert payload["tasks"], "expected at least one planned task"
+    assert all(t["status"] == "pending" for t in payload["tasks"])
+    assert payload["budget"]["spent_usd"] == 0.0
+    assert payload["workflow_id"]
+
+
+def test_plan_surfaces_pending_approval_hitl(capsys, tmp_path, monkeypatch):
+    """When the planner requires approval, `hydra plan` honestly returns the
+    pending approval HITL (it does NOT pretend pending_hitl is null) and still
+    dispatches nothing."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp.db"))
+    # A multi-squad / high-risk-flavoured goal trips requires_human_approval.
+    rc = _run(["plan",
+               "Add idempotency-key support to the payments API and notify support"],
+              project_root=REPO_ROOT)
+    out = capsys.readouterr().out
+    payload = _extract_json(out)
+    assert payload is not None, f"no JSON found in: {out[-500:]}"
+    assert rc == 0
+    assert payload["ok"] is True
+    if payload["requires_human_approval"]:
+        assert payload["pending_hitl"] is not None
+        assert payload["pending_hitl"].get("gate_node") == "approval"
+        assert payload["phase"] in ("approval", "planning", "intake")
+    # Either way, no execution happened.
+    assert payload["budget"]["spent_usd"] == 0.0
+
+
 # --- run --workflow-id -------------------------------------------------------
 
 def test_run_workflow_id_passthrough(capsys):

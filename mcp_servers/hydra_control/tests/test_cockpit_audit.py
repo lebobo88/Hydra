@@ -338,7 +338,12 @@ def test_all_tools_in_handlers():
     # Hybrid continuation transport: the host->engine launch + ingest surfaces.
     assert "hydra.workflow.launch" in handlers
     assert "hydra.workflow.submit_envelopes" in handlers
-    assert len(handlers) == 5
+    # Attended (host-bridged) execution surfaces: non-detaching plan + the
+    # step/submit_host_result drive loop.
+    assert "hydra.workflow.plan" in handlers
+    assert "hydra.workflow.step" in handlers
+    assert "hydra.workflow.submit_host_result" in handlers
+    assert len(handlers) == 8
     # Every handler has a published schema.
     from mcp_servers.hydra_control.server import _TOOL_SCHEMAS
     assert set(handlers) == set(_TOOL_SCHEMAS)

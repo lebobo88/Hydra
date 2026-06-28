@@ -351,6 +351,95 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _cmd_plan(args) -> int:
+    """Non-detaching planning surface for attended (host-bridged) execution.
+
+    Runs intake -> planner and HALTS before any squad executes (plan_only adds
+    "dispatch" to the graph's interrupt_before, so the run stops at the planner
+    output in both the approval-required and no-approval cases). Returns the
+    planner's TaskState plan in-band so the host can then drive dispatch itself
+    via the visible Agent subagents — instead of `hydra run --live` detaching a
+    headless subprocess the operator cannot watch.
+
+    Requires the LangGraph/checkpoint path: the pure-Python runner has no
+    interrupt semantics, so it would run straight through dispatch. The
+    pre-allocated workflow_id threads continuity (plan -> step ->
+    submit_host_result -> resume all share it).
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+
+    # Mirror _cmd_run's workflow-id handling so a caller (the hydra.workflow.plan
+    # MCP tool) can pre-allocate the id and attach to the same checkpoint.
+    wf_id_override = getattr(args, "workflow_id_override", None)
+    workflow_id = uuid4()
+    if wf_id_override is not None and _WORKFLOW_ID_RE.match(wf_id_override):
+        try:
+            from uuid import UUID as _UUID
+            workflow_id = _UUID(wf_id_override)
+        except ValueError:
+            workflow_id = uuid4()
+
+    _goal = args.goal
+    if getattr(args, "repo", None):
+        _goal = f"{_goal} --repo {args.repo}"
+    if getattr(args, "repos", None):
+        _goal = f"{_goal} --repos {args.repos}"
+    if getattr(args, "subdir", None):
+        _goal = f"{_goal} --subdir {args.subdir}"
+
+    initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
+    if args.squad:
+        initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
+    if getattr(args, "budget", None) is not None:
+        initial.budget.budget_usd = float(args.budget)
+
+    # Planning never dispatches, so a NullDispatcher is correct and cheap — it
+    # lacks the `live_execution` marker, so drive_pp_loop is never auto-enabled.
+    dispatcher = _NullDispatcher()
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(
+        project_root=project,
+        dispatcher=dispatcher,
+        plan_only=True,
+    )
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "ok": False,
+            "error": "langgraph unavailable — plan requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+
+    emit(project, workflow_id, "workflow_plan", {"goal": _goal,
+                                                 "budget_usd": initial.budget.budget_usd})
+    config = {"configurable": {"thread_id": str(workflow_id)}}
+    sup.invoke(initial, config=config)
+    snap = sup.get_state(config)
+    values = snap.values if snap is not None else {}
+    try:
+        final = HydraState.model_validate(values) if values else initial
+    except Exception:  # noqa: BLE001 — fall back to a best-effort view
+        final = initial
+
+    def _task_view(t) -> dict:
+        if hasattr(t, "model_dump"):
+            return t.model_dump(mode="json")
+        return dict(t) if isinstance(t, dict) else {"value": str(t)}
+
+    pending = final.pending_hitl
+    print(json.dumps({
+        "ok": True,
+        "workflow_id": str(workflow_id),
+        "phase": getattr(final, "phase", "?"),
+        "selected_squads": list(getattr(final, "selected_squads", [])),
+        "requires_human_approval": bool(getattr(final, "requires_human_approval", False)),
+        "tasks": [_task_view(t) for t in getattr(final, "tasks", [])],
+        "pending_hitl": pending if isinstance(pending, dict) else None,
+        "budget": final.budget.model_dump(mode="json") if hasattr(final, "budget") else {},
+        "trace": str(trace_path(project, workflow_id)),
+    }, indent=2))
+    return 0
+
+
 _RESUME_LOCK_GRACE_S = 30        # min age before a dead-owner lock is reclaimed
 _RESUME_LOCK_HARD_CAP_S = 86_400  # PID-reuse safety valve: dead-or-alive, 24h max
 
@@ -924,6 +1013,206 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         "trace": str(trace_path(project, wf)),
     }, indent=2, default=str))
     return 0
+
+
+def _attended_live_dispatcher(project: Path, verbose: bool = False):
+    """Build the live MCP dispatcher attended mode drives (talks to pp_harness).
+    Attended mode does NOT set drive_pp_loop — the host drives the stage steps."""
+    from .dispatcher import MCPStdioDispatcher
+    dispatcher = MCPStdioDispatcher(project, verbose=verbose)
+    packs = discover_squads(project)
+    if hasattr(dispatcher, "set_squad_packs"):
+        dispatcher.set_squad_packs(packs)
+    return dispatcher
+
+
+def _next_engineering_task(state: HydraState):
+    """First not-yet-finished engineering task in the plan (pending / surfaced /
+    in_progress), or None when engineering is fully done."""
+    for t in getattr(state, "tasks", []):
+        if t.owner_squad == "engineering" and t.status in (
+                "pending", "surfaced", "in_progress"):
+            return t
+    return None
+
+
+def _resolve_task_project_path(task, project: Path) -> str:
+    """Resolve the engineering target dir: an allow-listed repo id when the task
+    targets one, else the workflow project root."""
+    rid = getattr(task, "target_repo_id", None)
+    if rid:
+        from .repo_registry import resolve_repo_project_path
+        sub = getattr(task, "target_repo_subpath", None)
+        p = resolve_repo_project_path(rid, sub)
+        if sub:
+            Path(p).mkdir(parents=True, exist_ok=True)
+        return str(p)
+    return str(project)
+
+
+def _cmd_attended_step(args) -> int:
+    """Attended (host-bridged) execution: open the next engineering stage and
+    PAUSE for a visible host `engineer` subagent.
+
+    Loads the workflow checkpoint (engineering inherits the planned task ledger +
+    budget), scaffolds a pp run, opens an attended code stage, and returns the
+    first host_action. The host then spawns the `engineer` Agent and feeds the
+    result back via `hydra submit-host-result`. Requires the LangGraph/checkpoint
+    path (continuity with the plan)."""
+    from . import host_bridge
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+    if not _WORKFLOW_ID_RE.match(wf):
+        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+              file=sys.stderr)
+        return 1
+
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "status": "resume_in_progress",
+                          "lock": str(lock_path)}))
+        return 0
+    try:
+        dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+        from .supervisor import build_supervisor, _PurePythonRunner
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        if isinstance(sup, _PurePythonRunner):
+            print(json.dumps({"ok": False,
+                              "error": "langgraph unavailable — attended step requires "
+                                       "the checkpointing supervisor"}), file=sys.stderr)
+            return 1
+        config = {"configurable": {"thread_id": wf}}
+        snap = sup.get_state(config)
+        if snap is None or not snap.values:
+            print(json.dumps({"ok": False, "error": "not_found",
+                              "detail": "no checkpoint — run `hydra plan` first"}),
+                  file=sys.stderr)
+            return 1
+        state = HydraState.model_validate(snap.values)
+
+        task = _next_engineering_task(state)
+        if task is None:
+            print(json.dumps({"ok": True, "status": "no_pending_engineering_task",
+                              "workflow_id": wf}))
+            return 0
+        project_path = _resolve_task_project_path(task, project)
+        request_text = task.description or state.root_goal
+
+        start = dispatcher.call_mcp("pp_harness", "start_run", {
+            "request_text": request_text, "project_path": project_path,
+            "mode": "single"}, squad_id="engineering")
+        inner = start.get("result", start) if isinstance(start, dict) else {}
+        run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
+        if not run_id:
+            print(json.dumps({"ok": False, "error": "start_run returned no run_id",
+                              "detail": str(start)[:500]}), file=sys.stderr)
+            return 1
+
+        # Register the open pp run so postcheck/reap can finalize-abort it if the
+        # workflow is abandoned mid-stage (the run holds the .harness lock).
+        state.open_pp_runs.append({"run_id": str(run_id), "project_path": project_path})
+        task.status = "in_progress"
+
+        res = host_bridge.begin_stage(
+            dispatcher, workflow_id=wf, run_id=str(run_id),
+            project_path=project_path, request_text=request_text,
+            model_tier=getattr(task, "model_tier", None),
+            project_root=project, task_id=str(task.task_id))
+
+        try:
+            sup.update_state(config, {
+                "tasks": [t.model_dump(mode="json") for t in state.tasks],
+                "open_pp_runs": state.open_pp_runs,
+            })
+        except Exception as e:  # noqa: BLE001 — never lose the run on a persist miss
+            emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+        emit(project, wf, "attended.step", {"run_id": str(run_id),
+                                            "task_id": str(task.task_id),
+                                            "state": res.get("state")})
+        print(json.dumps({"ok": True, **res}, indent=2, default=str))
+        return 0
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_attended_submit(args) -> int:
+    """Feed a host subagent's result back into an attended stage and advance it
+    one step. On stage completion, charge the accrued cost on the checkpointed
+    HydraState budget (keeping the 80%/100% tripwires live) and record the task
+    outcome — so attended execution is never budget-blind."""
+    from . import host_bridge
+    from .governance import charge_and_gate
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+    if not _WORKFLOW_ID_RE.match(wf):
+        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+              file=sys.stderr)
+        return 1
+    try:
+        result = json.loads(Path(args.result).read_text(encoding="utf-8"))
+        if not isinstance(result, dict):
+            raise ValueError("result file must be a JSON object")
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(json.dumps({"ok": False, "error": f"could not read --result: {e}"}),
+              file=sys.stderr)
+        return 1
+
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "status": "resume_in_progress",
+                          "lock": str(lock_path)}))
+        return 0
+    try:
+        dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+        cfile = host_bridge.cursor_path(project, wf, str(args.run_id))
+        if not Path(cfile).exists():
+            print(json.dumps({"ok": False, "error": "cursor_not_found",
+                              "detail": str(cfile)}), file=sys.stderr)
+            return 1
+        res = host_bridge.submit_host_result(
+            dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result)
+
+        # On terminal: charge budget on the authoritative HydraState ledger and
+        # record the task outcome into the checkpoint.
+        if res.get("status") in ("complete", "surfaced", "aborted"):
+            from .supervisor import build_supervisor, _PurePythonRunner
+            sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+            if not isinstance(sup, _PurePythonRunner):
+                config = {"configurable": {"thread_id": wf}}
+                snap = sup.get_state(config)
+                if snap is not None and snap.values:
+                    state = HydraState.model_validate(snap.values)
+                    cost = float(res.get("cost_usd") or 0.0)
+                    toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
+                    block, downgrade = charge_and_gate(state, cost, toks)
+                    tid = res.get("task_id")
+                    for t in state.tasks:
+                        if str(t.task_id) == str(tid):
+                            t.status = ("done" if res["status"] == "complete"
+                                        else "surfaced")
+                    state.open_pp_runs = [e for e in state.open_pp_runs
+                                          if e.get("run_id") != res.get("run_id")]
+                    res["budget_block"] = block
+                    res["budget_downgrade"] = downgrade
+                    res["spent_usd"] = state.budget.spent_usd
+                    try:
+                        sup.update_state(config, {
+                            "tasks": [t.model_dump(mode="json") for t in state.tasks],
+                            "open_pp_runs": state.open_pp_runs,
+                            "budget": state.budget.model_dump(mode="json"),
+                            "budget_downgrade_active": bool(downgrade),
+                        })
+                    except Exception as e:  # noqa: BLE001
+                        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+        emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
+                                              "call_key": str(args.call_key),
+                                              "status": res.get("status")})
+        print(json.dumps({"ok": True, **res}, indent=2, default=str))
+        return 0
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
 
 
 _TERMINAL_PHASES = frozenset({"done", "surfaced"})
@@ -1552,6 +1841,39 @@ def main(argv: list[str] | None = None) -> int:
             "and a warning is emitted."
         ),
     )
+    pl = sub.add_parser("plan", help=(
+        "Non-detaching planning surface for attended (host-bridged) execution: "
+        "run intake+planner and return the TaskState plan WITHOUT dispatching."))
+    pl.add_argument("goal")
+    pl.add_argument("--squad", help="Comma-separated squad slugs to force-select")
+    pl.add_argument("--budget", type=float, default=None,
+                    help="Workflow budget cap in USD (sets BudgetLedger.budget_usd).")
+    pl.add_argument("--repo", default=None, metavar="ID",
+                    help="Single allow-listed repo id (folded into the goal).")
+    pl.add_argument("--repos", default=None, metavar="ID,ID,...",
+                    help="Comma-separated allow-listed repo ids for fleet mode.")
+    pl.add_argument("--subdir", default=None, metavar="PATH",
+                    help="Repo-relative engineering target under --repo/--repos.")
+    pl.add_argument("--workflow-id", dest="workflow_id_override", default=None,
+                    metavar="ID",
+                    help="Pre-allocate the workflow id (threads plan->step->resume).")
+
+    stp = sub.add_parser("step", help=(
+        "Attended mode: open the next engineering stage and pause for a visible "
+        "host `engineer` subagent (returns a host_action)."))
+    stp.add_argument("workflow_id")
+    stp.add_argument("--verbose", action="store_true")
+
+    shr = sub.add_parser("submit-host-result", help=(
+        "Attended mode: feed a host subagent's result back into a stage and "
+        "advance it one step (charges budget on stage completion)."))
+    shr.add_argument("workflow_id")
+    shr.add_argument("--run-id", dest="run_id", required=True)
+    shr.add_argument("--call-key", dest="call_key", required=True)
+    shr.add_argument("--result", required=True, metavar="FILE",
+                     help="Path to a JSON file with the subagent's result object.")
+    shr.add_argument("--verbose", action="store_true")
+
     s = sub.add_parser("status")
     s.add_argument("workflow_id", nargs="?")
     t = sub.add_parser("trace")
@@ -1657,6 +1979,9 @@ def main(argv: list[str] | None = None) -> int:
         "verify": _cmd_verify,
         "squads": _cmd_squads,
         "run": _cmd_run,
+        "plan": _cmd_plan,
+        "step": _cmd_attended_step,
+        "submit-host-result": _cmd_attended_submit,
         "status": _cmd_status,
         "trace": _cmd_trace,
         "reap": _cmd_reap,

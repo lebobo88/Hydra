@@ -218,10 +218,21 @@ def build_supervisor(
     critique_client: Optional[CritiqueClient] = None,
     profile: Optional[str] = None,
     force_pure_python: bool = False,
+    plan_only: bool = False,
 ):
     """Build a compiled supervisor. Returns the compiled graph if LangGraph is
     installed; otherwise returns a callable that runs the graph step-by-step
-    in pure Python (suitable for headless tests)."""
+    in pure Python (suitable for headless tests).
+
+    `plan_only` adds ``"dispatch"`` to the graph's ``interrupt_before`` set so a
+    run halts after ``planner`` (before any squad executes). It is the engine
+    behind the non-detaching ``hydra plan`` surface / ``hydra.workflow.plan`` MCP
+    tool used by attended (host-bridged) execution: the host gets routing + the
+    planner's TaskState plan back in-band without launching dispatch. When the
+    planner sets ``requires_human_approval`` the run still halts at the existing
+    ``approval`` interrupt instead (with ``pending_hitl`` populated) — either way
+    nothing dispatches. Requires the LangGraph/checkpoint path (the pure-Python
+    runner has no interrupt semantics)."""
     packs = discover_squads(project_root)
     if not packs:
         raise RuntimeError("No squads discovered. Expected `squads/<name>/squad.yaml`.")
@@ -2917,9 +2928,16 @@ def build_supervisor(
     conn = sqlite3.connect(str(cp_path), check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
+    interrupts = ["approval", "synthesis", "judge_synthesis"]
+    if plan_only:
+        # Attended (host-bridged) planning surface: halt after planner, before
+        # any squad executes. Combined with the existing "approval" interrupt
+        # this guarantees the run stops at the planner output in BOTH the
+        # approval-required and no-approval cases.
+        interrupts.append("dispatch")
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["approval", "synthesis", "judge_synthesis"],
+        interrupt_before=interrupts,
     )
 
 

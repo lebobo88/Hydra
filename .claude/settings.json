@@ -1,0 +1,5 @@
+{
+  "env": {
+    "HYDRA_HOST_DRIVEN": "1"
+  }
+}

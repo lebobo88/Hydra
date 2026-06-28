@@ -56,6 +56,15 @@ Engineering execution is **always** the pair-programmer harness stage protocol, 
 
 **If a phase legitimately needs parallel engineering** (multiple subsystems or repos at once): use planner `phase_batch_index` batching, or the cross-repo fleet (`/hydra:campaign --repos …`, one pp run per repo) — both keep every subsystem inside a governed stage cycle. Parallelism never means bypassing the harness.
 
+### Attended (host-bridged) execution — `HYDRA_HOST_DRIVEN=1`
+
+Engineering has two execution modes that share the SAME engine + governance and differ only in WHERE the stage loop runs:
+
+- **Detached** (`HYDRA_HOST_DRIVEN` unset/`0`): `hydra.workflow.launch` detaches `hydra run --live`; `_drive_pp_stage_loop` runs the stage cycle headlessly in a background subprocess. No follow-along.
+- **Attended** (`HYDRA_HOST_DRIVEN=1`, the session default): YOU drive the lifecycle in-context so the operator follows along, surfacing generate + judge as visible `Agent` subagents. The deterministic Python engine REMAINS authoritative — it records every attempt/verdict (exactly-once pp ledger), routes the judge (`gate_eligible_judges`), runs the smoke + finalize-readiness gates, honours `finalize_run` downgrades, and charges budget on the checkpointed `HydraState`. You are NOT hand-emulating the ledger and NOT hand-writing engine source.
+
+Attended runbook (this is `/hydra:drive`): `hydra.workflow.plan` → (resolve any approval HITL) → loop { `hydra.workflow.step` → spawn the `host_action.agent_type` `Agent` (`engineer`, then `judge-cross-vendor`/`judge-same-vendor`) in `host_action.cwd` → `hydra.workflow.submit_host_result` } until `no_pending_engineering_task` → synthesize. The engineer writes into an isolated `.harness/worktrees/` worktree (write-safe under `hydra-block-direct-write`) that the engine merges back on a passing finalize. Cursor state persists under `.hydra/<wf>/attended/<run_id>.json`, so each step/submit is resumable and replay-safe (exactly-once). Engineering is driven one stage at a time (single-stream); parallel/fleet work stays on the detached path.
+
 ## Output Contract
 
 Every supervisor turn must end by writing the current `HydraState` to the trace file (`<project>/.hydra/<workflow_id>/trace.jsonl`) via `hydra_core.telemetry.emit`. Final synthesis must produce a `DECISION_RECORD` envelope archived to episodic memory.

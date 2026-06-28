@@ -407,8 +407,10 @@ XENIA_TICKETS_TOOLS = [
 ]
 
 HYDRA_CONTROL_TOOLS = [
-    "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.resume",
-    "hydra.workflow.submit_envelopes", "hydra.cockpit.audit",
+    "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.plan",
+    "hydra.workflow.step", "hydra.workflow.submit_host_result",
+    "hydra.workflow.resume", "hydra.workflow.submit_envelopes",
+    "hydra.cockpit.audit",
 ]
 
 
@@ -691,6 +693,40 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
             },
             "required": ["goal"],
+        },
+        "hydra.workflow.plan": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string"},
+                "squad": {
+                    "type": "string",
+                    "description": "Comma-separated squad slugs to force-select (optional).",
+                },
+                "budget": {
+                    "type": "number",
+                    "description": "Budget cap in USD (optional).",
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Pre-allocated workflow id (optional; threads into resume).",
+                },
+            },
+            "required": ["goal"],
+        },
+        "hydra.workflow.step": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+        "hydra.workflow.submit_host_result": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "call_key": {"type": "string"},
+                "result": {"type": "object"},
+            },
+            "required": ["workflow_id", "run_id", "call_key", "result"],
         },
         "hydra.workflow.submit_envelopes": {
             "type": "object",

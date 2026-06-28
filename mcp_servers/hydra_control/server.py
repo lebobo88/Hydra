@@ -298,6 +298,94 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
             "workflow_id": wf, "log": str(log_path)}
 
 
+# Planning halts after intake+planner; it never dispatches, so it is cheap and
+# bounded. Generous caps cover the planner's optional MCP enrichment calls and,
+# for attended step/submit, the pp start_run / judge-smoke round-trip.
+_PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
+_STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "300"))
+_SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "900"))
+
+
+def _run_cli_json(cli_args: list[str], *, timeout_s: int,
+                  err_label: str, workflow_id: str | None = None) -> dict[str, Any]:
+    """Run `python -m hydra_core.cli <cli_args>` SYNCHRONOUSLY and return its
+    JSON stdout IN-BAND. The non-detaching transport attended mode uses for
+    plan / step / submit-host-result (each prints exactly one JSON object)."""
+    cmd = [sys.executable, "-m", "hydra_core.cli", *cli_args]
+    env = dict(os.environ)
+    env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, validated tokens
+            cmd, cwd=str(_HYDRA_ROOT), env=env,
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"{err_label}_timeout",
+                "detail": f"exceeded {timeout_s}s", "workflow_id": workflow_id}
+    if proc.returncode != 0:
+        return {"ok": False, "error": f"{err_label}_failed", "workflow_id": workflow_id,
+                "detail": (proc.stderr or "")[-2000:]}
+    out = (proc.stdout or "").strip()
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        start = out.find("{")
+        if start >= 0:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(out[start:])
+                return data
+            except json.JSONDecodeError:
+                pass
+        return {"ok": False, "error": f"{err_label}_unparseable",
+                "workflow_id": workflow_id, "raw": out[-2000:]}
+
+
+def _run_plan(goal: str, *, squad: str | None, budget: float | None,
+              workflow_id: str | None) -> dict[str, Any]:
+    """Run `hydra plan` SYNCHRONOUSLY and return the planner state IN-BAND.
+
+    The non-detaching counterpart to `_launch_run`: attended (host-bridged)
+    execution needs the routing + TaskState plan returned to the host so the
+    host can drive dispatch itself (visible Agent subagents), rather than a
+    detached headless subprocess. The CLI halts after planner (plan_only adds
+    "dispatch" to interrupt_before), so this returns quickly without executing
+    any squad. The pre-allocated workflow_id threads continuity into a later
+    `hydra.workflow.resume`.
+    """
+    wf = workflow_id or str(uuid.uuid4())
+    cli_args = ["plan", goal, "--workflow-id", wf]
+    if squad:
+        cli_args.extend(["--squad", squad])
+    if budget is not None:
+        cli_args.extend(["--budget", str(budget)])
+    return _run_cli_json(cli_args, timeout_s=_PLAN_TIMEOUT_S,
+                         err_label="plan", workflow_id=wf)
+
+
+def _run_step(workflow_id: str) -> dict[str, Any]:
+    """Open the next attended engineering stage and return its host_action."""
+    return _run_cli_json(["step", workflow_id], timeout_s=_STEP_TIMEOUT_S,
+                         err_label="step", workflow_id=workflow_id)
+
+
+def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
+                            result: dict[str, Any]) -> dict[str, Any]:
+    """Feed a host subagent result into an attended stage (advances one step).
+
+    The CLI takes the result as a JSON file; write it to a temp file scoped to
+    the workflow's .hydra dir so the argv stays fixed.
+    """
+    res_dir = _HYDRA_ROOT / ".hydra" / workflow_id / "attended"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = "".join(c for c in call_key if c.isalnum() or c in "-_") or "result"
+    res_file = res_dir / f"hostresult-{safe_key}.json"
+    res_file.write_text(json.dumps(result), encoding="utf-8")
+    return _run_cli_json(
+        ["submit-host-result", workflow_id, "--run-id", run_id,
+         "--call-key", call_key, "--result", str(res_file)],
+        timeout_s=_SUBMIT_TIMEOUT_S, err_label="submit", workflow_id=workflow_id)
+
+
 def _tool_handlers() -> dict[str, Any]:
     def ping(args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -439,9 +527,88 @@ def _tool_handlers() -> dict[str, Any]:
             logger.exception("run launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
 
+    def workflow_plan(args: dict[str, Any]) -> dict[str, Any]:
+        """Plan a goal WITHOUT dispatching, returning the plan in-band.
+
+        The non-detaching planning surface for attended (host-bridged)
+        execution: routes + decomposes the goal and returns the planner's
+        TaskState plan (and any pending approval HITL) so the host can drive
+        dispatch itself with visible Agent subagents. Unlike
+        `hydra.workflow.launch` this is synchronous and executes no squad.
+        """
+        goal = str(args.get("goal") or "").strip()
+        if not goal:
+            return {"ok": False, "error": "goal is required"}
+        if len(goal) > 8000:
+            return {"ok": False, "error": "goal too long (max 8000 chars)"}
+        squad = args.get("squad")
+        squad = str(squad) if squad not in (None, "") else None
+        if squad is not None and not re.match(r"^[A-Za-z0-9_\-,]{1,200}$", squad):
+            return {"ok": False, "error": "invalid_squad"}
+        budget = args.get("budget")
+        try:
+            budget = float(budget) if budget not in (None, "") else None
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "budget must be numeric"}
+        workflow_id = args.get("workflow_id")
+        workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
+        if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        try:
+            return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("plan failed")
+            return {"ok": False, "error": f"plan_failed: {e}"}
+
+    def workflow_step(args: dict[str, Any]) -> dict[str, Any]:
+        """Open the next attended engineering stage; return its host_action.
+
+        Attended (host-bridged) execution: after `hydra.workflow.plan`, call this
+        to scaffold a pp run and pause for a VISIBLE host `engineer` subagent.
+        Returns {status:"awaiting_host", host_action:{agent_type, prompt, cwd,
+        call_key}, run_id, ...}. The host then spawns the Agent and feeds the
+        result back via `hydra.workflow.submit_host_result`.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        if not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        try:
+            return _run_step(workflow_id)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("attended step failed")
+            return {"ok": False, "error": f"step_failed: {e}"}
+
+    def workflow_submit_host_result(args: dict[str, Any]) -> dict[str, Any]:
+        """Feed a host subagent's result into an attended stage (advance one step).
+
+        On stage completion the engine charges the accrued cost on the
+        checkpointed HydraState budget (tripwires stay live) and records the task
+        outcome — attended execution is never budget-blind.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        run_id = str(args.get("run_id") or "")
+        call_key = str(args.get("call_key") or "")
+        result = args.get("result")
+        if not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        if not run_id or not re.match(r"^[A-Za-z0-9_\-]{1,128}$", run_id):
+            return {"ok": False, "error": "invalid_run_id"}
+        if not call_key or not re.match(r"^[A-Za-z0-9_\-]{1,128}$", call_key):
+            return {"ok": False, "error": "invalid_call_key"}
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "result must be an object"}
+        try:
+            return _run_submit_host_result(workflow_id, run_id, call_key, result)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("attended submit failed")
+            return {"ok": False, "error": f"submit_failed: {e}"}
+
     return {
         "hydra.control.ping": ping,
         "hydra.workflow.launch": workflow_launch,
+        "hydra.workflow.plan": workflow_plan,
+        "hydra.workflow.step": workflow_step,
+        "hydra.workflow.submit_host_result": workflow_submit_host_result,
         "hydra.workflow.resume": workflow_resume,
         "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
         "hydra.cockpit.audit": cockpit_audit,
@@ -489,6 +656,70 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "description": "Pre-allocated workflow id (optional)."},
             },
             "required": ["goal"],
+        },
+    },
+    "hydra.workflow.plan": {
+        "description": (
+            "Plan a goal WITHOUT dispatching, returning the plan IN-BAND "
+            "(synchronous `hydra plan`). The non-detaching planning surface for "
+            "attended (host-bridged) execution: routes + decomposes the goal and "
+            "returns {ok, workflow_id, selected_squads, tasks (TaskState[]), "
+            "requires_human_approval, pending_hitl, budget} so the host can drive "
+            "dispatch itself with visible Agent subagents. Executes NO squad. When "
+            "the planner requires approval, the run halts at the approval gate and "
+            "`pending_hitl` is populated (resolve via hydra.workflow.resume). The "
+            "pre-allocated workflow_id threads continuity into resume."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string"},
+                "squad": {"type": "string",
+                          "description": "Comma-separated squad slugs to force-select (optional)."},
+                "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
+                "workflow_id": {"type": "string",
+                                "description": "Pre-allocated workflow id (optional)."},
+            },
+            "required": ["goal"],
+        },
+    },
+    "hydra.workflow.step": {
+        "description": (
+            "Attended (host-bridged) execution: open the NEXT engineering stage "
+            "and pause for a visible host `engineer` subagent. Scaffolds a pp run "
+            "off the planned task ledger and returns {status:'awaiting_host', "
+            "host_action:{agent_type:'engineer', prompt, cwd, call_key}, run_id, "
+            "stage_id}. The host spawns Agent(engineer) in cwd, then calls "
+            "hydra.workflow.submit_host_result. Requires a prior hydra.workflow.plan "
+            "(shares its workflow_id checkpoint). Returns "
+            "{status:'no_pending_engineering_task'} when engineering is done."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+    },
+    "hydra.workflow.submit_host_result": {
+        "description": (
+            "Attended execution: feed a host subagent's result back into a stage "
+            "and advance it ONE step. After the engineer result the engine records "
+            "the attempt and pauses for the judge subagent (host_action.agent_type "
+            "= judge-cross-vendor|judge-same-vendor per gate routing); after the "
+            "judge verdict it runs smoke + finalizes and charges the accrued cost "
+            "on the checkpointed HydraState budget. result is the subagent's output "
+            "object (engineer: {text,cost_usd,tokens_in,tokens_out,model}; judge: "
+            "{outcome,critique_md,judge_producer,score_json,cost_usd}). Idempotent "
+            "on a stale/duplicate call_key (never double-records)."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "call_key": {"type": "string",
+                             "description": "The host_action.call_key being fulfilled."},
+                "result": {"type": "object",
+                           "description": "The host subagent's result object."},
+            },
+            "required": ["workflow_id", "run_id", "call_key", "result"],
         },
     },
     "hydra.workflow.submit_envelopes": {

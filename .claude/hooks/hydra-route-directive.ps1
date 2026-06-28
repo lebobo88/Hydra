@@ -84,6 +84,11 @@ if ($isAction) {
         Write-Output "You MUST invoke /hydra:run BEFORE doing any work. Hydra routes to the correct squad(s)."
         Write-Output "  /hydra:run `"goal`" — primary entry point (routes to engineering, executive, garland, or multi-squad)"
         Write-Output "  /hydra:campaign `"goal`" — for cross-functional work spanning multiple squads"
+        if ($env:HYDRA_HOST_DRIVEN -eq '1') {
+            Write-Output "  Mode: ATTENDED (HYDRA_HOST_DRIVEN=1) — drive engineering in-context with visible engineer/judge subagents via /hydra:drive (plan -> step -> submit_host_result). Engine stays authoritative (ledger/budget/judge)."
+        } else {
+            Write-Output "  Mode: DETACHED (HYDRA_HOST_DRIVEN unset) — /hydra:run hands engineering to a headless background subprocess. Set HYDRA_HOST_DRIVEN=1 for attended follow-along."
+        }
         Write-Output "Do NOT invoke /pp:run, /pp:team, or other PP commands directly. Hydra dispatches to pair-programmer via the engineering squad."
         Write-Output "Direct Edit/Write to ENGINE SOURCE (.ts/.py/.html/.css/...) is BLOCKED when HYDRA_ENFORCE_ROUTING=1 — the pair-programmer harness writes code, not you. Route engineering via /hydra:run. (Design docs / .md are allowed.)"
         Write-Output ""
