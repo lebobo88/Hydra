@@ -1027,22 +1027,32 @@ def _attended_live_dispatcher(project: Path, verbose: bool = False):
 
 
 def _next_engineering_task(state: HydraState):
-    """First not-yet-finished engineering task in the plan (pending / surfaced /
-    in_progress), or None when engineering is fully done."""
+    """First engineering task the host has not yet driven to a terminal attended
+    outcome, or None when engineering is fully done.
+
+    Completion is tracked via state.attended_completed_task_ids (a replace
+    channel) rather than task.status, because the `tasks` channel's _append
+    reducer makes an out-of-graph status flip impossible (it would duplicate)."""
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
     for t in getattr(state, "tasks", []):
-        if t.owner_squad == "engineering" and t.status in (
-                "pending", "surfaced", "in_progress"):
+        if t.owner_squad == "engineering" and str(t.task_id) not in done:
             return t
     return None
 
 
-def _resolve_task_project_path(task, project: Path) -> str:
+def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
     """Resolve the engineering target dir: an allow-listed repo id when the task
-    targets one, else the workflow project root."""
-    rid = getattr(task, "target_repo_id", None)
+    (or the workflow, via `--repo`) targets one, else the workflow project root.
+
+    Mirrors node_dispatch's precedence (supervisor.py): per-task target_repo_id
+    wins, else the workflow-level state.target_repo_id set by intake from
+    `--repo`. Without the state-level fallback, attended `step` would wrongly
+    target the Hydra cwd for a `--repo`-scoped goal."""
+    rid = getattr(task, "target_repo_id", None) or getattr(state, "target_repo_id", None)
     if rid:
         from .repo_registry import resolve_repo_project_path
-        sub = getattr(task, "target_repo_subpath", None)
+        sub = (getattr(task, "target_repo_subpath", None)
+               or getattr(state, "target_repo_subpath", None))
         p = resolve_repo_project_path(rid, sub)
         if sub:
             Path(p).mkdir(parents=True, exist_ok=True)
@@ -1095,7 +1105,7 @@ def _cmd_attended_step(args) -> int:
             print(json.dumps({"ok": True, "status": "no_pending_engineering_task",
                               "workflow_id": wf}))
             return 0
-        project_path = _resolve_task_project_path(task, project)
+        project_path = _resolve_task_project_path(task, state, project)
         request_text = task.description or state.root_goal
 
         start = dispatcher.call_mcp("pp_harness", "start_run", {
@@ -1111,7 +1121,6 @@ def _cmd_attended_step(args) -> int:
         # Register the open pp run so postcheck/reap can finalize-abort it if the
         # workflow is abandoned mid-stage (the run holds the .harness lock).
         state.open_pp_runs.append({"run_id": str(run_id), "project_path": project_path})
-        task.status = "in_progress"
 
         res = host_bridge.begin_stage(
             dispatcher, workflow_id=wf, run_id=str(run_id),
@@ -1120,10 +1129,10 @@ def _cmd_attended_step(args) -> int:
             project_root=project, task_id=str(task.task_id))
 
         try:
-            sup.update_state(config, {
-                "tasks": [t.model_dump(mode="json") for t in state.tasks],
-                "open_pp_runs": state.open_pp_runs,
-            })
+            # Only open_pp_runs (a replace channel) is persisted — NOT `tasks`,
+            # whose _append reducer would duplicate the task. Attended completion
+            # is recorded in attended_completed_task_ids by submit-host-result.
+            sup.update_state(config, {"open_pp_runs": state.open_pp_runs})
         except Exception as e:  # noqa: BLE001 — never lose the run on a persist miss
             emit(project, wf, "attended.persist_failed", {"error": str(e)})
 
@@ -1186,20 +1195,23 @@ def _cmd_attended_submit(args) -> int:
                     cost = float(res.get("cost_usd") or 0.0)
                     toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
                     block, downgrade = charge_and_gate(state, cost, toks)
+                    # Mark this engineering task attended-complete (replace
+                    # channel) so the next `step` does not re-pick it. We do NOT
+                    # flip task.status — the `tasks` channel's _append reducer
+                    # would duplicate the task on update_state.
                     tid = res.get("task_id")
-                    for t in state.tasks:
-                        if str(t.task_id) == str(tid):
-                            t.status = ("done" if res["status"] == "complete"
-                                        else "surfaced")
-                    state.open_pp_runs = [e for e in state.open_pp_runs
-                                          if e.get("run_id") != res.get("run_id")]
+                    completed = list(state.attended_completed_task_ids)
+                    if tid is not None and str(tid) not in completed:
+                        completed.append(str(tid))
+                    open_runs = [e for e in state.open_pp_runs
+                                 if e.get("run_id") != res.get("run_id")]
                     res["budget_block"] = block
                     res["budget_downgrade"] = downgrade
                     res["spent_usd"] = state.budget.spent_usd
                     try:
                         sup.update_state(config, {
-                            "tasks": [t.model_dump(mode="json") for t in state.tasks],
-                            "open_pp_runs": state.open_pp_runs,
+                            "attended_completed_task_ids": completed,
+                            "open_pp_runs": open_runs,
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),
                         })

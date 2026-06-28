@@ -267,6 +267,14 @@ class HydraState(BaseModel):
     # can shrink the list — append semantics would defeat draining.
     open_pp_runs: list[dict[str, str]] = Field(default_factory=list)
 
+    # Attended (host-bridged) execution: task_ids whose engineering stage the
+    # host has driven to a terminal outcome via `hydra step`/`submit-host-result`.
+    # The `tasks` channel uses an _append reducer, so an out-of-graph
+    # update_state cannot flip a task's status in place (it would APPEND a stale
+    # duplicate). This replace-by-default list is the authoritative "don't
+    # re-pick this engineering task" signal for _next_engineering_task.
+    attended_completed_task_ids: list[str] = Field(default_factory=list)
+
     def bump_iteration(self) -> None:
         self.iteration_count += 1
 

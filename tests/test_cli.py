@@ -249,6 +249,25 @@ def test_plan_surfaces_pending_approval_hitl(capsys, tmp_path, monkeypatch):
     assert payload["budget"]["spent_usd"] == 0.0
 
 
+def test_next_engineering_task_skips_attended_completed():
+    """Attended completion is tracked in attended_completed_task_ids (a replace
+    channel), NOT task.status — because the `tasks` channel's _append reducer
+    can't flip a status in place out-of-graph. _next_engineering_task must honour
+    that list so a finished task is never re-picked by the next `step`."""
+    from hydra_core.state import HydraState, TaskState
+    t1 = TaskState(owner_squad="engineering", description="a")
+    t2 = TaskState(owner_squad="engineering", description="b")
+    st = HydraState(root_goal="g", tasks=[t1, t2])
+    # Nothing completed yet → first task.
+    assert cli._next_engineering_task(st).task_id == t1.task_id
+    # Mark t1 complete via the replace channel → next is t2.
+    st.attended_completed_task_ids = [str(t1.task_id)]
+    assert cli._next_engineering_task(st).task_id == t2.task_id
+    # Both complete → None.
+    st.attended_completed_task_ids = [str(t1.task_id), str(t2.task_id)]
+    assert cli._next_engineering_task(st) is None
+
+
 # --- run --workflow-id -------------------------------------------------------
 
 def test_run_workflow_id_passthrough(capsys):
