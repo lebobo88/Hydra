@@ -1801,7 +1801,16 @@ def build_supervisor(
                     "budget_downgrade_active": True,
                     "open_pp_runs": state.open_pp_runs,
                 }
-            task.status = result.status
+            # M2: coerce unknown/out-of-contract statuses to 'surfaced' so a
+            # misbehaving squad pack cannot forge a 'done' when it returned
+            # something unrecognisable.  Known-good set mirrors TaskState.status.
+            _KNOWN_TASK_STATUSES: frozenset[str] = frozenset({
+                "pending", "running", "blocked", "done", "failed",
+                "surfaced", "cancelled", "deferred_to_host",
+            })
+            task.status = (result.status
+                           if result.status in _KNOWN_TASK_STATUSES
+                           else "surfaced")
             # Validate and redact envelopes crossing the squad boundary back
             # into the supervisor. Invalid envelopes fail the task.
             for produced in result.envelopes:

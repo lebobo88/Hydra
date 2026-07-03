@@ -623,6 +623,90 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     })
 
 
+def begin_squad_stage(
+    *,
+    workflow_id: str,
+    task_id: str,
+    squad_slug: str,
+    entrypoint: str,
+    lead_agent: str,
+    pack_cwd: str,
+    request_text: str,
+    project_root: str | Path,
+) -> dict[str, Any]:
+    """Create a lightweight cursor for an attended non-engineering squad task
+    (claude-skill or agent-impersonation entrypoint).
+
+    No pp stage is opened; no worktree isolation is needed (these squads produce
+    documents, not engine code). The cursor lives at
+    ``cursor_path(project_root, workflow_id, task_id)`` so the submit-host-result
+    CLI can find it by passing ``--run-id <task_id>``.
+
+    Returns an ``awaiting_host`` step result whose ``host_action`` tells the host
+    to spawn the visible pack agent subagent in ``pack_cwd``.
+    """
+    call_key = f"squad-{task_id}-0"
+    cursor: dict[str, Any] = {
+        "schema": CURSOR_SCHEMA,
+        "kind": "squad",
+        "workflow_id": workflow_id,
+        "task_id": task_id,
+        "run_id": task_id,   # mirrors engineering cursor shape for CLI compatibility
+        "squad_slug": squad_slug,
+        "entrypoint": entrypoint,
+        "project_path": pack_cwd,
+        "request_text": request_text,
+        "state": "await_squad_agent",
+        "cost_usd": 0.0,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "final_status": None,
+        "error": None,
+        "finalized": False,
+        "pending_action": {
+            "call_key": call_key,
+            "agent_type": lead_agent,
+            "cwd": pack_cwd,
+            "prompt": request_text,
+            "instructions": "Run the pack agent and submit the artifact.",
+        },
+    }
+    cfile = cursor_path(project_root, workflow_id, task_id)
+    save_cursor(cfile, cursor)
+    _trace(cursor, "attended.squad_stage_started", {
+        "squad_slug": squad_slug,
+        "entrypoint": entrypoint,
+        "task_id": task_id,
+    })
+    return _step_result(cursor, cfile)
+
+
+def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
+    """await_squad_agent → terminal.
+
+    Accumulate spend from the host agent's result and mark the cursor complete.
+    There are no pp ledger calls (this is not an engineering stage). The CLI
+    (``_cmd_attended_submit``) charges the returned cost_usd through the
+    authoritative HydraState budget path after this returns.
+    """
+    cursor["cost_usd"] = (float(cursor.get("cost_usd") or 0.0)
+                          + float(result.get("cost_usd") or 0.0))
+    cursor["tokens_in"] = (int(cursor.get("tokens_in") or 0)
+                           + int(result.get("tokens_in") or 0))
+    cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
+                            + int(result.get("tokens_out") or 0))
+    cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
+    cursor["final_status"] = "complete"
+    cursor["state"] = "complete"
+    cursor["pending_action"] = None
+    cursor["finalized"] = True
+    _trace(cursor, "attended.squad_result_applied", {
+        "task_id": cursor.get("task_id"),
+        "squad_slug": cursor.get("squad_slug"),
+        "cost_usd": cursor.get("cost_usd"),
+    })
+
+
 def submit_host_result(
     dispatcher: Dispatcher,
     *,
@@ -634,6 +718,10 @@ def submit_host_result(
     one transition. Idempotent on a stale/duplicate ``call_key`` (returns the
     current step result without re-applying), so a retried submit never
     double-records in the pp ledger.
+
+    Handles both ``kind="engineering"`` (the default pp stage flow) and the
+    lightweight ``kind="squad"`` cursors created by ``begin_squad_stage`` for
+    non-engineering tasks (claude-skill / agent-impersonation).
     """
     cursor = load_cursor(cursor_file)
     state = cursor.get("state")
@@ -652,6 +740,9 @@ def submit_host_result(
         _apply_generate(dispatcher, cursor, result)
     elif state == "await_judge":
         _apply_judge(dispatcher, cursor, result)
+    elif state == "await_squad_agent":
+        # Lightweight non-engineering squad flow — no pp protocol calls needed.
+        _apply_squad_result(cursor, result)
     else:  # pragma: no cover — defensive
         cursor["state"] = "aborted"
         cursor["final_status"] = "aborted"

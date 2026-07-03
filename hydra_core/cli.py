@@ -1040,6 +1040,68 @@ def _next_engineering_task(state: HydraState):
     return None
 
 
+def _next_nonengineering_attended_task(state: HydraState, packs: dict):
+    """First pending non-engineering task whose squad uses claude-skill or
+    agent-impersonation entrypoint, that the host has not yet completed.
+
+    These tasks cannot be driven headlessly — they need a human-in-the-loop
+    attended agent. We surface them in task-list order so the host can
+    dispatch one at a time, mirroring the engineering attended flow."""
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "agent-impersonation"})
+    for t in getattr(state, "tasks", []):
+        if str(t.task_id) in done:
+            continue
+        if t.owner_squad == "engineering":
+            continue
+        pack = packs.get(t.owner_squad)
+        if pack is None:
+            continue
+        if pack.entrypoint in _NON_ENG_ENTRYPOINTS:
+            return t, pack
+    return None, None
+
+
+def _resolve_pack_lead_agent(pack) -> str:
+    """Resolve the supervisor / lead agent slug for a squad pack.
+
+    Priority: first agent with authority='gatekeeper', then first agent in the
+    list, then 'general-purpose' as an absolute fallback.
+    """
+    agents = list(getattr(pack, "agents", []) or [])
+    for a in agents:
+        if getattr(a, "authority", "") == "gatekeeper":
+            return a.slug
+    if agents:
+        return agents[0].slug
+    return "general-purpose"
+
+
+def _resolve_pack_cwd(pack, project: Path) -> str:
+    """Resolve the on-disk directory for a squad pack.
+
+    Searches the project-local squads/ directory and resolves symlinks so
+    marketing packs (which are filesystem symlinks into MarketBliss) return
+    their real path.  Falls back to the project root if not found.
+    """
+    from .squad_loader import SQUAD_DIR_NAMES, USER_SQUAD_DIR
+    for dir_name in SQUAD_DIR_NAMES:
+        candidate = project / dir_name / pack.slug
+        if candidate.is_dir():
+            try:
+                return str(candidate.resolve())
+            except Exception:  # noqa: BLE001
+                return str(candidate)
+    # user-global fallback
+    candidate = USER_SQUAD_DIR / pack.slug
+    if candidate.is_dir():
+        try:
+            return str(candidate.resolve())
+        except Exception:  # noqa: BLE001
+            return str(candidate)
+    return str(project)
+
+
 def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
     """Resolve the engineering target dir: an allow-listed repo id when the task
     (or the workflow, via `--repo`) targets one, else the workflow project root.
@@ -1061,15 +1123,23 @@ def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
 
 
 def _cmd_attended_step(args) -> int:
-    """Attended (host-bridged) execution: open the next engineering stage and
-    PAUSE for a visible host `engineer` subagent.
+    """Attended (host-bridged) execution: open the next pending task stage and
+    PAUSE for a visible host subagent (engineer for mcp squads; pack lead agent
+    for claude-skill / agent-impersonation squads).
 
-    Loads the workflow checkpoint (engineering inherits the planned task ledger +
-    budget), scaffolds a pp run, opens an attended code stage, and returns the
-    first host_action. The host then spawns the `engineer` Agent and feeds the
-    result back via `hydra submit-host-result`. Requires the LangGraph/checkpoint
-    path (continuity with the plan)."""
+    Loads the workflow checkpoint (task ledger + budget), dispatches the
+    appropriate cursor, and returns the first host_action. The host spawns the
+    visible Agent and feeds the result back via ``hydra submit-host-result``.
+    Requires the LangGraph/checkpoint path.
+
+    Engineering tasks (mcp entrypoint): scaffolds a pp run, opens an attended
+    code stage via host_bridge.begin_stage, worktree-isolated.
+
+    Non-engineering tasks (claude-skill / agent-impersonation): creates a
+    lightweight squad cursor via host_bridge.begin_squad_stage, no worktree
+    isolation (these produce documents, not engine code)."""
     from . import host_bridge
+    from .squad_loader import discover_squads as _discover
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
@@ -1100,46 +1170,77 @@ def _cmd_attended_step(args) -> int:
             return 1
         state = HydraState.model_validate(snap.values)
 
+        # --- Engineering task (mcp entrypoint) ---
         task = _next_engineering_task(state)
-        if task is None:
-            print(json.dumps({"ok": True, "status": "no_pending_engineering_task",
-                              "workflow_id": wf}))
+        if task is not None:
+            project_path = _resolve_task_project_path(task, state, project)
+            request_text = task.description or state.root_goal
+
+            start = dispatcher.call_mcp("pp_harness", "start_run", {
+                "request_text": request_text, "project_path": project_path,
+                "mode": "single"}, squad_id="engineering")
+            inner = start.get("result", start) if isinstance(start, dict) else {}
+            run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
+            if not run_id:
+                print(json.dumps({"ok": False, "error": "start_run returned no run_id",
+                                  "detail": str(start)[:500]}), file=sys.stderr)
+                return 1
+
+            # Register the open pp run so postcheck/reap can finalize-abort it
+            # if the workflow is abandoned mid-stage (run holds the .harness lock).
+            state.open_pp_runs.append({"run_id": str(run_id), "project_path": project_path})
+
+            res = host_bridge.begin_stage(
+                dispatcher, workflow_id=wf, run_id=str(run_id),
+                project_path=project_path, request_text=request_text,
+                model_tier=getattr(task, "model_tier", None),
+                project_root=project, task_id=str(task.task_id))
+
+            try:
+                # Only open_pp_runs (replace channel) is persisted — NOT `tasks`
+                # (append reducer would duplicate). Completion is recorded via
+                # attended_completed_task_ids by submit-host-result.
+                sup.update_state(config, {"open_pp_runs": state.open_pp_runs})
+            except Exception as e:  # noqa: BLE001
+                emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+            emit(project, wf, "attended.step", {"run_id": str(run_id),
+                                                "task_id": str(task.task_id),
+                                                "state": res.get("state")})
+            print(json.dumps({"ok": True, **res}, indent=2, default=str))
             return 0
-        project_path = _resolve_task_project_path(task, state, project)
-        request_text = task.description or state.root_goal
 
-        start = dispatcher.call_mcp("pp_harness", "start_run", {
-            "request_text": request_text, "project_path": project_path,
-            "mode": "single"}, squad_id="engineering")
-        inner = start.get("result", start) if isinstance(start, dict) else {}
-        run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
-        if not run_id:
-            print(json.dumps({"ok": False, "error": "start_run returned no run_id",
-                              "detail": str(start)[:500]}), file=sys.stderr)
-            return 1
+        # --- Non-engineering task (claude-skill / agent-impersonation) ---
+        packs = _discover(project)
+        ne_task, ne_pack = _next_nonengineering_attended_task(state, packs)
+        if ne_task is not None:
+            task_id = str(ne_task.task_id)
+            request_text = ne_task.description or state.root_goal
+            pack_cwd = _resolve_pack_cwd(ne_pack, project)
+            lead_agent = _resolve_pack_lead_agent(ne_pack)
 
-        # Register the open pp run so postcheck/reap can finalize-abort it if the
-        # workflow is abandoned mid-stage (the run holds the .harness lock).
-        state.open_pp_runs.append({"run_id": str(run_id), "project_path": project_path})
+            res = host_bridge.begin_squad_stage(
+                workflow_id=wf,
+                task_id=task_id,
+                squad_slug=ne_pack.slug,
+                entrypoint=ne_pack.entrypoint,
+                lead_agent=lead_agent,
+                pack_cwd=pack_cwd,
+                request_text=request_text,
+                project_root=project,
+            )
+            emit(project, wf, "attended.step", {
+                "run_id": task_id,
+                "task_id": task_id,
+                "squad_slug": ne_pack.slug,
+                "state": res.get("state"),
+            })
+            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            return 0
 
-        res = host_bridge.begin_stage(
-            dispatcher, workflow_id=wf, run_id=str(run_id),
-            project_path=project_path, request_text=request_text,
-            model_tier=getattr(task, "model_tier", None),
-            project_root=project, task_id=str(task.task_id))
-
-        try:
-            # Only open_pp_runs (a replace channel) is persisted — NOT `tasks`,
-            # whose _append reducer would duplicate the task. Attended completion
-            # is recorded in attended_completed_task_ids by submit-host-result.
-            sup.update_state(config, {"open_pp_runs": state.open_pp_runs})
-        except Exception as e:  # noqa: BLE001 — never lose the run on a persist miss
-            emit(project, wf, "attended.persist_failed", {"error": str(e)})
-
-        emit(project, wf, "attended.step", {"run_id": str(run_id),
-                                            "task_id": str(task.task_id),
-                                            "state": res.get("state")})
-        print(json.dumps({"ok": True, **res}, indent=2, default=str))
+        # No pending tasks of any kind.
+        print(json.dumps({"ok": True, "status": "no_pending_task",
+                          "workflow_id": wf}))
         return 0
     finally:
         _release_resume_lock(lock_fd, lock_path)

@@ -71,7 +71,9 @@ def test_legal_placeholder_is_host_pickup_not_a_real_answer():
     result = _via_claude_skill(HydraState(root_goal="x"), pack, inbound, disp)
 
     assert result.host_pickup_pending is True
-    assert result.status == "host_pickup_required"
+    # F11: 'host_pickup_required' is normalised to 'deferred_to_host' so
+    # governance can block workflows whose pack work never executed.
+    assert result.status == "deferred_to_host"
 
 
 # --- Xenia: WS-AUTH ticket bridge is write-privileged + approval-gated -------- #

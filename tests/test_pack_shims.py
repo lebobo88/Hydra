@@ -228,7 +228,10 @@ def test_via_impersonation_persists_real_memoryref():
     })
 
     result = _via_impersonation(HydraState(root_goal="x"), pack, inbound, dispatcher)
-    assert result.status == "done"
+    # F11: emit_claude_prompt returns host_pickup_required → status is now
+    # 'deferred_to_host' (not 'done') so governance can block unexecuted workflows.
+    assert result.status == "deferred_to_host"
+    assert result.host_pickup_pending is True
     decision = result.envelopes[0]
     assert decision.artifacts and isinstance(decision.artifacts[0], MemoryRef)
     assert decision.artifacts[0].key.startswith("es:output:output/finance/")
@@ -291,5 +294,7 @@ def test_via_impersonation_falls_back_when_mcp_unreachable():
     )
     dispatcher = _FakeDispatcher({})  # all calls return status=failed
     result = _via_impersonation(HydraState(root_goal="x"), pack, inbound, dispatcher)
-    assert result.status == "done"
+    # F11: emit_claude_prompt returns host_pickup_required → status is now
+    # 'deferred_to_host' so governance can block unexecuted pack workflows.
+    assert result.status == "deferred_to_host"
     assert result.envelopes[0].artifacts[0].key.startswith("es:boardroom:")
