@@ -947,6 +947,50 @@ def test_cli_resume_reject_does_not_mint(monkeypatch, tmp_path):
         )
 
 
+@pytest.mark.parametrize("action,option", [
+    ("force-dispatch", None),
+    ("modify-budget", "25"),
+    ("change-squads", "engineering,executive"),
+])
+def test_cli_resume_mutating_actions_mint_capability(monkeypatch, tmp_path, action, option):
+    """WS-AUTH run-A: every state-mutating resume action — not just approve —
+    mints a signed operator_capability so downstream nodes can verify operator
+    identity. force-dispatch / modify-budget / change-squads all re-enter the
+    graph or mutate checkpointed state and must carry the token."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY_ID", TEST_KEY_ID)
+    monkeypatch.setenv("HYDRA_OPERATOR_ID", "cli-operator@test.com")
+
+    wf_id = f"wf-cli-mut-{action}"
+    pending = {
+        "workflow_id": wf_id,
+        "gate_node": "approval",
+        "reason": "high_risk",
+        "options": ["approve", "reject", "force-dispatch"],
+    }
+    mock_sup = _make_mock_sup(wf_id, pending)
+
+    with patch("hydra_core.supervisor.build_supervisor", return_value=mock_sup), \
+         patch("hydra_core.supervisor._PurePythonRunner", type(None)):
+        from hydra_core.cli import _cmd_resume_locked
+        import argparse
+        args = argparse.Namespace(project=str(tmp_path), live=False, verbose=False)
+        rc = _cmd_resume_locked(args, tmp_path, wf_id, action, option)
+
+    assert rc == 0, f"{action} resume must succeed with a valid minted token"
+    patch_dict = mock_sup.update_state.call_args_list[0][0][1]
+    assert "operator_capability" in patch_dict, (
+        f"{action} must write operator_capability (WS-AUTH run-A covers all "
+        f"mutating resume actions, not only approve)"
+    )
+    cap = patch_dict["operator_capability"]
+    assert cap["sig"]["value"] is not None, f"{action} token must be signed when key is set"
+    assert cap["sig"].get("degraded") is None
+    assert cap["actor_id"] == "cli-operator@test.com"
+    # Capability name derives from pending gate_node (mint/verify share the chain).
+    assert cap["capability"] == "approval"
+
+
 # ---------------------------------------------------------------------------
 # 14. mint: ttl_seconds, default exp
 # ---------------------------------------------------------------------------

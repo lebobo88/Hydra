@@ -685,15 +685,20 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # WS-AUTH: on approve, mint an operator-capability token BEFORE clearing
-    # pending_hitl so the token captures the gate context.  Persisted into the
-    # checkpointed state patch as operator_capability so downstream dispatch
-    # nodes can verify the approval is fresh and from the right actor.
-    # Degraded posture: when HYDRA_OPERATOR_KEY is unset we mint a degraded
-    # token (sig.value=None) and warn — the approval itself is NOT blocked
-    # (WS-AUTH foundation run A; gated consumers enforce in runs B/C).
+    # WS-AUTH run-A: mint + verify an operator-capability token for ALL
+    # state-mutating resume actions (approve, force-dispatch, modify-budget,
+    # change-squads).  These actions mutate checkpointed state or re-enter the
+    # graph and must carry operator identity so downstream nodes can verify the
+    # action is fresh and authorised.
+    # Degraded posture (no HYDRA_OPERATOR_KEY → warn-and-proceed) is UNIFORM
+    # across all actions — this is intentional for foundation run A; gated
+    # consumers enforce cryptographic proof in runs B/C.
+    # (WS-AUTH run-A comment: this block is intentionally non-enforcing on the
+    # operator side; the degraded-warn posture is the documented run-A stance.)
+    _MUTATING_RESUME_ACTIONS = frozenset({"approve", "force-dispatch",
+                                          "modify-budget", "change-squads"})
     operator_capability_patch: dict | None = None
-    if action == "approve":
+    if action in _MUTATING_RESUME_ACTIONS:
         import logging as _logging
         _log_cli = _logging.getLogger(__name__)
         _operator = (
@@ -703,15 +708,17 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         )
         # Sentinel check: empty or "unknown" operator identity means we cannot
         # issue a valid human capability — doing so would let any unidentified
-        # approval bypass the actor_id requirement in verify_operator_capability.
+        # action bypass the actor_id requirement in verify_operator_capability.
         # Force degraded mint (sig.value=None) in that case and warn loudly.
+        # This applies uniformly to all _MUTATING_RESUME_ACTIONS (WS-AUTH run-A).
         _UNKNOWN_OPERATORS = {"", "unknown"}
         _force_degraded = _operator.strip() in _UNKNOWN_OPERATORS
         if _force_degraded:
             _log_cli.warning(
-                "operator identity unknown; capability degraded — "
+                "operator identity unknown for action=%r; capability degraded — "
                 "set HYDRA_OPERATOR_ID (or args.operator) to a real operator id "
-                "to issue a verifiable capability token"
+                "to issue a verifiable capability token",
+                action,
             )
             # Use a sentinel actor_id for the degraded token payload so the
             # wire format is consistent; the sig.value=None marks it unusable.
@@ -861,6 +868,22 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             _cur_budget = float(_b.get("budget_usd") or 0.0)
             _b["budget_usd"] = max(_cur_budget * 1.2, _spent * 1.1 + 0.10)
             patch["budget"] = _b
+
+    # Minor: warn when an over_budget gate is approved WITHOUT extending the
+    # budget ceiling. The gate will immediately re-trigger on the next dispatch
+    # iteration unless modify-budget is used first.  This is a one-line guard
+    # so the operator knows why the resume appears to have no effect.
+    if action == "approve" and _gate_reason == "over_budget" and option != "approve_override":
+        import logging as _log_ob_mod
+        _log_ob_mod.getLogger(__name__).warning(
+            "over_budget gate approved without 'approve_override'; budget ceiling "
+            "unchanged — gate will re-trigger on next dispatch. "
+            "Use --option approve_override to extend the ceiling, or "
+            "--action modify-budget to set a new explicit budget."
+        )
+        emit(project, wf, "hitl.over_budget_reapprove_without_extend", {
+            "action": action, "option": option, "gate_reason": _gate_reason,
+        })
 
     # acknowledge / accept_partial / approve_with_criteria: gate-clear + resume
     # is the complete engine action (no additional state change required).
@@ -1410,6 +1433,18 @@ def _cmd_attended_submit(args) -> int:
                       "status": res.get("status"), "already_charged": True})
                 print(json.dumps({"ok": True, **res}, indent=2, default=str))
                 return 0
+            # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
+            # budget write to the LangGraph checkpoint so that a crash between
+            # here and the checkpoint persist is an under-charge (acceptable) rather
+            # than a double-charge (unsafe).  Crash-ordering rationale:
+            #   1. mark_charged(cfile)          ← cursor sidecar flagged first
+            #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
+            #   3. sup.update_state(...)         ← checkpoint persisted
+            # If the process dies after (1) but before (3), the retry sees
+            # already_charged=True and skips the charge → under-charge.
+            # The opposite order (charge then mark) would re-charge on that crash
+            # → double-charge, which burns real spend twice.
+            host_bridge.mark_charged(cfile)
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
             if not isinstance(sup, _PurePythonRunner):
@@ -1442,9 +1477,6 @@ def _cmd_attended_submit(args) -> int:
                         })
                     except Exception as e:  # noqa: BLE001
                         emit(project, wf, "attended.persist_failed", {"error": str(e)})
-            # Rider (b): mark cursor charged AFTER billing so a retried submit
-            # sees already_charged=True and skips the duplicate charge.
-            host_bridge.mark_charged(cfile)
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
