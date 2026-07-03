@@ -413,6 +413,18 @@ HYDRA_CONTROL_TOOLS = [
     "hydra.cockpit.audit",
 ]
 
+# Optional / 3rd-party: blender-mcp (uvx blender-mcp; socket :9876 / MCP bridge
+# :7700).  Declared by garland/engineering/rlm-gaming squad.yaml RBAC; the
+# backend must be running locally for these calls to succeed.  Listed here so
+# the completeness gate (test_gateway_catalog_complete.py) knows the toolshed
+# covers every backend in scripts/backends.template.json.
+BLENDER_TOOLS = [
+    "get_scene_info",
+    "get_object_info",
+    "execute_blender_code",
+    "get_viewport_screenshot",
+]
+
 
 class ProgressiveDisclosureTree:
     """Hierarchical tool navigation: squad → server → category → tool.
@@ -786,7 +798,11 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
 
 
 def build_default_shed(dispatcher: Any = None) -> ToolShed:
-    """Build a ToolShed pre-loaded with static catalogs for all 15 backends."""
+    """Build a ToolShed pre-loaded with static catalogs for all known backends.
+
+    Includes both core Hydra servers and optional/3rd-party backends declared
+    in scripts/backends.template.json (e.g. blender-mcp).
+    """
     shed = ToolShed(dispatcher=dispatcher)
     shed.register_static_catalog("pp_harness", PP_HARNESS_TOOLS,
                                  schemas=SCHEMA_OVERRIDES.get("pp_harness"))
@@ -807,4 +823,7 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
     shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
     shed.register_static_catalog("xenia_kb", XENIA_KB_TOOLS)
     shed.register_static_catalog("xenia_tickets", XENIA_TICKETS_TOOLS)
+    # Optional / 3rd-party backends — present in backends.template.json and
+    # declared by squad.yaml RBAC, but require a locally-running service.
+    shed.register_static_catalog("blender", BLENDER_TOOLS)
     return shed

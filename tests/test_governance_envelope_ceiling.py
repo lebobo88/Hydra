@@ -100,3 +100,40 @@ def test_envelope_ceiling_precedes_budget_check(packs):
     s.budget.spent_usd = 9_999.0
     verdict = enforce_governance(s, packs)
     assert verdict.reason.startswith("envelope_ceiling")
+
+
+# --- deferred_to_host: a workflow must not conclude `done` while pack work ---- #
+# was only handed off to the host and never actually executed in-process.
+
+def _task(status: str, squad: str = "executive"):
+    from hydra_core.state import TaskState
+    return TaskState(owner_squad=squad, description="t", status=status)
+
+
+def test_deferred_to_host_task_surfaces(packs):
+    s = _state()
+    s.tasks.append(_task("deferred_to_host"))
+    verdict = enforce_governance(s, packs)
+    assert verdict.surfaced is True
+    assert "deferred to host" in verdict.reason
+    assert "executive" in verdict.reason
+
+
+def test_all_done_tasks_pass(packs):
+    """A workflow whose tasks all reached a known-good terminal status is not
+    blocked by the deferred/out-of-contract guards."""
+    s = _state()
+    s.tasks.append(_task("done"))
+    verdict = enforce_governance(s, packs)
+    assert verdict.surfaced is False
+    assert verdict.reason == "all gates passed"
+
+
+def test_failed_task_precedes_deferred(packs):
+    """Failed tasks surface ahead of the deferred guard (higher precedence)."""
+    s = _state()
+    s.tasks.append(_task("failed"))
+    s.tasks.append(_task("deferred_to_host"))
+    verdict = enforce_governance(s, packs)
+    assert verdict.surfaced is True
+    assert "failed" in verdict.reason

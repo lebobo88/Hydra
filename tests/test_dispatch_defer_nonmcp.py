@@ -116,11 +116,23 @@ def test_live_engine_defers_nonmcp_and_dispatches_engineering():
 
 
 def test_stub_dispatcher_keeps_legacy_path():
-    """A non-live dispatcher (no live_execution) must NOT defer — Fix B is gated
-    on live_execution so existing in-graph tests are unaffected."""
+    """A non-live dispatcher (no live_execution) must NOT be pre-empted by Fix B —
+    Fix B (the live-defer pre-filter that skips non-mcp squads *without* invoking
+    them) is gated on live_execution, so a non-live dispatcher still runs the
+    in-graph skill path.
+
+    The observable discriminator is whether the skill was actually invoked: the
+    live path defers with ``skill_calls == []`` (see the test above), whereas the
+    non-live legacy path here invokes the skill in-process. F11 then maps the
+    skill's ``host_pickup_required`` placeholder to the honest ``deferred_to_host``
+    status — the same terminal status, but reached by actually running the leg
+    rather than skipping it. Status alone no longer distinguishes the two paths."""
     from hydra_core.supervisor import build_supervisor
 
     class _StubDispatcher:
+        def __init__(self):
+            self.skill_calls: list[str] = []
+
         def call_mcp(self, server, tool, args, **_kw):
             return {"status": "done", "tool": tool, "result": {"ok": True}}
         def spawn_subprocess(self, *_a, **_k):
@@ -128,11 +140,13 @@ def test_stub_dispatcher_keeps_legacy_path():
         def emit_claude_prompt(self, prompt, agent=None):
             return {"status": "host_pickup_required", "agent": agent}
         def invoke_claude_skill(self, skill, args):
+            self.skill_calls.append(skill)
             return {"status": "host_pickup_required", "skill": skill}
 
+    disp = _StubDispatcher()
     runner = build_supervisor(
         project_root=HYDRA_ROOT,
-        dispatcher=_StubDispatcher(),
+        dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
     )
@@ -140,6 +154,10 @@ def test_stub_dispatcher_keeps_legacy_path():
                        selected_squads=["garland"])
     final = _invoke(runner, state)
     by_squad = {t.owner_squad: t for t in final.tasks}
-    # Legacy behaviour: not deferred_to_host (it runs the in-graph stub path).
+    # Legacy behaviour: Fix B did NOT pre-empt — the in-graph skill path actually
+    # ran (the skill was invoked in-process), unlike the live path which skips it.
     assert by_squad.get("garland") is not None
-    assert by_squad["garland"].status != "deferred_to_host"
+    assert disp.skill_calls, "non-live dispatcher must run the in-graph skill path"
+    # F11: the invoked skill returned the host_pickup_required placeholder, which
+    # is surfaced honestly as deferred_to_host (never a forged 'done').
+    assert by_squad["garland"].status == "deferred_to_host"

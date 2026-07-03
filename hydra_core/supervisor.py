@@ -1731,7 +1731,17 @@ def build_supervisor(
                     }
                 if winners:
                     new_decisions.extend(winners)
-                    task.status = "done"
+                    # F11: propagate honest deferred_to_host status when EVERY
+                    # best-of-N candidate came back as a host_pickup placeholder.
+                    # _via_claude_skill already maps host_pickup_required →
+                    # deferred_to_host on the single-shot path; the best-of-N
+                    # path must honour the same contract so a non-live dispatcher
+                    # that actually invokes the skill in-process (unlike Fix B's
+                    # live-defer pre-filter) still surfaces the honest status.
+                    if all(w.get("_host_pickup_pending") for w in winners):
+                        task.status = "deferred_to_host"
+                    else:
+                        task.status = "done"
                 else:
                     task.status = "failed"
                 continue
