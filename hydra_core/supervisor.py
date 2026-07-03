@@ -1731,7 +1731,17 @@ def build_supervisor(
                     }
                 if winners:
                     new_decisions.extend(winners)
-                    task.status = "done"
+                    # F11: propagate honest deferred_to_host status when EVERY
+                    # best-of-N candidate came back as a host_pickup placeholder.
+                    # _via_claude_skill already maps host_pickup_required →
+                    # deferred_to_host on the single-shot path; the best-of-N
+                    # path must honour the same contract so a non-live dispatcher
+                    # that actually invokes the skill in-process (unlike Fix B's
+                    # live-defer pre-filter) still surfaces the honest status.
+                    if all(w.get("_host_pickup_pending") for w in winners):
+                        task.status = "deferred_to_host"
+                    else:
+                        task.status = "done"
                 else:
                     task.status = "failed"
                 continue
@@ -1801,7 +1811,16 @@ def build_supervisor(
                     "budget_downgrade_active": True,
                     "open_pp_runs": state.open_pp_runs,
                 }
-            task.status = result.status
+            # M2: coerce unknown/out-of-contract statuses to 'surfaced' so a
+            # misbehaving squad pack cannot forge a 'done' when it returned
+            # something unrecognisable.  Known-good set mirrors TaskState.status.
+            _KNOWN_TASK_STATUSES: frozenset[str] = frozenset({
+                "pending", "running", "blocked", "done", "failed",
+                "surfaced", "cancelled", "deferred_to_host",
+            })
+            task.status = (result.status
+                           if result.status in _KNOWN_TASK_STATUSES
+                           else "surfaced")
             # Validate and redact envelopes crossing the squad boundary back
             # into the supervisor. Invalid envelopes fail the task.
             for produced in result.envelopes:

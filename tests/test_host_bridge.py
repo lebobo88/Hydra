@@ -303,3 +303,77 @@ def test_abort_releases_lock(tmp_path):
     aborts = [a for _s, t, a, _q in disp.calls
               if t == "finalize_run" and a.get("status") == "aborted"]
     assert len(aborts) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Non-engineering squad attended path (claude-skill / agent-impersonation)     #
+# --------------------------------------------------------------------------- #
+# These squads produce documents, not engine code, so the attended cursor is a
+# lightweight one-hop machine: begin_squad_stage pauses for the pack lead agent,
+# submit drives straight to `complete`. No pp ledger calls, no worktree.
+
+def test_squad_stage_pauses_for_pack_lead(tmp_path):
+    disp = FakeDispatcher()
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-1", task_id="task-7", squad_slug="marketing-strategy",
+        entrypoint="claude-skill", lead_agent="brand-strategist",
+        pack_cwd=str(tmp_path), request_text="draft the brand brief",
+        project_root=str(tmp_path))
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_squad_agent"
+    assert res["task_id"] == "task-7"
+    # run_id mirrors task_id so `submit-host-result --run-id <task_id>` resolves
+    # the cursor for non-engineering tasks.
+    assert res["run_id"] == "task-7"
+    assert res["host_action"]["agent_type"] == "brand-strategist"
+    assert res["host_action"]["cwd"] == str(tmp_path)
+    assert res["host_action"]["call_key"] == "squad-task-7-0"
+    # The squad path never touches the engineering pp ledger.
+    assert disp.calls == []
+
+
+def test_squad_stage_submit_completes_and_accrues_spend(tmp_path):
+    disp = FakeDispatcher()
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-1", task_id="task-7", squad_slug="marketing-strategy",
+        entrypoint="claude-skill", lead_agent="brand-strategist",
+        pack_cwd=str(tmp_path), request_text="draft the brand brief",
+        project_root=str(tmp_path))
+    cfile = res["cursor_path"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="squad-task-7-0",
+        result={"text": "# Brand Brief\n...", "cost_usd": 0.08,
+                "tokens_in": 200, "tokens_out": 400})
+    assert res["status"] == "complete"
+    assert res["final_status"] == "complete"
+    # task_id flows back so the CLI charges budget and marks the task complete.
+    assert res["task_id"] == "task-7"
+    assert res["cost_usd"] == pytest.approx(0.08)
+    assert res["tokens_in"] == 200
+    assert res["tokens_out"] == 400
+    # Still no pp calls — no double-judging, no engineering-scope RBAC use.
+    assert disp.calls == []
+
+
+def test_squad_stage_duplicate_submit_is_exactly_once(tmp_path):
+    """A retried submit on a terminal squad cursor returns the terminal result
+    without re-accruing spend."""
+    disp = FakeDispatcher()
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-1", task_id="task-9", squad_slug="executive",
+        entrypoint="agent-impersonation", lead_agent="ceo",
+        pack_cwd=str(tmp_path), request_text="frame the decision",
+        project_root=str(tmp_path))
+    cfile = res["cursor_path"]
+    r1 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="squad-task-9-0",
+        result={"text": "minutes", "cost_usd": 0.05})
+    assert r1["status"] == "complete"
+    assert r1["cost_usd"] == pytest.approx(0.05)
+    # Duplicate submit (same call_key, already terminal) → no re-charge.
+    r2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="squad-task-9-0",
+        result={"text": "minutes", "cost_usd": 0.05})
+    assert r2["status"] == "complete"
+    assert r2["cost_usd"] == pytest.approx(0.05)

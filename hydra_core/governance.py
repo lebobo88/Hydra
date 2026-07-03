@@ -266,4 +266,31 @@ def enforce_governance(
             surfaced=True,
             reason=f"{len(surfaced)} task(s) surfaced (stub or HITL): {[t.owner_squad for t in surfaced]}",
         )
+    # F11: 'deferred_to_host' means pack work never actually executed in-process.
+    # A workflow must not conclude 'done' while tasks are unexecuted — surface for
+    # host follow-up.  Any status outside the known-good set is also treated as
+    # blocking (unknown status = unknown outcome = cannot claim done).
+    _KNOWN_GOOD: frozenset[str] = frozenset({
+        "done", "failed", "surfaced", "pending", "dispatched",
+        "deferred_to_host", "cancelled", "running", "blocked",
+    })
+    deferred = [t for t in state.tasks if t.status == "deferred_to_host"]
+    if deferred:
+        return GovernanceVerdict(
+            surfaced=True,
+            reason=(
+                f"{len(deferred)} task(s) deferred to host (pack not executed): "
+                f"{[t.owner_squad for t in deferred]}"
+            ),
+        )
+    out_of_contract = [t for t in state.tasks
+                       if t.status not in _KNOWN_GOOD]
+    if out_of_contract:
+        return GovernanceVerdict(
+            surfaced=True,
+            reason=(
+                f"{len(out_of_contract)} task(s) have unrecognised status "
+                f"{[t.status for t in out_of_contract]}: cannot conclude done."
+            ),
+        )
     return GovernanceVerdict(surfaced=False, reason="all gates passed")

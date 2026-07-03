@@ -760,6 +760,7 @@ def _drive_pp_stage_loop(
     model_tier: str | None = None,
     judge_rubric_id: str = "rfc-2119-normative",
     workflow_id: str | None = None,
+    invoke_mode: str | None = None,
 ) -> dict[str, Any]:
     """Drive a pp `code` stage to a finalized run, headless (no Claude driver).
 
@@ -784,11 +785,16 @@ def _drive_pp_stage_loop(
     to ``_drive_best_of_loop`` (N Claude candidates → Borda → merge winner). If
     that path can't open the best-of stage it returns None and we fall through to
     the single-candidate body below (unchanged).
+
+    F18: ``invoke_mode="pp_best_of"`` implies N=3 when HYDRA_BEST_OF_N is unset.
+    An explicit HYDRA_BEST_OF_N always wins over the invoke_mode default.
     """
-    if _best_of_n():
+    # F18: explicit env wins; invoke_mode="pp_best_of" implies N=3 as fallback.
+    _effective_n = _best_of_n() or (3 if invoke_mode == "pp_best_of" else None)
+    if _effective_n:
         _bo = _drive_best_of_loop(
             dispatcher, run_id=run_id, project_path=project_path,
-            request_text=request_text, n=_best_of_n(), model_tier=model_tier,
+            request_text=request_text, n=_effective_n, model_tier=model_tier,
             judge_rubric_id=judge_rubric_id, workflow_id=workflow_id)
         if _bo is not None:
             return _bo
@@ -1789,6 +1795,7 @@ def _via_mcp(
             request_text=str(args.get("request_text", "")),
             model_tier=effective_tier,
             workflow_id=str(getattr(inbound, "workflow_id", "") or ""),
+            invoke_mode=mode,
         )
         # The loop already finalized the run (complete/surfaced/aborted) → the
         # project lock is released. Drop the ledger entry so node_postcheck's
@@ -2027,10 +2034,15 @@ def _via_impersonation(
         isinstance(result, dict)
         and result.get("status") == "host_pickup_required"
     )
+    # F19: extract any delegation envelopes the impersonation result emitted
+    # (DEV_TASK/PRD → engineering, etc.), mirroring _via_claude_skill's RC1 block.
+    emitted = _extract_emitted_envelopes(result, inbound, pack.slug, state)
+    # F11: never report 'done' when work was only deferred to the host.
+    _imp_status = "deferred_to_host" if host_pickup else "done"
     return SquadResult(
-        envelopes=[decision],
+        envelopes=[decision, *emitted],
         artifacts=[{"kind": "boardroom_minutes", "raw": result, "persisted": write_result}],
-        status="done",
+        status=_imp_status,
         host_pickup_pending=host_pickup,
     )
 
@@ -2321,10 +2333,18 @@ def _via_claude_skill(
     # engineering, CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland) so the
     # supervisor can route them onward. The DecisionRecord stays first.
     emitted = _extract_emitted_envelopes(result, inbound, pack.slug, state)
+    # F11: 'stub' and 'host_pickup_required' both mean the work was not executed
+    # in-process; surface them honestly as 'deferred_to_host' so governance can
+    # block workflows that never had their pack work actually run.
+    _raw_skill_status = (result.get("status", "done")
+                         if isinstance(result, dict) else "done")
+    _skill_status = ("deferred_to_host"
+                     if _raw_skill_status in ("stub", "host_pickup_required")
+                     else _raw_skill_status)
     return SquadResult(
         envelopes=[decision, *emitted],
         artifacts=[{"kind": shim["artifact_kind"], "raw": result, "persisted": write_result}],
-        status=result.get("status", "done"),
+        status=_skill_status,
         host_pickup_pending=host_pickup,
     )
 
