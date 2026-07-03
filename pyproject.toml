@@ -34,6 +34,10 @@ hydra = "hydra_core.cli:main"
 [tool.setuptools.packages.find]
 include = ["hydra_core*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["maf-template", "web", ".tmp*", ".harness"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

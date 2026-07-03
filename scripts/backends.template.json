@@ -172,16 +172,15 @@
       "HYDRA_ROOT": "{{HYDRA_ROOT}}"
     }
   },
-  "hydra-cockpit": {
+  "blender": {
     "type": "stdio",
-    "command": "node",
+    "command": "uvx",
     "args": [
-      "{{HYDRA_ROOT}}/web/web/server/index.ts"
+      "blender-mcp"
     ],
     "env": {
-      "HYDRA_COCKPIT_BRIDGE_PORT": "8795",
-      "HYDRA_ROOT": "{{HYDRA_ROOT}}",
-      "PYTHONPATH": "{{HYDRA_ROOT}}"
+      "BLENDER_MCP_HOST": "127.0.0.1",
+      "BLENDER_MCP_PORT": "9876"
     }
   }
 }
