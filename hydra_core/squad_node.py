@@ -2030,15 +2030,18 @@ def _via_impersonation(
         rationale=str(result.get("summary", "(see artifact)"))[:1000],
         artifacts=artifacts_refs,
     )
-    host_pickup = (
-        isinstance(result, dict)
-        and result.get("status") == "host_pickup_required"
-    )
+    _raw_imp_status = result.get("status", "done") if isinstance(result, dict) else "done"
+    host_pickup = _raw_imp_status == "host_pickup_required"
     # F19: extract any delegation envelopes the impersonation result emitted
     # (DEV_TASK/PRD → engineering, etc.), mirroring _via_claude_skill's RC1 block.
     emitted = _extract_emitted_envelopes(result, inbound, pack.slug, state)
     # F11: never report 'done' when work was only deferred to the host.
-    _imp_status = "deferred_to_host" if host_pickup else "done"
+    # Rider (c): also map raw 'stub' → 'deferred_to_host' (mirrors _via_claude_skill).
+    _imp_status = (
+        "deferred_to_host"
+        if _raw_imp_status in ("host_pickup_required", "stub")
+        else _raw_imp_status
+    )
     return SquadResult(
         envelopes=[decision, *emitted],
         artifacts=[{"kind": "boardroom_minutes", "raw": result, "persisted": write_result}],

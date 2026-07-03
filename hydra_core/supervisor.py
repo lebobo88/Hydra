@@ -1120,6 +1120,9 @@ def build_supervisor(
                 }
                 state.phase = "surfaced"
                 state.pending_hitl = _bon_hitl
+                # F9: set hitl_return_node so node_dispatch's return (below)
+                # carries it through to after_dispatch routing.
+                state.hitl_return_node = "dispatch"
                 eights.hitl_request(_bon_hitl, gate_node="dispatch")
                 emit_trace(judge_trace_root, state.workflow_id, "budget.over_budget_surface", {
                     "site": "best_of_n", "candidate": i, "squad": pack.slug,
@@ -1237,6 +1240,10 @@ def build_supervisor(
         # uses direct parallel Agent() fanout.
         if state.is_over_envelope_ceiling():
             state.phase = "surfaced"
+            # F9: set hitl_return_node so after_dispatch routes to hitl_gate_dispatch
+            # (interrupt_before pause) instead of postcheck/halt. The operator can
+            # then acknowledge + resume; the graph re-enters dispatch.
+            state.hitl_return_node = "dispatch"
             state.pending_hitl = {
                 "workflow_id": str(state.workflow_id),
                 "reason": "envelope_ceiling",
@@ -1245,10 +1252,13 @@ def build_supervisor(
                     f"Envelope ceiling hit: {len(state.envelopes)} envelopes "
                     f"(ceiling {state.envelope_ceiling})"
                 ),
-                "options": ["split_phase", "abort"],
+                # F10: "split_phase" had no engine-side behaviour; "acknowledge"
+                # maps to "clear gate + continue" in the option dispatch table.
+                "options": ["acknowledge", "abort"],
                 "remediation": (
-                    "Split phase across multiple supervisor invocations "
-                    "(planner phase_batch_index) or use parallel Agent() dispatch."
+                    "Acknowledge to continue dispatch with the current envelope set, "
+                    "or abort to park the workflow. "
+                    "To split the phase, re-invoke with a raised envelope_ceiling."
                 ),
                 "envelope_count": len(state.envelopes),
                 "envelope_ceiling": state.envelope_ceiling,
@@ -1289,6 +1299,8 @@ def build_supervisor(
                 "phase": "surfaced",
                 "pending_hitl": _pre_hitl,
                 "budget_downgrade_active": True,
+                # F9: signal after_dispatch to route to hitl_gate_dispatch
+                "hitl_return_node": "dispatch",
             }
 
         state.phase = "executing"
@@ -1677,6 +1689,8 @@ def build_supervisor(
                     "pending_hitl": _hitl_fleet_budget,
                     "budget_downgrade_active": True,
                     "open_pp_runs": state.open_pp_runs,
+                    # F9: signal after_dispatch to route to hitl_gate_dispatch.
+                    "hitl_return_node": "dispatch",
                 }
             # Fleet tasks now have status != "pending"; the sequential loop
             # below skips them. Non-mcp and best-of-N tasks are still pending.
@@ -1728,6 +1742,9 @@ def build_supervisor(
                         "pending_hitl": state.pending_hitl,
                         "budget_downgrade_active": state.budget_downgrade_active,
                         "open_pp_runs": state.open_pp_runs,
+                        # F9: propagate hitl_return_node so after_dispatch can
+                        # route to hitl_gate_dispatch instead of postcheck/halt.
+                        "hitl_return_node": state.hitl_return_node,
                     }
                 if winners:
                     new_decisions.extend(winners)
@@ -1810,6 +1827,8 @@ def build_supervisor(
                     "pending_hitl": _hitl_over_budget,
                     "budget_downgrade_active": True,
                     "open_pp_runs": state.open_pp_runs,
+                    # F9: signal after_dispatch to route to hitl_gate_dispatch.
+                    "hitl_return_node": "dispatch",
                 }
             # M2: coerce unknown/out-of-contract statuses to 'surfaced' so a
             # misbehaving squad pack cannot forge a 'done' when it returned
@@ -1975,6 +1994,8 @@ def build_supervisor(
                     "pending_hitl": _hitl_fwd_budget,
                     "budget_downgrade_active": True,
                     "open_pp_runs": state.open_pp_runs,
+                    # F9: signal after_dispatch to route to hitl_gate_dispatch.
+                    "hitl_return_node": "dispatch",
                 }
 
         return {
@@ -2089,11 +2110,9 @@ def build_supervisor(
             })
         if _block:
             # Budget hit during reflexion — surface to HITL immediately.
-            # Fix 2b: must set state.phase + pending_hitl so after_dispatch
-            # routes to "postcheck" (halt) rather than "judge_per_squad".
-            # A bare `return [], []` was silently swallowed — the caller
-            # (node_judge_per_squad) continued accumulating retries and the
-            # state machine never halted.
+            # Fix 2b: must set state.phase + pending_hitl so after_judge_per_squad
+            # routes to "hitl_gate_judge" (F9) or "postcheck" (halt) rather than
+            # continuing to synthesis. A bare `return [], []` was silently swallowed.
             state.budget_downgrade_active = True
             _reflexion_hitl: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -2111,6 +2130,8 @@ def build_supervisor(
             }
             state.phase = "surfaced"
             state.pending_hitl = _reflexion_hitl
+            # F9: signal after_judge_per_squad to route to hitl_gate_judge.
+            state.hitl_return_node = "judge_per_squad"
             eights.hitl_request(_reflexion_hitl, gate_node="judge_per_squad")
             emit_trace(judge_trace_root, state.workflow_id, "budget.reflexion_blocked", {
                 "origin": origin, "spent_usd": state.budget.spent_usd,
@@ -2275,6 +2296,9 @@ def build_supervisor(
                     "phase": "surfaced",
                     "pending_hitl": state.pending_hitl,
                     "budget_downgrade_active": state.budget_downgrade_active,
+                    # F9: propagate hitl_return_node so after_judge_per_squad
+                    # routes to hitl_gate_judge instead of postcheck/halt.
+                    "hitl_return_node": state.hitl_return_node,
                 }
 
         # R3-tail: also scan the just-completed retry verdicts. If a retry
@@ -2313,7 +2337,11 @@ def build_supervisor(
                     f"Per-squad judge FAIL on rubric {breach.get('rubric_id')}. "
                     f"Critique: {(breach.get('critique_md') or '')[:240]}"
                 ),
-                options=["approve_override", "reject", "send_back_for_revision"],
+                # F10: "send_back_for_revision" had no distinct engine behaviour
+                # (it was identical to "reject" without a clear mechanism to
+                # re-dispatch). Removed so every advertised option maps to a real
+                # action in the cli.py F10 option dispatch table.
+                options=["approve_override", "reject"],
                 default_option="reject",
             )
             hitl_dict = hitl.model_dump(mode="json")
@@ -2321,6 +2349,9 @@ def build_supervisor(
             eights.hitl_request(hitl_dict, gate_node="judge_per_squad")
             out["pending_hitl"] = hitl_dict
             out["phase"] = "surfaced"
+            # F9: set hitl_return_node so after_judge_per_squad routes to
+            # hitl_gate_judge (interrupt_before) instead of postcheck/halt.
+            out["hitl_return_node"] = "judge_per_squad"
             emit_trace(judge_trace_root, state.workflow_id, "judge.hitl_escalation", {
                 "stage": "per_squad",
                 "rubric_id": breach.get("rubric_id"),
@@ -2366,6 +2397,9 @@ def build_supervisor(
             eights.hitl_request(hitl_dict, gate_node="judge_per_squad")
             out["pending_hitl"] = hitl_dict
             out["phase"] = "surfaced"
+            # F9: set hitl_return_node so after_judge_per_squad routes to
+            # hitl_gate_judge (interrupt_before pause) instead of postcheck/halt.
+            out["hitl_return_node"] = "judge_per_squad"
             emit_trace(judge_trace_root, state.workflow_id, "judge.reflexion_ceiling_hit", {
                 "active_ceiling": active_ceiling,
                 "blocked_count": count,
@@ -2733,7 +2767,12 @@ def build_supervisor(
                     f"Judge verdict FAIL on rubric {breach.get('rubric_id')}. "
                     f"Critique: {(breach.get('critique_md') or '')[:240]}"
                 ),
-                options=["approve_override", "reject", "send_back_for_revision"],
+                # F10: "send_back_for_revision" had no distinct engine behaviour
+                # (identical to "reject" without a clear re-dispatch mechanism).
+                # Removed from judge_synthesis gate for the same reason it was
+                # removed from judge_per_squad — every advertised option must map
+                # to a real action in the cli.py F10 option dispatch table.
+                options=["approve_override", "reject"],
                 default_option="reject",
             )
             hitl_dict = hitl.model_dump(mode="json")
@@ -2855,6 +2894,27 @@ def build_supervisor(
             out["pending_hitl"] = state.pending_hitl
         return out
 
+    # ----- F9: hitl_gate nodes (resumable HITL interrupt points) -----
+
+    def hitl_gate_dispatch(state: HydraState) -> dict[str, Any]:
+        """Interrupt point for HITL gates triggered from node_dispatch.
+
+        The operator resumes after clearing pending_hitl (via /hydra:approve
+        or /hydra:resume). This node clears hitl_return_node and resets phase
+        to "executing" so node_dispatch re-runs and continues remaining work.
+        The operator's approve action in cli.py (F10 option dispatch) adjusts
+        state (e.g. extends budget for over_budget gates) before resuming.
+        """
+        return {"hitl_return_node": None, "phase": "executing"}
+
+    def hitl_gate_judge(state: HydraState) -> dict[str, Any]:
+        """Interrupt point for HITL gates triggered from node_judge_per_squad.
+
+        Clears hitl_return_node and signals re-entry into node_judge_per_squad
+        so remaining envelope judgements / reflexion retries execute.
+        """
+        return {"hitl_return_node": None, "phase": "judge_per_squad"}
+
     # ----- routing edges -----
 
     def after_intake(state: HydraState) -> str:
@@ -2867,18 +2927,21 @@ def build_supervisor(
         return "approval" if state.requires_human_approval else "dispatch"
 
     def after_dispatch(state: HydraState) -> str:
-        """Fix 2d — if dispatch surfaced a budget HITL, route to postcheck
-        (halt) rather than proceeding to judge_per_squad / reflexion.
-        Mirrors the after_intake halt pattern.
+        """F9: when dispatch surfaced a resumable HITL gate, route to
+        hitl_gate_dispatch (interrupt_before pause) instead of postcheck/halt.
+        Legacy behaviour (no hitl_return_node in checkpoint) falls through to
+        the 'halt' branch so existing persisted workflows are unaffected.
         """
+        if state.hitl_return_node == "dispatch":
+            return "hitl_gate_dispatch"
         return "halt" if state.phase == "surfaced" else "judge_per_squad"
 
     def after_judge_per_squad(state: HydraState) -> str:
-        """Fix 2b — if judge_per_squad surfaced a budget HITL (reflexion
-        budget block), route to postcheck (halt) rather than synthesis.
-        Without this edge, synthesis runs unconditionally even after
-        node_judge_per_squad sets phase='surfaced' via _reflexion_retry.
+        """F9: when judge_per_squad surfaced a resumable HITL gate, route to
+        hitl_gate_judge (interrupt_before pause) instead of postcheck/halt.
         """
+        if state.hitl_return_node == "judge_per_squad":
+            return "hitl_gate_judge"
         return "halt" if state.phase == "surfaced" else "synthesis"
 
     def after_postcheck(state: HydraState) -> str:
@@ -2887,6 +2950,10 @@ def build_supervisor(
     # ----- assemble graph -----
 
     if force_pure_python or not _HAS_LANGGRAPH:
+        # PurePythonRunner does not include hitl_gate nodes — it exits on
+        # phase=="surfaced" and does not support interrupt_before. The
+        # hitl_return_node field is still set on the state so tests can verify
+        # the gating logic without requiring the compiled graph.
         return _PurePythonRunner(
             packs=packs,
             steps=[
@@ -2906,6 +2973,9 @@ def build_supervisor(
     graph.add_node("planner", node_planner)
     graph.add_node("approval", node_approval)
     graph.add_node("dispatch", node_dispatch)
+    # F9: dedicated interrupt nodes for resumable HITL gates.
+    graph.add_node("hitl_gate_dispatch", hitl_gate_dispatch)
+    graph.add_node("hitl_gate_judge", hitl_gate_judge)
     graph.add_node("judge_per_squad", node_judge_per_squad)
     graph.add_node("synthesis", node_synthesis)
     graph.add_node("judge_synthesis", node_judge_synthesis)
@@ -2921,18 +2991,24 @@ def build_supervisor(
         "dispatch": "dispatch",
     })
     graph.add_edge("approval", "dispatch")
-    # Fix 2d: conditional edge from dispatch so a budget surface routes to
-    # postcheck instead of proceeding to judge_per_squad / reflexion.
+    # F9: conditional edge from dispatch — resumable gates route to
+    # hitl_gate_dispatch; budget/envelope surfaces still halt at postcheck.
     graph.add_conditional_edges("dispatch", after_dispatch, {
         "judge_per_squad": "judge_per_squad",
+        "hitl_gate_dispatch": "hitl_gate_dispatch",
         "halt": "postcheck",
     })
-    # Fix 2b: conditional edge from judge_per_squad — when reflexion budget
-    # block sets phase='surfaced', route to postcheck (halt) not synthesis.
+    # F9: hitl_gate_dispatch → dispatch (re-entry after operator approval).
+    graph.add_edge("hitl_gate_dispatch", "dispatch")
+    # F9: conditional edge from judge_per_squad — resumable gates route to
+    # hitl_gate_judge; reflexion/policy surfaces still halt at postcheck.
     graph.add_conditional_edges("judge_per_squad", after_judge_per_squad, {
         "synthesis": "synthesis",
+        "hitl_gate_judge": "hitl_gate_judge",
         "halt": "postcheck",
     })
+    # F9: hitl_gate_judge → judge_per_squad (re-entry after operator approval).
+    graph.add_edge("hitl_gate_judge", "judge_per_squad")
     graph.add_edge("synthesis", "judge_synthesis")
     graph.add_edge("judge_synthesis", "postcheck")
     graph.add_conditional_edges("postcheck", after_postcheck, {END: END})
@@ -2947,7 +3023,17 @@ def build_supervisor(
     conn = sqlite3.connect(str(cp_path), check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
-    interrupts = ["approval", "synthesis", "judge_synthesis"]
+    # F9: add hitl_gate_dispatch and hitl_gate_judge to interrupt_before so
+    # the operator can review the gate before the node clears it and re-enters
+    # the originating node. Additive-only change: existing persisted workflows
+    # are unaffected (hitl_return_node defaults to None → halt path unchanged).
+    interrupts = [
+        "approval",
+        "hitl_gate_dispatch",
+        "hitl_gate_judge",
+        "synthesis",
+        "judge_synthesis",
+    ]
     if plan_only:
         # Attended (host-bridged) planning surface: halt after planner, before
         # any squad executes. Combined with the existing "approval" interrupt

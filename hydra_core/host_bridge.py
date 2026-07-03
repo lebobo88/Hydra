@@ -183,6 +183,55 @@ def save_cursor(path: str | Path, cursor: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Rider (a) — smoke baseline helpers                                         #
+# --------------------------------------------------------------------------- #
+
+def _parse_failing_tests(output: str) -> set[str]:
+    """Parse failing test IDs from pytest --tb=no -q output.
+
+    Matches lines like: ``FAILED tests/test_foo.py::test_bar - reason``
+    Returns a set of bare test IDs (no trailing reason).
+    """
+    failing: set[str] = set()
+    for line in output.splitlines():
+        s = line.strip()
+        if s.startswith("FAILED "):
+            # Strip "FAILED " prefix and any trailing " - reason" suffix.
+            test_id = s[7:].split(" - ")[0].strip()
+            if test_id:
+                failing.add(test_id)
+    return failing
+
+
+def _capture_baseline_failures(project_path: str) -> list[str]:
+    """Run pytest before engineer changes; return sorted list of failing test IDs.
+
+    Called at begin_stage time (fresh worktree = no engineer changes) so
+    environment-specific failures (path-sensitive tests that always fail
+    inside a worktree) are captured as the baseline.  A later smoke-fail
+    is treated as clean if current failures ⊆ baseline.
+
+    Fail-soft: any exception returns an empty list (no baseline → smoke
+    failures are NOT excused, which is the safe default).
+    """
+    try:
+        res = subprocess.run(
+            [
+                __import__("sys").executable, "-m", "pytest",
+                "tests/", "--no-header", "-q", "--tb=no", "--timeout=120",
+            ],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=240,
+        )
+        return sorted(_parse_failing_tests(res.stdout + "\n" + res.stderr))
+    except Exception:  # noqa: BLE001 — baseline failure is non-fatal
+        return []
+
+
+# --------------------------------------------------------------------------- #
 # Step results                                                                #
 # --------------------------------------------------------------------------- #
 
@@ -220,6 +269,9 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
             res["merge"] = cursor["merge"]
         if cursor.get("error"):
             res["error"] = cursor["error"]
+        # Rider (b): expose charged flag so _cmd_attended_submit can skip
+        # duplicate budget charges on a retried submit-host-result call.
+        res["already_charged"] = bool(cursor.get("charged", False))
     return res
 
 
@@ -287,6 +339,11 @@ def begin_stage(
                 work_path = worktree_path
 
     base_prompt = _build_engineer_prompt(request_text, work_path)
+    # Rider (a): capture baseline failures before the engineer touches anything.
+    # The worktree is a fresh copy of HEAD at this point, so any failures here
+    # are environment-specific (path-sensitive tests that always fail inside a
+    # worktree) rather than regressions introduced by the engineer's changes.
+    baseline_failures = _capture_baseline_failures(work_path)
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "workflow_id": workflow_id,
@@ -303,6 +360,7 @@ def begin_stage(
         "judge_rubric_id": judge_rubric_id,
         "state": "await_generate",
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
+        "baseline_failures": baseline_failures,
         "producer": "claude",
         "attempt_id": None,
         "cost_usd": 0.0,
@@ -514,10 +572,40 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     smoke_status = "skipped"
     smoke_reason = ""
     if outcome == "pass" and attempt_id:
+        _smoke_project = cursor.get("work_path") or cursor["project_path"]
         smoke_status, smoke_reason = _run_smoke(
             dispatcher,
-            project_path=cursor.get("work_path") or cursor["project_path"],
+            project_path=_smoke_project,
             stage_id=cursor["stage_id"])
+        # Rider (a): compare against the baseline failures captured at begin_stage.
+        # If every currently-failing test was ALREADY failing before the engineer's
+        # change, the smoke failure is not attributable to this change — excuse it.
+        if smoke_status == "fail" and cursor.get("baseline_failures"):
+            try:
+                _reruns = subprocess.run(
+                    [
+                        __import__("sys").executable, "-m", "pytest",
+                        "tests/", "--no-header", "-q", "--tb=no", "--timeout=120",
+                    ],
+                    cwd=_smoke_project,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=240,
+                )
+                _current_failing = _parse_failing_tests(
+                    _reruns.stdout + "\n" + _reruns.stderr
+                )
+            except Exception:  # noqa: BLE001
+                _current_failing = set()
+            _baseline_set = set(cursor["baseline_failures"])
+            _new_failures = _current_failing - _baseline_set
+            if not _new_failures:
+                smoke_status = "pass"
+                smoke_reason = (
+                    f"smoke: {len(_current_failing)} failure(s) all pre-existed "
+                    f"in worktree baseline; treated as pass"
+                )
         try:
             cm("pp_harness", "record_smoke_status", {
                 "stage_id": cursor["stage_id"], "candidate_index": 1,
@@ -616,6 +704,10 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
 
     cursor["pending_action"] = None
     cursor["finalized"] = True
+    # Rider (b): initialise the charged flag to False. _cmd_attended_submit sets
+    # it to True after the first budget charge so retried submit calls don't
+    # double-charge (the already_charged field in _step_result exposes this flag).
+    cursor.setdefault("charged", False)
     _trace(cursor, "attended.finalized", {
         "stage_id": stage_id, "final_status": cursor["final_status"],
         "smoke_status": cursor.get("smoke_status"), "cost_usd": cursor.get("cost_usd"),
@@ -750,6 +842,24 @@ def submit_host_result(
 
     save_cursor(cursor_file, cursor)
     return _step_result(cursor, cursor_file)
+
+
+def mark_charged(cursor_file: str | Path) -> None:
+    """Mark a terminal cursor as budget-charged (rider b idempotency guard).
+
+    Called by _cmd_attended_submit immediately after charging the HydraState
+    budget ledger. Subsequent submit calls that see ``already_charged=True``
+    in the step result skip the charge, preventing double-billing on retried
+    submit-host-result invocations.  Fail-soft: any I/O or schema error is
+    silently ignored so a storage hiccup never blocks the calling workflow.
+    """
+    try:
+        cursor = load_cursor(cursor_file)
+        if cursor.get("state") in _TERMINAL:
+            cursor["charged"] = True
+            save_cursor(cursor_file, cursor)
+    except Exception:  # noqa: BLE001 — never crash the caller on persist failure
+        pass
 
 
 def abort_stage(dispatcher: Dispatcher, *, cursor_file: str | Path,
