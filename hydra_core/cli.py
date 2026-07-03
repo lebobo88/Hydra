@@ -685,15 +685,20 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # WS-AUTH: on approve, mint an operator-capability token BEFORE clearing
-    # pending_hitl so the token captures the gate context.  Persisted into the
-    # checkpointed state patch as operator_capability so downstream dispatch
-    # nodes can verify the approval is fresh and from the right actor.
-    # Degraded posture: when HYDRA_OPERATOR_KEY is unset we mint a degraded
-    # token (sig.value=None) and warn — the approval itself is NOT blocked
-    # (WS-AUTH foundation run A; gated consumers enforce in runs B/C).
+    # WS-AUTH run-A: mint + verify an operator-capability token for ALL
+    # state-mutating resume actions (approve, force-dispatch, modify-budget,
+    # change-squads).  These actions mutate checkpointed state or re-enter the
+    # graph and must carry operator identity so downstream nodes can verify the
+    # action is fresh and authorised.
+    # Degraded posture (no HYDRA_OPERATOR_KEY → warn-and-proceed) is UNIFORM
+    # across all actions — this is intentional for foundation run A; gated
+    # consumers enforce cryptographic proof in runs B/C.
+    # (WS-AUTH run-A comment: this block is intentionally non-enforcing on the
+    # operator side; the degraded-warn posture is the documented run-A stance.)
+    _MUTATING_RESUME_ACTIONS = frozenset({"approve", "force-dispatch",
+                                          "modify-budget", "change-squads"})
     operator_capability_patch: dict | None = None
-    if action == "approve":
+    if action in _MUTATING_RESUME_ACTIONS:
         import logging as _logging
         _log_cli = _logging.getLogger(__name__)
         _operator = (
@@ -703,15 +708,17 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         )
         # Sentinel check: empty or "unknown" operator identity means we cannot
         # issue a valid human capability — doing so would let any unidentified
-        # approval bypass the actor_id requirement in verify_operator_capability.
+        # action bypass the actor_id requirement in verify_operator_capability.
         # Force degraded mint (sig.value=None) in that case and warn loudly.
+        # This applies uniformly to all _MUTATING_RESUME_ACTIONS (WS-AUTH run-A).
         _UNKNOWN_OPERATORS = {"", "unknown"}
         _force_degraded = _operator.strip() in _UNKNOWN_OPERATORS
         if _force_degraded:
             _log_cli.warning(
-                "operator identity unknown; capability degraded — "
+                "operator identity unknown for action=%r; capability degraded — "
                 "set HYDRA_OPERATOR_ID (or args.operator) to a real operator id "
-                "to issue a verifiable capability token"
+                "to issue a verifiable capability token",
+                action,
             )
             # Use a sentinel actor_id for the degraded token payload so the
             # wire format is consistent; the sig.value=None marks it unusable.
@@ -752,6 +759,61 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 type(_cap_exc).__name__, _cap_exc,
             )
 
+        # M3: verify the just-minted capability before applying the patch.
+        # Fail-closed on a tampered/invalid token; warn-and-continue on a
+        # degraded token (no key or unknown operator — already warned at mint).
+        if operator_capability_patch is not None:
+            try:
+                from .auth.capability import verify_operator_capability as _verify_cap
+                _pending_for_verify = pending if isinstance(pending, dict) else {}
+                _m3_cap_name = str(
+                    _pending_for_verify.get("capability")
+                    or _pending_for_verify.get("gate_node")
+                    or _pending_for_verify.get("reason")
+                    or "hitl_approve"
+                )
+                _m3_resource_id = str(
+                    _pending_for_verify.get("resource_id")
+                    or _pending_for_verify.get("proposal_id")
+                    or _pending_for_verify.get("workflow_id")
+                    or wf
+                )
+                _m3_result = _verify_cap(
+                    operator_capability_patch,
+                    expected_capability=_m3_cap_name,
+                    expected_workflow_id=wf,
+                    expected_resource_id=_m3_resource_id,
+                )
+                if not _m3_result.get("valid"):
+                    _m3_reason = _m3_result.get("reason", "unknown")
+                    # Degrade-warn for cases where no key was configured or the
+                    # token is intentionally degraded (foundation run posture).
+                    _m3_sig = (operator_capability_patch.get("sig") or {})
+                    _m3_is_degraded = (
+                        _m3_sig.get("degraded") is True
+                        or _m3_sig.get("value") is None
+                        or "degraded" in _m3_reason
+                        or "no operator key" in _m3_reason
+                        or "no key" in _m3_reason
+                    )
+                    if _m3_is_degraded:
+                        _log_cli.warning(
+                            "capability verify: degraded (%s) — approval proceeds "
+                            "(set HYDRA_OPERATOR_KEY to enable cryptographic enforcement)",
+                            _m3_reason,
+                        )
+                    else:
+                        print(json.dumps({
+                            "error": f"capability_verify_failed: {_m3_reason}",
+                            "workflow_id": wf,
+                        }), file=sys.stderr)
+                        return 1
+            except Exception as _m3_exc:  # noqa: BLE001
+                _log_cli.warning(
+                    "verify_operator_capability raised %s: %s — approval proceeds",
+                    type(_m3_exc).__name__, _m3_exc,
+                )
+
     patch: dict = {"pending_hitl": None, "hitl_history": [resolution]}
     if operator_capability_patch is not None:
         patch["operator_capability"] = operator_capability_patch
@@ -774,7 +836,70 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                   file=sys.stderr)
             return 1
 
+    # F8: reflexion_override → approve_override_raise_to_N handler.
+    # When the operator approves a reflexion_override gate with the raise-to-N
+    # option, parse N and set reflexion_override_granted_until on the state so
+    # the next pass through node_judge_per_squad respects the raised ceiling.
+    if (action == "approve"
+            and isinstance(pending, dict)
+            and pending.get("reason") == "reflexion_override"
+            and isinstance(option, str)
+            and option.startswith("approve_override_raise_to_")):
+        try:
+            _raise_n = int(option.rsplit("_", 1)[-1])
+            patch["reflexion_override_granted_until"] = _raise_n
+        except (ValueError, TypeError):
+            pass
+
+    # F10: per-option behaviour dispatch table.
+    # Every option that any gate advertises must map to a real engine action.
+    # No cosmetic options may remain (R3-tail post-mortem, 2026-05-21).
+    _gate_reason = pending.get("reason", "") if isinstance(pending, dict) else ""
+
+    # approve_override on over_budget gates: extend the budget ceiling by 20%
+    # (at least 10 cents above current spend) so the re-entered dispatch node
+    # can proceed. The extended budget is persisted into the checkpoint via patch.
+    if option == "approve_override" and _gate_reason == "over_budget":
+        _budget = values.get("budget")
+        if _budget is not None:
+            _b = (dict(_budget) if isinstance(_budget, dict) else
+                  (_budget.model_dump(mode="json") if hasattr(_budget, "model_dump") else {}))
+            _spent = float(_b.get("spent_usd") or 0.0)
+            _cur_budget = float(_b.get("budget_usd") or 0.0)
+            _b["budget_usd"] = max(_cur_budget * 1.2, _spent * 1.1 + 0.10)
+            patch["budget"] = _b
+
+    # Minor: warn when an over_budget gate is approved WITHOUT extending the
+    # budget ceiling. The gate will immediately re-trigger on the next dispatch
+    # iteration unless modify-budget is used first.  This is a one-line guard
+    # so the operator knows why the resume appears to have no effect.
+    if action == "approve" and _gate_reason == "over_budget" and option != "approve_override":
+        import logging as _log_ob_mod
+        _log_ob_mod.getLogger(__name__).warning(
+            "over_budget gate approved without 'approve_override'; budget ceiling "
+            "unchanged — gate will re-trigger on next dispatch. "
+            "Use --option approve_override to extend the ceiling, or "
+            "--action modify-budget to set a new explicit budget."
+        )
+        emit(project, wf, "hitl.over_budget_reapprove_without_extend", {
+            "action": action, "option": option, "gate_reason": _gate_reason,
+        })
+
+    # acknowledge / accept_partial / approve_with_criteria: gate-clear + resume
+    # is the complete engine action (no additional state change required).
+    # These are validated by the option dispatch table; their mere presence here
+    # prevents the "unknown option" path that would otherwise be the default.
+    # pylint: disable=pointless-statement
+    if option in ("acknowledge", "accept_partial", "approve_with_criteria"):
+        pass  # gate-clear + resume is sufficient
+
+    # F9: clear hitl_return_node when resuming so the routing functions return
+    # to their normal paths (after_dispatch → judge_per_squad, etc.).
+    if action in ("approve", "force-dispatch"):
+        patch["hitl_return_node"] = None
+
     sup.update_state(config, patch)
+
     # C3: prevent a later spool replay from filing a ticket for this
     # now-resolved gate (late-spool orphan reconciliation, gate-identity-keyed).
     pruned_spool = _prune_spooled_hitl_requests(wf, resolution.get("gate_node"))
@@ -784,6 +909,19 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "gate_node": resolution.get("gate_node"),
         "pruned_spooled_hitl_requests": pruned_spool,
     })
+
+    # F10: abort option → park the workflow surfaced without resuming the graph.
+    # Handled AFTER the patch+spool-prune+emit so the gate resolution is fully
+    # recorded before returning (mirrors the reject path).
+    if option == "abort":
+        sup.update_state(config, {"phase": "surfaced"})
+        print(json.dumps({
+            "workflow_id": wf,
+            "resumed": False,
+            "action": "abort_option",
+            "phase": "surfaced",
+        }, indent=2))
+        return 0
 
     if action == "reject":
         # A rejected gate does NOT continue the graph; the workflow stays
@@ -1285,7 +1423,28 @@ def _cmd_attended_submit(args) -> int:
 
         # On terminal: charge budget on the authoritative HydraState ledger and
         # record the task outcome into the checkpoint.
+        # Rider (b): skip charge if already_charged=True (idempotency guard).
         if res.get("status") in ("complete", "surfaced", "aborted"):
+            if res.get("already_charged"):
+                # Idempotent re-submit: cursor was already charged on the first
+                # terminal submit.  Return the cached result without re-billing.
+                emit(project, wf, "attended.submit",
+                     {"run_id": str(args.run_id), "call_key": str(args.call_key),
+                      "status": res.get("status"), "already_charged": True})
+                print(json.dumps({"ok": True, **res}, indent=2, default=str))
+                return 0
+            # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
+            # budget write to the LangGraph checkpoint so that a crash between
+            # here and the checkpoint persist is an under-charge (acceptable) rather
+            # than a double-charge (unsafe).  Crash-ordering rationale:
+            #   1. mark_charged(cfile)          ← cursor sidecar flagged first
+            #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
+            #   3. sup.update_state(...)         ← checkpoint persisted
+            # If the process dies after (1) but before (3), the retry sees
+            # already_charged=True and skips the charge → under-charge.
+            # The opposite order (charge then mark) would re-charge on that crash
+            # → double-charge, which burns real spend twice.
+            host_bridge.mark_charged(cfile)
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
             if not isinstance(sup, _PurePythonRunner):

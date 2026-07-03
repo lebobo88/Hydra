@@ -228,6 +228,15 @@ class HydraState(BaseModel):
     # constitutional ×1 invariant is unchanged for other workflows.
     reflexion_override_granted_until: int = 0
 
+    # F9 — resumable HITL gate node marker (fable-audit-2 Phase 2).
+    # Set by the originating HITL gate to tell after_dispatch /
+    # after_judge_per_squad to route to a dedicated hitl_gate_* node
+    # (interrupt_before-paused) rather than to postcheck/halt.
+    # Cleared by the hitl_gate node itself when the operator resumes.
+    # None = legacy behaviour (route to halt on surfaced).  Additive-only
+    # change: existing persisted checkpoints load fine (defaults to None).
+    hitl_return_node: str | None = None
+
     # Trace
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: Optional[datetime] = None

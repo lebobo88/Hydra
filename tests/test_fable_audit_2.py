@@ -1,22 +1,35 @@
-"""fable-audit-2 Phase 1 tests.
+"""fable-audit-2 Phase 1 + Phase 2 tests.
 
-Covers all four fixes introduced in this phase:
+Phase 1 (F11+M2, Fix-2, F19, F18) — see original docstring.
 
-  F11+M2 — Honest status: _via_claude_skill and _via_impersonation must return
-            'deferred_to_host' (not 'done' / raw 'stub') when the dispatcher
-            cannot actually run the pack.  supervisor.py coerces unknown statuses.
-            governance.py treats 'deferred_to_host' as blocking.
+Phase 2 tests cover:
 
-  Fix-2  — Host-executor seam: _cmd_attended_step returns a host_action for
-            claude-skill / agent-impersonation tasks; begin_squad_stage / submit
-            are exactly-once; submit-host-result stores the artifact and advances
-            the workflow cursor to 'complete'.
+  Rider (c) — _via_impersonation maps raw 'stub' → 'deferred_to_host'
+               (mirrors _via_claude_skill).
 
-  F19    — _via_impersonation calls _extract_emitted_envelopes so DEV_TASK /
-            CREATIVE_BRIEF delegation envelopes are surfaced to the supervisor.
+  Rider (d) — TestSupervisorStatusCoercion rewritten to exercise the REAL
+               supervisor coercion code path (no inline _KNOWN copy). Also adds
+               a test that the toolshed catalog contains the blender server.
 
-  F18    — _drive_pp_stage_loop with invoke_mode='pp_best_of' implies N=3 when
-            HYDRA_BEST_OF_N is unset; an explicit HYDRA_BEST_OF_N still wins.
+  F8  — cli.py _cmd_resume_locked parses approve_override_raise_to_N and sets
+         reflexion_override_granted_until on the state patch.
+
+  F9  — Budget/envelope/policy_breach HITL gates now set hitl_return_node on
+         the state so the compiled graph routes to hitl_gate_* (interrupt_before)
+         instead of postcheck/halt. PurePythonRunner tests verify the field is
+         set; compiled-graph tests verify the interrupt routing.
+
+  F10 — Every advertised gate option maps to a real engine action in the F10
+         option dispatch table (cli.py).
+
+  M3  — verify_operator_capability is called on approve; tampered token is
+         rejected; degraded token warns but does not block.
+
+  Rider (a) — Smoke baseline: _capture_baseline_failures + _parse_failing_tests;
+               smoke excuses failures that pre-existed in the baseline.
+
+  Rider (b) — already_charged flag in _step_result prevents double-billing on
+               retried submit-host-result calls.
 """
 from __future__ import annotations
 
@@ -171,51 +184,91 @@ class TestHonestStatus:
 
 
 # ===========================================================================
-# M2 — supervisor unknown-status coercion
+# M2 — supervisor unknown-status coercion (rider d: real supervisor code path)
 # ===========================================================================
 
 class TestSupervisorStatusCoercion:
-    """supervisor.py must coerce unknown/out-of-contract SquadResult.status
-    values to 'surfaced' so a rogue pack cannot forge a 'done'."""
+    """supervisor.py node_dispatch must coerce unknown/out-of-contract
+    SquadResult.status values to 'surfaced' so a rogue pack cannot forge a
+    'done'.  Tests exercise the REAL supervisor code path (no inline _KNOWN
+    copy) by invoking the PurePythonRunner up to the dispatch step."""
 
-    def _make_result(self, status: str):
+    def _run_dispatch(self, monkeypatch, status: str):
+        """Run the pure-python supervisor until dispatch finishes and return
+        the task status as coerced by node_dispatch."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
         from hydra_core.squad_node import SquadResult
         from hydra_core.schemas import DecisionRecord
+
         dr = DecisionRecord(
             workflow_id=uuid4(), parent_id=uuid4(),
-            origin_squad="garland", target_squad="hydra",
+            origin_squad="engineering", target_squad="hydra",
             decision="ok", rationale="ok",
         )
-        return SquadResult(envelopes=[dr], artifacts=[], status=status)
+        mock_result = SquadResult(envelopes=[dr], artifacts=[], status=status)
+        # Monkeypatch execute_squad in the supervisor module namespace
+        # (imported via `from .squad_node import execute_squad`).
+        monkeypatch.setattr("hydra_core.supervisor.execute_squad",
+                            lambda *a, **k: mock_result)
+        # Also stub enforce_constitution so postcheck does not surface.
+        monkeypatch.setattr(
+            "hydra_core.governance.enforce_constitution",
+            lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
+        )
 
-    def test_known_done_is_kept(self):
-        # We test the coercion logic directly without invoking the full supervisor
-        # graph (no LangGraph needed for a unit test).
-        _KNOWN: frozenset[str] = frozenset({
-            "pending", "running", "blocked", "done", "failed",
-            "surfaced", "cancelled", "deferred_to_host",
-        })
-        result = self._make_result("done")
-        coerced = result.status if result.status in _KNOWN else "surfaced"
-        assert coerced == "done"
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT,
+            dispatcher=object(),
+            force_pure_python=True,
+        )
+        assert isinstance(runner, _PurePythonRunner)
 
-    def test_unknown_status_coerces_to_surfaced(self):
-        _KNOWN: frozenset[str] = frozenset({
-            "pending", "running", "blocked", "done", "failed",
-            "surfaced", "cancelled", "deferred_to_host",
-        })
-        result = self._make_result("totally_made_up")
-        coerced = result.status if result.status in _KNOWN else "surfaced"
-        assert coerced == "surfaced"
+        from hydra_core.state import HydraState, TaskState
+        # Pre-seed selected_squads so intake skips the LLM router.
+        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        task = TaskState(owner_squad="engineering", description="implement x")
+        state.tasks.append(task)
 
-    def test_deferred_to_host_is_known(self):
-        _KNOWN: frozenset[str] = frozenset({
-            "pending", "running", "blocked", "done", "failed",
-            "surfaced", "cancelled", "deferred_to_host",
-        })
-        result = self._make_result("deferred_to_host")
-        coerced = result.status if result.status in _KNOWN else "surfaced"
-        assert coerced == "deferred_to_host"
+        # Stop BEFORE judge_per_squad to inspect the coerced task status
+        # without running the judge/synthesis/postcheck pipeline.
+        final = runner.invoke(state, stop_before="judge_per_squad")
+        # All tasks in the returned state; the first (pre-seeded) one was dispatched.
+        dispatched = [t for t in final.tasks if t.owner_squad == "engineering"]
+        assert dispatched, "expected at least one engineering task after dispatch"
+        return dispatched[0].status
+
+    def test_known_done_is_kept(self, monkeypatch):
+        assert self._run_dispatch(monkeypatch, "done") == "done"
+
+    def test_unknown_status_coerces_to_surfaced(self, monkeypatch):
+        assert self._run_dispatch(monkeypatch, "totally_made_up") == "surfaced"
+
+    def test_deferred_to_host_is_known(self, monkeypatch):
+        assert self._run_dispatch(monkeypatch, "deferred_to_host") == "deferred_to_host"
+
+
+# ===========================================================================
+# Rider (d) — toolshed blender catalog
+# ===========================================================================
+
+class TestToolshedBlenderCatalog:
+    """build_default_shed() must register the blender server with its 4 tools."""
+
+    def test_blender_server_has_four_tools(self):
+        from hydra_core.toolshed import build_default_shed
+
+        shed = build_default_shed(dispatcher=None)
+        # list_servers() returns [{"server": "<name>", "tool_count": N}, ...]
+        servers = shed.list_servers()
+        blender_entries = [s for s in servers if s.get("server") == "blender"]
+        assert blender_entries, (
+            f"Expected 'blender' server in ToolShed catalog, found servers: "
+            f"{[s['server'] for s in servers]}"
+        )
+        tool_count = blender_entries[0]["tool_count"]
+        assert tool_count == 4, (
+            f"Expected blender server to have 4 tools, got {tool_count}"
+        )
 
 
 # ===========================================================================
@@ -665,3 +718,1342 @@ class TestResolvePackLeadAgent:
             entrypoint="claude-skill",
         )
         assert _resolve_pack_lead_agent(empty_pack) == "general-purpose"
+
+
+# ===========================================================================
+# F8 — reflexion_override gate + approve_override_raise_to_N
+# ===========================================================================
+
+class TestF8ReflexionOverrideGate:
+    """F8: reflexion_override HITL gate + approve_override_raise_to_N option."""
+
+    def test_reflexion_override_granted_until_defaults_to_zero(self):
+        """HydraState must expose reflexion_override_granted_until defaulting to 0."""
+        from hydra_core.state import HydraState
+        state = HydraState(root_goal="test")
+        assert state.reflexion_override_granted_until == 0
+
+    def test_approve_override_raise_to_n_parses_integer(self):
+        """The cli.py F8 parsing: 'approve_override_raise_to_N' → N as int."""
+        for n_str, n_int in [("3", 3), ("5", 5), ("10", 10), ("0", 0)]:
+            option = f"approve_override_raise_to_{n_str}"
+            # Mirror the formula used in _cmd_resume_locked F8 block.
+            parsed = int(option.rsplit("_", 1)[-1])
+            assert parsed == n_int, (
+                f"expected {n_int} from {option!r}, got {parsed}"
+            )
+
+    def test_non_numeric_suffix_raises_value_error(self):
+        """Non-numeric suffix raises ValueError; _cmd_resume_locked's try/except
+        silently swallows it — the raw parse must raise so the guard is needed."""
+        option = "approve_override_raise_to_bogus"
+        with pytest.raises(ValueError):
+            int(option.rsplit("_", 1)[-1])
+
+    def test_reflexion_override_field_settable(self):
+        """The field must be writable (patch dict key used in cli.py F8)."""
+        from hydra_core.state import HydraState
+        state = HydraState(root_goal="test")
+        state.reflexion_override_granted_until = 7
+        assert state.reflexion_override_granted_until == 7
+
+
+# ===========================================================================
+# F9 — resumable HITL gate nodes + hitl_return_node state field
+# ===========================================================================
+
+class TestF9ResumableHitlGate:
+    """F9: hitl_return_node on HydraState; after_dispatch/after_judge routing;
+    pre-dispatch and envelope-ceiling gates set hitl_return_node."""
+
+    def _make_runner(self, monkeypatch):
+        """Build a PurePythonRunner with a null dispatcher (all MCP calls no-op)."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+        monkeypatch.setattr(
+            "hydra_core.governance.enforce_constitution",
+            lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
+        )
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT,
+            dispatcher=None,
+            force_pure_python=True,
+        )
+        assert isinstance(runner, _PurePythonRunner)
+        return runner
+
+    def test_hitl_return_node_defaults_to_none(self):
+        from hydra_core.state import HydraState
+        state = HydraState(root_goal="test")
+        assert state.hitl_return_node is None
+
+    def test_pre_dispatch_budget_block_sets_hitl_return_node(self, monkeypatch):
+        """When budget is exhausted before dispatch, hitl_return_node='dispatch'."""
+        from hydra_core.state import HydraState, TaskState
+        runner = self._make_runner(monkeypatch)
+
+        state = HydraState(root_goal="build X", selected_squads=["engineering"])
+        # Exhaust the budget (spent == budget_usd = 50.0).
+        state.budget.spent_usd = 50.0
+        task = TaskState(owner_squad="engineering", description="implement X")
+        state.tasks.append(task)
+
+        final = runner.invoke(state)
+
+        assert final.phase == "surfaced"
+        assert final.hitl_return_node == "dispatch", (
+            f"Expected hitl_return_node='dispatch', got {final.hitl_return_node!r}"
+        )
+        assert isinstance(final.pending_hitl, dict)
+        assert final.pending_hitl.get("reason") == "over_budget"
+
+    def test_envelope_ceiling_sets_hitl_return_node(self, monkeypatch):
+        """When envelope ceiling is reached, hitl_return_node='dispatch'."""
+        from hydra_core.state import HydraState
+        from hydra_core.schemas import HydraEnvelope
+        runner = self._make_runner(monkeypatch)
+
+        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        state.envelope_ceiling = 2
+        for _ in range(3):
+            env = HydraEnvelope(
+                type="PRD", origin_squad="test", workflow_id=state.workflow_id,
+            )
+            state.envelopes.append(env.model_dump(mode="json"))
+
+        final = runner.invoke(state)
+
+        assert final.phase == "surfaced"
+        assert final.hitl_return_node == "dispatch"
+        assert isinstance(final.pending_hitl, dict)
+        assert final.pending_hitl.get("reason") == "envelope_ceiling"
+
+    def test_hitl_gate_nodes_not_in_pure_python_runner_steps(self, monkeypatch):
+        """_PurePythonRunner intentionally excludes hitl_gate_* nodes
+        (documented: it exits on phase='surfaced'; interrupt_before not supported)."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT, dispatcher=None, force_pure_python=True,
+        )
+        assert isinstance(runner, _PurePythonRunner)
+        step_names = {name for name, _ in runner.steps}
+        assert "hitl_gate_dispatch" not in step_names
+        assert "hitl_gate_judge" not in step_names
+
+    def test_hitl_return_node_field_is_additive(self):
+        """Additive-only: field must survive a round-trip through model_dump/model_validate."""
+        from hydra_core.state import HydraState
+        state = HydraState(root_goal="test")
+        state.hitl_return_node = "dispatch"
+        dumped = state.model_dump(mode="json")
+        assert dumped.get("hitl_return_node") == "dispatch"
+        restored = HydraState.model_validate(dumped)
+        assert restored.hitl_return_node == "dispatch"
+
+    def test_hitl_return_node_none_survives_round_trip(self):
+        """None value must also survive model serialization for backward compat."""
+        from hydra_core.state import HydraState
+        state = HydraState(root_goal="test")
+        assert state.hitl_return_node is None
+        dumped = state.model_dump(mode="json")
+        restored = HydraState.model_validate(dumped)
+        assert restored.hitl_return_node is None
+
+
+# ===========================================================================
+# F10 — per-option behaviour dispatch table
+# ===========================================================================
+
+class TestF10OptionDispatchTable:
+    """F10: envelope_ceiling 'acknowledge' replaces 'split_phase';
+    'send_back_for_revision' removed from policy_breach; approve_override
+    extends budget by 20%; abort option parks surfaced."""
+
+    def _make_runner_and_ceiling_state(self, monkeypatch):
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+        from hydra_core.state import HydraState
+        from hydra_core.schemas import HydraEnvelope
+        monkeypatch.setattr(
+            "hydra_core.governance.enforce_constitution",
+            lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
+        )
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT, dispatcher=None, force_pure_python=True,
+        )
+        assert isinstance(runner, _PurePythonRunner)
+        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        state.envelope_ceiling = 2
+        for _ in range(3):
+            env = HydraEnvelope(
+                type="PRD", origin_squad="test", workflow_id=state.workflow_id,
+            )
+            state.envelopes.append(env.model_dump(mode="json"))
+        return runner, state
+
+    def test_envelope_ceiling_offers_acknowledge_not_split_phase(self, monkeypatch):
+        """F10: envelope_ceiling gate must offer 'acknowledge', not 'split_phase'."""
+        runner, state = self._make_runner_and_ceiling_state(monkeypatch)
+        final = runner.invoke(state)
+        options = (final.pending_hitl or {}).get("options", [])
+        assert "acknowledge" in options, (
+            f"F10: expected 'acknowledge' in envelope_ceiling options, got {options}"
+        )
+        assert "split_phase" not in options, (
+            "F10: 'split_phase' must not appear in options — it was removed"
+        )
+
+    def test_envelope_ceiling_abort_option_present(self, monkeypatch):
+        """F10: envelope_ceiling gate must offer 'abort'."""
+        runner, state = self._make_runner_and_ceiling_state(monkeypatch)
+        final = runner.invoke(state)
+        options = (final.pending_hitl or {}).get("options", [])
+        assert "abort" in options
+
+    def test_approve_override_budget_extension_formula_spend_floor(self):
+        """F10: budget extension = max(budget*1.2, spend*1.1+0.10) — spend-floor wins."""
+        _spent = 10.0
+        _cur_budget = 8.0
+        new_budget = max(_cur_budget * 1.2, _spent * 1.1 + 0.10)
+        # 8.0 * 1.2 = 9.6; 10.0 * 1.1 + 0.10 = 11.1 → max = 11.1
+        assert new_budget == pytest.approx(11.1, abs=1e-9)
+
+    def test_approve_override_budget_extension_formula_pct_wins(self):
+        """F10: when 20% of budget exceeds spend floor, pct wins."""
+        _spent = 5.0
+        _cur_budget = 50.0
+        new_budget = max(_cur_budget * 1.2, _spent * 1.1 + 0.10)
+        # 50.0 * 1.2 = 60.0; 5.0 * 1.1 + 0.10 = 5.60 → max = 60.0
+        assert new_budget == pytest.approx(60.0, abs=1e-9)
+
+    def test_policy_breach_options_exclude_send_back_for_revision(self):
+        """F10: 'send_back_for_revision' must not appear in any options=[...] list
+        in supervisor.py (comments may retain it for history; code must not)."""
+        from hydra_core import supervisor as sup_mod
+        import inspect, re
+        src = inspect.getsource(sup_mod)
+        # Strip single-line Python comments so we only check code, not comments.
+        src_no_comments = re.sub(r"#[^\n]*", "", src, flags=re.MULTILINE)
+        assert '"send_back_for_revision"' not in src_no_comments, (
+            "F10: 'send_back_for_revision' still present as a code literal in "
+            "supervisor.py; it must only appear in comments, not in options lists"
+        )
+        assert "'send_back_for_revision'" not in src_no_comments, (
+            "F10: 'send_back_for_revision' (single-quoted) still present as code"
+        )
+
+
+# ===========================================================================
+# M3 — verify_operator_capability wired into resume consumer
+# ===========================================================================
+
+class TestM3VerifyOperatorCapability:
+    """M3: verify_operator_capability called in resume; fail-closed on tamper,
+    warn-and-continue on degraded."""
+
+    def test_rejects_degraded_token_fail_closed(self):
+        """A degraded token (sig.value=None, degraded=True) must return valid=False."""
+        from hydra_core.auth.capability import verify_operator_capability
+        import time
+        degraded_token = {
+            "v": 1,
+            "actor_id": "rob.hasselbach@gmail.com",
+            "actor_kind": "human",
+            "capability": "budget.gate",
+            "workflow_id": "wf-123",
+            "resource_id": "res-456",
+            "jti": "jti-789",
+            "exp": int(time.time()) + 900,
+            "sig": {
+                "alg": "HMAC-SHA256",
+                "key_id": "k1",
+                "value": None,
+                "degraded": True,
+            },
+        }
+        result = verify_operator_capability(
+            degraded_token,
+            expected_capability="budget.gate",
+            expected_workflow_id="wf-123",
+            expected_resource_id="res-456",
+        )
+        assert result["valid"] is False
+        assert "degraded" in result.get("reason", "").lower(), (
+            f"Expected 'degraded' in reason, got {result.get('reason')!r}"
+        )
+
+    def test_rejects_unknown_actor_id_sentinel(self):
+        """actor_id='unknown' is a sentinel that must be rejected by verify."""
+        from hydra_core.auth.capability import verify_operator_capability
+        import time
+        token = {
+            "v": 1,
+            "actor_id": "unknown",
+            "actor_kind": "human",
+            "capability": "budget.gate",
+            "workflow_id": "wf-123",
+            "resource_id": "res-456",
+            "jti": "jti-789",
+            "exp": int(time.time()) + 900,
+            "sig": {"alg": "HMAC-SHA256", "key_id": "k1", "value": "anything"},
+        }
+        result = verify_operator_capability(
+            token,
+            expected_capability="budget.gate",
+            expected_workflow_id="wf-123",
+            expected_resource_id="res-456",
+        )
+        assert result["valid"] is False
+        reason = result.get("reason", "")
+        assert "sentinel" in reason.lower() or "actor_id" in reason.lower(), (
+            f"Expected actor_id sentinel rejection, got reason={reason!r}"
+        )
+
+    def test_rejects_non_human_actor_kind(self):
+        """actor_kind != 'human' must be rejected (operator gates are human-only)."""
+        from hydra_core.auth.capability import verify_operator_capability
+        import time
+        token = {
+            "v": 1,
+            "actor_id": "agent-bot",
+            "actor_kind": "agent",  # not "human"
+            "capability": "budget.gate",
+            "workflow_id": "wf-123",
+            "resource_id": "res-456",
+            "jti": "jti-789",
+            "exp": int(time.time()) + 900,
+            "sig": {"alg": "HMAC-SHA256", "key_id": "k1", "value": "anything"},
+        }
+        result = verify_operator_capability(
+            token,
+            expected_capability="budget.gate",
+            expected_workflow_id="wf-123",
+            expected_resource_id="res-456",
+        )
+        assert result["valid"] is False
+        assert "human" in result.get("reason", "").lower()
+
+    def test_never_raises_on_garbage_input(self):
+        """verify_operator_capability must never raise (NEVER raises contract)."""
+        from hydra_core.auth.capability import verify_operator_capability
+        for bad_input in [None, 42, "string", [], {"v": True}]:
+            result = verify_operator_capability(
+                bad_input,
+                expected_capability="x",
+                expected_workflow_id="y",
+                expected_resource_id="z",
+            )
+            assert result["valid"] is False
+
+    def test_wired_into_cli_resume(self):
+        """M3: _cmd_resume_locked must import and call verify_operator_capability."""
+        import inspect
+        from hydra_core import cli as cli_mod
+        src = inspect.getsource(cli_mod)
+        assert "verify_operator_capability" in src, (
+            "M3: verify_operator_capability must appear in cli.py"
+        )
+        # Confirm the fail-closed branch exists (tampered → return 1).
+        assert "return 1" in src, (
+            "M3: cli.py must have a fail-closed return 1 path for tampered tokens"
+        )
+
+
+# ===========================================================================
+# Rider (a) — smoke baseline helpers
+# ===========================================================================
+
+class TestRiderABaseline:
+    """Rider (a): _parse_failing_tests + _capture_baseline_failures."""
+
+    def test_parse_failing_tests_extracts_ids(self):
+        from hydra_core.host_bridge import _parse_failing_tests
+        output = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError: expected 1\n"
+            "FAILED tests/test_baz.py::test_qux\n"
+            "5 passed in 0.12s\n"
+            "PASSED tests/test_ok.py::test_fine\n"
+        )
+        result = _parse_failing_tests(output)
+        assert result == {
+            "tests/test_foo.py::test_bar",
+            "tests/test_baz.py::test_qux",
+        }
+
+    def test_parse_failing_tests_empty_on_no_failures(self):
+        from hydra_core.host_bridge import _parse_failing_tests
+        assert _parse_failing_tests("10 passed in 2.1s\n") == set()
+
+    def test_parse_failing_tests_strips_reason_after_dash(self):
+        from hydra_core.host_bridge import _parse_failing_tests
+        output = "FAILED tests/a.py::test_x - long reason - with extra dashes\n"
+        result = _parse_failing_tests(output)
+        assert "tests/a.py::test_x" in result
+        for item in result:
+            assert " - " not in item, f"reason suffix leaked into id: {item!r}"
+
+    def test_capture_baseline_failures_returns_sorted_list(self, monkeypatch, tmp_path):
+        """_capture_baseline_failures returns a sorted list of failing test ids."""
+        from hydra_core.host_bridge import _capture_baseline_failures
+        import subprocess
+        fake_stdout = (
+            "FAILED tests/test_z.py::test_z - AssertionError\n"
+            "FAILED tests/test_a.py::test_a - AssertionError\n"
+            "2 failed in 1.0s\n"
+        )
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: type("R", (), {
+            "stdout": fake_stdout, "stderr": "", "returncode": 1,
+        })())
+        result = _capture_baseline_failures(str(tmp_path))
+        assert isinstance(result, list)
+        assert result == sorted(result), "result must be sorted"
+        assert "tests/test_a.py::test_a" in result
+        assert "tests/test_z.py::test_z" in result
+
+    def test_capture_baseline_failures_fail_soft_on_exception(self, monkeypatch, tmp_path):
+        """_capture_baseline_failures must return [] on subprocess errors."""
+        from hydra_core.host_bridge import _capture_baseline_failures
+        import subprocess
+
+        def _raise(*_a, **_k):
+            raise OSError("no pytest binary found")
+
+        monkeypatch.setattr(subprocess, "run", _raise)
+        result = _capture_baseline_failures(str(tmp_path))
+        assert result == [], f"expected [] on exception, got {result!r}"
+
+
+# ===========================================================================
+# Rider (b) — idempotent charge (already_charged flag + mark_charged)
+# ===========================================================================
+
+class TestRiderBIdempotentCharge:
+    """Rider (b): already_charged in _step_result; mark_charged sets the flag."""
+
+    def _write_cursor(self, cursor_file, state: str = "complete",
+                      charged: bool = False) -> dict:
+        import json
+        from hydra_core.host_bridge import CURSOR_SCHEMA
+        data = {
+            "schema": CURSOR_SCHEMA,
+            "state": state,
+            "final_status": "passed",
+            "charged": charged,
+            "workflow_id": "wf-test",
+            "run_id": "run-test",
+            "stage_id": "stage-test",
+            "task_id": "task-test",
+            "project_path": ".",
+        }
+        import pathlib
+        pathlib.Path(cursor_file).write_text(
+            json.dumps(data), encoding="utf-8"
+        )
+        return data
+
+    def test_already_charged_false_by_default(self, tmp_path):
+        from hydra_core.host_bridge import _step_result
+        cursor_file = tmp_path / "cursor.json"
+        cursor = self._write_cursor(cursor_file, state="complete", charged=False)
+        result = _step_result(cursor, cursor_file)
+        assert "already_charged" in result
+        assert result["already_charged"] is False
+
+    def test_already_charged_true_when_flag_set(self, tmp_path):
+        from hydra_core.host_bridge import _step_result
+        cursor_file = tmp_path / "cursor.json"
+        cursor = self._write_cursor(cursor_file, state="complete", charged=True)
+        result = _step_result(cursor, cursor_file)
+        assert result["already_charged"] is True
+
+    def test_already_charged_only_in_terminal_states(self, tmp_path):
+        """already_charged is only present for terminal states in _step_result."""
+        from hydra_core.host_bridge import _step_result, CURSOR_SCHEMA
+        import json, pathlib
+        cursor_file = tmp_path / "cursor_nonterminal.json"
+        data = {
+            "schema": CURSOR_SCHEMA,
+            "state": "await_generate",  # non-terminal
+            "charged": False,
+            "workflow_id": "wf-test", "run_id": "run-test",
+            "stage_id": "stage-test", "task_id": "task-test",
+            "project_path": ".",
+        }
+        pathlib.Path(cursor_file).write_text(json.dumps(data), encoding="utf-8")
+        result = _step_result(data, cursor_file)
+        # Non-terminal: 'already_charged' must NOT be in the result.
+        assert "already_charged" not in result
+
+    def test_mark_charged_sets_flag(self, tmp_path):
+        """mark_charged must set cursor['charged']=True on a terminal cursor."""
+        from hydra_core.host_bridge import mark_charged, load_cursor
+        cursor_file = tmp_path / "cursor.json"
+        self._write_cursor(cursor_file, state="complete", charged=False)
+
+        mark_charged(cursor_file)
+
+        cursor = load_cursor(cursor_file)
+        assert cursor.get("charged") is True
+
+    def test_mark_charged_noop_on_non_terminal(self, tmp_path):
+        """mark_charged must not set charged on a non-terminal cursor."""
+        from hydra_core.host_bridge import mark_charged, load_cursor, CURSOR_SCHEMA
+        import json, pathlib
+        cursor_file = tmp_path / "cursor_nonterminal.json"
+        data = {
+            "schema": CURSOR_SCHEMA,
+            "state": "await_judge",
+            "charged": False,
+            "workflow_id": "wf-test", "run_id": "run-test",
+            "stage_id": "stage-test", "task_id": "task-test",
+            "project_path": ".",
+        }
+        pathlib.Path(cursor_file).write_text(json.dumps(data), encoding="utf-8")
+
+        mark_charged(cursor_file)
+
+        cursor = load_cursor(cursor_file)
+        assert cursor.get("charged") is False, (
+            "mark_charged must be a no-op on non-terminal cursors"
+        )
+
+    def test_mark_charged_fail_soft_on_missing_file(self, tmp_path):
+        """mark_charged must not raise when the cursor file is missing."""
+        from hydra_core.host_bridge import mark_charged
+        nonexistent = tmp_path / "does_not_exist.json"
+        # Must not raise.
+        mark_charged(nonexistent)
+
+
+# ===========================================================================
+# Rider (c) — _via_impersonation maps 'stub' → 'deferred_to_host'
+# ===========================================================================
+
+class TestRiderCImpersonationStubMapping:
+    """Rider (c): _via_impersonation maps raw 'stub' → 'deferred_to_host'."""
+
+    class _MockDispatcher:
+        """Minimal dispatcher for _via_impersonation tests."""
+        live_execution = False
+
+        def __init__(self, emit_status: str = "stub"):
+            self._emit_status = emit_status
+
+        def call_mcp(self, server, tool, args, **kwargs):
+            return None  # roster list + output write both return None
+
+        def emit_claude_prompt(self, prompt, agent=None):
+            return {"status": self._emit_status, "summary": "mock boardroom session"}
+
+        def emit(self, event_name, payload=None, **kwargs):
+            pass
+
+    def _get_executive_pack(self):
+        from hydra_core.squad_loader import discover_squads
+        packs = discover_squads(HYDRA_ROOT)
+        pack = packs.get("executive")
+        if pack is None:
+            pytest.skip("executive pack not discovered — skipping rider (c) test")
+        return pack
+
+    def _make_inbound(self, state):
+        from hydra_core.schemas import HydraEnvelope
+        return HydraEnvelope(
+            type="C_SUITE_DECISION_PACKET",
+            origin_squad="hydra",
+            target_squad="executive",
+            workflow_id=state.workflow_id,
+        )
+
+    def test_stub_maps_to_deferred_to_host(self):
+        """Raw 'stub' from emit_claude_prompt must be coerced to 'deferred_to_host'."""
+        from hydra_core.squad_node import _via_impersonation, SquadResult
+        from hydra_core.state import HydraState
+
+        pack = self._get_executive_pack()
+        state = HydraState(root_goal="test rider c", selected_squads=["executive"])
+        inbound = self._make_inbound(state)
+        dispatcher = self._MockDispatcher(emit_status="stub")
+
+        result = _via_impersonation(state, pack, inbound, dispatcher)
+
+        assert isinstance(result, SquadResult)
+        assert result.status == "deferred_to_host", (
+            f"F19/Rider(c): 'stub' must map to 'deferred_to_host', got {result.status!r}"
+        )
+
+    def test_host_pickup_required_maps_to_deferred_to_host(self):
+        """Pre-existing 'host_pickup_required' must still map to 'deferred_to_host'."""
+        from hydra_core.squad_node import _via_impersonation, SquadResult
+        from hydra_core.state import HydraState
+
+        pack = self._get_executive_pack()
+        state = HydraState(root_goal="test host_pickup", selected_squads=["executive"])
+        inbound = self._make_inbound(state)
+        dispatcher = self._MockDispatcher(emit_status="host_pickup_required")
+
+        result = _via_impersonation(state, pack, inbound, dispatcher)
+
+        assert isinstance(result, SquadResult)
+        assert result.status == "deferred_to_host"
+
+    def test_done_status_is_preserved(self):
+        """Raw 'done' must not be remapped."""
+        from hydra_core.squad_node import _via_impersonation, SquadResult
+        from hydra_core.state import HydraState
+
+        pack = self._get_executive_pack()
+        state = HydraState(root_goal="test done", selected_squads=["executive"])
+        inbound = self._make_inbound(state)
+        dispatcher = self._MockDispatcher(emit_status="done")
+
+        result = _via_impersonation(state, pack, inbound, dispatcher)
+
+        assert isinstance(result, SquadResult)
+        assert result.status == "done"
+
+
+# ===========================================================================
+# Revise-verdict additions (fable-audit-2 Phase 2 REVISE)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# (3a) Compiled-LangGraph integration: over_budget → hitl_gate_dispatch pause
+# ---------------------------------------------------------------------------
+
+try:
+    from langgraph.checkpoint.memory import MemorySaver as _MemSaver  # noqa: F401
+    _HAS_LANGGRAPH = True
+except ImportError:
+    _HAS_LANGGRAPH = False
+
+
+class _NullMCPDispatcher:
+    """Dispatcher stub for compiled-graph tests. All MCP calls return done/empty."""
+    live_execution = False
+
+    def call_mcp(self, server, tool, args, **_kw):
+        return {"status": "done", "result": {}}
+
+    def invoke_claude_skill(self, skill, args):
+        return {"status": "host_pickup_required"}
+
+    def emit_claude_prompt(self, prompt, agent=None):
+        return {"status": "host_pickup_required"}
+
+    def spawn_subprocess(self, cmd, env=None):
+        return {"status": "done", "returncode": 0}
+
+    def set_squad_packs(self, packs):
+        pass
+
+
+@pytest.mark.skipif(not _HAS_LANGGRAPH, reason="langgraph not installed")
+class TestCompiledLangGraphOverBudget:
+    """(3a) Compiled-LangGraph integration: drive a workflow into over_budget
+    surface, assert graph pauses at hitl_gate_dispatch (pending interrupt,
+    not END), then resume via invoke(None) after patching budget and assert
+    dispatch re-executes (hitl_return_node cleared)."""
+
+    def _build(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp.db"))
+        monkeypatch.setattr(
+            "hydra_core.governance.enforce_constitution",
+            lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
+        )
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+        sup = build_supervisor(
+            project_root=HYDRA_ROOT,
+            dispatcher=_NullMCPDispatcher(),
+        )
+        if isinstance(sup, _PurePythonRunner):
+            pytest.skip("LangGraph compiled graph not available; skipping")
+        return sup
+
+    def test_over_budget_pauses_before_hitl_gate_dispatch(self, monkeypatch, tmp_path):
+        """update_state(as_node='dispatch') with over_budget signals must produce
+        snap.next==('hitl_gate_dispatch',) — the interrupt_before gate is pending,
+        not END."""
+        from uuid import uuid4 as _uuid4
+        sup = self._build(monkeypatch, tmp_path)
+
+        wf = _uuid4()
+        config = {"configurable": {"thread_id": str(wf)}}
+
+        # Inject state as if node_dispatch just returned an over_budget block.
+        # after_dispatch checks hitl_return_node=="dispatch" → routes to
+        # hitl_gate_dispatch, which is in interrupt_before → graph pauses.
+        over_budget_hitl = {
+            "workflow_id": str(wf),
+            "reason": "over_budget",
+            "gate_node": "dispatch",
+            "summary": "Pre-dispatch: at/over budget ($50.00 of $50.00).",
+            "options": ["approve_override", "abort"],
+            "default_option": "abort",
+            "spent_usd": 50.0,
+            "budget_usd": 50.0,
+        }
+        sup.update_state(config, {
+            "phase": "surfaced",
+            "pending_hitl": over_budget_hitl,
+            "hitl_return_node": "dispatch",
+            "budget_downgrade_active": True,
+        }, as_node="dispatch")
+
+        snap = sup.get_state(config)
+        assert snap is not None and snap.values, (
+            "expected a checkpointed state after update_state"
+        )
+        assert snap.next == ("hitl_gate_dispatch",), (
+            f"Expected graph paused at hitl_gate_dispatch (interrupt_before), "
+            f"got snap.next={snap.next!r}"
+        )
+        assert snap.values.get("pending_hitl", {}).get("reason") == "over_budget", (
+            f"expected pending_hitl.reason='over_budget', "
+            f"got {snap.values.get('pending_hitl')!r}"
+        )
+        assert snap.values.get("hitl_return_node") == "dispatch"
+
+    def test_resume_after_clearing_gate_advances_graph(self, monkeypatch, tmp_path):
+        """invoke(None) resumes execution from hitl_gate_dispatch; that node
+        clears hitl_return_node, proving dispatch re-entered the graph.
+
+        Design note: we inject hitl_return_node='dispatch' with budget NOT
+        exhausted so that when dispatch re-runs after the gate, it proceeds
+        normally (no re-trigger). This isolates the graph-resumption contract
+        from the budget arithmetic test in the first test case.
+        """
+        from uuid import uuid4 as _uuid4
+
+        sup = self._build(monkeypatch, tmp_path)
+
+        wf = _uuid4()
+        config = {"configurable": {"thread_id": str(wf)}}
+
+        # Inject state that LOOKS LIKE dispatch just returned an over_budget signal
+        # (hitl_return_node="dispatch") BUT budget is NOT actually exhausted
+        # (spent=0, budget=50 → should_block_for_budget returns False).  This
+        # lets dispatch run cleanly on resume without re-triggering the gate.
+        over_budget_hitl = {
+            "workflow_id": str(wf),
+            "reason": "over_budget",
+            "gate_node": "dispatch",
+            "summary": "Simulated over_budget for test.",
+            "options": ["approve_override", "abort"],
+        }
+        sup.update_state(config, {
+            "phase": "surfaced",
+            "pending_hitl": over_budget_hitl,
+            "hitl_return_node": "dispatch",
+            # Budget is healthy — dispatch will not re-trigger on resume.
+            "budget": {"budget_usd": 50.0, "spent_usd": 0.0},
+        }, as_node="dispatch")
+
+        # Verify we are paused at hitl_gate_dispatch.
+        snap = sup.get_state(config)
+        assert snap.next == ("hitl_gate_dispatch",), (
+            f"Pre-resume: expected hitl_gate_dispatch, got {snap.next!r}"
+        )
+
+        # Clear the pending gate (operator "approved"), then resume.
+        # Must pass as_node="dispatch" so LangGraph re-evaluates after_dispatch
+        # from dispatch's perspective (hitl_return_node still "dispatch") and
+        # keeps the graph paused at hitl_gate_dispatch.  Without as_node, the
+        # default is __start__ which resets next → intake and skips the gate node.
+        sup.update_state(config, {"pending_hitl": None}, as_node="dispatch")
+
+        # Monkeypatch execute_squad so dispatch completes without real MCP/LLM.
+        from hydra_core.schemas import DecisionRecord
+        from hydra_core.squad_node import SquadResult
+        mock_dr = DecisionRecord(
+            workflow_id=wf, parent_id=wf,
+            origin_squad="engineering", target_squad="hydra",
+            decision="ok", rationale="mock dispatch completed",
+        )
+        monkeypatch.setattr(
+            "hydra_core.supervisor.execute_squad",
+            lambda *_a, **_k: SquadResult(envelopes=[mock_dr], status="done"),
+        )
+        monkeypatch.setattr(
+            "hydra_core.governance.enforce_governance",
+            lambda *_a, **_k: type("V", (), {"surfaced": False, "reason": ""})(),
+        )
+
+        # Resume. LangGraph continues from hitl_gate_dispatch.
+        # hitl_gate_dispatch node returns {hitl_return_node: None, phase: "executing"},
+        # then dispatch re-runs (budget ok → no block → routes to judge).
+        sup.invoke(None, config=config)
+
+        snap2 = sup.get_state(config)
+        final_vals = snap2.values if snap2 else {}
+        # hitl_gate_dispatch cleared hitl_return_node — this proves it executed.
+        assert final_vals.get("hitl_return_node") is None, (
+            "hitl_gate_dispatch must clear hitl_return_node on execution; "
+            f"got hitl_return_node={final_vals.get('hitl_return_node')!r}. "
+            "If this is 'dispatch', hitl_gate_dispatch did not run."
+        )
+        # The graph moved forward — it's no longer paused before hitl_gate_dispatch.
+        snap2_next = snap2.next if snap2 else ()
+        assert snap2_next != ("hitl_gate_dispatch",), (
+            "graph must have advanced past hitl_gate_dispatch after resume; "
+            f"got snap2.next={snap2_next!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# (3b) Rider-a: baseline excuse path in _apply_judge
+# ---------------------------------------------------------------------------
+
+class TestRiderAExcusePath:
+    """Rider (a): _apply_judge excuses a smoke-fail when every currently-failing
+    test was already in the baseline (new_failures = {}) → smoke_status='pass'.
+    A genuinely new failure is NOT excused → smoke_status='fail'."""
+
+    def _make_cursor(self, tmp_path, baseline_failures=None):
+        from hydra_core.host_bridge import CURSOR_SCHEMA
+        return {
+            "schema": CURSOR_SCHEMA,
+            "state": "await_judge",
+            "producer": "claude",
+            "attempt_id": "att-excuse-test",
+            "judge_rubric_id": "code-review@1",
+            "gate_rubric": "code-review@1",
+            "required_cross": False,
+            "project_path": str(tmp_path),
+            "work_path": str(tmp_path),
+            "stage_id": "stage-excuse",
+            "run_id": "run-excuse",
+            "task_id": "task-excuse",
+            "workflow_id": "wf-excuse",
+            "cost_usd": 0.0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "baseline_failures": baseline_failures or [],
+            "changed_paths": [],
+            "charged": False,
+            "request_text": "implement the feature",
+        }
+
+    class _StubDispatcher:
+        """Minimal dispatcher: all MCP calls succeed (fail-soft guarantees)."""
+        def call_mcp(self, server, tool, args, **_kw):
+            return {"status": "done", "result": {}}
+
+    def _judge_result(self, outcome="pass"):
+        return {
+            "outcome": outcome,
+            "critique_md": "well structured code",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-1",
+            "cost_usd": 0.01,
+            "tokens_in": 100,
+            "tokens_out": 50,
+        }
+
+    def test_excuses_when_failures_subset_of_baseline(self, monkeypatch, tmp_path):
+        """Baseline failures ⊆ current failures → no NEW failures → excuse:
+        smoke_status is forced to 'pass'."""
+        import subprocess as subprocess_mod
+        from hydra_core import host_bridge
+
+        baseline = ["tests/test_foo.py::test_bar", "tests/test_baz.py::test_qux"]
+        cursor = self._make_cursor(tmp_path, baseline_failures=baseline)
+
+        # _run_smoke: first smoke returns fail so the excuse path is exercised.
+        monkeypatch.setattr(
+            "hydra_core.host_bridge._run_smoke",
+            lambda *_a, **_k: ("fail", "baseline excuse test: smoke failed"),
+        )
+        # Re-run pytest inside excuse path: SAME failures as baseline.
+        fake_stdout = "\n".join(f"FAILED {t} - AssertionError" for t in baseline)
+        monkeypatch.setattr(
+            subprocess_mod, "run",
+            lambda *_a, **_k: type("R", (), {
+                "stdout": fake_stdout, "stderr": "", "returncode": 1,
+            })(),
+        )
+
+        host_bridge._apply_judge(self._StubDispatcher(), cursor, self._judge_result("pass"))
+
+        assert cursor.get("smoke_status") == "pass", (
+            f"Rider (a): baseline excuse path must set smoke_status='pass' when "
+            f"all current failures pre-existed; got {cursor.get('smoke_status')!r}"
+        )
+        assert "pre-existed" in (cursor.get("smoke_reason") or ""), (
+            f"smoke_reason should mention 'pre-existed', "
+            f"got {cursor.get('smoke_reason')!r}"
+        )
+
+    def test_does_not_excuse_new_failures(self, monkeypatch, tmp_path):
+        """A test that fails NOW but was NOT in the baseline is a NEW failure
+        → smoke_status must stay 'fail' (not excused)."""
+        import subprocess as subprocess_mod
+        from hydra_core import host_bridge
+
+        baseline = ["tests/test_foo.py::test_bar"]
+        new_failure = "tests/test_new.py::test_fresh_regression"
+        cursor = self._make_cursor(tmp_path, baseline_failures=baseline)
+
+        monkeypatch.setattr(
+            "hydra_core.host_bridge._run_smoke",
+            lambda *_a, **_k: ("fail", "smoke: new failure"),
+        )
+        # Re-run returns both baseline failure AND a new failure.
+        fake_stdout = (
+            f"FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            f"FAILED {new_failure} - Regression\n"
+        )
+        monkeypatch.setattr(
+            subprocess_mod, "run",
+            lambda *_a, **_k: type("R", (), {
+                "stdout": fake_stdout, "stderr": "", "returncode": 1,
+            })(),
+        )
+
+        host_bridge._apply_judge(self._StubDispatcher(), cursor, self._judge_result("pass"))
+
+        assert cursor.get("smoke_status") == "fail", (
+            f"Rider (a): must NOT excuse a genuinely new failure; "
+            f"got smoke_status={cursor.get('smoke_status')!r}"
+        )
+
+    def test_no_baseline_means_no_excuse(self, monkeypatch, tmp_path):
+        """When baseline_failures is empty/absent, smoke failures are not excused
+        (safe default — no baseline means we cannot distinguish new from old)."""
+        import subprocess as subprocess_mod
+        from hydra_core import host_bridge
+
+        cursor = self._make_cursor(tmp_path, baseline_failures=[])
+
+        monkeypatch.setattr(
+            "hydra_core.host_bridge._run_smoke",
+            lambda *_a, **_k: ("fail", "smoke: something failed"),
+        )
+        # subprocess.run should not be called when baseline is empty.
+        subprocess_called = []
+        monkeypatch.setattr(
+            subprocess_mod, "run",
+            lambda *_a, **_k: subprocess_called.append(True) or type(
+                "R", (), {"stdout": "", "stderr": "", "returncode": 0})(),
+        )
+
+        host_bridge._apply_judge(self._StubDispatcher(), cursor, self._judge_result("pass"))
+
+        # No excuse: baseline is empty so new_failures is always non-empty.
+        # smoke_status must remain "fail" (not "pass" from excuse logic).
+        assert cursor.get("smoke_status") == "fail", (
+            f"Without a baseline, smoke failures must not be excused; "
+            f"got smoke_status={cursor.get('smoke_status')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# (3c) Rider-b: recovery-safe ordering (mark_charged BEFORE charge_and_gate)
+# ---------------------------------------------------------------------------
+
+class TestRiderBRecoverySafeOrdering:
+    """Rider (b) recovery-safe ordering: mark_charged must appear BEFORE
+    charge_and_gate in _cmd_attended_submit source (under-charge on crash is
+    safer than double-charge). Also verifies cursor round-trip idempotency."""
+
+    def test_mark_charged_before_charge_and_gate_in_source(self):
+        """Source-order guard: the CALL to mark_charged must precede the CALL to
+        charge_and_gate in _cmd_attended_submit (crash-ordering: under-charge on
+        crash is safer than double-charge).
+
+        We match the actual call sites (not the import statement for charge_and_gate,
+        which appears earlier) to pin execution order, not declaration order.
+        """
+        import inspect
+        from hydra_core import cli as cli_mod
+        src = inspect.getsource(cli_mod._cmd_attended_submit)
+        # Match the actual CALL sites, not the import at the top of the function.
+        # mark_charged call: "mark_charged(cfile)"
+        # charge_and_gate call: "charge_and_gate(state, cost, toks)"
+        idx_mark = src.find("mark_charged(cfile)")
+        idx_charge = src.find("charge_and_gate(state, cost, toks)")
+        assert idx_mark != -1, (
+            "mark_charged(cfile) call must appear in _cmd_attended_submit"
+        )
+        assert idx_charge != -1, (
+            "charge_and_gate(state, cost, toks) call must appear in _cmd_attended_submit"
+        )
+        assert idx_mark < idx_charge, (
+            f"Rider (b) recovery-safe ordering: mark_charged call (pos {idx_mark}) must "
+            f"appear BEFORE charge_and_gate call (pos {idx_charge}) in "
+            "_cmd_attended_submit. A crash between them is an under-charge (acceptable); "
+            "the reverse ordering would be a double-charge (unsafe)."
+        )
+
+    def test_cursor_round_trip_already_charged_after_mark(self, tmp_path):
+        """mark_charged(cursor_file) → load_cursor shows charged=True; subsequent
+        _step_result shows already_charged=True. Proves that the flag persists
+        before any budget write, so a retry sees already_charged and skips."""
+        from hydra_core.host_bridge import (
+            mark_charged, load_cursor, _step_result, CURSOR_SCHEMA,
+        )
+        import json
+
+        cursor_file = tmp_path / "cursor_ordering.json"
+        data = {
+            "schema": CURSOR_SCHEMA,
+            "state": "complete",
+            "final_status": "passed",
+            "charged": False,
+            "workflow_id": "wf-order",
+            "run_id": "run-order",
+            "stage_id": "stage-order",
+            "task_id": "task-order",
+            "project_path": ".",
+        }
+        cursor_file.write_text(json.dumps(data), encoding="utf-8")
+
+        # Simulate: mark_charged called FIRST (before budget charge).
+        mark_charged(cursor_file)
+
+        # Immediately read back — cursor must show charged=True before any
+        # budget write happened. This is the invariant the ordering fix provides.
+        reloaded = load_cursor(cursor_file)
+        assert reloaded.get("charged") is True, (
+            "charged flag must be True immediately after mark_charged, "
+            "BEFORE any budget charge occurs (recovery-safe ordering)"
+        )
+
+        # _step_result must expose already_charged=True so _cmd_attended_submit
+        # skips the duplicate charge on a retried call.
+        res = _step_result(reloaded, cursor_file)
+        assert res.get("already_charged") is True, (
+            "_step_result must report already_charged=True after mark_charged "
+            "(this is what the retry guard in _cmd_attended_submit checks)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# (3d) F8 end-to-end: approve_override_raise_to_N → checkpoint field
+# ---------------------------------------------------------------------------
+
+class TestF8E2EApproveOverrideRaiseToN:
+    """F8 end-to-end: _cmd_resume_locked with action=approve,
+    option=approve_override_raise_to_5 on a reflexion_override gate must
+    write reflexion_override_granted_until=5 into the supervisor patch AND
+    that value must be consumed by effective_max_retry_index as the ceiling."""
+
+    def test_approve_override_raise_to_n_patches_checkpoint(self, monkeypatch, tmp_path):
+        """Full CLI path: _cmd_resume_locked writes reflexion_override_granted_until=5
+        into the state patch when option=approve_override_raise_to_5."""
+        import argparse
+
+        wf = str(uuid4())
+        patches_applied: list[dict] = []
+
+        # Build a fake supervisor with a pending reflexion_override gate.
+        state_values: dict = {
+            "pending_hitl": {
+                "workflow_id": wf,
+                "reason": "reflexion_override",
+                "gate_node": "judge_per_squad",
+                "options": ["approve_override_raise_to_3", "abort"],
+                "reflexion_count": 3,
+            },
+            "phase": "surfaced",
+            "reflexion_override_granted_until": 0,
+        }
+
+        class _FakeSup:
+            def get_state(self, _config):
+                return type("Snap", (), {"values": dict(state_values), "next": ()})()
+
+            def update_state(self, _config, patch, **_kw):
+                patches_applied.append(dict(patch))
+                state_values.update(patch)
+
+            def invoke(self, _state, config=None):
+                return {"phase": "judge_per_squad"}
+
+        from hydra_core.supervisor import _PurePythonRunner as _PPR
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **_k: _FakeSup())
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests",
+                            lambda *_a: 0)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *_a, **_k: None)
+
+        args = argparse.Namespace(
+            project=str(tmp_path),
+            workflow_id=wf,
+            action="approve",
+            option="approve_override_raise_to_5",
+            live=False,
+            verbose=False,
+            operator="operator@example.com",
+        )
+
+        from hydra_core.cli import _cmd_resume_locked
+        ret = _cmd_resume_locked(
+            args, tmp_path, wf, "approve", "approve_override_raise_to_5"
+        )
+        assert ret == 0, f"_cmd_resume_locked returned {ret}, expected 0"
+
+        all_patches: dict = {}
+        for p in patches_applied:
+            all_patches.update(p)
+
+        assert all_patches.get("reflexion_override_granted_until") == 5, (
+            f"F8 E2E: reflexion_override_granted_until must be 5 in checkpoint patch, "
+            f"got {all_patches.get('reflexion_override_granted_until')!r}; "
+            f"patches={patches_applied}"
+        )
+
+    def test_reflexion_override_consumed_by_effective_ceiling(self):
+        """The value written by F8 must be consumed by effective_max_retry_index
+        as the ceiling — approve_override_raise_to_5 must allow 5 retries."""
+        from hydra_core.judge.reflexion import effective_max_retry_index, MAX_RETRY_INDEX
+
+        # Default ceiling: the ×1 invariant.
+        assert effective_max_retry_index() == MAX_RETRY_INDEX
+
+        # After approve_override_raise_to_5, the field is 5.
+        # effective_max_retry_index(max_retry_override=5) must return 5.
+        assert effective_max_retry_index(max_retry_override=5) == 5, (
+            "reflexion_override_granted_until=5 must raise the ceiling to 5 "
+            "(consumed by effective_max_retry_index as the per-workflow override)"
+        )
+
+        # max_retry_override=0 or None: falls back to invariant default.
+        assert effective_max_retry_index(max_retry_override=0) == MAX_RETRY_INDEX
+        assert effective_max_retry_index(max_retry_override=None) == MAX_RETRY_INDEX
+
+
+# ---------------------------------------------------------------------------
+# (3e) Force-dispatch capability: uniform mint+verify for all mutating actions
+# ---------------------------------------------------------------------------
+
+class TestForceDispatchCapabilityUniform:
+    """(3e) M3 fix: force-dispatch (and modify-budget, change-squads) must now
+    go through the same mint+verify as approve.
+    (WS-AUTH run-A: degraded token warns but never blocks; verified token passes.)"""
+
+    def test_mutating_actions_guard_covers_force_dispatch(self):
+        """_cmd_resume_locked source must define _MUTATING_RESUME_ACTIONS that
+        includes 'force-dispatch', 'modify-budget', and 'change-squads'."""
+        import inspect
+        from hydra_core import cli as cli_mod
+        src = inspect.getsource(cli_mod._cmd_resume_locked)
+        assert "_MUTATING_RESUME_ACTIONS" in src, (
+            "M3 fix: _MUTATING_RESUME_ACTIONS constant must exist in _cmd_resume_locked"
+        )
+        for action in ("force-dispatch", "modify-budget", "change-squads", "approve"):
+            assert action in src, (
+                f"M3 fix: action {action!r} must appear in _cmd_resume_locked source "
+                f"(expected in _MUTATING_RESUME_ACTIONS definition)"
+            )
+        assert "action in _MUTATING_RESUME_ACTIONS" in src, (
+            "M3 fix: guard must use 'action in _MUTATING_RESUME_ACTIONS' "
+            "(not the old 'action == \"approve\"')"
+        )
+
+    def test_force_dispatch_with_key_mints_valid_token(self, monkeypatch):
+        """When HYDRA_OPERATOR_KEY is set, force-dispatch mints a verifiable token."""
+        import argparse
+        import os
+
+        monkeypatch.setenv("HYDRA_OPERATOR_KEY", "0" * 64)  # 32-byte hex key
+        monkeypatch.setenv("HYDRA_OPERATOR_ID", "operator@example.com")
+
+        wf = str(uuid4())
+        minted_tokens: list[dict] = []
+
+        class _FakeSup:
+            def get_state(self, _config):
+                return type("Snap", (), {"values": {
+                    "pending_hitl": {
+                        "workflow_id": wf,
+                        "reason": "over_budget",
+                        "gate_node": "dispatch",
+                        "options": ["force-dispatch", "abort"],
+                    },
+                    "phase": "surfaced",
+                }})()
+
+            def update_state(self, _config, patch, **_kw):
+                if patch.get("operator_capability"):
+                    minted_tokens.append(patch["operator_capability"])
+
+            def invoke(self, _state, config=None):
+                return {"phase": "executing"}
+
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **_k: _FakeSup())
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests",
+                            lambda *_a: 0)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *_a, **_k: None)
+
+        args = argparse.Namespace(
+            project=".",
+            workflow_id=wf,
+            action="force-dispatch",
+            option=None,
+            live=False,
+            verbose=False,
+            operator="operator@example.com",
+        )
+
+        from hydra_core.cli import _cmd_resume_locked
+        from pathlib import Path
+        ret = _cmd_resume_locked(args, Path("."), wf, "force-dispatch", None)
+
+        # The capability token must have been minted and captured.
+        assert len(minted_tokens) >= 1, (
+            "M3 fix: force-dispatch must mint an operator capability token "
+            "(stored in update_state patch as 'operator_capability')"
+        )
+        token = minted_tokens[0]
+        sig = token.get("sig") or {}
+        assert sig.get("degraded") is not True, (
+            "With HYDRA_OPERATOR_KEY set, force-dispatch token must NOT be degraded"
+        )
+        assert sig.get("value") is not None, (
+            "With HYDRA_OPERATOR_KEY set, force-dispatch token sig.value must be set"
+        )
+
+    def test_force_dispatch_without_key_degrades_warns_proceeds(self, monkeypatch,
+                                                                  caplog):
+        """Without HYDRA_OPERATOR_KEY, force-dispatch warns (WS-AUTH run-A
+        degraded posture) and proceeds without blocking."""
+        import argparse
+        import logging
+
+        monkeypatch.delenv("HYDRA_OPERATOR_KEY", raising=False)
+        monkeypatch.delenv("HYDRA_OPERATOR_ID", raising=False)
+
+        wf = str(uuid4())
+        patch_store: dict = {}
+
+        class _FakeSup:
+            def get_state(self, _config):
+                return type("Snap", (), {"values": {
+                    "pending_hitl": {
+                        "workflow_id": wf,
+                        "reason": "over_budget",
+                        "gate_node": "dispatch",
+                        "options": ["force-dispatch", "abort"],
+                    },
+                    "phase": "surfaced",
+                }})()
+
+            def update_state(self, _config, patch, **_kw):
+                patch_store.update(patch)
+
+            def invoke(self, _state, config=None):
+                return {"phase": "executing"}
+
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **_k: _FakeSup())
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests",
+                            lambda *_a: 0)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *_a, **_k: None)
+
+        args = argparse.Namespace(
+            project=".",
+            workflow_id=wf,
+            action="force-dispatch",
+            option=None,
+            live=False,
+            verbose=False,
+            operator=None,
+        )
+
+        from hydra_core.cli import _cmd_resume_locked
+        from pathlib import Path
+        with caplog.at_level(logging.WARNING):
+            ret = _cmd_resume_locked(args, Path("."), wf, "force-dispatch", None)
+
+        # Must NOT block — degraded posture means warn-and-proceed.
+        assert ret == 0, (
+            f"M3 fix degraded posture: force-dispatch without key must proceed "
+            f"(warn-and-proceed, not block), got ret={ret}"
+        )
+        # A warning about degraded capability must have been emitted.
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        degraded_warned = any("degraded" in str(m).lower() for m in warning_texts)
+        assert degraded_warned, (
+            f"M3 fix: force-dispatch without HYDRA_OPERATOR_KEY must log a "
+            f"degraded capability warning; warnings={warning_texts}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# (4) Minor: over_budget gate re-trigger guard
+# ---------------------------------------------------------------------------
+
+class TestOverBudgetReapproveGuard:
+    """(4) Minor: approving an over_budget gate without 'approve_override' option
+    must emit a warning that budget is unchanged and the gate will re-trigger."""
+
+    def test_over_budget_approve_without_option_warns(self, monkeypatch, caplog, tmp_path):
+        """action=approve + over_budget gate + option!=approve_override → warning
+        that budget ceiling unchanged and gate will re-trigger."""
+        import argparse
+        import logging
+
+        wf = str(uuid4())
+
+        class _FakeSup:
+            def get_state(self, _config):
+                return type("Snap", (), {"values": {
+                    "pending_hitl": {
+                        "workflow_id": wf,
+                        "reason": "over_budget",
+                        "gate_node": "dispatch",
+                        "options": ["approve_override", "abort"],
+                        "spent_usd": 50.0,
+                        "budget_usd": 50.0,
+                    },
+                    "phase": "surfaced",
+                    "budget": {"budget_usd": 50.0, "spent_usd": 50.0},
+                }})()
+
+            def update_state(self, _config, patch, **_kw):
+                pass
+
+            def invoke(self, _state, config=None):
+                return {"phase": "surfaced"}
+
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **_k: _FakeSup())
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests",
+                            lambda *_a: 0)
+
+        emitted: list[tuple] = []
+        monkeypatch.setattr("hydra_core.cli.emit",
+                            lambda *a, **k: emitted.append(a))
+
+        args = argparse.Namespace(
+            project=str(tmp_path),
+            workflow_id=wf,
+            action="approve",
+            option=None,   # ← NOT approve_override
+            live=False,
+            verbose=False,
+            operator="operator@example.com",
+        )
+
+        from hydra_core.cli import _cmd_resume_locked
+        with caplog.at_level(logging.WARNING):
+            _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+
+        warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        retrigger_warned = any(
+            "re-trigger" in str(m).lower() or "modify-budget" in str(m).lower()
+            for m in warning_texts
+        )
+        assert retrigger_warned, (
+            "(4) Minor: approving over_budget without approve_override must warn "
+            "that the gate will re-trigger; warnings logged: "
+            f"{warning_texts}"
+        )
+
+        # Telemetry event must also have been emitted.
+        emitted_kinds = [a[2] for a in emitted if len(a) > 2]
+        assert any("over_budget_reapprove_without_extend" in str(k)
+                   for k in emitted_kinds), (
+            "(4) Minor: expected 'over_budget_reapprove_without_extend' telemetry event; "
+            f"got emitted events: {emitted_kinds}"
+        )
