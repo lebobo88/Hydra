@@ -40,22 +40,23 @@ modes a contributor should expect.
         |                    |                    |
 +-------v------+    +--------v-------+   +--------v-------+
 | Squad packs  |    | MCP host       |   | Memory fabric  |
-| (13 today)   |    | per-squad      |   | episodic + vec |
+| (14 today)   |    | per-squad      |   | episodic + vec |
 |              |    | client session |   |                |
 | executive    |    | hydra_memory   |   | ~/.hydra/      |
 | engineering  |    | executive_suite|   |   episodic.db  |
 | garland      |    | rlm_creative   |   |   vectors/     |
 | legal/Curia  |    | hydra_control  |   |   checkpoints  |
 | customer-sup |    | xenia_tickets  |   |                |
+| rlm-gaming   |    | rlm_gaming     |   |                |
 | 5 marketing  |    | hydra_toolshed |   |                |
 | 3 stubs      |    | hydra_gateway  |   |                |
 +--------------+    +----------------+   +----------------+
 ```
 
-Squad census: **13 packs, 10 active** (executive, engineering, garland,
-legal-compliance/Curia, customer-support/Xenia Hearth, and the 5 `marketing-*`
-packs — the latter are filesystem symlinks into the MarketBliss checkout) **and
-3 stubs** (healthcare, sales-gtm, research-ds).
+Squad census: **14 packs, 11 active** (executive, engineering, garland,
+legal-compliance/Curia, customer-support/Xenia Hearth, rlm-gaming/Arcade Crown,
+and the 5 `marketing-*` packs — the latter are filesystem symlinks into the
+MarketBliss checkout) **and 3 stubs** (healthcare, sales-gtm, research-ds).
 
 A Claude Code session loads the plugin. The plugin's hooks initialize the
 registry and start the supervisor on `/hydra:run`. The supervisor compiles
@@ -236,6 +237,17 @@ gateway proxies them — see §6e.
 
 Only the Engineering squad uses MCP as its primary execution path.
 
+**Attended vs detached execution.** Engineering dispatch runs in one of two
+modes, differing only in *where* the pp stage loop runs. In **attended** mode
+(`HYDRA_HOST_DRIVEN=1`, the default) the host session drives the lifecycle
+in-context — `hydra.workflow.plan` → loop `hydra.workflow.step` + spawn `Agent`
+subagents → `hydra.workflow.submit_host_result` — while the Python engine stays
+authoritative (ledger, budget, judge routing, finalize gates). In **detached**
+mode (`HYDRA_HOST_DRIVEN` unset/`0`) `hydra_workflow_launch` detaches
+`hydra run --live` and the stage loop runs headlessly in the background.
+Attended execution is single-stream; fleet/parallel work always takes the
+detached path.
+
 ### 6d. RBAC enforcement
 
 Each squad's `squad.yaml#tools` block declares which tools and MCP
@@ -263,6 +275,13 @@ and re-exposes their tools under namespaced names:
 Hydra's internal dispatcher (`MCPStdioDispatcher`) also reads
 `backends.json` as a fallback, so supervisor/judge/squad_node calls
 still work when backends are absent from `~/.claude.json`.
+
+**Gateway RBAC scope.** Per-squad RBAC binds on the Python dispatcher path —
+`MCPStdioDispatcher._check_tool_rbac` validates every squad-originated call
+against the calling squad's `squad.yaml#tools` allowlist (§6d). Direct operator
+tool calls made through the gateway (e.g. from a Claude Code session) are an
+**intentional flat passthrough**: the gateway proxies and namespaces, it does
+not arbitrate per-squad privilege.
 
 See `docs/MCP_SETUP.md` for migration and setup instructions.
 
@@ -399,11 +418,15 @@ repos* in parallel. Three `hydra_core` modules cooperate.
 
 `target_repo_id` on `HydraState` directs pair-programmer at a sibling
 repository. Resolution is **allow-list-only** — raw path strings are
-rejected (the allow-list is the injection guard). The allow-list maps
-nine `repo_id`s (`hydra`, `pair-programmer`, `agentsmith`, `theeights`,
-`xenia`, `executivesuite`, `senate`, `marketbliss`, `rlm-creative`) to
-exact on-disk folder names under a shared base dir
-(`…/AiAppDeployments/`, overridable via `HYDRA_REPO_BASE`).
+rejected (the allow-list is the injection guard). The built-in allow-list maps
+twelve `repo_id`s (`hydra`, `pair-programmer`, `agentsmith`, `theeights`,
+`xenia`, `executivesuite`, `senate`, `marketbliss`, `mc-test`, `rlm-creative`,
+`rlm-gaming`, `candc`) to exact on-disk folder names under a shared base dir
+(`…/AiAppDeployments/`, overridable via `HYDRA_REPO_BASE`). Operators extend
+the registry beyond the built-ins via `~/.hydra/repos.json` (a JSON object
+`{"<id>": "<abs-path>"}`) or the `HYDRA_EXTRA_REPOS` environment variable
+(the same JSON-object shape as a string; env overrides file, malformed
+entries are skipped fail-soft).
 `resolve_repo_path()` layers three guards: allow-list lookup → base-escape
 check (`candidate.is_relative_to(base)` defeats symlink traversal) → a real
 local `git -C <path> rev-parse --show-toplevel` (10 s timeout, no network)

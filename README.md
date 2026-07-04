@@ -202,6 +202,7 @@ graph TD
 | **Forge** | `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | mcp | verifiable correctness — best-of-N harness with 7 forge heads (Daedalus/Prometheus/Argus/Hygeia/Cerberus/Charon/Mnemosyne), 16 built-in profiles |
 | **Garland** | `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | claude-skill | divergent ideation — 8 Muses (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) + Helios sub-crew (video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa) |
 | **Curia** | `legal-compliance` | [Senate](https://github.com/lebobo88/Senate) | claude-skill | binding judgment under law — 9 jurists of the Law of Citations (Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian) + consilium (Paulus, Modestinus, Janus); deliberates by majority with Papinian's tiebreak, halts at the Tribune's Veto |
+| **Arcade** | `rlm-gaming` | [RLM-Gaming](https://github.com/lebobo88/RLM-Gaming) | claude-skill | game development — 20-agent studio squad (game-director, producer, tech-director, systems/narrative/level/encounter/economy designers, game-ai, netcode, art/audio/animation direction, QA-balance, liveops, compliance-cert, security gate) |
 
 Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo88/MarketBliss):
 
@@ -409,7 +410,7 @@ Verify:
 
 ```
 /mcp                   # in gateway mode: expect hydra_gateway connected; standalone: expect individual servers
-/hydra:hydra-squads    # expect 13 squads (10 active: 3 crowns + Curia + Xenia Hearth + 5 marketing; 3 stubs)
+/hydra:squads          # expect 14 squads (11 active: 3 crowns + Arcade Crown + Curia + Xenia Hearth + 5 marketing; 3 stubs)
 /doctor                # expect 0 plugin errors
 ```
 
@@ -438,6 +439,7 @@ Available in any Claude Code session once the plugin is registered:
 | Command | Purpose |
 |---|---|
 | `/hydra:run "<goal>"` | Start a new workflow. Routes through intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck. |
+| `/hydra:drive "<goal>"` | Attended host-bridged execution — drive the lifecycle in-context with visible engineer/judge subagents (the Python engine stays authoritative). |
 | `/hydra:status [<workflow_id>]` | List recent workflows or dump the trace for one. |
 | `/hydra:squads` | Show the discovered squad registry (slugs, entrypoints, accepts/emits, industries). |
 | `/hydra:approve <workflow_id>` | Resume a workflow paused at the HITL approval gate. |

@@ -18,7 +18,7 @@ Cards are shelves. A card grid says "here are items you may pick from." It is a 
 
 - **Neck lines** are not edges in the graph-theory sense — they are living tendons. Their length encodes status: a taut, short neck means the head is in active covenant with the Spirit (dispatching, executing). A slack, long neck means idle or dormant. Neck line weight (1px → 3px) encodes data flow rate. Animated dash-offset traveling Spirit→Head means task dispatching; Head→Spirit means synthesis returning.
 
-- **Head nodes** are the 13 squad packs. Each is a circle whose diameter encodes capacity utilization. Active heads carry a tongue-of-fire particle emitter at their crown — a small upward flame in amber that shifts to cyan (Forge) or rose (Garland) depending on squad Crown. The Executive crown heads carry a faint gold filament halo. Dormant heads are slate-outlined, no fill, no flame.
+- **Head nodes** are the 14 squad packs. Each is a circle whose diameter encodes capacity utilization. Active heads carry a tongue-of-fire particle emitter at their crown — a small upward flame in amber that shifts to cyan (Forge) or rose (Garland) depending on squad Crown. The Executive crown heads carry a faint gold filament halo. Dormant heads are slate-outlined, no fill, no flame.
 
 - **The Constellation Field** is not a fixed layout. It breathes. Heads in active workflows cluster toward the Spirit. Idle heads drift to the periphery. When all heads are idle, they form the canonical Hydra constellation silhouette (matching the actual 88-IAU map outline) — a reference the user will learn to read as "all clear."
 
@@ -31,7 +31,7 @@ Cards are shelves. A card grid says "here are items you may pick from." It is a 
 | Launchpad workflow cards | Spirit node tooltip + ring of recent intent chips |
 | Live Workflow 8-phase machine | Animated neck arc with phase waypoints |
 | Gate Cockpit HITL panel | Floating covenant card, crimson-gated, blocking |
-| Squads (13 packs) | The 13 head nodes on the constellation field |
+| Squads (14 packs) | The 14 head nodes on the constellation field |
 | Campaigns | Saved constellation snapshots in a bottom drawer |
 | Memory 8-cell bagua | Eight-fold memory ring orbiting the Spirit inward |
 
@@ -266,7 +266,7 @@ The constellation SVG carries `aria-hidden="true"` on its root element. Beside i
 | State | Spirit Node | Head Nodes | Necks | Panels | A11y treatment |
 |---|---|---|---|---|---|
 | **loading** | Amber ring pulsing at 2Hz, label "Connecting…" | All nodes slate ghost circles, no labels | None visible | None | `aria-busy="true"` on nav tree root; sr-only "Loading Hydra constellation" |
-| **empty** | Amber pulse at resting 0.78Hz, label in Cormorant: "Name the goal." | All 13 dormant at periphery in IAU silhouette | None | Intent Ring available on Spirit click | Tree contains only Spirit node; sr-only "No active workflows. Activate Spirit to begin." |
+| **empty** | Amber pulse at resting 0.78Hz, label in Cormorant: "Name the goal." | All 14 dormant at periphery in IAU silhouette | None | Intent Ring available on Spirit click | Tree contains only Spirit node; sr-only "No active workflows. Activate Spirit to begin." |
 | **live** | Full amber glow, intent phrase shown | Active heads near center with flames; dormant at periphery | Dash-offset flowing, sway active | Phase Rail available | Live tree updated via `aria-live="polite"` on phase changes |
 | **error** | Spirit pulse turns shallow tremor, amber desaturates to ochre | Errored head node gains crimson dot badge | Errored neck stops animating, turns slate | Error card floats (dark glass, crimson border) with error message + retry | `role="alert"` on error card; focus sent to retry button |
 | **degraded** | Spirit pulse continues but at reduced amplitude (0.7×) | Affected heads show yellow caution badge, flame dims | Affected necks thin to 1px | Degraded banner strip at top: "1 head degraded — results may be partial" | `aria-label` on affected head nodes updated; `aria-live="polite"` degraded banner |
@@ -324,7 +324,7 @@ sprite sheet format. Aspect ratio 4:3.
 ### Prompt C — Constellation Hero Shot (Marketing / Onboarding)
 ```
 Overhead view of a living force-directed constellation in deep void space. 
-Central glowing amber orb (the Spirit) surrounded by 13 smaller glowing 
+Central glowing amber orb (the Spirit) surrounded by 14 smaller glowing 
 nodes connected by luminous curved tendrils of light. Each satellite node 
 carries a tiny upward flame — amber, cyan, and rose varieties scattered 
 asymmetrically. The overall silhouette loosely matches the Hydra IAU 
@@ -390,9 +390,9 @@ RTL handling: The constellation is radially symmetric — RTL/LTR does not affec
 
 | Breakpoint | Layout | Constellation behavior | Phase Rail |
 |---|---|---|---|
-| `≥1440px` | Full constellation + side memory drawer | All 13 heads, full force sim | Full Phase Rail (bottom) |
-| `1024–1439px` | Constellation (80vw) + collapsible rail | All 13 heads, reduced force radius | Phase Rail collapsed to icon strip |
-| `768–1023px` | Constellation fills viewport, panels overlay | 13 heads, reduced node size | Phase Rail as bottom sheet |
+| `≥1440px` | Full constellation + side memory drawer | All 14 heads, full force sim | Full Phase Rail (bottom) |
+| `1024–1439px` | Constellation (80vw) + collapsible rail | All 14 heads, reduced force radius | Phase Rail collapsed to icon strip |
+| `768–1023px` | Constellation fills viewport, panels overlay | 14 heads, reduced node size | Phase Rail as bottom sheet |
 | `<768px` (mobile) | Accessible list view default; constellation available via toggle | Constellation scales to 100vw; necks simplified to straight lines; flame particles disabled | Phase Rail as full-screen modal |
 
 Mobile-first accessible list is the default below 768px because a force-directed graph at phone scale loses legibility. The constellation toggle is available for demonstration but the list view is the working interface on mobile. This is honest: Hydra Cockpit is a power-user orchestration tool; its primary surface is large-screen.

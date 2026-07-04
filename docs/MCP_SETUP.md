@@ -130,6 +130,11 @@ In gateway mode, `~/.claude.json` contains only `hydra_gateway`. The actual back
 
 ## Available Backends
 
+The 16 backends below mirror `scripts/backends.template.json` — the **single
+canonical template** for the backend registry. If the template and this table
+disagree, the template wins; regenerate `~/.hydra/backends.json` from it via
+`scripts/setup.{ps1,sh}`.
+
 | Backend | Source | Standalone server | Required? |
 |---|---|---|---|
 | `pp_harness` | pair-programmer | Node.js daemon | No |
@@ -140,4 +145,16 @@ In gateway mode, `~/.claude.json` contains only `hydra_gateway`. The actual back
 | `hydra_memory` | Hydra (in-repo) | Python shim | Yes (with Hydra) |
 | `executive_suite` | Hydra (in-repo) | Python shim | No |
 | `rlm_creative` | Hydra (in-repo) | Python shim | No |
+| `rlm_gaming` | Hydra (in-repo) | Python shim | No |
+| `xenia` | Hydra (in-repo) | Python shim | No |
 | `senate` | Hydra (in-repo) | Python shim | No |
+| `xenia_kb` | Hydra (in-repo) | Python shim | No |
+| `xenia_tickets` | Hydra (in-repo) | Python shim | No |
+| `marketbliss` | Hydra (in-repo) | Python shim | No |
+| `hydra_control` | Hydra (in-repo) | Python shim | No |
+| `blender` | 3rd-party (`uvx blender-mcp`) | Python (uvx) | No (optional) |
+
+`blender` is a newly registered optional 3rd-party backend (launched via
+`uvx blender-mcp`, connecting to a local Blender instance on `127.0.0.1:9876`).
+The former `hydra-cockpit` entry was removed — it was a dead non-MCP entry and
+is not part of the registry.

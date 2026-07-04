@@ -24,6 +24,7 @@ The architecture is grounded in `Enterprise Master AI Orchestration System Archi
 | Garland (Creative & Production) | `garland` | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | active |
 | Senate — Legal & Compliance (Curia) | `legal-compliance` | [`Senate`](https://github.com/lebobo88/Senate) | active |
 | Customer Support (Xenia Hearth) | `customer-support` | [`Xenia`](https://github.com/lebobo88/Xenia-Support) | active |
+| RLM-Gaming (Arcade Crown) | `rlm-gaming` | [`RLM-Gaming`](https://github.com/lebobo88/RLM-Gaming) | active |
 | Marketing — Strategy | `marketing-strategy` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
 | Marketing — Creative | `marketing-creative` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
 | Marketing — Research | `marketing-research` | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | active |
@@ -36,9 +37,10 @@ The architecture is grounded in `Enterprise Master AI Orchestration System Archi
 The five `marketing-*` packs are filesystem symlinks into the
 [`MarketBliss`](https://github.com/lebobo88/MarketBliss) checkout
 (`squads/marketing-* → MarketBliss/squads/marketing-*`), so they share that
-pack's source of truth while registering under Hydra's covenant. **13 squads
-total: 10 active (3 crowns + legal-compliance/Curia + customer-support/Xenia
-Hearth + 5 marketing) and 3 stubs (healthcare, sales-gtm, research-ds).**
+pack's source of truth while registering under Hydra's covenant. **14 squads
+total: 11 active (3 crowns + rlm-gaming/Arcade Crown + legal-compliance/Curia +
+customer-support/Xenia Hearth + 5 marketing) and 3 stubs (healthcare, sales-gtm,
+research-ds).**
 
 Every squad declares — in its `squad.yaml`:
 - `agents:` the roster (slugs + role description + authority bounds)
@@ -149,7 +151,7 @@ Agents receive **handles**, never raw blobs, to keep prompt cost predictable.
 | Surface | Items |
 |---|---|
 | Agents | `hydra-supervisor`, `hydra-router`, `hydra-planner`, `hydra-synthesizer`, `hydra-hitl-gate`, `hydra-cfo-gate` |
-| Commands | `/hydra:run`, `/hydra:status`, `/hydra:squads`, `/hydra:approve`, `/hydra:resume`, `/hydra:budget`, `/hydra:campaign`, `/hydra:replay`, `/hydra:add-squad` |
+| Commands | `/hydra:run`, `/hydra:drive`, `/hydra:status`, `/hydra:squads`, `/hydra:approve`, `/hydra:resume`, `/hydra:budget`, `/hydra:campaign`, `/hydra:replay`, `/hydra:add-squad` |
 | Skills | `cross-squad-message`, `hitl-protocol`, `budget-control`, `squad-registry-discovery`, `memory-handles` |
 | Hooks | `SessionStart`: load registry, surface waiting HITLs; `UserPromptSubmit`: route hint; `PreToolUse`: privilege-check, schema-validate; `PostToolUse`: cost tally, trace append; `Stop`: workflow checkpoint flush |
 

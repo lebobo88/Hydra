@@ -22,12 +22,15 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 | marketing-ops | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
 | legal-compliance | [`Senate`](https://github.com/lebobo88/Senate) | claude-skill |
 | customer-support | [`Xenia`](https://github.com/lebobo88/Xenia-Support) | claude-skill |
+| rlm-gaming | [`RLM-Gaming`](https://github.com/lebobo88/RLM-Gaming) | claude-skill |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |
 | research-ds | (stub) | stub |
 
-**13 squads: 10 active, 3 stubs (healthcare, sales-gtm, research-ds).** The five
+**14 squads: 11 active, 3 stubs (healthcare, sales-gtm, research-ds).** The five
 `marketing-*` packs are filesystem symlinks into the MarketBliss checkout.
+`rlm-gaming` is the **Arcade Crown** — RLM-Gaming's 20-agent game-development
+studio squad (claude-skill entrypoint).
 `legal-compliance` is the **Curia** — Senate's Law-of-Citations council (9 jurists:
 Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian, +
 consilium Paulus/Modestinus/Janus); it deliberates by majority with Papinian's

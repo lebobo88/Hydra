@@ -342,7 +342,7 @@ The whitelist is a frozen `Object.freeze([...])` set with an `allowWriteTool()` 
 
 Two complementary records per write:
 
-1. **eights envelope** — one eights envelope per write via a **NEW `hydra.cockpit.audit` tool added to `hydra_control`**. This tool drives `EightsAttestor.envelope_record` and is **spool-safe when eights is down** (spools locally, replays on reconnect). The fixed server-side envelope (`actor='hydra-cockpit'`, `project='Hydra'`) is applied here; no email in the payload.
+1. **eights envelope** — one eights envelope per write via the **`hydra.cockpit.audit` tool in `hydra_control`** (implemented in `mcp_servers/hydra_control/server.py`). The tool drives `EightsAttestor.envelope_record` and is **spool-safe when eights is down** (spools locally, replays on reconnect). The fixed server-side envelope (`actor='hydra-cockpit'`, `project='Hydra'`) is applied here; no email in the payload. The cockpit envelope type is **`COCKPIT_WRITE`** (UPPER_SNAKE canonical).
 2. **trace ledger** — the existing `trace.jsonl` Hydra already emits for the resumed/launched workflow.
 
 This gives the cockpit the same audit posture as the CLI: every governed write is attested to TheEights and appears in the workflow trace.
@@ -380,7 +380,7 @@ Because the mesh-console envelope is untouched and no new authority is created, 
 ## 3.2 Obligations (in scope for Stage 2)
 
 1. **Register `AgentMesh\manifests\hydra-cockpit.mesh-manifest.yaml`** (`kind: SiblingManifest`) with an **http-get health probe** against the bridge `GET /api/health`, so **meshd observes the bridge** as a sibling. Validated against `mesh-manifest.schema.json` (fail-closed).
-2. **File eights envelopes for every write** (§2.6) via the new `hydra.cockpit.audit` tool.
+2. **File eights envelopes for every write** (§2.6) via the `hydra.cockpit.audit` tool (implemented in `hydra_control`; envelope type `COCKPIT_WRITE`).
 
 ## 3.3 Discovered drift (flag for a separate governance fix — out of scope here)
 
@@ -398,17 +398,17 @@ Because the mesh-console envelope is untouched and no new authority is created, 
 
 **Resolution → chunk C2:** add a `--workflow-id <uuid>` flag to `_cmd_run`. When supplied (and well-formed), `_cmd_run` uses it instead of minting a fresh uuid; the bridge generates the id, passes it on the validated argv, and returns it instantly. (Rejected alternative: log-tail parsing the minted id — racy and fragile.)
 
-### Gap (b) — replay is skill-only today
+### Gap (b) — replay needed a deterministic CLI surface (closed)
 
-Replay exists only as a **model-driven skill** (`Hydra\.claude\commands\hydra-replay.md` → `/hydra:replay`); there is **no deterministic `replay` subcommand** in `cli.py`. The bridge must launch replay as a fixed-argv detached subprocess, which requires a CLI surface.
+Replay originally existed only as a **model-driven skill** (`Hydra\.claude\commands\hydra-replay.md` → `/hydra:replay`). The bridge must launch replay as a fixed-argv detached subprocess, which requires a CLI surface.
 
-**Resolution → chunk C6:** first add a **deterministic CLI subcommand**:
+**Resolution (chunk C6, implemented):** the **deterministic CLI subcommand exists** in `hydra_core/cli.py`:
 
 ```
 hydra replay <workflow_id> [--from-phase <phase>] [--swap-model <id>] [--live]
 ```
 
-then wire the bridge to it (fire-and-attach, venom-gated when `--live`).
+The bridge wires to it (fire-and-attach, venom-gated when `--live`).
 
 ---
 
@@ -447,8 +447,8 @@ then wire the bridge to it (fire-and-attach, venom-gated when `--live`).
 | **C2** | Launch contract: `launch.ts`, `POST /api/launch`, **add `--workflow-id` to `_cmd_run`** (gap a), dry-run default, fire-and-attach | C1 | ∥ C3, C4 |
 | **C3** | Gate writes: write-whitelist (8), `hydra_control` client, `POST /api/resume` (×5 actions), confirm-nonce, typed challenge, venom/Cerberus for force-dispatch | C1 | ∥ C2, C4. Validation alphabet identical to `hydra_control` |
 | **C4** | SSE streaming: checkpoint-mtime reader, trace tail (`fs.watch` + cursor), event schema (`trace/state/gate/ping/done`), poll fallback | C1 | ∥ C2, C3 |
-| **C5** | eights audit (**new `hydra.cockpit.audit` tool** in `hydra_control`, spool-safe) + register `hydra-cockpit.mesh-manifest.yaml` | **C2 + C3** | One eights envelope per write |
-| **C6** | Replay (**add `hydra replay` CLI subcommand** — gap b) + memory `tag_memory` write | **C2 + C4** | Replay venom-gated if `--live` |
+| **C5** | eights audit (`hydra.cockpit.audit` tool in `hydra_control` — **implemented**, spool-safe, `COCKPIT_WRITE` envelopes) + register `hydra-cockpit.mesh-manifest.yaml` | **C2 + C3** | One eights envelope per write |
+| **C6** | Replay (`hydra replay` CLI subcommand — **implemented** in `hydra_core/cli.py`, gap b closed) + memory `tag_memory` write | **C2 + C4** | Replay venom-gated if `--live` |
 | **C7** | React SPA: all 7 views, 8-state screens, ConfirmDialog/typed-challenge, live hook (SSE→poll), WCAG 2.2 AA | C1 (frozen) | Can start in parallel against frozen C1 contracts (mock endpoints) |
 | **C8** | Mesh-console **"Open in Cockpit"** deep-link button | C7 | **AgentMesh repo, last.** Uses §2.7 deep-link contract |
 
@@ -482,8 +482,8 @@ then wire the bridge to it (fire-and-attach, venom-gated when `--live`).
 | # | Question (from plan) | Resolution |
 |---|---|---|
 | 1 | `hydra run` lacks `--workflow-id` | **Add the flag** (gap a, C2). Confirmed `_cmd_run` mints its own uuid. |
-| 2 | Replay entrypoint | **Add `hydra replay` CLI subcommand** (gap b, C6) before wiring the bridge. Skill-only today. |
-| 3 | eights filing from Node bridge | **Add `hydra.cockpit.audit` tool to `hydra_control`** (C5), spool-safe. |
+| 2 | Replay entrypoint | **Implemented** — the `hydra replay` CLI subcommand exists in `hydra_core/cli.py` (gap b, C6). |
+| 3 | eights filing from Node bridge | **Implemented** — the `hydra.cockpit.audit` tool exists in `hydra_control` (C5), spool-safe; files `COCKPIT_WRITE` envelopes. |
 | 4 | Article III §6 verbatim text | Confirmed verbatim (§3.1). No amendment needed; drift flagged separately (§3.3). |
 
 ## Appendix B — Verification (for review)
