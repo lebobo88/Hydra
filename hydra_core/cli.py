@@ -1653,19 +1653,20 @@ def _cmd_budget(args) -> int:
                 "resource_id": wf_arg,
             }
             _cap_token_bs: dict | None = None
-            # _force_degraded_bs: True when no operator identity is known.
-            # In that case we intentionally strip HYDRA_OPERATOR_KEY to produce a
-            # degraded (unsigned) capability token, and warn-and-proceed regardless
-            # of the verify result.  This is the documented WS-AUTH run-A (foundation)
-            # posture.  When a key IS configured and mint/verify raises or the token
-            # is hard-invalid, we FAIL CLOSED to prevent unsigned state mutations.
-            _force_degraded_bs = _operator_bs.strip() in {"", "unknown"}
+            # _force_degraded_bs: True when HYDRA_OPERATOR_KEY is absent/empty.
+            # KEY presence — not operator-id — is the authoritative signal for whether
+            # cryptographic enforcement is configured.  With no key we intentionally
+            # produce a degraded (unsigned) capability token and warn-and-proceed
+            # regardless of HYDRA_OPERATOR_ID (documented WS-AUTH run-A / foundation
+            # posture).  When a key IS present, any mint/verify exception FAILS CLOSED
+            # (return 1, no patch) to prevent unsigned state mutations.
+            _force_degraded_bs = not bool(os.environ.get("HYDRA_OPERATOR_KEY", "").strip())
             try:
                 from .auth.capability import mint_for_approval as _mint_bs
                 if _force_degraded_bs:
                     _log_bs.warning(
-                        "operator identity unknown for budget_set; capability degraded — "
-                        "set HYDRA_OPERATOR_ID to issue a verifiable capability token",
+                        "HYDRA_OPERATOR_KEY not configured for budget_set; capability degraded — "
+                        "set HYDRA_OPERATOR_KEY to enable cryptographic enforcement",
                     )
                     _saved_key_bs = os.environ.pop("HYDRA_OPERATOR_KEY", None)
                     try:

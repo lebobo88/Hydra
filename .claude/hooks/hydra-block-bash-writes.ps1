@@ -114,14 +114,22 @@ if (-not $matched) {
 }
 
 # 4. python -c write idioms:
-#    4a. open() in write/append/exclusive mode (any mode string containing w, a, or x)
+#    4a. open() in write/append/exclusive mode.
+#        Matches open( <first-quoted-arg> , <second-quoted-arg-containing-w/a/x> )
+#        so the mode check applies to the MODE string only, not the filename.
+#        False-positive guard: open('data.py','r') → filename has 'a' but mode
+#        is 'r' — NOT blocked.  open('data.py','w') → mode is 'w' — BLOCKED.
 #        e.g.  python -c "open('foo.py','w').write('...')"
 #              python -c "open('bar.ts','wb').write(b'...')"
 #              python -c "open('q.py','a+').write('...')"
 if (-not $matched) {
-    if ($cmd -match "python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bopen\s*\([^)]*['""][^'""\)]*[wax][^'""\)]*['""]") {
+    # Capture: open( '<path>' , '<mode-with-w/a/x>' )
+    # First arg: any quoted string. Second arg: quoted string that contains w, a, or x.
+    $openMatches = [regex]::Matches($cmd,
+        "\bopen\s*\(\s*[`"'][^`"']*[`"']\s*,\s*[`"']([^`"']*[wax][^`"']*)[`"']")
+    if ($openMatches.Count -gt 0) {
         $matched = $true
-        $reason  = 'python -c with open() in write/append/exclusive mode'
+        $reason  = "python -c with open() in write/append/exclusive mode ('$($openMatches[0].Groups[1].Value)')"
     }
 }
 #    4b. pathlib.Path(...).write_text / write_bytes — scan directly for the

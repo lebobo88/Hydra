@@ -234,6 +234,20 @@ def test_bash_writes_hook_allows_redirect_to_log():
     )
 
 
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_allows_open_read_mode():
+    """open('data.py','r') must be ALLOWED — read-only mode, NOT a write idiom.
+    Regression guard against the false-positive where the filename ('data.py')
+    contains 'a' which wrongly satisfied the old [wax] class."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    cmd = "python -c \"open('data.py','r').read()\""
+    result = _run_bash_writes_hook(cmd)
+    assert result.returncode == 0, (
+        f"Expected exit 0 (allow) for open(..'r') read-only, got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # F6 — _cmd_status: latest-first ordering + structured render
 # ---------------------------------------------------------------------------
@@ -544,6 +558,78 @@ def test_budget_set_fail_closed_when_key_configured(tmp_path, capsys):
     # Budget MUST NOT have been patched.
     assert not update_state_called["called"], (
         "update_state was called despite mint failure — budget set must not proceed"
+    )
+
+
+@pytest.mark.skipif(not _HAS_LANGGRAPH, reason="langgraph not installed")
+def test_budget_set_fail_closed_on_verify_exception_with_key(tmp_path, capsys):
+    """When HYDRA_OPERATOR_KEY is set and verify_operator_capability RAISES, --set
+    must fail closed (exit 1) and NOT call update_state.
+
+    Distinguishes from the no-key degraded path where verify raising just warns.
+    Also covers the new keying rule: _force_degraded_bs gates on KEY presence,
+    so even if HYDRA_OPERATOR_ID is 'unknown', a configured key means fail-closed.
+    """
+    from hydra_core import cli
+    from hydra_core.state import HydraState, BudgetLedger
+    from hydra_core.telemetry import emit
+    from uuid import uuid4
+
+    wf = str(uuid4())
+    emit(tmp_path, wf, "workflow_start", {"goal": "verify-exc fail-closed test"})
+
+    fake_budget = BudgetLedger(budget_usd=50.0, spent_usd=5.0)
+    fake_state = HydraState(workflow_id=wf, root_goal="verify-exc fail-closed test")
+    fake_state.budget = fake_budget
+
+    update_state_called = {"called": False}
+
+    class _FakeSup:
+        def get_state(self, config):
+            snap = MagicMock()
+            snap.values = fake_state.model_dump(mode="json")
+            return snap
+
+        def update_state(self, config, applied_patch):
+            update_state_called["called"] = True
+
+    # mint succeeds (returns a plausible token), but verify raises.
+    def _ok_mint(**kwargs):
+        return {"capability": "budget_set", "sig": {"value": "tok", "degraded": False}}
+
+    def _boom_verify(token, **kwargs):
+        raise RuntimeError("simulated verify crash — should fail closed")
+
+    with patch("hydra_core.supervisor.build_supervisor", return_value=_FakeSup()):
+        with patch("hydra_core.supervisor._PurePythonRunner", type(None)):
+            old_key = os.environ.get("HYDRA_OPERATOR_KEY")
+            os.environ["HYDRA_OPERATOR_KEY"] = "fake-test-key"
+            # Leave HYDRA_OPERATOR_ID unset / unknown to validate that key presence
+            # alone (not operator-id) governs fail-closed behaviour.
+            old_op = os.environ.pop("HYDRA_OPERATOR_ID", None)
+            try:
+                with patch("hydra_core.auth.capability.mint_for_approval", side_effect=_ok_mint):
+                    with patch("hydra_core.auth.capability.verify_operator_capability",
+                               side_effect=_boom_verify):
+                        rc = cli.main(["--project", str(tmp_path), "budget", wf, "--set", "777"])
+            finally:
+                if old_key is None:
+                    os.environ.pop("HYDRA_OPERATOR_KEY", None)
+                else:
+                    os.environ["HYDRA_OPERATOR_KEY"] = old_key
+                if old_op is not None:
+                    os.environ["HYDRA_OPERATOR_ID"] = old_op
+
+    err = capsys.readouterr().err
+    assert rc == 1, (
+        f"Expected exit 1 (fail-closed) when key configured and verify raises; got {rc}.\n"
+        f"stderr: {err}"
+    )
+    assert "capability_verify_exception" in err or "verify" in err.lower(), (
+        f"Expected verify-exception error in stderr; got: {err!r}"
+    )
+    assert not update_state_called["called"], (
+        "update_state was called despite verify exception — budget set must not proceed"
     )
 
 
