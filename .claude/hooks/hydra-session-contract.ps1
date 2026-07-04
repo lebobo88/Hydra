@@ -35,14 +35,19 @@ if ($ecosystemAvailable) {
             }
         }
 
-        if ($looksLikeRepo -and -not (Test-Path $agentsPath)) {
+        # HYDRA_SCAFFOLD_CONTRACT=0: opt out of AGENTS.md/CLAUDE.md scaffolding.
+        if ($env:HYDRA_SCAFFOLD_CONTRACT -ne '0' -and $looksLikeRepo -and -not (Test-Path $agentsPath)) {
             Set-Content -Path $agentsPath -Value @(
                 '# AGENTS'
                 ''
                 'Hydra bootstrap placeholder. Add repository-specific agent guidance here.'
             )
+            if ((Test-Path $agentsPath)) {
+                Write-Output "[hydra] Scaffolded $agentsPath"
+            }
             if ((Test-Path $agentsPath) -and -not (Test-Path $claudePath)) {
                 Set-Content -Path $claudePath -Value '@AGENTS.md'
+                Write-Output "[hydra] Scaffolded $claudePath"
             }
         }
     } catch {}

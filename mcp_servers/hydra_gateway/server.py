@@ -1,13 +1,13 @@
 """Hydra Gateway — unified MCP server proxying all backend servers.
 
-Consolidates 8 individual MCP server registrations into 1. Claude Code
+Consolidates 16 individual MCP server registrations into 1. Claude Code
 registers only `hydra_gateway`; it discovers backends from
 ``~/.hydra/backends.json`` and proxies tool calls to them.
 
 Backend tools are exposed under their original server-qualified names:
 ``{server}__{tool_name}`` → Claude sees ``mcp__hydra_gateway__{server}__{tool_name}``.
 
-Also exposes 7 gateway meta-tools for search/describe/navigate/health.
+Also exposes 6 gateway meta-tools for search/describe/navigate/health.
 
 Architecture:
 - AsyncBackendPool manages long-lived async MCP client sessions
@@ -657,8 +657,8 @@ def _build_static_tool_list(
 ) -> list[dict[str, Any]]:
     """Build the tool list from the static toolshed catalog.
 
-    No live connections needed — the toolshed catalogs ~200 tools across
-    8 backends. Tools are namespaced as ``{server}__{tool_name}`` so
+    No live connections needed — the toolshed catalogs tools across
+    16 backends. Tools are namespaced as ``{server}__{tool_name}`` so
     Claude sees ``mcp__hydra_gateway__{server}__{tool_name}``.
 
     Only tools whose server has a matching entry in ``backends.json``

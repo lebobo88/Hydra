@@ -57,6 +57,17 @@ class ToolShed:
     def servers(self) -> list[str]:
         return sorted(self._catalog.keys())
 
+    @property
+    def _catalogs(self) -> dict[str, list[ToolEntry]]:
+        """Read-only alias for ``_catalog`` (one key per registered server).
+
+        Kept so callers that probe the per-server catalog map by the plural
+        name resolve to the same backing store — e.g. the Phase-5 acceptance
+        check that asserts ``build_default_shed`` registers exactly 16 backend
+        catalogs. Without this, that assertion is guarded by a ``hasattr`` that
+        would fail and skip, silently un-enforcing the 16-backend invariant."""
+        return self._catalog
+
     def register_server(self, server: str, tools: list[dict[str, Any]]) -> int:
         """Register all tools from a server into the catalog."""
         entries = []

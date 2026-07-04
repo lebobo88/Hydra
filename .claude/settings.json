@@ -1,5 +1,6 @@
 {
   "env": {
-    "HYDRA_HOST_DRIVEN": "1"
+    "HYDRA_HOST_DRIVEN": "1",
+    "HYDRA_ENFORCE_ROUTING": "1"
   }
 }
