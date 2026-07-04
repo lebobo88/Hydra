@@ -881,27 +881,64 @@ def test_gapd_fixture_survives_modified_squad_yaml(monkeypatch, tmp_path):
 # Finding 1: record_attempt schema pin + happy-path try/except
 # ===========================================================================
 
+_PP_HARNESS_TS = Path(
+    "C:/AiAppDeployments/pair-programmer/daemon/src/mcp/harness-server.ts"
+)
+
+
+@pytest.mark.skipif(
+    not _PP_HARNESS_TS.exists(),
+    reason="pair-programmer harness-server.ts not found on this machine; skip schema pin",
+)
 def test_f1_record_attempt_payload_has_accepted_keys():
-    """The record_attempt payload we send must only include keys that pp's
-    RecordAttemptSchema accepts.  Pins against the known accepted set."""
-    # Accepted keys from daemon/src/mcp/harness-server.ts RecordAttemptSchema.
-    # This set is the authoritative contract; update it when pp schema changes.
-    _ACCEPTED_KEYS = frozenset({
-        "stage_id", "producer", "model_id", "prompt_hash", "artifact_path",
-        "tokens_in", "tokens_out", "cost_usd", "wall_ms", "retry_index",
-        "parent_attempt_id", "status", "attempt_slot_id", "attempted_tier",
-        "notes", "agent_type",
-    })
-    # Keys we actually send (must be a subset of accepted).
-    _OUR_KEYS = frozenset({
+    """Our record_attempt payload keys must be a strict subset of pp's
+    RecordAttemptSchema.  Reads harness-server.ts at test runtime so the pin
+    stays honest across pp schema evolution (8-residual: live extraction)."""
+    import re as _re
+
+    ts_text = _PP_HARNESS_TS.read_text(encoding="utf-8")
+
+    # Locate the RecordAttemptSchema block.
+    start_m = _re.search(r"const RecordAttemptSchema\s*=\s*z\.object\(\{", ts_text)
+    assert start_m, (
+        "Could not find 'const RecordAttemptSchema = z.object({' in harness-server.ts — "
+        "the schema may have been renamed; update this test."
+    )
+    # Walk brace-depth to extract the body between the outer { }.
+    block_start = start_m.end()
+    depth = 1
+    i = block_start
+    while i < len(ts_text) and depth > 0:
+        ch = ts_text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    schema_block = ts_text[block_start : i - 1]
+
+    # Extract property names: lines that start (after whitespace) with an
+    # identifier followed by optional whitespace and a colon.
+    accepted_keys = frozenset(
+        _re.findall(r"^\s+(\w+)\s*:", schema_block, _re.MULTILINE)
+    )
+    assert accepted_keys, (
+        "Extracted an empty accepted_keys set from RecordAttemptSchema — "
+        "the extraction regex may need updating."
+    )
+
+    # Keys we actually send in host_bridge._apply_generate.
+    our_keys = frozenset({
         "stage_id", "producer", "model_id", "agent_type",
         "tokens_in", "tokens_out", "cost_usd", "status", "retry_index",
         "notes",
     })
-    extra = _OUR_KEYS - _ACCEPTED_KEYS
+
+    extra = our_keys - accepted_keys
     assert not extra, (
-        f"Finding 1: record_attempt payload contains keys NOT in pp schema: {extra}. "
-        "Update _OUR_KEYS to match the actual payload in host_bridge._apply_generate.")
+        f"record_attempt payload contains keys NOT in pp RecordAttemptSchema: {extra}. "
+        f"Accepted keys extracted from harness-server.ts: {sorted(accepted_keys)}"
+    )
 
 
 def test_f1_record_attempt_rpc_failure_surfaces_not_crashes(tmp_path):
@@ -1075,6 +1112,53 @@ def test_f4_merge_failure_makes_finalize_run_surfaced(tmp_path, monkeypatch):
     assert last_call.get("status") == "surfaced", (
         f"Finding 4: merge failure must call finalize_run(surfaced), "
         f"got: {last_call.get('status')}")
+
+
+def test_new_merge_failure_sets_pass_unlanded_outcome(tmp_path, monkeypatch):
+    """When the worktree merge fails after a passing verdict, cursor['outcome']
+    must be downgraded to 'pass_unlanded' so step_result / summary report an
+    outcome that matches the surfaced landing status."""
+    finalize_run_calls: list[dict] = []
+
+    class _MergeFailDisp2(FakeDispatcher):
+        def call_mcp(self, server, tool, args, squad_id=None):
+            if tool == "finalize_run":
+                finalize_run_calls.append(dict(args))
+            return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    monkeypatch.setattr(
+        host_bridge, "_merge_worktree_back",
+        lambda *a, **k: {"merged": False, "error": "test_merge_fail"},
+    )
+    monkeypatch.setattr(host_bridge, "_remove_worktree", lambda *a, **k: None)
+
+    disp = _MergeFailDisp2(required_cross_vendor=False)  # same-vendor OK
+    res = _begin(disp, tmp_path)
+
+    # Inject fake worktree fields so the merge path is exercised.
+    import json
+    cpath = res["cursor_path"]
+    cursor = json.loads(Path(cpath).read_text())
+    cursor["worktree_path"] = str(tmp_path / "wt_new")
+    cursor["repo_root"] = str(tmp_path)
+    cursor["branch"] = "attended/new-test"
+    Path(cpath).write_text(json.dumps(cursor))
+
+    res = _submit(disp, res, "generate-0", text="edit")
+    # same-vendor claude judge with required_cross_vendor=False → pass, no F31
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="claude")
+
+    # Run must be surfaced (merge failed).
+    assert res["status"] == "surfaced", (
+        "NEW: merge failure must produce surfaced run")
+    # stage_outcome in step result must NOT be 'pass'.
+    stage_outcome = res.get("stage_outcome")
+    assert stage_outcome == "pass_unlanded", (
+        f"NEW: cursor['outcome'] must be 'pass_unlanded' after merge failure, "
+        f"got: {stage_outcome!r}")
+    # finalize_run must carry the true (surfaced) status.
+    assert finalize_run_calls, "finalize_run must be called"
+    assert finalize_run_calls[-1].get("status") == "surfaced"
 
 
 # ===========================================================================

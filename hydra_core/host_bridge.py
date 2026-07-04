@@ -863,7 +863,10 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
             if not merge.get("merged"):
                 # Merge failed — surface the run so the operator knows code
                 # did not land, and pass that truth to finalize_run below.
+                # NEW: downgrade cursor['outcome'] so step_result / summary
+                # report 'pass_unlanded' rather than 'pass' on a surfaced run.
                 passed = False
+                cursor["outcome"] = "pass_unlanded"
                 cursor["error"] = (cursor.get("error") or "") + \
                     f" merge-back failed: {merge.get('error')}"
         else:
