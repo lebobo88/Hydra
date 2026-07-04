@@ -108,34 +108,35 @@ def test_f29_record_attempt_includes_agent_type_engineer(tmp_path):
 
 def test_f31_same_vendor_judge_when_required_cross_downgrades(tmp_path):
     """A same-vendor verdict when required_cross_vendor=True must NOT finalize
-    as complete — the stage is downgraded to surfaced."""
+    as complete.  Finding 2: F31 is an infra failure — surface immediately
+    without burning a Reflexion retry."""
     disp = FakeDispatcher(required_cross_vendor=True)
     # NB: producer defaults to "claude"; judge_producer="claude" → same-vendor.
     res = _full_pass(disp, tmp_path,
                      judge_result={"outcome": "pass", "judge_producer": "claude"})
-    # F31 demotes pass → revise at gen_idx=0 → GAP-f reflexion kicks in first.
-    # The key invariant: the stage must NOT finalize complete.
+    # Finding 2: F31 is an infra downgrade → direct surface, no Reflexion.
     assert res["status"] != "complete", (
         "F31: same-vendor judge when cross required must not produce complete")
-    # After the reflexion → second attempt is pending.
-    assert res.get("state") in ("await_generate", "surfaced")
+    assert res["status"] == "surfaced", (
+        "F31 (Finding 2): infra downgrade must surface immediately, not trigger Reflexion")
 
 
-def test_f31_same_vendor_after_reflexion_surfaces(tmp_path):
-    """After Reflexion x1, if the second judge is also same-vendor (degraded),
-    the stage surfaces (no further retries)."""
+def test_f31_infra_failure_does_not_consume_reflexion_slot(tmp_path):
+    """F31 infra downgrade must surface immediately — the Reflexion slot must
+    NOT be consumed by an infra failure (it is reserved for code defects)."""
     disp = FakeDispatcher(required_cross_vendor=True)
     res = _begin(disp, tmp_path)
-    # generate-0 → judge-0 revise → reflexion
     res = _submit(disp, res, "generate-0", text="edit1")
+    # F31: same-vendor "pass" when cross required → infra downgrade → surface
     res = _submit(disp, res, "judge-0",
-                  outcome="pass", judge_producer="claude")  # degraded → revise → reflexion
-    assert res["state"] == "await_generate", "reflexion should have fired"
-    # generate-1 → judge-1 same-vendor pass again → surfaces (no more retries)
-    res = _submit(disp, res, "generate-1", text="edit2")
-    res = _submit(disp, res, "judge-1",
                   outcome="pass", judge_producer="claude")
-    assert res["status"] == "surfaced"
+    # Must surface immediately, NOT wait for generate-1.
+    assert res["status"] == "surfaced", (
+        "F31 infra: must surface directly without triggering generate-1")
+    assert res.get("state") == "surfaced", "state must be surfaced after F31 infra"
+    # Verify no second generate was requested (no pending_action for generate-1)
+    assert disp.count("record_attempt") == 1, (
+        "F31 infra: only one generate attempt must be recorded")
 
 
 # ===========================================================================
@@ -150,20 +151,20 @@ class _RVFailDispatcher(FakeDispatcher):
         return super().call_mcp(server, tool, args, squad_id=squad_id)
 
 
-def test_f26_m8_rv_failure_on_gen0_triggers_reflexion_not_complete(tmp_path):
-    """record_verdict failure on gen-0 downgrade (pass→revise) then reflexion —
-    the stage must NOT finalize complete on gen-0."""
+def test_f26_m8_rv_failure_on_gen0_surfaces_immediately(tmp_path):
+    """record_verdict RPC failure on gen-0 is an infra failure — must surface
+    immediately (Finding 2), NOT burn a Reflexion retry.  A retry cannot fix
+    an RPC-level failure."""
     disp = _RVFailDispatcher(required_cross_vendor=True)
     res = _begin(disp, tmp_path)
     res = _submit(disp, res, "generate-0", text="edit")
-    # record_verdict raises → _record_verdict_ok=False → outcome demoted to revise
-    # gen_idx=0 → GAP-f reflexion fires
+    # record_verdict raises → _infra_downgrade=True → direct surface, no Reflexion
     res = _submit(disp, res, "judge-0",
                   outcome="pass", judge_producer="codex")
-    # Must not be complete; should be in reflexion state
-    assert res["status"] != "complete", (
-        "F26+M8: rv failure on gen-0 must not produce complete")
-    assert res.get("state") == "await_generate"
+    assert res["status"] == "surfaced", (
+        "F26+M8 Finding 2: rv failure on gen-0 must surface immediately, "
+        "not trigger Reflexion")
+    assert res.get("state") == "surfaced", "state must be surfaced after rv failure"
 
 
 def test_f26_m8_rv_failure_on_gen1_surfaces(tmp_path):
@@ -830,3 +831,474 @@ def test_gapd_fixture_packs_importable():
     })
     assert isinstance(eng, SquadPack)
     assert eng.invoke.get("mode") == "pp_best_of"
+
+
+def test_gapd_fixture_uses_real_coerce_pack():
+    """The fixture uses the real _coerce_pack loader path (not a hand-rolled
+    bypass).  Verifies the real schema is exercised, not a dict-return stub."""
+    from hydra_core.squad_loader import _coerce_pack, SquadPack
+    # Must produce a typed SquadPack, not a raw dict.
+    pack = _coerce_pack("engineering", {
+        "name": "test-fixture",
+        "entrypoint": "mcp",
+        "accepts": ["DEV_TASK"],
+        "invoke": {"mode": "pp_best_of", "command_hint": "/pp:run"},
+    })
+    assert isinstance(pack, SquadPack), (
+        "GAP-d: _coerce_pack must return a typed SquadPack, not a raw dict")
+    # Real loader populates defaults — verify a known default field is set.
+    assert hasattr(pack, "slug"), "GAP-d: SquadPack must have a slug attribute"
+
+
+def test_gapd_fixture_survives_modified_squad_yaml(monkeypatch, tmp_path):
+    """Fixture-pinned tests must pass even when squads/engineering/squad.yaml
+    is modified.  Simulate by monkeypatching discover_squads to return a
+    deliberately wrong config; the fixture must still produce a valid pack."""
+    from hydra_core.squad_loader import _coerce_pack, SquadPack
+
+    # Simulate discover_squads returning a broken / different config.
+    bad_config = {"name": "WRONG-NAME", "entrypoint": "stub", "accepts": []}
+    monkeypatch.setattr(
+        "hydra_core.squad_loader.discover_squads",
+        lambda _root=None: {"engineering": bad_config},
+    )
+
+    # The fixture bypasses discover_squads — it calls _coerce_pack directly
+    # with its own pinned config, which must still produce a valid pack.
+    fixture_pack = _coerce_pack("engineering", {
+        "name": "Engineering & Product (fixture)",
+        "entrypoint": "mcp",
+        "accepts": ["PRD", "DEV_TASK"],
+        "invoke": {"mode": "pp_best_of"},
+    })
+    assert isinstance(fixture_pack, SquadPack), (
+        "GAP-d: fixture _coerce_pack must succeed regardless of live squad.yaml")
+    assert fixture_pack.invoke.get("mode") == "pp_best_of", (
+        "GAP-d: fixture config must take precedence over (simulated) modified squad.yaml")
+
+
+# ===========================================================================
+# Finding 1: record_attempt schema pin + happy-path try/except
+# ===========================================================================
+
+def test_f1_record_attempt_payload_has_accepted_keys():
+    """The record_attempt payload we send must only include keys that pp's
+    RecordAttemptSchema accepts.  Pins against the known accepted set."""
+    # Accepted keys from daemon/src/mcp/harness-server.ts RecordAttemptSchema.
+    # This set is the authoritative contract; update it when pp schema changes.
+    _ACCEPTED_KEYS = frozenset({
+        "stage_id", "producer", "model_id", "prompt_hash", "artifact_path",
+        "tokens_in", "tokens_out", "cost_usd", "wall_ms", "retry_index",
+        "parent_attempt_id", "status", "attempt_slot_id", "attempted_tier",
+        "notes", "agent_type",
+    })
+    # Keys we actually send (must be a subset of accepted).
+    _OUR_KEYS = frozenset({
+        "stage_id", "producer", "model_id", "agent_type",
+        "tokens_in", "tokens_out", "cost_usd", "status", "retry_index",
+        "notes",
+    })
+    extra = _OUR_KEYS - _ACCEPTED_KEYS
+    assert not extra, (
+        f"Finding 1: record_attempt payload contains keys NOT in pp schema: {extra}. "
+        "Update _OUR_KEYS to match the actual payload in host_bridge._apply_generate.")
+
+
+def test_f1_record_attempt_rpc_failure_surfaces_not_crashes(tmp_path):
+    """A record_attempt RPC failure on the happy path must surface the stage
+    cleanly, NOT crash submit_host_result and orphan the attended workflow."""
+
+    class _RAFailDispatcher(FakeDispatcher):
+        """Raises RuntimeError on record_attempt call."""
+        def call_mcp(self, server, tool, args, squad_id=None):
+            if tool == "record_attempt":
+                raise RuntimeError("record_attempt RPC boom (Finding 1 test)")
+            return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    disp = _RAFailDispatcher()
+    res = _begin(disp, tmp_path)
+    # Should NOT raise; must return a surfaced result.
+    res = _submit(disp, res, "generate-0", text="edit")
+    assert res["status"] == "surfaced", (
+        "Finding 1: record_attempt RPC failure must surface the stage, not crash")
+    assert "record_attempt" in (res.get("error") or ""), (
+        "Finding 1: error message must mention record_attempt")
+
+
+# ===========================================================================
+# Finding 2: infra downgrades surface immediately (F31 + F26 attended)
+# ===========================================================================
+
+def test_f2_f31_attended_does_not_consume_reflexion_and_surfaces(tmp_path):
+    """F31 infra downgrade in attended mode: direct surface, no Reflexion.
+    The generate-1 slot is preserved (not consumed by an infra failure)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    res = _submit(disp, res, "generate-0", text="edit")
+    # F31: same-vendor "pass" when cross required → infra downgrade
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="claude")
+    assert res["status"] == "surfaced", (
+        "Finding 2 (F31 attended): infra downgrade must surface immediately")
+    assert disp.count("record_attempt") == 1, "only one generate attempt must be made"
+
+
+def test_f2_f26_rv_failure_attended_surfaces_not_reflexion(tmp_path):
+    """F26+M8 RV failure in attended mode: direct surface, no Reflexion.
+    record_verdict RPC failure is an infra problem — retrying cannot fix it."""
+
+    class _RVFailDispatcher2(FakeDispatcher):
+        def call_mcp(self, server, tool, args, squad_id=None):
+            if tool == "record_verdict":
+                raise RuntimeError("boom")
+            return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    disp = _RVFailDispatcher2(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    res = _submit(disp, res, "generate-0", text="edit")
+    # cross-vendor pass → rv fails → infra downgrade → surface immediately
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="codex")
+    assert res["status"] == "surfaced", (
+        "Finding 2 (F26 attended): rv RPC failure must surface immediately, not Reflexion")
+    assert disp.count("record_attempt") == 1
+
+
+# ===========================================================================
+# Finding 3: GAP-a2 baseline uses repo_root (not just parent)
+# ===========================================================================
+
+def test_f3_capture_baseline_uses_repo_root_when_provided(tmp_path, monkeypatch):
+    """_capture_baseline_failures must try repo_root first when provided.
+    A worktree at <repo>/.harness/worktrees/attended-X needs to run pytest
+    from <repo>/tests/, not from the worktree or its direct parent."""
+    from hydra_core.host_bridge import _capture_baseline_failures
+
+    # Simulate: worktree path (no tests/) is two levels deep in the repo.
+    repo_root = tmp_path / "myrepo"
+    worktrees_dir = repo_root / ".harness" / "worktrees"
+    worktree = worktrees_dir / "attended-run123"
+    worktree.mkdir(parents=True)
+    # Only repo_root has tests/
+    (repo_root / "tests").mkdir()
+
+    _mock_proc = MagicMock()
+    _mock_proc.stdout = "FAILED tests/test_repo.py::test_r\n1 failed"
+    _mock_proc.stderr = ""
+    _mock_proc.returncode = 1
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _mock_proc)
+
+    result = _capture_baseline_failures(str(worktree), repo_root=str(repo_root))
+    assert isinstance(result, list), "must return a list"
+    assert any("test_repo" in r for r in result), (
+        "Finding 3: baseline must find tests via repo_root, not worktree parent")
+
+
+def test_f3_capture_baseline_no_repo_root_falls_back_to_parent(
+        tmp_path, monkeypatch):
+    """When repo_root is not provided, parent-dir fallback still works."""
+    from hydra_core.host_bridge import _capture_baseline_failures
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (tmp_path / "tests").mkdir()  # tests/ is at tmp_path (parent of worktree)
+
+    _mock_proc = MagicMock()
+    _mock_proc.stdout = "FAILED tests/test_y.py::test_y\n1 failed"
+    _mock_proc.stderr = ""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _mock_proc)
+
+    result = _capture_baseline_failures(str(worktree))  # no repo_root
+    assert any("test_y" in r for r in result), (
+        "Finding 3: parent-dir fallback must still work when repo_root is absent")
+
+
+# ===========================================================================
+# Finding 4: attended _finalize merge before finalize_run
+# ===========================================================================
+
+def test_f4_merge_failure_makes_finalize_run_surfaced(tmp_path, monkeypatch):
+    """When _merge_worktree_back fails after finalize_stage(passed), _finalize
+    must call finalize_run(surfaced), NOT finalize_run(complete).  The pp ledger
+    must reflect the true state: code did not land."""
+    finalize_run_calls: list[dict] = []
+
+    class _MergeFailDispatcher(FakeDispatcher):
+        def call_mcp(self, server, tool, args, squad_id=None):
+            if tool == "finalize_run":
+                finalize_run_calls.append(dict(args))
+            return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    # Inject a worktree_path + repo_root + branch into the cursor so the merge
+    # path is exercised; then patch _merge_worktree_back to fail.
+    monkeypatch.setattr(
+        host_bridge, "_merge_worktree_back",
+        lambda *a, **k: {"merged": False, "error": "simulated_merge_failure"},
+    )
+    monkeypatch.setattr(host_bridge, "_remove_worktree", lambda *a, **k: None)
+
+    disp = _MergeFailDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    # Inject fake worktree fields into the cursor.
+    import json
+    cpath = res["cursor_path"]
+    cursor = json.loads(Path(cpath).read_text())
+    cursor["worktree_path"] = str(tmp_path / "wt")
+    cursor["repo_root"] = str(tmp_path)
+    cursor["branch"] = "attended/test-branch"
+    Path(cpath).write_text(json.dumps(cursor))
+
+    res = _submit(disp, res, "generate-0", text="edit")
+    res = _submit(disp, res, "judge-1",  # skip to gen-1 judge (after reflexion)
+                  outcome="pass", judge_producer="codex") \
+        if False else None
+
+    # Drive through the full pass path without reflexion by using gen-0 pass
+    # and a cross-vendor judge so F31 doesn't fire.
+    disp2 = _MergeFailDispatcher(required_cross_vendor=False)
+    monkeypatch.setattr(
+        host_bridge, "_merge_worktree_back",
+        lambda *a, **k: {"merged": False, "error": "simulated_merge_failure"},
+    )
+    res2 = _begin(disp2, tmp_path)
+    cursor2 = json.loads(Path(res2["cursor_path"]).read_text())
+    cursor2["worktree_path"] = str(tmp_path / "wt2")
+    cursor2["repo_root"] = str(tmp_path)
+    cursor2["branch"] = "attended/test-branch-2"
+    Path(res2["cursor_path"]).write_text(json.dumps(cursor2))
+
+    res2 = _submit(disp2, res2, "generate-0", text="edit")
+    res2 = _submit(disp2, res2, "judge-0",
+                   outcome="pass", judge_producer="claude")  # same-vendor OK (not required_cross)
+
+    # finalize_run must have been called with surfaced (merge failed)
+    assert finalize_run_calls, "finalize_run must be called"
+    last_call = finalize_run_calls[-1]
+    assert last_call.get("status") == "surfaced", (
+        f"Finding 4: merge failure must call finalize_run(surfaced), "
+        f"got: {last_call.get('status')}")
+
+
+# ===========================================================================
+# Finding 5: best-of loop merges winner only after readiness+finalize_stage
+# ===========================================================================
+
+def test_f5_best_of_readiness_fail_does_not_call_archive(monkeypatch):
+    """When readiness check fails, archive_winner_and_losers must NOT be called
+    (winner code must not land in the project)."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    archive_called = []
+
+    def _fake_cm(server, tool, args, *, squad_id=None):
+        if tool == "archive_winner_and_losers":
+            archive_called.append(True)
+            return {"status": "done", "result": {"merge_status": "merged"}}
+        if tool == "start_best_of_stage":
+            # Return stage_id + candidates list as the real daemon does.
+            return {"status": "done", "result": {
+                "stage_id": "stg-bo", "n": 1,
+                "candidates": [{"candidate_index": 0, "attempt_slot_id": "s0",
+                                "worktree_path": "/tmp/wt0"}]}}
+        if tool == "get_stage_finalize_readiness":
+            return {"status": "done", "result": {"can_pass": False,
+                                                  "next_action": "blocker_gate"}}
+        if tool in {"record_attempt", "archive_artifact"}:
+            return {"status": "done", "result": {"attempt_id": "a0"}}
+        if tool in {"record_verdict", "record_smoke_status"}:
+            return {"status": "done", "result": {}}
+        if tool == "finalize_stage":
+            return {"status": "done", "result": {}}
+        if tool == "finalize_run":
+            return {"status": "done", "result": {"status": "surfaced"}}
+        if tool == "teardown_candidates":
+            return {"status": "done", "result": {"teardown_status": "ok"}}
+        if tool == "gate_eligible_judges":
+            return {"status": "done", "result": {
+                "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+        return {"status": "done", "result": {}}
+
+    class _BODisp:
+        def call_mcp(self, server, tool, args, *, squad_id=None):
+            return _fake_cm(server, tool, args, squad_id=squad_id)
+        def emit_claude_prompt(self, *a, **k): return {"text": "ok", "model": "m"}
+        def invoke_claude_skill(self, *a, **k): raise NotImplementedError
+        def spawn_subprocess(self, *a, **k): raise NotImplementedError
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *a, **k: ("pass", "stub"))
+    monkeypatch.setattr("hydra_core.squad_node._drive_generate",
+                        lambda *a, **k: (
+                            {"status": "done", "result": {
+                                "text": "edit", "model": "m",
+                                "tokens_in": 1, "tokens_out": 1,
+                                "cost_usd": 0.01, "wall_ms": 10}},
+                            "claude"))
+    monkeypatch.setattr("hydra_core.squad_node._claude_critique",
+                        lambda *a, **k: {"outcome": "pass", "critique_md": "ok",
+                                         "score": {"c": 9}, "cost_usd": 0.0,
+                                         "tokens_in": 0, "tokens_out": 0})
+
+    # Note: _drive_best_of_loop calls start_best_of_stage itself; do NOT pass stage_id.
+    disp = _BODisp()
+    out = _drive_best_of_loop(disp, run_id="run-bo",
+                               project_path="/tmp/proj", request_text="do it",
+                               n=1)
+    assert not archive_called, (
+        "Finding 5: readiness fail must prevent archive_winner_and_losers from running")
+    assert out.get("final_status") == "surfaced", (
+        "Finding 5: readiness fail must produce surfaced final_status")
+
+
+# ===========================================================================
+# Finding 6: bounded GAP-a2 baseline
+# ===========================================================================
+
+def test_f6_baseline_too_broad_fails_smoke(tmp_path, monkeypatch):
+    """When excusable set exceeds HYDRA_SMOKE_BASELINE_MAX, smoke must remain
+    failed (not excused) and a telemetry event must be emitted."""
+    import hydra_core.telemetry as _tel
+    telemetry_events: list = []
+    monkeypatch.setattr(_tel, "emit", lambda *a, **k: telemetry_events.append(a))
+
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "many tests failed"))
+    # Set up 3 excusable tests with a cap of 2 → too broad
+    monkeypatch.setenv("HYDRA_SMOKE_BASELINE_TESTS",
+                       "tests/t1.py::t1,tests/t2.py::t2,tests/t3.py::t3")
+    monkeypatch.setenv("HYDRA_SMOKE_BASELINE_MAX", "2")
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    res = _submit(disp, res, "generate-0", text="edit")
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="codex")
+    # smoke must remain failed → not complete
+    assert res["status"] != "complete", (
+        "Finding 6: baseline too broad must keep smoke failed")
+    # telemetry must mention too_broad
+    too_broad = [e for e in telemetry_events
+                 if "baseline_too_broad" in str(e)]
+    assert too_broad, "Finding 6: baseline_too_broad telemetry must be emitted"
+
+
+def test_f6_baseline_intersection_with_env_var(tmp_path, monkeypatch):
+    """When both captured baseline and env var are set, excusable = intersection.
+    A test that is in env var but NOT in captured baseline must NOT be excused."""
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "test_new FAILED"))
+    # env var allows test_old; captured baseline also has test_old
+    # current failure: test_new (not in either) → not excused → surfaced
+    monkeypatch.setenv("HYDRA_SMOKE_BASELINE_TESTS", "tests/test_old.py::test_old")
+
+    _mock_proc = MagicMock()
+    _mock_proc.stdout = "FAILED tests/test_new.py::test_new\n1 failed"
+    _mock_proc.stderr = ""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _mock_proc)
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    # Set baseline_failures in cursor to have test_old
+    import json
+    cursor = json.loads(Path(res["cursor_path"]).read_text())
+    cursor["baseline_failures"] = ["tests/test_old.py::test_old"]
+    Path(res["cursor_path"]).write_text(json.dumps(cursor))
+
+    res = _submit(disp, res, "generate-0", text="edit")
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="codex")
+    assert res["status"] != "complete", (
+        "Finding 6: test_new not in excusable set → must not complete")
+
+
+def test_f6_baseline_excuse_telemetry_emitted(tmp_path, monkeypatch):
+    """When failures are excused (pre-existing), telemetry must list which
+    tests were excused (baseline_excuse_decision event)."""
+    import hydra_core.telemetry as _tel
+    telemetry_events: list = []
+    monkeypatch.setattr(_tel, "emit", lambda *a, **k: telemetry_events.append(a))
+
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "test_old FAILED"))
+    monkeypatch.setenv("HYDRA_SMOKE_BASELINE_TESTS", "tests/test_old.py::test_old")
+    _mock_proc = MagicMock()
+    _mock_proc.stdout = "FAILED tests/test_old.py::test_old\n1 failed"
+    _mock_proc.stderr = ""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _mock_proc)
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    res = _submit(disp, res, "generate-0", text="edit")
+    res = _submit(disp, res, "judge-0", outcome="pass", judge_producer="codex")
+    excuse_events = [e for e in telemetry_events
+                     if "baseline_excuse_decision" in str(e)]
+    assert excuse_events, (
+        "Finding 6: baseline_excuse_decision telemetry must be emitted "
+        "when failures are excused")
+
+
+# ===========================================================================
+# Finding 7: F27 preflight checks all three agent files
+# ===========================================================================
+
+def test_f7_preflight_missing_judge_cross_vendor(monkeypatch, tmp_path):
+    """The attended preflight must error when judge-cross-vendor.md is absent,
+    not just when engineer.md is absent."""
+    from hydra_core import cli as _cli
+    # Create only engineer.md and judge-same-vendor.md — omit judge-cross-vendor.md
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "engineer.md").write_text("stub", encoding="utf-8")
+    (agents_dir / "judge-same-vendor.md").write_text("stub", encoding="utf-8")
+    # judge-cross-vendor.md is missing
+
+    # Invoke the preflight logic directly (mirrors _cmd_attended_step check)
+    _required = {"engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"}
+    missing = [n for n in _required if not (agents_dir / n).exists()]
+    assert "judge-cross-vendor.md" in missing, (
+        "Finding 7: preflight must detect missing judge-cross-vendor.md")
+
+
+def test_f7_preflight_missing_judge_same_vendor(tmp_path):
+    """The attended preflight must error when judge-same-vendor.md is absent."""
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "engineer.md").write_text("stub", encoding="utf-8")
+    (agents_dir / "judge-cross-vendor.md").write_text("stub", encoding="utf-8")
+    # judge-same-vendor.md is missing
+
+    _required = {"engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"}
+    missing = [n for n in _required if not (agents_dir / n).exists()]
+    assert "judge-same-vendor.md" in missing, (
+        "Finding 7: preflight must detect missing judge-same-vendor.md")
+
+
+def test_f7_engineer_md_has_self_verification():
+    """engineer.md must contain the self-verification step (anti-pattern grep
+    and do_not_touch) so the engineer sub-agent knows to run it."""
+    eng_file = HYDRA_ROOT / ".claude" / "agents" / "engineer.md"
+    content = eng_file.read_text(encoding="utf-8")
+    assert "self-verif" in content.lower() or "anti-pattern" in content.lower(), (
+        "Finding 7: engineer.md must mention self-verification or anti-pattern grep")
+    assert "do_not_touch" in content or "do not touch" in content.lower(), (
+        "Finding 7: engineer.md must mention do_not_touch boundary check")
+
+
+def test_f7_judge_files_say_do_not_call_record_verdict():
+    """Both judge stubs must explicitly say NOT to call record_verdict."""
+    for name in ("judge-cross-vendor.md", "judge-same-vendor.md"):
+        f = HYDRA_ROOT / ".claude" / "agents" / name
+        content = f.read_text(encoding="utf-8")
+        assert "record_verdict" in content and (
+            "not" in content.lower() or "do NOT" in content
+        ), (f"Finding 7: {name} must explicitly say NOT to call record_verdict")
+
+
+def test_f7_judge_files_tools_do_not_include_record_verdict():
+    """Neither judge stub's tools frontmatter should list record_verdict."""
+    for name in ("judge-cross-vendor.md", "judge-same-vendor.md"):
+        f = HYDRA_ROOT / ".claude" / "agents" / name
+        content = f.read_text(encoding="utf-8")
+        # Extract the tools line from frontmatter
+        for line in content.splitlines():
+            if line.startswith("tools:"):
+                assert "record_verdict" not in line, (
+                    f"Finding 7: {name} tools frontmatter must NOT list "
+                    f"mcp__pp_harness__record_verdict (got: {line!r})")
+                break

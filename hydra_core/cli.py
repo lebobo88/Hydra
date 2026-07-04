@@ -1316,19 +1316,30 @@ def _cmd_attended_step(args) -> int:
             project_path = _resolve_task_project_path(task, state, project)
             request_text = task.description or state.root_goal
 
-            # F27: preflight — verify the engineer agent file exists before
-            # staging a host_action that references it. If absent, surface a
-            # clear dependency error rather than emitting a broken host_action.
-            _eng_agent_file = project / ".claude" / "agents" / "engineer.md"
-            if not _eng_agent_file.exists():
+            # F27: preflight — verify ALL THREE agent files exist before
+            # staging host_actions that reference them.  If any is absent,
+            # surface a clear dependency error rather than a broken host_action.
+            _agents_dir = project / ".claude" / "agents"
+            _required_agents = {
+                "engineer.md": "code generator",
+                "judge-cross-vendor.md": "cross-vendor judge",
+                "judge-same-vendor.md": "same-vendor judge",
+            }
+            _missing_agents = [
+                name for name in _required_agents
+                if not (_agents_dir / name).exists()
+            ]
+            if _missing_agents:
                 print(json.dumps({
                     "ok": False, "error": "missing_agent_dependency",
                     "detail": (
-                        f"engineer agent file not found: {_eng_agent_file}. "
-                        "Create .claude/agents/engineer.md (or symlink from "
-                        "pair-programmer/.claude/agents/engineer.md) to enable "
+                        f"attended engineering requires agent stubs: "
+                        f"{', '.join(_missing_agents)}. "
+                        "Create them under .claude/agents/ (or symlink from "
+                        "pair-programmer/.claude/agents/) to enable "
                         "attended engineering."
                     ),
+                    "missing": _missing_agents,
                 }), file=sys.stderr)
                 return 1
 

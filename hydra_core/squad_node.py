@@ -1042,8 +1042,13 @@ def _drive_pp_stage_loop(
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
                     _rv_ok = False
+            # Finding 2: track infra-failure downgrades so we can skip Reflexion.
+            # Infra failures (RPC error, degraded judge) are not code defects —
+            # retrying the engineer cannot fix them.
+            _infra_downgrade = False
             if outcome == "pass" and not _rv_ok:
                 outcome = "revise"
+                _infra_downgrade = True
                 out["error"] = (out.get("error") or "") + \
                     " record_verdict RPC failed; stage downgraded to surfaced"
             # F11-trace: per-attempt verdict event (Reflexion×1 → up to 2 attempts).
@@ -1057,11 +1062,14 @@ def _drive_pp_stage_loop(
             # F31: required cross-vendor but got same-vendor (degraded) → downgrade pass.
             if degraded and outcome == "pass":
                 outcome = "revise"
+                _infra_downgrade = True
                 out["error"] = (out.get("error") or "") + \
                     " required_cross_vendor=true but judge was same-vendor; downgraded"
 
             if outcome == "pass":
                 break  # accept; no Reflexion needed
+            if _infra_downgrade:
+                break  # Finding 2: infra failure → surface immediately, skip Reflexion
 
         out["attempt_id"] = attempt_id
 
@@ -1450,57 +1458,19 @@ def _drive_best_of_loop(
         out["critique"] = str(winner["critique"])[:1000]
         out["smoke_status"] = winner["smoke"]
 
-        # Merge winner worktree; archive losers. pp refuses the merge if the
-        # winner's recorded smoke failed (merge_status="smoke_failed").
         candidate_paths = [str(c.get("worktree_path") or project_path)
                            for c in sorted(candidates,
                                            key=lambda c: int(c.get("candidate_index") or 0))]
-        merge_status = "unknown"
-        try:
-            aw = _pp_inner(cm("pp_harness", "archive_winner_and_losers", {
-                "run_id": run_id, "stage_id": stage_id, "stage_kind": "code",
-                "winner_candidate_index": int(winner["ci"]),
-                "candidate_paths": candidate_paths,
-            }, squad_id=sq))
-            merge_status = str(aw.get("merge_status") or "unknown")
-            wdp = aw.get("winner_diff_path")
-            if wdp:
-                out["changed_paths"] = sorted(set(out["changed_paths"]) | {wdp})
-        except Exception as e:  # noqa: BLE001
-            out["error"] = f"archive_winner_and_losers failed: {e!r}"
-            merge_status = "error"
 
-        # Teardown candidate worktrees (best-effort; pp preserves artifacts
-        # first). A non-ok teardown (preserve_failed / partial) means orphaned
-        # worktrees or un-preserved artifacts — surface it (pp's contract says the
-        # caller MUST). We do NOT discard a successfully-merged winner over a
-        # cleanup gap, but we make the gap visible in out + the trace + the log.
-        try:
-            td = _pp_inner(cm("pp_harness", "teardown_candidates", {
-                "project_path": project_path, "candidate_paths": candidate_paths,
-                "run_id": run_id, "stage_kind": "code",
-            }, squad_id=sq))
-            td_status = str(td.get("teardown_status") or "ok")
-            if td_status != "ok":
-                out["teardown_status"] = td_status
-                out["teardown_not_torn_down"] = td.get("not_torn_down") or []
-                _log.warning(
-                    "best-of teardown not clean (run=%s): status=%s not_torn_down=%s",
-                    run_id, td_status, out["teardown_not_torn_down"])
-        except Exception as e:  # noqa: BLE001
-            out["teardown_status"] = "error"
-            _log.warning("best-of teardown raised (run=%s): %r", run_id, e)
-
-        # "merged" (git merge) and "copy" (copy-mode merge-back on a non-git
-        # project) are BOTH successful applies; everything else is a real block.
-        # A passed stage also requires a real winner attempt id (finalize_stage
-        # rejects a 'passed' status without winner_attempt_id).
-        merge_ok = merge_status in {"merged", "copy"}
+        # Finding 5: preliminary passed check WITHOUT merging yet.  The winner
+        # merge (archive_winner_and_losers) is deferred until AFTER
+        # readiness + finalize_stage succeed.  Merging first then downgrading
+        # left surfaced code in the project tree — the gate order was inverted.
         passed = (winner["outcome"] == "pass" and winner["smoke"] == "pass"
-                  and bool(winner.get("att")) and merge_ok)
+                  and bool(winner.get("att")))
         if not passed and not out.get("error"):
             out["error"] = (f"best-of: winner outcome={winner['outcome']} "
-                            f"smoke={winner['smoke']} merge={merge_status}")
+                            f"smoke={winner['smoke']}")
 
         # Readiness preflight (same terminal-blocker handling as the single path).
         if passed:
@@ -1533,6 +1503,54 @@ def _drive_best_of_loop(
             out["stage_outcome"] = "surfaced"
             out["error"] = (out.get("error") or "") + \
                 " finalize_stage RPC failed; stage downgraded to surfaced"
+
+        # Merge winner worktree ONLY when still passing after readiness +
+        # finalize_stage.  pp refuses the merge if the winner's recorded smoke
+        # failed (merge_status="smoke_failed").
+        merge_status = "skipped"
+        if passed:
+            try:
+                aw = _pp_inner(cm("pp_harness", "archive_winner_and_losers", {
+                    "run_id": run_id, "stage_id": stage_id, "stage_kind": "code",
+                    "winner_candidate_index": int(winner["ci"]),
+                    "candidate_paths": candidate_paths,
+                }, squad_id=sq))
+                merge_status = str(aw.get("merge_status") or "unknown")
+                wdp = aw.get("winner_diff_path")
+                if wdp:
+                    out["changed_paths"] = sorted(set(out["changed_paths"]) | {wdp})
+            except Exception as e:  # noqa: BLE001
+                out["error"] = (out.get("error") or "") + \
+                    f" archive_winner_and_losers failed: {e!r}"
+                merge_status = "error"
+            merge_ok = merge_status in {"merged", "copy"}
+            if not merge_ok:
+                passed = False
+                out["stage_outcome"] = "surfaced"
+                if "merge" not in (out.get("error") or ""):
+                    out["error"] = (out.get("error") or "") + \
+                        f" merge failed: {merge_status}"
+
+        # Teardown candidate worktrees (best-effort; pp preserves artifacts
+        # first). A non-ok teardown (preserve_failed / partial) means orphaned
+        # worktrees or un-preserved artifacts — surface it (pp's contract says the
+        # caller MUST). We do NOT discard a successfully-merged winner over a
+        # cleanup gap, but we make the gap visible in out + the trace + the log.
+        try:
+            td = _pp_inner(cm("pp_harness", "teardown_candidates", {
+                "project_path": project_path, "candidate_paths": candidate_paths,
+                "run_id": run_id, "stage_kind": "code",
+            }, squad_id=sq))
+            td_status = str(td.get("teardown_status") or "ok")
+            if td_status != "ok":
+                out["teardown_status"] = td_status
+                out["teardown_not_torn_down"] = td.get("not_torn_down") or []
+                _log.warning(
+                    "best-of teardown not clean (run=%s): status=%s not_torn_down=%s",
+                    run_id, td_status, out["teardown_not_torn_down"])
+        except Exception as e:  # noqa: BLE001
+            out["teardown_status"] = "error"
+            _log.warning("best-of teardown raised (run=%s): %r", run_id, e)
 
         td_note = (f" teardown={out['teardown_status']}"
                    if out.get("teardown_status") else "")

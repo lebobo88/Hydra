@@ -808,9 +808,13 @@ def test_best_of_n_merge_conflict_surfaces(monkeypatch) -> None:
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
     assert out["final_status"] == "surfaced"
+    # Finding 5: finalize_stage is now called BEFORE archive_winner_and_losers,
+    # so it reflects the preliminary winner verdict ("passed"), not the merge result.
+    # The run is surfaced via finalize_run(surfaced) after the merge fails.
     fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
-    assert fs["status"] == "surfaced"
-    assert "merge=conflict" in (out.get("error") or "")
+    assert fs["status"] == "passed"   # preliminary verdict was pass; merge failed after
+    assert "conflict" in (out.get("error") or ""), (
+        f"merge failure error must mention conflict: {out.get('error')}")
 
 
 def test_best_of_n_falls_back_to_single_when_cannot_open(monkeypatch) -> None:

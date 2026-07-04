@@ -206,7 +206,8 @@ def _parse_failing_tests(output: str) -> set[str]:
     return failing
 
 
-def _capture_baseline_failures(project_path: str) -> list[str]:
+def _capture_baseline_failures(
+        project_path: str, repo_root: str | None = None) -> list[str]:
     """Run pytest before engineer changes; return sorted list of failing test IDs.
 
     Called at begin_stage time (fresh worktree = no engineer changes) so
@@ -214,17 +215,26 @@ def _capture_baseline_failures(project_path: str) -> list[str]:
     inside a worktree) are captured as the baseline.  A later smoke-fail
     is treated as clean if current failures ⊆ baseline.
 
-    GAP-a2: tries multiple candidate directories to find tests/. A worktree
-    often shares tests with the repo root (git worktree is a shallow copy).
+    GAP-a2 (Fix 3): tries repo_root first when provided, since a worktree
+    at <repo>/.harness/worktrees/attended-X does NOT have a tests/ directory
+    of its own — the tests live in the repo root.  Without repo_root, falls
+    back to project_path then project_path.parent (less reliable for worktrees,
+    which may be several levels deep under the repo root).
     Fail-soft: any exception returns an empty list (no baseline → smoke
     failures are NOT excused, which is the safe default).
     """
     import sys as _sys
-    candidates = [project_path]
-    # Also try parent (the repo root; worktrees share the same .git objects)
-    parent = str(Path(project_path).parent)
-    if parent and parent != project_path:
-        candidates.append(parent)
+    # Build candidate list: prefer repo_root > project_path > parent
+    candidates: list[str] = []
+    if repo_root and repo_root != project_path:
+        candidates.append(repo_root)
+    candidates.append(project_path)
+    if not repo_root:
+        # Legacy fallback: try parent (unreliable for deep worktrees but better
+        # than nothing when repo_root is unknown).
+        parent = str(Path(project_path).parent)
+        if parent and parent != project_path:
+            candidates.append(parent)
     for cwd in candidates:
         tests_dir = Path(cwd) / "tests"
         if not tests_dir.is_dir():
@@ -378,10 +388,11 @@ def begin_stage(
 
     base_prompt = _build_engineer_prompt(request_text, work_path)
     # Rider (a): capture baseline failures before the engineer touches anything.
-    # The worktree is a fresh copy of HEAD at this point, so any failures here
-    # are environment-specific (path-sensitive tests that always fail inside a
-    # worktree) rather than regressions introduced by the engineer's changes.
-    baseline_failures = _capture_baseline_failures(work_path)
+    # The worktree is a linked git worktree (same commits as the repo root); any
+    # failures here are environment-specific rather than regressions introduced
+    # by the engineer's changes.  Pass repo_root so pytest runs from the right
+    # directory (worktrees don't carry their own tests/ dir).
+    baseline_failures = _capture_baseline_failures(work_path, repo_root=repo_root)
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "workflow_id": workflow_id,
@@ -504,16 +515,27 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         }, squad_id=_SQ)
     except Exception:  # noqa: BLE001
         pass
-    att = cm("pp_harness", "record_attempt", {
-        "stage_id": stage_id, "producer": producer, "model_id": model_id,
-        "agent_type": "engineer",   # F29
-        "tokens_in": int(result.get("tokens_in") or 0),
-        "tokens_out": int(result.get("tokens_out") or 0),
-        "cost_usd": float(result.get("cost_usd") or 0.0),
-        "status": "ok", "retry_index": gen_idx,
-        "notes": {"candidate_index": 1},
-    }, squad_id=_SQ)
-    cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
+    # Finding 1: wrap record_attempt in try/except — an RPC failure here must
+    # surface cleanly, not crash submit_host_result and orphan the stage.
+    # The pp schema accepts agent_type as an optional top-level string; strict
+    # mode only rejects the literal 'general-purpose', not 'engineer'.
+    try:
+        att = cm("pp_harness", "record_attempt", {
+            "stage_id": stage_id, "producer": producer, "model_id": model_id,
+            "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
+            "tokens_in": int(result.get("tokens_in") or 0),
+            "tokens_out": int(result.get("tokens_out") or 0),
+            "cost_usd": float(result.get("cost_usd") or 0.0),
+            "status": "ok", "retry_index": gen_idx,
+            "notes": {"candidate_index": 1},
+        }, squad_id=_SQ)
+        cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
+    except Exception as _ra_exc:  # noqa: BLE001
+        # record_attempt RPC failed — surface the stage immediately rather than
+        # crashing. The engineer's work is generated but cannot be tracked.
+        cursor["error"] = f"record_attempt RPC failed: {_ra_exc!r}"
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        return
 
     # Judge routing — honour pp's gate_eligible_judges (cross- vs same-vendor)
     # exactly like the headless loop, so the host spawns the right judge agent.
@@ -602,9 +624,15 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if degraded:
         score_json["_judge_degraded"] = True
 
+    # Finding 2: track whether the outcome change is an infra failure (F31 /
+    # F26+M8) vs a genuine artifact defect.  Infra failures must surface
+    # immediately — Reflexion is reserved for code defects the engineer can fix.
+    _infra_downgrade = False
+
     # F31: required cross-vendor but got same-vendor judge → downgrade pass to surfaced.
     if degraded and outcome == "pass":
         outcome = "revise"   # treat as revise so non-pass path runs
+        _infra_downgrade = True
         cursor["error"] = ("required_cross_vendor=true but judge was same-vendor "
                            "(degraded); stage downgraded to surfaced")
 
@@ -628,6 +656,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             _record_verdict_ok = False
     if outcome == "pass" and not _record_verdict_ok:
         outcome = "revise"
+        _infra_downgrade = True
         cursor["outcome"] = "revise"
         cursor["error"] = (cursor.get("error") or "") + \
             " record_verdict RPC failed; stage downgraded to surfaced"
@@ -651,7 +680,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     # GAP-f: Reflexion×1 — on first revise (gen_idx==0), transition back to
     # await_generate with an augmented prompt that embeds the critique.
-    if outcome == "revise" and gen_idx == 0:
+    # Finding 2: skip Reflexion for infra failures (F31 degraded judge, F26+M8
+    # record_verdict RPC error) — retrying the engineer cannot fix an infra
+    # problem and wastes a generation slot.
+    if outcome == "revise" and gen_idx == 0 and not _infra_downgrade:
         cursor["generate_index"] = 1
         cursor["reflexion_critique"] = critique_md
         aug_prompt = _augment_with_critique(cursor["request_text"], critique_md)
@@ -686,34 +718,70 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         # GAP-a2 / Rider (a): compare against the baseline failures.
         # If every currently-failing test was ALREADY failing before the engineer's
         # change, the smoke failure is not attributable to this change — excuse it.
-        # Lazy fallback: if baseline is empty, try HYDRA_SMOKE_BASELINE_TESTS env var.
+        # Finding 6: bound the excusable set to prevent real regressions being
+        # silently blessed by an overly broad baseline.
         if smoke_status == "fail":
-            baseline = list(cursor.get("baseline_failures") or [])
-            if not baseline:
-                _env_bl = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
-                if _env_bl:
-                    baseline = [t.strip() for t in _env_bl.split(",") if t.strip()]
-            if baseline:
-                import sys as _sys
-                try:
-                    _reruns = subprocess.run(
-                        [_sys.executable, "-m", "pytest",
-                         "tests/", "--no-header", "-q", "--tb=no"],
-                        cwd=work_path,
-                        capture_output=True, text=True, check=False, timeout=240,
-                    )
-                    _current_failing = _parse_failing_tests(
-                        _reruns.stdout + "\n" + _reruns.stderr)
-                except Exception:  # noqa: BLE001
-                    _current_failing = set()
-                _baseline_set = set(baseline)
-                _new_failures = _current_failing - _baseline_set
-                if not _new_failures:
-                    smoke_status = "pass"
+            _captured_baseline = list(cursor.get("baseline_failures") or [])
+            _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
+            _env_allowlist: set[str] | None = (
+                {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
+                if _env_bl_raw else None
+            )
+            # Build excusable set:
+            #  - env var present + captured non-empty → intersection (tightest bound)
+            #  - env var present + captured empty → env var alone (legacy fallback)
+            #  - env var absent → captured baseline alone
+            _captured_set = set(_captured_baseline)
+            if _env_allowlist is not None:
+                _excusable = (_captured_set & _env_allowlist) if _captured_set else _env_allowlist
+            else:
+                _excusable = _captured_set
+
+            if _excusable:
+                _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
+                if len(_excusable) > _max_excuse:
+                    # Baseline too broad — refuse to excuse; treat as real failure.
+                    _trace(cursor, "attended.smoke.baseline_too_broad", {
+                        "stage_id": cursor.get("stage_id"),
+                        "excusable_count": len(_excusable),
+                        "max": _max_excuse,
+                    })
                     smoke_reason = (
-                        f"smoke: {len(_current_failing)} failure(s) all pre-existed "
-                        f"in baseline; treated as pass"
+                        f"smoke: baseline too broad ({len(_excusable)} excusable "
+                        f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
+                        "treating as real failure"
                     )
+                else:
+                    import sys as _sys
+                    try:
+                        _reruns = subprocess.run(
+                            [_sys.executable, "-m", "pytest",
+                             "tests/", "--no-header", "-q", "--tb=no"],
+                            cwd=work_path,
+                            capture_output=True, text=True, check=False, timeout=240,
+                        )
+                        _current_failing = _parse_failing_tests(
+                            _reruns.stdout + "\n" + _reruns.stderr)
+                    except Exception:  # noqa: BLE001
+                        _current_failing = set()
+                    _excused = _current_failing & _excusable
+                    _new_failures = _current_failing - _excusable
+                    # Always emit telemetry about excused failures (Finding 6).
+                    if _current_failing or _excused:
+                        _trace(cursor, "attended.smoke.baseline_excuse_decision", {
+                            "stage_id": cursor.get("stage_id"),
+                            "current_failing": sorted(_current_failing),
+                            "excused": sorted(_excused),
+                            "new_failures": sorted(_new_failures),
+                            "excusable_set_size": len(_excusable),
+                        })
+                    if not _new_failures:
+                        smoke_status = "pass"
+                        smoke_reason = (
+                            f"smoke: {len(_current_failing)} failure(s) all "
+                            f"pre-existed in baseline ({len(_excused)} excused); "
+                            "treated as pass"
+                        )
         try:
             cm("pp_harness", "record_smoke_status", {
                 "stage_id": cursor["stage_id"], "candidate_index": 1,
@@ -754,6 +822,9 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     F26+M8: a finalize_stage RPC failure on a passing stage downgrades to
     surfaced — we never proceed to finalize_run 'complete' with an un-recorded
     stage.
+    Finding 4: worktree merge happens BEFORE finalize_run so a merge failure
+    can downgrade finalize_run to 'surfaced' truthfully (previously the run
+    was finalized 'complete' and only the cursor reflected the merge failure).
     F30: abort/error reason is included in summary_md (FinalizeRunSchema strips
     standalone `reason` / `project_path` keys).
     """
@@ -777,6 +848,27 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
         cursor["outcome"] = "surfaced"
         cursor["error"] = (cursor.get("error") or "") + \
             " finalize_stage RPC failed; stage downgraded to surfaced"
+
+    # Finding 4: merge the worktree BEFORE calling finalize_run so a merge
+    # failure can truthfully downgrade the run to 'surfaced'.  Previously the
+    # order was finalize_run(complete) → merge → cursor surfaced, which left the
+    # pp ledger claiming 'complete' while no code actually landed.
+    worktree_path = cursor.get("worktree_path")
+    repo_root = cursor.get("repo_root")
+    branch = cursor.get("branch")
+    if worktree_path and repo_root and branch:
+        if passed:
+            merge = _merge_worktree_back(repo_root, worktree_path, branch)
+            cursor["merge"] = merge
+            if not merge.get("merged"):
+                # Merge failed — surface the run so the operator knows code
+                # did not land, and pass that truth to finalize_run below.
+                passed = False
+                cursor["error"] = (cursor.get("error") or "") + \
+                    f" merge-back failed: {merge.get('error')}"
+        else:
+            cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
+        _remove_worktree(repo_root, worktree_path)
 
     # F30: build summary_md that embeds any error/abort reason.
     if gen_failed:
@@ -804,27 +896,6 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     else:
         cursor["final_status"] = "surfaced"
         cursor["state"] = "surfaced"
-
-    # Worktree write-safety: merge the engineer's isolated changes back into the
-    # repo ONLY on a complete finalize; otherwise discard. Always remove the
-    # worktree so it never accumulates. The merge is recorded for the operator.
-    worktree_path = cursor.get("worktree_path")
-    repo_root = cursor.get("repo_root")
-    branch = cursor.get("branch")
-    if worktree_path and repo_root and branch:
-        if cursor["final_status"] == "complete":
-            merge = _merge_worktree_back(repo_root, worktree_path, branch)
-            cursor["merge"] = merge
-            if not merge.get("merged"):
-                # Code passed gates but could not land — surface honestly rather
-                # than report a clean complete with no committed change.
-                cursor["final_status"] = "surfaced"
-                cursor["state"] = "surfaced"
-                cursor["error"] = (cursor.get("error") or "") + \
-                    f" merge-back failed: {merge.get('error')}"
-        else:
-            cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
-        _remove_worktree(repo_root, worktree_path)
 
     cursor["pending_action"] = None
     cursor["finalized"] = True
