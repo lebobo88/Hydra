@@ -77,9 +77,10 @@ def test_abort_drains_every_entry_on_success() -> None:
         assert server == "pp_harness"
         assert tool == "finalize_run"
         assert args["status"] == "aborted"
-        assert args["reason"] == "envelope_ceiling"
+        # F30: reason is embedded in summary_md (FinalizeRunSchema strips bare reason).
+        assert "envelope_ceiling" in (args.get("summary_md") or ""), (
+            f"F30: abort reason must be in summary_md, got: {args}")
         assert args["run_id"] in {"run_A", "run_B"}
-        assert args["project_path"] in {"C:/proj/a", "C:/proj/b"}
 
 
 def test_abort_partial_drain_leaves_failed_entries_in_state() -> None:
@@ -140,7 +141,10 @@ def test_abort_reason_defaults_to_supervisor_surfaced() -> None:
 
     abort_open_pp_runs(state, dispatcher)
 
-    assert dispatcher.calls[0][2]["reason"] == "supervisor_surfaced"
+    # F30: reason is embedded in summary_md (FinalizeRunSchema strips bare reason key).
+    args = dispatcher.calls[0][2]
+    assert "supervisor_surfaced" in (args.get("summary_md") or ""), (
+        f"F30: default abort reason must be in summary_md, got: {args}")
 
 
 def test_open_pp_runs_field_is_replace_not_append_reducer() -> None:

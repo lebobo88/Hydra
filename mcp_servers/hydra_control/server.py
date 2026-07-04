@@ -251,7 +251,7 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
 
 
 def _launch_run(goal: str, *, squad: str | None, budget: float | None,
-                workflow_id: str | None) -> dict[str, Any]:
+                workflow_id: str | None, risk: str | None = None) -> dict[str, Any]:
     """Launch a NEW workflow via a DETACHED `hydra run --live`.
 
     The host-facing deterministic launch surface (generalises web/server's
@@ -270,6 +270,8 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
         cmd.extend(["--squad", squad])
     if budget is not None:
         cmd.extend(["--budget", str(budget)])
+    if risk is not None:
+        cmd.extend(["--risk", risk])
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
@@ -341,7 +343,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
 
 
 def _run_plan(goal: str, *, squad: str | None, budget: float | None,
-              workflow_id: str | None) -> dict[str, Any]:
+              workflow_id: str | None, risk: str | None = None) -> dict[str, Any]:
     """Run `hydra plan` SYNCHRONOUSLY and return the planner state IN-BAND.
 
     The non-detaching counterpart to `_launch_run`: attended (host-bridged)
@@ -358,6 +360,8 @@ def _run_plan(goal: str, *, squad: str | None, budget: float | None,
         cli_args.extend(["--squad", squad])
     if budget is not None:
         cli_args.extend(["--budget", str(budget)])
+    if risk is not None:
+        cli_args.extend(["--risk", risk])
     return _run_cli_json(cli_args, timeout_s=_PLAN_TIMEOUT_S,
                          err_label="plan", workflow_id=wf)
 
@@ -496,6 +500,8 @@ def _tool_handlers() -> dict[str, Any]:
             logger.exception("ingest launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
 
+    _RISK_VALUES = frozenset({"low", "medium", "high"})
+
     def workflow_launch(args: dict[str, Any]) -> dict[str, Any]:
         """Launch a NEW workflow deterministically (detached `hydra run --live`).
 
@@ -521,8 +527,13 @@ def _tool_handlers() -> dict[str, Any]:
         workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
         if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
             return {"ok": False, "error": "invalid_workflow_id"}
+        # F5: risk param — enum low|medium|high (optional).
+        risk = args.get("risk")
+        risk = str(risk) if risk not in (None, "") else None
+        if risk is not None and risk not in _RISK_VALUES:
+            return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
         try:
-            return _launch_run(goal, squad=squad, budget=budget, workflow_id=workflow_id)
+            return _launch_run(goal, squad=squad, budget=budget, workflow_id=workflow_id, risk=risk)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("run launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
@@ -554,8 +565,13 @@ def _tool_handlers() -> dict[str, Any]:
         workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
         if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
             return {"ok": False, "error": "invalid_workflow_id"}
+        # F5: risk param — enum low|medium|high (optional).
+        risk = args.get("risk")
+        risk = str(risk) if risk not in (None, "") else None
+        if risk is not None and risk not in _RISK_VALUES:
+            return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
         try:
-            return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id)
+            return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id, risk=risk)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("plan failed")
             return {"ok": False, "error": f"plan_failed: {e}"}
@@ -857,6 +873,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
                 "workflow_id": {"type": "string",
                                 "description": "Pre-allocated workflow id (optional)."},
+                "risk": {"type": "string", "enum": ["low", "medium", "high"],
+                         "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
             },
             "required": ["goal"],
         },
@@ -881,6 +899,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
                 "workflow_id": {"type": "string",
                                 "description": "Pre-allocated workflow id (optional)."},
+                "risk": {"type": "string", "enum": ["low", "medium", "high"],
+                         "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
             },
             "required": ["goal"],
         },

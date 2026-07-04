@@ -1091,9 +1091,16 @@ class TestRiderABaseline:
             assert " - " not in item, f"reason suffix leaked into id: {item!r}"
 
     def test_capture_baseline_failures_returns_sorted_list(self, monkeypatch, tmp_path):
-        """_capture_baseline_failures returns a sorted list of failing test ids."""
+        """_capture_baseline_failures returns a sorted list of failing test ids.
+
+        GAP-a2: the function now requires a tests/ directory to exist before
+        running pytest (it tries project_path then parent). Create tests/ so
+        the subprocess.run mock is actually invoked.
+        """
         from hydra_core.host_bridge import _capture_baseline_failures
         import subprocess
+        # GAP-a2: create tests/ so _capture_baseline_failures enters the run block.
+        (tmp_path / "tests").mkdir()
         fake_stdout = (
             "FAILED tests/test_z.py::test_z - AssertionError\n"
             "FAILED tests/test_a.py::test_a - AssertionError\n"

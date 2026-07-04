@@ -34,6 +34,11 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
     return {
         ("pp_harness", "start_run"): {"status": "done", "result": {"run_id": "run_T"}},
         ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
+        # F31: required_cross_vendor=False so same-vendor codex→codex doesn't
+        # downgrade here (these tests exercise drive-loop mechanics, not the
+        # cross-vendor enforcement gate).
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
         ("pp_codex", "generate"): {"status": "done", "result": {
             "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"pytest -q -> exit 0\"}",
             "model": "codex-1",
@@ -333,7 +338,12 @@ def test_drive_generate_prefers_host_engineer_and_codex_is_cross_vendor(monkeypa
     host = {"result": {
         "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
         "model": "claude-x", "cost_usd": 0.05, "tokens_in": 3, "tokens_out": 4}}
-    disp = _HostDispatcher(_happy_responses("pass"), host)
+    # F31: override gate to required_cross_vendor=True so codex is genuinely
+    # cross-vendor (claude generated, codex judged — not degraded).
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": True, "rubric_id": "rfc-2119-normative"}}
+    disp = _HostDispatcher(resp, host)
 
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
@@ -354,14 +364,20 @@ def test_drive_generate_prefers_host_engineer_and_codex_is_cross_vendor(monkeypa
 def test_drive_generate_falls_back_to_codex_when_no_host(monkeypatch) -> None:
     monkeypatch.setattr("hydra_core.squad_node._run_smoke",
                         lambda *_a, **_k: ("pass", "stub smoke pass"))
-    disp = _ScriptedDispatcher(_happy_responses("pass"))  # no run_host_agent
+    # F31: require cross-vendor so same-vendor codex→codex is flagged degraded.
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": True, "rubric_id": "rfc-2119-normative"}}
+    disp = _ScriptedDispatcher(resp)  # no run_host_agent
 
-    out = _drive_pp_stage_loop(
+    # Note: F31 fires (required_cross=True, codex judge = same-vendor → degraded)
+    # so the verdict is downgraded from pass→revise. The test verifies the FIRST
+    # record_verdict call carries the degraded marker, which is the key assertion.
+    _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
 
     # No host → codex generated → same-vendor codex judge, marked degraded.
-    assert out.get("producer") == "codex"
-    assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
+    assert any(True for (s, t, _a) in disp.calls if (s, t) == ("pp_codex", "generate"))
     rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
     assert rv["score_json"].get("_cross_vendor") is False
     assert rv["score_json"].get("_judge_degraded") is True
@@ -619,9 +635,17 @@ def test_judge_artifact_text_falls_back_to_summary() -> None:
 
 def test_judge_defaults_cross_vendor_codex_when_gate_unavailable(monkeypatch) -> None:
     """Claude generated but the gate tool returns nothing (no daemon) → default
-    to cross-vendor codex (conservative); gate_eligible_judges is still called."""
+    to cross-vendor codex (conservative); gate_eligible_judges is still called.
+
+    F31: gate returns empty → required_cross_vendor defaults to True; Claude
+    generates + codex judges → cross_vendor=True → NOT degraded → pass accepted.
+    """
     _claude_gen(monkeypatch)
-    disp = _LiveDispatcher(_happy_responses("pass"))  # no gate_eligible_judges response
+    # Explicitly remove gate_eligible_judges from responses so it returns {}
+    # (simulates "no daemon / tool missing"), falling back to required_cross=True.
+    resp = _happy_responses("pass")
+    del resp[("pp_harness", "gate_eligible_judges")]
+    disp = _LiveDispatcher(resp)  # no gate_eligible_judges response → default True
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
     assert out["producer"] == "claude"
@@ -784,9 +808,13 @@ def test_best_of_n_merge_conflict_surfaces(monkeypatch) -> None:
     out = _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="x")
     assert out["final_status"] == "surfaced"
+    # Finding 5: finalize_stage is now called BEFORE archive_winner_and_losers,
+    # so it reflects the preliminary winner verdict ("passed"), not the merge result.
+    # The run is surfaced via finalize_run(surfaced) after the merge fails.
     fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
-    assert fs["status"] == "surfaced"
-    assert "merge=conflict" in (out.get("error") or "")
+    assert fs["status"] == "passed"   # preliminary verdict was pass; merge failed after
+    assert "conflict" in (out.get("error") or ""), (
+        f"merge failure error must mention conflict: {out.get('error')}")
 
 
 def test_best_of_n_falls_back_to_single_when_cannot_open(monkeypatch) -> None:

@@ -270,8 +270,13 @@ def test_worktree_isolation_and_merge_back(tmp_path):
 
 
 def test_worktree_discarded_on_surface(tmp_path):
-    """When the stage surfaces (judge revise), the worktree is discarded and the
-    repo is left untouched."""
+    """When the stage surfaces (judge revise × Reflexion x1), the worktree is
+    discarded and the repo is left untouched.
+
+    GAP-f: the first revise now triggers Reflexion x1 (back to await_generate
+    for generate-1). The worktree must persist through generate-1 and only be
+    discarded once the stage actually finalizes surfaced after the second revise.
+    """
     _init_repo(tmp_path)
     disp = FakeDispatcher()
     res = host_bridge.begin_stage(
@@ -284,8 +289,18 @@ def test_worktree_discarded_on_surface(tmp_path):
     res = host_bridge.submit_host_result(
         disp, cursor_file=res["cursor_path"], call_key="generate-0",
         result={"text": "added feature.py"})
+    # First revise → GAP-f Reflexion x1 transition (back to await_generate).
     res = host_bridge.submit_host_result(
         disp, cursor_file=res["cursor_path"], call_key="judge-0",
+        result={"outcome": "revise", "judge_producer": "codex"})
+    assert res["state"] == "await_generate", "GAP-f: first revise should trigger Reflexion"
+    assert Path(wt).exists(), "worktree must survive through Reflexion"
+    # Reflexion generate-1 and second revise → finalize surfaced.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-1",
+        result={"text": "revision attempt"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-1",
         result={"outcome": "revise", "judge_producer": "codex"})
     assert res["status"] == "surfaced"
     # Nothing merged; repo working tree clean of the change.

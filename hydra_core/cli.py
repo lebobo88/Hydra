@@ -409,8 +409,10 @@ def _cmd_plan(args) -> int:
         }), file=sys.stderr)
         return 1
 
+    _risk = getattr(args, "risk", None)
     emit(project, workflow_id, "workflow_plan", {"goal": _goal,
-                                                 "budget_usd": initial.budget.budget_usd})
+                                                 "budget_usd": initial.budget.budget_usd,
+                                                 "risk": _risk})
     config = {"configurable": {"thread_id": str(workflow_id)}}
     sup.invoke(initial, config=config)
     snap = sup.get_state(config)
@@ -1314,6 +1316,33 @@ def _cmd_attended_step(args) -> int:
             project_path = _resolve_task_project_path(task, state, project)
             request_text = task.description or state.root_goal
 
+            # F27: preflight — verify ALL THREE agent files exist before
+            # staging host_actions that reference them.  If any is absent,
+            # surface a clear dependency error rather than a broken host_action.
+            _agents_dir = project / ".claude" / "agents"
+            _required_agents = {
+                "engineer.md": "code generator",
+                "judge-cross-vendor.md": "cross-vendor judge",
+                "judge-same-vendor.md": "same-vendor judge",
+            }
+            _missing_agents = [
+                name for name in _required_agents
+                if not (_agents_dir / name).exists()
+            ]
+            if _missing_agents:
+                print(json.dumps({
+                    "ok": False, "error": "missing_agent_dependency",
+                    "detail": (
+                        f"attended engineering requires agent stubs: "
+                        f"{', '.join(_missing_agents)}. "
+                        "Create them under .claude/agents/ (or symlink from "
+                        "pair-programmer/.claude/agents/) to enable "
+                        "attended engineering."
+                    ),
+                    "missing": _missing_agents,
+                }), file=sys.stderr)
+                return 1
+
             start = dispatcher.call_mcp("pp_harness", "start_run", {
                 "request_text": request_text, "project_path": project_path,
                 "mode": "single"}, squad_id="engineering")
@@ -1323,6 +1352,20 @@ def _cmd_attended_step(args) -> int:
                 print(json.dumps({"ok": False, "error": "start_run returned no run_id",
                                   "detail": str(start)[:500]}), file=sys.stderr)
                 return 1
+
+            # F28: ensure AGENTS.md / CLAUDE.md bootstrap in the target repo,
+            # mirroring squad_node._via_mcp ~1764-1774. Fail-soft.
+            try:
+                dispatcher.call_mcp(
+                    "pp_harness", "ensure_agents_md",
+                    {"project_path": project_path}, squad_id="engineering")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from .squad_node import _maybe_write_claude_shim
+                _maybe_write_claude_shim(project_path)
+            except Exception:  # noqa: BLE001
+                pass
 
             # Register the open pp run so postcheck/reap can finalize-abort it
             # if the workflow is abandoned mid-stage (run holds the .harness lock).
@@ -2139,6 +2182,8 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--workflow-id", dest="workflow_id_override", default=None,
                     metavar="ID",
                     help="Pre-allocate the workflow id (threads plan->step->resume).")
+    pl.add_argument("--risk", choices=["low", "medium", "high"], default=None,
+                    help="Operator risk tolerance hint (recorded on the plan event).")
 
     stp = sub.add_parser("step", help=(
         "Attended mode: open the next engineering stage and pause for a visible "

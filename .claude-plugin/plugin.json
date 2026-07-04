@@ -8,7 +8,10 @@
     "./.claude/agents/hydra-planner.md",
     "./.claude/agents/hydra-router.md",
     "./.claude/agents/hydra-supervisor.md",
-    "./.claude/agents/hydra-synthesizer.md"
+    "./.claude/agents/hydra-synthesizer.md",
+    "./.claude/agents/engineer.md",
+    "./.claude/agents/judge-cross-vendor.md",
+    "./.claude/agents/judge-same-vendor.md"
   ],
   "skills": "./.claude/skills",
   "commands": "./.claude/commands",

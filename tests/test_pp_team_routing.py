@@ -16,11 +16,28 @@ from pathlib import Path
 from typing import Any
 
 from hydra_core.schemas import Constraints, CSuiteDecisionPacket, DevTask
-from hydra_core.squad_loader import discover_squads
+from hydra_core.squad_loader import _coerce_pack, discover_squads
 from hydra_core.squad_node import _resolve_pp_team, _via_mcp
 from hydra_core.state import HydraState
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
+
+# GAP-d: fixture squad config so operator edits to squads/engineering/squad.yaml
+# cannot break these tests.  The fixture pins only the fields that these tests
+# actually care about (invoke.mode, default_team, accepts).
+_FIXTURE_ENG_PACK = _coerce_pack("engineering", {
+    "name": "Engineering & Product (fixture)",
+    "entrypoint": "mcp",
+    "industries": ["software"],
+    "accepts": ["PRD", "ARCH_RFC", "DEV_TASK", "HANDOFF"],
+    "emits": ["DECISION_RECORD"],
+    "invoke": {
+        "mode": "pp_best_of",
+        "default_team": "feature-team",
+        "command_hint": "/pp:run",
+        "project_path": "${project_root}",
+    },
+})
 
 
 class _RecordingDispatcher:
@@ -45,7 +62,8 @@ class _RecordingDispatcher:
 
 
 def _eng_pack():
-    return discover_squads(HYDRA_ROOT)["engineering"]
+    # GAP-d: return the fixture pack so live squad.yaml edits can't break tests.
+    return _FIXTURE_ENG_PACK
 
 
 def _run(monkeypatch, inbound) -> dict:

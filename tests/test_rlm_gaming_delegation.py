@@ -18,11 +18,44 @@ from typing import Any
 import pytest
 
 from hydra_core.schemas import CSuiteDecisionPacket
+from hydra_core.squad_loader import _coerce_pack
 from hydra_core.squad_node import _extract_emitted_envelopes
 from hydra_core.state import HydraState
 from hydra_core.supervisor import build_supervisor, _PurePythonRunner
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
+
+# GAP-d: minimal fixture packs for the squads used by the dispatch tests.
+# Operator edits to squads/*.yaml must not break these tests.
+_FIXTURE_PACKS = {
+    "engineering": _coerce_pack("engineering", {
+        "name": "Engineering & Product (fixture)",
+        "entrypoint": "mcp",
+        "accepts": ["PRD", "ARCH_RFC", "DEV_TASK", "HANDOFF"],
+        "emits": ["DECISION_RECORD"],
+        "invoke": {
+            "mode": "pp_best_of",
+            "default_team": "feature-team",
+            "command_hint": "/pp:run",
+            "project_path": "${project_root}",
+        },
+    }),
+    "rlm-gaming": _coerce_pack("rlm-gaming", {
+        "name": "RLM-Gaming (fixture)",
+        "entrypoint": "claude-skill",
+        "industries": ["games", "game-development", "aaa-games"],
+        "accepts": ["C_SUITE_DECISION_PACKET", "PRD", "DEV_TASK", "HANDOFF"],
+        "emits": ["PRD", "DEV_TASK", "DECISION_RECORD"],
+        "invoke": {
+            "command_hint": "/game-studio",
+            "output_dir": "RLM/output/gaming/{phase}/{topic-kebab}-{date}.md",
+            "delegate": {
+                "code_to": "engineering",
+                "assets_to": "garland",
+            },
+        },
+    }),
+}
 
 
 def _dev_task_dict(**over) -> dict:
@@ -180,6 +213,9 @@ def _hermetic_repo(monkeypatch, tmp_path: Path) -> Path:
 def test_dispatch_forwards_dev_task_to_engineering(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: pin squad config so operator edits to squads/*.yaml can't break this test.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
     repo_path = _hermetic_repo(monkeypatch, tmp_path)
     disp = _SkillToEngDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
@@ -213,6 +249,9 @@ def test_dispatch_forwards_dev_task_to_engineering(monkeypatch, tmp_path) -> Non
 def test_dispatch_forwards_repo_subpath_to_engineering(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: fixture squad config isolation.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
     repo_path = _hermetic_repo(monkeypatch, tmp_path / "mc-test-root")
 
     class _SubdirDispatcher(_SkillToEngDispatcher):
@@ -237,6 +276,9 @@ def test_forwarded_envelope_is_redacted_before_engineering(monkeypatch, tmp_path
     MCP-injection strings must be scrubbed before engineering (and pp) see it."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: fixture squad config isolation.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
     _hermetic_repo(monkeypatch, tmp_path)
 
     dirty = ("Implement fog-of-war. Contact dev@evil.example for keys. "
@@ -265,6 +307,9 @@ def test_forwarding_sweep_budget_block_surfaces(monkeypatch, tmp_path) -> None:
     preserves the forwarded envelope/artifacts that were already produced."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: fixture squad config isolation.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
     _hermetic_repo(monkeypatch, tmp_path)
 
     class _CostlyDispatcher(_SkillToEngDispatcher):
@@ -299,6 +344,9 @@ def test_rlm_gaming_skill_receives_delegation_priming(monkeypatch) -> None:
     priming so the host-run skill emits typed DEV_TASKs with pp_team + context."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: fixture squad config isolation.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
     captured: dict = {}
 
     class _CapturingDispatcher(_SkillToEngDispatcher):
@@ -330,6 +378,9 @@ def test_no_emitted_envelopes_means_no_forward(monkeypatch) -> None:
     """A skill that emits nothing (pure host-pickup) must not forward anything."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # GAP-d: fixture squad config isolation.
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda _root=None: dict(_FIXTURE_PACKS))
 
     class _NoEmitDispatcher(_SkillToEngDispatcher):
         def invoke_claude_skill(self, skill: str, args: dict) -> dict:
