@@ -411,6 +411,11 @@ HYDRA_CONTROL_TOOLS = [
     "hydra.workflow.step", "hydra.workflow.submit_host_result",
     "hydra.workflow.resume", "hydra.workflow.submit_envelopes",
     "hydra.cockpit.audit",
+    # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
+    "hydra.venom.cross_check",
+    "hydra.squad.list",
+    "hydra.envelope.record",
+    "hydra.telemetry.tail",
 ]
 
 # Optional / 3rd-party: blender-mcp (uvx blender-mcp; socket :9876 / MCP bridge
@@ -792,6 +797,40 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
             },
             "required": ["action", "actor", "project", "trace_id"],
+        },
+        # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
+        "hydra.venom.cross_check": {
+            "type": "object",
+            "properties": {
+                "capability": {"type": "string"},
+                "context": {"type": "object"},
+                "args": {"type": "object"},
+            },
+            "required": ["capability"],
+        },
+        "hydra.squad.list": {
+            "type": "object",
+            "properties": {},
+        },
+        "hydra.envelope.record": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "type": {"type": "string"},
+                "from_squad": {"type": "string"},
+                "origin_squad": {"type": "string"},
+                "to_squad": {"type": "string"},
+                "workflow_id": {"type": "string"},
+                "payload": {},
+            },
+        },
+        "hydra.telemetry.tail": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "since": {"type": "string"},
+            },
         },
     },
 }

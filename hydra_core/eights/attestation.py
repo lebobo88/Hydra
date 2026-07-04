@@ -22,10 +22,21 @@ Per `AGENTS.md` layering:
 """
 from __future__ import annotations
 
+import logging
+import os as _os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# F34: dedicated short-circuit timeout and circuit-breaker cooldown for
+# budget_charge.  budget.charge is ephemeral — stale charges are meaningless
+# on daemon recovery so we do NOT spool them; instead we cap the wait and
+# use a circuit breaker to avoid unbounded thread accumulation.
+_BUDGET_CHARGE_TIMEOUT_DEFAULT = 5.0   # seconds before a charge is abandoned
+_BUDGET_CHARGE_COOLDOWN_DEFAULT = 60.0  # seconds breaker stays open after timeout
 
 from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool, SpooledCall
@@ -72,6 +83,29 @@ class EightsAttestor:
     spool: PendingSpool = field(default_factory=PendingSpool)
     _dispatch_lock: threading.RLock = field(
         default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+    # F34 circuit-breaker state: monotonic timestamp after which budget_charge
+    # may attempt again.  0.0 = breaker closed (normal path).
+    _budget_charge_breaker_until: float = field(
+        default=0.0,
+        init=False,
+        repr=False,
+    )
+    # F34 concurrency gate: BoundedSemaphore(1) ensures at most ONE
+    # budget_charge thread is in-flight at a time, so a wedged call_mcp
+    # cannot accumulate parked threads behind _dispatch_lock.
+    _budget_charge_semaphore: threading.BoundedSemaphore = field(
+        default_factory=lambda: threading.BoundedSemaphore(1),
+        init=False,
+        repr=False,
+    )
+    # F34 round-3: dedicated lock for race-safe read/write of _budget_charge_breaker_until.
+    # Tiny critical sections — only the timestamp reads/writes, not the whole
+    # budget_charge body — so contention is negligible.
+    _budget_charge_breaker_lock: threading.Lock = field(
+        default_factory=threading.Lock,
         init=False,
         repr=False,
     )
@@ -348,14 +382,122 @@ class EightsAttestor:
         vendor: str = "",
         purpose: str = "",
     ) -> Optional[dict]:
-        """Record token/cost spend. The daemon enforces caps; Hydra does not
-        gate on this return value — the local BudgetLedger is authoritative
-        within a workflow."""
-        return self._call("eights.governance.budget.charge", {
-            "run_id": str(workflow_id),
-            "cost_usd": float(usd),
-            "tokens": int(tokens),
-        })
+        """Record token/cost spend — non-blocking on the hot path (F34).
+
+        The daemon enforces caps; Hydra does not gate on this return value —
+        the local BudgetLedger is authoritative within a workflow.
+
+        Design (F34 round-2 circuit-breaker):
+
+        Problem: the naive thread+join approach still holds ``_dispatch_lock``
+        in the background worker.  A wedged ``call_mcp`` holds that lock
+        indefinitely; each subsequent timed-out call stacks another abandoned
+        thread behind the lock (unbounded accumulation).
+
+        Solution — two guards + one lock:
+
+        1. **BoundedSemaphore(1)** — at most ONE budget_charge thread may be
+           in-flight at a time.  A healthy overlapping call (two concurrent
+           charges while eights is fine) simply skips THIS call only — the
+           breaker is NOT tripped, so the next solo call proceeds normally.
+           The breaker is opened ONLY on evidence of a real wedge (worker
+           thread still alive after ``timeout_s`` join).
+
+        2. **Circuit breaker (time-based)** — after the first timeout the
+           breaker is opened for ``HYDRA_BUDGET_CHARGE_COOLDOWN_S`` (default
+           60 s).  During cooldown, calls return immediately (no thread, no
+           lock contention).  After cooldown the breaker resets and one new
+           attempt is allowed.
+
+        3. **Breaker lock** — ``_budget_charge_breaker_lock`` guards all reads
+           and writes of ``_budget_charge_breaker_until`` so concurrent calls
+           from multiple threads cannot race on the timestamp.
+
+        Both guards together ensure: at most ONE budget_charge worker is ever
+        in-flight, so at most 1 thread ever holds/waits on ``_dispatch_lock``.
+        While a wedged worker holds the permit, the breaker rejects every new
+        call (breaker spares them the join wait), so a sustained eights wedge
+        produces NO further threads — the permit re-arms the gate only when the
+        wedged worker's ``call_mcp`` finally returns and releases it.
+        """
+        if not self.enabled or self.dispatcher is None:
+            return None
+
+        import time as _time
+
+        timeout_s = float(_os.environ.get(
+            "HYDRA_BUDGET_CHARGE_TIMEOUT_S", str(_BUDGET_CHARGE_TIMEOUT_DEFAULT)
+        ))
+        cooldown_s = float(_os.environ.get(
+            "HYDRA_BUDGET_CHARGE_COOLDOWN_S", str(_BUDGET_CHARGE_COOLDOWN_DEFAULT)
+        ))
+
+        # Guard 1: circuit breaker check (lock-protected read).
+        with self._budget_charge_breaker_lock:
+            breaker_until = self._budget_charge_breaker_until
+        now = _time.monotonic()
+        if now < breaker_until:
+            logger.debug(
+                "budget_charge: circuit breaker open (%.1fs remaining) — skip",
+                breaker_until - now,
+            )
+            return None
+
+        # Guard 2: concurrency gate.  Exactly one thread in-flight at a time.
+        # Non-blocking acquire: if another budget_charge thread is already
+        # in-flight, skip THIS CALL ONLY — the breaker is NOT tripped here
+        # because a healthy concurrent overlap is not evidence of a wedge.
+        # The breaker opens ONLY when the worker thread actually times out (below).
+        if not self._budget_charge_semaphore.acquire(blocking=False):
+            logger.debug(
+                "budget_charge: previous charge still in-flight — "
+                "skipping this call (healthy overlap; breaker NOT tripped)",
+            )
+            return None
+
+        result_box: list[Optional[dict]] = [None]
+
+        def _charge_worker() -> None:
+            # The worker OWNS the semaphore permit for its full lifetime and
+            # releases it in `finally` — on success OR exception, but NOT on
+            # abandonment.  A wedged call_mcp never reaches finally, so the
+            # permit stays held: the concurrency gate above then rejects the
+            # next call (guard 2 skip path) instead of spawning a second thread
+            # that would park behind the wedged one.  This is what makes the
+            # documented invariant — at most ONE in-flight worker, hence at
+            # most 1 thread waiting on _dispatch_lock — actually hold.
+            try:
+                result_box[0] = self._call("eights.governance.budget.charge", {
+                    "run_id": str(workflow_id),
+                    "cost_usd": float(usd),
+                    "tokens": int(tokens),
+                })
+            finally:
+                self._budget_charge_semaphore.release()
+
+        t = threading.Thread(
+            target=_charge_worker,
+            daemon=True,
+            name="hydra-budget-charge",
+        )
+        t.start()
+        t.join(timeout=timeout_s)
+
+        # NOTE: the main thread does NOT release the semaphore.  On a fast /
+        # failed charge the worker's `finally` already released it; on a
+        # timeout the worker is abandoned still holding the permit (by design),
+        # which keeps the gate closed until the daemon recovers.
+
+        if t.is_alive():
+            with self._budget_charge_breaker_lock:
+                self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
+            logger.debug(
+                "budget_charge: timed out after %.1fs — breaker tripped "
+                "for %.0fs; local BudgetLedger remains authoritative",
+                timeout_s, cooldown_s,
+            )
+
+        return result_box[0]
 
     def hitl_request(self, hitl_envelope: dict, *, gate_node: str = "") -> Optional[dict]:
         """Enqueue a HITL request to the shared ledger so the operator UI
@@ -416,3 +558,60 @@ class EightsAttestor:
         if isinstance(out, dict) and isinstance(out.get("text"), str):
             return out["text"]
         return None
+
+    # ---------- evolution (F36: procedural risk routing) ----------
+
+    def evolution_register(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        body: str,
+        summary: str = "",
+    ) -> Optional[dict]:
+        """Register a resource in the eights evolution ledger before proposing.
+
+        Required for medium/high-risk procedural kinds so TheEights can track
+        the resource's lifecycle. Idempotent — re-registering with the same
+        resource_id is a no-op in the daemon.
+        """
+        return self._call("eights.evolution.register", {
+            "resource_kind": resource_kind,
+            "resource_id": resource_id,
+            "body": body,
+            "summary": summary or resource_kind,
+        })
+
+    def evolution_propose(
+        self,
+        *,
+        resource_id: str,
+        summary: str,
+        body: str,
+        proposed_by: str = "hydra.procedural",
+        workflow_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Propose an evolution update for a resource. Returns the proposal dict
+        (including ``proposal_id`` and ``status``) or None when the daemon is
+        unreachable. A None return means the caller must treat the update as
+        pending (fail-soft for medium risk) or rejected (fail-closed for high)."""
+        return self._call("eights.evolution.propose", {
+            "resource_id": resource_id,
+            "summary": summary,
+            "body": body,
+            "proposed_by": proposed_by,
+            "run_id": str(workflow_id or self.workflow_id or "procedural"),
+        })
+
+    def evolution_commit(
+        self,
+        *,
+        resource_id: str,
+        proposal_id: str,
+    ) -> Optional[dict]:
+        """Commit an approved evolution proposal. Returns the commit receipt or
+        None when the daemon is unreachable."""
+        return self._call("eights.evolution.commit", {
+            "resource_id": resource_id,
+            "proposal_id": proposal_id,
+        })

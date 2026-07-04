@@ -256,6 +256,20 @@ def dispatch_ingested_envelopes(
         # not a budget-blind side door (codex review item 3).
         cost_usd, cost_tok = _extract_squad_cost(result)
         block, downgrade = charge_and_gate(state, cost_usd, cost_tok)
+        # F34: budget_charge to eights (fail-soft; never blocks local work).
+        try:
+            from .eights.attestation import EightsAttestor as _EightsAttestor
+            _att = _EightsAttestor(
+                dispatcher=dispatcher,
+                workflow_id=str(state.workflow_id),
+            )
+            _att.budget_charge(
+                workflow_id=str(state.workflow_id),
+                usd=cost_usd, tokens=cost_tok,
+                purpose="ingest_dispatch",
+            )
+        except Exception:  # noqa: BLE001 — fail-soft per F34
+            pass
         outcome.charged_usd += cost_usd
         outcome.charged_tokens += cost_tok
         if downgrade:

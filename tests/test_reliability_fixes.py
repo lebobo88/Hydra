@@ -1123,6 +1123,16 @@ class TestGatewayIdempotentAllowList:
         assert pool._is_idempotent_tool("ping") is True
         # dotted: final segment "ping"
         assert pool._is_idempotent_tool("health.ping") is True
+        # F32-H / fable-audit-2 Phase 3a finding 4: cross_check and tail are
+        # read-only and must be classified as idempotent.
+        assert pool._is_idempotent_tool("hydra.venom.cross_check") is True, (
+            "venom.cross_check is read-only and must be idempotent"
+        )
+        assert pool._is_idempotent_tool("cross_check") is True
+        assert pool._is_idempotent_tool("hydra.telemetry.tail") is True, (
+            "telemetry.tail is read-only and must be idempotent"
+        )
+        assert pool._is_idempotent_tool("tail") is True
 
     def test_write_tools_non_idempotent(self):
         pool = self._get_pool_class()

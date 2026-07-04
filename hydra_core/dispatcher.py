@@ -318,9 +318,33 @@ class MCPStdioDispatcher:
             from .venom import gate_runtime_action, VenomRefused
         except Exception:  # noqa: BLE001 — venom module optional
             return None
+        # F35: inject AgentSmith cross-check when HYDRA_VENOM_CROSS_CHECK=1.
+        # The callable wraps self.call_mcp so venom.py stays runtime-agnostic
+        # (no provider SDK imports in venom.py — only a plain Callable here).
+        _xc_fn = None
+        if os.environ.get("HYDRA_VENOM_CROSS_CHECK") == "1":
+            _self = self  # capture for closure
+
+            def _agentsmith_cross_check(cap: str, xargs: Any) -> Optional[dict]:
+                try:
+                    result = _self.call_mcp(
+                        "agentsmith",
+                        "agentsmith.hydra.venom_cross_check",
+                        {"capability": cap, "context": xargs if isinstance(xargs, dict) else {}},
+                    )
+                    if isinstance(result, dict):
+                        inner = result.get("result", result)
+                        if isinstance(inner, dict):
+                            return inner
+                except Exception:  # noqa: BLE001 — fail-open on transport error
+                    pass
+                return None
+
+            _xc_fn = _agentsmith_cross_check
         try:
             verdicts = gate_runtime_action(
                 server=server, tool=tool, args=args, cmd=cmd, raise_on_refuse=True,
+                cross_check_fn=_xc_fn,
             )
         except VenomRefused as vr:
             # A venom-class action is BLOCKED pending human review (the constitution's

@@ -379,6 +379,13 @@ SCHEMA_REGISTRY: dict[str, type[HydraEnvelope]] = {
     "VOC_REPORT": VocReport,
 }
 
+# M7: COCKPIT_WRITE is an internal audit event type (not a cross-squad pydantic
+# envelope — workflow_id is a string, not a UUID, and the envelope is emitted
+# by the cockpit bridge, never routed across squad boundaries). Listed here so
+# validate_envelope does not raise on known-good types and so the toolshed /
+# AgentSmith catalog sees it as a first-class name.
+_OPAQUE_KNOWN_TYPES: frozenset[str] = frozenset({"COCKPIT_WRITE"})
+
 
 def _register_judge_verdict() -> None:
     """Register the JudgeVerdict envelope. Called by `hydra_core.judge` at
@@ -390,8 +397,30 @@ def _register_judge_verdict() -> None:
 
 
 def validate_envelope(obj: dict[str, Any]) -> HydraEnvelope:
-    """Validate any envelope dict. Raises pydantic.ValidationError on failure."""
+    """Validate any envelope dict. Raises pydantic.ValidationError on failure.
+
+    Opaque known types (e.g. COCKPIT_WRITE) that carry a non-UUID workflow_id
+    or other deviations from HydraEnvelope's strict contract are allowed
+    through as a passthrough envelope — they are internal audit events, never
+    routed across squad boundaries.
+    """
     t = obj.get("type")
+    if t in _OPAQUE_KNOWN_TYPES:
+        # Known internal type — return a minimal passthrough HydraEnvelope so
+        # callers that only inspect `.type` work without pydantic validation
+        # blowing up on the non-UUID workflow_id or missing fields.
+        from uuid import UUID as _UUID, uuid4 as _uuid4
+        raw_wf = obj.get("workflow_id")
+        try:
+            wf_uuid = _UUID(str(raw_wf)) if raw_wf else _uuid4()
+        except (ValueError, AttributeError):
+            wf_uuid = _uuid4()
+        return HydraEnvelope(
+            id=obj.get("id", str(_uuid4())),
+            type=t,
+            origin_squad=str(obj.get("origin_squad") or obj.get("actor") or "hydra"),
+            workflow_id=wf_uuid,
+        )
     if t not in SCHEMA_REGISTRY:
         raise ValueError(f"Unknown envelope type: {t!r}. Known: {list(SCHEMA_REGISTRY)}")
     return SCHEMA_REGISTRY[t].model_validate(obj)
