@@ -818,6 +818,52 @@ def _tool_handlers() -> dict[str, Any]:
 
         return {"ok": True, "events": events}
 
+    def workflow_budget(args: dict[str, Any]) -> dict[str, Any]:
+        """Read or set the budget ledger for a workflow.
+
+        No workflow_id   → list all workflows (latest-first) with budget summary.
+        With workflow_id → full ledger: budget_usd, spent_usd, repo_budgets, etc.
+        With set_budget  → patch budget_usd via the M3 capability verification
+                           path (same as resume modify-budget but without graph
+                           re-invocation). Returns {set: true, budget_usd, ...}.
+        """
+        workflow_id_raw = args.get("workflow_id")
+        set_budget_raw = args.get("set_budget")
+
+        workflow_id = str(workflow_id_raw) if workflow_id_raw not in (None, "") else None
+        if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+
+        set_budget: float | None = None
+        if set_budget_raw is not None:
+            try:
+                set_budget = float(set_budget_raw)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "set_budget must be numeric"}
+            if set_budget < 0:
+                return {"ok": False, "error": "set_budget must be non-negative"}
+
+        cli_args = ["budget"]
+        if workflow_id:
+            cli_args.append(workflow_id)
+        if set_budget is not None:
+            cli_args.extend(["--set", str(set_budget)])
+
+        try:
+            result = _run_cli_json(
+                cli_args,
+                timeout_s=60,
+                err_label="budget",
+                workflow_id=workflow_id,
+            )
+            if not isinstance(result, dict):
+                return {"ok": False, "error": "budget command returned non-object"}
+            result.setdefault("ok", "error" not in result)
+            return result
+        except Exception as e:  # noqa: BLE001
+            logger.exception("workflow_budget failed")
+            return {"ok": False, "error": f"budget_failed: {e}"}
+
     return {
         "hydra.control.ping": ping,
         "hydra.workflow.launch": workflow_launch,
@@ -826,6 +872,7 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.workflow.submit_host_result": workflow_submit_host_result,
         "hydra.workflow.resume": workflow_resume,
         "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
+        "hydra.workflow.budget": workflow_budget,
         "hydra.cockpit.audit": cockpit_audit,
         "hydra.venom.cross_check": venom_cross_check,
         "hydra.squad.list": squad_list,
@@ -1113,6 +1160,33 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "since": {
                     "type": "string",
                     "description": "Cursor from a prior tail call — returns only events after this.",
+                },
+            },
+        },
+    },
+    "hydra.workflow.budget": {
+        "description": (
+            "Read or set the budget ledger for a Hydra workflow. "
+            "No workflow_id → list all known workflows latest-first with budget summary "
+            "(budget_usd, spent_usd, phase). "
+            "With workflow_id → full ledger incl repo_budgets/repo_spend. "
+            "With set_budget → patch budget_usd via the M3 capability verification "
+            "path (same gate as resume modify-budget, without graph re-invocation). "
+            "Returns {set: true, budget_usd, prior_budget_usd, spent_usd} on set."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Workflow id to inspect or patch (omit to list all).",
+                },
+                "set_budget": {
+                    "type": "number",
+                    "description": (
+                        "New budget_usd ceiling to write into the checkpoint. "
+                        "Requires workflow_id. Triggers M3 capability verification. "
+                        "Must be non-negative."
+                    ),
                 },
             },
         },

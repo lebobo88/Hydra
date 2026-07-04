@@ -46,6 +46,25 @@ from .squad_loader import discover_squads
 from .state import HydraState
 from .telemetry import emit, trace_path
 
+# ---------------------------------------------------------------------------
+# Supervisor symbols exposed at module scope for test patchability.
+# unittest.mock.patch("hydra_core.cli.build_supervisor", ...) requires these
+# names to live in the module's __dict__.  The try/except degrades gracefully
+# when .supervisor can't be imported at module load time (e.g. missing deps).
+# Commands that never need the supervisor (doctor, squads, verify) pay a small
+# upfront import cost; the UserWarning from langchain_core is already silenced
+# by the filter above, so hook stderr stays clean.
+# ---------------------------------------------------------------------------
+try:
+    from .supervisor import build_supervisor, _PurePythonRunner
+except Exception:  # noqa: BLE001 — degrade: missing deps at load time
+    def build_supervisor(*args, **kwargs):  # type: ignore[misc]
+        from .supervisor import build_supervisor as _real
+        return _real(*args, **kwargs)
+
+    class _PurePythonRunner:  # type: ignore[no-redef]  # noqa: N801
+        """Sentinel; replaced when supervisor imports cleanly."""
+
 
 class _NullDispatcher:
     """Inert dispatcher for the CLI smoke path. Real dispatchers come from
@@ -1540,6 +1559,304 @@ def _cmd_attended_submit(args) -> int:
         _release_resume_lock(lock_fd, lock_path)
 
 
+def _cmd_budget(args) -> int:
+    """Show or set the budget ledger for Hydra workflows.
+
+    hydra budget
+        List all known workflows latest-first (by checkpoint mtime) with a
+        summary row: workflow_id, phase, budget_usd, spent_usd, spent_tokens.
+
+    hydra budget <workflow_id>
+        Full budget ledger for that workflow: budget_usd, spent_usd, remaining,
+        spent_tokens, utilization_pct, repo_budgets, repo_spend.
+
+    hydra budget <workflow_id> --set <USD>
+        Update the budget ceiling in the LangGraph checkpoint to USD. The
+        change is durable (persisted via update_state) and emits a trace event.
+        Equivalent to `hydra resume --action modify-budget --option USD` but
+        without graph re-invocation.
+    """
+    import os
+    import sqlite3
+
+    project = Path(args.project) if args.project else Path.cwd()
+    wf_arg = getattr(args, "workflow_id", None)
+    set_usd = getattr(args, "set_usd", None)
+
+    # --set is a mutation and MUST target a specific workflow. Without a
+    # workflow_id it would otherwise fall through to the list-all path and be
+    # silently discarded, leaving the operator believing a cap was written.
+    if set_usd is not None and not wf_arg:
+        print(json.dumps({
+            "error": "--set requires a workflow_id (e.g. `hydra budget <id> --set 250`)",
+        }), file=sys.stderr)
+        return 1
+
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+    if isinstance(sup, _PurePythonRunner):
+        print(json.dumps({
+            "error": "langgraph unavailable — budget requires the checkpointing supervisor",
+        }), file=sys.stderr)
+        return 1
+
+    # ---- Single-workflow path (detail or --set) --------------------------------
+    if wf_arg:
+        if not _WORKFLOW_ID_RE.match(wf_arg):
+            print(json.dumps({"error": f"invalid workflow_id {wf_arg!r}"}),
+                  file=sys.stderr)
+            return 1
+        config = {"configurable": {"thread_id": wf_arg}}
+        snap = sup.get_state(config)
+        if snap is None or not snap.values:
+            print(json.dumps({"workflow_id": wf_arg, "error": "not_found"}),
+                  file=sys.stderr)
+            return 1
+        try:
+            state = HydraState.model_validate(snap.values)
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({"workflow_id": wf_arg,
+                              "error": f"checkpoint_invalid: {e}"}),
+                  file=sys.stderr)
+            return 1
+
+        b = state.budget
+
+        if set_usd is not None:
+            try:
+                new_usd = float(set_usd)
+            except (TypeError, ValueError):
+                print(json.dumps({"error": (
+                    f"--set requires a numeric USD value, got {set_usd!r}"
+                )}), file=sys.stderr)
+                return 1
+            if new_usd < 0:
+                print(json.dumps({"error": "budget_usd must be non-negative"}),
+                      file=sys.stderr)
+                return 1
+
+            # M3 mutating-action capability verification (mirrors _cmd_resume_locked).
+            # budget_set is a state-mutating action; gate it through the same
+            # verify_operator_capability path as approve/force-dispatch/change-squads.
+            import logging as _logging_bs
+            _log_bs = _logging_bs.getLogger(__name__)
+            _operator_bs = (
+                getattr(args, "operator", None)
+                or os.environ.get("HYDRA_OPERATOR_ID", "")
+                or "unknown"
+            )
+            _pending_for_mint: dict = {
+                "capability": "budget_set",
+                "gate_node": "budget",
+                "reason": "budget_modification",
+                "workflow_id": wf_arg,
+                "resource_id": wf_arg,
+            }
+            _cap_token_bs: dict | None = None
+            # _force_degraded_bs: True when HYDRA_OPERATOR_KEY is absent/empty.
+            # KEY presence — not operator-id — is the authoritative signal for whether
+            # cryptographic enforcement is configured.  With no key we intentionally
+            # produce a degraded (unsigned) capability token and warn-and-proceed
+            # regardless of HYDRA_OPERATOR_ID (documented WS-AUTH run-A / foundation
+            # posture).  When a key IS present, any mint/verify exception FAILS CLOSED
+            # (return 1, no patch) to prevent unsigned state mutations.
+            _force_degraded_bs = not bool(os.environ.get("HYDRA_OPERATOR_KEY", "").strip())
+            try:
+                from .auth.capability import mint_for_approval as _mint_bs
+                if _force_degraded_bs:
+                    _log_bs.warning(
+                        "HYDRA_OPERATOR_KEY not configured for budget_set; capability degraded — "
+                        "set HYDRA_OPERATOR_KEY to enable cryptographic enforcement",
+                    )
+                    _saved_key_bs = os.environ.pop("HYDRA_OPERATOR_KEY", None)
+                    try:
+                        _cap_token_bs = _mint_bs(
+                            workflow_id=wf_arg,
+                            pending_hitl=_pending_for_mint,
+                            operator=_operator_bs,
+                        )
+                    finally:
+                        if _saved_key_bs is not None:
+                            os.environ["HYDRA_OPERATOR_KEY"] = _saved_key_bs
+                else:
+                    _cap_token_bs = _mint_bs(
+                        workflow_id=wf_arg,
+                        pending_hitl=_pending_for_mint,
+                        operator=_operator_bs,
+                    )
+            except Exception as _mint_exc_bs:  # noqa: BLE001
+                if _force_degraded_bs:
+                    # Degraded path: mint raised on a no-key run — warn and proceed.
+                    _log_bs.warning(
+                        "mint_for_approval raised %s (degraded path) — budget_set proceeds",
+                        type(_mint_exc_bs).__name__,
+                    )
+                else:
+                    # Key IS configured but mint failed — fail closed.
+                    print(json.dumps({
+                        "error": (
+                            f"capability_mint_failed: {type(_mint_exc_bs).__name__}: "
+                            f"{_mint_exc_bs}"
+                        ),
+                        "workflow_id": wf_arg,
+                    }), file=sys.stderr)
+                    return 1
+            if _cap_token_bs is not None:
+                try:
+                    from .auth.capability import verify_operator_capability as _verify_bs
+                    _vr_bs = _verify_bs(
+                        _cap_token_bs,
+                        expected_capability="budget_set",
+                        expected_workflow_id=wf_arg,
+                        expected_resource_id=wf_arg,
+                    )
+                    if not _vr_bs.get("valid"):
+                        _m3_reason_bs = _vr_bs.get("reason", "unknown")
+                        _m3_sig_bs = (_cap_token_bs.get("sig") or {})
+                        _is_degraded_bs = (
+                            _m3_sig_bs.get("degraded") is True
+                            or _m3_sig_bs.get("value") is None
+                            or "degraded" in _m3_reason_bs
+                            or "no key" in _m3_reason_bs
+                        )
+                        if _is_degraded_bs:
+                            _log_bs.warning(
+                                "capability verify: degraded (%s) — budget_set proceeds "
+                                "(set HYDRA_OPERATOR_KEY to enable cryptographic enforcement)",
+                                _m3_reason_bs,
+                            )
+                        else:
+                            print(json.dumps({
+                                "error": f"capability_verify_failed: {_m3_reason_bs}",
+                                "workflow_id": wf_arg,
+                            }), file=sys.stderr)
+                            return 1
+                except Exception as _v_exc_bs:  # noqa: BLE001
+                    if _force_degraded_bs:
+                        # Degraded path: verify raised on a no-key run — warn and proceed.
+                        _log_bs.warning(
+                            "verify_operator_capability raised %s (degraded path) — proceeds",
+                            type(_v_exc_bs).__name__,
+                        )
+                    else:
+                        # Key IS configured but verify raised — fail closed.
+                        print(json.dumps({
+                            "error": (
+                                f"capability_verify_exception: {type(_v_exc_bs).__name__}: "
+                                f"{_v_exc_bs}"
+                            ),
+                            "workflow_id": wf_arg,
+                        }), file=sys.stderr)
+                        return 1
+
+            b.budget_usd = new_usd
+            try:
+                patch_bs: dict = {"budget": b.model_dump(mode="json")}
+                if _cap_token_bs is not None:
+                    patch_bs["operator_capability"] = _cap_token_bs
+                sup.update_state(config, patch_bs)
+            except Exception as e:  # noqa: BLE001
+                print(json.dumps({"error": f"checkpoint update failed: {e}"}),
+                      file=sys.stderr)
+                return 1
+            emit(project, wf_arg, "budget.set",
+                 {"workflow_id": wf_arg, "budget_usd": new_usd,
+                  "spent_usd": b.spent_usd, "operator": _operator_bs})
+            print(json.dumps({
+                "workflow_id": wf_arg,
+                "set": True,
+                "budget_usd": new_usd,
+                "spent_usd": round(b.spent_usd, 6),
+                "remaining_usd": round(max(new_usd - b.spent_usd, 0.0), 6),
+                "capability_degraded": (
+                    _cap_token_bs is None
+                    or (_cap_token_bs.get("sig") or {}).get("degraded", False)
+                ),
+            }, indent=2))
+            return 0
+
+        # Detail view
+        print(json.dumps({
+            "workflow_id": wf_arg,
+            "phase": getattr(state, "phase", "?"),
+            "root_goal": (getattr(state, "root_goal", "") or "")[:80],
+            "budget_usd": b.budget_usd,
+            "spent_usd": round(b.spent_usd, 6),
+            "remaining_usd": round(max(b.budget_usd - b.spent_usd, 0.0), 6),
+            "spent_tokens": b.spent_tokens,
+            "utilization_pct": round(b.percent_consumed * 100, 1),
+            "repo_budgets": b.repo_budgets,
+            "repo_spend": {k: round(v, 6) for k, v in b.repo_spend.items()},
+        }, indent=2))
+        return 0
+
+    # ---- List all workflows ---------------------------------------------------
+    cp_db = Path(
+        os.environ.get("HYDRA_CHECKPOINT_DB")
+        or str(Path.home() / ".hydra" / "checkpoints.db")
+    )
+    if not cp_db.exists():
+        print(json.dumps({"workflows": [], "reason": "no_checkpoint_db"}, indent=2))
+        return 0
+
+    conn = sqlite3.connect(
+        f"file:{cp_db.as_posix()}?mode=ro", uri=True, check_same_thread=False
+    )
+    try:
+        thread_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints LIMIT 500"
+            ).fetchall()
+        ]
+    except Exception:  # noqa: BLE001 — schema absent / older langgraph layout
+        thread_ids = []
+    finally:
+        conn.close()
+
+    rows: list[dict] = []
+    for wf in thread_ids:
+        config = {"configurable": {"thread_id": wf}}
+        try:
+            snap = sup.get_state(config)
+        except Exception:  # noqa: BLE001
+            continue
+        if snap is None or not snap.values:
+            continue
+        try:
+            state = HydraState.model_validate(snap.values)
+        except Exception:  # noqa: BLE001
+            continue
+        b = state.budget
+        # Checkpoint mtime: use the trace JSONL file as a proxy (written at
+        # every emit call throughout the workflow run).
+        tp = trace_path(project, wf)
+        mtime: float = 0.0
+        try:
+            if tp.exists():
+                mtime = tp.stat().st_mtime
+        except OSError:
+            pass
+        rows.append({
+            "_mtime": mtime,
+            "workflow_id": wf,
+            "phase": getattr(state, "phase", "?"),
+            "goal": (getattr(state, "root_goal", "") or "")[:60],
+            "budget_usd": b.budget_usd,
+            "spent_usd": round(b.spent_usd, 6),
+            "spent_tokens": b.spent_tokens,
+            "utilization_pct": round(b.percent_consumed * 100, 1),
+        })
+
+    # Sort latest-first; remove the sort key before printing.
+    rows.sort(key=lambda r: r["_mtime"], reverse=True)
+    for r in rows:
+        del r["_mtime"]
+
+    print(json.dumps({"count": len(rows), "workflows": rows}, indent=2))
+    return 0
+
+
 _TERMINAL_PHASES = frozenset({"done", "surfaced"})
 
 
@@ -1675,21 +1992,151 @@ def _cmd_reap(args) -> int:
 
 
 def _cmd_status(args) -> int:
+    """List recent workflows (latest-first) or show a specific workflow's state.
+
+    No arg  → JSON list of {workflow_id, phase, pending_hitl, root_goal}
+              sorted by trace mtime LATEST-FIRST. Phase is read from the
+              LangGraph checkpoint when available; "?" otherwise.
+
+    With id → structured JSON view: tasks table (task_id[:8], owner_squad,
+              status), pending HITL summary, budget (budget_usd, spent_usd,
+              usd_remaining). NOT a raw trace.jsonl dump.
+    """
     project = Path(args.project) if args.project else Path.cwd()
     base = project / ".hydra"
+
     if args.workflow_id:
-        p = trace_path(project, args.workflow_id)
+        # --- Specific workflow: structured view (checkpoint preferred) ---
+        wf = str(args.workflow_id)
+        try:
+            from .supervisor import build_supervisor, _PurePythonRunner
+            _sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+            if not isinstance(_sup, _PurePythonRunner):
+                _config = {"configurable": {"thread_id": wf}}
+                _snap = _sup.get_state(_config)
+                if _snap is not None and _snap.values:
+                    _state = HydraState.model_validate(_snap.values)
+                    tasks_view = [
+                        {
+                            "task_id": str(t.task_id)[:8],
+                            "owner_squad": t.owner_squad,
+                            "status": t.status,
+                        }
+                        for t in getattr(_state, "tasks", [])
+                    ]
+                    _b = _state.budget
+                    _pending = _state.pending_hitl
+                    _pending_summary = None
+                    if isinstance(_pending, dict):
+                        _pending_summary = {
+                            "reason": _pending.get("reason"),
+                            "gate_node": _pending.get("gate_node"),
+                            "summary": (_pending.get("summary", "") or "")[:120],
+                        }
+                    print(json.dumps({
+                        "workflow_id": wf,
+                        "phase": _state.phase,
+                        "root_goal": (_state.root_goal or "")[:120],
+                        "tasks": tasks_view,
+                        "pending_hitl": _pending_summary,
+                        "budget": {
+                            "budget_usd": _b.budget_usd,
+                            "spent_usd": round(_b.spent_usd, 6),
+                            "usd_remaining": round(_b.usd_remaining, 6),
+                            "percent_consumed": round(_b.percent_consumed * 100, 1),
+                        },
+                    }, indent=2))
+                    return 0
+        except Exception:  # noqa: BLE001 — fall back to trace view
+            pass
+
+        # Fall back: structured view of the most recent trace events (NOT raw dump).
+        p = trace_path(project, wf)
         if not p.exists():
-            print(f"no trace at {p}")
+            print(json.dumps({"error": f"no trace for workflow_id={wf!r}"}))
             return 1
-        print(p.read_text(encoding="utf-8"))
+        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        recent_events: list[dict] = []
+        for line in lines[-30:]:
+            try:
+                recent_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        print(json.dumps({
+            "workflow_id": wf,
+            "note": "checkpoint unavailable — showing last 30 trace events",
+            "events": recent_events,
+        }, indent=2, default=str))
         return 0
+
+    # --- No arg: list workflows, latest-first by trace mtime ---
     if not base.exists():
-        print("(no workflows yet)")
+        print(json.dumps({"workflows": []}, indent=2))
         return 0
-    for d in sorted(base.iterdir()):
-        if d.is_dir():
-            print(d.name)
+
+    wf_dirs = [d for d in base.iterdir() if d.is_dir()]
+
+    def _trace_mtime(d: Path) -> float:
+        tf = d / "trace.jsonl"
+        try:
+            return tf.stat().st_mtime if tf.exists() else d.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    wf_dirs.sort(key=_trace_mtime, reverse=True)
+
+    # Try building the supervisor once (to get rich checkpoint state per workflow).
+    _list_sup = None
+    try:
+        from .supervisor import build_supervisor, _PurePythonRunner
+        _sup_cand = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+        if not isinstance(_sup_cand, _PurePythonRunner):
+            _list_sup = _sup_cand
+    except Exception:  # noqa: BLE001 — langgraph absent; degrade gracefully
+        pass
+
+    rows: list[dict] = []
+    for d in wf_dirs:
+        row: dict = {"workflow_id": d.name, "phase": "?", "pending_hitl": None}
+        if _list_sup is not None:
+            try:
+                _cfg = {"configurable": {"thread_id": d.name}}
+                _sn = _list_sup.get_state(_cfg)
+                if _sn is not None and _sn.values:
+                    _st = HydraState.model_validate(_sn.values)
+                    row["phase"] = _st.phase
+                    row["root_goal"] = (_st.root_goal or "")[:80]
+                    _ph = _st.pending_hitl
+                    if isinstance(_ph, dict):
+                        row["pending_hitl"] = {
+                            "reason": _ph.get("reason"),
+                            "gate_node": _ph.get("gate_node"),
+                        }
+            except Exception:  # noqa: BLE001 — one bad checkpoint must not abort listing
+                pass
+        if "root_goal" not in row:
+            # Try to extract goal from the first workflow_start trace event.
+            tf = d / "trace.jsonl"
+            if tf.exists():
+                try:
+                    lines = tf.read_text(encoding="utf-8").splitlines()
+                    for line in lines[:10]:
+                        if not line.strip():
+                            continue
+                        try:
+                            ev = json.loads(line)
+                            if ev.get("kind") == "workflow_start":
+                                _g = (ev.get("payload") or {}).get("goal", "")
+                                if _g:
+                                    row["root_goal"] = _g[:80]
+                                    break
+                        except json.JSONDecodeError:
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+        rows.append(row)
+
+    print(json.dumps({"workflows": rows}, indent=2))
     return 0
 
 
@@ -2274,6 +2721,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     rp.add_argument("--verbose", action="store_true")
 
+    # budget: show or set workflow budget ledger
+    bg = sub.add_parser("budget", help=(
+        "Show or set workflow budget ledger. "
+        "No args = list all workflows latest-first. "
+        "With id = full ledger. "
+        "--set USD = update the budget ceiling in the checkpoint."))
+    bg.add_argument(
+        "workflow_id", nargs="?", default=None,
+        help="Workflow id to inspect or modify (omit to list all workflows).")
+    bg.add_argument(
+        "--set", dest="set_usd", metavar="USD", default=None,
+        help=(
+            "Update the budget cap for the workflow to this USD value. "
+            "Persisted into the LangGraph checkpoint and traced. "
+            "Requires a workflow_id argument."
+        ),
+    )
+
     # gateway management
     sub.add_parser("gateway-backup")
     sub.add_parser("gateway-export-backends")
@@ -2311,6 +2776,7 @@ def main(argv: list[str] | None = None) -> int:
         "submit-host-result": _cmd_attended_submit,
         "status": _cmd_status,
         "trace": _cmd_trace,
+        "budget": _cmd_budget,
         "reap": _cmd_reap,
         # C2: approve == resume --action approve (the old stub printed a
         # plugin pointer and did nothing; resume is now first-class).

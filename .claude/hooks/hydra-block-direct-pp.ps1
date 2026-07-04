@@ -7,6 +7,8 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # --- Enforcement gate -------------------------------------------------------
 if ($env:HYDRA_ENFORCE_ROUTING -ne '1') { exit 0 }
+# Harness-driven engineer stage: the deterministic codegen path is sanctioned.
+if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') { exit 0 }
 
 $raw = $input | Out-String
 if (-not $raw) { exit 0 }

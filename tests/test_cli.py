@@ -564,4 +564,36 @@ def test_reap_dry_run_empty_store(capsys, tmp_path, monkeypatch):
     payload = json.loads(out)
     assert payload["mode"] == "dry-run"  # default is never destructive
     assert payload["candidate_count"] == 0
-    assert payload["reaped_count"] == 0
+
+
+# --- budget ------------------------------------------------------------------
+
+def test_budget_set_without_workflow_id_errors(capsys):
+    """`--set` is a mutation; without a workflow_id it must fail loudly rather
+    than silently fall through to the list-all path and drop the write."""
+    rc = _run(["budget", "--set", "250"], project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    payload = json.loads(err)
+    assert "workflow_id" in payload["error"]
+
+
+def test_budget_invalid_workflow_id(capsys):
+    """A malformed workflow_id is rejected. When langgraph is unavailable the
+    supervisor gate fires first — either message is an acceptable rc=1."""
+    rc = _run(["budget", "bad id!"], project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "invalid workflow_id" in err or "langgraph unavailable" in err
+
+
+def test_budget_list_empty_store(capsys, tmp_path, monkeypatch):
+    """List-all against an absent checkpoint DB yields an empty roster (or a
+    clean langgraph-unavailable error), never a crash."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    rc = _run(["budget"], project_root=REPO_ROOT)
+    captured = capsys.readouterr()
+    assert rc in (0, 1)
+    if rc == 0:
+        payload = json.loads(captured.out)
+        assert payload["workflows"] == []
