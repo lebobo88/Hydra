@@ -2376,6 +2376,56 @@ class TestF32HNewTools:
             f"F32-H: expected intake+dispatch events, got {kinds}"
         )
 
+    def test_envelope_record_payload_cannot_shadow_reserved_fields(self, monkeypatch):
+        """Reserved envelope fields (type, workflow_id, …) must come from the
+        bridge args, not from the payload.  A crafted payload with a valid
+        'type' or 'workflow_id' must NOT allow an otherwise-invalid envelope
+        to pass validation (fable-audit-2 Phase 3a finding 1 round 2)."""
+        import hydra_core.memory as mem_mod
+        monkeypatch.setattr(mem_mod, "append_episodic", lambda *a, **k: None)
+
+        handlers = self._handlers()
+        result = handlers["hydra.envelope.record"]({
+            "kind": "COMPLETELY_UNKNOWN_TYPE_XYZ",   # invalid — not in registry
+            "from_squad": "agentsmith",
+            "workflow_id": "wf-collision-test",
+            # Crafted payload: carries reserved keys that would bypass validation
+            # if payload were flattened into the validation dict.
+            "payload": {
+                "type": "COCKPIT_WRITE",              # valid opaque type
+                "workflow_id": "00000000-0000-0000-0000-000000000001",
+            },
+        })
+        assert result.get("ok") is False, (
+            "F32-H round-2: a payload with reserved keys must NOT bypass "
+            f"validation of an invalid 'kind'; got {result!r}"
+        )
+
+    def test_envelope_record_no_persist_on_reject(self, monkeypatch):
+        """When envelope_record rejects due to validation failure, neither
+        append_episodic nor attestor.envelope_record must be called
+        (fable-audit-2 Phase 3a finding 1 round 2: no-persist-on-reject)."""
+        persist_calls: list[dict] = []
+        import hydra_core.memory as mem_mod
+        monkeypatch.setattr(
+            mem_mod, "append_episodic", lambda *a, **k: persist_calls.append(k)
+        )
+
+        handlers = self._handlers()
+        result = handlers["hydra.envelope.record"]({
+            "kind": "COMPLETELY_UNKNOWN_TYPE_XYZ",
+            "from_squad": "agentsmith",
+            "workflow_id": "wf-nopersist-test",
+            "payload": {},
+        })
+        assert result.get("ok") is False, (
+            f"F32-H: rejected envelope must return ok=False, got {result!r}"
+        )
+        assert persist_calls == [], (
+            f"F32-H round-2: no-persist-on-reject violated; "
+            f"append_episodic was called {len(persist_calls)} time(s)"
+        )
+
 
 # ---------------------------------------------------------------------------
 # F34: EightsAttestor.budget_charge wired at every charge_and_gate call site
@@ -2539,6 +2589,100 @@ class TestF34BudgetChargeWired:
         # Result is None because the thread timed out before completing.
         assert result is None, (
             f"F34: timed-out budget_charge must return None, got {result!r}"
+        )
+
+    def test_budget_charge_breaker_trips_after_timeout_and_skips_during_cooldown(
+        self, monkeypatch
+    ):
+        """F34 circuit-breaker round-2: after the first timeout the breaker
+        must open and subsequent calls must skip immediately (no thread
+        spawned) until the cooldown window expires."""
+        import time as _time
+        import threading as _threading
+        from hydra_core.eights.attestation import EightsAttestor
+
+        threads_started: list[str] = []
+
+        class _SlowDispatcher:
+            def call_mcp(self, server, tool, args):
+                threads_started.append(_threading.current_thread().name)
+                _time.sleep(60)
+                return {"status": "ok"}
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "0.1")
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_COOLDOWN_S", "60")
+        att = EightsAttestor(dispatcher=_SlowDispatcher(), workflow_id="wf-breaker-test")
+
+        # First call: spawns thread, times out, trips breaker.
+        att.budget_charge(workflow_id="wf-breaker-test", usd=0.01, tokens=100)
+        count_after_first = len(threads_started)
+        assert att._budget_charge_breaker_until > _time.monotonic(), (
+            "F34: breaker must be tripped (future timestamp) after a timeout"
+        )
+
+        # Second call (immediately, breaker still open): must NOT spawn a thread.
+        att.budget_charge(workflow_id="wf-breaker-test", usd=0.01, tokens=100)
+        assert len(threads_started) == count_after_first, (
+            f"F34: second call during cooldown must not spawn a new thread; "
+            f"spawned {len(threads_started)} total (expected {count_after_first})"
+        )
+
+    def test_budget_charge_semaphore_held_skips_without_spawning(self, monkeypatch):
+        """F34 circuit-breaker round-2: when the concurrency semaphore is
+        already held (another charge is in-flight), the next call must skip
+        without spawning and must trip the circuit breaker."""
+        import time as _time
+        from hydra_core.eights.attestation import EightsAttestor
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "5")
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_COOLDOWN_S", "60")
+        # Enabled=True but no real dispatcher; semaphore probe happens before
+        # dispatcher is needed (guard 1 = breaker, guard 2 = semaphore).
+        att = EightsAttestor(dispatcher=object(), enabled=True,  # type: ignore[arg-type]
+                             workflow_id="wf-sem-test")
+        # Simulate an in-flight charge by holding the semaphore.
+        att._budget_charge_semaphore.acquire()
+        try:
+            result = att.budget_charge(
+                workflow_id="wf-sem-test", usd=0.01, tokens=100
+            )
+        finally:
+            att._budget_charge_semaphore.release()
+
+        assert result is None, (
+            f"F34: semaphore-held call must return None, got {result!r}"
+        )
+        assert att._budget_charge_breaker_until > _time.monotonic(), (
+            "F34: semaphore-held skip must trip the circuit breaker"
+        )
+
+    def test_budget_charge_breaker_resets_after_cooldown(self, monkeypatch):
+        """F34 circuit-breaker round-2: after the cooldown window expires the
+        breaker is considered closed and the next call must proceed normally
+        (attempt the charge, not skip)."""
+        import time as _time
+        from hydra_core.eights.attestation import EightsAttestor
+
+        calls_made: list[str] = []
+
+        class _FastDispatcher:
+            """Returns immediately so the thread completes within the join."""
+            def call_mcp(self, server, tool, args):
+                calls_made.append(tool)
+                return {"status": "ok", "result": {}}
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "5")
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_COOLDOWN_S", "60")
+        att = EightsAttestor(dispatcher=_FastDispatcher(), workflow_id="wf-reset-test")
+
+        # Manually set the breaker to a timestamp 1 s in the past (expired).
+        att._budget_charge_breaker_until = _time.monotonic() - 1.0
+
+        # With an expired breaker the call must proceed — charge attempted.
+        att.budget_charge(workflow_id="wf-reset-test", usd=0.01, tokens=100)
+        assert len(calls_made) > 0, (
+            "F34: expired breaker must allow the call through; "
+            f"no calls were made → breaker incorrectly blocking"
         )
 
 

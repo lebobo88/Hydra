@@ -31,11 +31,12 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# F34: dedicated short-circuit timeout for budget_charge so a wedged TheEights
-# daemon costs the hot path at most this many seconds (not the 120s default).
-# budget.charge is ephemeral — stale charges are meaningless on daemon recovery
-# so we do NOT spool them; we just cap the wait and abandon.
-_BUDGET_CHARGE_TIMEOUT_DEFAULT = 5.0
+# F34: dedicated short-circuit timeout and circuit-breaker cooldown for
+# budget_charge.  budget.charge is ephemeral — stale charges are meaningless
+# on daemon recovery so we do NOT spool them; instead we cap the wait and
+# use a circuit breaker to avoid unbounded thread accumulation.
+_BUDGET_CHARGE_TIMEOUT_DEFAULT = 5.0   # seconds before a charge is abandoned
+_BUDGET_CHARGE_COOLDOWN_DEFAULT = 60.0  # seconds breaker stays open after timeout
 
 from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool, SpooledCall
@@ -82,6 +83,21 @@ class EightsAttestor:
     spool: PendingSpool = field(default_factory=PendingSpool)
     _dispatch_lock: threading.RLock = field(
         default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
+    # F34 circuit-breaker state: monotonic timestamp after which budget_charge
+    # may attempt again.  0.0 = breaker closed (normal path).
+    _budget_charge_breaker_until: float = field(
+        default=0.0,
+        init=False,
+        repr=False,
+    )
+    # F34 concurrency gate: BoundedSemaphore(1) ensures at most ONE
+    # budget_charge thread is in-flight at a time, so a wedged call_mcp
+    # cannot accumulate parked threads behind _dispatch_lock.
+    _budget_charge_semaphore: threading.BoundedSemaphore = field(
+        default_factory=lambda: threading.BoundedSemaphore(1),
         init=False,
         repr=False,
     )
@@ -358,34 +374,90 @@ class EightsAttestor:
         vendor: str = "",
         purpose: str = "",
     ) -> Optional[dict]:
-        """Record token/cost spend with a dedicated short timeout (F34).
+        """Record token/cost spend — non-blocking on the hot path (F34).
 
         The daemon enforces caps; Hydra does not gate on this return value —
         the local BudgetLedger is authoritative within a workflow.
 
-        Design (F34): budget.charge is ephemeral — stale charges carry no
-        value once the daemon recovers, so we do NOT spool them (see
-        ``_SPOOLABLE_TOOLS``). Instead we cap the hot-path wait with a
-        daemon thread + join(timeout). A wedged TheEights costs at most
-        ``HYDRA_BUDGET_CHARGE_TIMEOUT_S`` seconds (default 5 s) per call
-        site, not the 120 s dispatcher default. After the cap the thread is
-        abandoned (daemon thread, reclaimed on process exit).
+        Design (F34 round-2 circuit-breaker):
+
+        Problem: the naive thread+join approach still holds ``_dispatch_lock``
+        in the background worker.  A wedged ``call_mcp`` holds that lock
+        indefinitely; each subsequent timed-out call stacks another abandoned
+        thread behind the lock (unbounded accumulation).
+
+        Solution — two guards:
+
+        1. **BoundedSemaphore(1)** — at most ONE budget_charge thread may be
+           in-flight at a time.  If a thread is already parked waiting for
+           ``_dispatch_lock``, the next call skips without spawning a second
+           thread and trips the breaker.
+
+        2. **Circuit breaker (time-based)** — after the first timeout the
+           breaker is opened for ``HYDRA_BUDGET_CHARGE_COOLDOWN_S`` (default
+           60 s).  During cooldown, calls return immediately (no thread, no
+           lock contention).  After cooldown the breaker resets and one new
+           attempt is allowed.
+
+        Both guards together ensure: at most ONE budget_charge worker is ever
+        in-flight, so at most 1 thread ever holds/waits on ``_dispatch_lock``.
+        While a wedged worker holds the permit, guard 2 rejects every new call
+        (the breaker just spares them the join wait), so a sustained eights
+        wedge produces NO further threads — the permit re-arms the gate only
+        when the wedged worker's ``call_mcp`` finally returns and releases it.
         """
         if not self.enabled or self.dispatcher is None:
             return None
 
-        timeout_s = float(
-            _os.environ.get("HYDRA_BUDGET_CHARGE_TIMEOUT_S",
-                            str(_BUDGET_CHARGE_TIMEOUT_DEFAULT))
-        )
+        import time as _time
+
+        timeout_s = float(_os.environ.get(
+            "HYDRA_BUDGET_CHARGE_TIMEOUT_S", str(_BUDGET_CHARGE_TIMEOUT_DEFAULT)
+        ))
+        cooldown_s = float(_os.environ.get(
+            "HYDRA_BUDGET_CHARGE_COOLDOWN_S", str(_BUDGET_CHARGE_COOLDOWN_DEFAULT)
+        ))
+
+        # Guard 1: circuit breaker check.
+        now = _time.monotonic()
+        if now < self._budget_charge_breaker_until:
+            logger.debug(
+                "budget_charge: circuit breaker open (%.1fs remaining) — skip",
+                self._budget_charge_breaker_until - now,
+            )
+            return None
+
+        # Guard 2: concurrency gate.  Exactly one thread in-flight at a time.
+        # Non-blocking acquire: if another budget_charge thread is already
+        # waiting on _dispatch_lock, skip and trip the breaker so subsequent
+        # calls also skip during cooldown.
+        if not self._budget_charge_semaphore.acquire(blocking=False):
+            logger.debug(
+                "budget_charge: previous charge still in-flight — "
+                "skipping and opening breaker for %.0fs", cooldown_s,
+            )
+            self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
+            return None
+
         result_box: list[Optional[dict]] = [None]
 
         def _charge_worker() -> None:
-            result_box[0] = self._call("eights.governance.budget.charge", {
-                "run_id": str(workflow_id),
-                "cost_usd": float(usd),
-                "tokens": int(tokens),
-            })
+            # The worker OWNS the semaphore permit for its full lifetime and
+            # releases it in `finally` — on success OR exception, but NOT on
+            # abandonment.  A wedged call_mcp never reaches finally, so the
+            # permit stays held: the concurrency gate above then rejects the
+            # next call (guard 2 skip path) instead of spawning a second thread
+            # that would park behind the wedged one.  This is what makes the
+            # documented invariant — at most ONE in-flight worker, hence at
+            # most 1 thread waiting on _dispatch_lock — actually hold.
+            try:
+                result_box[0] = self._call("eights.governance.budget.charge", {
+                    "run_id": str(workflow_id),
+                    "cost_usd": float(usd),
+                    "tokens": int(tokens),
+                })
+            finally:
+                self._budget_charge_semaphore.release()
 
         t = threading.Thread(
             target=_charge_worker,
@@ -394,13 +466,20 @@ class EightsAttestor:
         )
         t.start()
         t.join(timeout=timeout_s)
+
+        # NOTE: the main thread does NOT release the semaphore.  On a fast /
+        # failed charge the worker's `finally` already released it; on a
+        # timeout the worker is abandoned still holding the permit (by design),
+        # which keeps the gate closed until the daemon recovers.
+
         if t.is_alive():
+            self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
             logger.debug(
-                "budget_charge: eights did not respond within %.1fs — "
-                "abandoning (charge will be lost; local BudgetLedger "
-                "remains authoritative)",
-                timeout_s,
+                "budget_charge: timed out after %.1fs — breaker tripped "
+                "for %.0fs; local BudgetLedger remains authoritative",
+                timeout_s, cooldown_s,
             )
+
         return result_box[0]
 
     def hitl_request(self, hitl_envelope: dict, *, gate_node: str = "") -> Optional[dict]:

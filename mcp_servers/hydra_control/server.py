@@ -683,6 +683,11 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "error": "kind (or type) is required"}
 
         envelope_id = str(uuid.uuid4())
+        # Build the envelope ONCE from bridge args.  Payload is nested under its
+        # own key — NOT merged/flattened — so payload keys (e.g. a crafted
+        # "type" or "workflow_id") can never shadow the reserved outer fields
+        # during validation (fable-audit-2 Phase 3a finding 1, round 2).
+        # We validate EXACTLY this dict and persist EXACTLY this dict on success.
         hydra_env: dict[str, Any] = {
             "id": envelope_id,
             "type": kind,
@@ -690,17 +695,15 @@ def _tool_handlers() -> dict[str, Any]:
             "target_squad": to_squad,
             "workflow_id": workflow_id_raw or str(uuid.uuid4()),
         }
+        if payload is not None:
+            hydra_env["payload"] = payload
 
-        # Validate the REAL envelope including payload fields (F32-H / fable-audit-2
-        # Phase 3a finding 1). Flatten the payload into the validation dict so that
-        # type-specific required fields (e.g. DevTask.owner/repo/branch) are visible
-        # to the validator. On failure REJECT — do NOT persist an invalid envelope.
-        _payload_flat: dict[str, Any] = (
-            payload if isinstance(payload, dict) else {}
-        )
+        # Validate the same object we will persist. On failure REJECT — do NOT
+        # persist. Pydantic treats "payload" as an extra field (ignored), so
+        # only the canonical envelope fields are checked.
         try:
             from hydra_core.schemas import validate_envelope as _validate
-            _validate({**hydra_env, **_payload_flat})
+            _validate(hydra_env)
         except Exception as val_exc:  # noqa: BLE001
             return {
                 "ok": False,
