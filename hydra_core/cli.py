@@ -1653,9 +1653,15 @@ def _cmd_budget(args) -> int:
                 "resource_id": wf_arg,
             }
             _cap_token_bs: dict | None = None
+            # _force_degraded_bs: True when no operator identity is known.
+            # In that case we intentionally strip HYDRA_OPERATOR_KEY to produce a
+            # degraded (unsigned) capability token, and warn-and-proceed regardless
+            # of the verify result.  This is the documented WS-AUTH run-A (foundation)
+            # posture.  When a key IS configured and mint/verify raises or the token
+            # is hard-invalid, we FAIL CLOSED to prevent unsigned state mutations.
+            _force_degraded_bs = _operator_bs.strip() in {"", "unknown"}
             try:
                 from .auth.capability import mint_for_approval as _mint_bs
-                _force_degraded_bs = _operator_bs.strip() in {"", "unknown"}
                 if _force_degraded_bs:
                     _log_bs.warning(
                         "operator identity unknown for budget_set; capability degraded — "
@@ -1678,10 +1684,22 @@ def _cmd_budget(args) -> int:
                         operator=_operator_bs,
                     )
             except Exception as _mint_exc_bs:  # noqa: BLE001
-                _log_bs.warning(
-                    "mint_for_approval raised %s: %s — budget_set proceeds without token",
-                    type(_mint_exc_bs).__name__, _mint_exc_bs,
-                )
+                if _force_degraded_bs:
+                    # Degraded path: mint raised on a no-key run — warn and proceed.
+                    _log_bs.warning(
+                        "mint_for_approval raised %s (degraded path) — budget_set proceeds",
+                        type(_mint_exc_bs).__name__,
+                    )
+                else:
+                    # Key IS configured but mint failed — fail closed.
+                    print(json.dumps({
+                        "error": (
+                            f"capability_mint_failed: {type(_mint_exc_bs).__name__}: "
+                            f"{_mint_exc_bs}"
+                        ),
+                        "workflow_id": wf_arg,
+                    }), file=sys.stderr)
+                    return 1
             if _cap_token_bs is not None:
                 try:
                     from .auth.capability import verify_operator_capability as _verify_bs
@@ -1713,8 +1731,22 @@ def _cmd_budget(args) -> int:
                             }), file=sys.stderr)
                             return 1
                 except Exception as _v_exc_bs:  # noqa: BLE001
-                    _log_bs.warning("verify_operator_capability raised %s — proceeds",
-                                    type(_v_exc_bs).__name__)
+                    if _force_degraded_bs:
+                        # Degraded path: verify raised on a no-key run — warn and proceed.
+                        _log_bs.warning(
+                            "verify_operator_capability raised %s (degraded path) — proceeds",
+                            type(_v_exc_bs).__name__,
+                        )
+                    else:
+                        # Key IS configured but verify raised — fail closed.
+                        print(json.dumps({
+                            "error": (
+                                f"capability_verify_exception: {type(_v_exc_bs).__name__}: "
+                                f"{_v_exc_bs}"
+                            ),
+                            "workflow_id": wf_arg,
+                        }), file=sys.stderr)
+                        return 1
 
             b.budget_usd = new_usd
             try:

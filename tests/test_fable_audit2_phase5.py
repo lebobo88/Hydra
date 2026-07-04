@@ -176,6 +176,64 @@ def test_bash_writes_hook_disabled_when_no_enforce():
     )
 
 
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_blocks_set_content_named_path():
+    """Set-Content -Path foo.py must be blocked (flag form — previously a false negative)."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    result = _run_bash_writes_hook("Set-Content -Path foo.py -Value 'hello'")
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for Set-Content -Path foo.py, got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+    assert "BLOCKED" in result.stderr or "block" in result.stderr.lower()
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_blocks_set_content_positional():
+    """Set-Content foo.py 'x' must be blocked (positional form)."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    result = _run_bash_writes_hook("Set-Content foo.py 'x'")
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for Set-Content foo.py positional, got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_blocks_pathlib_write_text():
+    """python -c pathlib.Path.write_text targeting a .ts file must be blocked."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    cmd = "python -c \"from pathlib import Path; Path('src/index.ts').write_text('x')\""
+    result = _run_bash_writes_hook(cmd)
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for pathlib write_text, got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_blocks_open_write_bytes():
+    """python -c open(...,'wb') must be blocked (binary write mode)."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    cmd = "python -c \"open('x.ts','wb').write(b'hello')\""
+    result = _run_bash_writes_hook(cmd)
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for open(..'wb'), got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_hook_allows_redirect_to_log():
+    """pytest > log.txt must be ALLOWED — .txt is not a blocked engine-source extension."""
+    assert _BASH_WRITES_SCRIPT.exists()
+    result = _run_bash_writes_hook("pytest tests/ -q > test_results.log.txt")
+    assert result.returncode == 0, (
+        f"Expected exit 0 (allow) for redirect to .txt, got {result.returncode}.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # F6 — _cmd_status: latest-first ordering + structured render
 # ---------------------------------------------------------------------------
@@ -421,6 +479,72 @@ def test_budget_set_capability_gate(tmp_path, capsys):
     assert _state_patch["budget"]["budget_usd"] == 200.0
     # capability token should be in the patch (even if degraded)
     assert "operator_capability" in _state_patch
+
+
+@pytest.mark.skipif(not _HAS_LANGGRAPH, reason="langgraph not installed")
+def test_budget_set_fail_closed_when_key_configured(tmp_path, capsys):
+    """When HYDRA_OPERATOR_KEY is set and mint_for_approval raises, --set must fail
+    closed (exit 1) and NOT call update_state."""
+    from hydra_core import cli
+    from hydra_core.state import HydraState, BudgetLedger
+    from hydra_core.telemetry import emit
+    from uuid import uuid4
+
+    wf = str(uuid4())
+    emit(tmp_path, wf, "workflow_start", {"goal": "fail-closed test"})
+
+    fake_budget = BudgetLedger(budget_usd=50.0, spent_usd=5.0)
+    fake_state = HydraState(workflow_id=wf, root_goal="fail-closed test")
+    fake_state.budget = fake_budget
+
+    update_state_called = {"called": False}
+
+    class _FakeSup:
+        def get_state(self, config):
+            snap = MagicMock()
+            snap.values = fake_state.model_dump(mode="json")
+            return snap
+
+        def update_state(self, config, applied_patch):
+            update_state_called["called"] = True
+
+    def _boom_mint(**kwargs):
+        raise RuntimeError("simulated mint failure — key configured")
+
+    with patch("hydra_core.supervisor.build_supervisor", return_value=_FakeSup()):
+        with patch("hydra_core.supervisor._PurePythonRunner", type(None)):
+            # Patch mint_for_approval to raise AND ensure HYDRA_OPERATOR_KEY is set
+            # so _force_degraded_bs is False (non-degraded / key-configured path).
+            old_key = os.environ.get("HYDRA_OPERATOR_KEY")
+            os.environ["HYDRA_OPERATOR_KEY"] = "fake-test-key"
+            old_op = os.environ.get("HYDRA_OPERATOR_ID")
+            os.environ["HYDRA_OPERATOR_ID"] = "test-operator"
+            try:
+                with patch("hydra_core.auth.capability.mint_for_approval", side_effect=_boom_mint):
+                    rc = cli.main(["--project", str(tmp_path), "budget", wf, "--set", "999"])
+            finally:
+                if old_key is None:
+                    os.environ.pop("HYDRA_OPERATOR_KEY", None)
+                else:
+                    os.environ["HYDRA_OPERATOR_KEY"] = old_key
+                if old_op is None:
+                    os.environ.pop("HYDRA_OPERATOR_ID", None)
+                else:
+                    os.environ["HYDRA_OPERATOR_ID"] = old_op
+
+    err = capsys.readouterr().err
+    # Must fail closed (exit 1) when key is configured and mint raises.
+    assert rc == 1, (
+        f"Expected exit 1 (fail-closed) when key configured and mint raises; got {rc}.\n"
+        f"stderr: {err}"
+    )
+    assert "capability_mint_failed" in err or "mint" in err.lower(), (
+        f"Expected mint-failure error in stderr; got: {err!r}"
+    )
+    # Budget MUST NOT have been patched.
+    assert not update_state_called["called"], (
+        "update_state was called despite mint failure — budget set must not proceed"
+    )
 
 
 # ---------------------------------------------------------------------------

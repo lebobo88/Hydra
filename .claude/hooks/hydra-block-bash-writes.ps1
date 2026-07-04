@@ -9,9 +9,12 @@
 #   - Output redirection (> or >>) targeting a blocked-extension file
 #   - tee command with a blocked-extension destination
 #   - cp / mv / copy / move whose resolved destination has a blocked extension
-#   - python -c ... open(..., 'w' | 'a') — one-liner writing to any file
+#   - python -c ... open(..., write/append/exclusive mode) — one-liner writing
+#   - python -c ... pathlib.Path(...).write_text/write_bytes(...)
+#   - python -c ... shutil.copy*/move with a blocked-extension destination
 #   - sed -i (in-place edit) when a blocked extension appears in the command
-#   - Set-Content / Out-File with a blocked-extension path argument
+#   - Set-Content / Out-File — scans ALL tokens for -Path/-FilePath/-LiteralPath
+#     flag values AND positional arguments (fixes first-token-is-flag false neg)
 #   - Shell heredoc (<<WORD) redirected into a blocked-extension file
 #   - PowerShell here-string (@'...'@ or @"..."@) piped to Set-Content/Out-File
 #
@@ -110,12 +113,40 @@ if (-not $matched) {
     }
 }
 
-# 4. python -c with open() in write or append mode
-#    e.g.  python -c "open('foo.py','w').write('...')"
+# 4. python -c write idioms:
+#    4a. open() in write/append/exclusive mode (any mode string containing w, a, or x)
+#        e.g.  python -c "open('foo.py','w').write('...')"
+#              python -c "open('bar.ts','wb').write(b'...')"
+#              python -c "open('q.py','a+').write('...')"
 if (-not $matched) {
-    if ($cmd -match 'python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bopen\s*\([^)]*[''"][wa][''"]') {
+    if ($cmd -match "python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bopen\s*\([^)]*['""][^'""\)]*[wax][^'""\)]*['""]") {
         $matched = $true
-        $reason  = 'python -c with open() in write/append mode'
+        $reason  = 'python -c with open() in write/append/exclusive mode'
+    }
+}
+#    4b. pathlib.Path(...).write_text / write_bytes — scan directly for the
+#        method call pattern and test the captured filename.  Does not rely on
+#        the -c prefix so it works even when the Python code contains semicolons
+#        (which would stop a [^;|&\n]* lookahead before reaching the call).
+#        e.g.  python -c "from pathlib import Path; Path('x.py').write_text('...')"
+if (-not $matched) {
+    $plMatches = [regex]::Matches($cmd,
+        "\bPath\s*\(\s*[`"']([^`"']+)[`"']\s*\)\s*\.\s*write_(?:text|bytes)\b")
+    foreach ($pm in $plMatches) {
+        if (Test-BlockedDest $pm.Groups[1].Value) {
+            $matched = $true
+            $reason = "pathlib.Path.write_text/write_bytes to '$($pm.Groups[1].Value)'"
+            break
+        }
+    }
+}
+#    4c. shutil.copy*/move with a blocked-extension filename in the command
+#        e.g.  python -c "import shutil; shutil.copy('tmpl.py','src/real.py')"
+if (-not $matched) {
+    if (($cmd -match 'python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\b') -and
+        ($cmd -match $blockExtPat)) {
+        $matched = $true
+        $reason  = 'python -c shutil write to engine source'
     }
 }
 
@@ -128,17 +159,50 @@ if (-not $matched) {
     }
 }
 
-# 6. PowerShell Set-Content / Out-File with a blocked-extension path argument
-#    e.g.  Set-Content -Path foo.py -Value '...'
-#          Get-Template | Out-File -FilePath src/index.ts
+# 6. PowerShell Set-Content / Out-File with a blocked-extension path argument.
+#    Scans ALL tokens of each invocation: named params (-Path, -FilePath,
+#    -LiteralPath) consume the NEXT token as the destination; positional args
+#    (tokens not beginning with '-') are also tested.  This avoids the false
+#    negative where the first token is a flag name, not the filename.
+#    e.g.  Set-Content -Path foo.py -Value '...'    → blocked
+#          Get-Template | Out-File -FilePath src/index.ts  → blocked
+#          Set-Content foo.py 'content'              → blocked (positional)
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '\b(?:Set-Content|Out-File)\b[^;|&\n]*?[''"]?([^\s''";|&<>]+)')
-    foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value) {
-            $matched = $true
-            $reason = "Set-Content/Out-File to '$($hit.Groups[1].Value)'"
-            break
+    $scMatches = [regex]::Matches($cmd, '\b(?:Set-Content|Out-File)\b([^;|&\n]*)')
+    foreach ($m in $scMatches) {
+        $invocation = $m.Groups[1].Value
+        $tokens = ($invocation -split '\s+') | Where-Object { $_ -ne '' }
+        $nextIsPathValue = $false
+        foreach ($tok in $tokens) {
+            if ($nextIsPathValue) {
+                if (Test-BlockedDest $tok) {
+                    $matched = $true
+                    $reason = "Set-Content/Out-File to '$tok'"
+                    break
+                }
+                $nextIsPathValue = $false
+            } elseif ($tok -match '^-(?:Path|FilePath|LiteralPath)(?::|$)') {
+                # Flag with inline value (-Path:foo.py) or flag expecting next token
+                $inline = ($tok -replace '^-(?:Path|FilePath|LiteralPath):', '')
+                if ($inline -and ($inline -ne $tok)) {
+                    if (Test-BlockedDest $inline) {
+                        $matched = $true
+                        $reason = "Set-Content/Out-File to '$inline'"
+                        break
+                    }
+                } else {
+                    $nextIsPathValue = $true
+                }
+            } elseif ($tok -notmatch '^-') {
+                # Positional argument (not a flag name or flag value)
+                if (Test-BlockedDest $tok) {
+                    $matched = $true
+                    $reason = "Set-Content/Out-File to '$tok'"
+                    break
+                }
+            }
         }
+        if ($matched) { break }
     }
 }
 
