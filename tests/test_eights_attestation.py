@@ -198,6 +198,7 @@ def test_supervisor_intake_replay_is_bounded(monkeypatch):
         def ceiling_tick(self, **kw): return None
         def envelope_record(self, *a, **kw): return None
         def hitl_request(self, *a, **kw): return None
+        def budget_charge(self, **kw): return None  # F34 stub
 
     fake_eights = _BoundedReplayEights()
     monkeypatch.setenv("HYDRA_EIGHTS_REPLAY_MAX_REPLAYS", "2")

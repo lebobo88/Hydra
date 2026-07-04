@@ -31,6 +31,21 @@ from .eights import Cell, validate_cells
 from .governance import enforce_constitution
 from .immortal_head import AlignmentVerdict, ConstitutionSnapshot
 
+# F36: Risk classification for each ProceduralKind.
+# low    → approve() commits locally with an explicit posture comment.
+# medium → approve() routes through eights evolution; fail-soft to 'pending'
+#          when eights is unreachable (never silently commit).
+# high   → approve() routes through eights evolution; fail CLOSED (→ 'rejected')
+#          when eights is unreachable.
+# critical → like high; reserved for future tightening.
+_PROCEDURAL_RISK_CLASS: dict[str, Literal["low", "medium", "high", "critical"]] = {
+    "routing_heuristic": "low",
+    "prompt_rewrite": "medium",
+    "policy_adjustment": "high",
+    "deprecation_proposal": "high",
+    "memory_pruning": "low",
+}
+
 
 # --- domain types ------------------------------------------------------------
 
@@ -173,18 +188,133 @@ def approve(
     *,
     approved_by: str = "user",
     store: Optional[ProceduralStore] = None,
+    attestor: Optional[Any] = None,
 ) -> Optional[ProceduralUpdate]:
     """Commit a pending update. Returns the updated record, or None if the
-    update is missing or not in 'pending'."""
+    update is missing or not in 'pending'.
+
+    F36 — risk_class gating:
+      low    (routing_heuristic, memory_pruning):
+               Local commit immediately. Posture: low-risk heuristic update;
+               no governance escalation required by constitution §5.
+      medium (prompt_rewrite):
+               Route through eights evolution contract via `attestor`.
+               Commit only after an eights verdict (status=='approved'/'committed').
+               If eights is unreachable (attestor=None or transport error),
+               fail-soft → leave status='pending' (never silently commit).
+      high   (policy_adjustment, deprecation_proposal):
+               Route through eights evolution contract via `attestor`.
+               If eights is unreachable, fail CLOSED → set status='rejected'.
+               A high-risk update that cannot get an eights verdict MUST NOT
+               commit; the operator must retry when TheEights is healthy.
+    """
     s = store or _DEFAULT_STORE
     u = s.get(update_id)
     if u is None or u.status != "pending":
         return None
-    u.status = "committed"
-    u.decided_at = datetime.now(timezone.utc).isoformat()
-    u.decided_by = approved_by
-    s.put(u)
-    return u
+
+    risk = _PROCEDURAL_RISK_CLASS.get(u.kind, "low")
+
+    if risk == "low":
+        # Low-risk: local commit. Explicit posture comment per F36: routing
+        # heuristics and memory pruning are low-blast-radius; the constitution
+        # §5 governance gate runs only at propose() time for these kinds.
+        # POSTURE: low-risk local commit — no eights escalation.
+        u.status = "committed"
+        u.decided_at = datetime.now(timezone.utc).isoformat()
+        u.decided_by = approved_by
+        s.put(u)
+        return u
+
+    # medium or high: must route through eights evolution contract.
+    # For medium: fail-soft to 'pending' when eights unreachable.
+    # For high:   fail CLOSED to 'rejected' when eights unreachable.
+    if attestor is None:
+        if risk == "medium":
+            # Fail-soft: leave as pending so operator can retry when eights is healthy.
+            u.rationale = (
+                (u.rationale + " | " if u.rationale else "")
+                + f"F36: {risk} risk kind requires eights verdict; "
+                "attestor not provided — leaving pending (fail-soft)."
+            ).strip(" |")
+            s.put(u)
+            return u
+        else:  # high / critical
+            u.status = "rejected"
+            u.decided_at = datetime.now(timezone.utc).isoformat()
+            u.decided_by = "governance.fail_closed"
+            u.rationale = (
+                (u.rationale + " | " if u.rationale else "")
+                + f"F36: {risk} risk kind requires eights verdict; "
+                "attestor not provided — fail CLOSED."
+            ).strip(" |")
+            s.put(u)
+            return u
+
+    # Attestor provided — route through eights evolution.
+    resource_id = f"procedural:{u.kind}:{u.id}"
+    eights_verdict: Optional[dict] = None
+
+    try:
+        # Step 1: register the resource (idempotent).
+        attestor.evolution_register(
+            resource_kind=u.kind,
+            resource_id=resource_id,
+            body=u.body,
+            summary=u.summary,
+        )
+        # Step 2: propose the evolution and read back the verdict.
+        eights_verdict = attestor.evolution_propose(
+            resource_id=resource_id,
+            summary=u.summary,
+            body=u.body,
+            proposed_by=approved_by,
+            workflow_id=u.workflow_id,
+        )
+    except Exception:  # noqa: BLE001 — fail per risk class on transport error
+        eights_verdict = None
+
+    # Interpret verdict: commit on explicit approved/committed status.
+    verdict_status = ""
+    if isinstance(eights_verdict, dict):
+        verdict_status = str(
+            eights_verdict.get("status")
+            or eights_verdict.get("verdict")
+            or ""
+        ).lower()
+
+    if verdict_status in ("approved", "committed", "done", "ok"):
+        u.status = "committed"
+        u.decided_at = datetime.now(timezone.utc).isoformat()
+        u.decided_by = approved_by
+        u.rationale = (
+            (u.rationale + " | " if u.rationale else "")
+            + f"F36: eights verdict={verdict_status}"
+        ).strip(" |")
+        s.put(u)
+        return u
+
+    # Eights either unavailable (None verdict) or returned a non-committed status.
+    if risk == "medium":
+        # Fail-soft: stay pending so operator can retry.
+        u.rationale = (
+            (u.rationale + " | " if u.rationale else "")
+            + f"F36: medium risk; eights verdict={verdict_status or 'unavailable'} "
+            "— leaving pending (fail-soft)."
+        ).strip(" |")
+        s.put(u)
+        return u
+    else:  # high / critical
+        u.status = "rejected"
+        u.decided_at = datetime.now(timezone.utc).isoformat()
+        u.decided_by = "governance.fail_closed"
+        u.rationale = (
+            (u.rationale + " | " if u.rationale else "")
+            + f"F36: {risk} risk; eights verdict={verdict_status or 'unavailable'} "
+            "— fail CLOSED."
+        ).strip(" |")
+        s.put(u)
+        return u
 
 
 def reject(

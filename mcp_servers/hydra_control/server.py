@@ -104,7 +104,7 @@ def _file_cockpit_audit_envelope(
     """
     envelope: dict[str, Any] = {
         "id": str(uuid.uuid4()),
-        "type": "cockpit_write",
+        "type": "COCKPIT_WRITE",
         "workflow_id": workflow_id or "",
         "origin_squad": actor,          # actor='hydra-cockpit' from bridge
         "target_squad": None,
@@ -603,6 +603,194 @@ def _tool_handlers() -> dict[str, Any]:
             logger.exception("attended submit failed")
             return {"ok": False, "error": f"submit_failed: {e}"}
 
+    # ------------------------------------------------------------------
+    # F32-H: four new governance-federation tools called by AgentSmith's
+    # HydraBridge (hydra-bridge.ts:74,108,129,150). Argument shapes match
+    # exactly what the bridge sends — do NOT edit AgentSmith.
+    # ------------------------------------------------------------------
+
+    def venom_cross_check(args: dict[str, Any]) -> dict[str, Any]:
+        """Run require_cerberus_pass against the live venom registry.
+
+        Called by AgentSmith HydraBridge.venomCrossCheck(capability, args).
+        Never raises — transport-shaped errors return ok=false with rationale.
+        """
+        capability = str(args.get("capability") or "")
+        context = args.get("args") or args.get("context")
+        if not capability:
+            return {"ok": False, "rationale": "capability is required"}
+        try:
+            from hydra_core.venom import require_cerberus_pass, VenomUnregistered
+        except Exception as imp_exc:  # noqa: BLE001
+            return {"ok": False, "rationale": f"venom module unavailable: {imp_exc}"}
+        try:
+            verdict = require_cerberus_pass(
+                capability, context,
+                raise_on_refuse=False,   # never raises — we translate to ok/rationale
+            )
+            if verdict.allowed:
+                return {"ok": True, "rationale": "cerberus pass"}
+            return {
+                "ok": False,
+                "rationale": "; ".join(verdict.refusal_reasons) or "cerberus refused",
+            }
+        except VenomUnregistered:
+            # Capability not in registry → not a known venom; treat as pass.
+            return {"ok": True, "rationale": "capability not in venom registry — not a venom-class action"}
+        except Exception as exc:  # noqa: BLE001 — transport-shaped error → ok=false
+            logger.exception("venom_cross_check: unexpected error")
+            return {"ok": False, "rationale": f"gate error: {type(exc).__name__}: {exc}"}
+
+    def squad_list(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+        """Squad discovery. Called by AgentSmith HydraBridge.squadRegistry().
+
+        Returns {squads: [{slug, name, entrypoint, active, version}]}.
+        """
+        try:
+            from hydra_core.squad_loader import discover_squads
+            packs = discover_squads(_HYDRA_ROOT)
+            squads = []
+            for slug, pack in sorted(packs.items()):
+                squads.append({
+                    "slug": slug,
+                    "name": pack.name,
+                    "entrypoint": pack.entrypoint,
+                    "active": pack.entrypoint != "stub",
+                    "version": str(pack.version),
+                })
+            return {"ok": True, "squads": squads}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("squad_list: discovery failed")
+            return {"ok": False, "error": f"squad_list failed: {exc}", "squads": []}
+
+    def envelope_record(args: dict[str, Any]) -> dict[str, Any]:
+        """Record an envelope to episodic db / trace.
+
+        Called by AgentSmith HydraBridge.envelopeRecord(envelope).
+        Args match the bridge's shape: {kind, from_squad, to_squad?, workflow_id, payload}.
+        Also accepts Hydra-native envelope shape: {type, origin_squad, ...}.
+        Validates via hydra_core.schemas.validate_envelope (best-effort);
+        appends to episodic db using the existing attestor helper.
+        """
+        # Normalise bridge → Hydra envelope shape.
+        kind = str(args.get("kind") or args.get("type") or "")
+        from_squad = str(args.get("from_squad") or args.get("origin_squad") or "")
+        to_squad = args.get("to_squad") or args.get("target_squad")
+        workflow_id_raw = str(args.get("workflow_id") or "")
+        payload = args.get("payload")
+
+        if not kind:
+            return {"ok": False, "error": "kind (or type) is required"}
+
+        envelope_id = str(uuid.uuid4())
+        hydra_env: dict[str, Any] = {
+            "id": envelope_id,
+            "type": kind,
+            "origin_squad": from_squad or "agentsmith",
+            "target_squad": to_squad,
+            "workflow_id": workflow_id_raw or str(uuid.uuid4()),
+        }
+
+        # Best-effort schema validation — unknown types log a warning but
+        # do not block the record (the envelope is still persisted).
+        try:
+            from hydra_core.schemas import validate_envelope as _validate
+            _validate(hydra_env)
+        except Exception as val_exc:  # noqa: BLE001
+            logger.debug("envelope_record: validation skipped: %s", val_exc)
+
+        # Persist to episodic db via the EightsAttestor spool path (the
+        # existing envelope-persist helper — reuse, don't reinvent).
+        attestor = _get_attestor()
+        if attestor is not None:
+            attestor.envelope_record(hydra_env)
+
+        # Also persist locally to episodic SQLite for in-process recall.
+        try:
+            from hydra_core.memory import append_episodic
+            append_episodic(
+                workflow_id=workflow_id_raw or "no-workflow",
+                kind=kind,
+                payload={"envelope": hydra_env, "payload": payload},
+                origin_squad=from_squad or "agentsmith",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        return {"ok": True, "envelope_id": envelope_id}
+
+    def telemetry_tail(args: dict[str, Any]) -> dict[str, Any]:
+        """Return recent telemetry/trace events from a workflow's trace.jsonl.
+
+        Called by AgentSmith HydraBridge.telemetryTail(workflow_id, ...).
+        Args: {workflow_id?: str, limit?: int, since?: str}.
+        Returns {events: [{kind, payload, cursor}]}.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        limit = min(int(args.get("limit") or 50), 500)
+        since_cursor = str(args.get("since") or "")
+
+        events: list[dict[str, Any]] = []
+
+        if workflow_id:
+            trace_file = _HYDRA_ROOT / ".hydra" / workflow_id / "trace.jsonl"
+            if trace_file.exists():
+                try:
+                    lines = trace_file.read_text(encoding="utf-8").splitlines()
+                    # Apply since_cursor (line index) if provided.
+                    start = 0
+                    if since_cursor:
+                        try:
+                            start = int(since_cursor) + 1
+                        except ValueError:
+                            start = 0
+                    for idx, line in enumerate(lines[start:], start=start):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        events.append({
+                            "kind": ev.get("kind", "event"),
+                            "payload": ev,
+                            "cursor": str(idx),
+                        })
+                        if len(events) >= limit:
+                            break
+                except Exception as exc:  # noqa: BLE001
+                    return {"ok": False, "error": f"trace read error: {exc}", "events": []}
+        else:
+            # No workflow_id: scan all recent workflows and tail each.
+            hydra_dir = _HYDRA_ROOT / ".hydra"
+            if hydra_dir.is_dir():
+                wf_dirs = sorted(
+                    (d for d in hydra_dir.iterdir() if d.is_dir() and (d / "trace.jsonl").exists()),
+                    key=lambda d: d.stat().st_mtime, reverse=True,
+                )[:5]
+                for wf_dir in wf_dirs:
+                    try:
+                        lines = (wf_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+                        for idx, line in enumerate(lines[-limit:]):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                ev = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            events.append({
+                                "kind": ev.get("kind", "event"),
+                                "payload": ev,
+                                "cursor": f"{wf_dir.name}:{idx}",
+                            })
+                    except Exception:  # noqa: BLE001
+                        continue
+                events = events[-limit:]
+
+        return {"ok": True, "events": events}
+
     return {
         "hydra.control.ping": ping,
         "hydra.workflow.launch": workflow_launch,
@@ -612,6 +800,10 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.workflow.resume": workflow_resume,
         "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
         "hydra.cockpit.audit": cockpit_audit,
+        "hydra.venom.cross_check": venom_cross_check,
+        "hydra.squad.list": squad_list,
+        "hydra.envelope.record": envelope_record,
+        "hydra.telemetry.tail": telemetry_tail,
     }
 
 
@@ -750,7 +942,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "hydra.cockpit.audit": {
         "description": (
-            "C5: File a 'cockpit_write' audit envelope to TheEights for every "
+            "C5: File a 'COCKPIT_WRITE' audit envelope to TheEights for every "
             "cockpit write action. SPOOL-SAFE: if TheEights is offline the payload "
             "is spooled locally and replayed on next workflow start. Returns "
             "{ok:true, spooled:false} on live filing or {ok:true, spooled:true} "
@@ -792,6 +984,106 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
             "required": ["action", "actor", "project", "trace_id"],
+        },
+    },
+    # F32-H: four governance-federation tools (AgentSmith HydraBridge contract).
+    "hydra.venom.cross_check": {
+        "description": (
+            "Run Cerberus' require_cerberus_pass against the live venom registry "
+            "for a capability + context. Called by AgentSmith HydraBridge for "
+            "cross-system venom validation. Never raises — transport errors return "
+            "ok=false with rationale. Returns {ok: bool, rationale: str}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "capability": {
+                    "type": "string",
+                    "description": "Registered venom capability name (e.g. 'shell.destructive').",
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Proposed invocation context / args (optional).",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Alias for context (bridge compatibility).",
+                },
+            },
+            "required": ["capability"],
+        },
+    },
+    "hydra.squad.list": {
+        "description": (
+            "Discover all squad packs registered in this Hydra instance. "
+            "Called by AgentSmith HydraBridge.squadRegistry(). "
+            "Returns {squads: [{slug, name, entrypoint, active, version}]}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    "hydra.envelope.record": {
+        "description": (
+            "Validate and persist an envelope to the episodic db and eights trace. "
+            "Called by AgentSmith HydraBridge.envelopeRecord(). "
+            "Accepts AgentSmith bridge shape ({kind, from_squad, to_squad?, "
+            "workflow_id, payload}) or Hydra-native shape ({type, origin_squad, ...}). "
+            "Returns {ok: true, envelope_id: str}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "Envelope type / kind (bridge field; use 'type' for Hydra-native).",
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Envelope type (Hydra-native; alias for kind).",
+                },
+                "from_squad": {
+                    "type": "string",
+                    "description": "Origin squad (bridge field).",
+                },
+                "origin_squad": {
+                    "type": "string",
+                    "description": "Origin squad (Hydra-native; alias for from_squad).",
+                },
+                "to_squad": {
+                    "type": "string",
+                    "description": "Target squad (optional).",
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Workflow id for audit lineage.",
+                },
+                "payload": {
+                    "description": "Envelope payload content (any).",
+                },
+            },
+        },
+    },
+    "hydra.telemetry.tail": {
+        "description": (
+            "Return recent telemetry/trace events from a workflow's trace.jsonl. "
+            "Called by AgentSmith HydraBridge.telemetryTail(). "
+            "Returns {events: [{kind, payload, cursor}]}. "
+            "Pass 'since' (a prior cursor) to get only new events since last poll."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Workflow id to tail (optional — tails recent workflows if absent).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return (default 50, max 500).",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Cursor from a prior tail call — returns only events after this.",
+                },
+            },
         },
     },
 }

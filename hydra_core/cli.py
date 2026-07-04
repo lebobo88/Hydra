@@ -1455,6 +1455,16 @@ def _cmd_attended_submit(args) -> int:
                     cost = float(res.get("cost_usd") or 0.0)
                     toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
                     block, downgrade = charge_and_gate(state, cost, toks)
+                    # F34: budget_charge to eights (fail-soft; never blocks local work).
+                    try:
+                        from .eights.attestation import EightsAttestor as _EightsAttestor
+                        _att = _EightsAttestor(dispatcher=dispatcher, workflow_id=wf)
+                        _att.budget_charge(
+                            workflow_id=wf, usd=cost, tokens=toks,
+                            purpose="attended_submit",
+                        )
+                    except Exception:  # noqa: BLE001 — fail-soft per F34
+                        pass
                     # Mark this engineering task attended-complete (replace
                     # channel) so the next `step` does not re-pick it. We do NOT
                     # flip task.status — the `tasks` channel's _append reducer

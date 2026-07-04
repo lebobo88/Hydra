@@ -29,6 +29,7 @@ how the persona's refusals get enforced at runtime.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -93,6 +94,27 @@ class VenomCapability:
 
 _REGISTRY: dict[str, VenomCapability] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+# F35: optional AgentSmith cross-check hook.
+# Set by the dispatcher's _venom_gate when HYDRA_VENOM_CROSS_CHECK=1.
+# Signature: (capability: str, args: Any) -> Optional[dict]
+# Returns None or {"ok": bool, "rationale": str}. MUST be runtime-agnostic
+# (no provider SDK types stored — only a plain Callable).
+_CROSS_CHECK_HOOK: Optional[Callable[[str, Any], Optional[dict]]] = None
+_CROSS_CHECK_LOCK = threading.Lock()
+
+
+def set_cross_check_hook(fn: Optional[Callable[[str, Any], Optional[dict]]]) -> None:
+    """Inject the AgentSmith cross-check callable. Thread-safe; idempotent."""
+    global _CROSS_CHECK_HOOK  # noqa: PLW0603
+    with _CROSS_CHECK_LOCK:
+        _CROSS_CHECK_HOOK = fn
+
+
+def get_cross_check_hook() -> Optional[Callable[[str, Any], Optional[dict]]]:
+    """Return the installed cross-check hook (may be None)."""
+    with _CROSS_CHECK_LOCK:
+        return _CROSS_CHECK_HOOK
 
 
 def register_venom(
@@ -297,6 +319,7 @@ def gate_runtime_action(
     cmd: Any = None,
     workflow_id: Optional[str | UUID] = None,
     raise_on_refuse: bool = True,
+    cross_check_fn: Optional[Callable[[str, Any], Optional[dict]]] = None,
 ) -> list[VenomVerdict]:
     """Cerberus gate for a runtime MCP call or subprocess. Classifies the action
     by ARGS signature, then runs ``require_cerberus_pass`` for each matched +
@@ -305,6 +328,9 @@ def gate_runtime_action(
 
     Returns the verdicts (empty when nothing classified — the common, fast path).
     Raises ``VenomRefused`` on a hard refusal when ``raise_on_refuse`` is True.
+
+    ``cross_check_fn`` is forwarded to ``require_cerberus_pass`` for the F35
+    optional AgentSmith cross-check (injected by the dispatcher's _venom_gate).
     """
     parts: list[str] = []
     if server:
@@ -325,6 +351,7 @@ def gate_runtime_action(
             {"server": server, "tool": tool, "args": args, "cmd": cmd},
             workflow_id=workflow_id,
             raise_on_refuse=raise_on_refuse,
+            cross_check_fn=cross_check_fn,
         ))
     return verdicts
 
@@ -367,6 +394,7 @@ def require_cerberus_pass(
     workflow_id: Optional[str | UUID] = None,
     constitution: Optional[ConstitutionSnapshot] = None,
     raise_on_refuse: bool = True,
+    cross_check_fn: Optional[Callable[[str, Any], Optional[dict]]] = None,
 ) -> VenomVerdict:
     """The single Cerberus gate. Every venom invocation flows through here.
 
@@ -375,6 +403,11 @@ def require_cerberus_pass(
       2. Capability's own refusal patterns over stringified args.
       3. Constitution gate over the proposed invocation.
       4. MCP-attack scan over stringified args.
+      4b. F35: Optional AgentSmith cross-check when HYDRA_VENOM_CROSS_CHECK=1.
+          Uses the injected hook (set by dispatcher._venom_gate) or falls back
+          to the module-level hook. Fail-open on transport error — the local
+          gate's verdict is authoritative; the cross-check is best-effort
+          second-opinion only.
       5. Audit entry written to Kan cell (or the capability's custom sink).
 
     Returns `VenomVerdict`. If `raise_on_refuse=True` (default) and the
@@ -405,6 +438,30 @@ def require_cerberus_pass(
     if hits:
         for category, excerpt in hits:
             refusal_reasons.append(f"mcp-attack ({category}): {excerpt[:80]}")
+
+    # 4b. F35: optional AgentSmith cross-check (HYDRA_VENOM_CROSS_CHECK=1).
+    # Fail-open: a transport error from AgentSmith must never turn a local
+    # allow into a block. The local gate's verdict remains authoritative.
+    if os.environ.get("HYDRA_VENOM_CROSS_CHECK") == "1":
+        _fn = cross_check_fn or get_cross_check_hook()
+        if _fn is not None:
+            try:
+                xc_result = _fn(capability, args)
+                if isinstance(xc_result, dict) and xc_result.get("ok") is False:
+                    rationale = xc_result.get("rationale", "agentsmith cross-check refused")
+                    refusal_reasons.append(f"agentsmith cross-check: {rationale}")
+            except Exception as _xc_exc:  # noqa: BLE001 — fail-open on transport error
+                try:
+                    from .telemetry import emit as _emit_tel
+                    from pathlib import Path as _Path
+                    _emit_tel(
+                        _Path("."),
+                        str(workflow_id or "venom-no-workflow"),
+                        "venom.cross_check_error",
+                        {"capability": capability, "error": str(_xc_exc)[:200]},
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must never block
+                    pass
 
     # 5. always audit, pass or fail
     record = {

@@ -1085,6 +1085,12 @@ def build_supervisor(
             # Fix 2b: charge + gate after every best-of-N candidate.
             _cost_usd, _cost_tok = _extract_squad_cost(result)
             _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            # F34: budget_charge to eights (fail-soft; never blocks local work).
+            eights.budget_charge(
+                workflow_id=str(state.workflow_id),
+                usd=_cost_usd, tokens=_cost_tok,
+                purpose=f"best_of_n candidate {i}",
+            )
             if _cost_usd == 0.0 and _cost_tok == 0:
                 emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
                     "site": "best_of_n", "candidate": i, "squad": pack.slug,
@@ -1784,6 +1790,12 @@ def build_supervisor(
             # Fix 2b: charge + gate via centralized helper.
             _cost_usd, _cost_tok = _extract_squad_cost(result)
             _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            # F34: budget_charge to eights (fail-soft; never blocks local work).
+            eights.budget_charge(
+                workflow_id=str(state.workflow_id),
+                usd=_cost_usd, tokens=_cost_tok,
+                purpose="sequential_dispatch",
+            )
             if _cost_usd == 0.0 and _cost_tok == 0:
                 emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
                     "site": "dispatch", "squad": pack.slug,
@@ -1939,6 +1951,12 @@ def build_supervisor(
                 continue
             _fc_usd, _fc_tok = _extract_squad_cost(_fwd_result)
             _fblock, _fdown = charge_and_gate(state, _fc_usd, _fc_tok)
+            # F34: budget_charge to eights (fail-soft; never blocks local work).
+            eights.budget_charge(
+                workflow_id=str(state.workflow_id),
+                usd=_fc_usd, tokens=_fc_tok,
+                purpose="forwarded_dispatch",
+            )
             if _fdown and not state.budget_downgrade_active:
                 state.budget_downgrade_active = True
             emit_trace(judge_trace_root, state.workflow_id, "dispatch.forwarded", {
@@ -2098,6 +2116,12 @@ def build_supervisor(
         # Fix 2b: charge + gate for reflexion retries.
         _cost_usd, _cost_tok = _extract_squad_cost(result)
         _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+        # F34: budget_charge to eights (fail-soft; never blocks local work).
+        eights.budget_charge(
+            workflow_id=str(state.workflow_id),
+            usd=_cost_usd, tokens=_cost_tok,
+            purpose="reflexion_retry",
+        )
         if _cost_usd == 0.0 and _cost_tok == 0:
             emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
                 "site": "reflexion", "origin": origin,

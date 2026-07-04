@@ -416,3 +416,60 @@ class EightsAttestor:
         if isinstance(out, dict) and isinstance(out.get("text"), str):
             return out["text"]
         return None
+
+    # ---------- evolution (F36: procedural risk routing) ----------
+
+    def evolution_register(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        body: str,
+        summary: str = "",
+    ) -> Optional[dict]:
+        """Register a resource in the eights evolution ledger before proposing.
+
+        Required for medium/high-risk procedural kinds so TheEights can track
+        the resource's lifecycle. Idempotent — re-registering with the same
+        resource_id is a no-op in the daemon.
+        """
+        return self._call("eights.evolution.register", {
+            "resource_kind": resource_kind,
+            "resource_id": resource_id,
+            "body": body,
+            "summary": summary or resource_kind,
+        })
+
+    def evolution_propose(
+        self,
+        *,
+        resource_id: str,
+        summary: str,
+        body: str,
+        proposed_by: str = "hydra.procedural",
+        workflow_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Propose an evolution update for a resource. Returns the proposal dict
+        (including ``proposal_id`` and ``status``) or None when the daemon is
+        unreachable. A None return means the caller must treat the update as
+        pending (fail-soft for medium risk) or rejected (fail-closed for high)."""
+        return self._call("eights.evolution.propose", {
+            "resource_id": resource_id,
+            "summary": summary,
+            "body": body,
+            "proposed_by": proposed_by,
+            "run_id": str(workflow_id or self.workflow_id or "procedural"),
+        })
+
+    def evolution_commit(
+        self,
+        *,
+        resource_id: str,
+        proposal_id: str,
+    ) -> Optional[dict]:
+        """Commit an approved evolution proposal. Returns the commit receipt or
+        None when the daemon is unreachable."""
+        return self._call("eights.evolution.commit", {
+            "resource_id": resource_id,
+            "proposal_id": proposal_id,
+        })
