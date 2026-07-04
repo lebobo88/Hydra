@@ -101,6 +101,14 @@ class EightsAttestor:
         init=False,
         repr=False,
     )
+    # F34 round-3: dedicated lock for race-safe read/write of _budget_charge_breaker_until.
+    # Tiny critical sections — only the timestamp reads/writes, not the whole
+    # budget_charge body — so contention is negligible.
+    _budget_charge_breaker_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     @staticmethod
     def _is_success_envelope(result: Any) -> bool:
@@ -386,12 +394,14 @@ class EightsAttestor:
         indefinitely; each subsequent timed-out call stacks another abandoned
         thread behind the lock (unbounded accumulation).
 
-        Solution — two guards:
+        Solution — two guards + one lock:
 
         1. **BoundedSemaphore(1)** — at most ONE budget_charge thread may be
-           in-flight at a time.  If a thread is already parked waiting for
-           ``_dispatch_lock``, the next call skips without spawning a second
-           thread and trips the breaker.
+           in-flight at a time.  A healthy overlapping call (two concurrent
+           charges while eights is fine) simply skips THIS call only — the
+           breaker is NOT tripped, so the next solo call proceeds normally.
+           The breaker is opened ONLY on evidence of a real wedge (worker
+           thread still alive after ``timeout_s`` join).
 
         2. **Circuit breaker (time-based)** — after the first timeout the
            breaker is opened for ``HYDRA_BUDGET_CHARGE_COOLDOWN_S`` (default
@@ -399,12 +409,16 @@ class EightsAttestor:
            lock contention).  After cooldown the breaker resets and one new
            attempt is allowed.
 
+        3. **Breaker lock** — ``_budget_charge_breaker_lock`` guards all reads
+           and writes of ``_budget_charge_breaker_until`` so concurrent calls
+           from multiple threads cannot race on the timestamp.
+
         Both guards together ensure: at most ONE budget_charge worker is ever
         in-flight, so at most 1 thread ever holds/waits on ``_dispatch_lock``.
-        While a wedged worker holds the permit, guard 2 rejects every new call
-        (the breaker just spares them the join wait), so a sustained eights
-        wedge produces NO further threads — the permit re-arms the gate only
-        when the wedged worker's ``call_mcp`` finally returns and releases it.
+        While a wedged worker holds the permit, the breaker rejects every new
+        call (breaker spares them the join wait), so a sustained eights wedge
+        produces NO further threads — the permit re-arms the gate only when the
+        wedged worker's ``call_mcp`` finally returns and releases it.
         """
         if not self.enabled or self.dispatcher is None:
             return None
@@ -418,25 +432,27 @@ class EightsAttestor:
             "HYDRA_BUDGET_CHARGE_COOLDOWN_S", str(_BUDGET_CHARGE_COOLDOWN_DEFAULT)
         ))
 
-        # Guard 1: circuit breaker check.
+        # Guard 1: circuit breaker check (lock-protected read).
+        with self._budget_charge_breaker_lock:
+            breaker_until = self._budget_charge_breaker_until
         now = _time.monotonic()
-        if now < self._budget_charge_breaker_until:
+        if now < breaker_until:
             logger.debug(
                 "budget_charge: circuit breaker open (%.1fs remaining) — skip",
-                self._budget_charge_breaker_until - now,
+                breaker_until - now,
             )
             return None
 
         # Guard 2: concurrency gate.  Exactly one thread in-flight at a time.
         # Non-blocking acquire: if another budget_charge thread is already
-        # waiting on _dispatch_lock, skip and trip the breaker so subsequent
-        # calls also skip during cooldown.
+        # in-flight, skip THIS CALL ONLY — the breaker is NOT tripped here
+        # because a healthy concurrent overlap is not evidence of a wedge.
+        # The breaker opens ONLY when the worker thread actually times out (below).
         if not self._budget_charge_semaphore.acquire(blocking=False):
             logger.debug(
                 "budget_charge: previous charge still in-flight — "
-                "skipping and opening breaker for %.0fs", cooldown_s,
+                "skipping this call (healthy overlap; breaker NOT tripped)",
             )
-            self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
             return None
 
         result_box: list[Optional[dict]] = [None]
@@ -473,7 +489,8 @@ class EightsAttestor:
         # which keeps the gate closed until the daemon recovers.
 
         if t.is_alive():
-            self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
+            with self._budget_charge_breaker_lock:
+                self._budget_charge_breaker_until = _time.monotonic() + cooldown_s
             logger.debug(
                 "budget_charge: timed out after %.1fs — breaker tripped "
                 "for %.0fs; local BudgetLedger remains authoritative",

@@ -2628,9 +2628,10 @@ class TestF34BudgetChargeWired:
         )
 
     def test_budget_charge_semaphore_held_skips_without_spawning(self, monkeypatch):
-        """F34 circuit-breaker round-2: when the concurrency semaphore is
+        """F34 circuit-breaker round-3: when the concurrency semaphore is
         already held (another charge is in-flight), the next call must skip
-        without spawning and must trip the circuit breaker."""
+        without spawning but must NOT trip the circuit breaker — a healthy
+        concurrent overlap is not evidence of a wedge."""
         import time as _time
         from hydra_core.eights.attestation import EightsAttestor
 
@@ -2652,8 +2653,11 @@ class TestF34BudgetChargeWired:
         assert result is None, (
             f"F34: semaphore-held call must return None, got {result!r}"
         )
-        assert att._budget_charge_breaker_until > _time.monotonic(), (
-            "F34: semaphore-held skip must trip the circuit breaker"
+        # Round-3 fix: semaphore collision does NOT trip the breaker.
+        # The breaker should still be closed (0.0 or a past timestamp).
+        assert att._budget_charge_breaker_until <= _time.monotonic(), (
+            "F34 round-3: semaphore-held skip must NOT trip the circuit breaker "
+            "(healthy overlap ≠ wedge); breaker opened unexpectedly"
         )
 
     def test_budget_charge_breaker_resets_after_cooldown(self, monkeypatch):
@@ -2683,6 +2687,91 @@ class TestF34BudgetChargeWired:
         assert len(calls_made) > 0, (
             "F34: expired breaker must allow the call through; "
             f"no calls were made → breaker incorrectly blocking"
+        )
+
+    def test_budget_charge_healthy_concurrent_skips_do_not_trip_breaker(
+        self, monkeypatch
+    ):
+        """F34 round-3: a healthy overlapping budget_charge (semaphore held by
+        a fast in-flight call) must NOT trip the breaker.  A subsequent solo
+        call with a fast dispatcher must still proceed normally."""
+        import time as _time
+        import threading as _threading
+        from hydra_core.eights.attestation import EightsAttestor
+
+        calls_made: list[str] = []
+
+        class _FastDispatcher:
+            def call_mcp(self, server, tool, args):
+                calls_made.append(tool)
+                return {"status": "ok", "result": {}}
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "5")
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_COOLDOWN_S", "60")
+        att = EightsAttestor(dispatcher=_FastDispatcher(), workflow_id="wf-healthy-concurrent")
+
+        # Hold semaphore to simulate in-flight concurrent charge.
+        att._budget_charge_semaphore.acquire()
+        try:
+            result = att.budget_charge(workflow_id="wf-healthy-concurrent", usd=0.01, tokens=100)
+        finally:
+            att._budget_charge_semaphore.release()
+
+        # Skip must have occurred (no dispatcher needed — semaphore gate fires first).
+        assert result is None
+
+        # Breaker must remain closed after a healthy overlap (round-3 fix).
+        assert att._budget_charge_breaker_until <= _time.monotonic(), (
+            "F34 round-3: healthy concurrent overlap must NOT open the breaker"
+        )
+
+        # Subsequent solo call must proceed normally (breaker still closed).
+        calls_before = len(calls_made)
+        att.budget_charge(workflow_id="wf-healthy-concurrent", usd=0.02, tokens=200)
+        # Wait briefly for the daemon thread to finish.
+        _time.sleep(0.2)
+        assert len(calls_made) > calls_before, (
+            "F34 round-3: solo call after healthy-concurrent skip must reach dispatcher; "
+            f"calls_made={calls_made}"
+        )
+
+    def test_budget_charge_breaker_state_race_safe(self, monkeypatch):
+        """F34 round-3: _budget_charge_breaker_lock protects breaker state
+        against concurrent reads/writes.  Two threads hammering budget_charge
+        must not produce a data-race crash or leave the breaker in a
+        logically-impossible state (negative remaining time on a fresh instance)."""
+        import time as _time
+        import threading as _threading
+        from hydra_core.eights.attestation import EightsAttestor
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "0.05")
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_COOLDOWN_S", "1")
+
+        class _SlowDispatcher:
+            def call_mcp(self, server, tool, args):
+                _time.sleep(5)  # wedged; will time out
+                return {"status": "ok", "result": {}}
+
+        att = EightsAttestor(dispatcher=_SlowDispatcher(), workflow_id="wf-race-test")
+
+        errors: list[str] = []
+
+        def _hammer() -> None:
+            for _ in range(5):
+                try:
+                    att.budget_charge(workflow_id="wf-race-test", usd=0.01, tokens=1)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+        t1 = _threading.Thread(target=_hammer, daemon=True)
+        t2 = _threading.Thread(target=_hammer, daemon=True)
+        t1.start(); t2.start()
+        t1.join(timeout=5); t2.join(timeout=5)
+
+        assert not errors, f"F34 round-3: race hammer produced errors: {errors}"
+        # Breaker timestamp must be >= 0 (never negative from a fresh instance).
+        assert att._budget_charge_breaker_until >= 0.0, (
+            "F34 round-3: breaker_until must be non-negative"
         )
 
 
