@@ -394,6 +394,9 @@ def _run_smoke(
     host. Exit code is authoritative: 0 → ``pass``, non-zero → ``fail``. No
     runnable command → ``skipped`` (an honest non-pass, never a forged pass).
 
+    GAP-g: on Windows, npm/npx are cmd-shell scripts that require shell=True
+    (bare subprocess exec fails with ENOENT). Detected automatically.
+
     The ``dispatcher`` parameter is retained for call-site stability and possible
     future use; the host-side runner does not need it.
     """
@@ -401,10 +404,13 @@ def _run_smoke(
     if not cmd:
         # Genuinely no command — an honest non-pass that is NOT an infra failure.
         return "skipped", "no runnable build/test command detected"
+    # GAP-g: npm/npx are cmd-shell scripts on Windows; run with shell=True.
+    _use_shell = os.name == "nt" and cmd[0].lower() in ("npm", "npx", "yarn", "pnpm")
     try:
         res = subprocess.run(
-            cmd, cwd=project_path, capture_output=True, text=True,
-            check=False, timeout=600,
+            cmd if not _use_shell else " ".join(cmd),
+            cwd=project_path, capture_output=True, text=True,
+            check=False, timeout=600, shell=_use_shell,
         )
     except subprocess.TimeoutExpired:
         # F10: a timeout is an INFRA failure, NOT "skipped" (which reads as
@@ -940,6 +946,7 @@ def _drive_pp_stage_loop(
             att = cm("pp_harness", "record_attempt", {
                 "stage_id": stage_id,
                 "producer": producer,
+                "agent_type": "engineer",  # F29
                 "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
                 "tokens_in": int(gi.get("tokens_in") or 0),
                 "tokens_out": int(gi.get("tokens_out") or 0),
@@ -1019,6 +1026,8 @@ def _drive_pp_stage_loop(
             if degraded:
                 score_json["_judge_degraded"] = True
 
+            # F26+M8: capture record_verdict success; failure on pass → downgrade.
+            _rv_ok = True
             if attempt_id:
                 try:
                     cm("pp_harness", "record_verdict", {
@@ -1032,7 +1041,11 @@ def _drive_pp_stage_loop(
                         "rubric_id": gate_rubric,
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
-                    pass
+                    _rv_ok = False
+            if outcome == "pass" and not _rv_ok:
+                outcome = "revise"
+                out["error"] = (out.get("error") or "") + \
+                    " record_verdict RPC failed; stage downgraded to surfaced"
             # F11-trace: per-attempt verdict event (Reflexion×1 → up to 2 attempts).
             _trace("judge.verdict", {
                 "stage_id": stage_id, "rubric_id": gate_rubric,
@@ -1040,6 +1053,12 @@ def _drive_pp_stage_loop(
                 "producer": producer, "judge_producer": judge_producer,
                 "outcome": outcome, "cross_vendor": cross_vendor,
             })
+
+            # F31: required cross-vendor but got same-vendor (degraded) → downgrade pass.
+            if degraded and outcome == "pass":
+                outcome = "revise"
+                out["error"] = (out.get("error") or "") + \
+                    " required_cross_vendor=true but judge was same-vendor; downgraded"
 
             if outcome == "pass":
                 break  # accept; no Reflexion needed
@@ -1116,6 +1135,8 @@ def _drive_pp_stage_loop(
                     _log.warning("drive_loop readiness blocked (run=%s): %s",
                                  run_id, out["error"])
 
+        # F26+M8: capture finalize_stage success; failure on pass → downgrade.
+        _fs_ok = True
         try:
             cm("pp_harness", "finalize_stage", {
                 "stage_id": stage_id,
@@ -1123,8 +1144,15 @@ def _drive_pp_stage_loop(
                 **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
             }, squad_id=sq)
         except Exception:  # noqa: BLE001
-            pass
+            _fs_ok = False
+        if passed and not _fs_ok:
+            passed = False
+            out["stage_outcome"] = "surfaced"
+            out["error"] = (out.get("error") or "") + \
+                " finalize_stage RPC failed; stage downgraded to surfaced"
 
+        # F30: embed error/abort reason in summary_md (FinalizeRunSchema strips
+        # standalone 'reason'/'project_path' keys).
         if gen_failed:
             summary = f"Headless drive loop: generate failed -- {out.get('error')}"
         elif passed:
@@ -1171,10 +1199,10 @@ def _drive_pp_stage_loop(
     except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
         out["error"] = repr(e)
         try:
+            # F30: embed reason in summary_md (FinalizeRunSchema strips 'reason'/'project_path').
             abort_fin = cm("pp_harness", "finalize_run", {
                 "run_id": run_id, "status": "aborted",
-                "reason": f"drive_loop_error: {e!r}",
-                "project_path": project_path,
+                "summary_md": f"drive_loop_error: {e!r}",
             }, squad_id=sq)
             # Don't claim the run was finalized unless the abort envelope itself
             # succeeded — a failed finalize_run leaves the project lock held, and
@@ -1352,6 +1380,8 @@ def _drive_best_of_loop(
             score["_judge_tier"] = "cross_vendor" if required_cross else "same_vendor"
             if required_cross and not cross_vendor:
                 score["_judge_degraded"] = True
+            # F26+M8: capture record_verdict success; failure on pass → downgrade.
+            _bo_rv_ok = True
             if att_id:
                 try:
                     cm("pp_harness", "record_verdict", {
@@ -1362,7 +1392,13 @@ def _drive_best_of_loop(
                         "rubric_id": gate_rubric,
                     }, squad_id=sq)
                 except Exception:  # noqa: BLE001
-                    pass
+                    _bo_rv_ok = False
+            if v_outcome == "pass" and not _bo_rv_ok:
+                v_outcome = "revise"
+            # F31: required cross-vendor but same-vendor judge → downgrade.
+            if (required_cross and not cross_vendor) and v_outcome == "pass":
+                v_outcome = "revise"
+                score["_judge_degraded"] = True
             smoke_status, _smoke_reason = _run_smoke(
                 dispatcher, project_path=wt, stage_id=stage_id)
             try:
@@ -1481,6 +1517,8 @@ def _drive_best_of_loop(
                     out["stage_outcome"] = "surfaced"
                     out["error"] = f"pp readiness: not ready (next_action={na})"
 
+        # F26+M8: capture finalize_stage success; failure on pass → downgrade.
+        _bo_fs_ok = True
         try:
             cm("pp_harness", "finalize_stage", {
                 "stage_id": stage_id,
@@ -1489,10 +1527,16 @@ def _drive_best_of_loop(
                    if (passed and winner["att"]) else {}),
             }, squad_id=sq)
         except Exception:  # noqa: BLE001
-            pass
+            _bo_fs_ok = False
+        if passed and not _bo_fs_ok:
+            passed = False
+            out["stage_outcome"] = "surfaced"
+            out["error"] = (out.get("error") or "") + \
+                " finalize_stage RPC failed; stage downgraded to surfaced"
 
         td_note = (f" teardown={out['teardown_status']}"
                    if out.get("teardown_status") else "")
+        # F30: embed any error reason in summary_md.
         summary = (f"Headless best-of-{n}: winner candidate={winner['ci']} "
                    f"outcome={winner['outcome']} smoke={winner['smoke']} "
                    f"merge={merge_status}{td_note}"
@@ -1518,9 +1562,10 @@ def _drive_best_of_loop(
     except Exception as e:  # noqa: BLE001 — fail-soft; always release the lock
         out["error"] = repr(e)
         try:
+            # F30: embed reason in summary_md (FinalizeRunSchema strips 'reason'/'project_path').
             abort_fin = cm("pp_harness", "finalize_run", {
                 "run_id": run_id, "status": "aborted",
-                "reason": f"best_of_error: {e!r}", "project_path": project_path,
+                "summary_md": f"best_of_error: {e!r}",
             }, squad_id=sq)
             out["finalized"] = (isinstance(abort_fin, dict)
                                 and abort_fin.get("status") != "failed")
@@ -2520,14 +2565,15 @@ def abort_open_pp_runs(
         if not run_id:
             continue
         try:
+            # F30: FinalizeRunSchema strips 'reason'/'project_path' keys;
+            # embed the reason in summary_md so it is preserved in the ledger.
             env = dispatcher.call_mcp(
                 "pp_harness",
                 "finalize_run",
                 {
                     "run_id": run_id,
                     "status": "aborted",
-                    "reason": reason,
-                    "project_path": project_path,
+                    "summary_md": f"abort_open_pp_runs: {reason}",
                 },
                 squad_id="engineering",
             )

@@ -37,9 +37,12 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
+import re as _re
+
 from . import telemetry as _telemetry
 from .squad_node import (
     Dispatcher,
+    _augment_with_critique,
     _build_engineer_prompt,
     _generate_failure_reason,
     _judge_artifact_text,
@@ -211,24 +214,59 @@ def _capture_baseline_failures(project_path: str) -> list[str]:
     inside a worktree) are captured as the baseline.  A later smoke-fail
     is treated as clean if current failures ⊆ baseline.
 
+    GAP-a2: tries multiple candidate directories to find tests/. A worktree
+    often shares tests with the repo root (git worktree is a shallow copy).
     Fail-soft: any exception returns an empty list (no baseline → smoke
     failures are NOT excused, which is the safe default).
     """
-    try:
-        res = subprocess.run(
-            [
-                __import__("sys").executable, "-m", "pytest",
-                "tests/", "--no-header", "-q", "--tb=no", "--timeout=120",
-            ],
-            cwd=project_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=240,
-        )
-        return sorted(_parse_failing_tests(res.stdout + "\n" + res.stderr))
-    except Exception:  # noqa: BLE001 — baseline failure is non-fatal
-        return []
+    import sys as _sys
+    candidates = [project_path]
+    # Also try parent (the repo root; worktrees share the same .git objects)
+    parent = str(Path(project_path).parent)
+    if parent and parent != project_path:
+        candidates.append(parent)
+    for cwd in candidates:
+        tests_dir = Path(cwd) / "tests"
+        if not tests_dir.is_dir():
+            continue
+        try:
+            res = subprocess.run(
+                [
+                    _sys.executable, "-m", "pytest",
+                    "tests/", "--no-header", "-q", "--tb=no",
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=240,
+            )
+            failing = sorted(_parse_failing_tests(res.stdout + "\n" + res.stderr))
+            # Return the first successful (or empty) result — empty is valid
+            # (all tests pass in this env = no baseline needed).
+            return failing
+        except Exception:  # noqa: BLE001 — baseline failure is non-fatal
+            continue
+    return []
+
+
+# GAP-h: heuristic — a regex for file-path-like tokens in critique text.
+_PATH_TOKEN_RE = _re.compile(
+    r'[A-Za-z0-9_][A-Za-z0-9_./-]*\.[a-zA-Z]{1,10}'
+)
+
+
+def _has_real_file_ref(critique_md: str, work_path: str) -> bool:
+    """Return True if critique_md contains at least one path-like token that
+    resolves to an existing file under work_path.  Heuristic — warn-only."""
+    for match in _PATH_TOKEN_RE.finditer(critique_md):
+        token = match.group().replace("\\", "/").lstrip("/")
+        try:
+            if (Path(work_path) / token).exists():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +400,8 @@ def begin_stage(
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
         "baseline_failures": baseline_failures,
         "producer": "claude",
+        "generate_index": 0,   # GAP-f: tracks Reflexion×1 — 0=first attempt, 1=retry
+        "reflexion_critique": "",
         "attempt_id": None,
         "cost_usd": 0.0,
         "tokens_in": 0,
@@ -422,13 +462,16 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     model_id = str(result.get("model") or cursor.get("model_tier") or f"{producer}-default")
 
+    # GAP-f: generate_index tracks the Reflexion×1 retry (0=first, 1=Reflexion).
+    gen_idx = cursor.get("generate_index", 0)
+
     if gen_fail:
         cursor["error"] = gen_fail
         cursor["outcome"] = "error"
         try:
             cm("pp_harness", "archive_artifact", {
                 "run_id": run_id,
-                "relative_path": f"code/{producer}-attempt-0.failed.md",
+                "relative_path": f"code/{producer}-attempt-{gen_idx}.failed.md",
                 "bytes": f"GENERATE FAILED: {gen_fail}\n\n{gen_text or '(no output)'}",
                 "stage_id": stage_id, "kind": "code", "encoding": "utf8",
             }, squad_id=_SQ)
@@ -437,10 +480,11 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         try:
             att = cm("pp_harness", "record_attempt", {
                 "stage_id": stage_id, "producer": producer, "model_id": model_id,
+                "agent_type": "engineer",   # F29
                 "tokens_in": int(result.get("tokens_in") or 0),
                 "tokens_out": int(result.get("tokens_out") or 0),
                 "cost_usd": float(result.get("cost_usd") or 0.0),
-                "status": "error", "retry_index": 0,
+                "status": "error", "retry_index": gen_idx,
                 "notes": {"candidate_index": 1},
             }, squad_id=_SQ)
             cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
@@ -454,7 +498,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     try:
         cm("pp_harness", "archive_artifact", {
             "run_id": run_id,
-            "relative_path": f"code/{producer}-attempt-0.md",
+            "relative_path": f"code/{producer}-attempt-{gen_idx}.md",
             "bytes": gen_text or "(no summary returned)",
             "stage_id": stage_id, "kind": "code", "encoding": "utf8",
         }, squad_id=_SQ)
@@ -462,10 +506,11 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         pass
     att = cm("pp_harness", "record_attempt", {
         "stage_id": stage_id, "producer": producer, "model_id": model_id,
+        "agent_type": "engineer",   # F29
         "tokens_in": int(result.get("tokens_in") or 0),
         "tokens_out": int(result.get("tokens_out") or 0),
         "cost_usd": float(result.get("cost_usd") or 0.0),
-        "status": "ok", "retry_index": 0,
+        "status": "ok", "retry_index": gen_idx,
         "notes": {"candidate_index": 1},
     }, squad_id=_SQ)
     cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
@@ -494,8 +539,9 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["gate_rubric"] = gate_rubric
     cursor["required_cross"] = required_cross
     cursor["state"] = "await_judge"
+    judge_call_key = f"judge-{gen_idx}"  # GAP-f: judge-0 or judge-1
     cursor["pending_action"] = {
-        "call_key": "judge-0",
+        "call_key": judge_call_key,
         "agent_type": judge_agent,
         "rubric_id": gate_rubric,
         "required_cross_vendor": required_cross,
@@ -512,18 +558,29 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         "stage_id": stage_id, "attempt_id": cursor["attempt_id"],
         "producer": producer, "judge_agent": judge_agent,
         "required_cross_vendor": required_cross, "wrote_changes": wrote_changes,
+        "generate_index": gen_idx,
     })
 
 
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any]) -> None:
-    """await_judge -> terminal: record the verdict, run smoke on pass, honour the
-    finalize-readiness gate, then finalize the stage + run."""
+    """await_judge -> terminal (or back to await_generate for Reflexion x1).
+
+    F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
+    the stage to surfaced (never proceeds to finalize_run complete).
+    F31: required_cross_vendor but judge was same-vendor (degraded) → downgrade.
+    GAP-f: Reflexion×1 — on the first revise, transition back to await_generate
+    with call_key='generate-1' and the critique embedded in the prompt.
+    GAP-h: warn-telemetry when critique_md cites no existing worktree file.
+    GAP-a2: lazy baseline fallback from HYDRA_SMOKE_BASELINE_TESTS env var.
+    """
     cm = dispatcher.call_mcp
     producer = cursor["producer"]
     attempt_id = cursor.get("attempt_id")
     gate_rubric = cursor.get("gate_rubric") or cursor["judge_rubric_id"]
     required_cross = bool(cursor.get("required_cross"))
+    gen_idx = cursor.get("generate_index", 0)   # GAP-f: 0=first attempt, 1=retry
+    work_path = cursor.get("work_path") or cursor["project_path"]
 
     cursor["cost_usd"] = float(cursor["cost_usd"]) + float(result.get("cost_usd") or 0.0)
     cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
@@ -545,7 +602,16 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if degraded:
         score_json["_judge_degraded"] = True
 
+    # F31: required cross-vendor but got same-vendor judge → downgrade pass to surfaced.
+    if degraded and outcome == "pass":
+        outcome = "revise"   # treat as revise so non-pass path runs
+        cursor["error"] = ("required_cross_vendor=true but judge was same-vendor "
+                           "(degraded); stage downgraded to surfaced")
+
     cursor["outcome"] = outcome
+
+    # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
+    _record_verdict_ok = True
     if attempt_id:
         try:
             cm("pp_harness", "record_verdict", {
@@ -553,59 +619,101 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "judge_producer": judge_producer,
                 "judge_model_id": str(result.get("judge_model_id")
                                       or result.get("model") or f"{judge_producer}-default"),
-                "outcome": outcome,
+                "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
                 "critique_md": critique_md[:4000],
                 "score_json": score_json,
                 "rubric_id": gate_rubric,
             }, squad_id=_SQ)
         except Exception:  # noqa: BLE001
-            pass
+            _record_verdict_ok = False
+    if outcome == "pass" and not _record_verdict_ok:
+        outcome = "revise"
+        cursor["outcome"] = "revise"
+        cursor["error"] = (cursor.get("error") or "") + \
+            " record_verdict RPC failed; stage downgraded to surfaced"
+
     _trace(cursor, "attended.verdict", {
         "stage_id": cursor["stage_id"], "rubric_id": gate_rubric,
         "attempt_id": attempt_id, "producer": producer,
         "judge_producer": judge_producer, "outcome": outcome,
-        "cross_vendor": cross_vendor,
+        "cross_vendor": cross_vendor, "generate_index": gen_idx,
+        "degraded": degraded,
     })
+
+    # GAP-h: warn when critique references no existing worktree file.
+    if critique_md and not _has_real_file_ref(critique_md, work_path):
+        _trace(cursor, "attended.judge.suspicious_critique", {
+            "stage_id": cursor["stage_id"],
+            "warning": "critique_md contains no path token matching an existing worktree file",
+            "judge_producer": judge_producer,
+            "critique_head": critique_md[:200],
+        })
+
+    # GAP-f: Reflexion×1 — on first revise (gen_idx==0), transition back to
+    # await_generate with an augmented prompt that embeds the critique.
+    if outcome == "revise" and gen_idx == 0:
+        cursor["generate_index"] = 1
+        cursor["reflexion_critique"] = critique_md
+        aug_prompt = _augment_with_critique(cursor["request_text"], critique_md)
+        cursor["state"] = "await_generate"
+        cursor["pending_action"] = {
+            "call_key": "generate-1",
+            "agent_type": "engineer",
+            "cwd": work_path,
+            "isolated_worktree": bool(cursor.get("worktree_path")),
+            "prompt": aug_prompt,
+            "retry_index": 1,
+            "instructions": (
+                "Spawn the visible `engineer` subagent to revise the implementation "
+                "addressing the critique embedded in the prompt. Then call "
+                "submit-host-result with {call_key, result:{text, cost_usd, "
+                "tokens_in, tokens_out, model}}."),
+        }
+        _trace(cursor, "attended.reflexion", {
+            "stage_id": cursor["stage_id"], "generate_index": 1,
+        })
+        return  # Don't finalize — wait for generate-1
 
     # PP-VG-5: a code stage may finalize 'complete' only with a real smoke result.
     passed = False
     smoke_status = "skipped"
     smoke_reason = ""
     if outcome == "pass" and attempt_id:
-        _smoke_project = cursor.get("work_path") or cursor["project_path"]
         smoke_status, smoke_reason = _run_smoke(
             dispatcher,
-            project_path=_smoke_project,
+            project_path=work_path,
             stage_id=cursor["stage_id"])
-        # Rider (a): compare against the baseline failures captured at begin_stage.
+        # GAP-a2 / Rider (a): compare against the baseline failures.
         # If every currently-failing test was ALREADY failing before the engineer's
         # change, the smoke failure is not attributable to this change — excuse it.
-        if smoke_status == "fail" and cursor.get("baseline_failures"):
-            try:
-                _reruns = subprocess.run(
-                    [
-                        __import__("sys").executable, "-m", "pytest",
-                        "tests/", "--no-header", "-q", "--tb=no", "--timeout=120",
-                    ],
-                    cwd=_smoke_project,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=240,
-                )
-                _current_failing = _parse_failing_tests(
-                    _reruns.stdout + "\n" + _reruns.stderr
-                )
-            except Exception:  # noqa: BLE001
-                _current_failing = set()
-            _baseline_set = set(cursor["baseline_failures"])
-            _new_failures = _current_failing - _baseline_set
-            if not _new_failures:
-                smoke_status = "pass"
-                smoke_reason = (
-                    f"smoke: {len(_current_failing)} failure(s) all pre-existed "
-                    f"in worktree baseline; treated as pass"
-                )
+        # Lazy fallback: if baseline is empty, try HYDRA_SMOKE_BASELINE_TESTS env var.
+        if smoke_status == "fail":
+            baseline = list(cursor.get("baseline_failures") or [])
+            if not baseline:
+                _env_bl = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
+                if _env_bl:
+                    baseline = [t.strip() for t in _env_bl.split(",") if t.strip()]
+            if baseline:
+                import sys as _sys
+                try:
+                    _reruns = subprocess.run(
+                        [_sys.executable, "-m", "pytest",
+                         "tests/", "--no-header", "-q", "--tb=no"],
+                        cwd=work_path,
+                        capture_output=True, text=True, check=False, timeout=240,
+                    )
+                    _current_failing = _parse_failing_tests(
+                        _reruns.stdout + "\n" + _reruns.stderr)
+                except Exception:  # noqa: BLE001
+                    _current_failing = set()
+                _baseline_set = set(baseline)
+                _new_failures = _current_failing - _baseline_set
+                if not _new_failures:
+                    smoke_status = "pass"
+                    smoke_reason = (
+                        f"smoke: {len(_current_failing)} failure(s) all pre-existed "
+                        f"in baseline; treated as pass"
+                    )
         try:
             cm("pp_harness", "record_smoke_status", {
                 "stage_id": cursor["stage_id"], "candidate_index": 1,
@@ -641,11 +749,21 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
 def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
               passed: bool, gen_failed: bool) -> None:
     """Finalize the stage + run and set the terminal cursor state. Mirrors the
-    headless loop's downgrade-honouring finalize_run handling."""
+    headless loop's downgrade-honouring finalize_run handling.
+
+    F26+M8: a finalize_stage RPC failure on a passing stage downgrades to
+    surfaced — we never proceed to finalize_run 'complete' with an un-recorded
+    stage.
+    F30: abort/error reason is included in summary_md (FinalizeRunSchema strips
+    standalone `reason` / `project_path` keys).
+    """
     cm = dispatcher.call_mcp
     stage_id = cursor["stage_id"]
     run_id = cursor["run_id"]
     attempt_id = cursor.get("attempt_id")
+
+    # F26+M8: capture finalize_stage success; failure on pass → downgrade.
+    _finalize_stage_ok = True
     try:
         cm("pp_harness", "finalize_stage", {
             "stage_id": stage_id,
@@ -653,8 +771,14 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
             **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
         }, squad_id=_SQ)
     except Exception:  # noqa: BLE001
-        pass
+        _finalize_stage_ok = False
+    if passed and not _finalize_stage_ok:
+        passed = False
+        cursor["outcome"] = "surfaced"
+        cursor["error"] = (cursor.get("error") or "") + \
+            " finalize_stage RPC failed; stage downgraded to surfaced"
 
+    # F30: build summary_md that embeds any error/abort reason.
     if gen_failed:
         summary = f"Attended drive: generate failed -- {cursor.get('error')}"
     elif passed:
@@ -873,10 +997,11 @@ def abort_stage(dispatcher: Dispatcher, *, cursor_file: str | Path,
     if cursor.get("state") in _TERMINAL:
         return _step_result(cursor, cursor_file)
     try:
+        # F30: FinalizeRunSchema strips 'reason'/'project_path' — embed reason
+        # in summary_md so it is never silently dropped.
         dispatcher.call_mcp("pp_harness", "finalize_run", {
             "run_id": cursor["run_id"], "status": "aborted",
-            "reason": f"attended_abort: {reason}",
-            "project_path": cursor.get("project_path"),
+            "summary_md": f"attended_abort: {reason}",
         }, squad_id=_SQ)
     except Exception:  # noqa: BLE001
         pass

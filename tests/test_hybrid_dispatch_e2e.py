@@ -40,6 +40,11 @@ def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
     return {
         ("pp_harness", "start_run"): {"status": "done", "result": {"run_id": "run_T"}},
         ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
+        # F31: required_cross_vendor=False so same-vendor codex→codex does not
+        # trigger the F31 downgrade (these tests exercise the drive-loop and
+        # ingest mechanics, not cross-vendor enforcement).
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
         ("pp_codex", "generate"): {"status": "done", "result": {
             "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"pytest -q -> exit 0\"}",
             "model": "codex-1",
