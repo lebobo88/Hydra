@@ -275,7 +275,7 @@ def test_file_cockpit_audit_envelope_live_filing():
     assert result["spooled"] is False
     mock_attestor.envelope_record.assert_called_once()
     envelope_arg = mock_attestor.envelope_record.call_args[0][0]
-    assert envelope_arg["type"] == "cockpit_write"
+    assert envelope_arg["type"] == "COCKPIT_WRITE"
     assert envelope_arg["action"] == "approve"
     assert envelope_arg["workflow_id"] == VALID_WORKFLOW_ID
     assert "id" in envelope_arg  # uuid4 minted
@@ -343,7 +343,9 @@ def test_all_tools_in_handlers():
     assert "hydra.workflow.plan" in handlers
     assert "hydra.workflow.step" in handlers
     assert "hydra.workflow.submit_host_result" in handlers
-    assert len(handlers) == 8
+    # 8 original + 4 F32-H governance-federation tools
+    # (venom.cross_check, squad.list, envelope.record, telemetry.tail)
+    assert len(handlers) == 12
     # Every handler has a published schema.
     from mcp_servers.hydra_control.server import _TOOL_SCHEMAS
     assert set(handlers) == set(_TOOL_SCHEMAS)

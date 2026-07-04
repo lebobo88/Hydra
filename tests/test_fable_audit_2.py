@@ -2271,24 +2271,54 @@ class TestF32HNewTools:
             )
 
     def test_envelope_record_valid_bridge_shape(self, monkeypatch):
-        """envelope_record with AgentSmith bridge args must return envelope_id."""
+        """envelope_record with a known opaque type must pass validation and
+        return ok=True with an envelope_id.
+
+        Uses COCKPIT_WRITE (the canonical opaque type) because bridge callers
+        can use it without supplying type-specific required fields (DevTask
+        requires owner/repo/branch/instructions which a bridge notification
+        might not carry).  The validator now rejects unknown/invalid envelopes
+        (fable-audit-2 Phase 3a finding 1), so a non-opaque type with missing
+        required fields would correctly return ok=False.
+        """
         # Stub append_episodic to prevent SQLite writes during the test.
-        # (_get_attestor returns a no-dispatcher attestor that fail-softs cleanly.)
         import hydra_core.memory as mem_mod
         monkeypatch.setattr(mem_mod, "append_episodic", lambda *a, **k: None)
 
         handlers = self._handlers()
         result = handlers["hydra.envelope.record"]({
-            "kind": "DEV_TASK",
+            "kind": "COCKPIT_WRITE",
             "from_squad": "agentsmith",
-            "workflow_id": "wf-f32-test",
-            "payload": {"task": "do something"},
+            "workflow_id": "cockpit-audit-wf",  # opaque type allows non-UUID wf_id
+            "payload": {"action": "launch", "actor": "agentsmith"},
         })
         assert result.get("ok") is True, (
-            f"F32-H: valid envelope_record must return ok=True, got {result!r}"
+            f"F32-H: valid COCKPIT_WRITE envelope_record must return ok=True, "
+            f"got {result!r}"
         )
         assert isinstance(result.get("envelope_id"), str), (
             f"F32-H: envelope_record must return a string envelope_id, got {result!r}"
+        )
+
+    def test_envelope_record_invalid_type_rejected(self, monkeypatch):
+        """envelope_record with an unknown/invalid type must return ok=False
+        instead of persisting a corrupt envelope (fable-audit-2 Phase 3a
+        finding 1: validation failures must REJECT, not swallow)."""
+        import hydra_core.memory as mem_mod
+        monkeypatch.setattr(mem_mod, "append_episodic", lambda *a, **k: None)
+
+        handlers = self._handlers()
+        result = handlers["hydra.envelope.record"]({
+            "kind": "COMPLETELY_UNKNOWN_TYPE_XYZ",
+            "from_squad": "agentsmith",
+            "workflow_id": "wf-bad-type-test",
+            "payload": {},
+        })
+        assert result.get("ok") is False, (
+            f"F32-H: unknown envelope type must return ok=False, got {result!r}"
+        )
+        assert "error" in result, (
+            f"F32-H: rejection must include 'error' field, got {result!r}"
         )
 
     def test_envelope_record_missing_kind_error(self):
@@ -2478,6 +2508,39 @@ class TestF34BudgetChargeWired:
                 f"EightsAttestor failures; got {type(exc).__name__}: {exc}"
             )
 
+    def test_budget_charge_does_not_block_hot_path(self, monkeypatch):
+        """F34: a budget_charge call that takes longer than the timeout cap
+        must return within the cap — not 120 s (the dispatcher default).
+
+        Strategy: inject a dispatcher whose call_mcp sleeps for 60 s and set
+        HYDRA_BUDGET_CHARGE_TIMEOUT_S=0.1; the call must complete in < 1 s.
+        """
+        import time as _time
+        from hydra_core.eights.attestation import EightsAttestor
+
+        class _SlowDispatcher:
+            """Simulates a wedged / hung eights daemon."""
+            def call_mcp(self, server, tool, args):
+                _time.sleep(60)  # will be abandoned after the cap
+                return {"status": "ok"}
+
+        monkeypatch.setenv("HYDRA_BUDGET_CHARGE_TIMEOUT_S", "0.1")
+        att = EightsAttestor(dispatcher=_SlowDispatcher(), workflow_id="wf-timeout-test")
+
+        start = _time.monotonic()
+        result = att.budget_charge(workflow_id="wf-timeout-test", usd=0.01, tokens=100)
+        elapsed = _time.monotonic() - start
+
+        assert elapsed < 2.0, (
+            f"F34: budget_charge blocked for {elapsed:.2f}s; must return within "
+            "HYDRA_BUDGET_CHARGE_TIMEOUT_S (0.1s) + overhead — a wedged eights "
+            "must NOT stall the hot path for 120s"
+        )
+        # Result is None because the thread timed out before completing.
+        assert result is None, (
+            f"F34: timed-out budget_charge must return None, got {result!r}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # F35: venom cross-check optional, off by default, fail-open
@@ -2648,7 +2711,10 @@ class TestF36ProceduralRiskRouting:
         def evolution_propose(self, *, resource_id, summary, body,
                               proposed_by="hydra.procedural", workflow_id=None):
             self.propose_calls.append({"resource_id": resource_id})
-            return {"status": self._verdict}
+            # Include proposal_id so the F36 evolution_commit round-trip can
+            # proceed. Tests that expect commit must also have evolution_commit
+            # called on the spy.
+            return {"status": self._verdict, "proposal_id": "spy-proposal-id"}
 
         def evolution_commit(self, *, resource_id, proposal_id):
             return {"status": "committed"}

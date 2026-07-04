@@ -22,10 +22,20 @@ Per `AGENTS.md` layering:
 """
 from __future__ import annotations
 
+import logging
+import os as _os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# F34: dedicated short-circuit timeout for budget_charge so a wedged TheEights
+# daemon costs the hot path at most this many seconds (not the 120s default).
+# budget.charge is ephemeral — stale charges are meaningless on daemon recovery
+# so we do NOT spool them; we just cap the wait and abandon.
+_BUDGET_CHARGE_TIMEOUT_DEFAULT = 5.0
 
 from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool, SpooledCall
@@ -348,14 +358,50 @@ class EightsAttestor:
         vendor: str = "",
         purpose: str = "",
     ) -> Optional[dict]:
-        """Record token/cost spend. The daemon enforces caps; Hydra does not
-        gate on this return value — the local BudgetLedger is authoritative
-        within a workflow."""
-        return self._call("eights.governance.budget.charge", {
-            "run_id": str(workflow_id),
-            "cost_usd": float(usd),
-            "tokens": int(tokens),
-        })
+        """Record token/cost spend with a dedicated short timeout (F34).
+
+        The daemon enforces caps; Hydra does not gate on this return value —
+        the local BudgetLedger is authoritative within a workflow.
+
+        Design (F34): budget.charge is ephemeral — stale charges carry no
+        value once the daemon recovers, so we do NOT spool them (see
+        ``_SPOOLABLE_TOOLS``). Instead we cap the hot-path wait with a
+        daemon thread + join(timeout). A wedged TheEights costs at most
+        ``HYDRA_BUDGET_CHARGE_TIMEOUT_S`` seconds (default 5 s) per call
+        site, not the 120 s dispatcher default. After the cap the thread is
+        abandoned (daemon thread, reclaimed on process exit).
+        """
+        if not self.enabled or self.dispatcher is None:
+            return None
+
+        timeout_s = float(
+            _os.environ.get("HYDRA_BUDGET_CHARGE_TIMEOUT_S",
+                            str(_BUDGET_CHARGE_TIMEOUT_DEFAULT))
+        )
+        result_box: list[Optional[dict]] = [None]
+
+        def _charge_worker() -> None:
+            result_box[0] = self._call("eights.governance.budget.charge", {
+                "run_id": str(workflow_id),
+                "cost_usd": float(usd),
+                "tokens": int(tokens),
+            })
+
+        t = threading.Thread(
+            target=_charge_worker,
+            daemon=True,
+            name="hydra-budget-charge",
+        )
+        t.start()
+        t.join(timeout=timeout_s)
+        if t.is_alive():
+            logger.debug(
+                "budget_charge: eights did not respond within %.1fs — "
+                "abandoning (charge will be lost; local BudgetLedger "
+                "remains authoritative)",
+                timeout_s,
+            )
+        return result_box[0]
 
     def hitl_request(self, hitl_envelope: dict, *, gate_node: str = "") -> Optional[dict]:
         """Enqueue a HITL request to the shared ledger so the operator UI

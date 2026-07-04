@@ -274,7 +274,10 @@ def approve(
     except Exception:  # noqa: BLE001 — fail per risk class on transport error
         eights_verdict = None
 
-    # Interpret verdict: commit on explicit approved/committed status.
+    # Interpret verdict: commit only on explicit approved/committed + successful
+    # evolution_commit round-trip (F36 full round-trip requirement). Generic acks
+    # ("ok", "done") are not explicit approvals — they keep status pending so
+    # operators can retry and obtain a proper verdict.
     verdict_status = ""
     if isinstance(eights_verdict, dict):
         verdict_status = str(
@@ -283,18 +286,71 @@ def approve(
             or ""
         ).lower()
 
-    if verdict_status in ("approved", "committed", "done", "ok"):
-        u.status = "committed"
-        u.decided_at = datetime.now(timezone.utc).isoformat()
-        u.decided_by = approved_by
+    if verdict_status in ("approved", "committed"):
+        # Full round-trip: call evolution_commit with the proposal_id returned by
+        # evolution_propose. Without a confirmed commit receipt we do NOT promote
+        # to 'committed' (F36: evolution_commit is never optional for medium+).
+        proposal_id = str(
+            eights_verdict.get("proposal_id") or ""  # type: ignore[union-attr]
+        ) if isinstance(eights_verdict, dict) else ""
+        commit_ok = False
+        if proposal_id:
+            try:
+                commit_receipt = attestor.evolution_commit(
+                    resource_id=resource_id,
+                    proposal_id=proposal_id,
+                )
+                commit_ok = isinstance(commit_receipt, dict) and str(
+                    commit_receipt.get("status") or ""
+                ).lower() in ("committed", "ok", "done")
+            except Exception:  # noqa: BLE001 — treat commit failure as eights down
+                commit_ok = False
+
+        if commit_ok:
+            u.status = "committed"
+            u.decided_at = datetime.now(timezone.utc).isoformat()
+            u.decided_by = approved_by
+            u.rationale = (
+                (u.rationale + " | " if u.rationale else "")
+                + f"F36: eights verdict={verdict_status}; evolution_commit confirmed"
+            ).strip(" |")
+            s.put(u)
+            return u
+
+        # evolution_commit unavailable or did not confirm (proposal_id missing
+        # or commit call failed). Resolve by risk class.
+        if risk == "medium":
+            u.rationale = (
+                (u.rationale + " | " if u.rationale else "")
+                + f"F36: medium risk; eights verdict={verdict_status} but "
+                "evolution_commit did not confirm — leaving pending (fail-soft)."
+            ).strip(" |")
+            s.put(u)
+            return u
+        else:  # high / critical
+            u.status = "rejected"
+            u.decided_at = datetime.now(timezone.utc).isoformat()
+            u.decided_by = "governance.fail_closed"
+            u.rationale = (
+                (u.rationale + " | " if u.rationale else "")
+                + f"F36: {risk} risk; eights verdict={verdict_status} but "
+                "evolution_commit did not confirm — fail CLOSED."
+            ).strip(" |")
+            s.put(u)
+            return u
+
+    if verdict_status in ("ok", "done"):
+        # Generic acknowledgement — not an explicit approval. Stay pending so
+        # operators can retry with a proper approved/committed verdict (F36).
         u.rationale = (
             (u.rationale + " | " if u.rationale else "")
-            + f"F36: eights verdict={verdict_status}"
+            + f"F36: eights ack={verdict_status!r} (generic, not approved/committed); "
+            "staying pending."
         ).strip(" |")
         s.put(u)
         return u
 
-    # Eights either unavailable (None verdict) or returned a non-committed status.
+    # Eights either unavailable (None verdict) or returned an unrecognised status.
     if risk == "medium":
         # Fail-soft: stay pending so operator can retry.
         u.rationale = (

@@ -112,13 +112,21 @@ def test_cross_check_ignored_when_env_unset(_clean_registry, monkeypatch):
 # ===========================================================================
 
 class _FakeAttestor:
-    """Minimal eights evolution stub matching approve()'s call shape."""
+    """Minimal eights evolution stub matching approve()'s call shape.
 
-    def __init__(self, propose_return=None, *, raise_on_propose=False):
+    evolution_commit is now required for the full F36 round-trip.  Provide it
+    here so tests that pass an explicit proposal_id in propose_return can
+    complete the round-trip without AttributeError.
+    """
+
+    def __init__(self, propose_return=None, *, raise_on_propose=False,
+                 commit_status: str = "committed"):
         self.propose_return = propose_return
         self.raise_on_propose = raise_on_propose
         self.registered: list[str] = []
         self.proposed: list[str] = []
+        self.commits: list[str] = []
+        self._commit_status = commit_status
 
     def evolution_register(self, *, resource_kind, resource_id, body, summary=""):
         self.registered.append(resource_id)
@@ -129,6 +137,10 @@ class _FakeAttestor:
             raise RuntimeError("eights transport down")
         self.proposed.append(resource_id)
         return self.propose_return
+
+    def evolution_commit(self, *, resource_id, proposal_id):
+        self.commits.append(proposal_id)
+        return {"status": self._commit_status}
 
 
 def _queued(kind: str) -> tuple[InMemoryStore, ProceduralUpdate]:
@@ -169,17 +181,25 @@ def test_high_risk_no_attestor_fails_closed():
 
 def test_medium_risk_attestor_approved_commits():
     store, u = _queued("prompt_rewrite")
-    att = _FakeAttestor(propose_return={"status": "approved"})
+    # F36 full round-trip: propose_return must include proposal_id so
+    # evolution_commit can be called and confirmed.
+    att = _FakeAttestor(propose_return={"status": "approved", "proposal_id": "prop-1"})
     out = approve(u.id, store=store, attestor=att)
     assert out.status == "committed"
     assert att.registered and att.proposed
+    assert att.commits == ["prop-1"], (
+        "F36: evolution_commit must be called with the proposal_id from propose"
+    )
 
 
 def test_high_risk_attestor_committed_commits():
     store, u = _queued("deprecation_proposal")
-    att = _FakeAttestor(propose_return={"status": "committed"})
+    att = _FakeAttestor(propose_return={"status": "committed", "proposal_id": "prop-2"})
     out = approve(u.id, store=store, attestor=att)
     assert out.status == "committed"
+    assert att.commits == ["prop-2"], (
+        "F36: evolution_commit must be called for high-risk committed verdict"
+    )
 
 
 def test_high_risk_attestor_transport_error_fails_closed():
@@ -196,6 +216,35 @@ def test_medium_risk_attestor_unavailable_stays_pending():
     att = _FakeAttestor(propose_return=None)
     out = approve(u.id, store=store, attestor=att)
     assert out.status == "pending"
+
+
+def test_ok_ack_does_not_commit_medium_risk():
+    """F36: a generic 'ok' ack from eights must NOT commit medium-risk updates.
+    The propose round-trip must yield 'approved'/'committed'; 'ok' is a generic
+    ack that leaves status=pending so operators can retry."""
+    store, u = _queued("prompt_rewrite")
+    att = _FakeAttestor(propose_return={"status": "ok", "proposal_id": "prop-ok"})
+    out = approve(u.id, store=store, attestor=att)
+    assert out.status == "pending", (
+        f"F36: generic 'ok' ack must not commit; got status={out.status!r}"
+    )
+    # evolution_commit must NOT be called for a generic ack (ack never reaches
+    # the commit branch).
+    assert att.commits == [], (
+        f"F36: evolution_commit must not be called for 'ok' ack; got {att.commits}"
+    )
+
+
+def test_ok_ack_does_not_commit_high_risk():
+    """F36: 'ok' ack for high-risk must also keep status pending, not rejected.
+    Only transport-error/None verdicts fail CLOSED for high risk; generic acks
+    are treated as 'retry' regardless of risk class."""
+    store, u = _queued("policy_adjustment")
+    att = _FakeAttestor(propose_return={"status": "ok", "proposal_id": "prop-ok-high"})
+    out = approve(u.id, store=store, attestor=att)
+    assert out.status == "pending", (
+        f"F36: generic 'ok' ack must leave high-risk pending; got {out.status!r}"
+    )
 
 
 # ===========================================================================

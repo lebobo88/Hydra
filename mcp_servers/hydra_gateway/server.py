@@ -309,6 +309,11 @@ class AsyncBackendPool:
         "workflows_list", "workflow_status_get", "memory_search",
         "atlas_query", "schema_inspect", "roster_query",
         "attestation_get", "catalogue", "catalog",
+        # F32-H / fable-audit-2 Phase 3a finding 4: venom.cross_check and
+        # telemetry.tail are read-only; classify them as idempotent so
+        # transient-error retry semantics apply. envelope.record is a mutator
+        # (left in _NON_IDEMPOTENT_FINAL_SEGMENTS via absence).
+        "cross_check", "tail",
     })
 
     # NON-IDEMPOTENT override — wins regardless of the allow-list.

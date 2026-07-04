@@ -691,13 +691,21 @@ def _tool_handlers() -> dict[str, Any]:
             "workflow_id": workflow_id_raw or str(uuid.uuid4()),
         }
 
-        # Best-effort schema validation — unknown types log a warning but
-        # do not block the record (the envelope is still persisted).
+        # Validate the REAL envelope including payload fields (F32-H / fable-audit-2
+        # Phase 3a finding 1). Flatten the payload into the validation dict so that
+        # type-specific required fields (e.g. DevTask.owner/repo/branch) are visible
+        # to the validator. On failure REJECT — do NOT persist an invalid envelope.
+        _payload_flat: dict[str, Any] = (
+            payload if isinstance(payload, dict) else {}
+        )
         try:
             from hydra_core.schemas import validate_envelope as _validate
-            _validate(hydra_env)
+            _validate({**hydra_env, **_payload_flat})
         except Exception as val_exc:  # noqa: BLE001
-            logger.debug("envelope_record: validation skipped: %s", val_exc)
+            return {
+                "ok": False,
+                "error": f"envelope validation failed: {val_exc}",
+            }
 
         # Persist to episodic db via the EightsAttestor spool path (the
         # existing envelope-persist helper — reuse, don't reinvent).
