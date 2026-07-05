@@ -21,19 +21,22 @@ $promptLower = $prompt.ToLower().Trim()
 # --- Meta: already a slash command or talking about the system ---
 if ($promptLower.StartsWith('/')) { exit 0 }
 
-# --- Check ecosystem availability ---
+# --- Check ecosystem availability (fast install-marker, NOT a WMI process scan) ---
+# The previous check ran `Get-Process node | Where { $_.CommandLine -match ... }`.
+# Reading .CommandLine forces a per-process WMI Win32_Process lookup (~6s with a
+# handful of node procs, worse under a busy ecosystem) — this was the
+# UserPromptSubmit 10s-timeout culprit. The pp daemon dist that every sibling pp
+# hook invokes is a fast, faithful proxy: on disk => ecosystem installed at user
+# scope. Base resolved portably (env override -> project dir -> hook-anchored),
+# mirroring the other Hydra hooks.
 $ecosystemAvailable = $false
-try {
-    $ppProcs = Get-Process -Name "node" -ErrorAction Stop |
-        Where-Object { $_.CommandLine -and $_.CommandLine -match 'pair-programmer' }
-    if ($ppProcs) { $ecosystemAvailable = $true }
-} catch {}
-
-# If ecosystem not available, try a lighter check (daemon port or harness DB)
-if (-not $ecosystemAvailable) {
-    if (Test-Path "$env:USERPROFILE\.pp\harness.db") {
-        $ecosystemAvailable = $true
-    }
+$base = if ($env:AIAPP_BASE) { $env:AIAPP_BASE }
+        elseif ($env:CLAUDE_PROJECT_DIR) { Split-Path $env:CLAUDE_PROJECT_DIR }
+        else { Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
+if (Test-Path (Join-Path $base 'pair-programmer/daemon/dist/index.js')) {
+    $ecosystemAvailable = $true
+} elseif (Test-Path "$env:USERPROFILE\.pp\harness.db") {
+    $ecosystemAvailable = $true
 }
 
 # --- Classify prompt ---
