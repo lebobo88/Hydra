@@ -218,4 +218,4 @@ invoke:
   # IMPORTANT: Fable is operator/flag-driven only — Hydra does NOT auto-escalate
   # to Fable on retry or budget events. Set this only when the operator explicitly
   # wants every engineering dispatch from this squad to use the deep-reasoning-team.
-  model_tier: ~                      # null — use pp default; override per-workflow via dispatch envelope
+  model_tier: ~                      # null — use pp default; override per-workflow via dispatch envelope. (Reverted 2026-07-05: the fable override forced every engineering dispatch onto pp's spec-oriented deep-reasoning-team, so code tasks surfaced a spec and never produced a diff. Set to fable ONLY when the operator wants deep-reasoning-team for every dispatch.)

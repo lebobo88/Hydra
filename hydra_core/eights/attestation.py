@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 _BUDGET_CHARGE_TIMEOUT_DEFAULT = 5.0   # seconds before a charge is abandoned
 _BUDGET_CHARGE_COOLDOWN_DEFAULT = 60.0  # seconds breaker stays open after timeout
 
+# P1.2: generalized short-circuit for the OTHER hot eights calls on the
+# supervisor critical path — constitution_attest / ceiling_tick / hitl_request.
+# These previously called `_dispatch_call` synchronously under `_dispatch_lock`
+# with no cap, so a bloated-but-alive eights ledger (slow `call_mcp`, not
+# refused) blocked node_intake/dispatch for the full 120s dispatcher tool cap
+# (attest + ceiling_tick serialized ≈ 240s at intake). Same circuit-breaker
+# shape as the F34 budget_charge guard, keyed per tool. Env-overridable.
+_EIGHTS_GUARD_TIMEOUT_DEFAULT = 5.0    # seconds before a guarded call is abandoned
+_EIGHTS_GUARD_COOLDOWN_DEFAULT = 60.0  # seconds breaker stays open after a timeout
+
 from ..immortal_head import ConstitutionSnapshot
 from .pending_spool import PendingSpool, SpooledCall
 
@@ -106,6 +116,25 @@ class EightsAttestor:
     # budget_charge body — so contention is negligible.
     _budget_charge_breaker_lock: threading.Lock = field(
         default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    # P1.2: generalized F34 breaker state for constitution_attest / ceiling_tick
+    # / hitl_request. Keyed by a guard name so each tool gets its own breaker
+    # timestamp and its own single-permit concurrency gate. One lock guards both
+    # dicts (tiny critical sections — dict get/set only, not the call body).
+    _eights_guard_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _eights_guard_breaker_until: dict[str, float] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _eights_guard_semaphores: dict[str, threading.BoundedSemaphore] = field(
+        default_factory=dict,
         init=False,
         repr=False,
     )
@@ -196,6 +225,92 @@ class EightsAttestor:
             )
         except Exception:  # noqa: BLE001 — spool write must never crash dispatch
             pass
+
+    def _guarded_call(self, tool: str, args: dict, *, guard_key: str) -> Optional[dict]:
+        """Short-circuit wrapper over ``_call`` for the hot audit/ephemeral
+        eights tools on the supervisor critical path (constitution_attest,
+        ceiling_tick, hitl_request).
+
+        Same F34 circuit-breaker shape as ``budget_charge`` — a per-``guard_key``
+        breaker timestamp plus a single-permit concurrency gate — generalized so
+        each tool has its own state. A bloated-but-alive eights daemon (slow
+        ``call_mcp``, not refused) can therefore no longer block node_intake /
+        dispatch for the full 120s dispatcher cap: the call is abandoned after a
+        short timeout and the breaker opens for a cooldown.
+
+        Return value matches the degrade-open contract callers already handle:
+        ``None`` when the daemon is unreachable, the permit is busy, the breaker
+        is open, or the worker is abandoned on timeout. Durable payloads
+        (``_SPOOLABLE_TOOLS`` — attest / hitl / envelope.record) are spooled on
+        the breaker-open and in-flight-skip paths (where ``_call`` is not invoked
+        at all) so they still replay when the daemon recovers; on the timeout
+        path the worker still owns the call and spools it itself, so we don't
+        double-spool. Ephemeral tools (ceiling_tick) are never spooled.
+        """
+        if not self.enabled or self.dispatcher is None:
+            # Preserve _call's disabled-path spooling semantics.
+            return self._call(tool, args)
+
+        import time as _time
+
+        timeout_s = float(_os.environ.get(
+            "HYDRA_EIGHTS_GUARD_TIMEOUT_S", str(_EIGHTS_GUARD_TIMEOUT_DEFAULT)
+        ))
+        cooldown_s = float(_os.environ.get(
+            "HYDRA_EIGHTS_GUARD_COOLDOWN_S", str(_EIGHTS_GUARD_COOLDOWN_DEFAULT)
+        ))
+
+        # Read breaker timestamp + fetch-or-create this key's permit under lock.
+        with self._eights_guard_lock:
+            breaker_until = self._eights_guard_breaker_until.get(guard_key, 0.0)
+            sem = self._eights_guard_semaphores.get(guard_key)
+            if sem is None:
+                sem = threading.BoundedSemaphore(1)
+                self._eights_guard_semaphores[guard_key] = sem
+
+        # Guard 1: circuit breaker — during cooldown, skip immediately.
+        if _time.monotonic() < breaker_until:
+            self._maybe_spool(tool, args, reason="eights_guard_breaker_open")
+            return None
+
+        # Guard 2: concurrency gate — at most ONE guarded worker per key. A
+        # healthy overlap simply skips THIS call (breaker NOT tripped).
+        if not sem.acquire(blocking=False):
+            self._maybe_spool(tool, args, reason="eights_guard_inflight")
+            return None
+
+        result_box: list[Optional[dict]] = [None]
+
+        def _worker() -> None:
+            # Owns the permit for its full lifetime; releases in finally on
+            # success/exception but NOT on abandonment. A wedged call_mcp never
+            # reaches finally, so the permit stays held and guard 2 rejects
+            # subsequent calls instead of stacking threads behind _dispatch_lock.
+            try:
+                result_box[0] = self._call(tool, args)
+            finally:
+                sem.release()
+
+        t = threading.Thread(target=_worker, daemon=True,
+                             name=f"hydra-eights-{guard_key}")
+        t.start()
+        t.join(timeout=timeout_s)
+
+        if t.is_alive():
+            with self._eights_guard_lock:
+                self._eights_guard_breaker_until[guard_key] = (
+                    _time.monotonic() + cooldown_s
+                )
+            logger.debug(
+                "eights guard %s: timed out after %.1fs — breaker tripped for "
+                "%.0fs; supervisor proceeds (eights is an audit sink, not a gate)",
+                guard_key, timeout_s, cooldown_s,
+            )
+            # Do NOT spool here — the abandoned worker still owns the call and
+            # will spool on its own if/when call_mcp finally returns a failure
+            # (spooling here too would double-queue a durable payload).
+
+        return result_box[0]
 
     def replay_pending(
         self,
@@ -300,9 +415,9 @@ class EightsAttestor:
         Receipt shape (eights-daemon contract):
             {"hash": "sha256:...", "version": "...", "receipt": "uuid"}
         """
-        return self._call("eights.constitution.attest", {
+        return self._guarded_call("eights.constitution.attest", {
             "consumer": "hydra",
-        })
+        }, guard_key="constitution_attest")
 
     # ---------- envelope lineage ----------
 
@@ -368,10 +483,10 @@ class EightsAttestor:
     def ceiling_tick(self, *, workflow_id: str, node: str) -> Optional[dict]:
         """Bump the loop-ceiling counter in the shared ledger so cross-consumer
         loops are caught (e.g., engineering + executive ping-ponging)."""
-        return self._call("eights.governance.ceiling.tick", {
+        return self._guarded_call("eights.governance.ceiling.tick", {
             "run_id": str(workflow_id),
             "kind": "iteration",
-        })
+        }, guard_key="ceiling_tick")
 
     def budget_charge(
         self,
@@ -511,7 +626,7 @@ class EightsAttestor:
                       default_option, gate_node, expires_at }
         """
         wf = str(hitl_envelope.get("workflow_id", ""))
-        return self._call("eights.governance.hitl.request", {
+        return self._guarded_call("eights.governance.hitl.request", {
             "run_id": wf,
             "kind": "hydra_gate",
             "payload": {
@@ -524,7 +639,7 @@ class EightsAttestor:
                 "gate_node": gate_node or "unspecified",
                 "expires_at": hitl_envelope.get("expires_at"),
             },
-        })
+        }, guard_key="hitl_request")
 
     # ---------- redaction ----------
 

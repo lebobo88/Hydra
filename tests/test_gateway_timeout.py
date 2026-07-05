@@ -38,6 +38,28 @@ def test_llm_tools_get_long_timeout(pool: gw.AsyncBackendPool, server: str, tool
 
 
 @pytest.mark.parametrize(
+    "tool",
+    [
+        # hydra_control control-plane tools run a synchronous CLI subprocess whose
+        # own cap (plan 180s / step 300s / submit 900s) must fire BEFORE the
+        # gateway's, else the gateway returns a hard `failed` + tears the backend
+        # down (the observed 4/4 planner timeouts). They resolve by final segment.
+        "hydra.workflow.plan",
+        "hydra.workflow.step",
+        "hydra.workflow.submit_host_result",
+        "hydra.workflow.submit_envelopes",
+        "hydra.workflow.launch",
+        "hydra.workflow.resume",
+    ],
+)
+def test_control_plane_tools_get_long_timeout(pool: gw.AsyncBackendPool, tool: str) -> None:
+    # Gateway cap (1800s ceiling) must exceed hydra_control's max subprocess cap
+    # (submit=900s) so the subprocess's clean in-band timeout wins, not the
+    # gateway's hard teardown.
+    assert pool._resolve_tool_timeout("hydra_control", tool, {}) == 1800.0
+
+
+@pytest.mark.parametrize(
     ("server", "tool"),
     [
         ("eights", "list"),

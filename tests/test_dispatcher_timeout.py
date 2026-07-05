@@ -161,6 +161,46 @@ def test_success_then_teardown_error_still_returns_done(monkeypatch, disp):
     assert sess.call_count == 1
 
 
+def test_wedged_teardown_hits_overall_deadline_backstop(monkeypatch, disp):
+    # P1.3: the inner per-op timeouts cap connect / init / call_tool but NOT the
+    # stdio __aexit__ teardown. A child that wedges on teardown (the observed
+    # 45-min stall at dispatch) must be abandoned at the overall deadline
+    # (tool_timeout + overhead), not freeze the stage loop.
+    monkeypatch.setenv("HYDRA_DISPATCH_TOOL_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("HYDRA_DISPATCH_OVERALL_OVERHEAD_S", "0.3")
+
+    sess = _FakeSession()  # fast call_tool; the HANG is in stdio teardown below
+
+    class _HangingTeardownStdioCtx:
+        async def __aenter__(self):
+            return (None, None)
+
+        async def __aexit__(self, *exc):
+            await asyncio.sleep(30)  # wedged child — teardown never returns
+            return False
+
+    mcp = types.ModuleType("mcp")
+    mcp.ClientSession = lambda read, write: sess
+    mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
+    client = types.ModuleType("mcp.client")
+    stdio = types.ModuleType("mcp.client.stdio")
+    stdio.stdio_client = lambda params: _HangingTeardownStdioCtx()
+    monkeypatch.setitem(sys.modules, "mcp", mcp)
+    monkeypatch.setitem(sys.modules, "mcp.client", client)
+    monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
+
+    import time as _t
+    t0 = _t.monotonic()
+    res = disp.call_mcp("pp_harness", "start_run", {})
+    elapsed = _t.monotonic() - t0
+
+    assert res["status"] == "failed"
+    assert res.get("phase") == "overall"   # the backstop fired, not the inner call
+    assert res.get("timeout") is True
+    assert elapsed < 5.0                    # abandoned ~0.4s, not the 30s hang
+    assert sess.call_count == 1            # the tool DID run before teardown wedged
+
+
 def test_eights_calls_reuse_one_pooled_session(monkeypatch, disp):
     sess = _FakeSession()
     enters = {"stdio": 0}

@@ -293,6 +293,21 @@ class AsyncBackendPool:
         "generate", "critique", "best_of",
     })
 
+    # Control-plane workflow tools proxied to hydra_control run a synchronous
+    # `python -m hydra_core.cli` subprocess whose OWN cap is generous
+    # (HYDRA_PLAN_TIMEOUT_S=180 / STEP=300 / SUBMIT=900). Those subprocess caps
+    # return a clean in-band {ok:false, error:*_timeout}; the gateway must NOT
+    # preempt them with its short 120s default (which instead returns a hard
+    # `failed` AND tears the backend down — the observed 4/4 planner timeouts).
+    # Classify these by final dotted segment so the gateway cap (long default,
+    # 1800s ceiling) always exceeds the subprocess cap. Names come from
+    # hydra_control's tool table: "hydra.workflow.plan|step|submit_host_result|
+    # submit_envelopes|launch|resume" → final segments below.
+    _CONTROL_PLANE_FINAL_SEGMENTS: frozenset[str] = frozenset({
+        "plan", "step", "submit_host_result", "submit_envelopes",
+        "launch", "resume",
+    })
+
     # Fix 1b (revised): classify by the FINAL dotted segment of the tool name,
     # not by substring/suffix on the whole string.
     #
@@ -368,7 +383,9 @@ class AsyncBackendPool:
                           self._DEFAULT_LONG_TOOL_TIMEOUT)
         hard_max = _env_float("HYDRA_GATEWAY_MAX_TOOL_TIMEOUT_S",
                               self._DEFAULT_MAX_TOOL_TIMEOUT)
-        base = long if final in self._LONG_TOOL_FINAL_SEGMENTS else short
+        base = (long if final in self._LONG_TOOL_FINAL_SEGMENTS
+                or final in self._CONTROL_PLANE_FINAL_SEGMENTS
+                else short)
 
         override: float | None = None
         if isinstance(args, dict):
@@ -772,21 +789,36 @@ def main() -> None:
                 result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
             return [t.TextContent(type="text", text=json.dumps(result, default=str))]
 
-        route = _tool_routing.get(name)
-        if route:
-            backend_server, backend_tool = route
-            # Defensive coercion: cast string scalars to the advertised type
-            # so numeric/boolean params survive even if a caller sent a string.
-            arguments = _coerce_args_to_schema(arguments, _tool_schemas.get(name))
-            result = await pool.call_tool(backend_server, backend_tool, arguments)
-            return [t.TextContent(type="text", text=json.dumps(result, default=str))]
-
-        # Fallback for dynamically-discovered tools not in the static catalog
-        if "__" in name:
-            parts = name.split("__", 1)
-            if len(parts) == 2:
-                result = await pool.call_tool(parts[0], parts[1], arguments)
+        # P1.4: guard the backend-routed calls the same way the meta-tool branch
+        # above is guarded. pool.call_tool contains its own timeouts/errors into
+        # failed dicts, but cancelling a wedged in-flight call_tool can surface an
+        # anyio cancel-scope RuntimeError ("Attempted to exit a cancel scope...")
+        # asynchronously during teardown. If that escapes this handler it
+        # propagates into server.run and closes the WHOLE gateway stdio loop
+        # ("Connection closed" → forced /mcp reconnect). Contain it to THIS call.
+        try:
+            route = _tool_routing.get(name)
+            if route:
+                backend_server, backend_tool = route
+                # Defensive coercion: cast string scalars to the advertised type
+                # so numeric/boolean params survive even if a caller sent a string.
+                arguments = _coerce_args_to_schema(arguments, _tool_schemas.get(name))
+                result = await pool.call_tool(backend_server, backend_tool, arguments)
                 return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+
+            # Fallback for dynamically-discovered tools not in the static catalog
+            if "__" in name:
+                parts = name.split("__", 1)
+                if len(parts) == 2:
+                    result = await pool.call_tool(parts[0], parts[1], arguments)
+                    return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+        except (asyncio.CancelledError, Exception) as exc:
+            logger.error("gateway call_tool %s failed: %s", name, exc, exc_info=True)
+            return [t.TextContent(type="text", text=json.dumps({
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "tool": name,
+            }, default=str))]
 
         return [t.TextContent(type="text", text=json.dumps({
             "status": "failed",

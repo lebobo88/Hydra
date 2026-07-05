@@ -166,6 +166,16 @@ class MCPStdioDispatcher:
         "retry_with_critique",
     })
     _POOLED_SERVERS = frozenset({"eights"})
+    # P1.3: overall-call backstop overhead (seconds). The per-op timeouts above
+    # bound connect / initialize / call_tool, but NOT the stdio context-manager
+    # __aexit__ teardown — a wedged child MCP server (pp_harness/pp_codex) can
+    # block that teardown indefinitely (observed: a 45-min stall at dispatch with
+    # node+python children alive at ~0 CPU). call_mcp wraps the NON-pooled path in
+    # an overall deadline = tool_timeout + this overhead, so teardown/connect can
+    # never exceed it. The overhead exceeds the worst-case connect budget
+    # (3 attempts × ~2 × connect_timeout ≈ 120s) so the backstop only ever fires
+    # on a genuinely wedged transport, never on a legitimately slow-but-valid call.
+    _DEFAULT_OVERALL_OVERHEAD = 180.0
 
     def __init__(self, project_root: Path, *, verbose: bool = False):
         self.project_root = project_root
@@ -280,7 +290,13 @@ class MCPStdioDispatcher:
         if server in self._POOLED_SERVERS:
             result = self._run(self._async_call_pooled(server, tool, args))
         else:
-            result = self._run(self._async_call(server, tool, args))
+            # P1.3: bound the non-pooled path with an overall deadline so a
+            # wedged stdio __aexit__ teardown (not covered by the inner per-op
+            # timeouts) can never freeze the stage loop.
+            _overall = (self._resolve_tool_timeout(server, tool)
+                        + self._overall_overhead())
+            result = self._run(self._call_with_deadline(
+                self._async_call(server, tool, args), _overall, server, tool))
         _dur = (_time.monotonic() - _t0) * 1000
         status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
         self._record_tool_usage(server, tool, squad_id, status, _dur)
@@ -437,6 +453,46 @@ class MCPStdioDispatcher:
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
         return self._loop.run_until_complete(coro)
+
+    def _overall_overhead(self) -> float:
+        return _env_float("HYDRA_DISPATCH_OVERALL_OVERHEAD_S",
+                          self._DEFAULT_OVERALL_OVERHEAD)
+
+    async def _call_with_deadline(self, coro: Any, deadline: float,
+                                  server: str, tool: str) -> dict[str, Any]:
+        """Bound a whole non-pooled ``_async_call`` — INCLUDING the stdio
+        context-manager ``__aexit__`` teardown — with one overall deadline.
+
+        The inner per-op ``wait_for``s in ``_async_call`` cap connect /
+        initialize / call_tool, but a wedged child MCP server can still block the
+        ``async with`` teardown that runs on return, freezing the stage loop
+        (P1.3). ``wait_for`` cancels the coroutine at ``deadline``, injecting
+        ``CancelledError`` into the hung teardown await so it unwinds instead of
+        hanging. Because ``deadline`` = tool_timeout + overhead (which exceeds the
+        connect + call budget), this backstop only ever fires on a genuinely
+        wedged transport — never on a legitimately slow-but-valid call.
+        """
+        try:
+            return await asyncio.wait_for(coro, deadline)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "MCP call %s.%s exceeded overall deadline %.0fs — abandoning "
+                "wedged transport (teardown/connect never returned)",
+                server, tool, deadline,
+            )
+            return {
+                "status": "failed", "timeout": True, "phase": "overall",
+                "error": (f"tool {tool!r} on {server!r} exceeded overall "
+                          f"deadline {deadline}s (wedged transport teardown)"),
+                "server": server, "tool": tool, "timeout_s": deadline,
+            }
+        except Exception as exc:  # noqa: BLE001 — e.g. anyio cancel-scope RuntimeError
+            return {
+                "status": "failed",
+                "error": (f"overall-deadline unwind for {tool!r} on {server!r}: "
+                          f"{type(exc).__name__}: {exc!s}"),
+                "server": server, "tool": tool,
+            }
 
     def _pooled_session_lock(self, server: str) -> asyncio.Lock:
         lock = self._pooled_session_locks.get(server)

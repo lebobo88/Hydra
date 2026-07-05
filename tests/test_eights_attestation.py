@@ -138,6 +138,47 @@ def test_disabled_attestor_short_circuits():
     assert d.calls == []
 
 
+def test_guarded_call_degrades_open_on_slow_eights(monkeypatch):
+    """P1.2: a bloated-but-alive eights daemon (slow call_mcp) must NOT block
+    the supervisor for the full 120s dispatcher cap. The guarded call abandons
+    after a short timeout, degrades open (None), trips the breaker, and the next
+    call short-circuits without re-dialing."""
+    monkeypatch.setenv("HYDRA_EIGHTS_GUARD_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("HYDRA_EIGHTS_GUARD_COOLDOWN_S", "30")
+
+    release = threading.Event()
+
+    class _HangingDispatcher:
+        def __init__(self):
+            self.calls = 0
+
+        def call_mcp(self, server, tool, args, **_kw):
+            self.calls += 1
+            release.wait(timeout=5)  # simulate a wedged / bloated-ledger daemon
+            return {"status": "done", "tool": tool, "result": {}}
+
+        def spawn_subprocess(self, *a, **k): return {}
+        def emit_claude_prompt(self, *a, **k): return {}
+        def invoke_claude_skill(self, *a, **k): return {}
+
+    d = _HangingDispatcher()
+    a = EightsAttestor(dispatcher=d, workflow_id="wf")
+    try:
+        t0 = time.monotonic()
+        out = a.ceiling_tick(workflow_id="wf", node="intake")
+        elapsed = time.monotonic() - t0
+        assert out is None            # degraded open, not blocked on the hang
+        assert elapsed < 2.0          # abandoned ~0.2s, not the 5s call
+        assert d.calls == 1
+
+        # Breaker is now open: the next call returns immediately WITHOUT dialing.
+        out2 = a.ceiling_tick(workflow_id="wf", node="dispatch")
+        assert out2 is None
+        assert d.calls == 1           # breaker open → no second call_mcp
+    finally:
+        release.set()  # let the abandoned worker unwind
+
+
 # ---------------- supervisor integration ----------------
 
 class _PassClient:
