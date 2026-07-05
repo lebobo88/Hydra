@@ -721,3 +721,123 @@ def test_mu8b_timeout_includes_partial_output(monkeypatch):
     assert result["partial_stderr"].endswith("PARTIAL-ERR"), (
         f"MU8b: partial_stderr must end with 'PARTIAL-ERR'; got {result['partial_stderr']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU10 — envelope.record accepts typed envelopes without reintroducing
+#         payload-key shadowing (Phase 3a sequel)
+# ---------------------------------------------------------------------------
+# envelope_record previously built hydra_env from only the 7 canonical outer
+# fields + a nested payload blob.  Type-specific REQUIRED fields could never
+# reach the dict, so validate_envelope always failed on typed envelopes.
+# MU10 adds _ENVELOPE_EXTRA_FIELDS to promote those fields safely.
+
+
+def test_mu10_handoff_with_payload_field_validates(monkeypatch):
+    """MU10(a): HANDOFF with payload_envelope_id nested inside the payload
+    dict must promote it to the envelope top level and validate successfully
+    (ok True)."""
+    import mcp_servers.hydra_control.server as _srv
+    import hydra_core.memory as _mem
+
+    monkeypatch.setattr(_srv, "_get_attestor", lambda: None)
+    monkeypatch.setattr(_mem, "append_episodic", lambda **_k: None)
+
+    h = _srv._tool_handlers()
+    result = h["hydra.envelope.record"]({
+        "kind": "HANDOFF",
+        "from_squad": "engineering",
+        "workflow_id": str(uuid4()),
+        "payload": {
+            "payload_envelope_id": str(uuid4()),
+            "summary": "handoff to garland",
+        },
+    })
+    assert result.get("ok") is True, f"MU10(a): expected ok=True, got {result}"
+
+
+def test_mu10_decision_record_top_level_fields(monkeypatch):
+    """MU10(b): DECISION_RECORD with decision/rationale supplied at top level
+    (not nested in payload) must validate successfully (ok True)."""
+    import mcp_servers.hydra_control.server as _srv
+    import hydra_core.memory as _mem
+
+    monkeypatch.setattr(_srv, "_get_attestor", lambda: None)
+    monkeypatch.setattr(_mem, "append_episodic", lambda **_k: None)
+
+    h = _srv._tool_handlers()
+    result = h["hydra.envelope.record"]({
+        "kind": "DECISION_RECORD",
+        "from_squad": "executive",
+        "workflow_id": str(uuid4()),
+        "decision": "go",
+        "rationale": "because",
+    })
+    assert result.get("ok") is True, f"MU10(b): expected ok=True, got {result}"
+
+
+def test_mu10_anti_shadow_preserved(monkeypatch):
+    """MU10(c): payload keys 'workflow_id' and 'type' must never shadow the
+    outer envelope's reserved fields even when the extra-field promotion
+    mechanism is active.  The persisted envelope must carry the OUTER
+    workflow_id and type==HANDOFF."""
+    import mcp_servers.hydra_control.server as _srv
+    import hydra_core.memory as _mem
+
+    monkeypatch.setattr(_srv, "_get_attestor", lambda: None)
+
+    captured: list[dict] = []
+
+    def _capture(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(_mem, "append_episodic", _capture)
+
+    outer_wf = str(uuid4())
+    different_wf = str(uuid4())
+
+    h = _srv._tool_handlers()
+    result = h["hydra.envelope.record"]({
+        "kind": "HANDOFF",
+        "from_squad": "engineering",
+        "workflow_id": outer_wf,
+        "payload": {
+            "payload_envelope_id": str(uuid4()),
+            "workflow_id": different_wf,   # must NOT overwrite the outer field
+            "type": "PRD",                 # must NOT overwrite the outer field
+        },
+    })
+    assert result.get("ok") is True, f"MU10(c): expected ok=True, got {result}"
+    assert captured, "MU10(c): append_episodic must have been called"
+
+    persisted = captured[0]["payload"]["envelope"]
+    assert persisted["type"] == "HANDOFF", (
+        f"MU10(c): persisted type must be HANDOFF, got {persisted['type']!r}"
+    )
+    assert persisted["workflow_id"] == outer_wf, (
+        f"MU10(c): persisted workflow_id must be outer {outer_wf!r}, "
+        f"got {persisted.get('workflow_id')!r}"
+    )
+
+
+def test_mu10_missing_required_still_fails_closed(monkeypatch):
+    """MU10(d): DECISION_RECORD with no decision/rationale supplied anywhere
+    must still fail validation and return ok=False with an error mentioning
+    'validation'."""
+    import mcp_servers.hydra_control.server as _srv
+    import hydra_core.memory as _mem
+
+    monkeypatch.setattr(_srv, "_get_attestor", lambda: None)
+    monkeypatch.setattr(_mem, "append_episodic", lambda **_k: None)
+
+    h = _srv._tool_handlers()
+    result = h["hydra.envelope.record"]({
+        "kind": "DECISION_RECORD",
+        "from_squad": "executive",
+        "workflow_id": str(uuid4()),
+        # no decision, no rationale — validation must reject
+    })
+    assert result.get("ok") is False, f"MU10(d): expected ok=False, got {result}"
+    assert "validation" in result.get("error", "").lower(), (
+        f"MU10(d): error must mention 'validation', got {result.get('error')!r}"
+    )

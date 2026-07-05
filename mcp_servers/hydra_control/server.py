@@ -67,6 +67,97 @@ _COCKPIT_WRITE_ACTIONS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
+# MU10 — typed envelope extra-field allow-list (Phase 3a sequel).
+#
+# envelope_record builds hydra_env from only the 7 canonical outer fields
+# plus the nested payload blob.  Type-specific REQUIRED fields
+# (e.g. Handoff.payload_envelope_id, DecisionRecord.decision/rationale)
+# could never reach the dict, so validate_envelope always failed on them.
+#
+# This allow-list enumerates the non-base fields for each envelope type so
+# envelope_record can promote them from top-level args OR from the nested
+# payload dict into hydra_env before validation — without reintroducing the
+# Phase 3a payload-key shadowing vector (the reserved outer keys are locked).
+# ---------------------------------------------------------------------------
+
+# Fields that belong exclusively to the outer envelope envelope and must
+# NEVER be overwritten by type-specific field promotion.
+_RESERVED_ENVELOPE_KEYS: frozenset[str] = frozenset({
+    "id", "type", "origin_squad", "target_squad", "workflow_id",
+    "created_at", "parent_id",
+})
+
+# Per-type allow-list: required + safe optional non-base fields derived from
+# hydra_core/schemas.py.  Derived from each class's field definitions; does
+# NOT include any key from _RESERVED_ENVELOPE_KEYS (enforced below).
+_ENVELOPE_EXTRA_FIELDS: dict[str, frozenset[str]] = {
+    "C_SUITE_DECISION_PACKET": frozenset({
+        "origin", "objective", "proposed_tasks", "approvals_required",
+        "dissenting_opinions", "notes", "target_repo_id", "target_repo_subpath",
+        "model_tier", "pp_team", "pp_profile",
+    }),
+    "PRD": frozenset({
+        "source_goal_id", "summary", "user_personas", "user_stories",
+        "acceptance_criteria", "dependencies", "non_functional_requirements",
+    }),
+    "ARCH_RFC": frozenset({
+        "related_prd", "proposed_changes", "risk_assessment",
+        "rollout_plan", "requires_approvals",
+    }),
+    "DEV_TASK": frozenset({
+        "owner", "repo", "branch", "instructions", "files_touched",
+        "test_plan", "status", "pr_url", "target_repo_id", "target_repo_subpath",
+        "pp_team", "pp_profile",
+    }),
+    "CREATIVE_BRIEF": frozenset({
+        "campaign_id", "objective", "target_audience", "key_messages",
+        "channels", "brand_constraints", "assets_required",
+    }),
+    "SHOT_LIST": frozenset({
+        "brief_id", "shots",
+    }),
+    "ASSET_JOB": frozenset({
+        "shotlist_id", "model_type", "resolution", "fps", "style_refs",
+        "output_bucket", "max_render_cost_usd",
+    }),
+    "HITL_REQUEST": frozenset({
+        "reason", "summary", "options", "default_option", "expires_at",
+    }),
+    "DECISION_RECORD": frozenset({
+        "decision", "rationale", "dissenting_opinions", "artifacts", "sealed",
+    }),
+    "HANDOFF": frozenset({
+        "granted_tools", "granted_memory_scopes", "payload_envelope_id", "expires_at",
+    }),
+    "SUPPORT_TICKET": frozenset({
+        "ticket_id", "customer_ref", "subject", "body", "priority",
+        "intent", "channel", "portable_context",
+    }),
+    "PORTABLE_CONTEXT": frozenset({
+        # payload: PortableContextPayload — base logic already sets this from
+        # args["payload"]; included here so the field is documented and the
+        # promotion loop is a no-op rather than absent.
+        "payload",
+    }),
+    "VOC_REPORT": frozenset({
+        "period", "coverage", "themes", "escalation_patterns",
+        "delight_signals", "recommendations",
+    }),
+}
+
+# Sanity-check at module import: no allow-listed key may shadow a reserved
+# outer field.  Caught immediately rather than at call time.
+_bad_overlaps = {
+    t: fields & _RESERVED_ENVELOPE_KEYS
+    for t, fields in _ENVELOPE_EXTRA_FIELDS.items()
+    if fields & _RESERVED_ENVELOPE_KEYS
+}
+assert not _bad_overlaps, (
+    f"_ENVELOPE_EXTRA_FIELDS entries overlap _RESERVED_ENVELOPE_KEYS: {_bad_overlaps}"
+)
+del _bad_overlaps
+
+# ---------------------------------------------------------------------------
 # C5: EightsAttestor integration — spool-safe audit filing
 # ---------------------------------------------------------------------------
 
@@ -733,6 +824,22 @@ def _tool_handlers() -> dict[str, Any]:
         if payload is not None:
             hydra_env["payload"] = payload
 
+        # MU10 — promote type-specific required/optional fields into the
+        # envelope dict so validate_envelope can find them.
+        # Priority: top-level args first (explicit caller), then nested
+        # payload dict (bridge-style callers who embed fields inside payload).
+        # Only keys in the pre-validated allow-list are touched; reserved
+        # outer keys are never overwritten (the allow-list is verified at
+        # module import to exclude them).
+        _allowed = _ENVELOPE_EXTRA_FIELDS.get(kind, frozenset())
+        _payload_dict: dict[str, Any] = payload if isinstance(payload, dict) else {}
+        for _k in _allowed:
+            _val = args.get(_k)
+            if _val is None:
+                _val = _payload_dict.get(_k)
+            if _val is not None:
+                hydra_env[_k] = _val
+
         # Validate the same object we will persist. On failure REJECT — do NOT
         # persist. Pydantic treats "payload" as an extra field (ignored), so
         # only the canonical envelope fields are checked.
@@ -1125,9 +1232,22 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "Called by AgentSmith HydraBridge.envelopeRecord(). "
             "Accepts AgentSmith bridge shape ({kind, from_squad, to_squad?, "
             "workflow_id, payload}) or Hydra-native shape ({type, origin_squad, ...}). "
+            "Type-specific required fields (e.g. decision+rationale for DECISION_RECORD, "
+            "payload_envelope_id for HANDOFF) may be supplied either at the top level "
+            "or nested inside the payload dict — the tool promotes them automatically "
+            "via an allow-list (_ENVELOPE_EXTRA_FIELDS) without allowing payload keys "
+            "to shadow the reserved outer fields (id, type, origin_squad, target_squad, "
+            "workflow_id, created_at, parent_id). "
             "Returns {ok: true, envelope_id: str}."),
         "inputSchema": {
             "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Additional properties beyond the base fields are forwarded "
+                "to the envelope via a per-type allow-list; reserved outer "
+                "fields (id, type, origin_squad, target_squad, workflow_id, "
+                "created_at, parent_id) are always set from base args and can "
+                "never be overwritten by additional properties."),
             "properties": {
                 "kind": {
                     "type": "string",
@@ -1154,7 +1274,36 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": "Workflow id for audit lineage.",
                 },
                 "payload": {
-                    "description": "Envelope payload content (any).",
+                    "description": (
+                        "Envelope payload blob (any). For typed envelopes, "
+                        "type-specific required fields may be nested here "
+                        "and will be promoted to the envelope top level. "
+                        "Keys 'workflow_id' and 'type' inside payload are "
+                        "never promoted (anti-shadow guard)."),
+                },
+                "decision": {
+                    "type": "string",
+                    "description": "DECISION_RECORD: decision text (required for that type).",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "DECISION_RECORD: rationale text (required for that type).",
+                },
+                "payload_envelope_id": {
+                    "type": "string",
+                    "description": "HANDOFF: UUID of the artifact being handed off (required for that type).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "HITL_REQUEST: reason literal (required for that type).",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "HITL_REQUEST: summary text (required for that type).",
+                },
+                "options": {
+                    "type": "array",
+                    "description": "HITL_REQUEST: option strings (required for that type).",
                 },
             },
         },
