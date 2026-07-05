@@ -85,6 +85,13 @@ Policy: fix-as-found; Tiers 0–4 (full coverage, ~$15-35 ceiling).
 - **Pipeline milestone:** the MU15 run itself was the first attended run on the Hydra repo to go plan → engineer → judge → smoke PASS (worktree, thanks MU6-rc) → **merge autonomously** — no salvage, no manual conflict work.
 - **Lifecycle milestone (wf ae8837ef):** first Hydra workflow ever to complete the FULL lifecycle with real engineering work: attended complete+merge (mc-test sha 9f0b5c9) → resume → synthesis → judge_synthesis → postcheck → **phase "done"**. Cosmetic residual: the task-status display column still reads "surfaced" (append-reducer); status rendering could join against attended_done_task_ids (S3).
 
+## Continuation round 3: MU6b + MU8b + MU10 FIXED
+
+- **MU6b+MU8b fixed (merged autonomously, sha cc6923e; wf 1d3ab3cd closed "done"):** smoke failures now persist the full transcript to `.harness/smoke/<stage_id>-<ts>.log` and embed pytest FAILED lines + log path in the reason (cap 2000; pass path unchanged); `_run_cli_json` timeouts return partial_stdout/partial_stderr. The unrecoverable-failure-names problem that cost hours this morning is closed.
+- **MU10 fixed (merged 3c6da99, codex cross-vendor PASS 0.97/0.98/0.93):** `hydra.envelope.record` can record typed envelopes again — per-type `_ENVELOPE_EXTRA_FIELDS` allow-list (all 13 SCHEMA_REGISTRY types) promotes required fields from top-level args or nested payload; reserved outer keys locked by import-time assertion (Phase 3a anti-shadow preserved, proven by test); falsy-value coalescing correct. Direct invocation verified `{ok:true, envelope_id:...}`. NOTE: the live gateway path still serves the OLD code — stale gateway instances from prior sessions (seen in T0: 5 gateways, 2 hydra_control) keep respawning children from stale context; a fresh session gets the fix live. → hygiene item: kill stale `python -m mcp_servers.hydra_gateway` processes from ended sessions (S3).
+- **MU12 fix validated in production twice more:** both the MU10 merge conflict (my uncommitted ledger) and the earlier MU6-rc conflict surfaced `preserved_branch` instead of destroying work — salvage is now a one-command merge.
+- **Budget tripwires fired again** on the MU10 run ($2.50 vs $2 cap after the codex critique) — budget_block+downgrade flags set at finalize, honest surfaced outcome.
+
 ## Final summary (campaign complete, 2026-07-05)
 
 **Verdict: Hydra's core engine is sound; the "broken" experience came from four independent defects, three now fixed and verified, plus a set of reliability gaps around the attended/detached finalize paths — all catalogued below.**
