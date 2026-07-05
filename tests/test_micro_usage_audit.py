@@ -378,3 +378,92 @@ def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
         f"MU12c: git show {preserved}:mu12c_feature.py failed — work not preserved.\n"
         f"stderr: {show.stderr}\nstdout: {show.stdout}")
     assert "mu12c" in show.stdout
+
+
+# ---------------------------------------------------------------------------
+# MU6 — worktree-aware _get_base (repo_registry.py)
+# ---------------------------------------------------------------------------
+
+import types as _types  # noqa: E402  (used only in MU6 helpers below)
+
+import hydra_core.repo_registry as _rr  # noqa: E402
+from hydra_core.repo_registry import _GIT_PROBE_CACHE, _get_base  # noqa: E402
+
+
+def test_mu6_worktree_probe_resolves_main_repo_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MU6: when the git probe returns a common-dir pointing at a fake main
+    repo's .git, _get_base() must return the base two levels above that .git
+    (i.e. tmp_path/AiApp, NOT the worktree's naive parent)."""
+    # Fake layout: tmp_path/AiApp/Hydra/.git
+    fake_main_git = tmp_path / "AiApp" / "Hydra" / ".git"
+    fake_main_git.mkdir(parents=True)
+    expected_base = tmp_path / "AiApp"
+
+    monkeypatch.delenv("HYDRA_REPO_BASE", raising=False)
+
+    # Replace the cache dict via monkeypatch so it is isolated and automatically
+    # restored after the test — avoids polluting subsequent tests with a stale
+    # tmp_path-based entry.
+    monkeypatch.setattr(_rr, "_GIT_PROBE_CACHE", {})
+
+    # Build a minimal subprocess-module replacement whose run() returns the
+    # fake common-dir for --git-common-dir calls.
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001
+        if "--git-common-dir" in cmd:
+            class _R:
+                returncode = 0
+                stdout = str(fake_main_git) + "\n"
+            return _R()
+        import subprocess as _real_sp
+        return _real_sp.run(cmd, **kwargs)
+
+    monkeypatch.setattr(_rr, "subprocess", _types.SimpleNamespace(run=_fake_run))
+
+    result = _get_base()
+    assert result == expected_base, (
+        f"MU6: expected worktree-resolved base {expected_base}, got {result}"
+    )
+
+
+def test_mu6_probe_failure_falls_back_naive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MU6: when the git probe raises an exception, _get_base() falls back to
+    the naive __file__-derived base."""
+    monkeypatch.delenv("HYDRA_REPO_BASE", raising=False)
+    # Isolate the cache so stale entries from prior runs don't short-circuit the probe.
+    monkeypatch.setattr(_rr, "_GIT_PROBE_CACHE", {})
+
+    def _raise(*args, **kwargs):  # noqa: ANN001,ANN002,ANN003
+        raise OSError("git not found (simulated)")
+
+    monkeypatch.setattr(_rr, "subprocess", _types.SimpleNamespace(run=_raise))
+
+    result = _get_base()
+    expected = Path(_rr.__file__).resolve().parents[1].parent
+    assert result == expected, (
+        f"MU6: expected naive fallback {expected}, got {result}"
+    )
+
+
+def test_mu6_env_override_still_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MU6: HYDRA_REPO_BASE always wins, even when the probe cache is poisoned
+    with a wrong value."""
+    # Poison a fresh isolated cache with a wrong entry; monkeypatch restores the
+    # original dict after the test so no cross-test contamination occurs.
+    repo_dir_key = str(Path(_rr.__file__).resolve().parents[1])
+    monkeypatch.setattr(
+        _rr, "_GIT_PROBE_CACHE", {repo_dir_key: tmp_path / "wrong" / ".git"}
+    )
+
+    override = tmp_path / "override"
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(override))
+
+    result = _get_base()
+    assert result == override, (
+        f"MU6: env override must win; expected {override}, got {result}"
+    )
