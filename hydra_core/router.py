@@ -88,7 +88,9 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "tone of voice", "messaging framework", "creative brief",
     ),
     "marketing-ops": (
-        "media buying", "bid", "ppc", "paid media", "budget allocation",
+        "media buying", "bid", "ppc", "paid media",
+        "paid social",  # paid social-platform ad buying (FB/IG/LinkedIn/TikTok ads)
+        "budget allocation",
         "media plan", "mmm", "mta", "attribution", "lifecycle marketing",
         "email marketing", "crm", "marketing automation", "a/b test",
         "conversion rate optimization", "cro",
@@ -97,7 +99,11 @@ _KEYWORDS: dict[str, tuple[str, ...]] = {
         "shoot", "shot list", "production plan", "shoot day", "location scout",
         "talent release", "model release", "music license", "stock footage",
         "ip clearance", "post-production", "cinematographer", "dp",
-        "director of photography", "storyboard", "scheduling", "production budget",
+        "director of photography", "storyboard",
+        # PRUNED: "scheduling" — generic English; matched clinical goal
+        # "triage patient intake symptoms and recommend clinical follow-up scheduling"
+        # Domain-specific variants ("production schedule", "shoot day") are retained.
+        "production budget",
         "production schedule", "permit", "crew", "gaffer", "grip",
     ),
     "rlm-gaming": (
@@ -169,9 +175,19 @@ def classify_intent(
     text_l = text.lower()
     scores: dict[str, float] = {}
 
+    # MU9a: stubs cannot execute — exclude them from automatic selection.
+    # Explicit operator selection (--squad / pre-seeded selected_squads) bypasses
+    # this filter; that path lives in supervisor.node_intake, which emits a trace
+    # event when a stub is explicitly selected but still proceeds.
+    _stub_slugs: frozenset[str] = frozenset(
+        slug for slug, pack in packs.items() if pack.entrypoint == "stub"
+    )
+
     # Deterministic keyword pass
     for slug, kws in _KEYWORDS.items():
         if slug not in packs:
+            continue
+        if slug in _stub_slugs:  # MU9a: skip non-executable stubs
             continue
         hits = sum(1 for k in kws if re.search(rf"\b{re.escape(k)}\b", text_l))
         if hits:
@@ -179,6 +195,8 @@ def classify_intent(
 
     # Industry-tag boost
     for slug, pack in packs.items():
+        if slug in _stub_slugs:  # MU9a: skip non-executable stubs
+            continue
         overlap = set(industries) & set(pack.industries)
         if overlap:
             scores[slug] = max(scores.get(slug, 0.0), 0.4 + 0.2 * len(overlap))
@@ -201,7 +219,8 @@ def classify_intent(
     if classify_callable is not None:
         try:
             squads = classify_callable(text, packs) or []
-            squads = [s for s in squads if s in packs]
+            # MU9a: filter stubs and unknown slugs from LLM-returned list
+            squads = [s for s in squads if s in packs and s not in _stub_slugs]
             if squads:
                 return RoutingDecision(
                     squads=squads,
@@ -210,15 +229,24 @@ def classify_intent(
                     used_fallback=True,
                 )
         except Exception as e:
+            # MU9a: prefer non-stub for the error-path default
+            _err_default = next(
+                (s for s in ("executive",) if s in packs and s not in _stub_slugs),
+                next((s for s in packs if s not in _stub_slugs), ""),
+            ) or next(iter(packs), "")
             return RoutingDecision(
-                squads=["executive"] if "executive" in packs else list(packs)[:1],
+                squads=[_err_default] if _err_default else [],
                 confidence=0.1,
                 rationale=f"llm-fallback failed ({e!r}); default to executive triage",
                 used_fallback=True,
             )
 
-    # Last resort: send to executive for human-triage
-    default = "executive" if "executive" in packs else next(iter(packs), "")
+    # Last resort: send to executive for human-triage.
+    # MU9a: prefer a non-stub default; fall back to any pack only if no non-stubs exist.
+    default = next(
+        (s for s in ("executive",) if s in packs and s not in _stub_slugs),
+        next((s for s in packs if s not in _stub_slugs), ""),
+    ) or next(iter(packs), "")
     return RoutingDecision(
         squads=[default] if default else [],
         confidence=0.1,
