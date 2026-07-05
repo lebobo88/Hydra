@@ -146,7 +146,11 @@ def test_synthesis_preserves_dissents_and_marks_unsealed_on_conflict():
         critique_client=client,
         force_pure_python=True,
     )
-    state = HydraState(root_goal="healthcare PHI redaction policy review")
+    # MU9a: healthcare is a stub — excluded from automatic routing.  Use explicit
+    # selection (the sanctioned --squad path) so this test exercises the real
+    # healthcare per-squad judge path regardless of keyword routing changes.
+    state = HydraState(root_goal="healthcare PHI redaction policy review",
+                       selected_squads=["healthcare"])
     final = _invoke(sup, state)
 
     # Find the synthesis DecisionRecord (origin_squad="hydra" is the
@@ -216,7 +220,12 @@ def test_reflexion_ceiling_exhausted_emits_override_hitl():
     # squad_enabled=True means the scripted critique client is used (not the
     # NoOp fallback), so the revise verdicts are substantive, not
     # pragmatic-guard artefacts from a not-yet-enabled squad.
-    state = HydraState(root_goal="healthcare PHI redaction policy review")
+    # MU9a: healthcare is a stub — excluded from automatic routing.  Use explicit
+    # selection (the sanctioned --squad path) so the per-squad reflexion path
+    # fires on healthcare (best_of_n=0) rather than executive (best-of-N, which
+    # drains the scripted judge queue in candidate scoring before reflexion can fire).
+    state = HydraState(root_goal="healthcare PHI redaction policy review",
+                       selected_squads=["healthcare"])
     final = _invoke(sup, state)
 
     # Ceiling was exhausted → workflow surfaced with reflexion_override HITL.

@@ -1102,3 +1102,138 @@ def test_mu3_hydra_memory_workflow_status_no_deprecation_warning(tmp_path, monke
         f"MU3(b): 'Deserializing unregistered type' fired for hydra_core types via "
         f"hydra_memory path: {hydra_warned}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU9 — router must not auto-select stub squads; marketing keyword siphon pruned
+# ---------------------------------------------------------------------------
+# MU9a: classify_intent excludes squads whose entrypoint=="stub" from automatic
+#        selection.  Explicit --squad / pre-seeded selected_squads still passes
+#        through; supervisor.node_intake emits "stub_squad_explicitly_selected"
+#        trace but proceeds.
+# MU9b: "scheduling" pruned from marketing-production keywords — it is a generic
+#        English word that matched the clinical goal below.
+
+from hydra_core.router import classify_intent as _classify_intent  # noqa: E402
+from hydra_core.squad_loader import _coerce_pack as _coerce_pack  # noqa: E402
+
+
+def _mu9_packs() -> dict:
+    """Worktree packs extended with synthetic marketing-* squads (claude-skill).
+
+    Marketing-* packs are filesystem symlinks absent from the worktree squads/
+    directory.  We inject minimal synthetic packs so classify_intent sees them
+    via _KEYWORDS (which keys on the slug, not the pack's own description).
+    """
+    from hydra_core.squad_loader import discover_squads
+    real = discover_squads(REPO_ROOT)
+    synthetic = {
+        slug: _coerce_pack(slug, {
+            "name": slug,
+            "entrypoint": "claude-skill",
+            "description": slug,
+        })
+        for slug in (
+            "marketing-production", "marketing-strategy", "marketing-ops",
+            "marketing-creative", "marketing-research",
+        )
+        if slug not in real
+    }
+    return {**real, **synthetic}
+
+
+_CLINICAL_GOAL = (
+    "triage patient intake symptoms and recommend clinical follow-up scheduling"
+)
+_CAMPAIGN_GOAL = "plan a paid social campaign for the product launch"
+
+
+def test_mu9a_clinical_goal_excludes_stub_and_marketing_production():
+    """MU9(a): clinical goal must not select any stub squad (healthcare) and must
+    not select marketing-production after pruning 'scheduling'."""
+    packs = _mu9_packs()
+    # Confirm healthcare is present and is a stub.
+    assert "healthcare" in packs, "healthcare pack must be discoverable"
+    assert packs["healthcare"].entrypoint == "stub", (
+        "healthcare entrypoint must be 'stub' for this test to be meaningful"
+    )
+    decision = _classify_intent(_CLINICAL_GOAL, packs)
+    stub_selected = [s for s in decision.squads if s in packs and packs[s].entrypoint == "stub"]
+    assert not stub_selected, (
+        f"MU9(a): stub squad(s) {stub_selected!r} auto-selected for clinical goal; "
+        f"full selection: {decision.squads!r}"
+    )
+    assert "marketing-production" not in decision.squads, (
+        f"MU9(a): marketing-production must not be selected for clinical goal after "
+        f"pruning 'scheduling'; full selection: {decision.squads!r}"
+    )
+
+
+def test_mu9b_explicit_stub_squad_passes_through(monkeypatch):
+    """MU9(b): explicit selected_squads=['healthcare'] (the --squad path) still
+    yields healthcare in selected_squads — stub exclusion is for auto-selection only.
+    Also verifies that supervisor.node_intake emits 'stub_squad_explicitly_selected'."""
+    import hydra_core.supervisor as _sup_mod
+    from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+    class _StubDispMU9:
+        def call_mcp(self, *a, **k):
+            return {"status": "done", "result": {}}
+
+        def spawn_subprocess(self, *a, **k):
+            return {"status": "done", "stdout": ""}
+
+        def emit_claude_prompt(self, *a, **k):
+            return {"status": "host_pickup_required"}
+
+        def invoke_claude_skill(self, *a, **k):
+            return {"status": "host_pickup_required"}
+
+    captured_events: list[tuple] = []
+
+    def _capture_emit(root, wf_id, event_name, payload):
+        captured_events.append((event_name, payload))
+
+    monkeypatch.setattr(_sup_mod, "emit_trace", _capture_emit)
+
+    state = HydraState(
+        root_goal="healthcare explicit test",
+        selected_squads=["healthcare"],
+    )
+    sup = build_supervisor(
+        project_root=REPO_ROOT,
+        dispatcher=_StubDispMU9(),
+        force_pure_python=True,
+    )
+    assert isinstance(sup, _PurePythonRunner)
+    result = sup.invoke(state, stop_before="planner")
+    assert "healthcare" in result.selected_squads, (
+        f"MU9(b): explicit stub squad 'healthcare' must pass through to selected_squads; "
+        f"got {result.selected_squads!r}"
+    )
+    stub_events = [
+        (name, payload) for name, payload in captured_events
+        if name == "supervisor.stub_squad_explicitly_selected"
+    ]
+    assert stub_events, (
+        f"MU9(b): 'supervisor.stub_squad_explicitly_selected' trace event must be emitted "
+        f"when a stub squad is explicitly selected; captured events: "
+        f"{[n for n, _ in captured_events]}"
+    )
+    assert "healthcare" in stub_events[0][1].get("stub_squads", []), (
+        f"MU9(b): trace payload must name 'healthcare' in stub_squads; "
+        f"got {stub_events[0][1]!r}"
+    )
+
+
+def test_mu9c_campaign_goal_selects_marketing_squad():
+    """MU9(c): 'plan a paid social campaign for the product launch' must select
+    at least one marketing-* squad (keyword pruning must not break marketing routing).
+    marketing-ops matches via 'paid social' (added after MU9b pruning review)."""
+    packs = _mu9_packs()
+    decision = _classify_intent(_CAMPAIGN_GOAL, packs)
+    marketing_selected = [s for s in decision.squads if s.startswith("marketing-")]
+    assert marketing_selected, (
+        f"MU9(c): at least one marketing-* squad must be selected for campaign goal; "
+        f"full selection: {decision.squads!r}"
+    )

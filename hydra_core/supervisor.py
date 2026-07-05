@@ -571,6 +571,18 @@ def build_supervisor(
                 {"unknown": unknown, "known": sorted(packs)},
             )
         if forced:
+            # MU9a: if any explicitly-selected squads are stubs, emit a trace event
+            # but proceed — the operator knowingly force-selected them (e.g. for a
+            # dry-run or a squad that will become active soon).  Automatic selection
+            # excludes stubs inside classify_intent; this path is the explicit bypass.
+            _stub_forced = [s for s in forced if packs[s].entrypoint == "stub"]
+            if _stub_forced:
+                emit_trace(
+                    judge_trace_root,
+                    state.workflow_id,
+                    "supervisor.stub_squad_explicitly_selected",
+                    {"stub_squads": _stub_forced},
+                )
             decision = RoutingDecision(
                 squads=forced,
                 confidence=1.0,
