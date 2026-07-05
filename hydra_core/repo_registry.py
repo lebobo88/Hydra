@@ -13,10 +13,19 @@ Typical project layout assumed:
         AgentSmith/
         ...
 
-``_BASE`` defaults to ``AiAppDeployments/`` (two levels above this file:
-``hydra_core/`` → ``Hydra/`` → ``AiAppDeployments/``).  Override with
-the ``HYDRA_REPO_BASE`` environment variable for non-standard layouts or
-test fixtures.
+Base directory computation (``_get_base()``, called at resolution time):
+
+1. ``HYDRA_REPO_BASE`` env var — re-read every call so tests can monkeypatch.
+2. Worktree-aware git probe: ``git -C <repo_dir> rev-parse --git-common-dir``
+   is run (cached in ``_GIT_PROBE_CACHE`` keyed by ``str(repo_dir)``).  If the
+   returned path is not ``<repo_dir>/.git`` the file is running from a linked git
+   worktree; the main repo root is ``common_dir.parent`` and the base is
+   ``main_root.parent`` (same level as the non-worktree case).
+3. Naive fallback (probe fails / nonzero exit): two levels above this file —
+   ``hydra_core/`` → ``Hydra/`` → ``AiAppDeployments/``.
+
+Override with the ``HYDRA_REPO_BASE`` environment variable for non-standard
+layouts or test fixtures.
 """
 from __future__ import annotations
 
@@ -60,17 +69,70 @@ _BASE: Path = (
     else Path(__file__).resolve().parents[1].parent
 )
 
+# Module-level cache for the git --git-common-dir probe result, keyed by
+# str(repo_dir).  Populated lazily by _get_base(); clear in tests to force
+# a fresh probe.  The env-override path in _get_base() bypasses this cache.
+_GIT_PROBE_CACHE: dict[str, Path] = {}
+
 
 def _get_base() -> Path:
-    """Return the current base directory.
+    """Return the current base directory (parent of the Hydra repo root).
 
-    Re-evaluates ``HYDRA_REPO_BASE`` at call time so tests can monkeypatch
-    ``os.environ`` and see the effect without a module reload.
+    Resolution order:
+    1. ``HYDRA_REPO_BASE`` env var — re-read every call so tests can monkeypatch
+       ``os.environ`` and see the effect without a module reload.
+    2. Worktree-aware git probe (result cached in ``_GIT_PROBE_CACHE``): if this
+       file is running from a linked git worktree, ``git rev-parse
+       --git-common-dir`` points at the main checkout's ``.git`` dir.  The base
+       is derived as ``common_dir.parent.parent`` (main repo root → base dir).
+    3. Naive fallback when the probe fails: ``Path(__file__).resolve().parents[1].parent``.
     """
+    # 1. Env override — always wins; not cached so monkeypatching in tests works.
     env_val = os.environ.get("HYDRA_REPO_BASE")
     if env_val:
         return Path(env_val)
-    return Path(__file__).resolve().parents[1].parent
+
+    # 2. Compute repo_dir (the directory containing hydra_core/) and naive base.
+    repo_dir = Path(__file__).resolve().parents[1]
+    naive_base = repo_dir.parent
+
+    # 3. Worktree-aware probe (cached per repo_dir to avoid repeated subprocess calls).
+    cache_key = str(repo_dir)
+    if cache_key not in _GIT_PROBE_CACHE:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_dir), "rev-parse", "--git-common-dir"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                raw = proc.stdout.strip()
+                raw_path = Path(raw)
+                # --git-common-dir may return a relative path (e.g. ".git") or
+                # an absolute path.  Resolve relative paths against repo_dir.
+                if raw_path.is_absolute():
+                    common_dir: Path = raw_path.resolve()
+                else:
+                    common_dir = (repo_dir / raw_path).resolve()
+                _GIT_PROBE_CACHE[cache_key] = common_dir
+            else:
+                # Nonzero exit or empty output — treat as non-worktree (fall-soft).
+                _GIT_PROBE_CACHE[cache_key] = (repo_dir / ".git").resolve()
+        except Exception:  # noqa: BLE001 — git not found or timeout → fail-soft
+            _GIT_PROBE_CACHE[cache_key] = (repo_dir / ".git").resolve()
+
+    common_dir = _GIT_PROBE_CACHE[cache_key]
+
+    # 4. If common_dir is NOT repo_dir/.git we are in a linked worktree.
+    #    The main repo root is common_dir.parent; the shared base is one level above.
+    expected_git = (repo_dir / ".git").resolve()
+    if common_dir != expected_git:
+        main_root = common_dir.parent  # e.g. C:\AiAppDeployments\Hydra
+        return main_root.parent        # e.g. C:\AiAppDeployments
+
+    return naive_base
 
 
 def _load_extra_repos() -> dict[str, Path]:
