@@ -848,6 +848,10 @@ def _drive_pp_stage_loop(
     judge_rubric_id: str = "rfc-2119-normative",
     workflow_id: str | None = None,
     invoke_mode: str | None = None,
+    # MU16: optional budget state for pre-operation gates (fleet or global).
+    # None = no gate (unit tests / callers that don't thread state).
+    state: "HydraState | None" = None,
+    repo_id: str | None = None,
 ) -> dict[str, Any]:
     """Drive a pp `code` stage to a finalized run, headless (no Claude driver).
 
@@ -882,7 +886,8 @@ def _drive_pp_stage_loop(
         _bo = _drive_best_of_loop(
             dispatcher, run_id=run_id, project_path=project_path,
             request_text=request_text, n=_effective_n, model_tier=model_tier,
-            judge_rubric_id=judge_rubric_id, workflow_id=workflow_id)
+            judge_rubric_id=judge_rubric_id, workflow_id=workflow_id,
+            state=state, repo_id=repo_id)
         if _bo is not None:
             return _bo
         _log.warning("best-of-N could not open; falling back to single-candidate "
@@ -1010,6 +1015,13 @@ def _drive_pp_stage_loop(
                     attempt_id = _pp_inner(att).get("attempt_id") or attempt_id
                 except Exception:  # noqa: BLE001
                     pass
+                # MU14: if the failure carries no cost/token info (typical for
+                # subprocess.TimeoutExpired or CLI launch failures), emit a trace
+                # so the unaccounted spend is visible. Never fabricate numbers.
+                if float(gi.get("cost_usd") or 0.0) == 0.0 \
+                        and int(gi.get("tokens_in") or 0) == 0:
+                    _trace("budget.cost_unknown_timeout",
+                           {"candidate": 1, "retry": retry_index})
                 break
 
             # codex writes files in cwd directly; archive the producer summary
@@ -1336,6 +1348,10 @@ def _drive_best_of_loop(
     dispatcher: Dispatcher, *, run_id: str, project_path: str, request_text: str,
     n: int, model_tier: str | None = None,
     judge_rubric_id: str = "rfc-2119-normative", workflow_id: str | None = None,
+    # MU16: optional budget state + repo_id for pre-candidate gates.
+    # None = no gate (unit tests / callers that don't thread state).
+    state: "HydraState | None" = None,
+    repo_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Real best-of-N for the headless engineering stage (opt-in HYDRA_BEST_OF_N).
 
@@ -1393,6 +1409,35 @@ def _drive_best_of_loop(
             wt = str(c.get("worktree_path") or project_path)
             slot = c.get("attempt_slot_id")
             pre = _worktree_dirty_set(wt)
+            # MU16: pre-operation budget gate. Fires BEFORE the next expensive
+            # generate so we never start a generation that would exceed the budget.
+            # Between-candidates only (never mid-flight): a running generate is
+            # always allowed to finish; we only skip the NEXT one.
+            # _drive_pp_stage_loop is single-stage, so no inter-stage gate is
+            # needed here — only this between-candidates gate applies.
+            if state is not None:
+                _is_fleet_budget = bool(
+                    repo_id and repo_id in state.budget.repo_budgets
+                )
+                if _is_fleet_budget:
+                    _bud_remaining = state.budget.repo_remaining(
+                        repo_id)  # type: ignore[arg-type]
+                    if _bud_remaining <= 0:
+                        _trace("fleet.repo_budget_exhausted",
+                               {"repo_id": repo_id, "candidate": ci_idx})
+                        _log.warning(
+                            "best-of: repo budget exhausted, skipping candidates "
+                            "from %d (repo=%s, run=%s)", ci_idx, repo_id, run_id)
+                        break
+                else:
+                    _bud_remaining = state.budget.usd_remaining
+                    if _bud_remaining <= 0:
+                        _trace("budget.candidates_skipped",
+                               {"candidate": ci_idx, "remaining": _bud_remaining})
+                        _log.warning(
+                            "best-of: workflow budget exhausted, skipping candidates "
+                            "from %d (run=%s)", ci_idx, run_id)
+                        break
             # P2.2: heartbeat so a running dispatch shows forward motion in
             # trace.jsonl (a silent generate/judge is indistinguishable from a
             # hang and triggers premature kills).
@@ -1438,6 +1483,11 @@ def _drive_best_of_loop(
             except Exception:  # noqa: BLE001
                 att_id = None
             if gen_fail:
+                # MU14: emit trace when timeout/launch failure carries no cost.
+                # Don't fabricate token numbers.
+                if float(gi.get("cost_usd") or 0.0) == 0.0 \
+                        and int(gi.get("tokens_in") or 0) == 0:
+                    _trace("budget.cost_unknown_timeout", {"candidate": ci_idx})
                 scored.append({"ci": ci_idx, "att": att_id, "outcome": "fail",
                                "rank": -1.0, "smoke": "skipped", "critique": gen_fail})
                 continue
@@ -1954,6 +2004,8 @@ def _via_mcp(
             model_tier=effective_tier,
             workflow_id=str(getattr(inbound, "workflow_id", "") or ""),
             invoke_mode=mode,
+            state=state,
+            repo_id=target_repo_id,
         )
         # The loop already finalized the run (complete/surfaced/aborted) → the
         # project lock is released. Drop the ledger entry so node_postcheck's

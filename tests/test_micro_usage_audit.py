@@ -1237,3 +1237,257 @@ def test_mu9c_campaign_goal_selects_marketing_squad():
         f"MU9(c): at least one marketing-* squad must be selected for campaign goal; "
         f"full selection: {decision.squads!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU16 — pre-operation budget gates between candidates in _drive_best_of_loop
+# ---------------------------------------------------------------------------
+# _drive_pp_stage_loop is single-stage (no inter-stage iteration); the only
+# gate needed is the between-candidates gate in _drive_best_of_loop.
+#
+# Tests (a) fleet-repo exhausted, (b) workflow-global exhausted.
+
+from hydra_core.squad_node import _drive_best_of_loop as _dbol  # noqa: E402
+
+
+def _best_of_responses_mu16(n_candidates: int = 3) -> dict:
+    cands = [
+        {"candidate_index": i, "attempt_slot_id": f"slot{i}",
+         "worktree_path": f"/tmp/mu16c{i}", "worktree_mode": "copy"}
+        for i in range(1, n_candidates + 1)
+    ]
+    return {
+        ("pp_harness", "start_best_of_stage"): {"status": "done", "result": {
+            "stage_id": "st_mu16", "candidates": cands}},
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
+        ("pp_codex", "generate"): {"status": "done", "result": {
+            "text": "edited foo.py", "model": "codex-1",
+            "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": "x"}},
+        ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_mu16"}},
+        ("pp_codex", "critique"): {"status": "done", "result": {"parsed": {
+            "outcome": "pass", "critique_md": "ok", "score": {}}}},
+        ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
+        ("pp_harness", "record_smoke_status"): {"status": "done", "result": {}},
+        ("pp_harness", "get_stage_finalize_readiness"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {"status": "done", "result": {
+            "effective_status": "complete", "status": "complete"}},
+        ("pp_harness", "borda_count"): {"status": "done", "result": {"winner": "att_mu16"}},
+        ("pp_harness", "archive_winner_and_losers"): {"status": "done", "result": {
+            "merge_status": "merged", "winner_diff_path": "w.diff"}},
+        ("pp_harness", "teardown_candidates"): {"status": "done", "result": {
+            "teardown_status": "ok"}},
+    }
+
+
+class _BoDispatcher:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[tuple] = []
+
+    def call_mcp(self, server, tool, args, *, squad_id=None):
+        self.calls.append((server, tool, args))
+        return self.responses.get((server, tool), {"status": "done", "result": {}})
+
+    def tool_seq(self):
+        return [t for (_, t, _) in self.calls]
+
+    def emit_claude_prompt(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def invoke_claude_skill(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def spawn_subprocess(self, *a, **k): raise NotImplementedError  # pragma: no cover
+
+
+def test_mu16a_fleet_repo_budget_exhausted_no_generate(monkeypatch):
+    """MU16(a): best-of loop with a ledger whose repo allocation is already spent
+    must produce zero pp_codex.generate calls and emit fleet.repo_budget_exhausted
+    in the telemetry trace."""
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_smoke", lambda *a, **k: ("pass", "ok"))
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "hydra_core.telemetry.emit",
+        lambda _r, _wf, kind, payload: events.append((kind, payload)),
+    )
+
+    state = HydraState(root_goal="mu16a")
+    state.budget.budget_usd = 5.0
+    state.budget.allocate_repos(["repo-a"])
+    # Pre-exhaust: spend == allocation.
+    state.budget.repo_spend["repo-a"] = state.budget.repo_budgets["repo-a"]
+
+    disp = _BoDispatcher(_best_of_responses_mu16(n_candidates=3))
+
+    _dbol(
+        disp, run_id="run_mu16a", project_path="/tmp/proj",
+        request_text="x", n=3, workflow_id="wf-mu16a",
+        state=state, repo_id="repo-a",
+    )
+
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _) in disp.calls}, (
+        "MU16(a): no generate must run when repo budget is pre-exhausted"
+    )
+    kinds = [k for (k, _) in events]
+    assert "fleet.repo_budget_exhausted" in kinds, (
+        f"MU16(a): fleet.repo_budget_exhausted trace missing; got {kinds}"
+    )
+    evt = next(p for (k, p) in events if k == "fleet.repo_budget_exhausted")
+    assert evt.get("repo_id") == "repo-a"
+    assert evt.get("candidate") == 1
+
+
+def test_mu16b_workflow_budget_exhausted_candidates_skipped(monkeypatch):
+    """MU16(b): non-fleet best-of with exhausted global workflow budget must skip
+    remaining candidates and emit budget.candidates_skipped."""
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_smoke", lambda *a, **k: ("pass", "ok"))
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "hydra_core.telemetry.emit",
+        lambda _r, _wf, kind, payload: events.append((kind, payload)),
+    )
+
+    state = HydraState(root_goal="mu16b")
+    state.budget.budget_usd = 5.0
+    state.budget.spent_usd = 5.0  # 100% consumed; no per-repo allocation
+
+    disp = _BoDispatcher(_best_of_responses_mu16(n_candidates=3))
+
+    _dbol(
+        disp, run_id="run_mu16b", project_path="/tmp/proj",
+        request_text="x", n=3, workflow_id="wf-mu16b",
+        state=state, repo_id=None,
+    )
+
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _) in disp.calls}, (
+        "MU16(b): no generate must run when global budget is exhausted"
+    )
+    kinds = [k for (k, _) in events]
+    assert "budget.candidates_skipped" in kinds, (
+        f"MU16(b): budget.candidates_skipped trace missing; got {kinds}"
+    )
+    evt = next(p for (k, p) in events if k == "budget.candidates_skipped")
+    assert float(evt.get("remaining", 1.0)) <= 0.0
+
+
+# ---------------------------------------------------------------------------
+# MU14 — timed-out generation emits `budget.cost_unknown_timeout`
+# ---------------------------------------------------------------------------
+
+from hydra_core.squad_node import _drive_pp_stage_loop as _dpsl  # noqa: E402
+
+
+def test_mu14_timeout_generate_emits_cost_unknown_trace(monkeypatch):
+    """MU14: single-candidate loop — a codex-timeout generate with cost=0 and
+    tokens=0 must emit budget.cost_unknown_timeout in the telemetry trace so
+    unaccounted spend is visible without fabricating token numbers."""
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "hydra_core.telemetry.emit",
+        lambda _r, _wf, kind, payload: events.append((kind, payload)),
+    )
+    resp = {
+        ("pp_harness", "start_stage"): {
+            "status": "done", "result": {"stage_id": "st_mu14"}},
+        ("pp_harness", "gate_eligible_judges"): {
+            "status": "done", "result": {"required_cross_vendor": False}},
+        # Codex timeout: status=failed, timeout=True, zero cost/tokens.
+        ("pp_codex", "generate"): {
+            "status": "failed", "timeout": True,
+            "error": "pp_codex.generate timed out after 600s",
+            "result": {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "text": ""}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {}},
+        ("pp_harness", "record_attempt"): {
+            "status": "done", "result": {"attempt_id": "att_mu14"}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {
+            "status": "done", "result": {"status": "surfaced"}},
+    }
+
+    class _D:
+        def __init__(self):
+            self.calls: list[tuple] = []
+
+        def call_mcp(self, s, t, a, *, squad_id=None):
+            self.calls.append((s, t, a))
+            return resp.get((s, t), {"status": "done", "result": {}})
+
+        def emit_claude_prompt(self, *a, **k): raise NotImplementedError  # pragma: no cover
+        def invoke_claude_skill(self, *a, **k): raise NotImplementedError  # pragma: no cover
+        def spawn_subprocess(self, *a, **k): raise NotImplementedError  # pragma: no cover
+
+    disp = _D()
+    out = _dpsl(
+        disp, run_id="run_mu14", project_path="/tmp/proj",
+        request_text="add feature", workflow_id="wf-mu14",
+    )
+
+    # Timeout → run must not complete.
+    assert out["final_status"] in {"surfaced", "aborted"}, (
+        f"MU14: expected surfaced/aborted on timeout; got {out['final_status']!r}"
+    )
+    assert "timed out" in (out.get("error") or ""), (
+        f"MU14: error must mention 'timed out'; got {out.get('error')!r}"
+    )
+    # MU14 trace must be in the events.
+    kinds = [k for (k, _) in events]
+    assert "budget.cost_unknown_timeout" in kinds, (
+        f"MU14: budget.cost_unknown_timeout missing from trace; got {kinds}"
+    )
+    te = next(p for (k, p) in events if k == "budget.cost_unknown_timeout")
+    assert te.get("run_id") == "run_mu14"
+
+
+def test_mu14_no_trace_when_cost_captured(monkeypatch):
+    """MU14: when the failed generate DID carry cost/tokens (soft-block with
+    partial usage), budget.cost_unknown_timeout must NOT be emitted."""
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "hydra_core.telemetry.emit",
+        lambda _r, _wf, kind, payload: events.append((kind, payload)),
+    )
+    resp = {
+        ("pp_harness", "start_stage"): {
+            "status": "done", "result": {"stage_id": "st_mu14b"}},
+        ("pp_harness", "gate_eligible_judges"): {
+            "status": "done", "result": {"required_cross_vendor": False}},
+        # Soft-block: read-only sandbox marker but cost IS reported.
+        ("pp_codex", "generate"): {"status": "done", "result": {
+            "text": "writing is blocked by read-only sandbox",
+            "model": "codex-1",
+            "tokens_in": 8, "tokens_out": 4, "cost_usd": 0.03}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {}},
+        ("pp_harness", "record_attempt"): {
+            "status": "done", "result": {"attempt_id": "att_mu14b"}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {
+            "status": "done", "result": {"status": "surfaced"}},
+    }
+
+    class _D:
+        def __init__(self):
+            self.calls: list[tuple] = []
+
+        def call_mcp(self, s, t, a, *, squad_id=None):
+            self.calls.append((s, t, a))
+            return resp.get((s, t), {"status": "done", "result": {}})
+
+        def emit_claude_prompt(self, *a, **k): raise NotImplementedError  # pragma: no cover
+        def invoke_claude_skill(self, *a, **k): raise NotImplementedError  # pragma: no cover
+        def spawn_subprocess(self, *a, **k): raise NotImplementedError  # pragma: no cover
+
+    disp = _D()
+    out = _dpsl(
+        disp, run_id="run_mu14b", project_path="/tmp/proj",
+        request_text="x", workflow_id="wf-mu14b",
+    )
+
+    # Cost was captured — no budget.cost_unknown_timeout.
+    timeout_evts = [k for (k, _) in events if k == "budget.cost_unknown_timeout"]
+    assert timeout_evts == [], (
+        f"MU14: budget.cost_unknown_timeout must NOT fire when cost is captured; "
+        f"got {timeout_evts}"
+    )
+    # Cost propagates through correctly.
+    assert out["cost_usd"] >= 0.03
