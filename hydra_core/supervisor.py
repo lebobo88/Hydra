@@ -47,7 +47,7 @@ from .schemas import (
 from .squad_loader import SquadPack, discover_squads
 from .fleet import dispatch_fleet
 from .squad_node import Dispatcher, SquadResult, execute_squad
-from .state import HydraState, TaskState
+from .state import BudgetLedger, HydraState, TaskState, make_checkpoint_serde
 
 
 # --- LangGraph is an optional runtime dependency. If missing we still expose
@@ -3045,7 +3045,10 @@ def build_supervisor(
     cp_path.parent.mkdir(parents=True, exist_ok=True)
     import sqlite3
     conn = sqlite3.connect(str(cp_path), check_same_thread=False)
-    checkpointer = SqliteSaver(conn)
+    # MU3: use the shared serde helper so all SqliteSaver construction sites
+    # register hydra_core.state types and suppress the deprecation warning.
+    _serde = make_checkpoint_serde()
+    checkpointer = SqliteSaver(conn, serde=_serde) if _serde is not None else SqliteSaver(conn)
 
     # F9: add hitl_gate_dispatch and hitl_gate_judge to interrupt_before so
     # the operator can review the gate before the node clears it and re-enters

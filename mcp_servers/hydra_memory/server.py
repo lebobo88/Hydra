@@ -99,7 +99,9 @@ def _load_state_values(workflow_id: str) -> dict[str, Any] | None:
         return None
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
-        saver = SqliteSaver(conn)
+        from hydra_core.state import make_checkpoint_serde  # MU3: shared serde helper
+        _serde = make_checkpoint_serde()
+        saver = SqliteSaver(conn, serde=_serde) if _serde is not None else SqliteSaver(conn)
         tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
         if tup is None:
             return None

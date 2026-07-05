@@ -1,10 +1,11 @@
-"""MU micro-usage audit regression tests (MU7, MU12). See docs/audits/MU-MICRO-USAGE-2026-07-05.md."""
+"""MU micro-usage audit regression tests (MU1, MU3, MU7, MU12). See docs/audits/MU-MICRO-USAGE-2026-07-05.md."""
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -922,3 +923,182 @@ def test_mu17_timeout_returns_empty_no_second_candidate(tmp_path, monkeypatch):
     sha = _git_mu12(["rev-parse", "HEAD"], repo).stdout.strip()
     assert not (repo / ".harness" / "baseline" / f"{sha}.json").exists(), (
         "MU17: a timed-out baseline must not be cached")
+
+
+# ---------------------------------------------------------------------------
+# MU1 — hydra doctor probe table uses real tool names
+# ---------------------------------------------------------------------------
+
+def test_mu1_doctor_probe_tool_names():
+    """MU1: _DOCTOR_MCP_PROBES must reference real tool names for pp_harness and
+    hydra_memory so `hydra doctor` no longer emits false 'unreachable' WARNs."""
+    from hydra_core import cli
+
+    probes = cli._DOCTOR_MCP_PROBES
+    assert isinstance(probes, dict), "MU1: _DOCTOR_MCP_PROBES must be a dict"
+    assert "pp_harness" in probes, "MU1: pp_harness must be in _DOCTOR_MCP_PROBES"
+    assert "hydra_memory" in probes, "MU1: hydra_memory must be in _DOCTOR_MCP_PROBES"
+
+    pp_tool, _pp_args = probes["pp_harness"]
+    mem_tool, _mem_args = probes["hydra_memory"]
+
+    assert pp_tool != "ping", (
+        f"MU1: pp_harness probe must not use 'ping' (non-existent); got {pp_tool!r}"
+    )
+    assert mem_tool != "list_tools", (
+        f"MU1: hydra_memory probe must not use 'list_tools' (non-existent); got {mem_tool!r}"
+    )
+    assert pp_tool, "MU1: pp_harness probe tool name must be non-empty"
+    assert mem_tool, "MU1: hydra_memory probe tool name must be non-empty"
+
+    # Spot-check known correct values (regression guard).
+    assert pp_tool == "budget_status", (
+        f"MU1: pp_harness probe must be 'budget_status'; got {pp_tool!r}"
+    )
+    assert mem_tool == "hydra-mem.ping", (
+        f"MU1: hydra_memory probe must be 'hydra-mem.ping'; got {mem_tool!r}"
+    )
+
+
+def _run_doctor_with_dispatcher(monkeypatch, capsys, call_mcp_return):
+    """Invoke `_cmd_doctor` with every probe server 'registered' and a stub
+    dispatcher whose call_mcp returns ``call_mcp_return``. Returns doctor stdout."""
+    import hydra_core.dispatcher as _disp
+
+    monkeypatch.setattr(
+        _disp, "_load_mcp_config",
+        lambda project: {k: {} for k in cli._DOCTOR_MCP_PROBES},
+    )
+
+    class _StubDispatcher:
+        def __init__(self, *a, **k):
+            pass
+
+        def call_mcp(self, server, tool, args, **k):
+            return call_mcp_return(server, tool)
+
+    monkeypatch.setattr(_disp, "MCPStdioDispatcher", _StubDispatcher)
+    cli._cmd_doctor(SimpleNamespace(project=str(REPO_ROOT), quick=False))
+    return capsys.readouterr().out
+
+
+def test_mu1_doctor_reports_down_server_unreachable(monkeypatch, capsys):
+    """MU1: a genuinely-unreachable server must be reported 'unreachable'.
+
+    ``call_mcp`` catches transport/connect failures internally and returns a
+    ``{"status": "failed", ...}`` *dict* — it does not raise (dispatcher.py).
+    So an ``isinstance(res, dict)`` reachability test mislabels a down server as
+    reachable, defeating the purpose of `hydra doctor`. Reachability must key on
+    ``status == "done"``.
+    """
+    out = _run_doctor_with_dispatcher(
+        monkeypatch, capsys,
+        lambda server, tool: {
+            "status": "failed", "server": server, "tool": tool,
+            "error": "ConnectionRefusedError: server down",
+        },
+    )
+    for server in cli._DOCTOR_MCP_PROBES:
+        assert f"OK:   {server} reachable" not in out, (
+            f"MU1: down server {server!r} must NOT be reported reachable")
+        assert f"WARN: {server} unreachable" in out, (
+            f"MU1: down server {server!r} must be reported unreachable; got:\n{out}")
+
+
+def test_mu1_doctor_reports_healthy_server_reachable(monkeypatch, capsys):
+    """MU1: a healthy server (call_mcp returns status 'done') is 'reachable'."""
+    out = _run_doctor_with_dispatcher(
+        monkeypatch, capsys,
+        lambda server, tool: {"status": "done", "tool": tool,
+                              "result": {"ok": True}},
+    )
+    for server in cli._DOCTOR_MCP_PROBES:
+        assert f"OK:   {server} reachable" in out, (
+            f"MU1: healthy server {server!r} must be reported reachable; got:\n{out}")
+
+
+# ---------------------------------------------------------------------------
+# MU3 — SqliteSaver serde registers hydra_core.state types (no deprecation warning)
+# ---------------------------------------------------------------------------
+
+def test_mu3_checkpoint_roundtrip_no_deprecation_warning(tmp_path, monkeypatch):
+    """MU3: build_supervisor must pass a JsonPlusSerializer with hydra_core.state
+    types in allowed_msgpack_modules.  Loading a checkpoint must not populate the
+    'Deserializing unregistered type' warning dedup set for any hydra_core type.
+
+    We monkeypatch the module-level _warned_unregistered_types set so the test
+    is isolated from dedup state left by earlier tests in the session.
+    """
+    from langgraph.checkpoint.serde import jsonplus as _jps
+
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+
+    # Replace the dedup set with a fresh one so we see first-occurrence warnings.
+    fresh_warned: set = set()
+    monkeypatch.setattr(_jps, "_warned_unregistered_types", fresh_warned)
+
+    wf = uuid4()
+    initial = HydraState(workflow_id=wf, root_goal="MU3 roundtrip test")
+    initial.selected_squads = ["executive"]
+
+    # First pass: invoke to create the checkpoint (serialises state).
+    sup1 = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher())
+    sup1.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
+
+    # Second pass: re-open the supervisor (new SqliteSaver) and get_state
+    # (triggers deserialization of checkpointed state via JsonPlusSerializer).
+    sup2 = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher())
+    snap = sup2.get_state({"configurable": {"thread_id": str(wf)}})
+
+    # No hydra_core.* type should have been added to the unregistered-warning set.
+    hydra_warned = {k for k in fresh_warned if k[0].startswith("hydra_core.")}
+    assert not hydra_warned, (
+        f"MU3: 'Deserializing unregistered type' fired for hydra_core types: "
+        f"{hydra_warned}. Add them to allowed_msgpack_modules in build_supervisor."
+    )
+
+    # State round-trips correctly: root_goal survives the serialize/deserialize cycle.
+    assert snap is not None and snap.values, "MU3: checkpoint must be non-empty"
+    state = HydraState.model_validate(snap.values)
+    assert state.root_goal == "MU3 roundtrip test", (
+        f"MU3: root_goal must survive checkpoint roundtrip; got {state.root_goal!r}"
+    )
+
+
+def test_mu3_hydra_memory_workflow_status_no_deprecation_warning(tmp_path, monkeypatch):
+    """MU3(b): hydra_memory's _load_state_values (used by workflow_status handler)
+    must use make_checkpoint_serde so loading a checkpoint via the MCP server path
+    also suppresses the 'Deserializing unregistered type' warning."""
+    from langgraph.checkpoint.serde import jsonplus as _jps
+    from mcp_servers.hydra_memory.server import _tool_handlers as mem_handlers
+
+    db_path = str(tmp_path / "checkpoints.db")
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", db_path)
+
+    # Create a checkpoint via build_supervisor so _load_state_values has data to read.
+    wf = uuid4()
+    initial = HydraState(workflow_id=wf, root_goal="MU3b hydra_memory path test")
+    initial.selected_squads = ["executive"]
+    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher())
+    sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
+
+    # Replace the dedup set to isolate this test from prior dedup entries.
+    fresh_warned: set = set()
+    monkeypatch.setattr(_jps, "_warned_unregistered_types", fresh_warned)
+
+    # Call the workflow_status handler — this triggers _load_state_values which
+    # constructs SqliteSaver and calls get_tuple (deserializes the checkpoint).
+    h = mem_handlers()
+    result = h["hydra-mem.workflow_status"]({"workflow_id": str(wf)})
+
+    # workflow_status must return the workflow data (not a degraded error).
+    assert "phase" in result, (
+        f"MU3(b): workflow_status must return a valid result; got {result!r}"
+    )
+
+    # No hydra_core.* types should have been warned as unregistered.
+    hydra_warned = {k for k in fresh_warned if k[0].startswith("hydra_core.")}
+    assert not hydra_warned, (
+        f"MU3(b): 'Deserializing unregistered type' fired for hydra_core types via "
+        f"hydra_memory path: {hydra_warned}"
+    )
