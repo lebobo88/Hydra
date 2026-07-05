@@ -1,7 +1,8 @@
-"""MU micro-usage audit regression tests (MU7). See docs/audits/MU-MICRO-USAGE-2026-07-05.md."""
+"""MU micro-usage audit regression tests (MU7, MU12). See docs/audits/MU-MICRO-USAGE-2026-07-05.md."""
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -131,3 +132,249 @@ def test_mu7_terminal_still_no_pending_gate(tmp_path, monkeypatch, capsys):
     assert out["reason"] == "no_pending_gate", (
         f"MU7: terminal workflow must return reason='no_pending_gate', got {out.get('reason')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU12 tests — preserve judge-passed work on non-complete attended finalize
+# ---------------------------------------------------------------------------
+# Verify that when an attended engineering stage finalizes non-complete (e.g.
+# smoke-fail, judge-fail) the engineer's uncommitted changes are committed to
+# the attended branch BEFORE the worktree is removed, so work is never silently
+# destroyed and the operator can pick it up from the branch.
+
+from hydra_core import host_bridge as _hb  # noqa: E402
+
+
+def _git_mu12(args, cwd):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, check=False)
+
+
+def _init_repo_mu12(path):
+    _git_mu12(["init"], path)
+    _git_mu12(["config", "user.email", "t@t.test"], path)
+    _git_mu12(["config", "user.name", "Test"], path)
+    _git_mu12(["config", "commit.gpgsign", "false"], path)
+    (path / "README.md").write_text("base\n", encoding="utf-8")
+    _git_mu12(["add", "-A"], path)
+    _git_mu12(["commit", "-m", "base", "--no-verify"], path)
+
+
+class _FakeDispatcherMU12:
+    """FakeDispatcher variant for MU12 tests — smoke can be injected."""
+
+    def __init__(self, *, required_cross_vendor=True, can_pass=True,
+                 finalize_status="complete", downgraded=False):
+        self.calls: list[tuple] = []
+        self._required_cross = required_cross_vendor
+        self._can_pass = can_pass
+        self._finalize_status = finalize_status
+        self._downgraded = downgraded
+
+    def call_mcp(self, server, tool, args, squad_id=None):
+        self.calls.append((server, tool, dict(args), squad_id))
+        if tool == "start_stage":
+            return {"status": "done", "result": {"stage_id": "stage-mu12"}}
+        if tool == "record_attempt":
+            return {"status": "done", "result": {"attempt_id": "att-mu12"}}
+        if tool == "gate_eligible_judges":
+            return {"status": "done", "result": {
+                "required_cross_vendor": self._required_cross,
+                "rubric_id": "rfc-2119-normative"}}
+        if tool == "get_stage_finalize_readiness":
+            return {"status": "done", "result": {"can_pass": self._can_pass}}
+        if tool == "finalize_run":
+            return {"status": "done", "result": {
+                "effective_status": self._finalize_status,
+                "downgraded": self._downgraded}}
+        return {"status": "done", "result": {}}
+
+
+def test_mu12_non_complete_finalize_preserves_work(tmp_path, monkeypatch):
+    """MU12(a): when a stage finalizes non-complete (smoke-fail) with an
+    engineer-created file in the worktree, the attended branch must contain
+    that file afterward and the result/cursor must carry preserved_branch."""
+    _init_repo_mu12(tmp_path)
+
+    # Force smoke to fail so the judge-pass path surfaces the run.
+    monkeypatch.setattr(_hb, "_run_smoke",
+                        lambda *a, **k: ("fail", "MU12 injected smoke failure"))
+
+    disp = _FakeDispatcherMU12(required_cross_vendor=True)
+    res = _hb.begin_stage(
+        disp, workflow_id="wf-mu12", run_id="run-mu12",
+        project_path=str(tmp_path), request_text="add mu12_feature.py",
+        project_root=str(tmp_path), isolate=True)
+    assert res["status"] == "awaiting_host"
+
+    wt = res["host_action"]["cwd"]
+    assert "worktrees" in wt.replace("\\", "/"), "engineer must be in a worktree"
+
+    # Simulate the engineer creating a file in the worktree.
+    (Path(wt) / "mu12_feature.py").write_text("# mu12 feature\n", encoding="utf-8")
+
+    cfile = res["cursor_path"]
+
+    # Submit engineer result.
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "added mu12_feature.py", "cost_usd": 0.01,
+                "tokens_in": 10, "tokens_out": 5, "model": "claude-test"})
+    assert res["state"] == "await_judge"
+
+    # Submit judge pass — smoke will fail → stage surfaces.
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex", "cost_usd": 0.005})
+    assert res["status"] == "surfaced", (
+        f"MU12: expected surfaced (smoke-fail path), got {res['status']!r}")
+    assert res["final_status"] == "surfaced"
+
+    # The worktree must be gone (cleaned up as usual).
+    assert not Path(wt).exists(), "worktree must be removed after finalize"
+
+    # The attended branch must contain the engineer's file.
+    preserved = res.get("preserved_branch")
+    assert preserved, (
+        f"MU12: preserved_branch must be set in result on non-complete finalize, got {res!r}")
+
+    # Verify the file is on the branch via git show.
+    show = _git_mu12(["show", f"{preserved}:mu12_feature.py"], tmp_path)
+    assert show.returncode == 0, (
+        f"MU12: git show {preserved}:mu12_feature.py failed — work was not preserved.\n"
+        f"stderr: {show.stderr}\nstdout: {show.stdout}")
+    assert "mu12 feature" in show.stdout
+
+    # Cursor must also carry preserved_branch.
+    cursor = _hb.load_cursor(cfile)
+    assert cursor.get("preserved_branch") == preserved, (
+        "MU12: cursor preserved_branch must match result preserved_branch")
+
+
+def test_mu12_complete_path_merge_unchanged(tmp_path, monkeypatch):
+    """MU12(b): the complete path (passing judge + passing smoke) still merges
+    the engineer's work into the base branch unchanged — the preserve logic must
+    not interfere with it."""
+    _init_repo_mu12(tmp_path)
+
+    # Force smoke to pass.
+    monkeypatch.setattr(_hb, "_run_smoke",
+                        lambda *a, **k: ("pass", "MU12 injected smoke pass"))
+
+    disp = _FakeDispatcherMU12(required_cross_vendor=True)
+    res = _hb.begin_stage(
+        disp, workflow_id="wf-mu12b", run_id="run-mu12b",
+        project_path=str(tmp_path), request_text="add mu12b_feature.py",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+
+    # Engineer writes a file.
+    (Path(wt) / "mu12b_feature.py").write_text("# mu12b\n", encoding="utf-8")
+
+    cfile = res["cursor_path"]
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "added mu12b_feature.py", "cost_usd": 0.01,
+                "tokens_in": 10, "tokens_out": 5, "model": "claude-test"})
+    assert res["state"] == "await_judge"
+
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "lgtm",
+                "judge_producer": "codex", "cost_usd": 0.005})
+
+    assert res["status"] == "complete", (
+        f"MU12b: complete path must still succeed, got {res['status']!r}: {res!r}")
+    assert res["final_status"] == "complete"
+    assert res["merge"]["merged"] is True, "MU12b: merge must succeed on complete path"
+
+    # The file landed in the repo working tree (merge succeeded).
+    assert (tmp_path / "mu12b_feature.py").exists(), (
+        "MU12b: engineer's file must land in the repo on complete path")
+
+    # No preserved_branch on a complete run.
+    assert "preserved_branch" not in res, (
+        "MU12b: preserved_branch must NOT appear in complete-path result")
+
+
+def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
+    """MU12(c): judge-pass + smoke-pass but merge failure → final_status==surfaced
+    (pass_unlanded outcome) AND preserved_branch is set in result/cursor AND
+    git show <branch>:<file> succeeds (work committed by _merge_worktree_back).
+
+    The merge_worktree_back helper commits before attempting the merge, so the
+    work lives on the attended branch even when the merge itself fails.
+    We monkeypatch _merge_worktree_back to return a failed merge dict while
+    still having committed the engineer's file to the branch via the real helper.
+    """
+    _init_repo_mu12(tmp_path)
+
+    # Force smoke to pass.
+    monkeypatch.setattr(_hb, "_run_smoke",
+                        lambda *a, **k: ("pass", "MU12c injected smoke pass"))
+
+    disp = _FakeDispatcherMU12(required_cross_vendor=True)
+    res = _hb.begin_stage(
+        disp, workflow_id="wf-mu12c", run_id="run-mu12c",
+        project_path=str(tmp_path), request_text="add mu12c_feature.py",
+        project_root=str(tmp_path), isolate=True)
+    assert res["status"] == "awaiting_host"
+
+    wt = res["host_action"]["cwd"]
+    assert "worktrees" in wt.replace("\\", "/")
+
+    # Engineer creates the feature file inside the worktree.
+    (Path(wt) / "mu12c_feature.py").write_text("# mu12c\n", encoding="utf-8")
+
+    cfile = res["cursor_path"]
+
+    # Monkeypatch _merge_worktree_back to: (1) still commit the worktree changes
+    # onto the branch (so git show works), but (2) report a failed merge so the
+    # pass_unlanded downgrade fires.  We do the real commit part ourselves, then
+    # return the failed-merge dict.
+    def _fake_merge(repo_root, worktree_path, branch):
+        # Commit the engineer's work to the branch (mirrors what the real helper
+        # does before attempting the merge), then lie about the merge result.
+        _git_mu12(["add", "-A"], worktree_path)
+        _git_mu12(["-c", "user.name=hydra-attended",
+                   "-c", "user.email=hydra-attended@local",
+                   "commit", "-m", "mu12c test commit", "--no-verify"], worktree_path)
+        return {"merged": False, "sha": None, "error": "MU12c injected merge failure"}
+
+    monkeypatch.setattr(_hb, "_merge_worktree_back", _fake_merge)
+
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "added mu12c_feature.py", "cost_usd": 0.01,
+                "tokens_in": 10, "tokens_out": 5, "model": "claude-test"})
+    assert res["state"] == "await_judge"
+
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "lgtm",
+                "judge_producer": "codex", "cost_usd": 0.005})
+
+    # Merge failure downgrades to surfaced (pass_unlanded outcome).
+    assert res["status"] == "surfaced", (
+        f"MU12c: expected surfaced (pass_unlanded), got {res['status']!r}: {res!r}")
+    assert res["final_status"] == "surfaced"
+
+    # The worktree is gone.
+    assert not Path(wt).exists(), "worktree must be removed after finalize"
+
+    # preserved_branch must be in the result and cursor.
+    preserved = res.get("preserved_branch")
+    assert preserved, (
+        f"MU12c: preserved_branch must be set in result on pass_unlanded, got {res!r}")
+
+    cursor = _hb.load_cursor(cfile)
+    assert cursor.get("preserved_branch") == preserved, (
+        "MU12c: cursor preserved_branch must match result preserved_branch")
+
+    # The engineer's file must be reachable from the attended branch.
+    show = _git_mu12(["show", f"{preserved}:mu12c_feature.py"], tmp_path)
+    assert show.returncode == 0, (
+        f"MU12c: git show {preserved}:mu12c_feature.py failed — work not preserved.\n"
+        f"stderr: {show.stderr}\nstdout: {show.stdout}")
+    assert "mu12c" in show.stdout

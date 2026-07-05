@@ -150,6 +150,44 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> None:
         pass
 
 
+def _preserve_non_complete_work(cursor: dict[str, Any], worktree_path: str,
+                                branch: str, run_id: str,
+                                final_status: str = "surfaced") -> None:
+    """Commit any uncommitted engineer changes to the attended branch before the
+    worktree is removed on a non-complete outcome (MU12).
+
+    Fail-soft: any exception or nonzero git exit emits ``attended.preserve_failed``
+    and returns without changing the finalize outcome or cursor state machine.
+    Skips silently when the worktree has no changes (nothing to preserve).
+
+    ``final_status`` is interpolated into the commit message so the branch log
+    shows the actual outcome (e.g. "surfaced") rather than a hardcoded string.
+
+    On success sets ``cursor["preserved_branch"]`` so the caller and the step
+    result exposed to the operator carry the branch name for pickup.
+    """
+    try:
+        st = _git(["status", "--porcelain"], worktree_path)
+        if not (st.stdout or "").strip():
+            return  # nothing to preserve — skip silently
+        _git(["add", "-A"], worktree_path)
+        res = _git(
+            ["-c", "user.name=hydra-attended",
+             "-c", "user.email=hydra-attended@local",
+             "commit",
+             "-m", f"attended engineering ({final_status}): {run_id} — preserved for operator pickup",
+             "--no-verify"],
+            worktree_path,
+        )
+        if res.returncode != 0:
+            raise RuntimeError((res.stderr or res.stdout or "").strip()[:200])
+        cursor["preserved_branch"] = branch
+        _trace(cursor, "attended.preserved", {"branch": branch, "run_id": run_id})
+    except Exception as exc:  # noqa: BLE001
+        _trace(cursor, "attended.preserve_failed",
+               {"run_id": run_id, "error": str(exc)[:200]})
+
+
 # --------------------------------------------------------------------------- #
 # Cursor persistence                                                          #
 # --------------------------------------------------------------------------- #
@@ -317,6 +355,10 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
             res["merge"] = cursor["merge"]
         if cursor.get("error"):
             res["error"] = cursor["error"]
+        # MU12: expose preserved_branch so the operator knows where to find
+        # the work when the stage surfaces without completing.
+        if cursor.get("preserved_branch"):
+            res["preserved_branch"] = cursor["preserved_branch"]
         # Rider (b): expose charged flag so _cmd_attended_submit can skip
         # duplicate budget charges on a retried submit-host-result call.
         res["already_charged"] = bool(cursor.get("charged", False))
@@ -869,8 +911,22 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
                 cursor["outcome"] = "pass_unlanded"
                 cursor["error"] = (cursor.get("error") or "") + \
                     f" merge-back failed: {merge.get('error')}"
+                # MU12: _merge_worktree_back already committed any uncommitted
+                # work to the branch before attempting the merge — advertise the
+                # branch so the operator can pick it up without a new commit.
+                cursor["preserved_branch"] = branch
+                _trace(cursor, "attended.preserved",
+                       {"branch": branch, "run_id": run_id,
+                        "via": "merge_helper_commit"})
         else:
             cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
+            # MU12: commit any engineer changes to the attended branch BEFORE
+            # removing the worktree so the operator can pick them up.  The
+            # complete path is handled by _merge_worktree_back above; this
+            # preserves work on non-complete outcomes (smoke-fail, judge-fail,
+            # generate-fail).
+            _preserve_non_complete_work(cursor, worktree_path, branch, run_id,
+                                        final_status="surfaced")
         _remove_worktree(repo_root, worktree_path)
 
     # F30: build summary_md that embeds any error/abort reason.
