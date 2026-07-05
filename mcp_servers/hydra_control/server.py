@@ -1204,6 +1204,7 @@ def _serve_with_mcp_sdk() -> bool:
     except ImportError:
         return False
 
+    import asyncio  # needed by _call_tool below (off-loop offload)
     handlers = _tool_handlers()
     server = Server("hydra-control")
 
@@ -1223,10 +1224,13 @@ def _serve_with_mcp_sdk() -> bool:
     async def _call_tool(name: str, arguments: dict):
         if name not in handlers:
             raise ValueError(f"unknown tool: {name}")
-        result = handlers[name](arguments)
+        # Handlers are SYNC and may block for many seconds (some shell out via
+        # subprocess.run up to _SUBMIT_TIMEOUT_S). Running them inline would
+        # freeze the server's event loop (heartbeats/other tools). Offload to a
+        # worker thread so the loop stays responsive; also keeps the handler
+        # off the loop thread so its own dispatcher._run has no running loop.
+        result = await asyncio.to_thread(handlers[name], arguments)
         return [t.TextContent(type="text", text=json.dumps(result))]
-
-    import asyncio
 
     async def run() -> None:
         async with stdio_server() as (r, w):

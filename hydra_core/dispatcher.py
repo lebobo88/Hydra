@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -189,6 +190,9 @@ class MCPStdioDispatcher:
         self._tool_tracker: Any = None
         self._pooled_sessions: dict[str, _PooledMcpSession] = {}
         self._pooled_session_locks: dict[str, asyncio.Lock] = {}
+        # Guards driving self._loop so two _run() calls never run_until_complete
+        # on it concurrently (slow-path worker thread + any other caller).
+        self._run_lock = threading.Lock()
 
     def set_squad_packs(self, packs: dict[str, Any]) -> None:
         """Inject discovered squad packs for RBAC enforcement."""
@@ -452,7 +456,36 @@ class MCPStdioDispatcher:
         # session bookkeeping inside _stack survives across multiple calls.
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
-        return self._loop.run_until_complete(coro)
+        # run_until_complete is ILLEGAL when a loop is already running on THIS
+        # thread (call_mcp reached from inside a compiled-LangGraph node or any
+        # async caller): asyncio raises RuntimeError *before* the coroutine is
+        # awaited, leaking it un-awaited and surfacing as 'pp_harness
+        # unreachable -> failed' (the dispatch streak). Detect that case and
+        # drive the coroutine on a dedicated worker thread — which has no
+        # running loop of its own — blocking for the result. We drive
+        # self._loop (not a throwaway) so pooled sessions bound to it stay
+        # valid; self._loop runs nowhere else, so a worker may drive it.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            with self._run_lock:
+                return self._loop.run_until_complete(coro)  # no running loop
+        box: dict[str, Any] = {}
+
+        def _drive() -> None:
+            try:
+                with self._run_lock:
+                    box["value"] = self._loop.run_until_complete(coro)
+            except BaseException as exc:  # noqa: BLE001 — re-raised on caller
+                box["error"] = exc
+
+        t = threading.Thread(
+            target=_drive, name="hydra-dispatch-run", daemon=True)
+        t.start()
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
 
     def _overall_overhead(self) -> float:
         return _env_float("HYDRA_DISPATCH_OVERALL_OVERHEAD_S",
