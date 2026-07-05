@@ -261,6 +261,7 @@ def _capture_baseline_failures(
     Fail-soft: any exception returns an empty list (no baseline → smoke
     failures are NOT excused, which is the safe default).
     """
+    import json as _json
     import sys as _sys
     # Build candidate list: prefer repo_root > project_path > parent
     candidates: list[str] = []
@@ -273,6 +274,28 @@ def _capture_baseline_failures(
         parent = str(Path(project_path).parent)
         if parent and parent != project_path:
             candidates.append(parent)
+
+    # MU17: the baseline only depends on the tree at branch point (HEAD of the
+    # anchor repo), and the full-suite run costs minutes — enough to blow the
+    # attended step budget on large repos. Cache completed baselines per
+    # (anchor, HEAD sha) under <anchor>/.harness/baseline/<sha>.json so only
+    # the first stage after a new commit pays the suite cost. Timeouts are
+    # NEVER cached (transient) and never trigger a second candidate run
+    # (re-running an already-too-slow suite doubles the damage).
+    _cache_anchor = candidates[0] if candidates else project_path
+    _cache_file: Path | None = None
+    try:
+        _sha = _git(["rev-parse", "HEAD"], _cache_anchor).stdout.strip()
+        if _sha:
+            _cache_file = (Path(_cache_anchor) / ".harness" / "baseline"
+                           / f"{_sha}.json")
+            if _cache_file.is_file():
+                cached = _json.loads(_cache_file.read_text(encoding="utf-8"))
+                if isinstance(cached, list):
+                    return sorted(str(t) for t in cached)
+    except Exception:  # noqa: BLE001 — cache read is best-effort
+        _cache_file = None
+
     for cwd in candidates:
         tests_dir = Path(cwd) / "tests"
         if not tests_dir.is_dir():
@@ -290,9 +313,23 @@ def _capture_baseline_failures(
                 timeout=240,
             )
             failing = sorted(_parse_failing_tests(res.stdout + "\n" + res.stderr))
+            # Cache the completed result (empty list is a valid baseline) so
+            # subsequent stages at the same HEAD skip the suite entirely.
+            if _cache_file is not None:
+                try:
+                    _cache_file.parent.mkdir(parents=True, exist_ok=True)
+                    _cache_file.write_text(_json.dumps(failing), encoding="utf-8")
+                except Exception:  # noqa: BLE001 — cache write is best-effort
+                    pass
             # Return the first successful (or empty) result — empty is valid
             # (all tests pass in this env = no baseline needed).
             return failing
+        except subprocess.TimeoutExpired:
+            # MU17: the suite is too slow for the baseline budget — do NOT try
+            # the next candidate (another full-suite run would double the cost
+            # and blow the caller's step budget). No baseline → smoke failures
+            # are not excused, the safe default.
+            return []
         except Exception:  # noqa: BLE001 — baseline failure is non-fatal
             continue
     return []

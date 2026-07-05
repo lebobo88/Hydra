@@ -841,3 +841,84 @@ def test_mu10_missing_required_still_fails_closed(monkeypatch):
     assert "validation" in result.get("error", "").lower(), (
         f"MU10(d): error must mention 'validation', got {result.get('error')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU17 — baseline-failure capture: per-HEAD cache + no double-run on timeout
+# ---------------------------------------------------------------------------
+# _capture_baseline_failures runs the full suite at every begin_stage; on large
+# repos that costs minutes and (pre-fix) a timeout fell through to a SECOND
+# full-suite run in the next candidate dir, blowing the attended step budget.
+# MU17 caches completed baselines per (anchor, HEAD sha) and returns [] on
+# timeout without trying further candidates.
+
+
+def _mu17_repo(tmp_path):
+    _init_repo_mu12(tmp_path)  # reuse the MU12 git fixture
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_t.py").write_text(
+        "def test_t():\n    assert True\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_mu17_baseline_cached_per_head(tmp_path, monkeypatch):
+    """MU17(a): the second baseline capture at the same HEAD must be served
+    from the cache without spawning pytest again."""
+    repo = _mu17_repo(tmp_path)
+    calls = {"n": 0}
+
+    class _Res:
+        returncode = 1
+        stdout = "FAILED tests/test_t.py::test_t - boom\n1 failed\n"
+        stderr = ""
+
+    _real_run = _hb.subprocess.run
+
+    def _fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return _real_run(cmd, **kwargs)
+        calls["n"] += 1
+        return _Res()
+
+    monkeypatch.setattr(_hb.subprocess, "run", _fake_run)
+    first = _hb._capture_baseline_failures(str(repo), repo_root=str(repo))
+    assert first == ["tests/test_t.py::test_t"]
+    assert calls["n"] == 1
+    # Cache file exists for the current HEAD.
+    sha = _git_mu12(["rev-parse", "HEAD"], repo).stdout.strip()
+    assert (repo / ".harness" / "baseline" / f"{sha}.json").is_file(), (
+        "MU17: completed baseline must be cached per HEAD sha")
+    # Second call: cache hit, no new pytest spawn.
+    second = _hb._capture_baseline_failures(str(repo), repo_root=str(repo))
+    assert second == first
+    assert calls["n"] == 1, "MU17: cached baseline must not re-run the suite"
+
+
+def test_mu17_timeout_returns_empty_no_second_candidate(tmp_path, monkeypatch):
+    """MU17(b): a baseline suite timeout must return [] immediately — no
+    second candidate run, and nothing cached (timeouts are transient)."""
+    import subprocess as _sp
+    repo = _mu17_repo(tmp_path)
+    calls = {"n": 0}
+
+    _real_run = _hb.subprocess.run
+
+    def _maybe_timeout(cmd, **kwargs):
+        if cmd and cmd[0] == "git":
+            return _real_run(cmd, **kwargs)
+        calls["n"] += 1
+        raise _sp.TimeoutExpired(cmd=cmd, timeout=240)
+
+    monkeypatch.setattr(_hb.subprocess, "run", _maybe_timeout)
+    # project_path different from repo_root → two candidates pre-fix.
+    wt = repo / ".harness" / "worktrees" / "wt"
+    (wt / "tests").mkdir(parents=True)
+    (wt / "tests" / "test_t.py").write_text("def test_t():\n    pass\n",
+                                            encoding="utf-8")
+    result = _hb._capture_baseline_failures(str(wt), repo_root=str(repo))
+    assert result == [], "MU17: timeout must yield empty baseline (safe default)"
+    assert calls["n"] == 1, (
+        f"MU17: timeout must NOT trigger a second candidate run; got {calls['n']} runs")
+    sha = _git_mu12(["rev-parse", "HEAD"], repo).stdout.strip()
+    assert not (repo / ".harness" / "baseline" / f"{sha}.json").exists(), (
+        "MU17: a timed-out baseline must not be cached")

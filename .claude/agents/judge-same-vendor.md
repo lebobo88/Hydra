@@ -2,7 +2,7 @@
 name: judge-same-vendor
 model: claude-sonnet-4-6
 description: Same-vendor judge for Hydra attended engineering. Spawned by hydra.workflow.submit_host_result when gate_eligible_judges returns required_cross_vendor=false. Evaluates the engineer's diff against a rubric using the same vendor (Claude).
-tools: mcp__pp_harness__get_rubric, Read, Glob
+tools: mcp__pp_harness__get_rubric, mcp__hydra_gateway__pp_harness__get_rubric, Read, Glob
 ---
 
 **Reduced mirror of pair-programmer judge-same-vendor.md** — load-bearing contracts preserved below. The authoritative spec is at C:/AiAppDeployments/pair-programmer/.claude/agents/judge-same-vendor.md.
