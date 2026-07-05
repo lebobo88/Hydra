@@ -20,11 +20,29 @@ Failure modes (all surface as JudgeDispatchError via the dispatcher):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .schemas import JudgeVendor
+
+
+# P2.1: default wall-clock cap (ms) for a codex/gemini critique. Was a hardcoded
+# 30 min (1_800_000), which OVERRODE the pp daemon's own 5-min self-kill and let a
+# slow/mis-authed judge hold a stage for 30 min at ~0 CPU (indistinguishable from a
+# dispatch hang). 8 min is ample for a critique; a wedged judge now fails over to a
+# `skip` verdict fast. Env-tunable via HYDRA_JUDGE_TIMEOUT_MS.
+_DEFAULT_JUDGE_TIMEOUT_MS = 480_000
+
+
+def _default_judge_timeout_ms() -> int:
+    raw = os.environ.get("HYDRA_JUDGE_TIMEOUT_MS")
+    try:
+        v = int(raw) if raw else _DEFAULT_JUDGE_TIMEOUT_MS
+    except (TypeError, ValueError):
+        v = _DEFAULT_JUDGE_TIMEOUT_MS
+    return v if v > 0 else _DEFAULT_JUDGE_TIMEOUT_MS
 
 
 _VENDOR_TO_SERVER: dict[JudgeVendor, str] = {
@@ -44,13 +62,14 @@ class MCPCritiqueClient:
     """
     dispatcher: Any  # MCPStdioDispatcher (kept untyped to avoid a hard import)
     cwd: str | Path
-    # Per-call wall-clock budget (ms) forwarded to the critique tool. Defaults
-    # to 30 min so a large-artifact judge is not truncated. On the gateway path
+    # Per-call wall-clock budget (ms) forwarded to the critique tool. Defaults to
+    # 8 min (env HYDRA_JUDGE_TIMEOUT_MS) so a slow/wedged judge fails over fast
+    # instead of holding the stage for the old 30-min ceiling. On the gateway path
     # this also raises the gateway's per-call cap (see AsyncBackendPool
     # ._resolve_tool_timeout); on the direct-dispatch path it flows into the pp
     # daemon CLI runner's own timeout_ms (otherwise capped at the daemon's
     # 5-min default).
-    timeout_ms: int = 1_800_000
+    timeout_ms: int = field(default_factory=_default_judge_timeout_ms)
 
     def critique(
         self,

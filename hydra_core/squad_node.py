@@ -494,8 +494,36 @@ def _parse_claude_cli_result(
             "status": "done" if returncode == 0 else "error"}
 
 
+def _gen_timeout_s() -> int:
+    """P2.1: wall-clock cap (seconds) for a single headless generation subprocess
+    (nested ``claude -p`` / codex ``generate``). Default 600 (10 min) — a small
+    task finishes in 1-3 min, so a wedged/slow generation now fails fast instead
+    of holding the sequential best-of loop for the old 30-min ceiling (which,
+    silent under ``capture_output=True``, looked exactly like a dispatch hang).
+    Env: HYDRA_GEN_TIMEOUT_S."""
+    raw = os.environ.get("HYDRA_GEN_TIMEOUT_S")
+    try:
+        v = int(raw) if raw else 600
+    except (TypeError, ValueError):
+        v = 600
+    return v if v > 0 else 600
+
+
+def _judge_timeout_ms() -> int:
+    """P2.1: wall-clock cap (ms) forwarded to a codex ``critique`` subprocess so it
+    self-kills and the stage records skip/failed (loop continues) instead of the
+    old 30-min ceiling. Default 8 min. Env: HYDRA_JUDGE_TIMEOUT_MS (shared with
+    hydra_core/judge/mcp_client.py)."""
+    raw = os.environ.get("HYDRA_JUDGE_TIMEOUT_MS")
+    try:
+        v = int(raw) if raw else 480_000
+    except (TypeError, ValueError):
+        v = 480_000
+    return v if v > 0 else 480_000
+
+
 def _run_claude_cli(
-    prompt: str, *, cwd: str, model: str | None = None, timeout_s: int = 1800,
+    prompt: str, *, cwd: str, model: str | None = None, timeout_s: int | None = None,
     read_only: bool = False,
 ) -> dict[str, Any]:
     """Headless Claude CLI in ``cwd``. Returns the pp-generate-shaped inner dict
@@ -512,6 +540,8 @@ def _run_claude_cli(
     Inherits the env (incl. ``HYDRA_PP_STAGE_ACTIVE=1`` so the in-tree write block
     sanctions the engineer's edits).
     """
+    if timeout_s is None:
+        timeout_s = _gen_timeout_s()
     mdl = model or os.environ.get("HYDRA_CLAUDE_MODEL") or "claude-opus-4-8"
     # PP-BV-ISO: the headless engineer's browser-validator must NEVER drive the
     # operator's live Chrome (a second CDP controller on the operator's tab
@@ -645,7 +675,8 @@ def _drive_generate(
         "with Claude.")
     gen = dispatcher.call_mcp(
         "pp_codex", "generate",
-        {"prompt": prompt, "cwd": project_path, "sandbox": "workspace-write"},
+        {"prompt": prompt, "cwd": project_path, "sandbox": "workspace-write",
+         "timeout_ms": _gen_timeout_s() * 1000},
         squad_id=sq,
     )
     return gen, "codex"
@@ -1001,6 +1032,7 @@ def _drive_pp_stage_loop(
                     "artifact_text": judge_text,
                     "rubric_md": rubric_body,
                     "cwd": project_path,
+                    "timeout_ms": _judge_timeout_ms(),
                 }, squad_id=sq))
                 judge_producer = "codex"
             # cross_vendor := the judge vendor differs from the producer vendor.
@@ -1311,6 +1343,11 @@ def _drive_best_of_loop(
             wt = str(c.get("worktree_path") or project_path)
             slot = c.get("attempt_slot_id")
             pre = _worktree_dirty_set(wt)
+            # P2.2: heartbeat so a running dispatch shows forward motion in
+            # trace.jsonl (a silent generate/judge is indistinguishable from a
+            # hang and triggers premature kills).
+            _trace("candidate.start", {"candidate": ci_idx, "n": n})
+            _trace("gen.start", {"candidate": ci_idx, "n": n})
             gen, producer = _drive_generate(
                 dispatcher, prompt=base_prompt, project_path=wt,
                 model_tier=model_tier, sq=sq)
@@ -1324,6 +1361,8 @@ def _drive_best_of_loop(
             wrote = bool(run_changed)
             out["wrote_changes"] = out["wrote_changes"] or wrote
             gen_fail = _generate_failure_reason(gen, gen_text, wrote)
+            _trace("gen.done", {"candidate": ci_idx, "n": n, "producer": producer,
+                                "wrote": wrote, "failed": bool(gen_fail)})
             try:
                 cm("pp_harness", "archive_artifact", {
                     "run_id": run_id,
@@ -1367,12 +1406,16 @@ def _drive_best_of_loop(
             rubric_body = _rubric_md(gate_rubric)
             judge_text = _judge_artifact_text(wt, sorted(run_changed), gen_text)
             if (not required_cross) and producer == "claude":
+                _trace("judge.start", {"candidate": ci_idx, "n": n,
+                                       "vendor": "claude"})
                 jci = _claude_critique(judge_text, rubric_body, wt)
                 jp = "claude"
             else:
+                _trace("judge.start", {"candidate": ci_idx, "n": n,
+                                       "vendor": "codex"})
                 jci = _pp_inner(cm("pp_codex", "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
-                    "cwd": wt}, squad_id=sq))
+                    "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
                 jp = "codex"
             out["cost_usd"] += float(jci.get("cost_usd") or 0.0)
             out["tokens_in"] += int(jci.get("tokens_in") or 0)
@@ -1382,6 +1425,8 @@ def _drive_best_of_loop(
                 parsed = {}
             v_outcome = parsed.get("outcome") or parsed.get("verdict") or "revise"
             v_crit = parsed.get("critique_md") or parsed.get("critique") or ""
+            _trace("judge.done", {"candidate": ci_idx, "n": n, "vendor": jp,
+                                  "outcome": v_outcome})
             score = dict(parsed.get("score") or parsed.get("score_json") or {})
             cross_vendor = jp != producer
             score["_cross_vendor"] = cross_vendor
