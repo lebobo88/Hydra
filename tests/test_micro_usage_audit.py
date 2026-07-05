@@ -613,3 +613,111 @@ def test_mu6_env_override_still_wins(
     assert result == override, (
         f"MU6: env override must win; expected {override}, got {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# MU6b — smoke failure persists full log + embeds forensics in reason
+# ---------------------------------------------------------------------------
+
+def test_mu6b_smoke_failure_writes_full_log(tmp_path, monkeypatch):
+    """MU6b: _run_smoke on a failed subprocess writes the full combined output
+    to .harness/smoke/<stage_id>-<ts>.log and embeds FAILED lines + the log
+    path in the reason string."""
+    from hydra_core import squad_node
+
+    stdout_content = (
+        "collected 7 items\n"
+        "FAILED tests/test_x.py::test_a - AssertionError: expected 1 got 2\n"
+        "FAILED tests/test_x.py::test_b - ValueError: bad input\n"
+        "2 failed, 5 passed\n"
+    )
+
+    class _Res:
+        returncode = 1
+        stdout = stdout_content
+        stderr = ""
+
+    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
+
+    status, reason = squad_node._run_smoke(
+        None, project_path=str(tmp_path), stage_id="stage-mu6b-test"
+    )
+
+    assert status == "fail", f"MU6b: expected 'fail', got {status!r}"
+    assert "FAILED tests/test_x.py::test_a" in reason, (
+        f"MU6b: reason must contain FAILED line; got {reason!r}"
+    )
+    assert "full_log=" in reason, (
+        f"MU6b: reason must contain full_log= artifact path; got {reason!r}"
+    )
+
+    # Verify the .harness/smoke/ dir was created and the log contains full output.
+    smoke_dir = tmp_path / ".harness" / "smoke"
+    assert smoke_dir.exists(), "MU6b: .harness/smoke/ must be created on failure"
+    log_files = list(smoke_dir.glob("stage-mu6b-test-*.log"))
+    assert len(log_files) == 1, f"MU6b: expected 1 log file, got {log_files}"
+    log_content = log_files[0].read_text(encoding="utf-8")
+    assert stdout_content in log_content, (
+        "MU6b: log file must contain the full stdout content"
+    )
+
+    # The path embedded in the reason must point to the same existing file.
+    log_path = Path(reason.split("full_log=", 1)[1])
+    assert log_path.exists(), (
+        f"MU6b: full_log= path in reason must exist; got {log_path!r}"
+    )
+
+
+def test_mu6b_smoke_pass_writes_no_log(tmp_path, monkeypatch):
+    """MU6b: a passing smoke run must NOT create the .harness/smoke/ directory."""
+    from hydra_core import squad_node
+
+    class _Res:
+        returncode = 0
+        stdout = "5 passed\n"
+        stderr = ""
+
+    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
+
+    status, reason = squad_node._run_smoke(
+        None, project_path=str(tmp_path), stage_id="stage-mu6b-pass"
+    )
+
+    assert status == "pass", f"MU6b: expected 'pass', got {status!r}"
+    smoke_dir = tmp_path / ".harness" / "smoke"
+    assert not smoke_dir.exists() or not any(smoke_dir.iterdir()), (
+        "MU6b: .harness/smoke/ must be absent/empty on a passing smoke"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MU8b — _run_cli_json TimeoutExpired surfaces partial_stdout / partial_stderr
+# ---------------------------------------------------------------------------
+
+def test_mu8b_timeout_includes_partial_output(monkeypatch):
+    """MU8b: when _run_cli_json's subprocess.run raises TimeoutExpired the
+    returned dict must carry partial_stdout and partial_stderr (last 1000 chars)
+    so callers can diagnose a hung CLI without losing buffered context."""
+    import subprocess as _sp
+    from mcp_servers.hydra_control import server as _srv
+
+    def _raise(*_a, **_k):
+        raise _sp.TimeoutExpired(
+            cmd=["x"], timeout=1, output="PARTIAL-OUT", stderr="PARTIAL-ERR"
+        )
+
+    monkeypatch.setattr(_srv.subprocess, "run", _raise)
+
+    result = _srv._run_cli_json(["plan", "goal"], timeout_s=1, err_label="plan")
+
+    assert result["error"] == "plan_timeout", (
+        f"MU8b: error must be 'plan_timeout'; got {result['error']!r}"
+    )
+    assert result["partial_stdout"].endswith("PARTIAL-OUT"), (
+        f"MU8b: partial_stdout must end with 'PARTIAL-OUT'; got {result['partial_stdout']!r}"
+    )
+    assert result["partial_stderr"].endswith("PARTIAL-ERR"), (
+        f"MU8b: partial_stderr must end with 'PARTIAL-ERR'; got {result['partial_stderr']!r}"
+    )

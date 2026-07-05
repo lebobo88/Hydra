@@ -328,9 +328,21 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=timeout_s,
         )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"{err_label}_timeout",
-                "detail": f"exceeded {timeout_s}s", "workflow_id": workflow_id}
+    except subprocess.TimeoutExpired as exc:
+        # MU8b: surface whatever partial output was buffered so callers can
+        # diagnose a slow/hung CLI without losing all context.
+        def _dec(v: bytes | str | None) -> str:
+            if v is None:
+                return ""
+            return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
+        return {
+            "ok": False,
+            "error": f"{err_label}_timeout",
+            "detail": f"exceeded {timeout_s}s",
+            "workflow_id": workflow_id,
+            "partial_stdout": _dec(exc.stdout)[-1000:],
+            "partial_stderr": _dec(exc.stderr)[-1000:],
+        }
     if proc.returncode != 0:
         return {"ok": False, "error": f"{err_label}_failed", "workflow_id": workflow_id,
                 "detail": (proc.stderr or "")[-2000:]}

@@ -380,6 +380,27 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
     return None
 
 
+def _write_smoke_log(project_path: str, stage_id: str, content: str) -> str | None:
+    """Persist full smoke output to <project_path>/.harness/smoke/<stage_id>-<ts>.log.
+
+    MU6b: gives post-mortem access to the full runner transcript so failing
+    test ids and stack traces are not discarded after a smoke failure.
+
+    Returns the absolute path string on success; None on any write error
+    (fail-soft — callers always have a short-form fallback reason ready).
+    """
+    import time as _t
+    try:
+        smoke_dir = Path(project_path) / ".harness" / "smoke"
+        smoke_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(_t.time())
+        log_file = smoke_dir / f"{stage_id}-{ts}.log"
+        log_file.write_text(content, encoding="utf-8", errors="replace")
+        return str(log_file)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _run_smoke(
     dispatcher: "Dispatcher", *, project_path: str, stage_id: str
 ) -> tuple[str, str]:
@@ -412,11 +433,22 @@ def _run_smoke(
             cwd=project_path, capture_output=True, text=True,
             check=False, timeout=600, shell=_use_shell,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         # F10: a timeout is an INFRA failure, NOT "skipped" (which reads as
         # "nothing to run") and NOT "pass". Distinct class so PP-VG-5 never
         # finalizes complete on it, and triage can tell it apart from no-command.
-        return "infra_error", f"smoke timed out after 600s: {' '.join(cmd)}"
+        # MU6b: capture whatever partial output was buffered before the timeout.
+        def _dec_exc(v: bytes | str | None) -> str:
+            if v is None:
+                return ""
+            return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
+        _timeout_combined = f"{_dec_exc(exc.stderr)}\n{_dec_exc(exc.stdout)}"
+        _art = _write_smoke_log(project_path, stage_id, _timeout_combined)
+        _log_suffix = f" :: full_log={_art}" if _art else ""
+        return (
+            "infra_error",
+            f"smoke timed out after 600s: {' '.join(cmd)}{_log_suffix}"[:2000],
+        )
     except Exception as e:  # noqa: BLE001 — launch failure (ENOENT/EPERM) is infra
         return "infra_error", f"smoke could not launch ({' '.join(cmd)}): {e!r}"[:300]
     label = " ".join(cmd)
@@ -425,10 +457,28 @@ def _run_smoke(
     # (host EPERM/ENOENT, esbuild crash, segfault, spawn failure, missing
     # toolchain) is mislabeled `fail` — pattern-match those markers → infra_error.
     if res.returncode != 0 and _INFRA_SMOKE_RE.search(combined):
+        # MU6b: persist full log so infra crashes are recoverable post-mortem.
+        artifact = _write_smoke_log(project_path, stage_id, combined)
         tail = combined.strip().splitlines()[-1:] or [""]
-        return "infra_error", f"`{label}` exit={res.returncode} (infra) :: {tail[0]}"[:300]
+        reason = f"`{label}` exit={res.returncode} (infra) :: {tail[0]}"
+        if artifact:
+            reason += f" :: full_log={artifact}"
+        return "infra_error", reason[:2000]
     status = "pass" if res.returncode == 0 else "fail"
     tail = (res.stderr or res.stdout or "").strip().splitlines()[-1:] or [""]
+    if status == "fail":
+        # MU6b: persist full log and embed pytest FAILED lines in reason so
+        # failing test ids are not discarded after a smoke failure.
+        artifact = _write_smoke_log(project_path, stage_id, combined)
+        failed_lines = [
+            ln for ln in combined.splitlines() if ln.startswith("FAILED ")
+        ][:20]
+        reason = f"`{label}` exit={res.returncode} :: {tail[0]}"
+        if failed_lines:
+            reason += f" :: failed=[{'; '.join(failed_lines)}]"
+        if artifact:
+            reason += f" :: full_log={artifact}"
+        return status, reason[:2000]
     return status, f"`{label}` exit={res.returncode} :: {tail[0]}"[:300]
 
 
