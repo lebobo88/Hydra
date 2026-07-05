@@ -319,6 +319,13 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, validated tokens
             cmd, cwd=str(_HYDRA_ROOT), env=env,
+            # MU8: the child MUST NOT inherit this server's stdin. The server's
+            # stdin is the gateway's synchronous MCP pipe with a read always
+            # pending; Windows serializes operations on the shared file object,
+            # so an inheriting child freezes inside Py_InitializeFromConfig
+            # (lseek on fd 0 → NtQueryInformationFile blocks forever). Mirrors
+            # _launch_run, which already passes DEVNULL for the same reason.
+            stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
