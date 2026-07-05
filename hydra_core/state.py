@@ -313,3 +313,25 @@ class HydraState(BaseModel):
             if key.startswith("mcp_failure:") and count >= self.mcp_failure_ceiling:
                 return True, key.split(":", 1)[1]
         return False, None
+
+
+def make_checkpoint_serde() -> Any:
+    """Return a JsonPlusSerializer with hydra_core.state types registered.
+
+    This suppresses the 'Deserializing unregistered type' deprecation warning
+    that langgraph emits when it deserializes Pydantic models (BudgetLedger,
+    TaskState, HydraState) whose modules are not in the explicit allowlist.
+
+    Pass the return value as ``serde=`` to SqliteSaver at every construction
+    site (supervisor.build_supervisor + hydra_memory._load_state_values).
+
+    Returns None when langgraph / JsonPlusSerializer is not importable so the
+    caller can fall back to the bare SqliteSaver(conn) construction.
+    """
+    try:
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer  # type: ignore
+    except ImportError:  # pragma: no cover — langgraph absent
+        return None
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=[HydraState, TaskState, BudgetLedger],
+    )

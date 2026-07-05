@@ -47,6 +47,27 @@ from .state import HydraState
 from .telemetry import emit, trace_path
 
 # ---------------------------------------------------------------------------
+# MU1: MCP probe table for `hydra doctor`.
+# Hoisted to module scope so tests can introspect and assert correct names.
+# Each entry: server_key -> (tool_name, tool_args).
+# Reachability semantics: the probe tools are real, zero-arg, and succeed on a
+# healthy server, so reachable = call_mcp returns a {"status": "done"} envelope.
+# A down/unregistered server surfaces as a {"status": "failed"} envelope (NOT a
+# raised exception — call_mcp catches transport failures), so a bare
+# `isinstance(res, dict)` check would false-positive "reachable". See _cmd_doctor.
+# pp_harness:   budget_status (cheap read; returns budget rows)
+# hydra_memory: hydra-mem.ping (no-arg liveness probe with DB check)
+# Other pings:  leave as-is (consistent *.ping convention on those servers)
+# ---------------------------------------------------------------------------
+_DOCTOR_MCP_PROBES: dict[str, tuple[str, dict]] = {
+    "pp_harness":      ("budget_status", {}),
+    "hydra_memory":    ("hydra-mem.ping", {}),
+    "executive_suite": ("es.ping", {}),
+    "rlm_creative":    ("rlm.ping", {}),
+    "senate":          ("senate.ping", {}),
+}
+
+# ---------------------------------------------------------------------------
 # Supervisor symbols exposed at module scope for test patchability.
 # unittest.mock.patch("hydra_core.cli.build_supervisor", ...) requires these
 # names to live in the module's __dict__.  The try/except degrades gracefully
@@ -186,28 +207,31 @@ def _cmd_doctor(args) -> int:
     except ImportError:
         return 0 if fail_count == 0 else 1
     servers = _load_mcp_config(project)
-    probes = [
-        ("pp_harness", "ping", {}),
-        ("hydra_memory", "list_tools", {}),
-        ("executive_suite", "es.ping", {}),
-        ("rlm_creative", "rlm.ping", {}),
-        ("senate", "senate.ping", {}),
-    ]
     dispatcher = MCPStdioDispatcher(project)
-    for server, tool, tool_args in probes:
+    for server, (tool, tool_args) in _DOCTOR_MCP_PROBES.items():
         if server not in servers:
             print(f"WARN: {server} not registered at user scope (~/.claude.json)")
             continue
         try:
             res = dispatcher.call_mcp(server, tool, tool_args)
         except Exception as e:
-            print(f"WARN: {server} probe raised {type(e).__name__}: {e}")
+            # call_mcp is not expected to raise (it catches transport failures
+            # and returns a failed envelope), but guard anyway.
+            print(f"WARN: {server} unreachable — {type(e).__name__}: {e}")
             continue
-        status = (res or {}).get("status", "unknown") if isinstance(res, dict) else "unknown"
+        # call_mcp normalizes every response to an envelope: a successful call
+        # is {"status": "done", ...}; a transport/connect failure, a timeout, or
+        # an MCP tool error is {"status": "failed", ...}. It returns a dict in
+        # BOTH cases, so `isinstance(res, dict)` cannot distinguish reachable
+        # from down — a genuinely-unreachable server would be mislabeled OK.
+        # The probes above use real, zero-arg tools that succeed on a healthy
+        # server, so status == "done" is the correct reachability signal.
+        status = res.get("status") if isinstance(res, dict) else None
         if status == "done":
             print(f"OK:   {server} reachable")
         else:
-            err = (res or {}).get("error", "(no error field)") if isinstance(res, dict) else str(res)
+            err = (res.get("error", "(no error field)")
+                   if isinstance(res, dict) else f"non-dict {type(res).__name__}")
             print(f"WARN: {server} unreachable — {err}")
     return 0 if fail_count == 0 else 1
 
