@@ -690,12 +690,58 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     values = snap.values
     pending = values.get("pending_hitl")
     if not pending:
-        print(json.dumps({
+        # MU7: inspect snap.next to distinguish a bare LangGraph interrupt
+        # (no pending_hitl but graph paused before synthesis/judge_synthesis)
+        # from a genuinely terminal state (snap.next empty).
+        _snap_next = getattr(snap, "next", ()) or ()
+        if _snap_next and action in ("approve", "force-dispatch"):
+            # Bare interrupt + approve/force-dispatch: continue the graph.
+            emit(project, wf, "hitl_resumed", {
+                "action": action,
+                "option": option,
+                "gate_node": None,
+                "bare_interrupt": list(_snap_next),
+            })
+            final_dict = sup.invoke(None, config=config)
+            _phase = (final_dict.get("phase") if isinstance(final_dict, dict)
+                      else getattr(final_dict, "phase", "?"))
+            print(json.dumps({
+                "workflow_id": wf,
+                "resumed": True,
+                "action": action,
+                "continued_bare_interrupt": True,
+                "interrupted_before": list(_snap_next),
+                "gate_node": None,
+                "phase": _phase,
+                "trace": str(trace_path(project, wf)),
+            }))
+            return 0
+        if _snap_next and action == "reject":
+            # Bare interrupt + reject: park the workflow surfaced without
+            # continuing (mirrors the real-gate reject path).
+            sup.update_state(config, {"phase": "surfaced"})
+            print(json.dumps({
+                "workflow_id": wf,
+                "resumed": False,
+                "action": "reject",
+                "phase": "surfaced",
+                "continued_bare_interrupt": False,
+            }))
+            return 0
+        # All other cases (snap.next empty, or other actions with a bare
+        # interrupt): frozen no_pending_gate contract.  Other actions
+        # (modify-budget, change-squads) need a real gate — hint the operator
+        # that approve would work when a bare interrupt is pending.
+        _no_gate_out: dict = {
             "workflow_id": wf,
             "resumed": False,
             "reason": "no_pending_gate",
             "phase": values.get("phase"),
-        }))
+        }
+        if _snap_next:
+            _no_gate_out["hint"] = "bare_interrupt_pending"
+            _no_gate_out["interrupted_before"] = list(_snap_next)
+        print(json.dumps(_no_gate_out))
         return 0
 
     from datetime import datetime, timezone

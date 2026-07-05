@@ -159,13 +159,18 @@ def test_resume_approve_clears_gate_and_advances(tmp_path, monkeypatch, capsys):
 
 def test_resume_is_idempotent_on_cleared_gate(tmp_path, monkeypatch, capsys):
     wf = _start_paused_workflow(tmp_path, monkeypatch)
-    rc1 = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
-    capsys.readouterr()
-    assert rc1 == 0
+    # MU7: bare synthesis/judge_synthesis interrupts are now resumable.
+    # Drive through all three interrupt points (approval gate, bare synthesis,
+    # bare judge_synthesis) before testing idempotency.
+    for _ in range(3):
+        rc = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+        capsys.readouterr()
+        assert rc == 0
 
-    rc2 = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+    # Graph has reached END — a further approve is a genuine no-op.
+    rc_final = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
     out = json.loads(capsys.readouterr().out)
-    assert rc2 == 0
+    assert rc_final == 0
     assert out["resumed"] is False
     assert out["reason"] == "no_pending_gate"
 
@@ -324,10 +329,17 @@ def test_resume_releases_lock_after_completion(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert not (REPO_ROOT / ".hydra" / wf / "resume.lock").exists()
 
-    # And a follow-up resume reaches the idempotent no-op path (not the lock path)
-    rc2 = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+    # MU7: bare synthesis/judge_synthesis interrupts are resumable; drive
+    # through them verifying the lock is released after each resume.
+    for _ in range(2):
+        cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+        capsys.readouterr()
+        assert not (REPO_ROOT / ".hydra" / wf / "resume.lock").exists()
+
+    # Graph has reached END — the follow-up reaches the idempotent no-op path.
+    rc_final = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
     out = json.loads(capsys.readouterr().out)
-    assert rc2 == 0
+    assert rc_final == 0
     assert out["reason"] == "no_pending_gate"
 
 
