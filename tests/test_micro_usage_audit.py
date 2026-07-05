@@ -381,6 +381,152 @@ def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# MU15 — reflect attended task completions into the graph task ledger
+# ---------------------------------------------------------------------------
+# The tasks channel uses an _append reducer so task.status cannot be updated
+# in-place via update_state (it would duplicate the task).  The fix uses
+# attended_done_task_ids (replace-by-default) as the authoritative "host
+# completed this task successfully" signal.  enforce_governance skips the
+# deferred_to_host and surfaced checks for tasks in that set; only 'complete'
+# cursors enter attended_done_task_ids so surfaced/aborted attended outcomes
+# still cause governance to surface the workflow.
+#
+# Tests (a) and (b) unit-test enforce_governance directly (the "sync" path
+# being tested is the attended_done_task_ids read in governance.py — adding
+# to that set in tests mirrors exactly what _cmd_attended_submit does via
+# sup.update_state).  Test (c) is end-to-end: plan → attended_done sync via
+# sup.update_state → 3 bare-interrupt resumes → assert phase != "surfaced".
+
+from hydra_core.governance import enforce_governance as _gov  # noqa: E402
+from hydra_core.state import TaskState as _TaskState  # noqa: E402
+
+
+def test_mu15_attended_complete_marks_task_done(tmp_path, monkeypatch):
+    """MU15(a): when the attended host finalises a task as 'complete', adding
+    its task_id to attended_done_task_ids causes enforce_governance to treat the
+    deferred_to_host task as done and return surfaced=False.
+
+    The tasks channel uses _append reducer so task.status stays deferred_to_host
+    in the checkpoint; attended_done_task_ids is the authoritative override.
+    """
+    task = _TaskState(
+        owner_squad="engineering",
+        description="MU15a attended complete",
+        status="deferred_to_host",
+    )
+    state = HydraState(
+        root_goal="mu15a test",
+        tasks=[task],
+        attended_done_task_ids=[str(task.task_id)],
+    )
+    verdict = _gov(state, packs={})
+    assert not verdict.surfaced, (
+        f"MU15(a): task in attended_done_task_ids must not surface governance; "
+        f"got reason={verdict.reason!r}"
+    )
+
+
+def test_mu15_attended_surfaced_marks_task_surfaced(tmp_path, monkeypatch):
+    """MU15(b): when the attended host finalises a task as 'surfaced' or
+    'aborted', the task_id is NOT in attended_done_task_ids, so governance still
+    surfaces the workflow.
+
+    This verifies that only 'complete' cursors open the governance gate — a
+    smoke-fail or judge-fail attended outcome must not let the workflow sneak
+    through as 'done'.
+    """
+    task = _TaskState(
+        owner_squad="engineering",
+        description="MU15b attended surfaced",
+        status="deferred_to_host",
+    )
+    state = HydraState(
+        root_goal="mu15b test",
+        tasks=[task],
+        attended_done_task_ids=[],   # surfaced/aborted → not in done list
+    )
+    verdict = _gov(state, packs={})
+    assert verdict.surfaced, (
+        f"MU15(b): deferred task NOT in attended_done_task_ids must surface; "
+        f"got surfaced=False reason={verdict.reason!r}"
+    )
+    assert "deferred" in verdict.reason.lower(), (
+        f"MU15(b): surface reason must mention 'deferred'; got {verdict.reason!r}"
+    )
+
+
+def test_mu15_completed_workflow_resumes_to_non_surfaced(tmp_path, monkeypatch, capsys):
+    """MU15(c): end-to-end — after an attended engineering stage completes
+    (task_id added to attended_done_task_ids in the checkpoint via sup.update_state,
+    mirroring what _cmd_attended_submit does), resuming through dispatch +
+    synthesis + judge_synthesis reaches phase='done', not 'surfaced'.
+
+    Flow:
+      1. plan with engineering squad → halts before dispatch
+      2. sup.update_state adds attended_done_task_ids for the engineering task
+      3. 3x resume (dispatch runs→task surfaced by NullDispatcher→synthesis pause
+         →judge_synthesis pause→postcheck): governance skips the surfaced task
+         because it is in attended_done_task_ids → phase='done'
+
+    Note: the CLI-driven step/submit-host-result path requires a live pp_harness
+    MCP process; this test exercises the sync directly via sup.update_state (the
+    exact same LangGraph call _cmd_attended_submit makes) so the governance fix
+    is covered without spawning MCP servers.
+    """
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    wf = uuid4()
+
+    # 1. Build the plan: intake → planner → halt before dispatch.
+    initial = HydraState(workflow_id=wf, root_goal="MU15 e2e test: attended complete")
+    initial.selected_squads = ["engineering"]
+    sup_plan = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
+    )
+    config = {"configurable": {"thread_id": str(wf)}}
+    sup_plan.invoke(initial, config=config)
+
+    # 2. Read the task_id the planner synthesised.
+    snap = sup_plan.get_state(config)
+    assert snap is not None and snap.values, "MU15(c): plan must produce a checkpoint"
+    state_after_plan = HydraState.model_validate(snap.values)
+    assert state_after_plan.tasks, "MU15(c): planner must have created at least one task"
+    task_id = str(state_after_plan.tasks[0].task_id)
+
+    # 3. Simulate attended complete: write attended_done_task_ids to the checkpoint.
+    #    (_cmd_attended_submit does exactly this call on a 'complete' cursor.)
+    sup_plan.update_state(config, {
+        "attended_completed_task_ids": [task_id],
+        "attended_done_task_ids": [task_id],
+    })
+
+    # Verify the update landed.
+    snap2 = sup_plan.get_state(config)
+    state2 = HydraState.model_validate(snap2.values)
+    assert task_id in state2.attended_done_task_ids, (
+        f"MU15(c): attended_done_task_ids must contain {task_id!r} after update_state"
+    )
+
+    # 4. Resume 3 times:
+    #    - resume 1: dispatch (engineering→surfaced via NullDispatcher) → synthesis pause
+    #    - resume 2: synthesis → judge_synthesis pause
+    #    - resume 3: judge_synthesis → postcheck (governance fix) → done / END
+    for i in range(3):
+        rc = cli.main(
+            ["--project", str(REPO_ROOT), "resume", str(wf), "--action", "approve"]
+        )
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0, f"MU15(c): resume {i + 1} exited {rc}: {out}"
+
+    # 5. Assert final phase is not surfaced.
+    h = mem_handlers()
+    status = h["hydra-mem.workflow_status"]({"workflow_id": str(wf)})
+    assert status["phase"] != "surfaced", (
+        f"MU15(c): workflow with attended-complete engineering task must not surface; "
+        f"got phase={status['phase']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # MU6 — worktree-aware _get_base (repo_registry.py)
 # ---------------------------------------------------------------------------
 

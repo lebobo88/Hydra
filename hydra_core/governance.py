@@ -260,7 +260,19 @@ def enforce_governance(
             surfaced=True,
             reason=f"{len(failed)} task(s) failed: {[t.owner_squad for t in failed]}",
         )
-    surfaced = [t for t in state.tasks if t.status == "surfaced"]
+    # MU15: tasks the attended host drove to a *complete* outcome are logically
+    # done even when their checkpointed status still reads "surfaced" or
+    # "deferred_to_host".  The `tasks` channel uses an _append reducer so the
+    # status cannot be updated in-place via update_state; attended_done_task_ids
+    # (a replace-by-default list on HydraState) is the authoritative signal that
+    # the host successfully finished those tasks.  Only "complete" cursors are
+    # admitted — surfaced/aborted attended outcomes intentionally stay out so
+    # governance still surfaces workflows whose attended tasks did not finish.
+    _attended_done: frozenset[str] = frozenset(
+        getattr(state, "attended_done_task_ids", []) or []
+    )
+    surfaced = [t for t in state.tasks
+                if t.status == "surfaced" and str(t.task_id) not in _attended_done]
     if surfaced:
         return GovernanceVerdict(
             surfaced=True,
@@ -274,7 +286,8 @@ def enforce_governance(
         "done", "failed", "surfaced", "pending", "dispatched",
         "deferred_to_host", "cancelled", "running", "blocked",
     })
-    deferred = [t for t in state.tasks if t.status == "deferred_to_host"]
+    deferred = [t for t in state.tasks
+                if t.status == "deferred_to_host" and str(t.task_id) not in _attended_done]
     if deferred:
         return GovernanceVerdict(
             surfaced=True,
