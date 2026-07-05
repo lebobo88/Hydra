@@ -79,6 +79,12 @@ Policy: fix-as-found; Tiers 0–4 (full coverage, ~$15-35 ceiling).
 - Judge-agent tool-grant gap noted: the typed `judge-cross-vendor` subagent attempted Bash (not granted) and stalled twice; host executed `pp_codex.critique` directly with the same inputs (S3, open).
 - Cleanup: mu6-repro worktree/branch removed, both fix workflows parked surfaced, attended branches deleted post-merge.
 
+## Continuation round 2: MU15 FIXED — first full lifecycle "done"
+
+- **MU15 fixed (merged autonomously, sha f8f45be):** the tasks channel is an `_append` reducer (in-place status update impossible), so the fix adds `attended_done_task_ids` on HydraState (strict complete-only subset — surfaced/aborted attended outcomes stay out so governance is NOT weakened), written by `_cmd_attended_submit` on complete cursors and consulted by `enforce_governance` to skip the surfaced/deferred_to_host checks. Judge verified the failed-task check runs BEFORE the filter (no bypass), no injection vector, dispatcher skip-logic unaffected. 3 MU15 regression tests incl. an end-to-end real-graph resume test.
+- **Pipeline milestone:** the MU15 run itself was the first attended run on the Hydra repo to go plan → engineer → judge → smoke PASS (worktree, thanks MU6-rc) → **merge autonomously** — no salvage, no manual conflict work.
+- **Lifecycle milestone (wf ae8837ef):** first Hydra workflow ever to complete the FULL lifecycle with real engineering work: attended complete+merge (mc-test sha 9f0b5c9) → resume → synthesis → judge_synthesis → postcheck → **phase "done"**. Cosmetic residual: the task-status display column still reads "surfaced" (append-reducer); status rendering could join against attended_done_task_ids (S3).
+
 ## Final summary (campaign complete, 2026-07-05)
 
 **Verdict: Hydra's core engine is sound; the "broken" experience came from four independent defects, three now fixed and verified, plus a set of reliability gaps around the attended/detached finalize paths — all catalogued below.**
