@@ -1581,6 +1581,16 @@ def _cmd_attended_submit(args) -> int:
                     completed = list(state.attended_completed_task_ids)
                     if tid is not None and str(tid) not in completed:
                         completed.append(str(tid))
+                    # MU15: record complete-only outcomes in attended_done_task_ids
+                    # so enforce_governance can skip the deferred_to_host / surfaced
+                    # check for tasks the host successfully drove to completion.
+                    # Only 'complete' enters this list — surfaced/aborted outcomes
+                    # intentionally stay out so governance still surfaces those.
+                    done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                    if (res.get("status") == "complete"
+                            and tid is not None
+                            and str(tid) not in done_ids):
+                        done_ids.append(str(tid))
                     open_runs = [e for e in state.open_pp_runs
                                  if e.get("run_id") != res.get("run_id")]
                     res["budget_block"] = block
@@ -1589,6 +1599,7 @@ def _cmd_attended_submit(args) -> int:
                     try:
                         sup.update_state(config, {
                             "attended_completed_task_ids": completed,
+                            "attended_done_task_ids": done_ids,
                             "open_pp_runs": open_runs,
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),

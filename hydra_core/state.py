@@ -284,6 +284,15 @@ class HydraState(BaseModel):
     # re-pick this engineering task" signal for _next_engineering_task.
     attended_completed_task_ids: list[str] = Field(default_factory=list)
 
+    # MU15: task_ids whose attended stage finalized with final_status="complete"
+    # (a subset of attended_completed_task_ids). Used by enforce_governance to
+    # skip the deferred_to_host / surfaced governance checks for tasks the host
+    # drove to a successful outcome. Only "complete" cursors enter this list —
+    # surfaced/aborted attended outcomes intentionally stay out so governance
+    # can still surface workflows whose attended tasks did not finish cleanly.
+    # Replace-by-default (no _append reducer) so update_state can grow the list.
+    attended_done_task_ids: list[str] = Field(default_factory=list)
+
     def bump_iteration(self) -> None:
         self.iteration_count += 1
 
