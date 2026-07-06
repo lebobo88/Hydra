@@ -3,6 +3,12 @@
 Branch: `fable-audit-2` (HEAD 45dc757). Plan: `~/.claude/plans/ever-since-all-the-logical-lark.md`.
 Policy: fix-as-found; Tiers 0–4 (full coverage, ~$15-35 ceiling).
 
+## POLISH ROUND (final): the last three items closed
+
+- **P1 scoped smoke profile:** `HYDRA_SMOKE_TIMEOUT_S` env cap + operator opt-in `<repo>/.harness/smoke_cmd.json` `{"cmd": [...]}` override in `_detect_smoke_command` (PP-VG-5 still gets a real execution; operator-accepted tradeoff). Hydra's own scoped smoke configured (micro_usage + smoke + host_bridge subset, ~30s) — the chronic 600s finalize timeout is closed (fittingly, the polish batch itself was its final victim and landed via preserved_branch salvage).
+- **P2:** budget-exhausted best-of with zero candidates now finalizes `surfaced` with error `budget_exhausted` (proper finalize_stage/teardown/finalize_run plumbing + stage_outcome trace) instead of the misleading `aborted`.
+- **P3 prose-safe repo flags:** unknown-id `--repo`/`--repos` occurrences count as explicit ONLY in the goal's tail (last 120 chars — where the CLI folds real flags; short goals are always tail, preserving typo HITL); mid-prose mentions raise `RepoFlagIgnored` → `intake.repo_flag_like_token_ignored` trace, no HITL. Cross-vendor codex caught the first attempt's inverted tail rule (short goals lost typo protection, tests codified it) — fixed via Reflexion, codex re-judged 1.0/1.0.
+
 ## FINAL STATUS (end of 2026-07-05): ALL FINDINGS CLOSED
 
 Every MU finding is now **fixed and merged** (or operationally resolved). Rounds 4-6 closed the remainder:
