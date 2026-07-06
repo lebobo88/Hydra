@@ -343,6 +343,48 @@ def _parse_smoke_verdict(text: str) -> tuple[str, str]:
     return "skipped", "no parseable smoke verdict"
 
 
+def _resolve_worktree_main_root(project_path: Path) -> "Path | None":
+    """Return the main repo root when *project_path* is a git linked worktree.
+
+    Runs ``git -C <project_path> rev-parse --git-common-dir`` (same probe as
+    ``repo_registry._get_base``). Returns ``None`` when:
+      - git is not available or times out (5 s)
+      - the path is not inside a git repository
+      - the path IS the main checkout (not a linked worktree)
+
+    Fail-soft: any exception → ``None``. Callers treat None as "not a worktree".
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_path), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        raw = proc.stdout.strip()
+        raw_path = Path(raw)
+        # --git-common-dir may return a relative or absolute path; resolve
+        # relative paths against project_path (same as repo_registry).
+        common_dir = (
+            raw_path.resolve()
+            if raw_path.is_absolute()
+            else (project_path / raw_path).resolve()
+        )
+        # For a normal checkout common_dir == project_path/.git (a directory).
+        # For a linked worktree the .git entry is a FILE so its resolved path
+        # differs from common_dir (which points at the MAIN repo's .git dir).
+        expected_git = (project_path / ".git").resolve()
+        if common_dir != expected_git:
+            # common_dir is e.g. C:\Hydra\.git — its parent is the main root.
+            return common_dir.parent
+        return None  # not a linked worktree
+    except Exception:  # noqa: BLE001 — git not found / timeout → fail-soft
+        return None
+
+
 def _detect_smoke_command(project_path: str) -> list[str] | None:
     """Detect the project's build/test command, or ``None`` if there isn't one.
 
@@ -380,6 +422,37 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
                 "_detect_smoke_command: could not parse %s; falling through to auto-detection",
                 _override,
             )
+
+    # RA-11: when the local override is absent and project_path is a git linked
+    # worktree, also look for the override at the main repo root.  Attended
+    # finalise runs in a worktree where .harness/ is gitignored, so the
+    # project-local path never contains smoke_cmd.json even when one exists in
+    # the main checkout.  Worktree-local file wins when present (the block above
+    # already returned in that case).
+    if not _override.is_file():
+        _main_root = _resolve_worktree_main_root(root)
+        if _main_root is not None and _main_root != root:
+            _wt_override = _main_root / ".harness" / "smoke_cmd.json"
+            if _wt_override.is_file():
+                try:
+                    _wt_data = _json.loads(_wt_override.read_text(encoding="utf-8"))
+                    if (isinstance(_wt_data, dict)
+                            and isinstance(_wt_data.get("cmd"), list)
+                            and _wt_data["cmd"]
+                            and all(isinstance(x, str) for x in _wt_data["cmd"])):
+                        return _wt_data["cmd"]
+                    _log.warning(
+                        "_detect_smoke_command: worktree main-root override %s malformed; "
+                        "falling through to auto-detection",
+                        _wt_override,
+                    )
+                except Exception:  # noqa: BLE001
+                    _log.warning(
+                        "_detect_smoke_command: could not parse worktree main-root "
+                        "override %s; falling through to auto-detection",
+                        _wt_override,
+                    )
+
     pkg = root / "package.json"
     if pkg.is_file():
         try:
