@@ -158,3 +158,16 @@ disagree, the template wins; regenerate `~/.hydra/backends.json` from it via
 `uvx blender-mcp`, connecting to a local Blender instance on `127.0.0.1:9876`).
 The former `hydra-cockpit` entry was removed — it was a dead non-MCP entry and
 is not part of the registry.
+
+## Gateway Connection Timeout
+
+The gateway applies a per-backend connection timeout when opening a backend
+stdio process. Tunable via:
+
+| Level | Mechanism | Notes |
+|---|---|---|
+| Per-backend | `connect_timeout_s` key in the backend's `~/.hydra/backends.json` spec | Highest precedence |
+| Global env | `HYDRA_GATEWAY_CONNECT_TIMEOUT_S` (float seconds) | Overrides built-in default |
+| Built-in default | 20 s | Lowest precedence |
+
+See `mcp_servers/hydra_gateway/server.py` `AsyncBackendPool._connect_timeout_for`.

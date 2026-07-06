@@ -1,4 +1,4 @@
-%% D3 — Squad Orchestration Graph (Hydra Hub + Three Crowns + Stubs)
+%% D3 — Squad Orchestration Graph (14 squads: 11 active + 3 stubs)
 graph TD
     USER([User Goal])
     HYDRA{{Hydra Supervisor<br/>LangGraph 8-node}}
@@ -26,10 +26,17 @@ graph TD
         URANIA(Urania) --- HELIOS{{Helios + sub-crew x5}}
     end
 
-    subgraph STUBS[Stub Squads - covenant-bound, not yet active]
+    subgraph ACTIVE2[Active Squads - Non-Crown]
         direction LR
-        S1[legal-compliance] --- S2[healthcare] --- S3[sales-gtm]
-        S4[research-ds] --- S5[customer-support]
+        A1[legal-compliance<br/>Curia / Senate] --- A2[customer-support<br/>Xenia Hearth]
+        A3[rlm-gaming<br/>Arcade Crown]
+        A4[marketing-strategy] --- A5[marketing-creative]
+        A6[marketing-research] --- A7[marketing-production] --- A8[marketing-ops]
+    end
+
+    subgraph STUBS[Stub Squads - scaffold only]
+        direction LR
+        S1[healthcare<br/>STUB] --- S2[sales-gtm<br/>STUB] --- S3[research-ds<br/>STUB]
     end
 
     EIGHTS[(TheEights<br/>episodic + semantic<br/>8 trigram cells)]
@@ -40,21 +47,25 @@ graph TD
     HYDRA ==CSuiteDecisionPacket==> EXEC
     HYDRA ==PRD / ArchRFC / DevTask==> FORGE
     HYDRA ==CreativeBrief / ShotList / AssetJob==> GARLAND
+    HYDRA ==envelope==> ACTIVE2
     EXEC ==DecisionRecord==> HYDRA
     FORGE ==DecisionRecord==> HYDRA
     GARLAND ==DecisionRecord==> HYDRA
+    ACTIVE2 ==DecisionRecord==> HYDRA
     HYDRA <==MemoryRef==> EIGHTS
     SMITH <-. attests .-> IMMORTAL
     STUBS -.registered.-> HYDRA
 
     classDef hub fill:#0D0F1A,stroke:#E8D5A3,color:#E8D5A3,stroke-width:2px
     classDef crown fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3,stroke-width:1.5px
+    classDef active2 fill:#0D0F1A,stroke:#6FB8DA,color:#E8D5A3,stroke-width:1px
     classDef stub fill:#0D0F1A,stroke:#8B7355,color:#8B7355,stroke-width:1px,stroke-dasharray: 4 4
     classDef immortal fill:#C0392B,stroke:#C0392B,color:#0D0F1A,stroke-width:2px
     classDef memory fill:#8B7355,stroke:#8B7355,color:#0D0F1A
     class HYDRA hub
     class EXEC,FORGE,GARLAND crown
-    class STUBS,S1,S2,S3,S4,S5 stub
+    class ACTIVE2,A1,A2,A3,A4,A5,A6,A7,A8 active2
+    class STUBS,S1,S2,S3 stub
     class IMMORTAL immortal
     class SMITH hub
     class EIGHTS memory

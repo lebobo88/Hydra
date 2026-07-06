@@ -258,6 +258,23 @@ rejects unauthorized access with a telemetry event. Cross-squad tool
 delegation is supported via `Handoff` envelopes carrying explicit
 `granted_tools` lists with expiration timestamps.
 
+**RA-3 — claude-skill shim auto-authorization.** Each `claude-skill` squad is
+automatically authorized for its own MCP shim pair without a `squad.yaml#tools`
+entry — `garland` → `rlm_creative`, `legal-compliance` → `senate`,
+`customer-support` → `xenia`, `rlm-gaming` → `rlm_gaming`,
+`marketing-*` → `marketbliss`. This auto-authorization is narrow: only the
+shim server/prefix pair registered in `squad_node._SKILL_PACK_SHIMS` is allowed.
+An unknown slug (no shim entry) fails **CLOSED**: `_resolve_skill_shim` returns
+`None`, the adapter surfaces a typed `surfaced` `SquadResult`, and the squad's
+task status becomes `surfaced` — never a silent fallback to a wrong server.
+
+**RA-1 — enforcement hook bypass guard.** The `hydra-block-direct-write.ps1`
+PreToolUse hook permits `HYDRA_PP_STAGE_ACTIVE=1` to bypass write enforcement
+only when a real active-stage marker file also exists on disk. A bare env-var
+set outside an actual stage (e.g. a leaked or manually-set value) is ignored;
+the hook logs `bare HYDRA_PP_STAGE_ACTIVE=1 ignored (no active stage marker)`
+and enforcement stays on.
+
 ### 6e. Gateway consolidation (two-layer registry)
 
 In gateway mode, Claude Code registers only `hydra_gateway`. Backend
@@ -282,6 +299,13 @@ against the calling squad's `squad.yaml#tools` allowlist (§6d). Direct operator
 tool calls made through the gateway (e.g. from a Claude Code session) are an
 **intentional flat passthrough**: the gateway proxies and namespaces, it does
 not arbitrate per-squad privilege.
+
+**Connect timeout.** The gateway's backend connection timeout is tunable via
+`HYDRA_GATEWAY_CONNECT_TIMEOUT_S` (float seconds, env var). Individual backends
+can further override this via a `connect_timeout_s` key in their
+`~/.hydra/backends.json` spec. Precedence (highest → lowest): per-backend
+`connect_timeout_s` → `HYDRA_GATEWAY_CONNECT_TIMEOUT_S` → built-in default.
+See `mcp_servers/hydra_gateway/server.py` `AsyncBackendPool._connect_timeout_for`.
 
 See `docs/MCP_SETUP.md` for migration and setup instructions.
 
@@ -380,6 +404,20 @@ Behaviour:
   `<project>/.hydra/<workflow_id>/trace.jsonl` in PP-compatible format.
   Boundary crossings (dispatch, synthesis, redaction, RBAC violations)
   emit structured trace events.
+- **Synthesis episodic persistence** (RA-8): after merging all results,
+  `node_synthesis` appends the `DECISION_RECORD` and each artifact ref to
+  episodic memory (`kind="decision_record"`, keyed
+  `ep:<workflow_id>:decision_record`; one additional entry per artifact ref).
+  Fail-soft — a DB error (locked file, schema mismatch) never prevents
+  synthesis from returning its result.
+- **Eights spool drain**: when the TheEights daemon is offline, pending spool
+  entries are buffered on disk. `hydra doctor` probes the spool depth and emits
+  a WARN when it exceeds `HYDRA_EIGHTS_SPOOL_WARN` (default 100). Run
+  `python -m hydra_core.cli eights-drain` (or `hydra eights-drain`) to replay
+  buffered calls via `EightsAttestor.replay_pending` in a bounded batch (default
+  500 per run). Drain is fail-soft: entries remain on disk when the daemon is
+  still unreachable; stale `.partial` crash-residue files older than 1 hour are
+  removed unconditionally.
 
 ## 8. Delegation to PP, ES, and RLM
 
@@ -503,6 +541,29 @@ sig.value = base64url-nopad( HMAC-SHA256(HYDRA_OPERATOR_KEY, canonical) )
   the approval is not blocked on Hydra's side, but consumers that call the
   verifiers (TheEights and Xenia enforce them server-side on governance /
   ticket writes) reject degraded tokens. The CLI logs a warning.
+- **RA-9 — WS-AUTH doctor probe**: `hydra doctor` checks whether
+  `HYDRA_OPERATOR_KEY` is provisioned (process env or any backend spec's `env`
+  block in `~/.hydra/backends.json`). An unprovisioned key means
+  `xenia send_response` and `execute_approved` reject all tokens fail-closed.
+  The probe is informational only — missing key is a WARN, never a FAIL.
+
+### 8b. Scoped smoke command (RA-11)
+
+The smoke command is resolved by `squad_node._detect_smoke_command`. Resolution
+precedence (highest → lowest):
+
+1. **Worktree-local override** — `<worktree>/.harness/smoke_cmd.json`
+   (`{"cmd": ["non-empty", "list", "of", "strings"]}`).
+2. **Main-repo override** (RA-11) — when `project_path` is a git linked
+   worktree, `_resolve_worktree_main_root` locates the main checkout's
+   `.harness/smoke_cmd.json`. This handles attended finalise runs where the
+   worktree's `.harness/` directory is gitignored and therefore empty.
+3. **Heuristic auto-detection** — `package.json` test/build scripts, Python
+   pytest (`sys.executable -m pytest -q`), Go (`go build ./...`), Cargo.
+
+Smoke timeout is controlled by `HYDRA_SMOKE_TIMEOUT_S` (default 600 s, fail-soft
+parse). Full smoke output is persisted to
+`<project>/.harness/smoke/<stage_id>-<ts>.log` for post-mortem access.
 
 ## 9. Failure modes and recovery
 
