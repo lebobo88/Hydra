@@ -16,7 +16,7 @@ Hydra does not re-implement the squads' work. It sits above them: classifying go
 ---
 
 <p align="center">
-  <img src="docs/constellation/constellation.svg" alt="Hydra Constellation — Pentecost flower sigil with Immortal Red CONSTITUTION.md at the centre, three Crown Teal petals (Executive, Forge, Garland), five Trigram Amber stub petals, an outer ring of eight I Ching trigrams (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui), an AgentSmith warden ring (N1–N10 fail-closed), and a memory lemniscate looping episodic and semantic stores." width="780">
+  <img src="docs/constellation/constellation.svg" alt="Hydra Constellation — Pentecost flower sigil with Immortal Red CONSTITUTION.md at the centre, three Crown Teal petals (Executive, Forge, Garland), two active non-crown petals (legal-compliance/Curia, customer-support/Xenia Hearth), three Trigram Amber stub petals (healthcare, sales-gtm, research-ds), an outer ring of eight I Ching trigrams (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui), an AgentSmith warden ring (N1–N10 fail-closed), and a memory lemniscate looping episodic and semantic stores." width="780">
 </p>
 
 <p align="center"><em>The Pentecost flower sigil — central immortal head, three crown petals, eight-cell substrate. See <a href="docs/constellation/HYDRA-CONSTELLATION.md">docs/constellation/</a> for the full layered presentation, the <a href="docs/constellation/deck.html">reveal.js cinematic deck</a>, and <a href="docs/constellation/exec-memos/">executive memos</a>.</em></p>
@@ -456,7 +456,13 @@ python -m hydra_core.cli run "Refactor billing service auth" --squad engineering
 python -m hydra_core.cli status
 python -m hydra_core.cli trace 7f3c…
 python -m hydra_core.cli doctor
+python -m hydra_core.cli eights-drain   # drain the pending eights spool (--limit N, default 500)
 ```
+
+`doctor` surfaces three additional probes beyond the basic squad/constitution checks:
+- **eights spool depth** — warns when the pending spool exceeds `HYDRA_EIGHTS_SPOOL_WARN` (default 100); suggests `hydra eights-drain` when over threshold.
+- **AgentSmith venom back-channel** — probes `agentsmith.venom.cross_check` and surfaces the smith→hydra back-channel state (rationale field); `hydra-mcp-unavailable` means the gateway is not wired into backends.json.
+- **WS-AUTH operator key** — checks whether `HYDRA_OPERATOR_KEY` is provisioned (env or any backend spec's `env` block in `~/.hydra/backends.json`); unprovisioned means `xenia send_response` / `execute_approved` reject all tokens fail-closed.
 
 ---
 
@@ -548,6 +554,13 @@ It is a routing layer with strong typing, checkpointed state, human-in-the-loop 
 | [`Enterprise Master AI Orchestration System Architecture.md`](Enterprise%20Master%20AI%20Orchestration%20System%20Architecture.md) | The upstream research doc Hydra implements. |
 | `squads/<slug>/squad.yaml` | Canonical declaration of every active or stub squad. |
 | `hydra_core/` | Supervisor, router, governance plane, memory fabric — in Python. |
+
+### Verification
+
+Route-audit findings and fixes from the 2026-07-05 cohort are recorded in:
+
+- [`docs/audits/ROUTE-AUDIT-2026-07-05.md`](docs/audits/ROUTE-AUDIT-2026-07-05.md) — route-audit ledger (RA-1 through RA-11 findings, fixes, and smoke results; untracked in the worktree, present in the main checkout)
+- [`docs/audits/MU-MICRO-USAGE-2026-07-05.md`](docs/audits/MU-MICRO-USAGE-2026-07-05.md) — MU micro-usage audit ledger (MU1–MU15, all resolved)
 
 ---
 

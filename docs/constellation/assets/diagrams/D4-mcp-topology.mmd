@@ -1,4 +1,7 @@
-%% D4 — MCP Host Topology (Per-Crown Namespaces + Meta-Governance)
+%% D4 — MCP Host Topology (16 backends; shim map; attended vs detached)
+%% Shim map: garland→rlm_creative, legal-compliance→senate, customer-support→xenia,
+%%           rlm-gaming→rlm_gaming, marketing-*x5→marketbliss
+%% Engineering attended: plan→step→submit_host_result; detached: hydra_workflow_launch
 graph LR
     CC[Claude Code<br/>plugin host]
 
@@ -6,32 +9,49 @@ graph LR
         SUP[hydra-supervisor<br/>LangGraph]
     end
 
-    subgraph PP[mcp: pp-daemon]
-        PP_TOOLS[pp_harness.*<br/>42 tools<br/>start_run / archive / judge / replay]
+    subgraph PP[pp_harness / pp_codex / pp_gemini]
+        PP_TOOLS[pp_harness — 42 tools<br/>start_run / archive / judge / replay]
+        PP_CODEX[pp_codex — Codex critique]
+        PP_GEMINI[pp_gemini — Gemini critique]
     end
 
-    subgraph ES[mcp: executive-suite]
-        ES_TOOLS[es_*<br/>agent_get / roster_list<br/>command_get / output_read]
+    subgraph ES[executive_suite]
+        ES_TOOLS[agent_get / roster_list<br/>command_get / output_read]
     end
 
-    subgraph RLM[mcp: rlm-creative]
-        RLM_TOOLS[rlm_*<br/>agent_list / skill_get<br/>command_list / output_write]
+    subgraph RLM[rlm_creative / rlm_gaming]
+        RLM_TOOLS[rlm_creative → garland]
+        RLM_GAMING[rlm_gaming → rlm-gaming / Arcade Crown]
     end
 
-    subgraph MEM[mcp: hydra-memory]
-        MEM_TOOLS[hydra-mem.*<br/>read/write_episodic<br/>semantic_search<br/>query_eights / tag_memory]
+    subgraph SKILL_PACK[claude-skill shims]
+        SENATE_T[senate → legal-compliance / Curia]
+        XENIA_T[xenia / xenia_kb / xenia_tickets<br/>→ customer-support / Xenia Hearth]
+        MB_T[marketbliss → marketing-*x5]
     end
 
-    subgraph SMITH[mcp: agentsmith]
-        SMITH_TOOLS[agentsmith.*<br/>inspector_inspect<br/>constitution_attest<br/>archivist_seal<br/>quarantine_isolate]
+    subgraph MEM[hydra_memory]
+        MEM_TOOLS[hydra-mem.*<br/>write/read_episodic<br/>semantic_search / query_eights / tag_memory]
+    end
+
+    subgraph SMITH[agentsmith]
+        SMITH_TOOLS[inspector_inspect / constitution_attest<br/>archivist_seal / quarantine_isolate]
+    end
+
+    subgraph AUX[hydra_control / eights / blender]
+        CTRL[hydra_control — resume + audit<br/>WS-AUTH gated]
+        EIGHTS_T[eights — TheEights optional<br/>cross-project hybrid memory]
+        BLEND[blender — 3rd-party optional<br/>uvx blender-mcp]
     end
 
     CC --- SUP
     SUP ==Forge==> PP
     SUP ==Executive==> ES
-    SUP ==Garland==> RLM
+    SUP ==Garland / Arcade Crown==> RLM
+    SUP ==claude-skill squads==> SKILL_PACK
     SUP <==memory==> MEM
     SUP -.governance.-> SMITH
+    SUP -.aux / optional.-> AUX
     PP -.audited by.-> SMITH
     ES -.audited by.-> SMITH
     RLM -.audited by.-> SMITH
@@ -40,7 +60,11 @@ graph LR
     classDef ns fill:#0D0F1A,stroke:#2E86AB,color:#E8D5A3
     classDef memory fill:#0D0F1A,stroke:#8B7355,color:#E8D5A3
     classDef gov fill:#0D0F1A,stroke:#C0392B,color:#E8D5A3
+    classDef skill fill:#0D0F1A,stroke:#6FB8DA,color:#E8D5A3
+    classDef aux fill:#0D0F1A,stroke:#8B7355,color:#C2A57A
     class CC,SUP host
     class PP,ES,RLM ns
     class MEM memory
     class SMITH gov
+    class SKILL_PACK,SENATE_T,XENIA_T,MB_T skill
+    class AUX,CTRL,EIGHTS_T,BLEND aux
