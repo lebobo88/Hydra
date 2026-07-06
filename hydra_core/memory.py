@@ -104,14 +104,20 @@ def tag_episodic(
     *,
     db: Path = EPISODIC_DB,
     replace: bool = False,
-) -> list[Cell]:
+) -> list[Cell] | dict[str, str]:
     """Attach cells to an existing episodic row. Default merges with the
-    existing tag set; pass `replace=True` to overwrite."""
+    existing tag set; pass `replace=True` to overwrite.
+
+    Returns the merged cell list on success.  Returns
+    ``{"error": "unknown key", "key": key}`` when *key* does not exist in the
+    episodic store — callers should check for the error dict and surface it to
+    the user (the CLI exits 1 on this signal).
+    """
     validated = validate_cells(cells)
     with _ensure_episodic(db) as conn:
         row = conn.execute("SELECT cells FROM episodic WHERE key=?", (key,)).fetchone()
         if not row:
-            return []
+            return {"error": "unknown key", "key": key}
         if replace:
             merged = validated
         else:

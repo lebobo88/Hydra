@@ -1491,3 +1491,263 @@ def test_mu14_no_trace_when_cost_captured(monkeypatch):
     )
     # Cost propagates through correctly.
     assert out["cost_usd"] >= 0.03
+
+
+# ---------------------------------------------------------------------------
+# MU5 — conservative goal-prose repo inference in node_intake
+# ---------------------------------------------------------------------------
+# When no explicit --repo flag is present, node_intake scans the goal text for
+# known repo ids near recognized cue phrases ("repo:", "repository", "in repo",
+# "monorepo"). Exactly one cued id → infer; any other situation → warn only.
+
+import hydra_core.supervisor as _sup_mod_mu5  # noqa: E402
+
+
+class _StubDispMU5:
+    def call_mcp(self, *a, **k): return {"status": "done", "result": {}}
+    def spawn_subprocess(self, *a, **k): return {"status": "done", "stdout": ""}
+    def emit_claude_prompt(self, *a, **k): return {"status": "host_pickup_required"}
+    def invoke_claude_skill(self, *a, **k): return {"status": "host_pickup_required"}
+
+
+def test_mu5_repo_inferred_from_goal_single_cued(monkeypatch):
+    """MU5(a): goal 'Fix the parser bug. Repo: mc-test' — 'Repo:' is a cue phrase
+    and 'mc-test' is the only matched id within 40 chars → target_repo_id is
+    inferred and intake.repo_inferred_from_goal trace is emitted."""
+    from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+    events: list[tuple] = []
+
+    def _capture(root, wf_id, event_name, payload):
+        events.append((event_name, payload))
+
+    monkeypatch.setattr(_sup_mod_mu5, "emit_trace", _capture)
+
+    state = HydraState(root_goal="Fix the parser bug. Repo: mc-test")
+    sup = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_StubDispMU5(), force_pure_python=True
+    )
+    assert isinstance(sup, _PurePythonRunner)
+    result = sup.invoke(state, stop_before="planner")
+
+    assert result.target_repo_id == "mc-test", (
+        f"MU5(a): expected target_repo_id='mc-test', got {result.target_repo_id!r}"
+    )
+    infer_events = [(n, p) for n, p in events if n == "intake.repo_inferred_from_goal"]
+    assert infer_events, (
+        f"MU5(a): intake.repo_inferred_from_goal trace must be emitted; "
+        f"captured: {[n for n, _ in events]}"
+    )
+    assert infer_events[0][1].get("repo_id") == "mc-test", (
+        f"MU5(a): trace repo_id must be 'mc-test'; got {infer_events[0][1]!r}"
+    )
+
+
+def test_mu5_multiple_repo_mentions_warn_no_inference(monkeypatch):
+    """MU5(b): goal mentioning 'mc-test and candc repositories' — both ids match
+    but neither is cued (cue comes AFTER the ids) → no inference, warning trace
+    lists both ids."""
+    from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+    events: list[tuple] = []
+
+    def _capture(root, wf_id, event_name, payload):
+        events.append((event_name, payload))
+
+    monkeypatch.setattr(_sup_mod_mu5, "emit_trace", _capture)
+
+    state = HydraState(root_goal="Fix the parser bug in mc-test and candc repositories")
+    sup = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_StubDispMU5(), force_pure_python=True
+    )
+    assert isinstance(sup, _PurePythonRunner)
+    result = sup.invoke(state, stop_before="planner")
+
+    assert not result.target_repo_id, (
+        f"MU5(b): must not infer when multiple repos mentioned without single cue; "
+        f"got {result.target_repo_id!r}"
+    )
+    warn_events = [(n, p) for n, p in events if n == "intake.repo_mention_without_target"]
+    assert warn_events, (
+        f"MU5(b): intake.repo_mention_without_target trace must be emitted; "
+        f"captured: {[n for n, _ in events]}"
+    )
+    mentioned = warn_events[0][1].get("mentioned", [])
+    assert "mc-test" in mentioned and "candc" in mentioned, (
+        f"MU5(b): both ids must be in trace 'mentioned' list; got {mentioned}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MU11 — memory tag unknown key returns error + CLI exit 1
+# ---------------------------------------------------------------------------
+
+def test_mu11_memory_tag_unknown_key_exit_1(tmp_path, monkeypatch, capsys):
+    """MU11: cli.main memory tag with a nonexistent key returns rc=1 and outputs
+    a JSON object with 'error' key. Existing-key behavior is unchanged."""
+    import hydra_core.memory as _mem
+
+    # Redirect all tag_episodic calls to a fresh tmp db (the key won't exist there).
+    real_tag = _mem.tag_episodic
+
+    def _tmp_tag(key, cells, *, replace=False, db=None):  # noqa: ANN001
+        return real_tag(key, cells, replace=replace, db=tmp_path / "episodic.db")
+
+    monkeypatch.setattr(_mem, "tag_episodic", _tmp_tag)
+
+    rc = cli.main(["--project", str(REPO_ROOT), "memory", "tag", "bogus-nonexistent-key",
+                   "--cells", "qian"])
+    captured = capsys.readouterr()
+    assert rc == 1, f"MU11: expected rc=1 for unknown key, got {rc}"
+    out = captured.out.strip()
+    assert out, "MU11: must produce output when key is unknown"
+    data = json.loads(out)
+    assert "error" in data, f"MU11: output must contain 'error' key; got {data}"
+    assert data.get("key") == "bogus-nonexistent-key", (
+        f"MU11: output must echo the key; got {data}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MU13 — byproduct exclusion before git add -A in attended commits
+# ---------------------------------------------------------------------------
+
+def test_mu13_byproduct_excluded_from_preserved_branch(tmp_path, monkeypatch):
+    """MU13: when the attended host preserves non-complete work, __pycache__/
+    pyc files must NOT appear in the committed branch while real source files
+    must be included."""
+    _init_repo_mu12(tmp_path)
+
+    # Force smoke to fail so the non-complete preserve path fires.
+    monkeypatch.setattr(_hb, "_run_smoke",
+                        lambda *a, **k: ("fail", "MU13 injected smoke failure"))
+
+    disp = _FakeDispatcherMU12(required_cross_vendor=True)
+    res = _hb.begin_stage(
+        disp, workflow_id="wf-mu13", run_id="run-mu13",
+        project_path=str(tmp_path), request_text="add mu13_feature.py",
+        project_root=str(tmp_path), isolate=True)
+    assert res["status"] == "awaiting_host", (
+        f"MU13: expected awaiting_host, got {res['status']!r}"
+    )
+
+    wt = res["host_action"]["cwd"]
+    assert "worktrees" in wt.replace("\\", "/"), "MU13: engineer must be in a worktree"
+
+    # Engineer creates a real source file AND a __pycache__/junk.pyc byproduct.
+    (Path(wt) / "mu13_feature.py").write_text("# mu13 feature\n", encoding="utf-8")
+    pyc_dir = Path(wt) / "__pycache__"
+    pyc_dir.mkdir(exist_ok=True)
+    (pyc_dir / "junk.pyc").write_bytes(b"\x00\x00byproduct")
+
+    cfile = res["cursor_path"]
+
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "added mu13_feature.py", "cost_usd": 0.01,
+                "tokens_in": 10, "tokens_out": 5, "model": "claude-test"})
+    assert res["state"] == "await_judge"
+
+    # Submit judge pass — smoke fails → preserve fires.
+    res = _hb.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex", "cost_usd": 0.005})
+    assert res["status"] == "surfaced", (
+        f"MU13: expected surfaced (smoke-fail), got {res['status']!r}"
+    )
+
+    preserved = res.get("preserved_branch")
+    assert preserved, f"MU13: preserved_branch must be set; got {res!r}"
+
+    # Real file must be on the branch.
+    show_real = _git_mu12(["show", f"{preserved}:mu13_feature.py"], tmp_path)
+    assert show_real.returncode == 0, (
+        f"MU13: git show {preserved}:mu13_feature.py failed — real file not preserved.\n"
+        f"stderr: {show_real.stderr}"
+    )
+    assert "mu13 feature" in show_real.stdout
+
+    # Pyc must NOT be on the branch.
+    show_pyc = _git_mu12(["show", f"{preserved}:__pycache__/junk.pyc"], tmp_path)
+    assert show_pyc.returncode != 0, (
+        f"MU13: __pycache__/junk.pyc must NOT be committed to the attended branch; "
+        f"git show returned {show_pyc.returncode}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MU15d — status rendering: attended-done tasks show "done (attended)"
+# ---------------------------------------------------------------------------
+
+def test_mu15d_status_renders_done_attended(tmp_path, monkeypatch, capsys):
+    """MU15d: hydra status <wf> renders a deferred_to_host task as 'done (attended)'
+    when its task_id is present in state.attended_done_task_ids."""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
+    wf = uuid4()
+
+    # 1. Build the plan so a task is created in the checkpoint.
+    initial = HydraState(workflow_id=wf, root_goal="MU15d status render test")
+    initial.selected_squads = ["engineering"]
+    sup = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
+    )
+    config = {"configurable": {"thread_id": str(wf)}}
+    sup.invoke(initial, config=config)
+
+    snap = sup.get_state(config)
+    state_after_plan = HydraState.model_validate(snap.values)
+    assert state_after_plan.tasks, "MU15d: planner must have created at least one task"
+    task = state_after_plan.tasks[0]
+    task_id = str(task.task_id)
+
+    # 2. Simulate attended complete: add task_id to attended_done_task_ids.
+    sup.update_state(config, {
+        "attended_done_task_ids": [task_id],
+    })
+
+    # 3. Run cli status on the workflow.
+    rc = cli.main(["--project", str(REPO_ROOT), "status", str(wf)])
+    captured = capsys.readouterr()
+    assert rc == 0, f"MU15d: status must succeed, got rc={rc}"
+    data = json.loads(captured.out)
+
+    tasks_view = data.get("tasks", [])
+    assert tasks_view, "MU15d: tasks list must be non-empty"
+
+    # The attended-complete task must show "done (attended)".
+    matching = [t for t in tasks_view if t["task_id"] == task_id[:8]]
+    assert matching, (
+        f"MU15d: task {task_id[:8]} must appear in tasks view; got {tasks_view}"
+    )
+    assert matching[0]["status"] == "done (attended)", (
+        f"MU15d: task status must be 'done (attended)'; got {matching[0]['status']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# MU11b — hydra-mem.tag_memory handler propagates unknown-key error cleanly
+# ---------------------------------------------------------------------------
+
+def test_mu11b_tag_memory_handler_unknown_key(tmp_path, monkeypatch):
+    """MU11(b): the hydra-mem.tag_memory MCP handler must return a top-level
+    'error' key (not wrap the error dict inside 'cells') when the key is unknown."""
+    import hydra_core.memory as _mem
+    from mcp_servers.hydra_memory.server import _tool_handlers as mem_handlers
+
+    real_tag = _mem.tag_episodic
+
+    def _tmp_tag(key, cells, *, replace=False, db=None):  # noqa: ANN001
+        return real_tag(key, cells, replace=replace, db=tmp_path / "episodic.db")
+
+    monkeypatch.setattr(_mem, "tag_episodic", _tmp_tag)
+
+    h = mem_handlers()
+    result = h["hydra-mem.tag_memory"]({"key": "does-not-exist", "cells": ["qian"]})
+
+    assert "error" in result, (
+        f"MU11(b): result must have top-level 'error'; got {result!r}"
+    )
+    assert "cells" not in result or not isinstance(result.get("cells"), dict), (
+        f"MU11(b): 'cells' must not wrap the error dict; got {result!r}"
+    )

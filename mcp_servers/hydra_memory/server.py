@@ -212,6 +212,9 @@ def _tool_handlers() -> dict[str, callable]:
             cells=args.get("cells", []),
             replace=bool(args.get("replace", False)),
         )
+        # MU11: tag_episodic returns an error dict when the key is unknown.
+        if isinstance(merged, dict) and "error" in merged:
+            return {"error": merged["error"], "key": args["key"]}
         return {"key": args["key"], "cells": merged}
 
     def ping(args: dict[str, Any]) -> dict[str, Any]:
