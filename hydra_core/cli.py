@@ -177,6 +177,28 @@ def _cmd_doctor(args) -> int:
         print(f"FAIL: Cerberus venom load — {e}")
         fail_count += 1
 
+    # --- RA-7: eights spool depth check (cheap directory count) -----------
+    # Runs in both quick and full mode (counting files is fast).  A large spool
+    # means the daemon has been offline for a while; operator should run
+    # `hydra eights-drain` or check the daemon health.
+    try:
+        from .eights.pending_spool import PendingSpool
+        _spool_warn_thresh = int(
+            os.environ.get("HYDRA_EIGHTS_SPOOL_WARN", "100")
+        )
+        _spool_depth = PendingSpool().count()
+        if _spool_depth > _spool_warn_thresh:
+            print(
+                f"WARN: eights spool depth={_spool_depth} exceeds "
+                f"threshold={_spool_warn_thresh} — "
+                "run `hydra eights-drain` or check eights daemon health"
+            )
+        else:
+            print(f"OK:   eights spool  depth={_spool_depth} "
+                  f"(threshold={_spool_warn_thresh})")
+    except Exception as _spool_exc:
+        print(f"WARN: eights spool check — {_spool_exc}")
+
     # --- quick mode (hooks) -------------------------------------------------
     # Stop before the heavyweight checks. `--quick` is what SessionStart /
     # PreToolUse hooks run: it skips the langgraph import (whose transitive
@@ -233,6 +255,57 @@ def _cmd_doctor(args) -> int:
             err = (res.get("error", "(no error field)")
                    if isinstance(res, dict) else f"non-dict {type(res).__name__}")
             print(f"WARN: {server} unreachable — {err}")
+
+    # --- RA-6: AgentSmith venom cross-check / smith→hydra back-channel ------
+    # Informational only: surfaces the back-channel state (rationale field) but
+    # NEVER fails the doctor — a missing or degraded AgentSmith is a WARN.
+    # The "hydra-mcp-unavailable" rationale is the known live-deployment state
+    # and must surface as a WARN (not an error) so operators know it is expected.
+    if "agentsmith" in servers:
+        try:
+            _vs_res = dispatcher.call_mcp(
+                "agentsmith",
+                "agentsmith.venom.cross_check",
+                {"capability": "ping"},
+            )
+            _vs_status = _vs_res.get("status") if isinstance(_vs_res, dict) else None
+            if _vs_status == "done":
+                # Unwrap result envelope (agentsmith returns {"status":"done","result":{...}})
+                _inner = _vs_res.get("result", _vs_res) if isinstance(_vs_res, dict) else {}
+                _rationale = (
+                    _inner.get("rationale")
+                    if isinstance(_inner, dict)
+                    else None
+                )
+                if _rationale == "hydra-mcp-unavailable":
+                    print(
+                        "WARN: agentsmith venom.cross_check — smith→hydra back-channel "
+                        f"unavailable (rationale={_rationale!r}); "
+                        "check that hydra_gateway is registered in ~/.hydra/backends.json"
+                    )
+                else:
+                    print(
+                        f"OK:   agentsmith venom.cross_check reachable "
+                        f"(back-channel rationale={_rationale!r})"
+                    )
+            else:
+                _vs_err = (
+                    _vs_res.get("error", "(no error field)")
+                    if isinstance(_vs_res, dict)
+                    else f"non-dict {type(_vs_res).__name__}"
+                )
+                print(f"WARN: agentsmith venom.cross_check — {_vs_err}")
+        except Exception as _vs_exc:  # noqa: BLE001 — venom probe must never crash doctor
+            print(
+                f"WARN: agentsmith venom.cross_check raised "
+                f"{type(_vs_exc).__name__}: {_vs_exc}"
+            )
+    else:
+        print(
+            "WARN: agentsmith not registered — skipping venom.cross_check probe "
+            "(back-channel state unknown)"
+        )
+
     return 0 if fail_count == 0 else 1
 
 
@@ -695,6 +768,16 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
         # Resume re-enters dispatch — drive pp to real codegen on the live path.
         dispatcher.drive_pp_loop = True
+        # RA-7: fail-soft background spool drain on every lifecycle resume entry.
+        # node_intake (supervisor) calls replay_pending_async on full-run intake
+        # but resume skips node_intake, so 6 000+ spooled entries since 2026-07-03
+        # were never drained.  Non-blocking (replay_pending_async spawns a daemon
+        # thread); failed files stay in the spool for the next attempt.
+        try:
+            from .eights.attestation import EightsAttestor
+            EightsAttestor(dispatcher=dispatcher).replay_pending_async()
+        except Exception:  # noqa: BLE001 — spool drain must never block resume
+            pass
     else:
         dispatcher = _NullDispatcher()
 
@@ -1115,6 +1198,12 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
         # Ingest re-enters engineering dispatch — drive pp to real codegen.
         dispatcher.drive_pp_loop = True
+        # RA-7: fail-soft background spool drain (mirrors _cmd_resume_locked).
+        try:
+            from .eights.attestation import EightsAttestor
+            EightsAttestor(dispatcher=dispatcher).replay_pending_async()
+        except Exception:  # noqa: BLE001
+            pass
     else:
         dispatcher = _NullDispatcher()
 
@@ -2653,6 +2742,71 @@ def _interpolate(template: str, values: dict[str, str]) -> str:
     return result
 
 
+def _cmd_eights_drain(args) -> int:
+    """Drain the eights-pending spool in a bounded batch.
+
+    Re-issues up to --limit (default 500) spooled calls to the eights daemon
+    via the live MCPStdioDispatcher.  Also removes stale .partial staging
+    files older than 1 hour (these are crash residue from interrupted writes).
+
+    Prints JSON: {drained, failed, remaining, partial_removed, spool_root}.
+    ``drained`` = successfully re-sent; ``failed`` = attempted but daemon
+    rejected; ``remaining`` = still on disk after this run.
+
+    If the eights daemon is not reachable the replay attempts all fail; spool
+    entries remain in place for the next run (fail-soft, never destructive).
+    """
+    import time as _time
+    from .eights.pending_spool import PendingSpool, DEFAULT_SPOOL_ROOT
+
+    limit = int(getattr(args, "limit", 500))
+    project = Path(args.project) if args.project else Path.cwd()
+    spool_root = Path(
+        os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT
+    )
+
+    # Remove stale .partial files (crash residue from interrupted spool writes).
+    partial_removed = 0
+    if spool_root.is_dir():
+        stale_cutoff = _time.time() - 3600.0  # 1 hour
+        for _pf in spool_root.glob("*.partial"):
+            try:
+                if _pf.stat().st_mtime < stale_cutoff:
+                    _pf.unlink()
+                    partial_removed += 1
+            except OSError:
+                pass
+
+    spool = PendingSpool(root=spool_root)
+    drained = 0
+    failed = 0
+    drain_error: str | None = None
+
+    try:
+        from .dispatcher import MCPStdioDispatcher
+        from .eights.attestation import EightsAttestor
+        dispatcher = MCPStdioDispatcher(project)
+        attestor = EightsAttestor(dispatcher=dispatcher, spool=spool)
+        summary = attestor.replay_pending(max_replays=limit)
+        drained = summary.get("sent", 0)
+        failed = summary.get("failed", 0)
+    except Exception as exc:  # noqa: BLE001 — dispatcher not available → partial drain report
+        drain_error = f"{type(exc).__name__}: {exc}"
+
+    remaining = spool.count()
+    out: dict = {
+        "drained": drained,
+        "failed": failed,
+        "remaining": remaining,
+        "partial_removed": partial_removed,
+        "spool_root": str(spool_root),
+    }
+    if drain_error is not None:
+        out["error"] = drain_error
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hydra", description="Enterprise Agent Mesh supervisor")
     ap.add_argument("--project", help="Project root (defaults to cwd)")
@@ -2836,6 +2990,28 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    # RA-7: eights spool drain subcommand
+    ed = sub.add_parser(
+        "eights-drain",
+        help=(
+            "Drain the eights-pending spool in a bounded batch. "
+            "Re-issues spooled calls to the eights daemon and removes stale "
+            ".partial files older than 1 hour. "
+            "Prints JSON: {drained, failed, remaining}."
+        ),
+    )
+    ed.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        metavar="N",
+        help=(
+            "Maximum number of spool entries to attempt in this run "
+            "(default 500). Remaining entries stay in the spool for the next "
+            "call."
+        ),
+    )
+
     # gateway management
     sub.add_parser("gateway-backup")
     sub.add_parser("gateway-export-backends")
@@ -2883,6 +3059,7 @@ def main(argv: list[str] | None = None) -> int:
         "resume": _cmd_resume,
         "ingest": _cmd_ingest,
         "replay": _cmd_replay,
+        "eights-drain": _cmd_eights_drain,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,
         "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,

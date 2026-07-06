@@ -44,7 +44,12 @@ _SELF_NAMES = frozenset({"hydra_gateway", "hydra_toolshed"})
 # backend-side boot speed; this just stops a borderline cold start from being
 # marked failed. Per-server locking (see _connect) prevents concurrent callers
 # from all paying this latency at once.
-_CONNECT_TIMEOUT = 20.0
+#
+# RA-2: env-tunable default via HYDRA_GATEWAY_CONNECT_TIMEOUT_S (fail-soft
+# parse via _env_float). Per-backend override from spec key "connect_timeout_s"
+# in backends.json takes priority over the env var (resolved at call time via
+# AsyncBackendPool._connect_timeout_for).
+_CONNECT_TIMEOUT_DEFAULT = 20.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -195,6 +200,30 @@ class AsyncBackendPool:
             self._locks[server] = lock
         return lock
 
+    def _connect_timeout_for(self, server: str) -> float:
+        """Resolve the connect / list_tools timeout for one backend (seconds).
+
+        Priority (low → high):
+        1. Module default (``_CONNECT_TIMEOUT_DEFAULT`` = 20 s)
+        2. ``HYDRA_GATEWAY_CONNECT_TIMEOUT_S`` env var — fail-soft via
+           ``_env_float`` (non-positive / NaN / unparseable → default)
+        3. Per-backend ``connect_timeout_s`` key in the backend's spec
+           from ``backends.json`` — parsed via ``_coerce_timeout_seconds``
+           (non-positive / NaN / unparseable → ignored, env/default wins)
+
+        All three sources are read at call time (not cached) so an operator
+        can change an env var or restart with a new backends.json without
+        restarting the gateway process.
+        """
+        base = _env_float("HYDRA_GATEWAY_CONNECT_TIMEOUT_S", _CONNECT_TIMEOUT_DEFAULT)
+        spec = self._specs.get(server, {})
+        raw_override = spec.get("connect_timeout_s")
+        if raw_override is not None:
+            parsed = _coerce_timeout_seconds(raw_override, milliseconds=False)
+            if parsed is not None:
+                return parsed
+        return base
+
     async def _connect(self, server: str) -> Any:
         """Open a stdio session to a backend. Returns the ClientSession.
 
@@ -220,7 +249,7 @@ class AsyncBackendPool:
 
             try:
                 task = asyncio.ensure_future(self._do_connect(server, gen))
-                return await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
+                return await asyncio.wait_for(task, timeout=self._connect_timeout_for(server))
             except (TimeoutError, asyncio.TimeoutError):
                 task.cancel()
                 # Bump the generation so a late-completing attempt won't commit.
@@ -245,7 +274,7 @@ class AsyncBackendPool:
 
         try:
             task = asyncio.ensure_future(session.list_tools())
-            result = await asyncio.wait_for(task, timeout=_CONNECT_TIMEOUT)
+            result = await asyncio.wait_for(task, timeout=self._connect_timeout_for(server))
             tools = [
                 {
                     "name": t.name,
