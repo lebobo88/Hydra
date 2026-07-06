@@ -685,3 +685,15 @@ def test_node_postcheck_preserves_surfaced_phase() -> None:
             f"Expected phase='surfaced' to be preserved, got {final_phase!r}. "
             "node_postcheck must not overwrite a pre-surfaced phase with 'done'."
         )
+
+
+def test_parse_repo_arg_short_typo_raises_valueerror() -> None:
+    """P3: a short goal with a typo'd repo id (e.g. 'mc-tset') must raise plain
+    ValueError, NOT RepoFlagIgnored — short strings are always tail (typo protection).
+    """
+    from hydra_core.repo_registry import RepoFlagIgnored
+    with pytest.raises(ValueError) as exc_info:
+        parse_repo_arg("fix parser --repo mc-tset")
+    assert not isinstance(exc_info.value, RepoFlagIgnored), (
+        "Short-goal unknown id must raise plain ValueError, not RepoFlagIgnored"
+    )

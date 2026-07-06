@@ -1301,8 +1301,8 @@ class _BoDispatcher:
 
 def test_mu16a_fleet_repo_budget_exhausted_no_generate(monkeypatch):
     """MU16(a): best-of loop with a ledger whose repo allocation is already spent
-    must produce zero pp_codex.generate calls and emit fleet.repo_budget_exhausted
-    in the telemetry trace."""
+    must produce zero pp_codex.generate calls, emit fleet.repo_budget_exhausted,
+    and finalize as final_status='surfaced' with error='budget_exhausted'."""
     monkeypatch.setattr(
         "hydra_core.squad_node._run_smoke", lambda *a, **k: ("pass", "ok"))
     events: list[tuple] = []
@@ -1319,7 +1319,7 @@ def test_mu16a_fleet_repo_budget_exhausted_no_generate(monkeypatch):
 
     disp = _BoDispatcher(_best_of_responses_mu16(n_candidates=3))
 
-    _dbol(
+    result = _dbol(
         disp, run_id="run_mu16a", project_path="/tmp/proj",
         request_text="x", n=3, workflow_id="wf-mu16a",
         state=state, repo_id="repo-a",
@@ -1335,6 +1335,14 @@ def test_mu16a_fleet_repo_budget_exhausted_no_generate(monkeypatch):
     evt = next(p for (k, p) in events if k == "fleet.repo_budget_exhausted")
     assert evt.get("repo_id") == "repo-a"
     assert evt.get("candidate") == 1
+    # P2: budget-exhausted path must finalize as surfaced, not aborted.
+    assert result is not None, "MU16(a): _dbol must return a result dict"
+    assert result["final_status"] == "surfaced", (
+        f"MU16(a): expected final_status='surfaced', got {result['final_status']!r}"
+    )
+    assert "budget_exhausted" in (result.get("error") or ""), (
+        f"MU16(a): error must mention 'budget_exhausted'; got {result.get('error')!r}"
+    )
 
 
 def test_mu16b_workflow_budget_exhausted_candidates_skipped(monkeypatch):
@@ -1750,4 +1758,241 @@ def test_mu11b_tag_memory_handler_unknown_key(tmp_path, monkeypatch):
     )
     assert "cells" not in result or not isinstance(result.get("cells"), dict), (
         f"MU11(b): 'cells' must not wrap the error dict; got {result!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1 — scoped smoke profile
+# ---------------------------------------------------------------------------
+# (a) .harness/smoke_cmd.json with a valid cmd list is returned directly.
+# (b) Malformed smoke_cmd.json falls through to pytest heuristic detection.
+# (c) HYDRA_SMOKE_TIMEOUT_S=123 is passed as timeout kwarg to subprocess.run.
+
+def test_p1_smoke_cmd_json_override(tmp_path):
+    """P1(a): .harness/smoke_cmd.json with valid {"cmd": [...]} is returned
+    directly, bypassing all heuristic detection."""
+    from hydra_core.squad_node import _detect_smoke_command
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    cmd = ["my-custom-runner", "--fast", "smoke"]
+    (harness / "smoke_cmd.json").write_text(json.dumps({"cmd": cmd}), encoding="utf-8")
+    result = _detect_smoke_command(str(tmp_path))
+    assert result == cmd, f"P1(a): expected {cmd!r}, got {result!r}"
+
+
+def test_p1_smoke_cmd_json_malformed_falls_through(tmp_path):
+    """P1(b): malformed smoke_cmd.json (missing 'cmd' key) logs a warning and
+    falls through to pytest heuristic detection (tests/ dir present)."""
+    from hydra_core.squad_node import _detect_smoke_command
+    import sys as _sys
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "smoke_cmd.json").write_text('{"not_cmd": []}', encoding="utf-8")
+    # Provide a tests/ dir so the pytest heuristic fires.
+    (tmp_path / "tests").mkdir()
+    result = _detect_smoke_command(str(tmp_path))
+    assert result is not None, "P1(b): malformed override must fall through to pytest"
+    assert "pytest" in result, f"P1(b): expected pytest in result, got {result!r}"
+    assert result == [_sys.executable, "-m", "pytest", "-q"], (
+        f"P1(b): expected sys.executable -m pytest -q, got {result!r}"
+    )
+
+
+def test_p1_smoke_timeout_env(tmp_path, monkeypatch):
+    """P1(c): HYDRA_SMOKE_TIMEOUT_S=123 is forwarded as timeout=123 kwarg to
+    subprocess.run (captured via monkeypatched subprocess.run)."""
+    from hydra_core import squad_node
+    monkeypatch.setenv("HYDRA_SMOKE_TIMEOUT_S", "123")
+    captured: list[dict] = []
+
+    class _FakeRes:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(*_args, **kwargs):
+        captured.append(kwargs)
+        return _FakeRes()
+
+    monkeypatch.setattr(squad_node.subprocess, "run", _fake_run)
+    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="p1-timeout")
+    assert captured, "P1(c): subprocess.run must be called"
+    assert captured[0].get("timeout") == 123, (
+        f"P1(c): expected timeout=123, got {captured[0].get('timeout')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P2 — honest budget-exhausted finalize
+# ---------------------------------------------------------------------------
+# When the MU16 gate fires before any candidate generates, the best-of loop
+# must finalize as 'surfaced' with error='budget_exhausted' (not 'aborted' via
+# an uncaught RuntimeError). The MU16a test above already validates this for
+# the fleet-repo path; this test covers the workflow-global exhaustion path.
+
+def test_p2_global_budget_exhausted_finalizes_surfaced(monkeypatch):
+    """P2: non-fleet best-of with pre-exhausted global budget finalizes as
+    final_status='surfaced' with error='budget_exhausted', not 'aborted'."""
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_smoke", lambda *a, **k: ("pass", "ok"))
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "hydra_core.telemetry.emit",
+        lambda _r, _wf, kind, payload: events.append((kind, payload)),
+    )
+
+    state = HydraState(root_goal="p2-global")
+    state.budget.budget_usd = 5.0
+    state.budget.spent_usd = 5.0  # 100% consumed
+
+    disp = _BoDispatcher(_best_of_responses_mu16(n_candidates=3))
+    result = _dbol(
+        disp, run_id="run_p2g", project_path="/tmp/proj",
+        request_text="x", n=3, workflow_id="wf-p2g",
+        state=state, repo_id=None,
+    )
+
+    assert result is not None, "P2: _dbol must return a result dict"
+    assert result["final_status"] == "surfaced", (
+        f"P2: expected final_status='surfaced', got {result['final_status']!r}"
+    )
+    assert "budget_exhausted" in (result.get("error") or ""), (
+        f"P2: error must mention 'budget_exhausted'; got {result.get('error')!r}"
+    )
+    assert result.get("finalized") is True, (
+        "P2: finalized must be True (finalize_run was called)"
+    )
+    # No generate must have been called.
+    assert ("pp_codex", "generate") not in {(s, t) for (s, t, _) in disp.calls}, (
+        "P2: no generate must run when global budget is exhausted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P3 — prose-safe repo flag parsing
+# ---------------------------------------------------------------------------
+# (a) '--repo flag' mid-prose in a short goal → no HITL; trace emitted.
+# (b) '--repo not-a-real-repo' at tail of a long string (>120 chars) → ValueError.
+# (c) '--repo mc-test' with a known id mid-prose → target_repo_id == 'mc-test'.
+
+def test_p3_mid_prose_unknown_token_no_intake_hitl(tmp_path, monkeypatch):
+    """P3(a): '--repo flag' deep in the middle of a long goal (>120 chars from end)
+    must not surface an intake HITL; intake.repo_flag_like_token_ignored is emitted.
+
+    With the new tail rule (m.start() >= max(0, len-120)), short strings are always
+    tail (typo protection), so the prose-safe escape only fires when the match is
+    genuinely far from the end of a long string.
+
+    emit_trace in supervisor.py is bound as a module-level alias
+    (from .telemetry import emit as emit_trace); patch the supervisor module's
+    attribute directly so closures built inside build_supervisor see the patch.
+    """
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp_p3a.db"))
+    events: list[tuple] = []
+    # Patch the module-level alias in supervisor so the node_intake closure picks
+    # it up via LOAD_GLOBAL (patching telemetry.emit does NOT reach the alias).
+    import hydra_core.supervisor as _sv
+    monkeypatch.setattr(_sv, "emit_trace",
+                        lambda _r, _wf, kind, payload: events.append((kind, payload)))
+    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher(),
+                           plan_only=True)
+    wf_id = uuid4()
+    # Goal is long (>200 chars) with ONE '--repo' at position ~16 — well over 120
+    # chars from the end, so it is NOT in the tail zone and fires RepoFlagIgnored.
+    # Deliberately uses only one '--repo' occurrence to avoid the duplicate-check guard.
+    goal = (
+        "improve how the --repo flag parsing works in intake "
+        "so that prose descriptions of CLI flags are not treated as explicit "
+        "targets — this affects long-form workflow goal descriptions where operators "
+        "naturally discuss cli flag semantics without intending to set a target repo"
+    )
+    assert len(goal) > 200, "precondition: goal must be >200 chars for prose detection"
+    assert goal.lower().count("--repo") == 1, "precondition: exactly one --repo token"
+    initial = HydraState(workflow_id=wf_id, root_goal=goal)
+    initial.selected_squads = ["executive"]
+    snap = sup.invoke(initial, config={"configurable": {"thread_id": str(wf_id)}})
+
+    # No intake HITL from bad --repo: if the workflow paused, it must be at the
+    # normal executive approval gate (gate_node != "intake").
+    _hitl = snap.get("pending_hitl") or {}
+    assert _hitl.get("gate_node") != "intake", (
+        f"P3(a): prose --repo must not surface intake HITL; got pending_hitl={_hitl!r}"
+    )
+    kinds = [k for (k, _) in events]
+    assert "intake.repo_flag_like_token_ignored" in kinds, (
+        f"P3(a): intake.repo_flag_like_token_ignored trace must be emitted; got {kinds}"
+    )
+
+
+def test_p3_tail_position_unknown_raises():
+    """P3(b): '--repo not-a-real-repo' in the tail zone of a long string must
+    raise plain ValueError (not RepoFlagIgnored) — typo protection preserved.
+
+    Tail zone = m.start() >= max(0, len-120). With a 150-char prefix + short
+    suffix the --repo match lands in the last 120 chars → explicit → ValueError.
+    """
+    from hydra_core.repo_registry import parse_repo_arg, RepoFlagIgnored
+    # Long prefix puts --repo in the final 120 chars of a >120-char string.
+    goal = "x" * 150 + " fix the tests --repo not-a-real-repo"
+    with pytest.raises(ValueError) as exc_info:
+        parse_repo_arg(goal)
+    assert not isinstance(exc_info.value, RepoFlagIgnored), (
+        "P3(b): tail-position unknown id must raise plain ValueError, not RepoFlagIgnored"
+    )
+
+
+def test_p3_known_id_mid_prose_is_explicit():
+    """P3(c): '--repo mc-test' with a known id is always explicit regardless of
+    position — parse_repo_arg returns ('mc-test', cleaned_text)."""
+    from hydra_core.repo_registry import parse_repo_arg
+    repo_id, rest = parse_repo_arg("use --repo mc-test for this")
+    assert repo_id == "mc-test", f"P3(c): expected 'mc-test', got {repo_id!r}"
+    assert "--repo" not in rest
+    assert "mc-test" not in rest
+
+
+def test_p3_fleet_mid_prose_unknown_token_no_intake_hitl(tmp_path, monkeypatch):
+    """P3(d): a mid-prose '--repos <unknown>' in a long goal (>120 chars from end)
+    must NOT surface an intake HITL — the fleet intake path must handle
+    RepoFlagIgnored before the generic ValueError handler, mirroring the single
+    --repo path (P3a). Without the dedicated handler, RepoFlagIgnored (a ValueError
+    subclass) would be swallowed by the fleet ValueError branch and surface HITL.
+    """
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp_p3d.db"))
+    events: list[tuple] = []
+    import hydra_core.supervisor as _sv
+    monkeypatch.setattr(_sv, "emit_trace",
+                        lambda _r, _wf, kind, payload: events.append((kind, payload)))
+    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher(),
+                           plan_only=True)
+    wf_id = uuid4()
+    # Long goal (>200 chars) with ONE '--repos flag' near the start — well over 120
+    # chars from the end, so it is NOT in the tail zone and fires RepoFlagIgnored.
+    # The captured token 'fleet' is not an allow-listed repo id. '--repos' does not
+    # match the single --repo parser (lookahead requires =/space/end after 'repo'),
+    # so intake reaches the fleet parser cleanly.
+    goal = (
+        "improve how the --repos fleet flag parsing works in intake "
+        "so that prose descriptions of CLI flags are not treated as explicit "
+        "targets — this affects long-form workflow goal descriptions where operators "
+        "naturally discuss cli flag semantics without intending to set target repos"
+    )
+    assert len(goal) > 200, "precondition: goal must be >200 chars for prose detection"
+    assert goal.lower().count("--repos") == 1, "precondition: exactly one --repos token"
+    initial = HydraState(workflow_id=wf_id, root_goal=goal)
+    initial.selected_squads = ["executive"]
+    snap = sup.invoke(initial, config={"configurable": {"thread_id": str(wf_id)}})
+
+    _hitl = snap.get("pending_hitl") or {}
+    assert _hitl.get("gate_node") != "intake", (
+        f"P3(d): prose --repos must not surface intake HITL; got pending_hitl={_hitl!r}"
+    )
+    kinds = [k for (k, _) in events]
+    assert "intake.repo_flag_like_token_ignored" in kinds, (
+        f"P3(d): intake.repo_flag_like_token_ignored trace must be emitted; got {kinds}"
+    )
+    # And it must NOT have surfaced the fleet bad-arg trace.
+    assert "supervisor.bad_repos_arg" not in kinds, (
+        f"P3(d): fleet prose token must not trip supervisor.bad_repos_arg; got {kinds}"
     )

@@ -485,6 +485,13 @@ def parse_repos_arg(text: str) -> tuple[list[str], str]:
     if not parts:
         raise ValueError("--repos/--fleet requires at least one non-empty repo id")
 
+    # P3: prose-safe tail check (same rule as parse_repo_arg).
+    # Short strings: max(0, len-120)=0 → m.start(1)>=0 always → tail → ValueError.
+    # Long strings: only matches in the final 120 chars are explicit; mid-prose
+    # --repos with an unknown id raises RepoFlagIgnored instead.
+    _repos_text_len = len(text)
+    _repos_is_tail = m.start(1) >= max(0, _repos_text_len - 120)
+
     # Validate each id; collect deduplicated list.
     seen: dict[str, bool] = {}
     deduped: list[str] = []
@@ -494,6 +501,8 @@ def parse_repos_arg(text: str) -> tuple[list[str], str]:
             continue  # dedup: keep first occurrence
         seen[normalised] = True
         if not is_known_repo(raw_id):
+            if not _repos_is_tail:
+                raise RepoFlagIgnored(raw_id)
             raise ValueError(
                 f"--repos/--fleet: {raw_id!r} is not an allow-listed repo_id; "
                 f"known: {sorted(_REPO_DIRNAMES)}"
@@ -540,6 +549,24 @@ def parse_repo_subpath_arg(text: str) -> tuple[Optional[str], str]:
     cleaned = text[:token_start].rstrip() + " " + text[token_end:].lstrip()
     cleaned = re.sub(r"  +", " ", cleaned.strip())
     return normalized, cleaned
+
+
+class RepoFlagIgnored(ValueError):
+    """Raised when ``--repo <token>`` looks like prose rather than an explicit CLI flag.
+
+    The intake node catches this (before the generic ``ValueError`` handler) to emit
+    an ``intake.repo_flag_like_token_ignored`` trace and continue without HITL —
+    the user described the flag conceptually rather than intending to target a repo.
+
+    Attributes:
+        token: The unrecognised id token that triggered the ignore decision.
+    """
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        super().__init__(
+            f"--repo {token!r} looks like prose (not an explicit flag); ignored"
+        )
 
 
 def parse_repo_arg(text: str) -> tuple[Optional[str], str]:
@@ -603,6 +630,19 @@ def parse_repo_arg(text: str) -> tuple[Optional[str], str]:
         raise ValueError("--repo requires a value")
 
     if not is_known_repo(raw_id):
+        # P3: prose-safe flag detection.
+        # A match is EXPLICIT (raises ValueError / surfaces HITL) when the match
+        # starts within the last 120 chars of the goal: max(0, len-120).
+        # Short strings (≤120 chars): max(0, len-120)=0, so m.start()>=0 is always
+        # True → all short-string unknown ids raise ValueError (typo protection).
+        # Long strings: only matches in the FINAL 120 chars are explicit; a match
+        # deep in the middle (>120 chars from the end) raises RepoFlagIgnored so
+        # prose descriptions of --repo never surface unexpected HITL.
+        # Known ids remain explicit regardless of position (checked above).
+        _text_len = len(text)
+        _is_tail = m.start() >= max(0, _text_len - 120)
+        if not _is_tail:
+            raise RepoFlagIgnored(raw_id)
         raise ValueError(
             f"--repo {raw_id!r} is not an allow-listed repo_id; "
             f"known: {sorted(_REPO_DIRNAMES)}"
