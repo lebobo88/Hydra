@@ -539,7 +539,7 @@ def _run_doctor_with_mock_dispatcher(
 def test_doctor_probe_warns_on_hydra_mcp_unavailable(tmp_path, capsys, monkeypatch):
     """Doctor surfaces 'hydra-mcp-unavailable' rationale as a WARN, not a FAIL."""
     responses = {
-        "agentsmith.agentsmith.venom.cross_check": {
+        "agentsmith.agentsmith.hydra.venom_cross_check": {
             "status": "done",
             "result": {"rationale": "hydra-mcp-unavailable", "allowed": False},
         },
@@ -569,7 +569,7 @@ def test_doctor_probe_warns_on_hydra_mcp_unavailable(tmp_path, capsys, monkeypat
 def test_doctor_probe_ok_when_cross_check_succeeds(tmp_path, capsys, monkeypatch):
     """Doctor emits OK when agentsmith.venom.cross_check succeeds."""
     responses = {
-        "agentsmith.agentsmith.venom.cross_check": {
+        "agentsmith.agentsmith.hydra.venom_cross_check": {
             "status": "done",
             "result": {"rationale": "allowed", "allowed": True},
         },
@@ -592,7 +592,7 @@ def test_doctor_probe_ok_when_cross_check_succeeds(tmp_path, capsys, monkeypatch
 def test_doctor_probe_warns_when_agentsmith_unreachable(tmp_path, capsys, monkeypatch):
     """Doctor emits WARN (not FAIL) when venom.cross_check returns failed status."""
     responses = {
-        "agentsmith.agentsmith.venom.cross_check": {
+        "agentsmith.agentsmith.hydra.venom_cross_check": {
             "status": "failed",
             "error": "tool_not_found",
         },
