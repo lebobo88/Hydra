@@ -610,11 +610,24 @@ def parse_repo_arg(text: str) -> tuple[Optional[str], str]:
     if re.search(r"(?:^|\s)--repo$", stripped, re.IGNORECASE):
         raise ValueError("--repo requires a value")
 
-    # Count occurrences of --repo (both forms).
-    occurrences = len(_REPO_COUNT_RE.findall(text))
-    if occurrences > 1:
+    # RA-10: count only "explicit" --repo occurrences (those that survive the
+    # prose-safe rule) toward the duplicate check. A match where the id is NOT
+    # known AND the match is mid-prose (not in the final 120 chars) raises
+    # RepoFlagIgnored below — counting it here fires "specified more than once"
+    # before the prose-safe filter runs, aborting goals like
+    # "improve --repo flags and documentation --repo hydra".
+    # Explicit = tail-position (m.start >= max(0, len-120)) OR known repo id.
+    _ra10_all_ms = list(_REPO_ARG_RE.finditer(text))
+    _ra10_tail_thresh = max(0, len(text) - 120)
+    _ra10_explicit = sum(
+        1
+        for _rm in _ra10_all_ms
+        if _rm.start() >= _ra10_tail_thresh
+        or is_known_repo(((_rm.group(2) or "") + (_rm.group(3) or "")).strip())
+    )
+    if _ra10_explicit > 1:
         raise ValueError(
-            f"--repo specified more than once ({occurrences} times); "
+            f"--repo specified more than once ({_ra10_explicit} times); "
             "only a single repo target is supported per invocation"
         )
 

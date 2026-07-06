@@ -2091,6 +2091,23 @@ def _via_mcp(
         args["forum"] = invoke.get("forum_for_review")
     # Drop None values — pp schema rejects them.
     args = {k: v for k, v in args.items() if v is not None}
+    # RA-12b: thread Hydra provenance into the pp daemon's start_run call so
+    # every run row carries hydra_workflow_id (v7 schema, harness-server.ts
+    # lines 85-88). The pp DB indexes hydra_workflow_id for cost attribution
+    # (MU16 gate) and eights provenance writes. All four fields are optional
+    # on the pp start_run schema — absence is the standalone case.
+    # hydra_workflow_id is the load-bearing identifier (required for context
+    # parsing); the other three are enrichment and may be absent on bare envelopes.
+    args["hydra_workflow_id"] = str(state.workflow_id)
+    _hctx_env_id = getattr(inbound, "id", None)
+    if _hctx_env_id is not None:
+        args["hydra_envelope_id"] = str(_hctx_env_id)
+    _hctx_origin = getattr(inbound, "origin_squad", None)
+    if _hctx_origin:
+        args["hydra_origin_squad"] = str(_hctx_origin)
+    _hctx_type = getattr(inbound, "type", None)
+    if _hctx_type:
+        args["hydra_envelope_type"] = str(_hctx_type)
     # WS9: record effective tier in rationale for observability.
     # Do NOT pass model_tier as an arg — pp's start_run schema rejects unknown args.
     try:

@@ -620,11 +620,94 @@ def build_supervisor(
                         {"mentioned": sorted(_matched_ids)},
                     )
 
+        # RA-10: --squad <slug>[,slug...] goal-text extraction.
+        # Mirrors the MU5/P3 prose-safe --repo-flag rule for a TAIL-POSITION
+        # --squad token: only matches in the last 120 chars of the goal are
+        # treated as explicit CLI flags. Mid-prose occurrences (not at tail)
+        # are traced and ignored. Only processes when no selected_squads are
+        # pre-seeded (CLI --squad path already sets them).
+        _SQUAD_FLAG_RE = re.compile(
+            r"(?:^|(?<=\s))(--squad(?:=(\S+)|\s+(\S+)))(?=\s|$)",
+            re.IGNORECASE,
+        )
+        _squad_goal = state.root_goal or ""
+        _squad_goal_len = len(_squad_goal)
+        _squad_tail_thresh = max(0, _squad_goal_len - 120)
+        _squad_all_ms = list(_SQUAD_FLAG_RE.finditer(_squad_goal))
+        # Outer-scope flag: set to True when we successfully strip + force-select
+        # from goal text; used later to persist root_goal in the update dict.
+        _squad_goal_stripped: bool = False
+        if not state.selected_squads:
+            # Find the rightmost match that is at tail position.
+            _squad_tail_m = next(
+                (m for m in reversed(_squad_all_ms) if m.start(1) >= _squad_tail_thresh),
+                None,
+            )
+            if _squad_tail_m is not None:
+                _squad_raw = (
+                    (_squad_tail_m.group(2) or "") + (_squad_tail_m.group(3) or "")
+                ).strip()
+                if _squad_raw:
+                    _squad_tokens = [
+                        t.strip().lower() for t in _squad_raw.split(",") if t.strip()
+                    ]
+                    _squad_unknown = [t for t in _squad_tokens if t not in packs]
+                    _squad_valid = [t for t in _squad_tokens if t in packs]
+                    if _squad_unknown:
+                        # Unknown slug at tail position: error like unknown --repo.
+                        state.phase = "surfaced"
+                        _squad_hitl: dict[str, Any] = {
+                            "workflow_id": str(state.workflow_id),
+                            "reason": "high_risk",
+                            "gate_node": "intake",
+                            "summary": (
+                                f"--squad argument rejected: unknown squad slug(s) "
+                                f"{_squad_unknown!r}; known: {sorted(packs)}"
+                            ),
+                            "options": ["abort"],
+                            "default_option": "abort",
+                        }
+                        emit_trace(
+                            judge_trace_root, state.workflow_id,
+                            "supervisor.bad_squad_arg",
+                            {"unknown": _squad_unknown, "known": sorted(packs)},
+                        )
+                        return {
+                            "phase": "surfaced",
+                            "pending_hitl": _squad_hitl,
+                            "last_event": f"bad --squad arg: unknown {_squad_unknown}",
+                        }
+                    if _squad_valid:
+                        # All slugs valid at tail: force-select + strip from goal.
+                        _squad_stripped = (
+                            _squad_goal[: _squad_tail_m.start(1)].rstrip()
+                            + " " + _squad_goal[_squad_tail_m.end(1):].lstrip()
+                        ).strip()
+                        _squad_stripped = re.sub(r"  +", " ", _squad_stripped)
+                        state.root_goal = _squad_stripped
+                        state.selected_squads = _squad_valid
+                        _squad_goal_stripped = True
+                        emit_trace(
+                            judge_trace_root, state.workflow_id,
+                            "intake.squad_flag_selected",
+                            {"squads": _squad_valid, "stripped_goal": _squad_stripped},
+                        )
+            elif _squad_all_ms:
+                # Mid-prose occurrences only (no tail match): ignore + trace.
+                _prose_raw = (
+                    (_squad_all_ms[0].group(2) or "") + (_squad_all_ms[0].group(3) or "")
+                ).strip()
+                emit_trace(
+                    judge_trace_root, state.workflow_id,
+                    "intake.squad_flag_like_token_ignored",
+                    {"token": _prose_raw, "reason": "mid_prose"},
+                )
+
         # Route the goal text. A pre-seeded non-empty `selected_squads`
-        # (CLI `hydra run --squad ...` / operator force-select) wins over
-        # the intent router: validate slugs against discovered packs and
-        # skip classification. Unknown slugs are dropped with a trace event;
-        # if nothing valid survives, fall back to the router.
+        # (CLI `hydra run --squad ...` / operator force-select / RA-10 goal-text
+        # --squad) wins over the intent router: validate slugs against discovered
+        # packs and skip classification. Unknown slugs are dropped with a trace
+        # event; if nothing valid survives, fall back to the router.
         forced = [s for s in state.selected_squads if s in packs]
         unknown = [s for s in state.selected_squads if s not in packs]
         if unknown:
@@ -684,6 +767,12 @@ def build_supervisor(
             "iteration_count": state.iteration_count,
             "constitution_hash": constitution.sha256,
         }
+        # RA-10: persist stripped goal when --squad was extracted from goal text.
+        # state.root_goal was mutated in-place; include in update so LangGraph
+        # persists the clean version (without the --squad token).
+        if _squad_goal_stripped:
+            update["root_goal"] = state.root_goal
+
         # Propagate repo targeting and fleet mode into the state update dict.
         # These are replace-by-default scalars; they must appear in the return
         # dict (not just be set on state) for LangGraph to persist them.
@@ -1404,6 +1493,28 @@ def build_supervisor(
             if _tid not in _seen_dispatch_ids:
                 _seen_dispatch_ids.add(_tid)
                 _dispatch_tasks.append(_t)
+
+        # RA-12a: skip tasks the attended host already drove to a terminal
+        # "complete" outcome. attended_done_task_ids is a replace-by-default list
+        # populated by _cmd_attended_submit when final_status="complete" (a subset
+        # of attended_completed_task_ids). Marking these tasks "done" here — before
+        # _all_task_payloads and the fleet/sequential dispatch — excludes them from
+        # ALL dispatch paths without ever calling execute_squad or the drive loop.
+        # We do NOT flip task.status via the _append reducer (which would duplicate
+        # the task); we mutate in-place so the sequential loop's `status != "pending"`
+        # guard naturally skips them.
+        _attended_done_set: frozenset[str] = frozenset(
+            getattr(state, "attended_done_task_ids", None) or []
+        )
+        for _adt in _dispatch_tasks:
+            if _adt.status == "pending" and str(_adt.task_id) in _attended_done_set:
+                _adt.status = "done"
+                emit_trace(
+                    judge_trace_root,
+                    state.workflow_id,
+                    "dispatch.attended_already_complete",
+                    {"task_id": str(_adt.task_id), "squad": _adt.owner_squad},
+                )
 
         # WS8 SLICE 1 — shared payload factory used by BOTH the sequential loop
         # and the fleet path so construction is never duplicated.
