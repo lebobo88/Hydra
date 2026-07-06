@@ -350,9 +350,36 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
     prefer a declared ``test`` script, else ``build``; Python projects prefer
     pytest. Keep this conservative — an undetected project degrades to
     ``skipped`` (an honest non-pass), never a forged pass.
+
+    Operator-authored override: ``<project_path>/.harness/smoke_cmd.json`` is
+    checked FIRST. When it exists and parses to ``{"cmd": [non-empty list of
+    strings]}``, that list is returned directly. Operator-accepted tradeoff:
+    PP-VG-5 still gets a real execution — the operator is responsible for
+    ensuring the command actually runs tests. Malformed or unreadable → logs a
+    warning and falls through to heuristic auto-detection.
     """
     import json as _json
     root = Path(project_path)
+    # Operator-authored smoke command override (PP-VG-5 operator-accepted tradeoff).
+    _override = root / ".harness" / "smoke_cmd.json"
+    if _override.is_file():
+        try:
+            _data = _json.loads(_override.read_text(encoding="utf-8"))
+            if (isinstance(_data, dict)
+                    and isinstance(_data.get("cmd"), list)
+                    and _data["cmd"]
+                    and all(isinstance(x, str) for x in _data["cmd"])):
+                return _data["cmd"]
+            _log.warning(
+                "_detect_smoke_command: %s malformed "
+                '(expected {"cmd": [non-empty list of strings]}); falling through',
+                _override,
+            )
+        except Exception:  # noqa: BLE001
+            _log.warning(
+                "_detect_smoke_command: could not parse %s; falling through to auto-detection",
+                _override,
+            )
     pkg = root / "package.json"
     if pkg.is_file():
         try:
@@ -401,6 +428,17 @@ def _write_smoke_log(project_path: str, stage_id: str, content: str) -> str | No
         return None
 
 
+def _smoke_timeout_s() -> int:
+    """Return the smoke timeout in seconds from ``HYDRA_SMOKE_TIMEOUT_S`` (default 600).
+
+    Fail-soft: any non-integer or missing value returns 600.
+    """
+    try:
+        return int(os.environ.get("HYDRA_SMOKE_TIMEOUT_S", 600))
+    except (ValueError, TypeError):
+        return 600
+
+
 def _run_smoke(
     dispatcher: "Dispatcher", *, project_path: str, stage_id: str
 ) -> tuple[str, str]:
@@ -427,11 +465,12 @@ def _run_smoke(
         return "skipped", "no runnable build/test command detected"
     # GAP-g: npm/npx are cmd-shell scripts on Windows; run with shell=True.
     _use_shell = os.name == "nt" and cmd[0].lower() in ("npm", "npx", "yarn", "pnpm")
+    _timeout = _smoke_timeout_s()
     try:
         res = subprocess.run(
             cmd if not _use_shell else " ".join(cmd),
             cwd=project_path, capture_output=True, text=True,
-            check=False, timeout=600, shell=_use_shell,
+            check=False, timeout=_timeout, shell=_use_shell,
         )
     except subprocess.TimeoutExpired as exc:
         # F10: a timeout is an INFRA failure, NOT "skipped" (which reads as
@@ -447,7 +486,7 @@ def _run_smoke(
         _log_suffix = f" :: full_log={_art}" if _art else ""
         return (
             "infra_error",
-            f"smoke timed out after 600s: {' '.join(cmd)}{_log_suffix}"[:2000],
+            f"smoke timed out after {_timeout}s: {' '.join(cmd)}{_log_suffix}"[:2000],
         )
     except Exception as e:  # noqa: BLE001 — launch failure (ENOENT/EPERM) is infra
         return "infra_error", f"smoke could not launch ({' '.join(cmd)}): {e!r}"[:300]
@@ -1404,6 +1443,7 @@ def _drive_best_of_loop(
     try:
         base_prompt = _build_engineer_prompt(request_text, project_path)
         scored: list[dict[str, Any]] = []
+        _budget_gate_fired = False  # P2: tracks MU16 between-candidate budget gate
         for c in candidates:
             ci_idx = int(c.get("candidate_index") or 0)
             wt = str(c.get("worktree_path") or project_path)
@@ -1428,6 +1468,7 @@ def _drive_best_of_loop(
                         _log.warning(
                             "best-of: repo budget exhausted, skipping candidates "
                             "from %d (repo=%s, run=%s)", ci_idx, repo_id, run_id)
+                        _budget_gate_fired = True
                         break
                 else:
                     _bud_remaining = state.budget.usd_remaining
@@ -1437,6 +1478,7 @@ def _drive_best_of_loop(
                         _log.warning(
                             "best-of: workflow budget exhausted, skipping candidates "
                             "from %d (run=%s)", ci_idx, run_id)
+                        _budget_gate_fired = True
                         break
             # P2.2: heartbeat so a running dispatch shows forward motion in
             # trace.jsonl (a silent generate/judge is indistinguishable from a
@@ -1596,6 +1638,46 @@ def _drive_best_of_loop(
         if winner is None:
             winner = ranked[0] if ranked else None
         if winner is None:
+            if _budget_gate_fired and not scored:
+                # P2: budget exhausted before any candidate completed — finalize
+                # honestly as surfaced (not aborted) so the operator sees the real
+                # reason. Gate trace events were already emitted above.
+                out["error"] = "budget_exhausted"
+                out["stage_outcome"] = "surfaced"
+                try:
+                    cm("pp_harness", "finalize_stage",
+                       {"stage_id": stage_id, "status": "surfaced"}, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+                _cand_paths = [
+                    str(_c.get("worktree_path") or project_path)
+                    for _c in sorted(
+                        candidates,
+                        key=lambda _c: int(_c.get("candidate_index") or 0),
+                    )
+                ]
+                try:
+                    cm("pp_harness", "teardown_candidates", {
+                        "project_path": project_path,
+                        "candidate_paths": _cand_paths,
+                        "run_id": run_id, "stage_kind": "code",
+                    }, squad_id=sq)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    cm("pp_harness", "finalize_run", {
+                        "run_id": run_id, "status": "surfaced",
+                        "summary_md": "best-of: budget exhausted, no candidates scored",
+                    }, squad_id=sq)
+                    out["finalized"] = True
+                except Exception:  # noqa: BLE001
+                    out["finalized"] = False
+                out["final_status"] = "surfaced"
+                _trace("best_of.stage_outcome", {
+                    "stage_id": stage_id, "final_status": "surfaced",
+                    "n": n, "cost_usd": out.get("cost_usd"),
+                    "reason": "budget_exhausted"})
+                return out
             raise RuntimeError("best-of produced no candidates")
 
         out["attempt_id"] = winner["att"]

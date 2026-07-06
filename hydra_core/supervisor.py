@@ -393,12 +393,23 @@ def build_supervisor(
         # success, target_repo_id is set (or left unchanged if already set by
         # the caller, e.g. a test that pre-seeds HydraState). root_goal is
         # NOT mutated so the router and planner see the original text.
-        from hydra_core.repo_registry import parse_repo_arg
+        from hydra_core.repo_registry import parse_repo_arg, RepoFlagIgnored
         try:
             _repo_id, _cleaned = parse_repo_arg(state.root_goal)
+        except RepoFlagIgnored as _prose_token:
+            # P3: --repo token looks like prose (e.g. "improve how the --repo flag
+            # works") — not an explicit CLI flag. Emit a trace for diagnostics and
+            # continue without HITL; no target_repo_id is set.
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "intake.repo_flag_like_token_ignored",
+                {"token": str(_prose_token.token)},
+            )
+            _repo_id = None
         except ValueError as _repo_err:
-            # Unknown --repo id: surface immediately so the operator sees the
-            # problem rather than the dispatch silently targeting the wrong repo.
+            # Unknown --repo id at tail position: surface immediately so the
+            # operator sees the problem rather than silently targeting the wrong repo.
             state.phase = "surfaced"
             _hitl_payload: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -431,6 +442,19 @@ def build_supervisor(
         from hydra_core.repo_registry import parse_repos_arg
         try:
             _fleet_repo_ids, _fleet_cleaned = parse_repos_arg(state.root_goal)
+        except RepoFlagIgnored as _prose_repos_token:
+            # P3: --repos/--fleet token looks like prose rather than an explicit
+            # CLI flag (mid-prose in a long goal). Mirror the single --repo path:
+            # emit a diagnostic trace and continue without HITL — no fleet wiring.
+            # RepoFlagIgnored subclasses ValueError, so this MUST precede the
+            # generic handler below or the prose-safe raise would surface HITL.
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "intake.repo_flag_like_token_ignored",
+                {"token": str(_prose_repos_token.token)},
+            )
+            _fleet_repo_ids, _fleet_cleaned = [], state.root_goal
         except ValueError as _repos_err:
             state.phase = "surfaced"
             _repos_hitl: dict[str, Any] = {
