@@ -7,8 +7,32 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # --- Enforcement gate -------------------------------------------------------
 if ($env:HYDRA_ENFORCE_ROUTING -ne '1') { exit 0 }
-# Harness-driven engineer stage: the deterministic codegen path is sanctioned.
-if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') { exit 0 }
+# RA-1: Harness-driven engineer stage: only bypass when a real active-stage marker
+# exists. A bare HYDRA_PP_STAGE_ACTIVE=1 (leaked or set outside a stage) must NOT
+# silently disable enforcement session-wide.
+if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
+    $_stagedActive = $false
+    try {
+        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 2 levels up from PSScriptRoot.
+        $_projRoot = $env:CLAUDE_PROJECT_DIR
+        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path $PSScriptRoot) }
+        if ($_projRoot) {
+            # Marker 1: any attended-* worktree directory under .harness\worktrees
+            $_wtDir = Join-Path $_projRoot '.harness\worktrees'
+            if ((Test-Path $_wtDir -PathType Container) -and
+                (Get-ChildItem -Path $_wtDir -Directory -Filter 'attended-*' -ErrorAction SilentlyContinue)) {
+                $_stagedActive = $true
+            }
+            # Marker 2: .harness\stage-active sentinel file
+            if (-not $_stagedActive -and
+                (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf)) {
+                $_stagedActive = $true
+            }
+        }
+    } catch { $_stagedActive = $true }   # internal error → preserve old bypass behavior
+    if ($_stagedActive) { exit 0 }
+    Write-Host '[hydra-hook] bare HYDRA_PP_STAGE_ACTIVE=1 ignored (no active stage marker) — enforcement stays ON'
+}
 
 $raw = $input | Out-String
 if (-not $raw) { exit 0 }

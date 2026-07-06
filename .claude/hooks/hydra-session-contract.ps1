@@ -3,6 +3,13 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
+# RA-1: Warn loudly when HYDRA_PP_STAGE_ACTIVE persists into a real session start.
+# This env var should only be set by the pp harness during an active engineer stage.
+# A leaked value will silently disable routing enforcement for the whole session.
+if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
+    Write-Output '[hydra-hook] WARNING: HYDRA_PP_STAGE_ACTIVE=1 detected at session start — this env var should only be set by the pp harness during an active engineer stage. A leaked value silently disables routing enforcement. Unset it if no harness stage is running.'
+}
+
 $ecosystemAvailable = $false
 try {
     $ppProcs = Get-Process -Name 'node' -ErrorAction Stop |
