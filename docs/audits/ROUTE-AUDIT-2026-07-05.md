@@ -154,6 +154,16 @@ Follow-up micro-fix RA-6b (wf 246c8e8b): the shipped doctor probe used a nonexis
 tool name — corrected to `agentsmith.hydra.venom_cross_check` (verified against
 AgentSmith's tool registry), judge PASS, scoped smoke pass, **auto-merged `352724a`**.
 
+## Phase 7 — Residual round (operator-approved 2026-07-06, second session)
+
+| Fix | Repo / workflow | Outcome |
+|---|---|---|
+| FIX-D: RA-12a dispatch skip + RA-12b provenance threading + RA-10 goal-text --squad (+ prose-safe repo multiplicity) + RA-3 docs | Hydra / 2418f135 (run_rWSg8bFhNcK4) | Engineer (stalled verify subprocess → continuation engineer reconciled 3 test mismatches) → judge REVISE (d-1 doc named nonexistent shim pair) → Reflexion → **PASS** (.95/.95/.95) → scoped smoke pass → **auto-merged `2688f0f`**. Suite **1435 green** (+16). **RA-12a live-verified**: resume of the merged workflow fired 2× `dispatch.attended_already_complete`, zero ghost generations (the identical scenario previously cost $10). |
+| FIX-E: RA-6 smith hydra-bridge connect timeout (env AGENTSMITH_HYDRA_CONNECT_TIMEOUT_MS, default 15s vs hardcoded 2s < hydra_control's ~3s initialize) | AgentSmith / a8dc16f1 (run_swdXhQuG3nVn) | Judge **PASS** (1.0/1.0/.05); smoke skipped (no root auto-detect) → pickup merge `095848d`; vitest 99/99, tsc clean, dist rebuilt in main checkout. Back-channel becomes functional on next smith daemon restart. |
+| FIX-F: RA-4 ack_run tool + banner acked_at filters; codex --add-dir for linked worktrees GATED to read-only sandbox | pair-programmer / 0938262a (run_BfP8_Q4YqaSi) | Judge REVISE (--add-dir on workspace-write would breach candidate isolation — host-analysis confirmed by codex) → Reflexion (read-only gate + guard tests) → **PASS** (1.0/1.0/.97); pickup merge `f8aabbb` (critique_failures byproducts excluded); ack-run 5/5 + codex-worktree 8/8 in main checkout, tsc clean, dist rebuilt. ack_run + sandbox fix live on next pp daemon restart. |
+
+New residuals recorded (S4): `pp_harness.get_rubric("rfc-2119-normative")` resolves null though verdicts pin that rubric id (registry lookup gap — judges inlined the rubric); intake repo-flag multiplicity counted mid-prose tokens before the prose-safe filter (fixed in FIX-D alongside RA-10).
+
 ## Phase 6 — Final status
 
 - Branch `fable-audit-2` @ `352724a`; five campaign merges (726e2ee, 168a474, a7aa846, 35a0da1, 352724a).
