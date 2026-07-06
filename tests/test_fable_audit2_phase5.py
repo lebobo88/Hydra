@@ -148,21 +148,33 @@ def test_bash_writes_hook_allows_git_status():
 
 
 @pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
-def test_bash_writes_hook_bypassed_when_stage_active():
-    """Hook must exit 0 when HYDRA_PP_STAGE_ACTIVE=1 (harness bypass)."""
+def test_bash_writes_hook_bypassed_when_stage_active(tmp_path):
+    """Hook must exit 0 when HYDRA_PP_STAGE_ACTIVE=1 and a real stage marker exists.
+
+    RA-1 hardening: the bypass now requires a filesystem marker. This test explicitly
+    creates the .harness/stage-active marker and points CLAUDE_PROJECT_DIR at it,
+    which is the correct way to simulate a harness-driven stage.
+    """
     assert _BASH_WRITES_SCRIPT.exists()
+    # RA-1: create the required stage-active marker.
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "stage-active").write_text("stage-id=phase5-bypass-test", encoding="utf-8")
+
     payload = json.dumps({
         "tool_name": "Bash",
         "tool_input": {"command": "echo x > foo.py"},
     })
     env = {**os.environ, "HYDRA_ENFORCE_ROUTING": "1",
-           "HYDRA_PP_STAGE_ACTIVE": "1"}
+           "HYDRA_PP_STAGE_ACTIVE": "1",
+           "CLAUDE_PROJECT_DIR": str(tmp_path)}
     result = subprocess.run(
         [_PWSH, "-NoProfile", "-File", str(_BASH_WRITES_SCRIPT)],
         input=payload, capture_output=True, text=True, env=env, timeout=15,
     )
     assert result.returncode == 0, (
-        f"Expected exit 0 with bypass, got {result.returncode}.\nstderr: {result.stderr}"
+        f"Expected exit 0 with bypass (stage-active marker present), "
+        f"got {result.returncode}.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
 
 

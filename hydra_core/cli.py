@@ -306,6 +306,45 @@ def _cmd_doctor(args) -> int:
             "(back-channel state unknown)"
         )
 
+    # --- RA-9: WS-AUTH operator key probe -----------------------------------
+    # Check whether an operator key is provisioned for Xenia's WS-AUTH capability
+    # enforcement (send_response / execute_approved). Never fail the doctor, never
+    # print the key or its length. OK when HYDRA_OPERATOR_KEY is non-empty in
+    # os.environ OR present under any backend spec's env block in
+    # ~/.hydra/backends.json (read-only parse, fail-soft on IO/parse errors).
+    try:
+        _wsauth_src: str | None = None
+        if os.environ.get("HYDRA_OPERATOR_KEY"):
+            _wsauth_src = "env"
+        else:
+            try:
+                _bj_path = Path.home() / ".hydra" / "backends.json"
+                if _bj_path.exists():
+                    _bj = json.loads(_bj_path.read_text(encoding="utf-8"))
+                    if isinstance(_bj, dict):
+                        for _bj_spec in _bj.values():
+                            if (
+                                isinstance(_bj_spec, dict)
+                                and isinstance(_bj_spec.get("env"), dict)
+                                and _bj_spec["env"].get("HYDRA_OPERATOR_KEY")
+                            ):
+                                _wsauth_src = "backends.json"
+                                break
+            except Exception:  # noqa: BLE001 — fail-soft on parse / IO errors
+                pass
+        if _wsauth_src:
+            print(f"OK:   WS-AUTH operator key configured (source={_wsauth_src})")
+        else:
+            print(
+                "WARN: WS-AUTH operator key unprovisioned - "
+                "xenia send_response/execute_approved will reject all tokens (fail-closed)"
+            )
+    except Exception as _wsauth_exc:  # noqa: BLE001 — never crash doctor
+        print(
+            f"WARN: WS-AUTH key probe error "
+            f"({type(_wsauth_exc).__name__}: {_wsauth_exc}) — key status unknown"
+        )
+
     return 0 if fail_count == 0 else 1
 
 
