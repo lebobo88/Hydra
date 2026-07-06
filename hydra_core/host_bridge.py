@@ -112,12 +112,49 @@ def _provision_worktree(repo_root: str, run_id: str) -> tuple[str, str] | None:
     return str(wt), branch
 
 
+_BYPRODUCT_PATTERNS: list[str] = [
+    "__pycache__/",
+    ".pytest_cache/",
+    "*.pyc",
+    "node_modules/",
+    ".tmp*/",
+]
+
+
+def _write_worktree_gitexcludes(worktree_path: str) -> None:
+    """Append byproduct patterns to the worktree-local git exclude file.
+
+    For linked worktrees the ``.git`` entry is a text file pointing at the
+    private gitdir; ``git rev-parse --git-path info/exclude`` resolves the
+    correct exclude file path regardless of worktree type.  Idempotent — patterns
+    already present in the file are not duplicated.  Fail-soft on any error.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "--git-path", "info/exclude"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return
+        raw = r.stdout.strip()
+        excl = Path(raw) if Path(raw).is_absolute() else Path(worktree_path) / raw
+        excl.parent.mkdir(parents=True, exist_ok=True)
+        existing = excl.read_text(encoding="utf-8") if excl.exists() else ""
+        to_add = [p for p in _BYPRODUCT_PATTERNS if p not in existing]
+        if to_add:
+            with excl.open("a", encoding="utf-8") as _f:
+                _f.write("\n".join(to_add) + "\n")
+    except Exception:  # noqa: BLE001 — fail-soft
+        pass
+
+
 def _merge_worktree_back(repo_root: str, worktree_path: str, branch: str) -> dict[str, Any]:
     """Commit the engineer's changes in the worktree and merge them into the
     repo's checked-out branch. Returns a status dict; never raises."""
     out: dict[str, Any] = {"merged": False, "sha": None, "error": None}
     try:
         # Stage + commit any uncommitted work the engineer left in the worktree.
+        _write_worktree_gitexcludes(worktree_path)
         st = _git(["status", "--porcelain"], worktree_path)
         if st.stdout.strip():
             _git(["add", "-A"], worktree_path)
@@ -167,6 +204,7 @@ def _preserve_non_complete_work(cursor: dict[str, Any], worktree_path: str,
     result exposed to the operator carry the branch name for pickup.
     """
     try:
+        _write_worktree_gitexcludes(worktree_path)
         st = _git(["status", "--porcelain"], worktree_path)
         if not (st.stdout or "").strip():
             return  # nothing to preserve — skip silently

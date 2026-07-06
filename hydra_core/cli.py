@@ -277,6 +277,10 @@ def _cmd_memory_tag(args) -> int:
         print(json.dumps({"error": "no cells supplied"}), file=sys.stderr)
         return 1
     merged = tag_episodic(args.key, cells, replace=bool(args.replace))
+    # MU11: tag_episodic returns an error dict when the key does not exist.
+    if isinstance(merged, dict) and "error" in merged:
+        print(json.dumps(merged, indent=2))
+        return 1
     print(json.dumps({"key": args.key, "cells": merged}, indent=2))
     return 0
 
@@ -2097,11 +2101,23 @@ def _cmd_status(args) -> int:
                 _snap = _sup.get_state(_config)
                 if _snap is not None and _snap.values:
                     _state = HydraState.model_validate(_snap.values)
+                    # MU15d: tasks whose id is in attended_done_task_ids show
+                    # "done (attended)" — the checkpoint status stays
+                    # "deferred_to_host" (append-reducer cannot update it in
+                    # place) but the attended host's completion signal is the
+                    # authoritative override for display.
+                    _done_task_ids = set(
+                        getattr(_state, "attended_done_task_ids", []) or []
+                    )
                     tasks_view = [
                         {
                             "task_id": str(t.task_id)[:8],
                             "owner_squad": t.owner_squad,
-                            "status": t.status,
+                            "status": (
+                                "done (attended)"
+                                if str(t.task_id) in _done_task_ids
+                                else t.status
+                            ),
                         }
                         for t in getattr(_state, "tasks", [])
                     ]

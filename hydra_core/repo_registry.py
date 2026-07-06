@@ -275,6 +275,21 @@ def is_known_repo(repo_id: str) -> bool:
         return False
 
 
+def known_repo_ids() -> set[str]:
+    """Return the full set of currently known repo ids (allow-list + extras).
+
+    Combines ``_REPO_DIRNAMES`` keys with any operator-registered ids from
+    ``_load_extra_repos()``. Fail-soft: extra-repo load errors are silently
+    ignored so the built-in ids are always returned.
+    """
+    ids: set[str] = set(_REPO_DIRNAMES.keys())
+    try:
+        ids |= set(_load_extra_repos().keys())
+    except Exception:  # noqa: BLE001
+        pass
+    return ids
+
+
 def normalize_repo_subpath(subpath: str) -> str:
     """Validate and normalize a repo-relative target subpath.
 

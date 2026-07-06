@@ -12,6 +12,7 @@ squad-node per pack so the graph is self-describing.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -555,6 +556,45 @@ def build_supervisor(
                 {"repo": _fleet_repo_ids[0]},
             )
         # 0 repos from --repos/--fleet: nothing changes.
+
+        # MU5 — conservative goal-prose repo inference.
+        # After all explicit-flag handling, if no target was set, scan the goal
+        # text for known repo ids mentioned near one of the recognised cue phrases:
+        #   "repo:", "repository", "in repo", "monorepo"
+        # A match is "cued" when the id appears within ~40 chars AFTER a cue phrase
+        # (case-insensitive, word-boundary matched). Exactly one cued id → infer;
+        # any other situation (multiple cued ids, or uncued mentions) → warn only.
+        # Never overrides an explicit --repo/--repos flag.
+        if not state.target_repo_id:
+            from hydra_core.repo_registry import known_repo_ids as _known_repo_ids
+            _all_known_ids = _known_repo_ids()
+            _goal_lower = (state.root_goal or "").lower()
+            _matched_ids: set[str] = set()
+            for _rid in _all_known_ids:
+                if re.search(r"\b" + re.escape(_rid) + r"\b", _goal_lower):
+                    _matched_ids.add(_rid)
+            if _matched_ids:
+                _CUE_PAT = r"(?:repo:|repository|in repo|monorepo)"
+                _cued_ids: set[str] = set()
+                for _rid in _matched_ids:
+                    _id_pat = r"\b" + re.escape(_rid) + r"\b"
+                    if re.search(_CUE_PAT + r".{0,40}" + _id_pat, _goal_lower, re.DOTALL):
+                        _cued_ids.add(_rid)
+                if len(_cued_ids) == 1:
+                    _inferred_id = next(iter(_cued_ids))
+                    state.target_repo_id = _inferred_id
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "intake.repo_inferred_from_goal",
+                        {"repo_id": _inferred_id},
+                    )
+                else:
+                    # Multiple cued ids, or uncued mentions only — warn, don't infer.
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "intake.repo_mention_without_target",
+                        {"mentioned": sorted(_matched_ids)},
+                    )
 
         # Route the goal text. A pre-seeded non-empty `selected_squads`
         # (CLI `hydra run --squad ...` / operator force-select) wins over
