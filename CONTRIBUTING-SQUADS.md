@@ -170,6 +170,41 @@ invoke:
   notes: "Activate by adding implementing agents + MCP server + commands."
 ```
 
+## d-1) Tool declaration naming
+
+Tool entries in `squad.yaml` under `tools:` declare **host-side capability
+bindings** — they tell the dispatcher which privileges the squad's agents hold
+and which MCP server backs a live tool. An entry like:
+
+```yaml
+tools:
+  - name: ticket-system-bridge
+    mcp_server: xenia-tickets
+    privilege: write
+```
+
+means: "the `ticket-system-bridge` capability is served by the MCP server
+registered as `xenia-tickets` in `.mcp.json`". This binding is a **host-side
+intent declaration for pack agents** — it wires the logical tool name to a
+real server for the runtime — but it is **NOT a dispatcher RBAC grant**.
+
+Dispatcher RBAC (in `_check_tool_rbac`) matches on the **exact tool name AND
+the MCP server key** as they appear in live MCP calls (e.g. `server=xenia-tickets`,
+`tool=ticket-system-bridge`). A tool listed in `squad.yaml` is allowed only
+when the calling squad's pack has that exact `(name, mcp_server)` pair in its
+`tools` block — see the comment in `squads/engineering/squad.yaml` for a worked
+example.
+
+For `claude-skill` squads, the dispatcher auto-authorizes the shim tool pair
+`{shim_prefix}.command.list` and `{shim_prefix}.output.write` — where
+`shim_prefix` is the per-squad value in `_SKILL_PACK_SHIMS` (e.g. `xenia` for
+`customer-support`, `rlm` for `garland`). These two tools are injected by the
+skill-dispatch infrastructure (`_via_claude_skill`) and therefore do **not** need
+to be listed in `squad.yaml`. Note: `.ping` is a doctor reachability probe, not
+an RBAC-authorized tool; `.invoke_skill` is not registered in the RBAC table.
+All other tools must be declared in `tools:` to be RBAC-allowed.
+See `dispatcher._check_tool_rbac` (RA-3 block) for the enforcement code.
+
 ## d) Wiring the squad's runtime
 
 Depending on entrypoint:

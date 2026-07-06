@@ -107,6 +107,12 @@ agents:
     notes: "Always the LAST gate before any outbound write. PII, disclosure, right-to-human, OWASP LLM01/02/06/08."
 
 tools:
+  # Tool declaration naming note (see CONTRIBUTING-SQUADS.md §d-1):
+  # These entries declare host-side capability bindings for Xenia's pack agents,
+  # NOT dispatcher RBAC grants on their own. RBAC matches exact (name, mcp_server)
+  # pairs; claude-skill squads also get a shim pair auto-authorized by the
+  # dispatcher._check_tool_rbac RA-3 block. abstract names (e.g.
+  # ticket-system-bridge @ xenia-tickets) must appear here to be RBAC-allowed.
   - name: ticket-system-bridge
     privilege: write
     mcp_server: xenia-tickets
