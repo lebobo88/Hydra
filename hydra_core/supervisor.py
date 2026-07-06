@@ -1798,7 +1798,14 @@ def build_supervisor(
             # skill and re-injects emitted envelopes via the continuation
             # transport (hydra.workflow.submit_envelopes -> ingest). Stub/test
             # dispatchers (live_execution=False) keep the legacy in-graph path.
-            if getattr(dispatcher, "live_execution", False) and pack.entrypoint != "mcp":
+            #
+            # RA-5: stub squads are EXCLUDED from this live-defer pre-filter.
+            # A stub squad has a real in-graph path (_stub) that returns a
+            # canned [STUB] DecisionRecord with status="surfaced" — deferring
+            # it to the host strands the task as deferred_to_host instead of
+            # surfacing the honest stub signal. Only agent-impersonation and
+            # claude-skill (which genuinely need a host executor) are deferred.
+            if getattr(dispatcher, "live_execution", False) and pack.entrypoint not in ("mcp", "stub"):
                 emit_trace(judge_trace_root, state.workflow_id, "dispatch.deferred_to_host", {
                     "squad": pack.slug,
                     "entrypoint": pack.entrypoint,
@@ -2827,6 +2834,38 @@ def build_supervisor(
         )
         record_dict = record.model_dump(mode="json")
         eights.envelope_record(record_dict)
+
+        # RA-8: persist the synthesized DECISION_RECORD to episodic memory so
+        # the workflow becomes queryable via list_episodic / search_episodic.
+        # Fail-soft: a DB error (locked file, disk full, schema mismatch) must
+        # never prevent synthesis from completing and returning to the caller.
+        try:
+            from . import memory as _mem  # noqa: PLC0415 — local import to keep runtime-agnostic
+            _run_squads = list({t.owner_squad for t in (state.tasks or [])})
+            _rationale_excerpt = "\n".join(rationale_lines)[:500]
+            _mem.append_episodic(
+                state.workflow_id,
+                kind="decision_record",
+                payload={
+                    "rationale": _rationale_excerpt,
+                    "artifact_refs": [a.key for a in all_artifacts],
+                    "squads": _run_squads,
+                },
+                key=f"ep:{state.workflow_id}:decision_record",
+                origin_squad="hydra",
+            )
+            for _art_ref in all_artifacts:
+                _art_kind = _art_ref.summary or "artifact"
+                _mem.append_episodic(
+                    state.workflow_id,
+                    kind=_art_kind,
+                    payload={"ref_key": _art_ref.key},
+                    key=f"ep:{state.workflow_id}:{_art_ref.key}",
+                    origin_squad="hydra",
+                )
+        except Exception:  # noqa: BLE001 — never block synthesis on a DB error
+            pass
+
         return {
             "envelopes": [record_dict],
             "phase": "judge_synthesis",

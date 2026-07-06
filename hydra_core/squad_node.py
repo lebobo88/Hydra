@@ -2393,18 +2393,23 @@ _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
 }
 
 
-def _resolve_skill_shim(slug: str) -> dict[str, str]:
-    """Resolve the MCP shim for a claude-skill squad. An unknown slug is a
-    routing bug — log loudly (it would otherwise silently write to garland's
-    rlm_creative server + wrong path) and fall back to garland so we don't crash."""
+def _resolve_skill_shim(slug: str) -> dict[str, str] | None:
+    """Resolve the MCP shim for a claude-skill squad.
+
+    RA-3 (fail-CLOSED): an unknown slug is a routing bug. Returning garland's
+    shim would silently persist output to the *wrong* pack store (rlm_creative)
+    and RBAC-authorize calls to a server the squad does not own. We now return
+    None so the caller (_via_claude_skill) can surface a clear error instead of
+    writing to the wrong destination.
+    """
     shim = _SKILL_PACK_SHIMS.get(slug)
     if shim is None:
         _log.warning(
-            "claude-skill squad %r has no _SKILL_PACK_SHIMS entry — falling back to "
-            "garland (rlm_creative). Output will land in the WRONG pack; add a shim.",
+            "claude-skill squad %r has no _SKILL_PACK_SHIMS entry — "
+            "returning None (fail-CLOSED). Add a shim entry to _SKILL_PACK_SHIMS.",
             slug,
         )
-        return _SKILL_PACK_SHIMS["garland"]
+        return None
     return shim
 
 
@@ -2537,6 +2542,20 @@ def _via_claude_skill(
     on-disk path. Squads without a shim entry use the RLM shim (legacy default).
     """
     shim = _resolve_skill_shim(pack.slug)
+    # RA-3 fail-CLOSED: unknown slug has no shim → surface instead of routing
+    # to the wrong pack store. This is a configuration error (add an entry to
+    # _SKILL_PACK_SHIMS), never a silent fallback.
+    if shim is None:
+        return SquadResult(
+            envelopes=[],
+            artifacts=[],
+            status="surfaced",
+            rationale=(
+                f"claude-skill squad {pack.slug!r} has no entry in _SKILL_PACK_SHIMS. "
+                "Routing to the wrong pack store is not allowed. "
+                "Add a shim entry for this squad in hydra_core/squad_node.py."
+            ),
+        )
     server, prefix = shim["server"], shim["prefix"]
     invoke = pack.invoke or {}
     cmd = invoke.get("command_hint", shim["default_cmd"])

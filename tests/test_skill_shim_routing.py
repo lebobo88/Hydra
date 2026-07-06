@@ -36,10 +36,12 @@ def test_known_skill_squads_unchanged():
     assert _resolve_skill_shim("rlm-gaming")["server"] == "rlm_gaming"
 
 
-def test_unknown_squad_falls_back_to_garland_with_warning(caplog):
+def test_unknown_squad_returns_none_with_warning(caplog):
+    """RA-3 fail-CLOSED: unknown slug returns None (not garland fallback) to
+    prevent silently writing to the wrong pack store."""
     with caplog.at_level(logging.WARNING):
         shim = _resolve_skill_shim("totally-unknown-squad")
-    assert shim["server"] == "rlm_creative"  # garland fallback (no crash)
+    assert shim is None  # fail-CLOSED: no silent fallback to garland
     assert any("no _SKILL_PACK_SHIMS entry" in r.message for r in caplog.records)
 
 

@@ -235,12 +235,39 @@ class MCPStdioDispatcher:
 
         Returns None if authorized, or a rejection reason string.
         Skips enforcement when squad_id is None (CLI/test paths).
+
+        RA-3: claude-skill squads are auto-authorized for their own shim tool
+        pair ({prefix}.command.list / {prefix}.output.write) on their shim
+        server. These tools are not listed in squad.yaml because they are
+        injected by the skill-dispatch infrastructure (_via_claude_skill), not
+        declared by the squad author. Importing _SKILL_PACK_SHIMS lazily
+        (inside the function) avoids a circular import — squad_node imports
+        from schemas/state/iolaus, dispatcher imports nothing from squad_node
+        at module level, so the lazy load is safe.
         """
         if squad_id is None:
             return None
         pack = self._squad_packs.get(squad_id)
         if pack is None:
             return None
+
+        # RA-3: auto-authorize each claude-skill squad's own shim tool pair.
+        if getattr(pack, "entrypoint", None) == "claude-skill":
+            # Lazy import to avoid a circular-import if the import graph changes.
+            try:
+                from .squad_node import _SKILL_PACK_SHIMS  # noqa: PLC0415
+                shim = _SKILL_PACK_SHIMS.get(squad_id)
+                if shim is not None:
+                    shim_server = shim["server"]
+                    shim_prefix = shim["prefix"]
+                    if server == shim_server and tool in (
+                        f"{shim_prefix}.command.list",
+                        f"{shim_prefix}.output.write",
+                    ):
+                        return None  # authorized: this squad's own shim pair
+            except ImportError:
+                pass  # fail-open on import error; fall through to declared-tools check
+
         declared_tools = getattr(pack, "tools", ())
         tool_key = f"{server}.{tool}" if server else tool
         for t in declared_tools:
@@ -270,7 +297,19 @@ class MCPStdioDispatcher:
                  *, squad_id: str | None = None) -> dict[str, Any]:
         rejection = self._check_tool_rbac(server, tool, squad_id)
         if rejection:
-            logger.warning("MCP RBAC violation: %s", rejection)
+            # RA-3: structured warning with the dispatch.rbac_denied event key
+            # so log aggregators can identify shim-authorization failures as a
+            # distinct signal from general RBAC violations.
+            logger.warning(
+                "dispatch.rbac_denied server=%s tool=%s squad=%s: %s",
+                server, tool, squad_id, rejection,
+                extra={
+                    "event": "dispatch.rbac_denied",
+                    "server": server,
+                    "tool": tool,
+                    "squad_id": squad_id,
+                },
+            )
             from . import telemetry
             try:
                 telemetry.emit(self.project_root, "rbac", "rbac_violation", {
