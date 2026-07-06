@@ -3,6 +3,19 @@
 Branch: `fable-audit-2` (HEAD 45dc757). Plan: `~/.claude/plans/ever-since-all-the-logical-lark.md`.
 Policy: fix-as-found; Tiers 0–4 (full coverage, ~$15-35 ceiling).
 
+## FINAL STATUS (end of 2026-07-05): ALL FINDINGS CLOSED
+
+Every MU finding is now **fixed and merged** (or operationally resolved). Rounds 4-6 closed the remainder:
+- **MU1+MU3** (doctor probes, msgpack serde) — merged `07c12b9`.
+- **MU17** (NEW, found round 4: baseline full-suite double-run blew the 300s attended step budget once the suite crossed ~240s — attended steps on Hydra hard-blocked): per-HEAD baseline cache + no-double-run-on-timeout, bootstrap-fixed + committed `b5f7625`; live-validated (blocked step → seconds).
+- **MU9a/MU9b** (router stub exclusion + keyword siphon) — cross-vendor codex judged (revise→pass, caught a phase34 test regression + missing trace assertion), merged.
+- **MU16+MU14** (pre-candidate budget gates fleet+global; timeout cost visibility) — merged; judge noted one polish item: all-candidates-skipped finalizes "aborted" rather than "surfaced-budget-exhausted" (cosmetic, trace fires correctly).
+- **MU5+MU11+MU13+MU15d** (conservative goal-prose repo inference with cue words; memory tag unknown-key error incl. the MCP tag_memory handler the judge caught; worktree info/exclude byproduct guard; "done (attended)" status rendering) — merged.
+- **MU4** operational: `hydra reap --apply` parked 262 stale workflows.
+- **Judge-cross-vendor agent FIXED and live-validated**: root cause was gateway-mode tool-name mismatch (`mcp__pp_codex__critique` doesn't exist under the gateway; agents now grant both plain and `mcp__hydra_gateway__`-prefixed names + explicit no-filesystem instruction). The repaired agent ran two full codex critiques cleanly, one returning a genuine revise.
+- **Stray gateways killed** (4 from old sessions + stale hydra_control children). Discovery: the gateway serves hydra_control handlers from its own long-lived context, so server.py changes require a fresh session's gateway (child-killing is insufficient) — session hygiene note, not a code defect.
+- Chronic residual (documented, non-blocking): the 600s finalize smoke times out on the Hydra repo when the box is busy (suite ≈ 240s+ under load × worktree) → judge-passed work surfaces with `preserved_branch` and lands via a one-command salvage merge (MU12 machinery). Proper fix is a scoped smoke profile (tracked as the surviving piece of MU6).
+
 ## Findings ledger
 
 | ID | Sev | Tier/Cell | Feature | Invocation | Expected | Observed | Evidence | Suspect commit/module | Status |

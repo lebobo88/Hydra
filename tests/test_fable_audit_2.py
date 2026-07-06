@@ -416,7 +416,8 @@ class TestPpBestOfImpliesN3:
         from hydra_core.squad_node import _drive_pp_stage_loop
 
         def _fake_best_of(dispatcher, *, run_id, project_path, request_text,
-                          n, model_tier=None, judge_rubric_id=None, workflow_id=None):
+                          n, model_tier=None, judge_rubric_id=None, workflow_id=None,
+                          state=None, repo_id=None):  # MU16: budget-gate kwargs
             n_received.append(n)
             return {
                 "final_status": "complete", "stage_outcome": outcome,
