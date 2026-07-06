@@ -265,7 +265,7 @@ def _cmd_doctor(args) -> int:
         try:
             _vs_res = dispatcher.call_mcp(
                 "agentsmith",
-                "agentsmith.venom.cross_check",
+                "agentsmith.hydra.venom_cross_check",
                 {"capability": "ping"},
             )
             _vs_status = _vs_res.get("status") if isinstance(_vs_res, dict) else None
@@ -279,13 +279,13 @@ def _cmd_doctor(args) -> int:
                 )
                 if _rationale == "hydra-mcp-unavailable":
                     print(
-                        "WARN: agentsmith venom.cross_check — smith→hydra back-channel "
+                        "WARN: agentsmith venom_cross_check — smith→hydra back-channel "
                         f"unavailable (rationale={_rationale!r}); "
                         "check that hydra_gateway is registered in ~/.hydra/backends.json"
                     )
                 else:
                     print(
-                        f"OK:   agentsmith venom.cross_check reachable "
+                        f"OK:   agentsmith venom_cross_check reachable "
                         f"(back-channel rationale={_rationale!r})"
                     )
             else:
@@ -294,10 +294,10 @@ def _cmd_doctor(args) -> int:
                     if isinstance(_vs_res, dict)
                     else f"non-dict {type(_vs_res).__name__}"
                 )
-                print(f"WARN: agentsmith venom.cross_check — {_vs_err}")
+                print(f"WARN: agentsmith venom_cross_check — {_vs_err}")
         except Exception as _vs_exc:  # noqa: BLE001 — venom probe must never crash doctor
             print(
-                f"WARN: agentsmith venom.cross_check raised "
+                f"WARN: agentsmith venom_cross_check raised "
                 f"{type(_vs_exc).__name__}: {_vs_exc}"
             )
     else:
