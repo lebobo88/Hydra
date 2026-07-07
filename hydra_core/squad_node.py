@@ -932,6 +932,30 @@ def _judge_artifact_text(
     return (head + "\n\n".join(parts))[:max_chars]
 
 
+def _execution_evidence_md(
+    project_path: str, smoke_status: str, smoke_reason: str
+) -> str:
+    """Render a short ``## Execution evidence`` block for the judge (R9).
+
+    The smoke is a REAL install/build/test execution outside the sandbox. Judges
+    that see only a prose summary + diff have no signal that the candidate's
+    build/tests actually ran, so they withhold ``pass`` for "regression
+    confidence" even when the smoke already succeeded. Feeding the smoke command
+    + its outcome into the judge context gives that evidence explicitly. Kept
+    short (reason clipped) so it never crowds out the diff."""
+    cmd = _detect_smoke_command(project_path)
+    cmd_str = " ".join(cmd) if cmd else "(no runnable build/test command detected)"
+    reason = (smoke_reason or "").strip()
+    lines = [
+        "## Execution evidence",
+        f"- smoke command: `{cmd_str}`",
+        f"- smoke status: {smoke_status}",
+    ]
+    if reason:
+        lines.append(f"- smoke detail: {reason[:500]}")
+    return "\n".join(lines)
+
+
 def _drop_open_run(
     state: "HydraState", collect_open_runs: list | None, run_id: str
 ) -> None:
@@ -1483,6 +1507,7 @@ def _drive_best_of_loop(
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
         "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "best_of_n": n,
+        "smoke_excluded_candidates": [],
     }
 
     def _trace(kind: str, payload: dict[str, Any]) -> None:
@@ -1606,6 +1631,21 @@ def _drive_best_of_loop(
                 scored.append({"ci": ci_idx, "att": att_id, "outcome": "fail",
                                "rank": -1.0, "smoke": "skipped", "critique": gen_fail})
                 continue
+            # (A) R9: run the smoke BEFORE judging (it used to run after). Two
+            # reasons: winner selection below can be smoke-aware (B), and the
+            # judge is handed the real execution outcome (evidence appended to
+            # judge_text) so it stops withholding pass for regression fear on a
+            # candidate whose build/tests already passed.
+            smoke_status, _smoke_reason = _run_smoke(
+                dispatcher, project_path=wt, stage_id=stage_id)
+            try:
+                cm("pp_harness", "record_smoke_status", {
+                    "stage_id": stage_id, "candidate_index": ci_idx,
+                    "status": smoke_status,
+                    "reason": (_smoke_reason or "best-of candidate smoke")[:300],
+                }, squad_id=sq)
+            except Exception:  # noqa: BLE001
+                pass
             # Judge per pp's routing (identical policy to the single path).
             gate: dict[str, Any] = {}
             try:
@@ -1620,6 +1660,9 @@ def _drive_best_of_loop(
             gate_rubric = str(gate.get("rubric_id") or judge_rubric_id)
             rubric_body = _rubric_md(gate_rubric)
             judge_text = _judge_artifact_text(wt, sorted(run_changed), gen_text)
+            # (A) Give the judge the candidate's real execution outcome.
+            judge_text = judge_text + "\n\n" + _execution_evidence_md(
+                wt, smoke_status, _smoke_reason)
             if (not required_cross) and producer == "claude":
                 _trace("judge.start", {"candidate": ci_idx, "n": n,
                                        "vendor": "claude"})
@@ -1667,16 +1710,7 @@ def _drive_best_of_loop(
             if (required_cross and not cross_vendor) and v_outcome == "pass":
                 v_outcome = "revise"
                 score["_judge_degraded"] = True
-            smoke_status, _smoke_reason = _run_smoke(
-                dispatcher, project_path=wt, stage_id=stage_id)
-            try:
-                cm("pp_harness", "record_smoke_status", {
-                    "stage_id": stage_id, "candidate_index": ci_idx,
-                    "status": smoke_status,
-                    "reason": (_smoke_reason or "best-of candidate smoke")[:300],
-                }, squad_id=sq)
-            except Exception:  # noqa: BLE001
-                pass
+            # (A) smoke already ran + was recorded above (before judging).
             scored.append({"ci": ci_idx, "att": att_id, "outcome": v_outcome,
                            "rank": _rank_key(v_outcome, score, smoke_status),
                            "smoke": smoke_status, "critique": v_crit})
@@ -1686,10 +1720,40 @@ def _drive_best_of_loop(
                 "outcome": v_outcome, "smoke": smoke_status,
                 "cross_vendor": cross_vendor})
 
+        # (B) R9: smoke-aware selection. The smoke is a REAL install/build/test
+        # execution; a candidate whose smoke FAILED can never merge (pp refuses
+        # merge_status="smoke_failed"), so picking it over a smoke-PASS candidate
+        # on judge preference alone discarded the whole stage (incidents
+        # run_eawskOzIx3TS / run_fL4GeNrIRfaS, ~USD 26 of judged work lost).
+        # When >=1 candidate passed smoke, restrict selection to that subset and
+        # rank within it by the existing judge/Borda order. When NONE passed,
+        # keep today's behavior (judge order over all) and let the post-selection
+        # smoke veto (C) surface the stage.
+        smoke_passed = [s for s in scored if s["smoke"] == "pass"]
+        if smoke_passed:
+            eligible = smoke_passed
+            excluded_by_smoke = [s for s in scored if s["smoke"] != "pass"]
+        else:
+            eligible = scored
+            excluded_by_smoke = []
+        out["smoke_excluded_candidates"] = [
+            {"ci": s["ci"], "smoke": s["smoke"]} for s in excluded_by_smoke
+        ]
+        if excluded_by_smoke:
+            _log.info(
+                "best-of: %d candidate(s) excluded by smoke (run=%s): %s",
+                len(excluded_by_smoke), run_id, out["smoke_excluded_candidates"])
+            _trace("best_of.smoke_excluded", {
+                "stage_id": stage_id,
+                "excluded": out["smoke_excluded_candidates"],
+                "eligible": [s["ci"] for s in eligible]})
+
         # Rank + Borda: highest rank first; Borda aggregates the judge order.
-        ranked = sorted(scored, key=lambda s: s["rank"], reverse=True)
+        # Ranking/Borda operate over the smoke-eligible subset only (B), so a
+        # smoke-fail candidate can never be resurrected by a high judge score.
+        ranked = sorted(eligible, key=lambda s: s["rank"], reverse=True)
         ranking_atts = [s["att"] for s in ranked if s["att"]]
-        cand_atts = [s["att"] for s in scored if s["att"]]
+        cand_atts = [s["att"] for s in eligible if s["att"]]
         winner_att = ranking_atts[0] if ranking_atts else None
         if len(cand_atts) >= 2 and ranking_atts:
             try:
@@ -1705,7 +1769,7 @@ def _drive_best_of_loop(
         # wrong one regardless of rank.
         winner = None
         if winner_att:
-            matches = [s for s in scored if s["att"] == winner_att]
+            matches = [s for s in eligible if s["att"] == winner_att]
             if len(matches) == 1:
                 winner = matches[0]
         if winner is None:
@@ -1854,10 +1918,14 @@ def _drive_best_of_loop(
 
         td_note = (f" teardown={out['teardown_status']}"
                    if out.get("teardown_status") else "")
+        # (B) R9: record which candidates the smoke gate excluded from selection.
+        _excl = out.get("smoke_excluded_candidates") or []
+        _excl_note = (
+            f" smoke_excluded={[e['ci'] for e in _excl]}" if _excl else "")
         # F30: embed any error reason in summary_md.
         summary = (f"Headless best-of-{n}: winner candidate={winner['ci']} "
                    f"outcome={winner['outcome']} smoke={winner['smoke']} "
-                   f"merge={merge_status}{td_note}"
+                   f"merge={merge_status}{td_note}{_excl_note}"
                    f"{f' :: {out['error']}' if out.get('error') and not passed else ''}.")
         fin = cm("pp_harness", "finalize_run", {
             "run_id": run_id, "status": "complete" if passed else "surfaced",
