@@ -1386,3 +1386,188 @@ def test_f7_judge_files_tools_do_not_include_record_verdict():
                     f"Finding 7: {name} tools frontmatter must NOT list "
                     f"mcp__pp_harness__record_verdict (got: {line!r})")
                 break
+
+
+# ===========================================================================
+# R9: smoke-aware best-of winner selection + execution evidence for judges
+# (incidents run_eawskOzIx3TS / run_fL4GeNrIRfaS — ~USD 26 discarded because a
+#  judge-preferred but smoke-FAILED candidate was picked over a smoke-PASS one,
+#  and judges withheld pass for lack of execution evidence).
+# ===========================================================================
+
+def _make_best_of_dispatcher(*, borda_winner_att=None, judge_capture=None):
+    """A dispatcher for _drive_best_of_loop with 2 candidates and unique attempt
+    ids (att-0 / att-1) keyed off record_attempt's candidate_index note.
+
+    ``borda_winner_att`` — attempt id borda_count should return as winner
+    (simulates the judge/Borda preferring that candidate). When it names a
+    candidate that is smoke-excluded, the smoke-aware selection must ignore it.
+    ``judge_capture`` — optional list; unused here (judge text is captured by
+    monkeypatching _claude_critique in the test that needs it)."""
+
+    def _fake_cm(server, tool, args, *, squad_id=None):
+        if tool == "start_best_of_stage":
+            n = int(args.get("n") or 2)
+            cands = [{"candidate_index": i, "attempt_slot_id": f"s{i}",
+                      "worktree_path": f"/tmp/wt{i}"} for i in range(n)]
+            return {"status": "done", "result": {
+                "stage_id": "stg-bo", "n": n, "candidates": cands}}
+        if tool == "record_attempt":
+            ci = int((args.get("notes") or {}).get("candidate_index") or 0)
+            return {"status": "done", "result": {"attempt_id": f"att-{ci}"}}
+        if tool == "borda_count":
+            return {"status": "done", "result": {"winner": borda_winner_att}}
+        if tool == "gate_eligible_judges":
+            return {"status": "done", "result": {
+                "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+        if tool == "get_stage_finalize_readiness":
+            return {"status": "done", "result": {"can_pass": True}}
+        if tool == "archive_winner_and_losers":
+            return {"status": "done", "result": {"merge_status": "merged"}}
+        if tool == "finalize_run":
+            return {"status": "done", "result": {"effective_status": "complete"}}
+        if tool == "teardown_candidates":
+            return {"status": "done", "result": {"teardown_status": "ok"}}
+        return {"status": "done", "result": {}}
+
+    class _BODisp:
+        def __init__(self):
+            self.calls: list[tuple[str, str, dict]] = []
+
+        def call_mcp(self, server, tool, args, *, squad_id=None):
+            self.calls.append((server, tool, dict(args)))
+            return _fake_cm(server, tool, args, squad_id=squad_id)
+
+        def tool_seq(self):
+            return [t for (_s, t, _a) in self.calls]
+
+        def emit_claude_prompt(self, *a, **k): return {"text": "ok", "model": "m"}
+        def invoke_claude_skill(self, *a, **k): raise NotImplementedError
+        def spawn_subprocess(self, *a, **k): raise NotImplementedError
+
+    return _BODisp()
+
+
+def _patch_generate_and_judge(monkeypatch, *, outcome="pass", score=None):
+    """Stub _drive_generate (claude producer, wrote nothing but non-empty text)
+    and _claude_critique so best-of runs without a real repo/model."""
+    monkeypatch.setattr("hydra_core.squad_node._drive_generate",
+                        lambda *a, **k: (
+                            {"status": "done", "result": {
+                                "text": "edit summary", "model": "m",
+                                "tokens_in": 1, "tokens_out": 1,
+                                "cost_usd": 0.01, "wall_ms": 10}},
+                            "claude"))
+    monkeypatch.setattr("hydra_core.squad_node._claude_critique",
+                        lambda *a, **k: {"outcome": outcome, "critique_md": "ok",
+                                         "score": dict(score or {"c": 9}),
+                                         "cost_usd": 0.0,
+                                         "tokens_in": 0, "tokens_out": 0})
+
+
+def test_r9_smoke_fail_candidate_excluded_when_another_passed(monkeypatch):
+    """When >=1 candidate passes smoke, a smoke-FAILED candidate must be excluded
+    from selection even if the judge/Borda prefers it. Winner must be the
+    smoke-pass candidate, and it must merge (final complete)."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    # Candidate 0 fails smoke, candidate 1 passes.  worktree_path is /tmp/wt<idx>.
+    smoke_map = {"/tmp/wt0": ("fail", "exit=1"), "/tmp/wt1": ("pass", "exit=0")}
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda disp, *, project_path, stage_id:
+                        smoke_map.get(project_path, ("skipped", "")))
+    _patch_generate_and_judge(monkeypatch)
+
+    # Borda "prefers" candidate 0 (the smoke-FAIL one) — must be ignored.
+    disp = _make_best_of_dispatcher(borda_winner_att="att-0")
+    out = _drive_best_of_loop(disp, run_id="run-bo", project_path="/tmp/proj",
+                              request_text="do it", n=2)
+
+    # Winner is the smoke-PASS candidate (index 1), not the judge-preferred one.
+    aw = [a for (_s, t, a) in disp.calls if t == "archive_winner_and_losers"]
+    assert aw, "smoke-pass winner must be merged via archive_winner_and_losers"
+    assert aw[0]["winner_candidate_index"] == 1, (
+        f"R9: winner must be the smoke-PASS candidate (1), got {aw[0]}")
+    assert out["final_status"] == "complete"
+    excluded = [e["ci"] for e in out.get("smoke_excluded_candidates", [])]
+    assert 0 in excluded, (
+        f"R9: smoke-fail candidate 0 must be recorded as excluded, got {excluded}")
+
+
+def test_r9_all_smoke_fail_preserves_old_behavior(monkeypatch):
+    """When NO candidate passes smoke, selection falls back to today's judge
+    order and the post-selection smoke veto surfaces the stage (no merge)."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *a, **k: ("fail", "exit=1"))
+    _patch_generate_and_judge(monkeypatch)
+
+    disp = _make_best_of_dispatcher(borda_winner_att="att-0")
+    out = _drive_best_of_loop(disp, run_id="run-bo", project_path="/tmp/proj",
+                              request_text="do it", n=2)
+
+    # No candidate passed → nothing excluded, veto downgrades to surfaced, and
+    # archive_winner_and_losers must NOT run (no failed code lands).
+    assert out.get("smoke_excluded_candidates") == [], (
+        "R9: all-fail must exclude nothing (old-behavior fallback)")
+    assert out["final_status"] == "surfaced"
+    assert "archive_winner_and_losers" not in disp.tool_seq(), (
+        "R9: a stage where every candidate failed smoke must not merge a winner")
+
+
+def test_r9_judge_context_contains_execution_evidence(monkeypatch):
+    """The judge's artifact text must carry a '## Execution evidence' section
+    stating the smoke command + its status (so the judge sees the build/tests
+    actually ran)."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *a, **k: ("pass", "`pytest -q` exit=0"))
+    captured: list[str] = []
+    monkeypatch.setattr("hydra_core.squad_node._drive_generate",
+                        lambda *a, **k: (
+                            {"status": "done", "result": {
+                                "text": "edit summary", "model": "m",
+                                "tokens_in": 1, "tokens_out": 1,
+                                "cost_usd": 0.01, "wall_ms": 10}},
+                            "claude"))
+
+    def _capture_critique(artifact_text, rubric_md, cwd, *a, **k):
+        captured.append(artifact_text)
+        return {"outcome": "pass", "critique_md": "ok", "score": {"c": 9},
+                "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0}
+    monkeypatch.setattr("hydra_core.squad_node._claude_critique",
+                        _capture_critique)
+
+    disp = _make_best_of_dispatcher()
+    _drive_best_of_loop(disp, run_id="run-bo", project_path="/tmp/proj",
+                        request_text="do it", n=2)
+
+    assert captured, "judge critique must have been invoked"
+    assert all("## Execution evidence" in t for t in captured), (
+        "R9: every judge artifact must carry the Execution evidence heading")
+    assert any("smoke status: pass" in t for t in captured), (
+        "R9: execution evidence must state the smoke status")
+
+
+def test_r9_smoke_runs_before_judging(monkeypatch):
+    """ORDER: for each candidate record_smoke_status must be emitted BEFORE the
+    judge gate (gate_eligible_judges) and BEFORE record_verdict — smoke now runs
+    ahead of judging so the judge can see the execution outcome."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *a, **k: ("pass", "exit=0"))
+    _patch_generate_and_judge(monkeypatch)
+
+    disp = _make_best_of_dispatcher()
+    _drive_best_of_loop(disp, run_id="run-bo", project_path="/tmp/proj",
+                        request_text="do it", n=1)
+
+    seq = disp.tool_seq()
+    assert "record_smoke_status" in seq and "gate_eligible_judges" in seq
+    assert seq.index("record_smoke_status") < seq.index("gate_eligible_judges"), (
+        f"R9: smoke must be recorded before the judge gate, got {seq}")
+    assert seq.index("record_smoke_status") < seq.index("record_verdict"), (
+        f"R9: smoke must be recorded before the verdict, got {seq}")
