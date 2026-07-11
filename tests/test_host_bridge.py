@@ -522,3 +522,127 @@ def test_reflexion_clears_idempotency_markers(tmp_path, monkeypatch):
     assert "smoke_result_for" not in cursor_after, (
         "smoke_result_for must be cleared after Reflexion transition"
     )
+
+
+# --------------------------------------------------------------------------- #
+# LV-1: error-payload detection                                               #
+# --------------------------------------------------------------------------- #
+# MCPStdioDispatcher.call_mcp returns error DICTS instead of raising, so the
+# existing try/except downgrade paths would silently pass through failures.
+# _raise_on_error_payload converts those dicts into RuntimeError so the
+# existing except clauses fire for payload-level errors too.
+
+
+class _FakeDispatcherVerdictRejected(FakeDispatcher):
+    """Variant where record_verdict returns a rejection payload (no raise)."""
+
+    def call_mcp(self, server: str, tool: str, args: dict,
+                 squad_id: str | None = None) -> dict:
+        self.calls.append((server, tool, dict(args), squad_id))
+        if tool == "record_verdict":
+            # Simulate MCPStdioDispatcher RBAC rejection — a dict, not an exception.
+            return {"status": "rejected", "error": "vendor pinning"}
+        # Delegate all other tools to the base fake.
+        return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+
+class _FakeDispatcherAttemptRejected(FakeDispatcher):
+    """Variant where the success-path record_attempt returns a rejection payload."""
+
+    def call_mcp(self, server: str, tool: str, args: dict,
+                 squad_id: str | None = None) -> dict:
+        self.calls.append((server, tool, dict(args), squad_id))
+        if tool == "record_attempt" and args.get("status") == "ok":
+            # Simulate a rejection dict — no exception raised.
+            return {"status": "rejected", "error": "attempt rejected by ledger"}
+        return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+
+def test_record_verdict_error_payload_surfaces_stage(tmp_path):
+    """LV-1: a record_verdict that returns an error dict (no raise) must
+    trigger the existing F26+M8 downgrade — the stage surfaces rather than
+    completing.  Without _raise_on_error_payload the error dict was silently
+    swallowed and the stage incorrectly finalized 'complete'."""
+    disp = _FakeDispatcherVerdictRejected(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
+    assert res.get("final_status") != "complete", (
+        "record_verdict error payload must surface the stage, not complete it"
+    )
+    assert res.get("status") in ("surfaced", "aborted"), (
+        f"expected surfaced/aborted after record_verdict rejection, got {res.get('status')!r}"
+    )
+    # finalize_run must still have been called (stage exits cleanly)
+    assert disp.count("finalize_run") == 1
+
+
+def test_record_attempt_error_payload_surfaces_without_judge(tmp_path):
+    """LV-1: a record_attempt success-path that returns an error dict surfaces
+    the stage immediately — no judge routing, no record_verdict.  Without
+    _raise_on_error_payload the rejection dict silently left attempt_id=None
+    and allowed gate_eligible_judges to run."""
+    disp = _FakeDispatcherAttemptRejected(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.05,
+                "tokens_in": 80, "tokens_out": 40, "model": "claude-sonnet-4"})
+    assert res.get("status") in ("surfaced", "aborted"), (
+        f"expected surfaced/aborted after record_attempt error payload, "
+        f"got {res.get('status')!r}"
+    )
+    assert disp.count("gate_eligible_judges") == 0, (
+        "gate_eligible_judges must NOT be called when record_attempt errors"
+    )
+    assert disp.count("record_verdict") == 0, (
+        "record_verdict must NOT be called when record_attempt errors"
+    )
+    assert disp.count("finalize_run") == 1, (
+        "finalize_run must still be called to release the pp run lock"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LV-3: same-vendor producer relabeling                                       #
+# --------------------------------------------------------------------------- #
+
+def test_same_vendor_judge_producer_relabeled_for_ledger(tmp_path):
+    """LV-3: when required_cross=False and the judge_producer equals the
+    generator producer ('claude'), record_verdict must receive
+    judge_producer='claude-same-vendor-host' so the pp ledger does not reject
+    the generator-identical pair.  score_json._judge_tier stays 'same_vendor'."""
+    disp = FakeDispatcher(required_cross_vendor=False)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.08,
+                "tokens_in": 90, "tokens_out": 45, "model": "claude-sonnet-4"})
+    # Submit same-vendor judge result (judge_producer == producer == "claude")
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "claude",
+                "judge_model_id": "claude-haiku-4", "cost_usd": 0.02})
+    verdict_calls = [
+        (a.get("judge_producer"), a.get("score_json", {}).get("_judge_tier"))
+        for _s, t, a, _q in disp.calls
+        if t == "record_verdict"
+    ]
+    assert verdict_calls, "record_verdict was not called"
+    actual_producer, actual_tier = verdict_calls[0]
+    assert actual_producer == "claude-same-vendor-host", (
+        f"expected judge_producer='claude-same-vendor-host', got {actual_producer!r}"
+    )
+    # _judge_tier must remain 'same_vendor' — the score_json reflects the truth
+    # (same-vendor judging), not the relabeled name.
+    assert actual_tier == "same_vendor", (
+        f"expected _judge_tier='same_vendor', got {actual_tier!r}"
+    )

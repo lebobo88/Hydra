@@ -1564,9 +1564,27 @@ def _cmd_attended_step(args) -> int:
                 }), file=sys.stderr)
                 return 1
 
-            start = dispatcher.call_mcp("pp_harness", "start_run", {
-                "request_text": request_text, "project_path": project_path,
-                "mode": "single"}, squad_id="engineering")
+            # RA-12b (attended path): thread Hydra provenance into pp's start_run
+            # so every attended run row carries hydra_workflow_id for cost
+            # attribution (MU16 gate) and eights provenance writes.  Mirrors
+            # squad_node._via_mcp — same optional key names, same semantics.
+            _start_run_args: dict = {
+                "request_text": request_text,
+                "project_path": project_path,
+                "mode": "single",
+                "hydra_workflow_id": wf,
+            }
+            _env_id = getattr(task, "envelope_id", None)
+            if _env_id is not None:
+                _start_run_args["hydra_envelope_id"] = str(_env_id)
+            _origin_squad = getattr(task, "origin_squad", None)
+            if _origin_squad:
+                _start_run_args["hydra_origin_squad"] = str(_origin_squad)
+            _env_type = getattr(task, "envelope_type", None)
+            if _env_type:
+                _start_run_args["hydra_envelope_type"] = str(_env_type)
+            start = dispatcher.call_mcp("pp_harness", "start_run",
+                                        _start_run_args, squad_id="engineering")
             inner = start.get("result", start) if isinstance(start, dict) else {}
             run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
             if not run_id:
