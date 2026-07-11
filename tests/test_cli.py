@@ -597,3 +597,220 @@ def test_budget_list_empty_store(capsys, tmp_path, monkeypatch):
     if rc == 0:
         payload = json.loads(captured.out)
         assert payload["workflows"] == []
+
+
+# ---------------------------------------------------------------------------
+# LV-2: hydra context in attended start_run (RA-12b, attended path)
+# ---------------------------------------------------------------------------
+
+def test_attended_step_passes_hydra_workflow_id(tmp_path, monkeypatch, capsys):
+    """LV-2 / RA-12b: _cmd_attended_step must pass hydra_workflow_id in the
+    pp start_run args so pp's DB can link the attended run row to the Hydra
+    workflow — mirrors squad_node._via_mcp's provenance threading.
+
+    TaskState.envelope_id is None by default, so hydra_envelope_id must be
+    absent from start_run args (only include non-empty optional fields)."""
+    import argparse
+    from hydra_core import cli
+    from hydra_core.state import HydraState, TaskState
+
+    # Engineering task (no explicit envelope_id)
+    task = TaskState(owner_squad="engineering", description="implement the feature")
+    state_val = HydraState(root_goal="implement the feature", tasks=[task])
+    wf_id = str(state_val.workflow_id)  # real UUID — passes _WORKFLOW_ID_RE
+
+    # Agent stubs so the preflight check passes
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    for name in ["engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"]:
+        (agents_dir / name).write_text("# stub\n")
+
+    # Recording dispatcher — captures start_run args
+    start_run_calls: list[dict] = []
+
+    class _RecDisp:
+        def call_mcp(self, server: str, tool: str, args: dict,
+                     *, squad_id: str | None = None) -> dict:
+            if tool == "start_run":
+                start_run_calls.append(dict(args))
+                return {"status": "done", "result": {"run_id": "run-lv2-1"}}
+            return {"status": "done", "result": {}}
+        def set_squad_packs(self, packs: dict) -> None:
+            pass
+
+    class _FakeSnap:
+        values = state_val.model_dump(mode="json")
+
+    update_calls: list[dict] = []
+
+    class _FakeSup:
+        def get_state(self, config: dict) -> "_FakeSnap":
+            return _FakeSnap()
+        def update_state(self, config: dict, values: dict) -> None:
+            update_calls.append(dict(values))
+
+    monkeypatch.setattr("hydra_core.cli._attended_live_dispatcher",
+                        lambda *a, **k: _RecDisp())
+    monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                        lambda **k: _FakeSup())
+    # Stub begin_stage to avoid git operations
+    monkeypatch.setattr(
+        "hydra_core.host_bridge.begin_stage",
+        lambda *a, **k: {
+            "status": "awaiting_host",
+            "cursor_path": str(tmp_path / "c.json"),
+            "state": "await_generate",
+            "workflow_id": wf_id,
+            "run_id": "run-lv2-1",
+            "stage_id": "s1",
+            "task_id": str(task.task_id),
+            "cost_usd": 0.0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "host_action": {
+                "call_key": "generate-0",
+                "agent_type": "engineer",
+                "cwd": str(tmp_path),
+            },
+        },
+    )
+    monkeypatch.setattr("hydra_core.squad_node._maybe_write_claude_shim",
+                        lambda *a, **k: None)
+
+    rc = cli._cmd_attended_step(
+        argparse.Namespace(project=str(tmp_path), workflow_id=wf_id, verbose=False))
+    capsys.readouterr()  # consume output
+
+    assert rc == 0, f"expected rc=0"
+    assert start_run_calls, "start_run was not called"
+    sr = start_run_calls[0]
+    assert sr.get("hydra_workflow_id") == wf_id, (
+        f"hydra_workflow_id missing or wrong in start_run args: {sr}"
+    )
+    # envelope_id is None → hydra_envelope_id must be absent (only non-empty)
+    assert "hydra_envelope_id" not in sr, (
+        f"hydra_envelope_id should be absent when task.envelope_id is None: {sr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# LV-2 / RA-12a: attended squad path e2e — step, submit, idempotency, skip
+# ---------------------------------------------------------------------------
+
+def test_attended_squad_path_completes_charges_once_no_redispatch(
+        tmp_path, monkeypatch, capsys):
+    """Squad path e2e (claude-skill / garland):
+
+    1. _cmd_attended_step with only a non-engineering task → host_action with
+       state=await_squad_agent (begin_squad_stage cursor created).
+    2. _cmd_attended_submit completes the task and charges budget once.
+    3. Duplicate _cmd_attended_submit reports already_charged (no double-billing).
+    4. update_state is called with attended_done_task_ids containing the task_id
+       so a subsequent supervisor resume does NOT re-dispatch (RA-12a skip).
+    """
+    import argparse
+    import json as _json
+    from hydra_core import cli
+    from hydra_core.state import HydraState, TaskState
+
+    task = TaskState(owner_squad="garland", description="write brand copy")
+    wf_id = "attended-sq-0001"  # valid for _WORKFLOW_ID_RE
+    state_val = HydraState(root_goal="write brand copy", tasks=[task])
+    state_dict = state_val.model_dump(mode="json")
+
+    update_state_log: list[dict] = []
+
+    class _FakeSnap:
+        values = state_dict
+
+    class _FakeSup:
+        def get_state(self, config: dict) -> "_FakeSnap":
+            return _FakeSnap()
+        def update_state(self, config: dict, values: dict) -> None:
+            update_state_log.append(dict(values))
+
+    # Minimal garland pack (claude-skill, with a gatekeeper agent)
+    class _FakeAgent:
+        slug = "brand-director"
+        authority = "gatekeeper"
+
+    class _FakePack:
+        slug = "garland"
+        entrypoint = "claude-skill"
+        agents = [_FakeAgent()]
+
+    monkeypatch.setattr("hydra_core.cli._attended_live_dispatcher",
+                        lambda *a, **k: type("_NOP", (), {
+                            "call_mcp": lambda s, sv, t, a, **k: {"status": "done", "result": {}},
+                            "set_squad_packs": lambda s, p: None,
+                        })())
+    monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                        lambda **k: _FakeSup())
+    monkeypatch.setattr("hydra_core.squad_loader.discover_squads",
+                        lambda *a, **k: {"garland": _FakePack()})
+    monkeypatch.setattr("hydra_core.governance.charge_and_gate",
+                        lambda state, cost, toks: (False, False))
+
+    # --- step 1: attended step → squad cursor ---
+    rc_step = cli._cmd_attended_step(
+        argparse.Namespace(project=str(tmp_path), workflow_id=wf_id, verbose=False))
+    out_step = capsys.readouterr().out
+    assert rc_step == 0, f"step failed (rc={rc_step}): {out_step[:300]}"
+    payload_step = _json.loads(out_step)
+    assert payload_step["ok"] is True
+    assert payload_step["state"] == "await_squad_agent", (
+        f"expected await_squad_agent, got {payload_step['state']!r}"
+    )
+    assert payload_step["host_action"]["agent_type"] == "brand-director"
+
+    cfile = payload_step["cursor_path"]
+    call_key = payload_step["host_action"]["call_key"]
+    task_id_str = str(task.task_id)
+    assert payload_step.get("run_id") == task_id_str, (
+        "squad cursor run_id must equal task_id for CLI submit to resolve it"
+    )
+
+    # --- step 2: submit → complete ---
+    result_file = tmp_path / "agent_result.json"
+    result_file.write_text(_json.dumps({
+        "text": "Brand brief done.",
+        "cost_usd": 0.06,
+        "tokens_in": 80,
+        "tokens_out": 120,
+    }))
+
+    def _do_submit() -> tuple[int, dict]:
+        rc = cli._cmd_attended_submit(argparse.Namespace(
+            project=str(tmp_path),
+            workflow_id=wf_id,
+            run_id=task_id_str,
+            call_key=call_key,
+            result=str(result_file),
+        ))
+        out = capsys.readouterr().out
+        return rc, _json.loads(out)
+
+    rc2, p2 = _do_submit()
+    assert rc2 == 0
+    assert p2["ok"] is True
+    assert p2["status"] == "complete", (
+        f"squad task must complete on submit, got {p2['status']!r}"
+    )
+    assert not p2.get("already_charged"), "first submit must not be already_charged"
+
+    # --- step 3: attended_done_task_ids updated (RA-12a skip guard) ---
+    done_updates = [u for u in update_state_log if "attended_done_task_ids" in u]
+    assert done_updates, (
+        "update_state must be called with attended_done_task_ids after complete"
+    )
+    assert task_id_str in done_updates[0]["attended_done_task_ids"], (
+        f"task {task_id_str!r} not in attended_done_task_ids: "
+        f"{done_updates[0]['attended_done_task_ids']}"
+    )
+
+    # --- step 4: duplicate submit → already_charged ---
+    rc3, p3 = _do_submit()
+    assert rc3 == 0
+    assert p3.get("already_charged") is True, (
+        "duplicate submit must report already_charged to prevent double-billing"
+    )

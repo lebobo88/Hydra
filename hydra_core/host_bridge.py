@@ -63,6 +63,51 @@ _TERMINAL = {"complete", "surfaced", "aborted"}
 
 _SQ = "engineering"
 
+# --------------------------------------------------------------------------- #
+# LV-1: error-payload detection                                               #
+# --------------------------------------------------------------------------- #
+
+# Known-good statuses from MCPStdioDispatcher.call_mcp; anything else with an
+# "error" key is treated as a failure too.
+_CALL_MCP_SUCCESS_STATUSES: frozenset[str] = frozenset(
+    {"done", "ok", "complete", "stub", "skipped"}
+)
+
+
+def _raise_on_error_payload(resp: Any, tool: str) -> Any:
+    """Raise RuntimeError when a call_mcp response is a structured error dict.
+
+    MCPStdioDispatcher.call_mcp returns error DICTS instead of raising for:
+    - RBAC rejections:   {"status":"rejected","error":...}
+    - transport/timeout: {"status":"failed","error":...}
+    - isError results:   {"status":"failed", "tool":..., "error":...}
+
+    The existing try/except downgrade paths in begin_stage, _apply_generate,
+    _apply_judge, and _finalize only catch *raised* exceptions, so they silently
+    passed through error dicts, which broke finalize/verdict/attempt tracking.
+
+    Raises RuntimeError on:
+    - ``status`` in {"rejected","failed","error"}, or
+    - ``"error"`` key present and ``status`` not in the known-good set.
+
+    Returns ``resp`` unchanged on a normal response or on a non-dict (callers
+    must tolerate both — no change to existing semantics).
+    """
+    if not isinstance(resp, dict):
+        return resp
+    status = resp.get("status")
+    if status in {"rejected", "failed", "error"}:
+        raise RuntimeError(
+            f"pp ledger call {tool!r} returned error payload "
+            f"(status={status!r}): {resp.get('error', resp)!r}"
+        )
+    if status not in _CALL_MCP_SUCCESS_STATUSES and "error" in resp:
+        raise RuntimeError(
+            f"pp ledger call {tool!r} returned error (status={status!r}): "
+            f"{resp['error']!r}"
+        )
+    return resp
+
 
 # --------------------------------------------------------------------------- #
 # Worktree isolation (write-safety)                                           #
@@ -516,9 +561,12 @@ def begin_stage(
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
     cm = dispatcher.call_mcp
 
-    st = cm("pp_harness", "start_stage",
-            {"run_id": run_id, "kind": "code", "gate_type": "code"},
-            squad_id=_SQ)
+    st = _raise_on_error_payload(
+        cm("pp_harness", "start_stage",
+           {"run_id": run_id, "kind": "code", "gate_type": "code"},
+           squad_id=_SQ),
+        "start_stage",
+    )
     stage_id = _pp_inner(st).get("stage_id")
     if not stage_id:
         raise RuntimeError(f"start_stage returned no stage_id: {st!r}")
@@ -630,24 +678,30 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         cursor["error"] = gen_fail
         cursor["outcome"] = "error"
         try:
-            cm("pp_harness", "archive_artifact", {
-                "run_id": run_id,
-                "relative_path": f"code/{producer}-attempt-{gen_idx}.failed.md",
-                "bytes": f"GENERATE FAILED: {gen_fail}\n\n{gen_text or '(no output)'}",
-                "stage_id": stage_id, "kind": "code", "encoding": "utf8",
-            }, squad_id=_SQ)
+            _raise_on_error_payload(
+                cm("pp_harness", "archive_artifact", {
+                    "run_id": run_id,
+                    "relative_path": f"code/{producer}-attempt-{gen_idx}.failed.md",
+                    "bytes": f"GENERATE FAILED: {gen_fail}\n\n{gen_text or '(no output)'}",
+                    "stage_id": stage_id, "kind": "code", "encoding": "utf8",
+                }, squad_id=_SQ),
+                "archive_artifact",
+            )
         except Exception:  # noqa: BLE001
             pass
         try:
-            att = cm("pp_harness", "record_attempt", {
-                "stage_id": stage_id, "producer": producer, "model_id": model_id,
-                "agent_type": "engineer",   # F29
-                "tokens_in": int(result.get("tokens_in") or 0),
-                "tokens_out": int(result.get("tokens_out") or 0),
-                "cost_usd": float(result.get("cost_usd") or 0.0),
-                "status": "error", "retry_index": gen_idx,
-                "notes": {"candidate_index": 1},
-            }, squad_id=_SQ)
+            att = _raise_on_error_payload(
+                cm("pp_harness", "record_attempt", {
+                    "stage_id": stage_id, "producer": producer, "model_id": model_id,
+                    "agent_type": "engineer",   # F29
+                    "tokens_in": int(result.get("tokens_in") or 0),
+                    "tokens_out": int(result.get("tokens_out") or 0),
+                    "cost_usd": float(result.get("cost_usd") or 0.0),
+                    "status": "error", "retry_index": gen_idx,
+                    "notes": {"candidate_index": 1},
+                }, squad_id=_SQ),
+                "record_attempt",
+            )
             cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
         except Exception:  # noqa: BLE001
             pass
@@ -657,28 +711,36 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     # Successful generate: archive the producer summary + record the attempt.
     try:
-        cm("pp_harness", "archive_artifact", {
-            "run_id": run_id,
-            "relative_path": f"code/{producer}-attempt-{gen_idx}.md",
-            "bytes": gen_text or "(no summary returned)",
-            "stage_id": stage_id, "kind": "code", "encoding": "utf8",
-        }, squad_id=_SQ)
+        _raise_on_error_payload(
+            cm("pp_harness", "archive_artifact", {
+                "run_id": run_id,
+                "relative_path": f"code/{producer}-attempt-{gen_idx}.md",
+                "bytes": gen_text or "(no summary returned)",
+                "stage_id": stage_id, "kind": "code", "encoding": "utf8",
+            }, squad_id=_SQ),
+            "archive_artifact",
+        )
     except Exception:  # noqa: BLE001
         pass
     # Finding 1: wrap record_attempt in try/except — an RPC failure here must
     # surface cleanly, not crash submit_host_result and orphan the stage.
+    # LV-1: _raise_on_error_payload converts error dicts into RuntimeError so
+    # the existing except clause fires for payload-level failures too.
     # The pp schema accepts agent_type as an optional top-level string; strict
     # mode only rejects the literal 'general-purpose', not 'engineer'.
     try:
-        att = cm("pp_harness", "record_attempt", {
-            "stage_id": stage_id, "producer": producer, "model_id": model_id,
-            "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
-            "tokens_in": int(result.get("tokens_in") or 0),
-            "tokens_out": int(result.get("tokens_out") or 0),
-            "cost_usd": float(result.get("cost_usd") or 0.0),
-            "status": "ok", "retry_index": gen_idx,
-            "notes": {"candidate_index": 1},
-        }, squad_id=_SQ)
+        att = _raise_on_error_payload(
+            cm("pp_harness", "record_attempt", {
+                "stage_id": stage_id, "producer": producer, "model_id": model_id,
+                "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
+                "tokens_in": int(result.get("tokens_in") or 0),
+                "tokens_out": int(result.get("tokens_out") or 0),
+                "cost_usd": float(result.get("cost_usd") or 0.0),
+                "status": "ok", "retry_index": gen_idx,
+                "notes": {"candidate_index": 1},
+            }, squad_id=_SQ),
+            "record_attempt",
+        )
         cursor["attempt_id"] = _pp_inner(att).get("attempt_id")
     except Exception as _ra_exc:  # noqa: BLE001
         # record_attempt RPC failed — surface the stage immediately rather than
@@ -691,11 +753,14 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # exactly like the headless loop, so the host spawns the right judge agent.
     gate_dec: dict[str, Any] = {}
     try:
-        gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
-            "gate_type": _pp_gate_type("code", "code_style"),
-            "generator_producer": producer,
-            "prompt_keywords": cursor["request_text"][:1000],
-        }, squad_id=_SQ))
+        gate_dec = _pp_inner(_raise_on_error_payload(
+            cm("pp_harness", "gate_eligible_judges", {
+                "gate_type": _pp_gate_type("code", "code_style"),
+                "generator_producer": producer,
+                "prompt_keywords": cursor["request_text"][:1000],
+            }, squad_id=_SQ),
+            "gate_eligible_judges",
+        ))
     except Exception:  # noqa: BLE001
         gate_dec = {}
     required_cross = bool(gate_dec.get("required_cross_vendor", True))
@@ -771,6 +836,15 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                          or ("codex" if required_cross else "claude"))
     cross_vendor = judge_producer != producer
     degraded = required_cross and not cross_vendor
+    # LV-3 defense-in-depth: when same-vendor judging is allowed (not
+    # required_cross) and the judge producer is identical to the generator,
+    # relabel with a "-same-vendor-host" suffix before record_verdict.  pp's
+    # recordVerdict rejects generator-identical producer+model pairs; the
+    # suffix keeps the model id honest while making the ledger entry
+    # distinguishable.  cross_vendor is NOT recomputed — it was False (same
+    # vendor) and stays False; score_json._judge_tier="same_vendor" is correct.
+    if not required_cross and judge_producer == producer:
+        judge_producer = f"{producer}-same-vendor-host"
 
     score_json = dict(result.get("score_json") or result.get("score") or {})
     score_json["_cross_vendor"] = cross_vendor
@@ -808,17 +882,22 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         })
     elif attempt_id:
         # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
+        # LV-1: _raise_on_error_payload converts error dicts (rejected/failed) into
+        # RuntimeError so the existing except fires for payload-level errors too.
         try:
-            cm("pp_harness", "record_verdict", {
-                "attempt_id": attempt_id,
-                "judge_producer": judge_producer,
-                "judge_model_id": str(result.get("judge_model_id")
-                                      or result.get("model") or f"{judge_producer}-default"),
-                "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
-                "critique_md": critique_md[:4000],
-                "score_json": score_json,
-                "rubric_id": gate_rubric,
-            }, squad_id=_SQ)
+            _raise_on_error_payload(
+                cm("pp_harness", "record_verdict", {
+                    "attempt_id": attempt_id,
+                    "judge_producer": judge_producer,
+                    "judge_model_id": str(result.get("judge_model_id")
+                                          or result.get("model") or f"{judge_producer}-default"),
+                    "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
+                    "critique_md": critique_md[:4000],
+                    "score_json": score_json,
+                    "rubric_id": gate_rubric,
+                }, squad_id=_SQ),
+                "record_verdict",
+            )
             # Persist marker before _run_smoke so a timeout mid-smoke leaves the
             # cursor in a state where a retry can skip this call.
             if call_key is not None and cursor_file is not None:
@@ -978,11 +1057,14 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                                 "treated as pass"
                             )
             try:
-                cm("pp_harness", "record_smoke_status", {
-                    "stage_id": cursor["stage_id"], "candidate_index": 1,
-                    "status": smoke_status,
-                    "reason": (smoke_reason or "attended drive smoke")[:300],
-                }, squad_id=_SQ)
+                _raise_on_error_payload(
+                    cm("pp_harness", "record_smoke_status", {
+                        "stage_id": cursor["stage_id"], "candidate_index": 1,
+                        "status": smoke_status,
+                        "reason": (smoke_reason or "attended drive smoke")[:300],
+                    }, squad_id=_SQ),
+                    "record_smoke_status",
+                )
             except Exception:  # noqa: BLE001
                 pass
             # Fix-1b: persist smoke outcome before _finalize so a timeout between
@@ -1002,8 +1084,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     # headless loop).
     if passed:
         try:
-            rd = _pp_inner(cm("pp_harness", "get_stage_finalize_readiness",
-                              {"stage_id": cursor["stage_id"]}, squad_id=_SQ))
+            rd = _pp_inner(_raise_on_error_payload(
+                cm("pp_harness", "get_stage_finalize_readiness",
+                   {"stage_id": cursor["stage_id"]}, squad_id=_SQ),
+                "get_stage_finalize_readiness",
+            ))
         except Exception:  # noqa: BLE001
             rd = {}
         if rd.get("can_pass") is False:
@@ -1038,13 +1123,18 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     attempt_id = cursor.get("attempt_id")
 
     # F26+M8: capture finalize_stage success; failure on pass → downgrade.
+    # LV-1: _raise_on_error_payload converts error dicts into RuntimeError so
+    # the existing except fires for payload-level rejections/failures too.
     _finalize_stage_ok = True
     try:
-        cm("pp_harness", "finalize_stage", {
-            "stage_id": stage_id,
-            "status": "passed" if passed else "surfaced",
-            **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
-        }, squad_id=_SQ)
+        _raise_on_error_payload(
+            cm("pp_harness", "finalize_stage", {
+                "stage_id": stage_id,
+                "status": "passed" if passed else "surfaced",
+                **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
+            }, squad_id=_SQ),
+            "finalize_stage",
+        )
     except Exception:  # noqa: BLE001
         _finalize_stage_ok = False
     if passed and not _finalize_stage_ok:

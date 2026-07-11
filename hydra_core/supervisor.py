@@ -1922,6 +1922,10 @@ def build_supervisor(
                     "entrypoint": pack.entrypoint,
                     "task_id": str(task.task_id),
                 })
+                # Detached-path deferral for non-mcp packs is intentional: the
+                # attended path handles these squads via host_bridge.begin_squad_stage
+                # squad cursors; detached launch is automation-only and must not
+                # try to inline a skill/impersonation dispatch it cannot execute.
                 task.status = "deferred_to_host"
                 continue
 
