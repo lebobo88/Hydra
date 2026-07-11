@@ -32,11 +32,15 @@ in WHERE the pp stage loop runs:
   stage loop runs headlessly in the background.
 
 The mode is selected by which MCP verb the host invokes (`plan/step/submit`
-vs `launch`) — `HYDRA_HOST_DRIVEN` (default `1` in `.claude/settings.json`) is
-**never read by the Python engine**; its only read site is the
-`hydra-route-directive.ps1` hook, which uses it to steer operator guidance.
-The engine's behavioral switch is `dispatcher.live_execution`. Attended
-engineering is single-stream; parallel/fleet work uses the detached path.
+vs `launch`) — there is no mode env var. (`HYDRA_HOST_DRIVEN` is retired: it
+was never read by the Python engine, and its last read site — hook guidance —
+is gone; interactive sessions are always attended.) The engine's behavioral
+switch is `dispatcher.live_execution`. Attended engineering is single-stream;
+parallel/fleet work uses the detached path, which is automation-only and
+gated by `HYDRA_ALLOW_DETACHED=1` (the fleet sets the gate internally).
+`HYDRA_DISABLE_CLAUDE_ENGINEER=1` (session default) keeps detached runs
+spawned from a session on the codex generator — no invisible `claude -p`
+subprocess writes code.
 
 ### Available Hydra Commands
 

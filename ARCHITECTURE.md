@@ -248,10 +248,11 @@ runs headlessly in the background. Attended execution is single-stream;
 fleet/parallel work always takes the detached path.
 
 Note the mode is selected by **which CLI verb the host invokes**, not by an
-engine flag: `HYDRA_HOST_DRIVEN` is never read by any Python — its only read
-site is the `hydra-route-directive.ps1` hook, which uses it to steer the
-operator-facing guidance toward `plan/step/submit` (attended) or `launch`
-(detached). The engine's real behavioral switch is
+engine flag. (`HYDRA_HOST_DRIVEN` is retired — it was never read by any
+Python, and the `hydra-route-directive.ps1` hook that once used it for
+guidance now emits an unconditional attended directive; interactive sessions
+are always attended, and detached launch is automation-only behind
+`HYDRA_ALLOW_DETACHED=1`.) The engine's real behavioral switch is
 `dispatcher.live_execution` (`dispatcher.py`), which `build_supervisor` uses
 to auto-wire `drive_pp_loop` and the `MCPCritiqueClient`; the engine itself is
 mode-agnostic.

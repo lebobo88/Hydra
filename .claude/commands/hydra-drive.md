@@ -19,9 +19,10 @@ tools; the engine records every attempt/verdict and charges budget.
 
 ## When this runs
 
-`/hydra:drive` is always attended. `/hydra:run` is attended by default when
-`HYDRA_HOST_DRIVEN=1` (the session default, set in `.claude/settings.json`) and
-detached when it's unset/`0`.
+`/hydra:drive` is always attended — and so is every interactive `/hydra:run`,
+which follows this same runbook. Detached execution (`hydra.workflow.launch`)
+is automation-only (cron / external callers / the cross-repo fleet), gated by
+`HYDRA_ALLOW_DETACHED=1`.
 
 ## Steps
 
