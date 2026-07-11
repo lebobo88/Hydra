@@ -3,11 +3,13 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-# RA-1: Warn loudly when HYDRA_PP_STAGE_ACTIVE persists into a real session start.
+# RA-1: Flag a leaked HYDRA_PP_STAGE_ACTIVE at session start (hygiene only).
 # This env var should only be set by the pp harness during an active engineer stage.
-# A leaked value will silently disable routing enforcement for the whole session.
+# Since the S6 hardening, the write-block bypass ALSO requires a filesystem marker
+# (.harness/worktrees/attended-* or .harness/stage-active), so a bare leaked value
+# no longer disables routing enforcement — but it is still stale state worth clearing.
 if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
-    Write-Output '[hydra-hook] WARNING: HYDRA_PP_STAGE_ACTIVE=1 detected at session start — this env var should only be set by the pp harness during an active engineer stage. A leaked value silently disables routing enforcement. Unset it if no harness stage is running.'
+    Write-Output '[hydra-hook] NOTE: HYDRA_PP_STAGE_ACTIVE=1 detected at session start — this env var should only be set by the pp harness during an active engineer stage. Enforcement is NOT bypassed by the bare var (a filesystem stage marker is also required), but unset it if no harness stage is running.'
 }
 
 $ecosystemAvailable = $false
@@ -18,7 +20,8 @@ try {
 } catch {}
 
 if (-not $ecosystemAvailable) {
-    if (Test-Path "$env:USERPROFILE\.pp\harness.db") {
+    # Fallback: pp's real state DB (paths.ts) — present once the daemon has run at least once.
+    if (Test-Path "$env:USERPROFILE\.pair-programmer\state.db") {
         $ecosystemAvailable = $true
     }
 }

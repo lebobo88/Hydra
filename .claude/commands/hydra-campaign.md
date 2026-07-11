@@ -32,6 +32,7 @@ Rules:
 - Allow-listed ids (`hydra_core/repo_registry.py`): `hydra`, `pair-programmer`, `agentsmith`, `theeights`, `xenia`, `executivesuite`, `senate`, `marketbliss`, `rlm-creative`. Raw paths are rejected — the allow-list is the injection guard. Each id is resolved by a real `git rev-parse` check before dispatch.
 - Unknown ids surface an immediate HITL (`reason=high_risk`, `gate_node=intake`, options=["abort"]).
 - Fleet is engineering-only; `selected_squads` is locked to `["engineering"]` for fleet runs (only `entrypoint="mcp"` packs are fleet-eligible).
+- **Fleet is always detached.** The attended (host-bridged) cursor is single-stream by design — one persisted cursor, one visible engineer at a time — so multi-repo parallelism runs headless via `_drive_pp_stage_loop` in background workers. Do not try to drive a fleet through `plan/step/submit_host_result`; the fleet path is exempt from the interactive detached gate (`HYDRA_ALLOW_DETACHED`) because it sets it internally.
 - Cancellation propagates: if any repo's run surfaces, in-flight runs for other repos are cancelled (not-yet-started runs return `cancelled`; runs already past their entry-check finish naturally — threads are not force-killed).
 
 ### Per-repo budget scoping

@@ -239,14 +239,22 @@ Only the Engineering squad uses MCP as its primary execution path.
 
 **Attended vs detached execution.** Engineering dispatch runs in one of two
 modes, differing only in *where* the pp stage loop runs. In **attended** mode
-(`HYDRA_HOST_DRIVEN=1`, the default) the host session drives the lifecycle
-in-context — `hydra.workflow.plan` → loop `hydra.workflow.step` + spawn `Agent`
-subagents → `hydra.workflow.submit_host_result` — while the Python engine stays
+the host session drives the lifecycle in-context — `hydra.workflow.plan` →
+loop `hydra.workflow.step` + spawn `Agent` subagents →
+`hydra.workflow.submit_host_result` — while the Python engine stays
 authoritative (ledger, budget, judge routing, finalize gates). In **detached**
-mode (`HYDRA_HOST_DRIVEN` unset/`0`) `hydra_workflow_launch` detaches
-`hydra run --live` and the stage loop runs headlessly in the background.
-Attended execution is single-stream; fleet/parallel work always takes the
-detached path.
+mode `hydra_workflow_launch` detaches `hydra run --live` and the stage loop
+runs headlessly in the background. Attended execution is single-stream;
+fleet/parallel work always takes the detached path.
+
+Note the mode is selected by **which CLI verb the host invokes**, not by an
+engine flag: `HYDRA_HOST_DRIVEN` is never read by any Python — its only read
+site is the `hydra-route-directive.ps1` hook, which uses it to steer the
+operator-facing guidance toward `plan/step/submit` (attended) or `launch`
+(detached). The engine's real behavioral switch is
+`dispatcher.live_execution` (`dispatcher.py`), which `build_supervisor` uses
+to auto-wire `drive_pp_loop` and the `MCPCritiqueClient`; the engine itself is
+mode-agnostic.
 
 ### 6d. RBAC enforcement
 
@@ -274,6 +282,19 @@ only when a real active-stage marker file also exists on disk. A bare env-var
 set outside an actual stage (e.g. a leaked or manually-set value) is ignored;
 the hook logs `bare HYDRA_PP_STAGE_ACTIVE=1 ignored (no active stage marker)`
 and enforcement stays on.
+
+**Enforcement layers per transport (asymmetry, by design).** Two enforcement
+stacks exist, and only one of them covers each transport. Host-session tool
+calls (the operator, or Hydra-spawned attended subagents with pp's `.claude`
+linked) pass through pp's client-side `hooks.json` Pre/PostToolUse hooks
+(enforce-vendor-matrix, enforce-sandbox-policy, cost-tally, …) *in addition
+to* Hydra's own session hooks. Hydra's **headless** dispatch path
+(`MCPStdioDispatcher.call_mcp` stdio) bypasses all client-side hooks on both
+sides; its integrity rests on Hydra RBAC (§6d) plus pp's **server-side**
+gates — vendor pinning, Reflexion×1/loop-ceiling, findings-closed rejudge,
+finalize auto-downgrade. Any policy that must hold on the headless path must
+therefore be enforced server-side in the pp daemon (e.g. the codex sandbox
+`danger-full-access` deny), never only in a client hook.
 
 ### 6e. Gateway consolidation (two-layer registry)
 

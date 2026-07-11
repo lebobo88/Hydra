@@ -22,16 +22,20 @@ Hydra dispatches to pair-programmer via the engineering squad internally.
 Engineering runs in one of two modes — SAME engine + governance, differing only
 in WHERE the pp stage loop runs:
 
-- **Attended (default, `HYDRA_HOST_DRIVEN=1`)** — the host session drives the
-  lifecycle IN-CONTEXT so you follow along; generate + judge surface as visible
-  `Agent` subagents. The Python engine stays authoritative (ledger, budget,
-  judge routing, finalize gates). Use `/hydra:drive` (or `/hydra:run`, which
-  takes the attended branch when the toggle is on). Runbook: `hydra.workflow.plan`
-  → loop `hydra.workflow.step` + spawn `Agent` + `hydra.workflow.submit_host_result`.
-- **Detached (`HYDRA_HOST_DRIVEN` unset/`0`)** — `hydra.workflow.launch` detaches
-  `hydra run --live`; the stage loop runs headlessly in the background.
+- **Attended (default)** — the host session drives the lifecycle IN-CONTEXT so
+  you follow along; generate + judge surface as visible `Agent` subagents. The
+  Python engine stays authoritative (ledger, budget, judge routing, finalize
+  gates). Use `/hydra:drive` (or `/hydra:run`, which follows the same attended
+  runbook). Runbook: `hydra.workflow.plan` → loop `hydra.workflow.step` +
+  spawn `Agent` + `hydra.workflow.submit_host_result`.
+- **Detached** — `hydra.workflow.launch` detaches `hydra run --live`; the
+  stage loop runs headlessly in the background.
 
-The toggle lives in `.claude/settings.json` (`env.HYDRA_HOST_DRIVEN`). Attended
+The mode is selected by which MCP verb the host invokes (`plan/step/submit`
+vs `launch`) — `HYDRA_HOST_DRIVEN` (default `1` in `.claude/settings.json`) is
+**never read by the Python engine**; its only read site is the
+`hydra-route-directive.ps1` hook, which uses it to steer operator guidance.
+The engine's behavioral switch is `dispatcher.live_execution`. Attended
 engineering is single-stream; parallel/fleet work uses the detached path.
 
 ### Available Hydra Commands

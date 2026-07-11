@@ -35,7 +35,8 @@ $base = if ($env:AIAPP_BASE) { $env:AIAPP_BASE }
         else { Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
 if (Test-Path (Join-Path $base 'pair-programmer/daemon/dist/index.js')) {
     $ecosystemAvailable = $true
-} elseif (Test-Path "$env:USERPROFILE\.pp\harness.db") {
+} elseif (Test-Path "$env:USERPROFILE\.pair-programmer\state.db") {
+    # Fallback: pp's real state DB (paths.ts) — present once the daemon has run at least once.
     $ecosystemAvailable = $true
 }
 
