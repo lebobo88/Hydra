@@ -34,14 +34,14 @@ def pool() -> gw.AsyncBackendPool:
     ],
 )
 def test_llm_tools_get_long_timeout(pool: gw.AsyncBackendPool, server: str, tool: str) -> None:
-    assert pool._resolve_tool_timeout(server, tool, {}) == 1800.0
+    assert pool._resolve_tool_timeout(server, tool, {}) == 3000.0
 
 
 @pytest.mark.parametrize(
     "tool",
     [
         # hydra_control control-plane tools run a synchronous CLI subprocess whose
-        # own cap (plan 180s / step 300s / submit 900s) must fire BEFORE the
+        # own cap (plan 180s / step 300s / submit 2700s) must fire BEFORE the
         # gateway's, else the gateway returns a hard `failed` + tears the backend
         # down (the observed 4/4 planner timeouts). They resolve by final segment.
         "hydra.workflow.plan",
@@ -53,10 +53,10 @@ def test_llm_tools_get_long_timeout(pool: gw.AsyncBackendPool, server: str, tool
     ],
 )
 def test_control_plane_tools_get_long_timeout(pool: gw.AsyncBackendPool, tool: str) -> None:
-    # Gateway cap (1800s ceiling) must exceed hydra_control's max subprocess cap
-    # (submit=900s) so the subprocess's clean in-band timeout wins, not the
+    # Gateway cap (3000s ceiling) must exceed hydra_control's max subprocess cap
+    # (submit=2700s) so the subprocess's clean in-band timeout wins, not the
     # gateway's hard teardown.
-    assert pool._resolve_tool_timeout("hydra_control", tool, {}) == 1800.0
+    assert pool._resolve_tool_timeout("hydra_control", tool, {}) == 3000.0
 
 
 @pytest.mark.parametrize(
@@ -89,7 +89,7 @@ def test_invalid_env_override_falls_back_to_default(monkeypatch: pytest.MonkeyPa
     # A typo / zero must NOT disable the timeout — fall back to the default.
     for bad in ("0", "-5", "not-a-number", "nan"):
         monkeypatch.setenv("HYDRA_GATEWAY_LONG_TOOL_TIMEOUT_S", bad)
-        assert pool._resolve_tool_timeout("pp_codex", "critique", {}) == 1800.0
+        assert pool._resolve_tool_timeout("pp_codex", "critique", {}) == 3000.0
 
 
 # ─── per-call override parsing (defensive) ─────────────────────────────────
@@ -97,11 +97,12 @@ def test_invalid_env_override_falls_back_to_default(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
-        ({"timeout_ms": 2_400_000}, 2400.0),     # int ms
-        ({"timeout_ms": "2400000"}, 2400.0),     # numeric-string ms (coercion left it a string)
-        ({"timeout_ms": 2_400_000.0}, 2400.0),   # float ms
-        ({"timeout_s": 2400}, 2400.0),           # int seconds
-        ({"timeout_s": "2400"}, 2400.0),         # numeric-string seconds
+        # Use 3300 s — above the new 3000 s long default, below the 3600 s hard cap.
+        ({"timeout_ms": 3_300_000}, 3300.0),     # int ms
+        ({"timeout_ms": "3300000"}, 3300.0),     # numeric-string ms (coercion left it a string)
+        ({"timeout_ms": 3_300_000.0}, 3300.0),   # float ms
+        ({"timeout_s": 3300}, 3300.0),           # int seconds
+        ({"timeout_s": "3300"}, 3300.0),         # numeric-string seconds
     ],
 )
 def test_per_call_override_raises_base(pool: gw.AsyncBackendPool, args: dict, expected: float) -> None:
@@ -115,7 +116,7 @@ def test_override_raises_short_tool_above_its_class(pool: gw.AsyncBackendPool) -
 
 def test_override_only_raises_never_lowers(pool: gw.AsyncBackendPool) -> None:
     # A small caller value must not shrink the long class default below it.
-    assert pool._resolve_tool_timeout("pp_codex", "critique", {"timeout_ms": 1000}) == 1800.0
+    assert pool._resolve_tool_timeout("pp_codex", "critique", {"timeout_ms": 1000}) == 3000.0
 
 
 @pytest.mark.parametrize(
@@ -130,14 +131,14 @@ def test_override_only_raises_never_lowers(pool: gw.AsyncBackendPool) -> None:
     ],
 )
 def test_junk_override_is_ignored(pool: gw.AsyncBackendPool, args: dict) -> None:
-    assert pool._resolve_tool_timeout("pp_codex", "critique", args) == 1800.0
+    assert pool._resolve_tool_timeout("pp_codex", "critique", args) == 3000.0
 
 
 def test_timeout_ms_preferred_but_falls_back_to_timeout_s(pool: gw.AsyncBackendPool) -> None:
-    # junk timeout_ms → fall back to a valid timeout_s
+    # junk timeout_ms → fall back to a valid timeout_s (use 3300 > 3000 s base)
     assert pool._resolve_tool_timeout(
-        "pp_codex", "critique", {"timeout_ms": "junk", "timeout_s": 2400}
-    ) == 2400.0
+        "pp_codex", "critique", {"timeout_ms": "junk", "timeout_s": 3300}
+    ) == 3300.0
 
 
 # ─── hard-max clamp ────────────────────────────────────────────────────────

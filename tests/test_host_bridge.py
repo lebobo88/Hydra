@@ -392,3 +392,133 @@ def test_squad_stage_duplicate_submit_is_exactly_once(tmp_path):
         result={"text": "minutes", "cost_usd": 0.05})
     assert r2["status"] == "complete"
     assert r2["cost_usd"] == pytest.approx(0.05)
+
+
+# --------------------------------------------------------------------------- #
+# Fix-1b: idempotency markers (verdict_recorded_for / smoke_result_for)       #
+# --------------------------------------------------------------------------- #
+
+def test_verdict_idempotency_skips_record_verdict_on_retry(tmp_path, monkeypatch):
+    """If verdict_recorded_for is set on the cursor for the current call_key, a
+    retried submit with the same call_key must NOT call record_verdict again.
+
+    Scenario: submit timeout kills mid-_run_smoke after record_verdict succeeded
+    but before the outer save_cursor.  The cursor still has state=await_judge with
+    the verdict_recorded_for marker persisted by the mid-function save.  A retry
+    with call_key='judge-0' must honour the marker and skip record_verdict.
+    """
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+
+    # Advance to await_judge state.
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py"})
+    assert disp.count("record_attempt") == 1
+
+    # Simulate a mid-function save: set verdict_recorded_for on the cursor manually
+    # (as if the first judge submit wrote it before timing out).
+    cursor = host_bridge.load_cursor(cfile)
+    cursor["verdict_recorded_for"] = "judge-0"
+    host_bridge.save_cursor(cfile, cursor)
+
+    verdict_calls_before = disp.count("record_verdict")
+
+    # Retry judge submit — must NOT re-invoke record_verdict.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex", "cost_usd": 0.05})
+    assert res2["status"] == "complete"
+    assert disp.count("record_verdict") == verdict_calls_before, (
+        "record_verdict must not be called again when verdict_recorded_for matches"
+    )
+    # The stage must still finalize correctly.
+    assert disp.count("finalize_run") == 1
+
+
+def test_smoke_idempotency_skips_run_smoke_on_retry(tmp_path, monkeypatch):
+    """If smoke_result_for is set on the cursor for the current call_key, a retried
+    submit with the same call_key must NOT call _run_smoke again and must reuse
+    the persisted status.
+
+    Scenario: submit timeout kills between record_smoke_status and the outer
+    save_cursor.  smoke_result_for is persisted; a retry finds it and skips smoke.
+    """
+    # Track whether _run_smoke is invoked.
+    smoke_calls: list[tuple[str, str]] = []
+
+    def _fake_smoke_pass(*_a, **_k) -> tuple[str, str]:
+        smoke_calls.append(("called", ""))
+        return ("pass", "fake smoke pass")
+
+    monkeypatch.setattr(host_bridge, "_run_smoke", _fake_smoke_pass)
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py"})
+
+    # Simulate that smoke already ran and its result was persisted.
+    cursor = host_bridge.load_cursor(cfile)
+    cursor["verdict_recorded_for"] = "judge-0"
+    cursor["smoke_result_for"] = {
+        "call_key": "judge-0",
+        "status": "pass",
+        "reason": "pre-persisted smoke pass",
+    }
+    host_bridge.save_cursor(cfile, cursor)
+    smoke_calls.clear()  # reset; the fixture-level monkeypatch already suppresses real smoke
+
+    # Retry judge submit — _run_smoke must not be invoked.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "critique_md": "LGTM",
+                "judge_producer": "codex", "cost_usd": 0.03})
+    assert res2["status"] == "complete"
+    assert smoke_calls == [], (
+        "_run_smoke must not be invoked when smoke_result_for matches the call_key"
+    )
+    assert disp.count("finalize_run") == 1
+
+
+def test_reflexion_clears_idempotency_markers(tmp_path, monkeypatch):
+    """After a Reflexion×1 transition (revise on gen_idx=0), the idempotency
+    markers must be cleared so the next judge cycle (judge-1) records its own
+    verdict independently.
+    """
+    # Monkeypatch _run_smoke at module level (the autouse fixture already does
+    # this, but we want to confirm markers are gone after Reflexion regardless).
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+
+    # Advance to await_judge.
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py"})
+
+    # Simulate verdict_recorded_for being set before the first revise verdict.
+    cursor = host_bridge.load_cursor(cfile)
+    cursor["verdict_recorded_for"] = "judge-0"
+    host_bridge.save_cursor(cfile, cursor)
+
+    # Submit revise verdict → Reflexion fires, cursor transitions to await_generate.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "revise", "critique_md": "needs work",
+                "judge_producer": "codex", "cost_usd": 0.02})
+    assert res2["state"] == "await_generate", "Reflexion must transition to await_generate"
+
+    # After the transition, markers must be cleared so judge-1 can record freshly.
+    cursor_after = host_bridge.load_cursor(cfile)
+    assert "verdict_recorded_for" not in cursor_after, (
+        "verdict_recorded_for must be cleared after Reflexion transition"
+    )
+    assert "smoke_result_for" not in cursor_after, (
+        "smoke_result_for must be cleared after Reflexion transition"
+    )

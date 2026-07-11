@@ -502,14 +502,20 @@ def _write_smoke_log(project_path: str, stage_id: str, content: str) -> str | No
 
 
 def _smoke_timeout_s() -> int:
-    """Return the smoke timeout in seconds from ``HYDRA_SMOKE_TIMEOUT_S`` (default 600).
+    """Return the smoke timeout in seconds from ``HYDRA_SMOKE_TIMEOUT_S`` (default 2400).
 
-    Fail-soft: any non-integer or missing value returns 600.
+    Default raised from 600 → 2400 to align with the attend-submit timeout
+    (HYDRA_SUBMIT_TIMEOUT_S, default 2700).  A 40-min test suite now fits within
+    the ceiling without requiring an env override.
+
+    Fail-soft: any non-integer or missing value returns 2400.
     """
+    raw = os.environ.get("HYDRA_SMOKE_TIMEOUT_S")
     try:
-        return int(os.environ.get("HYDRA_SMOKE_TIMEOUT_S", 600))
-    except (ValueError, TypeError):
-        return 600
+        v = int(raw) if raw else 2400
+    except (TypeError, ValueError):
+        v = 2400
+    return v if v > 0 else 2400
 
 
 def _run_smoke(

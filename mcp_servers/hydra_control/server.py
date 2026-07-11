@@ -396,7 +396,7 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 # for attended step/submit, the pp start_run / judge-smoke round-trip.
 _PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
 _STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "300"))
-_SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "900"))
+_SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "2700"))
 
 
 def _run_cli_json(cli_args: list[str], *, timeout_s: int,

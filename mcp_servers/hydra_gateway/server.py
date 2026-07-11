@@ -298,7 +298,7 @@ class AsyncBackendPool:
     # LIVE in _resolve_tool_timeout (not cached at import) so an operator can
     # raise them without restarting the gateway:
     #   HYDRA_GATEWAY_TOOL_TIMEOUT_S       — ordinary/quick tools (default 120s)
-    #   HYDRA_GATEWAY_LONG_TOOL_TIMEOUT_S  — LLM generate/critique (default 1800s)
+    #   HYDRA_GATEWAY_LONG_TOOL_TIMEOUT_S  — LLM generate/critique (default 3000s)
     #   HYDRA_GATEWAY_MAX_TOOL_TIMEOUT_S   — hard ceiling on any caller override
     #
     # The flat 120s ceiling used to truncate cross-vendor codex/gemini judge &
@@ -311,7 +311,10 @@ class AsyncBackendPool:
     # genuinely hung in-flight call occupies that backend's shared session until
     # the cap fires (call_tool then tears the backend down).
     _DEFAULT_TOOL_TIMEOUT = 120.0
-    _DEFAULT_LONG_TOOL_TIMEOUT = 1800.0
+    # Raised from 1800 → 3000 to exceed the new HYDRA_SUBMIT_TIMEOUT_S default
+    # (2700 s) so the hydra_control in-band timeout always fires before the
+    # gateway hard-preempts and tears down the backend.
+    _DEFAULT_LONG_TOOL_TIMEOUT = 3000.0
     _DEFAULT_MAX_TOOL_TIMEOUT = 3600.0
 
     # Backend tools whose FINAL dotted segment names an LLM generate/critique
@@ -324,12 +327,12 @@ class AsyncBackendPool:
 
     # Control-plane workflow tools proxied to hydra_control run a synchronous
     # `python -m hydra_core.cli` subprocess whose OWN cap is generous
-    # (HYDRA_PLAN_TIMEOUT_S=180 / STEP=300 / SUBMIT=900). Those subprocess caps
+    # (HYDRA_PLAN_TIMEOUT_S=180 / STEP=300 / SUBMIT=2700). Those subprocess caps
     # return a clean in-band {ok:false, error:*_timeout}; the gateway must NOT
     # preempt them with its short 120s default (which instead returns a hard
     # `failed` AND tears the backend down — the observed 4/4 planner timeouts).
     # Classify these by final dotted segment so the gateway cap (long default,
-    # 1800s ceiling) always exceeds the subprocess cap. Names come from
+    # 3000s ceiling) always exceeds the subprocess cap. Names come from
     # hydra_control's tool table: "hydra.workflow.plan|step|submit_host_result|
     # submit_envelopes|launch|resume" → final segments below.
     _CONTROL_PLANE_FINAL_SEGMENTS: frozenset[str] = frozenset({
