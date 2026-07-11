@@ -65,3 +65,62 @@ def test_mcp_critique_client_reads_env(monkeypatch):
     monkeypatch.setenv("HYDRA_JUDGE_TIMEOUT_MS", "90000")
     client = mcp_client.MCPCritiqueClient(dispatcher=object(), cwd=".")
     assert client.timeout_ms == 90_000
+
+
+# ─── smoke timeout (seconds) ────────────────────────────────────────────────
+
+def test_smoke_timeout_default(monkeypatch):
+    monkeypatch.delenv("HYDRA_SMOKE_TIMEOUT_S", raising=False)
+    # Default raised to 2400 (40 min) to align with the new submit timeout tier.
+    assert squad_node._smoke_timeout_s() == 2400
+
+
+def test_smoke_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("HYDRA_SMOKE_TIMEOUT_S", "600")
+    assert squad_node._smoke_timeout_s() == 600
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", ""])
+def test_smoke_timeout_bad_env_falls_back(monkeypatch, bad):
+    monkeypatch.setenv("HYDRA_SMOKE_TIMEOUT_S", bad)
+    assert squad_node._smoke_timeout_s() == 2400
+
+
+# ─── baseline and git timeouts (host_bridge helpers) ────────────────────────
+
+def test_baseline_timeout_default(monkeypatch):
+    from hydra_core import host_bridge
+    monkeypatch.delenv("HYDRA_BASELINE_TIMEOUT_S", raising=False)
+    assert host_bridge._baseline_timeout_s() == 600
+
+
+def test_baseline_timeout_env_override(monkeypatch):
+    from hydra_core import host_bridge
+    monkeypatch.setenv("HYDRA_BASELINE_TIMEOUT_S", "300")
+    assert host_bridge._baseline_timeout_s() == 300
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc", ""])
+def test_baseline_timeout_bad_env_falls_back(monkeypatch, bad):
+    from hydra_core import host_bridge
+    monkeypatch.setenv("HYDRA_BASELINE_TIMEOUT_S", bad)
+    assert host_bridge._baseline_timeout_s() == 600
+
+
+def test_git_timeout_default(monkeypatch):
+    from hydra_core import host_bridge
+    monkeypatch.delenv("HYDRA_GIT_TIMEOUT_S", raising=False)
+    assert host_bridge._git_timeout_s() == 60
+
+
+def test_git_timeout_env_override(monkeypatch):
+    from hydra_core import host_bridge
+    monkeypatch.setenv("HYDRA_GIT_TIMEOUT_S", "120")
+    assert host_bridge._git_timeout_s() == 120
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "abc", ""])
+def test_git_timeout_bad_env_falls_back(monkeypatch, bad):
+    from hydra_core import host_bridge
+    monkeypatch.setenv("HYDRA_GIT_TIMEOUT_S", bad)
+    assert host_bridge._git_timeout_s() == 60

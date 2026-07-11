@@ -76,7 +76,40 @@ _SQ = "engineering"
 # the host session unable to hand-write project source. Fail-soft: if the repo
 # isn't git or worktree provisioning fails, fall back to in-place writes.
 
-def _git(args: list[str], cwd: str | Path, timeout: int = 60) -> subprocess.CompletedProcess:
+def _git_timeout_s() -> int:
+    """Return the git subprocess timeout in seconds from ``HYDRA_GIT_TIMEOUT_S``
+    (default 60). Env: HYDRA_GIT_TIMEOUT_S.
+
+    Fail-soft: any non-integer, missing, or non-positive value returns 60.
+    """
+    raw = os.environ.get("HYDRA_GIT_TIMEOUT_S")
+    try:
+        v = int(raw) if raw else 60
+    except (TypeError, ValueError):
+        v = 60
+    return v if v > 0 else 60
+
+
+def _baseline_timeout_s() -> int:
+    """Return the baseline-smoke test-suite timeout in seconds from
+    ``HYDRA_BASELINE_TIMEOUT_S`` (default 600). Env: HYDRA_BASELINE_TIMEOUT_S.
+
+    Used for both the pre-change baseline run and the per-failure rerun.
+    Raised from the old hardcoded 240 s to give slow suites more headroom.
+
+    Fail-soft: any non-integer, missing, or non-positive value returns 600.
+    """
+    raw = os.environ.get("HYDRA_BASELINE_TIMEOUT_S")
+    try:
+        v = int(raw) if raw else 600
+    except (TypeError, ValueError):
+        v = 600
+    return v if v > 0 else 600
+
+
+def _git(args: list[str], cwd: str | Path, timeout: int | None = None) -> subprocess.CompletedProcess:
+    if timeout is None:
+        timeout = _git_timeout_s()
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, timeout=timeout, check=False)
 
@@ -348,7 +381,7 @@ def _capture_baseline_failures(
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=240,
+                timeout=_baseline_timeout_s(),
             )
             failing = sorted(_parse_failing_tests(res.stdout + "\n" + res.stderr))
             # Cache the completed result (empty list is a valid baseline) so
@@ -702,7 +735,9 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 
 
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
-                 result: dict[str, Any]) -> None:
+                 result: dict[str, Any],
+                 *, cursor_file: "str | Path | None" = None,
+                 call_key: str | None = None) -> None:
     """await_judge -> terminal (or back to await_generate for Reflexion x1).
 
     F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
@@ -712,6 +747,9 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     with call_key='generate-1' and the critique embedded in the prompt.
     GAP-h: warn-telemetry when critique_md cites no existing worktree file.
     GAP-a2: lazy baseline fallback from HYDRA_SMOKE_BASELINE_TESTS env var.
+    Fix-1b: idempotency markers (verdict_recorded_for / smoke_result_for) written
+    mid-function so a retried submit after a timeout never double-records in the
+    pp ledger or restarts the ~28-min smoke.
     """
     cm = dispatcher.call_mcp
     producer = cursor["producer"]
@@ -755,9 +793,21 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     cursor["outcome"] = outcome
 
-    # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
+    # Fix-1b: idempotency — skip record_verdict if a prior attempt for this exact
+    # call_key already succeeded and we persisted the marker.  A submit timeout
+    # that kills mid-_run_smoke (before the outer save_cursor at line ~1172) would
+    # otherwise cause a retry to double-write the pp verdict ledger.
     _record_verdict_ok = True
-    if attempt_id:
+    _verdict_already_recorded = (call_key is not None
+                                  and cursor.get("verdict_recorded_for") == call_key)
+    if _verdict_already_recorded:
+        _trace(cursor, "attended.verdict_skip_idempotent", {
+            "stage_id": cursor.get("stage_id"),
+            "call_key": call_key,
+            "reason": "verdict_recorded_for marker matches — skipping duplicate record_verdict",
+        })
+    elif attempt_id:
+        # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
         try:
             cm("pp_harness", "record_verdict", {
                 "attempt_id": attempt_id,
@@ -769,6 +819,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "score_json": score_json,
                 "rubric_id": gate_rubric,
             }, squad_id=_SQ)
+            # Persist marker before _run_smoke so a timeout mid-smoke leaves the
+            # cursor in a state where a retry can skip this call.
+            if call_key is not None and cursor_file is not None:
+                cursor["verdict_recorded_for"] = call_key
+                save_cursor(cursor_file, cursor)
         except Exception:  # noqa: BLE001
             _record_verdict_ok = False
     if outcome == "pass" and not _record_verdict_ok:
@@ -818,6 +873,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "submit-host-result with {call_key, result:{text, cost_usd, "
                 "tokens_in, tokens_out, model}}."),
         }
+        # Fix-1b: clear idempotency markers when transitioning to a new generate
+        # cycle so the next judge (judge-1) records its own verdict freshly.
+        cursor.pop("verdict_recorded_for", None)
+        cursor.pop("smoke_result_for", None)
         _trace(cursor, "attended.reflexion", {
             "stage_id": cursor["stage_id"], "generate_index": 1,
         })
@@ -828,85 +887,113 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     smoke_status = "skipped"
     smoke_reason = ""
     if outcome == "pass" and attempt_id:
-        smoke_status, smoke_reason = _run_smoke(
-            dispatcher,
-            project_path=work_path,
-            stage_id=cursor["stage_id"])
-        # GAP-a2 / Rider (a): compare against the baseline failures.
-        # If every currently-failing test was ALREADY failing before the engineer's
-        # change, the smoke failure is not attributable to this change — excuse it.
-        # Finding 6: bound the excusable set to prevent real regressions being
-        # silently blessed by an overly broad baseline.
-        if smoke_status == "fail":
-            _captured_baseline = list(cursor.get("baseline_failures") or [])
-            _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
-            _env_allowlist: set[str] | None = (
-                {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
-                if _env_bl_raw else None
-            )
-            # Build excusable set:
-            #  - env var present + captured non-empty → intersection (tightest bound)
-            #  - env var present + captured empty → env var alone (legacy fallback)
-            #  - env var absent → captured baseline alone
-            _captured_set = set(_captured_baseline)
-            if _env_allowlist is not None:
-                _excusable = (_captured_set & _env_allowlist) if _captured_set else _env_allowlist
-            else:
-                _excusable = _captured_set
-
-            if _excusable:
-                _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
-                if len(_excusable) > _max_excuse:
-                    # Baseline too broad — refuse to excuse; treat as real failure.
-                    _trace(cursor, "attended.smoke.baseline_too_broad", {
-                        "stage_id": cursor.get("stage_id"),
-                        "excusable_count": len(_excusable),
-                        "max": _max_excuse,
-                    })
-                    smoke_reason = (
-                        f"smoke: baseline too broad ({len(_excusable)} excusable "
-                        f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
-                        "treating as real failure"
-                    )
+        # Fix-1b: if the smoke already completed for this call_key (persisted before
+        # a prior submit timed out inside _finalize), reuse the result without
+        # re-running the ~28-min test suite or double-calling record_smoke_status.
+        _cached_smoke = cursor.get("smoke_result_for") or {}
+        _smoke_from_cache = (call_key is not None
+                             and _cached_smoke.get("call_key") == call_key)
+        if _smoke_from_cache:
+            smoke_status = str(_cached_smoke.get("status") or "skipped")
+            smoke_reason = str(_cached_smoke.get("reason") or "")
+            _trace(cursor, "attended.smoke_skip_idempotent", {
+                "stage_id": cursor.get("stage_id"),
+                "call_key": call_key,
+                "smoke_status": smoke_status,
+                "reason": "smoke_result_for marker matches — reusing persisted smoke outcome",
+            })
+        else:
+            smoke_status, smoke_reason = _run_smoke(
+                dispatcher,
+                project_path=work_path,
+                stage_id=cursor["stage_id"])
+            # GAP-a2 / Rider (a): compare against the baseline failures.
+            # If every currently-failing test was ALREADY failing before the
+            # engineer's change, the smoke failure is not attributable to this
+            # change — excuse it.
+            # Finding 6: bound the excusable set to prevent real regressions being
+            # silently blessed by an overly broad baseline.
+            if smoke_status == "fail":
+                _captured_baseline = list(cursor.get("baseline_failures") or [])
+                _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
+                _env_allowlist: set[str] | None = (
+                    {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
+                    if _env_bl_raw else None
+                )
+                # Build excusable set:
+                #  - env var present + captured non-empty → intersection (tightest bound)
+                #  - env var present + captured empty → env var alone (legacy fallback)
+                #  - env var absent → captured baseline alone
+                _captured_set = set(_captured_baseline)
+                if _env_allowlist is not None:
+                    _excusable = ((_captured_set & _env_allowlist) if _captured_set
+                                  else _env_allowlist)
                 else:
-                    import sys as _sys
-                    try:
-                        _reruns = subprocess.run(
-                            [_sys.executable, "-m", "pytest",
-                             "tests/", "--no-header", "-q", "--tb=no"],
-                            cwd=work_path,
-                            capture_output=True, text=True, check=False, timeout=240,
-                        )
-                        _current_failing = _parse_failing_tests(
-                            _reruns.stdout + "\n" + _reruns.stderr)
-                    except Exception:  # noqa: BLE001
-                        _current_failing = set()
-                    _excused = _current_failing & _excusable
-                    _new_failures = _current_failing - _excusable
-                    # Always emit telemetry about excused failures (Finding 6).
-                    if _current_failing or _excused:
-                        _trace(cursor, "attended.smoke.baseline_excuse_decision", {
+                    _excusable = _captured_set
+
+                if _excusable:
+                    _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
+                    if len(_excusable) > _max_excuse:
+                        # Baseline too broad — refuse to excuse; treat as real failure.
+                        _trace(cursor, "attended.smoke.baseline_too_broad", {
                             "stage_id": cursor.get("stage_id"),
-                            "current_failing": sorted(_current_failing),
-                            "excused": sorted(_excused),
-                            "new_failures": sorted(_new_failures),
-                            "excusable_set_size": len(_excusable),
+                            "excusable_count": len(_excusable),
+                            "max": _max_excuse,
                         })
-                    if not _new_failures:
-                        smoke_status = "pass"
                         smoke_reason = (
-                            f"smoke: {len(_current_failing)} failure(s) all "
-                            f"pre-existed in baseline ({len(_excused)} excused); "
-                            "treated as pass"
+                            f"smoke: baseline too broad ({len(_excusable)} excusable "
+                            f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
+                            "treating as real failure"
                         )
-        try:
-            cm("pp_harness", "record_smoke_status", {
-                "stage_id": cursor["stage_id"], "candidate_index": 1,
-                "status": smoke_status,
-                "reason": (smoke_reason or "attended drive smoke")[:300],
-            }, squad_id=_SQ)
-        except Exception:  # noqa: BLE001
-            pass
+                    else:
+                        import sys as _sys
+                        try:
+                            _reruns = subprocess.run(
+                                [_sys.executable, "-m", "pytest",
+                                 "tests/", "--no-header", "-q", "--tb=no"],
+                                cwd=work_path,
+                                capture_output=True, text=True, check=False,
+                                timeout=_baseline_timeout_s(),
+                            )
+                            _current_failing = _parse_failing_tests(
+                                _reruns.stdout + "\n" + _reruns.stderr)
+                        except Exception:  # noqa: BLE001
+                            _current_failing = set()
+                        _excused = _current_failing & _excusable
+                        _new_failures = _current_failing - _excusable
+                        # Always emit telemetry about excused failures (Finding 6).
+                        if _current_failing or _excused:
+                            _trace(cursor, "attended.smoke.baseline_excuse_decision", {
+                                "stage_id": cursor.get("stage_id"),
+                                "current_failing": sorted(_current_failing),
+                                "excused": sorted(_excused),
+                                "new_failures": sorted(_new_failures),
+                                "excusable_set_size": len(_excusable),
+                            })
+                        if not _new_failures:
+                            smoke_status = "pass"
+                            smoke_reason = (
+                                f"smoke: {len(_current_failing)} failure(s) all "
+                                f"pre-existed in baseline ({len(_excused)} excused); "
+                                "treated as pass"
+                            )
+            try:
+                cm("pp_harness", "record_smoke_status", {
+                    "stage_id": cursor["stage_id"], "candidate_index": 1,
+                    "status": smoke_status,
+                    "reason": (smoke_reason or "attended drive smoke")[:300],
+                }, squad_id=_SQ)
+            except Exception:  # noqa: BLE001
+                pass
+            # Fix-1b: persist smoke outcome before _finalize so a timeout between
+            # here and the outer save_cursor does not restart the smoke on retry.
+            if call_key is not None and cursor_file is not None:
+                cursor["smoke_result_for"] = {
+                    "call_key": call_key,
+                    "status": smoke_status,
+                    "reason": smoke_reason,
+                }
+                save_cursor(cursor_file, cursor)
         passed = smoke_status == "pass"
     cursor["smoke_status"] = smoke_status
     cursor["smoke_reason"] = smoke_reason
@@ -1160,7 +1247,8 @@ def submit_host_result(
     if state == "await_generate":
         _apply_generate(dispatcher, cursor, result)
     elif state == "await_judge":
-        _apply_judge(dispatcher, cursor, result)
+        _apply_judge(dispatcher, cursor, result,
+                     cursor_file=cursor_file, call_key=call_key)
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
         _apply_squad_result(cursor, result)
