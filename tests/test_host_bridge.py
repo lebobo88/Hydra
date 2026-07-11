@@ -538,11 +538,12 @@ class _FakeDispatcherVerdictRejected(FakeDispatcher):
 
     def call_mcp(self, server: str, tool: str, args: dict,
                  squad_id: str | None = None) -> dict:
-        self.calls.append((server, tool, dict(args), squad_id))
         if tool == "record_verdict":
-            # Simulate MCPStdioDispatcher RBAC rejection — a dict, not an exception.
+            # Record locally only for the intercepted tool, then return rejection.
+            # (super() must NOT be called here — it would append a second time.)
+            self.calls.append((server, tool, dict(args), squad_id))
             return {"status": "rejected", "error": "vendor pinning"}
-        # Delegate all other tools to the base fake.
+        # For all other tools, delegate to base (which records the call once).
         return super().call_mcp(server, tool, args, squad_id=squad_id)
 
 
@@ -551,10 +552,12 @@ class _FakeDispatcherAttemptRejected(FakeDispatcher):
 
     def call_mcp(self, server: str, tool: str, args: dict,
                  squad_id: str | None = None) -> dict:
-        self.calls.append((server, tool, dict(args), squad_id))
         if tool == "record_attempt" and args.get("status") == "ok":
-            # Simulate a rejection dict — no exception raised.
+            # Record locally only for the intercepted case, then return rejection.
+            # (super() must NOT be called here — it would append a second time.)
+            self.calls.append((server, tool, dict(args), squad_id))
             return {"status": "rejected", "error": "attempt rejected by ledger"}
+        # For all other tools (and non-ok record_attempt), delegate to base.
         return super().call_mcp(server, tool, args, squad_id=squad_id)
 
 
