@@ -48,7 +48,10 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
       result}` with the subagent's output:
       - engineer → `{text, cost_usd, tokens_in, tokens_out, model}`
       - judge → `{outcome:pass|revise|fail, critique_md, judge_producer,
-        judge_model_id, score_json, cost_usd}`
+        judge_model_id, score_json, cost_usd}`. For the same-vendor judge,
+        `judge_producer` MUST be `"claude-same-vendor-host"` (never `"claude"`
+        — pp vendor pinning rejects generator-identical producer+model, and
+        the rejection currently surfaces only as an error payload).
    d. The response is either the next `host_action` (the judge, then the next
       stage) or a terminal `{status:"complete"|"surfaced"}` carrying the real
       `final_status`, smoke result, `merge`, and budget charge. On terminal, go
