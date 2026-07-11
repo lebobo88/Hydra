@@ -56,11 +56,20 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
       stage) or a terminal `{status:"complete"|"surfaced"}` carrying the real
       `final_status`, smoke result, `merge`, and budget charge. On terminal, go
       back to (a) for the next stage.
-4. **Skill-squad work** (rlm-gaming, garland, etc.): run the squad Skill in-host
-   as usual; submit any emitted engineering envelopes via
-   `hydra.workflow.submit_envelopes` (those still drive the headless engineering
-   loop) OR drive them attended via step/submit. Garland-bound envelopes are
-   `deferred_to_host`.
+4. **Non-engineering squads** (claude-skill / agent-impersonation packs:
+   executive, garland, rlm-gaming, marketing-*, …) are ALSO driven by the same
+   step/submit loop: when the next pending task belongs to such a pack, `step`
+   returns a lightweight **squad cursor** host_action instead of an engineering
+   one — `{call_key: "squad-<task_id>-0", agent_type: <pack lead agent>,
+   cwd: <pack checkout>, prompt: <task text>}`, cursor state
+   `await_squad_agent`, `run_id` = the task id (no pp run, no worktree — these
+   squads produce documents, not engine code). Spawn that visible pack-lead
+   `Agent`, then `submit_host_result {workflow_id, run_id: <task_id>, call_key,
+   result: {text, cost_usd, tokens_in, tokens_out}}` — the engine records the
+   artifact, charges budget exactly once (`already_charged` on duplicate
+   submits), and marks the task attended-done (RA-12a: a later resume will NOT
+   re-dispatch it). If the pack emits engineering envelopes (DEV_TASK/PRD),
+   submit them via `hydra.workflow.submit_envelopes` as before.
 5. **Synthesis.** When engineering is done and skills are resolved, read the
    workflow `trace.jsonl` + task results and present a conversational summary +
    artifact/commit paths.
