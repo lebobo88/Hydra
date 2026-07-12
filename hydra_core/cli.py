@@ -1587,6 +1587,10 @@ def _cmd_attended_step(args) -> int:
                                         _start_run_args, squad_id="engineering")
             inner = start.get("result", start) if isinstance(start, dict) else {}
             run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
+            _hydra_context_block: str | None = (
+                (inner or {}).get("hydra_context_block")
+                if isinstance(inner, dict) else None
+            )
             if not run_id:
                 print(json.dumps({"ok": False, "error": "start_run returned no run_id",
                                   "detail": str(start)[:500]}), file=sys.stderr)
@@ -1614,7 +1618,8 @@ def _cmd_attended_step(args) -> int:
                 dispatcher, workflow_id=wf, run_id=str(run_id),
                 project_path=project_path, request_text=request_text,
                 model_tier=getattr(task, "model_tier", None),
-                project_root=project, task_id=str(task.task_id))
+                project_root=project, task_id=str(task.task_id),
+                hydra_context_block=_hydra_context_block)
 
             try:
                 # Only open_pp_runs (replace channel) is persisted — NOT `tasks`

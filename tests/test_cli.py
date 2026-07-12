@@ -693,6 +693,88 @@ def test_attended_step_passes_hydra_workflow_id(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_attended_step_threads_hydra_context_block(tmp_path, monkeypatch, capsys):
+    """Phase 7b: when start_run returns hydra_context_block, _cmd_attended_step
+    must pass it as a kwarg to host_bridge.begin_stage so the engineer prompt
+    starts with the context block."""
+    import argparse
+    from hydra_core import cli
+    from hydra_core.state import HydraState, TaskState
+
+    task = TaskState(owner_squad="engineering", description="add a feature")
+    state_val = HydraState(root_goal="add a feature", tasks=[task])
+    wf_id = str(state_val.workflow_id)
+
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    for name in ["engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"]:
+        (agents_dir / name).write_text("# stub\n")
+
+    ctx_block = "## Hydra context\nworkflow_id: wf-ctx-1"
+
+    class _RecDisp:
+        def call_mcp(self, server: str, tool: str, args: dict,
+                     *, squad_id: str | None = None) -> dict:
+            if tool == "start_run":
+                return {"status": "done", "result": {
+                    "run_id": "run-ctx-1",
+                    "hydra_context_block": ctx_block,
+                }}
+            return {"status": "done", "result": {}}
+
+        def set_squad_packs(self, packs: dict) -> None:
+            pass
+
+    class _FakeSnap:
+        values = state_val.model_dump(mode="json")
+
+    class _FakeSup:
+        def get_state(self, config: dict) -> "_FakeSnap":
+            return _FakeSnap()
+
+        def update_state(self, config: dict, values: dict) -> None:
+            pass
+
+    begin_stage_kwargs: list[dict] = []
+
+    def _capture_begin_stage(*args, **kwargs):
+        begin_stage_kwargs.append(kwargs)
+        return {
+            "status": "awaiting_host",
+            "cursor_path": str(tmp_path / "c.json"),
+            "state": "await_generate",
+            "workflow_id": wf_id,
+            "run_id": "run-ctx-1",
+            "stage_id": "s1",
+            "task_id": str(task.task_id),
+            "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "host_action": {
+                "call_key": "generate-0",
+                "agent_type": "engineer",
+                "cwd": str(tmp_path),
+                "prompt": kwargs.get("hydra_context_block", "") + "\n\nREQUEST: add a feature",
+            },
+        }
+
+    monkeypatch.setattr("hydra_core.cli._attended_live_dispatcher",
+                        lambda *a, **k: _RecDisp())
+    monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                        lambda **k: _FakeSup())
+    monkeypatch.setattr("hydra_core.host_bridge.begin_stage", _capture_begin_stage)
+    monkeypatch.setattr("hydra_core.squad_node._maybe_write_claude_shim",
+                        lambda *a, **k: None)
+
+    rc = cli._cmd_attended_step(
+        argparse.Namespace(project=str(tmp_path), workflow_id=wf_id, verbose=False))
+    capsys.readouterr()
+
+    assert rc == 0, "expected rc=0"
+    assert begin_stage_kwargs, "begin_stage was not called"
+    assert begin_stage_kwargs[0].get("hydra_context_block") == ctx_block, (
+        f"hydra_context_block not threaded to begin_stage: {begin_stage_kwargs[0]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # LV-2 / RA-12a: attended squad path e2e — step, submit, idempotency, skip
 # ---------------------------------------------------------------------------

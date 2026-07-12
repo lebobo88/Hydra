@@ -2197,6 +2197,10 @@ def _via_mcp(
     inner = result.get("result", result) if isinstance(result, dict) else {}
     run_id = (inner or {}).get("run_id") if isinstance(inner, dict) else None
     pp_status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+    # 7b: workflow/envelope metadata block from pp's start_run response. Prepended
+    # to request_text so BOTH generators (_run_claude_cli and pp_codex.generate)
+    # receive it via _build_engineer_prompt inside _drive_pp_stage_loop.
+    _hctx_block: str | None = (inner or {}).get("hydra_context_block") if isinstance(inner, dict) else None
 
     # B7: register the pp run on state so node_postcheck can finalize-abort it
     # if the workflow surfaces. start_run acquired <project>/.harness/.lock and
@@ -2242,11 +2246,15 @@ def _via_mcp(
     # access auto-vivifies a truthy object does NOT accidentally engage the
     # loop. Real callers (cli.py live path, fleet factory) set a literal True.
     if getattr(dispatcher, "drive_pp_loop", False) is True and run_id and pp_status == "done":
+        _raw_request_text = str(args.get("request_text", ""))
+        _eff_request_text = (
+            f"{_hctx_block}\n\n{_raw_request_text}" if _hctx_block else _raw_request_text
+        )
         loop_outcome = _drive_pp_stage_loop(
             dispatcher,
             run_id=str(run_id),
             project_path=str(project_path),
-            request_text=str(args.get("request_text", "")),
+            request_text=_eff_request_text,
             model_tier=effective_tier,
             workflow_id=str(getattr(inbound, "workflow_id", "") or ""),
             invoke_mode=mode,

@@ -911,3 +911,56 @@ def test_best_of_n_unknown_borda_winner_falls_back_to_ranked(monkeypatch) -> Non
     fs = next(a for (s, t, a) in disp.calls if t == "finalize_stage")
     assert fs["status"] == "passed"
     assert fs["winner_attempt_id"] == "att_T"   # ranked[0]'s real attempt id
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7b: hydra_context_block threading into generator prompts (_via_mcp)   #
+# --------------------------------------------------------------------------- #
+
+def test_via_mcp_threads_hydra_context_block_to_generate(monkeypatch) -> None:
+    """When start_run returns hydra_context_block, _via_mcp must prepend it to
+    the request_text so the generator (pp_codex.generate) receives it inside the
+    prompt built by _build_engineer_prompt."""
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    ctx_block = "## Hydra context\nworkflow_id: wf-ctx-x"
+    resp = _happy_responses("pass")
+    resp[("pp_harness", "start_run")] = {"status": "done", "result": {
+        "run_id": "run_T", "hydra_context_block": ctx_block}}
+    disp = _ScriptedDispatcher(resp, drive=True)
+
+    _via_mcp(state, pack, _inbound(state), disp)
+
+    # Locate the generate call and verify its prompt argument contains the block.
+    gen_args_list = [a for (s, t, a) in disp.calls if t == "generate"]
+    assert gen_args_list, "expected at least one pp_codex.generate call"
+    gen_prompt = gen_args_list[0].get("prompt", "")
+    assert ctx_block in gen_prompt, (
+        f"hydra_context_block must appear in generate prompt; got: {gen_prompt[:200]!r}"
+    )
+
+
+def test_via_mcp_without_hydra_context_block_prompt_unchanged(monkeypatch) -> None:
+    """When start_run does NOT return hydra_context_block, the generate prompt
+    must not contain any spurious Hydra context header."""
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    # Default _happy_responses has no hydra_context_block in start_run.
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    _via_mcp(state, pack, _inbound(state), disp)
+
+    gen_args_list = [a for (s, t, a) in disp.calls if t == "generate"]
+    assert gen_args_list, "expected at least one pp_codex.generate call"
+    gen_prompt = gen_args_list[0].get("prompt", "")
+    assert "## Hydra context" not in gen_prompt, (
+        "generate prompt must not contain a Hydra context header when block is absent"
+    )
