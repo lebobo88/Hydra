@@ -285,3 +285,58 @@ Suggested sequencing: G1+G2 (config/docs, immediate) → G4 (small server change
 **pair-programmer:** `runs.ts` :73-228 (startRun), :262-300 (ensure_run), :433-452 (agent-type guard), :616-720 (vendor pinning), :1029-1228/:1414/:1444 (finalize gates), :1637-1668 (auto-downgrade), :2275-2332 (finalize side effects + DECISION_RECORD), :2788 (ackRun); `harness-server.ts` :609 (ack_run), :683-790 (Hydra-protocol tools), :1011-1098 (best-of tools), :1258-1283 (gates); `loop-ceiling.ts` :54-68; `hydra-context.ts` :15-16, :46-63, :73; `hydra-envelopes.ts` :60-104; `eights-client.ts` :552-596; `schema.ts` :36-39; `config.ts` :112-115, :162-164, :198-223; `codex-server.ts` :156-200, :360-448; `gemini-server.ts` :92, :183; `paths.ts` :9-11; `hooks/dispatcher.ts` :210-217; `.claude\settings.local.json` (PP_DISABLE_GEMINI=1).
 
 **Third systems:** `AgentSmith/daemon/src/bridges/pp-bridge.ts` :4-62; `AgentSmith/daemon/src/mcp/tools.ts` :476-490; `TheEights/daemon/src/engines/pp-watcher.ts`.
+
+---
+
+## 12. Implementation status (remediation program, 2026-07-11 → 2026-07-12)
+
+Every item below landed through attended Hydra runs (engine source) or direct
+edits (docs/hooks/config) per the approved remediation plan, each phase
+validated with a real Hydra run. Hydra branch `fable-audit-2`; pp and
+AgentSmith on their `fable-audit-2` branches.
+
+### §8 spec — all six items IMPLEMENTED
+
+| Item | Status | Commits / evidence |
+|---|---|---|
+| G1 attended-sole-interactive | DONE | Hydra `a48fe31` (hydra-run.md always-attended, unconditional hook directive, `HYDRA_HOST_DRIVEN` fully retired — zero read sites). Live-validated: full attended run on mu-fleet-scratch, zero `launch` calls, merge-back `debeac5`. |
+| G2 no interactive `claude -p` | DONE | `HYDRA_DISABLE_CLAUDE_ENGINEER=1` in `.claude/settings.json` (`a48fe31`); `_claude_cli_generation_enabled` already honored it. |
+| G3 non-eng attended path | DONE (was mostly pre-built) | Proof + pinning via `22b7719`/`0ff06c7` (e2e squad-cursor CLI test, RA-12a assertion) + `c9b87b2` (hydra-drive.md squad host_action shape). Live-validated: executive-pack attended run (CEO brief), charge-once on duplicate submit, no re-dispatch. |
+| G4 detached gate | DONE | Hydra `04ecdbc` (gate `_launch_run`/`_launch_resume` behind `HYDRA_ALLOW_DETACHED=1`, structured refusal, fleet-goal auto-exempt with boundary-tightened regex, ingest ungated) + `a177e48` (approve/resume docs). Codex cross-vendor judge: revise→Reflexion→pass 9/9/9. Gate live-verified in fresh process; **full MCP-path check pends the next session restart**. Pre-checks: no external launch callers, no crons. |
+| G5 fleet stays detached | DONE (doc) | `c329af8` (hydra-campaign.md) + fleet auto-exemption in G4's gate. |
+| G6 timeout/durability | DONE | Hydra `7631377` (step 900s / submit 1800s defaults; timeout errors carry remediation + `stale_state`; baseline `<sha>.timeout.json` degraded marker ends infinite suite re-pay) + `f90369c` (resume-after-timeout runbook). Live evidence that motivated the additions: two step-ceiling kills mid-baseline with stale lock/run/worktree, baseline never cached on timeout. |
+
+### §9 defects — all seven RESOLVED (or accepted+documented)
+
+| # | Status | Evidence |
+|---|---|---|
+| 9.1 `${HYDRA_CONTEXT}` unwired | **WIRED FOR REAL** | pp returns `hydra_context_block` from `start_run`/`ensure_run` (pp `98422d1` lineage, 7a); Hydra injects into all three generation prompts incl. attended Reflexion retries (Hydra `d0cd89b`, 7b; codex caught + fixed a retry-drop bug). Live-proven: fresh attended run's engineer prompt STARTS with `## Hydra context` + workflow id; stale doc comments rewritten. |
+| 9.2 dead `~/.pp/harness.db` probes | FIXED | `c329af8` — both hooks now probe `~/.pair-programmer/state.db`. |
+| 9.3 stale bypass warning | FIXED | `c329af8` — RA-1 line reworded (marker-required semantics); stale test assertion updated in `04ecdbc`. |
+| 9.4 stale AgentSmith docs | FIXED | AgentSmith `1d934c5` (AGENTS.md) + `c5baf14` (best-of-n.ts comment, via cross-repo attended run). |
+| 9.5 enforcement asymmetry | DOCUMENTED + partially closed | `c329af8` (ARCHITECTURE.md layers note); server-side closure via 9.6 + LV-4. |
+| 9.6 sandbox trust boundary | **SERVER-SIDE DENY** | pp `831f099`: `assertSandboxAllowed` rejects `danger-full-access` unless `PP_ALLOW_DANGER=1` on the headless MCP generate path; 6 unit tests. |
+| 9.7 mode-toggle doc drift | FIXED | `c329af8` + `a48fe31` (CLAUDE.md/ARCHITECTURE.md; toggle retired outright). |
+
+### New findings from live validation (LV series)
+
+| # | Finding | Status |
+|---|---|---|
+| LV-1 | host_bridge ignored MCP tool-error *payloads* (dispatcher returns error dicts, never raises) — a rejected `record_verdict` passed silently and a stage finalized `complete` with zero verdict rows | FIXED `22b7719`: `_raise_on_error_payload` on 10 ledger call sites; regression tests |
+| LV-2 | attended `start_run` omitted all `hydra_*` fields → R6 DECISION_RECORD never emitted for attended runs | FIXED `22b7719`: cli threads workflow/envelope ctx; live-verified non-NULL |
+| LV-3 | `judge-same-vendor.md` instructed the exact producer label pp's vendor pinning rejects when models collide | FIXED `62a6a7c` (contract → `claude-same-vendor-host`) + `22b7719` (host_bridge normalization); live-verified relabel in ledger |
+| LV-4 | pp `getStageFinalizeReadiness` passed stages with ZERO non-retracted verdicts (only blocked on latest-fail) | FIXED pp `831f099`: `zero_verdict` blocker; 8 unit tests + `finalize-gates-c` aligned (`d117691`) |
+| LV-5 | attended smoke has no story for non-Python repos (and worktrees lack node_modules) → TS-repo attended runs surface at PP-VG-5 by design | ACCEPTED + operator preserve-and-merge pickup protocol used; backlog: per-repo smoke_cmd for TS repos |
+| LV-6 | pp readiness MCP tool structurally could never return `finalize_passed` for code stages (schema stripped `winner_attempt_id`) | FIXED pp `d2a8269`: schema widened + threaded; tests |
+| LV-7 | pp's own test drift: `smoke.mjs` predated PP-VG-2/VG-5 gates (fixed across `747a26c`/`6c5adff`/`7ed0655`/`8c0df0c`/`0a9c3aa` — now ALL SMOKE CHECKS PASSED); `eights-integration.smoke.mjs`, `artifact-validators.smoke.mjs`, `agents-md.unit.mjs`, `shutdown.unit.mjs`, `finalize-gates-a.unit.mjs` fail identically pre-remediation (environmental/drift) | smoke.mjs FIXED; remaining five documented pp backlog (verified pre-existing on `276ff0b`) |
+
+### Activation requirements (pending operator restart)
+
+- **Session restart** re-spawns `hydra_control` → activates the G4 detached
+  gate and G6 timeout defaults on the MCP path (validated in fresh processes +
+  unit tests meanwhile).
+- **pp daemon restart** (`npm run build` already done; restart the daemon +
+  gateway) → activates the sandbox deny, zero-verdict blocker, readiness
+  winner param, and `hydra_context_block` on live MCP traffic. The Hydra-side
+  injection (7b) is already active (hydra_core loads per CLI call) — proven
+  live against the rebuilt daemon.
