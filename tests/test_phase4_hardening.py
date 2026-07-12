@@ -878,6 +878,233 @@ def test_gapd_fixture_survives_modified_squad_yaml(monkeypatch, tmp_path):
 
 
 # ===========================================================================
+# HYDRA_ALLOW_DETACHED gate (G4 routing-audit)
+# ===========================================================================
+
+def test_detached_gate_launch_blocked_without_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_launch_run returns a detached_disabled refusal when HYDRA_ALLOW_DETACHED
+    is not set, and subprocess.Popen is never called.  No log directory must be
+    created — the gate fires before any filesystem side-effects."""
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
+    # Redirect _HYDRA_ROOT so any accidental mkdir goes to a temp dir we can
+    # inspect, not the real project root.
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    class _ShouldNotBeCalled:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            raise AssertionError(
+                "Popen must NOT be called when the detached gate is active"
+            )
+
+    monkeypatch.setattr(subprocess, "Popen", _ShouldNotBeCalled)
+
+    out = _srv._launch_run("test goal", squad=None, budget=None, workflow_id="wf-gate-1")
+    assert out["ok"] is False, "gate off → ok must be False"
+    assert out["error"] == "detached_disabled", f"unexpected error key: {out}"
+    assert "HYDRA_ALLOW_DETACHED" in out.get("remediation", ""), (
+        "remediation must mention HYDRA_ALLOW_DETACHED"
+    )
+    # Side-effect assertion: no workflow directory must have been created.
+    assert not (tmp_path / ".hydra" / "wf-gate-1").exists(), (
+        "gate must fire before log_dir.mkdir — no workflow subdir may be created"
+    )
+
+
+def test_detached_gate_resume_blocked_without_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_launch_resume returns a detached_disabled refusal when HYDRA_ALLOW_DETACHED
+    is not set, and subprocess.Popen is never called.  No log directory must be
+    created — the gate fires before any filesystem side-effects."""
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
+    # Redirect _HYDRA_ROOT so any accidental mkdir goes to a temp dir we can
+    # inspect, not the real project root.
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    class _ShouldNotBeCalled:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            raise AssertionError(
+                "Popen must NOT be called when the detached gate is active"
+            )
+
+    monkeypatch.setattr(subprocess, "Popen", _ShouldNotBeCalled)
+
+    out = _srv._launch_resume("wf-gate-2", "approve", None)
+    assert out["ok"] is False, "gate off → ok must be False"
+    assert out["error"] == "detached_disabled", f"unexpected error key: {out}"
+    assert "HYDRA_ALLOW_DETACHED" in out.get("remediation", ""), (
+        "remediation must mention HYDRA_ALLOW_DETACHED"
+    )
+    # Side-effect assertion: no workflow directory must have been created.
+    assert not (tmp_path / ".hydra" / "wf-gate-2").exists(), (
+        "gate must fire before log_dir.mkdir — no workflow subdir may be created"
+    )
+
+
+def test_detached_gate_launch_allowed_with_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_launch_run proceeds to Popen when HYDRA_ALLOW_DETACHED=1."""
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.setenv("HYDRA_ALLOW_DETACHED", "1")
+    # Redirect _HYDRA_ROOT to tmp_path so mkdir/log operations go to a temp dir.
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    popen_calls: list[list[str]] = []
+
+    class _RecordPopen:
+        pid: int = 99999
+
+        def __init__(self, cmd: list[str], **kw: Any) -> None:
+            popen_calls.append(list(cmd))
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordPopen)
+
+    out = _srv._launch_run("test goal", squad=None, budget=None, workflow_id="wf-gate-3")
+    assert popen_calls, "Popen must be called when HYDRA_ALLOW_DETACHED=1"
+    assert out.get("ok") is True, f"expected ok=True, got: {out}"
+
+
+def test_detached_gate_launch_fleet_bypasses_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_launch_run bypasses the detached gate for fleet goals even when
+    HYDRA_ALLOW_DETACHED is not set (fleet is detached by design)."""
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    popen_calls: list[list[str]] = []
+
+    class _RecordPopen:
+        pid: int = 99999
+
+        def __init__(self, cmd: list[str], **kw: Any) -> None:
+            popen_calls.append(list(cmd))
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordPopen)
+
+    fleet_goal = "fix bug --repos agentsmith,theeights"
+    out = _srv._launch_run(fleet_goal, squad=None, budget=None, workflow_id="wf-gate-4")
+    assert popen_calls, (
+        "Popen must be called for a fleet goal even without HYDRA_ALLOW_DETACHED"
+    )
+    assert out.get("ok") is True, f"expected ok=True for fleet goal, got: {out}"
+
+
+@pytest.mark.parametrize("flag", ["--repos", "--fleet"])
+def test_detached_gate_single_id_remains_gated(
+    flag: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A single-id token (no comma) must NOT bypass the detached gate.
+
+    ``--repos agentsmith`` and ``--fleet agentsmith`` each carry only one repo
+    id; they do not constitute a fleet run, so _is_fleet_goal must return False
+    and _launch_run must return the detached_disabled refusal.
+    """
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    class _ShouldNotBeCalled:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            raise AssertionError(
+                f"Popen must NOT be called for single-id {flag} goal"
+            )
+
+    monkeypatch.setattr(subprocess, "Popen", _ShouldNotBeCalled)
+
+    single_id_goal = f"fix a bug {flag} agentsmith"
+    assert not _srv._is_fleet_goal(single_id_goal), (
+        f"_is_fleet_goal must be False for single-id goal: {single_id_goal!r}"
+    )
+
+    out = _srv._launch_run(
+        single_id_goal, squad=None, budget=None, workflow_id="wf-single-id"
+    )
+    assert out["ok"] is False, (
+        f"single-id {flag} goal must be gated → ok=False, got: {out}"
+    )
+    assert out["error"] == "detached_disabled", (
+        f"single-id {flag} goal must produce detached_disabled, got: {out}"
+    )
+    # Side-effect: no log directory created.
+    assert not (tmp_path / ".hydra" / "wf-single-id").exists(), (
+        "gate must fire before log_dir.mkdir for single-id goal"
+    )
+
+
+def test_detached_gate_ingest_always_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_launch_ingest is ungated: it always proceeds to Popen regardless of
+    HYDRA_ALLOW_DETACHED because it is the attended skill-squad continuation
+    transport (not a user-initiated detached launch)."""
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    popen_calls: list[list[str]] = []
+
+    class _RecordPopen:
+        pid: int = 99999
+
+        def __init__(self, cmd: list[str], **kw: Any) -> None:
+            popen_calls.append(list(cmd))
+
+    monkeypatch.setattr(subprocess, "Popen", _RecordPopen)
+
+    envelopes: list[dict[str, Any]] = [
+        {"type": "DEV_TASK", "origin_squad": "garland", "id": "env-1"}
+    ]
+    out = _srv._launch_ingest("wf-gate-5", envelopes)
+    assert popen_calls, (
+        "Popen must be called for ingest regardless of HYDRA_ALLOW_DETACHED"
+    )
+    assert out.get("ok") is True, f"expected ok=True for ingest, got: {out}"
+
+
+# ===========================================================================
+# _FLEET_GOAL_RE unit cases (G4 routing-audit tightening)
+# ===========================================================================
+
+@pytest.mark.parametrize("goal,expected", [
+    # ---- should match (genuine multi-id fleet) ----
+    ("--repos a,b", True),
+    ("fix bug --repos agentsmith,theeights", True),
+    ("fix bug --fleet agentsmith,theeights,xenia", True),
+    ("--repos a,b extra", True),        # trailing content after whitespace is fine
+    # ---- should NOT match ----
+    ("--repos a", False),               # single id, no comma
+    ("--fleet a", False),               # single id via --fleet
+    ("--repos a,b,", False),            # trailing comma — not a valid id list
+    ("refactor the --repos parser", False),  # prose: only one id, no comma
+])
+def test_fleet_goal_re_token_boundaries(goal: str, expected: bool) -> None:
+    """_FLEET_GOAL_RE must respect token boundaries.
+
+    Matches require 2+ comma-separated ids, the flag must follow start-of-string
+    or whitespace, and the id list must end at whitespace or end-of-string (so a
+    trailing comma does not sneak through).
+    """
+    from mcp_servers.hydra_control.server import _is_fleet_goal
+    result = _is_fleet_goal(goal)
+    assert result is expected, (
+        f"_is_fleet_goal({goal!r}): expected {expected}, got {result}"
+    )
+
+
+# ===========================================================================
 # Finding 1: record_attempt schema pin + happy-path try/except
 # ===========================================================================
 
