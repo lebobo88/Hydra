@@ -258,13 +258,24 @@ def test_hooks_contain_stage_active_marker_check():
 
 
 def test_session_contract_warns_on_leaked_stage_active():
-    """hydra-session-contract.ps1 must emit a warning when HYDRA_PP_STAGE_ACTIVE=1."""
+    """hydra-session-contract.ps1 must flag HYDRA_PP_STAGE_ACTIVE=1 at session start.
+
+    The hook was updated from a WARNING to a NOTE that documents the S6
+    hardening: enforcement is NOT bypassed by the bare env var alone — a
+    filesystem stage marker (.harness/stage-active or attended-* worktree) is
+    also required.  This test verifies the note is present with the correct
+    marker-required semantics (not the old literal 'WARNING').
+    """
     text = (HOOKS_DIR / "hydra-session-contract.ps1").read_text(encoding="utf-8")
     assert "HYDRA_PP_STAGE_ACTIVE" in text, (
-        "hydra-session-contract.ps1 missing HYDRA_PP_STAGE_ACTIVE=1 warning"
+        "hydra-session-contract.ps1 missing HYDRA_PP_STAGE_ACTIVE=1 check"
     )
-    assert "WARNING" in text or "warning" in text.lower(), (
-        "hydra-session-contract.ps1 warning line must contain 'WARNING'"
+    assert "NOTE" in text or "note" in text.lower(), (
+        "hydra-session-contract.ps1 leaked-var message must use NOTE (not WARNING)"
+    )
+    assert "marker" in text.lower(), (
+        "hydra-session-contract.ps1 must document that a filesystem stage marker "
+        "is required — bare HYDRA_PP_STAGE_ACTIVE no longer bypasses enforcement"
     )
 
 

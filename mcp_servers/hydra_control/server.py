@@ -224,7 +224,64 @@ def _file_cockpit_audit_envelope(
     return {"ok": True, "spooled": spooled}
 
 
+# ---------------------------------------------------------------------------
+# Detached launch gate helpers
+# ---------------------------------------------------------------------------
+
+def _detached_allowed() -> bool:
+    """Return True iff HYDRA_ALLOW_DETACHED=1 in the current environment.
+
+    Read at call time (not import time) so a parent process or test monkeypatch
+    can set the variable after the module is imported and have it take effect
+    immediately.
+    """
+    return os.environ.get("HYDRA_ALLOW_DETACHED") == "1"
+
+
+_FLEET_GOAL_RE: re.Pattern[str] = re.compile(
+    # Token boundaries:
+    #   (?:^|\s)    — flag must follow start-of-string or whitespace (not
+    #                 embedded mid-word)
+    #   (?=\s|$)    — id list must end at whitespace or end-of-string so a
+    #                 trailing comma like `--repos a,b,` does NOT match
+    # Two-or-more ids: [\w.-]+(,[\w.-]+)+  requires at least one comma-id pair.
+    r"(?:^|\s)--(repos|fleet)[ =]\s*[\w.-]+(,[\w.-]+)+(?=\s|$)"
+)
+
+
+def _is_fleet_goal(goal: str) -> bool:
+    """Return True if *goal* contains a multi-repo fleet token.
+
+    A fleet token is ``--repos`` or ``--fleet`` followed by two or more
+    comma-separated repo ids (e.g. ``--repos agentsmith,theeights``).  Fleet
+    runs are detached by design — the cross-repo campaign spawns one worker per
+    repo and collects results via ``as_completed``.  The attended cursor is
+    single-stream and cannot host a fleet; fleet goals are therefore exempt
+    from the ``HYDRA_ALLOW_DETACHED`` gate so that campaign paths continue to
+    work from sessions that have not set the env var.
+    """
+    return bool(_FLEET_GOAL_RE.search(goal))
+
+
+def _detached_refusal(kind: str) -> dict[str, Any]:
+    """Return a standard refusal envelope for a blocked detached launch."""
+    return {
+        "ok": False,
+        "error": "detached_disabled",
+        "detail": f"detached {kind} is automation-only",
+        "remediation": (
+            "set HYDRA_ALLOW_DETACHED=1 or use "
+            "plan/step/submit_host_result (attended)"
+        ),
+    }
+
+
 def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[str, Any]:
+    # Detached gate: resume is automation-only. No fleet exemption — a resume
+    # call carries no fleet goal string, so fleet detection is not applicable.
+    if not _detached_allowed():
+        return _detached_refusal("resume")
+
     log_dir = _HYDRA_ROOT / ".hydra" / workflow_id
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "resume.log"
@@ -286,6 +343,11 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
     idempotent (claim-before-dispatch ledger), so a retried submit never
     double-dispatches.
     """
+    # UNGATED: ingest is the attended skill-squad continuation transport.
+    # claude-skill squads (rlm-gaming, garland) run host-side and deliver
+    # their envelopes back to the deterministic engine via
+    # submit_envelopes → _launch_ingest.  Gating this would break every
+    # attended claude-skill workflow regardless of HYDRA_ALLOW_DETACHED.
     wf_dir = _HYDRA_ROOT / ".hydra" / workflow_id
     wf_dir.mkdir(parents=True, exist_ok=True)
     # Unique per-submit filename so two concurrent submits to the SAME workflow
@@ -350,6 +412,12 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
     hand-writing code: engineering then dispatches through the pp stage loop in
     Python. Pre-allocates the workflow_id so the caller can attach immediately.
     """
+    # Detached gate: fleet goals are exempt because the cross-repo campaign is
+    # detached by design and sets HYDRA_ALLOW_DETACHED internally before
+    # dispatching individual repo workers.
+    if not _detached_allowed() and not _is_fleet_goal(goal):
+        return _detached_refusal("launch")
+
     wf = workflow_id or str(uuid.uuid4())
     log_dir = _HYDRA_ROOT / ".hydra" / wf
     log_dir.mkdir(parents=True, exist_ok=True)
