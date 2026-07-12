@@ -521,9 +521,15 @@ def test_f5_workflow_plan_invalid_risk_returns_error():
     assert out["ok"] is False
 
 
-def test_f5_launch_risk_forwarded_to_cmd(monkeypatch):
+def test_f5_launch_risk_forwarded_to_cmd(monkeypatch, tmp_path):
     """workflow.launch with risk='medium' must pass --risk medium to the CLI subprocess."""
     from mcp_servers.hydra_control import server as _srv
+
+    # Gate opened: _launch_run is gated by HYDRA_ALLOW_DETACHED (G4). Without it
+    # the function returns detached_disabled before building the cmd.
+    monkeypatch.setenv("HYDRA_ALLOW_DETACHED", "1")
+    # Redirect _HYDRA_ROOT so mkdir/log operations don't touch the real project.
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
 
     captured_cmd: list = []
 
@@ -1798,3 +1804,62 @@ def test_r9_smoke_runs_before_judging(monkeypatch):
         f"R9: smoke must be recorded before the judge gate, got {seq}")
     assert seq.index("record_smoke_status") < seq.index("record_verdict"), (
         f"R9: smoke must be recorded before the verdict, got {seq}")
+
+
+# ===========================================================================
+# G6: timeout-error shape (remediation + stale_state)
+# ===========================================================================
+
+def test_g6_timeout_error_shape_step_label(monkeypatch):
+    """_run_cli_json with err_label='step' on TimeoutExpired must return a
+    'remediation' field naming HYDRA_STEP_TIMEOUT_S and a 'stale_state' list
+    naming resume.lock, orphan pp run, and orphan attended worktree."""
+    from mcp_servers.hydra_control import server as _srv
+
+    def _fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0] if args else [], 900)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    out = _srv._run_cli_json(["step", "--args"], timeout_s=900,
+                             err_label="step", workflow_id="wf-g6-1")
+    assert out["ok"] is False
+    assert out["error"] == "step_timeout"
+    assert "remediation" in out, "step timeout must carry remediation"
+    assert "HYDRA_STEP_TIMEOUT_S" in out["remediation"], (
+        "remediation must name HYDRA_STEP_TIMEOUT_S")
+    assert "stale_state" in out, "step timeout must carry stale_state list"
+    stale = out["stale_state"]
+    assert isinstance(stale, list) and len(stale) >= 1
+    stale_str = " ".join(stale)
+    assert "resume.lock" in stale_str, (
+        "stale_state must name the resume.lock file")
+    assert "worktree" in stale_str.lower(), (
+        "stale_state must name the orphan attended worktree")
+    assert "pp run" in stale_str or "finalize" in stale_str, (
+        "stale_state must name the orphan pp run entry")
+
+
+def test_g6_timeout_error_shape_submit_label(monkeypatch):
+    """_run_cli_json with err_label='submit' on TimeoutExpired must return a
+    'remediation' field naming HYDRA_SUBMIT_TIMEOUT_S with an idempotency note;
+    no 'stale_state' key (stale_state applies only to the step label)."""
+    from mcp_servers.hydra_control import server as _srv
+
+    def _fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0] if args else [], 1800)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    out = _srv._run_cli_json(["submit", "--args"], timeout_s=1800,
+                             err_label="submit", workflow_id="wf-g6-2")
+    assert out["ok"] is False
+    assert out["error"] == "submit_timeout"
+    assert "remediation" in out, "submit timeout must carry remediation"
+    assert "HYDRA_SUBMIT_TIMEOUT_S" in out["remediation"], (
+        "remediation must name HYDRA_SUBMIT_TIMEOUT_S")
+    rem = out["remediation"].lower()
+    assert "idempotent" in rem or "call_key" in rem, (
+        "remediation must state that re-issuing is safe via call_key idempotency")
+    assert "stale_state" not in out, (
+        "submit timeout must NOT carry stale_state (only the step label does)")

@@ -649,3 +649,98 @@ def test_same_vendor_judge_producer_relabeled_for_ledger(tmp_path):
     assert actual_tier == "same_vendor", (
         f"expected _judge_tier='same_vendor', got {actual_tier!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# G6: squad-kind mark_charged parity                                          #
+# --------------------------------------------------------------------------- #
+
+def test_squad_stage_mark_charged_parity(tmp_path):
+    """mark_charged on a completed squad-kind cursor must flip already_charged to
+    True — mirroring the engineering-kind charged flag (rider b idempotency guard).
+
+    Flow: begin_squad_stage → submit_host_result (completes) → verify
+    already_charged=False → mark_charged → re-read via submit (terminal
+    short-circuit) → verify already_charged=True.
+    """
+    disp = FakeDispatcher()
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-mc", task_id="task-mc", squad_slug="executive",
+        entrypoint="agent-impersonation", lead_agent="ceo",
+        pack_cwd=str(tmp_path), request_text="frame decision",
+        project_root=str(tmp_path))
+    cfile = res["cursor_path"]
+
+    # First submit: completes the squad stage.
+    r1 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="squad-task-mc-0",
+        result={"text": "decision doc", "cost_usd": 0.06})
+    assert r1["status"] == "complete"
+    assert r1.get("already_charged") is False, (
+        "before mark_charged, already_charged must be False (charge not yet recorded)")
+
+    # Mark as charged (the CLI does this after charging HydraState).
+    host_bridge.mark_charged(cfile)
+
+    # Re-read via a duplicate submit (terminal cursor → short-circuits to step result).
+    r2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="squad-task-mc-0",
+        result={"text": "decision doc", "cost_usd": 0.06})
+    assert r2["status"] == "complete"
+    assert r2.get("already_charged") is True, (
+        "after mark_charged, already_charged must be True (prevents double-charge)")
+
+
+# --------------------------------------------------------------------------- #
+# G6: baseline timeout marker                                                  #
+# --------------------------------------------------------------------------- #
+
+def test_capture_baseline_timeout_marker(tmp_path, monkeypatch):
+    """On TimeoutExpired _capture_baseline_failures must write a <sha>.timeout.json
+    marker and on the second call return [] WITHOUT re-running the suite.
+
+    The marker prevents re-paying an already-too-slow suite on every stage at the
+    same HEAD commit (which would double the damage and blow step budget).
+    """
+    import json
+    from hydra_core.host_bridge import _capture_baseline_failures
+
+    # Create a tests/ dir so the candidate loop finds something to attempt.
+    (tmp_path / "tests").mkdir()
+
+    fixed_sha = "cafebabe1234abcd"
+
+    # Bypass the real git subprocess: return a known fixed SHA so the cache paths
+    # are deterministic and don't accidentally pick up real HEAD state.
+    class _FakeGitResult:
+        stdout: str = fixed_sha
+        returncode: int = 0
+
+    monkeypatch.setattr(host_bridge, "_git", lambda *a, **k: _FakeGitResult())
+
+    call_count: list[int] = [0]
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001
+        call_count[0] += 1
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 600))
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    # First call: suite runs once, times out, marker written, returns [].
+    result1 = _capture_baseline_failures(str(tmp_path))
+    assert result1 == [], "TimeoutExpired must return []"
+    assert call_count[0] == 1, "suite must run exactly once on the first timed-out call"
+
+    # Marker file must exist in .harness/baseline/.
+    baseline_dir = tmp_path / ".harness" / "baseline"
+    timeout_markers = list(baseline_dir.glob("*.timeout.json"))
+    assert timeout_markers, "a <sha>.timeout.json marker file must be created"
+    marker_data = json.loads(timeout_markers[0].read_text(encoding="utf-8"))
+    assert "timeout_s" in marker_data, "marker must contain the timeout_s value"
+
+    # Second call: marker detected → suite must NOT re-run.
+    result2 = _capture_baseline_failures(str(tmp_path))
+    assert result2 == [], "marker-hit call must return []"
+    assert call_count[0] == 1, (
+        "suite must NOT re-run when the timeout marker already exists for this sha"
+    )

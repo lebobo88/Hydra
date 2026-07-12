@@ -395,22 +395,44 @@ def _capture_baseline_failures(
     # anchor repo), and the full-suite run costs minutes — enough to blow the
     # attended step budget on large repos. Cache completed baselines per
     # (anchor, HEAD sha) under <anchor>/.harness/baseline/<sha>.json so only
-    # the first stage after a new commit pays the suite cost. Timeouts are
-    # NEVER cached (transient) and never trigger a second candidate run
-    # (re-running an already-too-slow suite doubles the damage).
+    # the first stage after a new commit pays the suite cost.
+    # Completed baselines are cached as <sha>.json (a JSON list of failing tests).
+    # Timeouts are now cached as a degraded marker: <sha>.timeout.json containing
+    # {"timeout_s": <value>}.  On entry, if the marker exists for the current HEAD
+    # sha, the function returns [] immediately without re-running the suite — raise
+    # HYDRA_BASELINE_TIMEOUT_S to give the suite more budget.  This prevents
+    # re-paying an already-too-slow suite on every stage (which would double the
+    # damage and blow the step budget) while keeping the safe default: no baseline
+    # → smoke failures are not excused.  Do NOT try the next candidate on timeout —
+    # re-running is always just as slow.
     _cache_anchor = candidates[0] if candidates else project_path
     _cache_file: Path | None = None
+    _timeout_marker: Path | None = None
     try:
         _sha = _git(["rev-parse", "HEAD"], _cache_anchor).stdout.strip()
         if _sha:
             _cache_file = (Path(_cache_anchor) / ".harness" / "baseline"
                            / f"{_sha}.json")
+            _timeout_marker = (Path(_cache_anchor) / ".harness" / "baseline"
+                               / f"{_sha}.timeout.json")
             if _cache_file.is_file():
                 cached = _json.loads(_cache_file.read_text(encoding="utf-8"))
                 if isinstance(cached, list):
                     return sorted(str(t) for t in cached)
+            # If a timeout marker exists the suite already exceeded its budget at
+            # this commit.  Skip silently; operator can delete the marker or raise
+            # HYDRA_BASELINE_TIMEOUT_S.
+            if _timeout_marker.is_file():
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "baseline timeout marker found for sha=%s — skipping suite "
+                    "(baseline degraded; raise HYDRA_BASELINE_TIMEOUT_S to retry)",
+                    _sha,
+                )
+                return []
     except Exception:  # noqa: BLE001 — cache read is best-effort
         _cache_file = None
+        _timeout_marker = None
 
     for cwd in candidates:
         tests_dir = Path(cwd) / "tests"
@@ -441,10 +463,20 @@ def _capture_baseline_failures(
             # (all tests pass in this env = no baseline needed).
             return failing
         except subprocess.TimeoutExpired:
-            # MU17: the suite is too slow for the baseline budget — do NOT try
-            # the next candidate (another full-suite run would double the cost
-            # and blow the caller's step budget). No baseline → smoke failures
-            # are not excused, the safe default.
+            # MU17 degraded-marker: write <sha>.timeout.json so subsequent calls
+            # at the same HEAD return [] immediately without re-running the suite.
+            # No baseline → smoke failures are not excused, the safe default.
+            # Do NOT try the next candidate — the suite is too slow regardless of
+            # which cwd we use.
+            if _timeout_marker is not None:
+                try:
+                    _timeout_marker.parent.mkdir(parents=True, exist_ok=True)
+                    _timeout_marker.write_text(
+                        _json.dumps({"timeout_s": _baseline_timeout_s()}),
+                        encoding="utf-8",
+                    )
+                except Exception:  # noqa: BLE001 — marker write is best-effort
+                    pass
             return []
         except Exception:  # noqa: BLE001 — baseline failure is non-fatal
             continue

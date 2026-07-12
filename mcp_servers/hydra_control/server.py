@@ -462,9 +462,12 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 # Planning halts after intake+planner; it never dispatches, so it is cheap and
 # bounded. Generous caps cover the planner's optional MCP enrichment calls and,
 # for attended step/submit, the pp start_run / judge-smoke round-trip.
+# G6 durability: step raised 300→900 s (one engineer generation + smoke can
+# take several minutes); submit raised to 1800 s (full stage loop with judge).
+# All three defaults can be overridden at runtime via their env knobs.
 _PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
-_STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "300"))
-_SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "2700"))
+_STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "900"))
+_SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "1800"))
 
 
 def _run_cli_json(cli_args: list[str], *, timeout_s: int,
@@ -494,14 +497,43 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             if v is None:
                 return ""
             return v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
-        return {
+        # G6: map each label to its env knob so operators know exactly what to
+        # raise.  For 'submit', re-issuing is safe because submit-host-result is
+        # idempotent on call_key.  For 'step', a killed step can leave stale
+        # state that must be cleaned up manually.
+        _knob_map: dict[str, str] = {
+            "plan": "HYDRA_PLAN_TIMEOUT_S",
+            "step": "HYDRA_STEP_TIMEOUT_S",
+            "submit": "HYDRA_SUBMIT_TIMEOUT_S",
+        }
+        _knob = _knob_map.get(err_label,
+                               f"HYDRA_{err_label.upper()}_TIMEOUT_S")
+        _remediation = f"Increase timeout via {_knob}={timeout_s * 2}"
+        if err_label == "submit":
+            _remediation += (
+                "; re-issuing the same submit-host-result is idempotent on "
+                "call_key (safe to retry)"
+            )
+        _tout: dict[str, Any] = {
             "ok": False,
             "error": f"{err_label}_timeout",
             "detail": f"exceeded {timeout_s}s",
             "workflow_id": workflow_id,
             "partial_stdout": _dec(exc.stdout)[-1000:],
             "partial_stderr": _dec(exc.stderr)[-1000:],
+            "remediation": _remediation,
         }
+        if err_label == "step":
+            # A killed step can leave these artefacts requiring manual cleanup.
+            _tout["stale_state"] = [
+                "resume.lock (the workflow's resume lock file)",
+                "orphan pp run — finalize-abort it via the pp harness",
+                (
+                    "orphan .harness/worktrees/attended-* worktree "
+                    "(git worktree remove <path>)"
+                ),
+            ]
+        return _tout
     if proc.returncode != 0:
         return {"ok": False, "error": f"{err_label}_failed", "workflow_id": workflow_id,
                 "detail": (proc.stderr or "")[-2000:]}
