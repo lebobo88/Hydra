@@ -438,6 +438,107 @@ def test_verdict_idempotency_skips_record_verdict_on_retry(tmp_path, monkeypatch
     assert disp.count("finalize_run") == 1
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7b: hydra_context_block injection into engineer prompt                 #
+# --------------------------------------------------------------------------- #
+
+def test_begin_stage_hydra_context_block_prepended(tmp_path):
+    """When hydra_context_block is supplied, the engineer prompt STARTS with
+    that block (followed by a blank line) — the request body comes after."""
+    disp = FakeDispatcher()
+    block = "## Hydra context\nworkflow_id: wf-1"
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(tmp_path), request_text="implement the thing",
+        project_root=str(tmp_path),
+        hydra_context_block=block)
+    prompt = res["host_action"]["prompt"]
+    assert prompt.startswith(block), (
+        f"prompt must start with hydra_context_block; got: {prompt[:120]!r}"
+    )
+    # The context block must be followed by a blank separator line.
+    assert f"{block}\n\n" in prompt, (
+        "hydra_context_block must be separated from the engineer body by a blank line"
+    )
+    # The original request body is still present.
+    assert "implement the thing" in prompt
+
+
+def test_begin_stage_without_hydra_context_block_prompt_unchanged(tmp_path):
+    """Without hydra_context_block (default None), the prompt must NOT contain
+    any Hydra context header — identical to the pre-7b behavior."""
+    disp = FakeDispatcher()
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(tmp_path), request_text="implement the thing",
+        project_root=str(tmp_path))
+    prompt = res["host_action"]["prompt"]
+    assert "## Hydra context" not in prompt, (
+        "prompt must not contain a Hydra context header when hydra_context_block is absent"
+    )
+
+
+def test_reflexion_retry_prompt_contains_block_exactly_once(tmp_path):
+    """7b fix: the Reflexion generate-1 retry prompt must contain the
+    hydra_context_block heading exactly once AND the critique augmentation.
+
+    Drive: begin_stage(hydra_context_block=block) → submit generate-0 →
+    submit judge-0 revise (same-vendor ok, required_cross=False) →
+    assert the pending_action prompt for generate-1 contains the block
+    exactly once and contains the critique text.
+    """
+    HEADING = "## Hydra context"
+    block = f"{HEADING}\nworkflow_id: wf-1"
+    CRITIQUE = "critique: the thing needs fixing"
+    # required_cross_vendor=False so a same-vendor revise is a genuine code
+    # defect (not an infra downgrade) and Reflexion fires cleanly.
+    disp = FakeDispatcher(required_cross_vendor=False)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(tmp_path), request_text="implement the thing",
+        project_root=str(tmp_path),
+        hydra_context_block=block)
+    cfile = res["cursor_path"]
+
+    # Submit generate result.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.05,
+                "tokens_in": 50, "tokens_out": 25,
+                "model": "claude-sonnet-4-6"})
+    assert res["state"] == "await_judge"
+
+    # Submit revise verdict → Reflexion fires, cursor back to await_generate.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "revise", "critique_md": CRITIQUE,
+                "judge_producer": "claude", "cost_usd": 0.02})
+    assert res["state"] == "await_generate", (
+        "Reflexion must transition cursor back to await_generate"
+    )
+    assert res["host_action"]["call_key"] == "generate-1"
+
+    prompt = res["host_action"]["prompt"]
+
+    # Block must appear exactly once — not zero (dropped), not two (duplicated).
+    count = prompt.count(HEADING)
+    assert count == 1, (
+        f"hydra_context_block heading must appear exactly once in the generate-1 "
+        f"retry prompt; found {count} time(s). prompt[:400]={prompt[:400]!r}"
+    )
+    # Block must precede the critique (same structure as generate-0).
+    block_pos = prompt.index(HEADING)
+    critique_pos = prompt.index(CRITIQUE)
+    assert block_pos < critique_pos, (
+        "hydra_context_block must precede the critique in the retry prompt"
+    )
+    # Critique augmentation must be present.
+    assert CRITIQUE in prompt, (
+        f"critique must be embedded in the retry prompt; "
+        f"prompt[:400]={prompt[:400]!r}"
+    )
+
+
 def test_smoke_idempotency_skips_run_smoke_on_retry(tmp_path, monkeypatch):
     """If smoke_result_for is set on the cursor for the current call_key, a retried
     submit with the same call_key must NOT call _run_smoke again and must reuse

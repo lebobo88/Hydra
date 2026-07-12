@@ -577,6 +577,7 @@ def begin_stage(
     project_root: str | Path | None = None,
     task_id: str | None = None,
     isolate: bool = True,
+    hydra_context_block: str | None = None,
 ) -> dict[str, Any]:
     """Open an attended code stage and pause for the first host action (the
     ``engineer`` generation). ``run_id`` must already exist (the caller runs
@@ -617,6 +618,11 @@ def begin_stage(
                 work_path = worktree_path
 
     base_prompt = _build_engineer_prompt(request_text, work_path)
+    # 7b: prepend hydra_context_block (workflow/envelope metadata from start_run)
+    # so the engineer subagent carries full Hydra routing context. Empty/None →
+    # identical to previous behavior.
+    if hydra_context_block:
+        base_prompt = f"{hydra_context_block}\n\n{base_prompt}"
     # Rider (a): capture baseline failures before the engineer touches anything.
     # The worktree is a linked git worktree (same commits as the repo root); any
     # failures here are environment-specific rather than regressions introduced
@@ -635,6 +641,8 @@ def begin_stage(
         "branch": branch,
         "repo_root": repo_root,
         "request_text": request_text,
+        # Persisted so the Reflexion retry prompt can prepend it (7b fix).
+        "hydra_context_block": hydra_context_block or "",
         "model_tier": model_tier,
         "judge_rubric_id": judge_rubric_id,
         "state": "await_generate",
@@ -970,6 +978,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         cursor["generate_index"] = 1
         cursor["reflexion_critique"] = critique_md
         aug_prompt = _augment_with_critique(cursor["request_text"], critique_md)
+        # 7b fix: re-prepend the hydra_context_block exactly once so the retry
+        # prompt mirrors the initial generate-0 prompt structure.  The block was
+        # stored in the cursor at begin_stage; an empty string is a no-op.
+        _hcb = cursor.get("hydra_context_block", "")
+        if _hcb:
+            aug_prompt = f"{_hcb}\n\n{aug_prompt}"
         cursor["state"] = "await_generate"
         cursor["pending_action"] = {
             "call_key": "generate-1",
