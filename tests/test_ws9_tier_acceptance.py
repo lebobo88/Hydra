@@ -805,7 +805,7 @@ class TestFixARetryTierFromTask:
             target_envelope_id=env_id,
             outcome="revise",
             rubric_id="constitution-alignment@1",
-            judge_vendor="gemini",
+            judge_vendor="agy",
             generator_vendor="engineering",
             critique_md="Needs improvement",
         )
@@ -823,7 +823,7 @@ class TestFixARetryTierFromTask:
              patch("hydra_core.supervisor.route_judge",
                    return_value=MagicMock(
                        tier="full", rubric_ids=["constitution-alignment@1"],
-                       rationale="test", preferred_judge_vendors=["gemini"],
+                       rationale="test", preferred_judge_vendors=["agy"],
                    )), \
              patch.object(sup_module, "execute_squad", side_effect=capturing_execute):
             judge_fn(state)
@@ -1212,7 +1212,7 @@ class TestFix2RetryByTaskId:
             target_envelope_id=env_id,
             outcome="revise",
             rubric_id="constitution-alignment@1",
-            judge_vendor="gemini",
+            judge_vendor="agy",
             generator_vendor="engineering",
             critique_md="Needs improvement",
         )
@@ -1229,7 +1229,7 @@ class TestFix2RetryByTaskId:
                        tier="full",
                        rubric_ids=["constitution-alignment@1"],
                        rationale="test",
-                       preferred_judge_vendors=["gemini"],
+                       preferred_judge_vendors=["agy"],
                    )), \
              patch.object(sup_module, "execute_squad", side_effect=capturing_execute):
             judge_fn(state)
@@ -1456,7 +1456,7 @@ class TestFix2BonTaskIdTagged:
             target_envelope_id=env_id,
             outcome="revise",
             rubric_id="constitution-alignment@1",
-            judge_vendor="gemini",
+            judge_vendor="agy",
             generator_vendor="engineering",
             critique_md="needs revision",
         )
@@ -1473,7 +1473,7 @@ class TestFix2BonTaskIdTagged:
                        tier="full",
                        rubric_ids=["constitution-alignment@1"],
                        rationale="test",
-                       preferred_judge_vendors=["gemini"],
+                       preferred_judge_vendors=["agy"],
                    )), \
              patch.object(sup_module, "execute_squad", side_effect=capturing_execute):
             judge_fn(state)
@@ -1670,7 +1670,7 @@ class TestRound6Fix2RetryOfRetryTier:
             tier="full",
             rubric_ids=["constitution-alignment@1"],
             rationale="test",
-            preferred_judge_vendors=["gemini"],
+            preferred_judge_vendors=["agy"],
         )
 
         # --- Pass 1: judge the initial envelope (retry_index=0 -> retry 1 fires) ---

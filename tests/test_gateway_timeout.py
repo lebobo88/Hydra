@@ -1,7 +1,7 @@
 """Unit tests for the Hydra gateway's per-tool-class timeout resolver.
 
 Covers the fix for the flat 120s ceiling that truncated cross-vendor
-codex/gemini judge & generate calls on large artifacts. No network / no LLM:
+codex/agy judge & generate calls on large artifacts. No network / no LLM:
 exercises `AsyncBackendPool._resolve_tool_timeout` and the two parsing helpers
 directly.
 """
@@ -25,8 +25,8 @@ def pool() -> gw.AsyncBackendPool:
     [
         ("pp_codex", "critique"),
         ("pp_codex", "generate"),
-        ("pp_gemini", "critique"),
-        ("pp_gemini", "generate"),
+        ("pp_agy", "critique"),
+        ("pp_agy", "generate"),
         ("pp_harness", "best_of"),
         # final-segment classification: a dotted tool still resolves by its tail
         ("some_backend", "foo.generate"),

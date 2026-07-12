@@ -71,17 +71,17 @@ def test_classify_judge_error(text, reason, retryable):
 def test_fallback_falls_through_to_second_vendor():
     good = {"outcome": "pass", "critique_md": "x" * 100, "score_json": {"q": 9}}
     client = _ScriptedClient({
-        "gemini": RuntimeError("IneligibleTierError: no longer supported"),
+        "agy": RuntimeError("IneligibleTierError: no longer supported"),
         "codex": good,
     })
     verdict, attempts = dispatch_judge_with_fallback(
         envelope=_envelope(), rubric_id=RUBRIC,
-        judge_vendors=["gemini", "codex"], workflow_id=uuid4(),
+        judge_vendors=["agy", "codex"], workflow_id=uuid4(),
         client=client,
     )
     assert verdict.outcome == "pass"
     assert verdict.judge_vendor == "codex"
-    assert client.calls == ["gemini", "codex"]
+    assert client.calls == ["agy", "codex"]
     # fell back → marked degraded for audit
     assert verdict.score_json.get("_judge_degraded") is True
     assert attempts[0]["ok"] is False and attempts[0]["reason"] == "ineligible_tier"
@@ -90,12 +90,12 @@ def test_fallback_falls_through_to_second_vendor():
 
 def test_fallback_all_fail_returns_skip_not_fail():
     client = _ScriptedClient({
-        "gemini": RuntimeError("IneligibleTierError"),
+        "agy": RuntimeError("IneligibleTierError"),
         "codex": RuntimeError("usage limit"),
     })
     verdict, attempts = dispatch_judge_with_fallback(
         envelope=_envelope(), rubric_id=RUBRIC,
-        judge_vendors=["gemini", "codex"], workflow_id=uuid4(),
+        judge_vendors=["agy", "codex"], workflow_id=uuid4(),
         client=client,
     )
     assert verdict.outcome == "skip"          # NOT "fail"

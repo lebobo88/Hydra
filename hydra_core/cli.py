@@ -473,7 +473,7 @@ def _cmd_run(args) -> int:
         from .judge import MCPCritiqueClient
         dispatcher = MCPStdioDispatcher(project, verbose=args.verbose)
         # Reuse the same dispatcher for cross-vendor judge calls; pp_codex /
-        # pp_gemini servers must be registered at user scope (~/.claude.json).
+        # pp_agy servers must be registered at user scope (~/.claude.json).
         critique_client = MCPCritiqueClient(dispatcher=dispatcher, cwd=project)
         # Live path drives pp to actual code generation (start_run alone only
         # scaffolds). The skill/gateway path leaves this flag unset.
@@ -2638,7 +2638,7 @@ def _cmd_gateway_migrate_hooks(args) -> int:
         ("mcp__hydra_gateway__agentsmith__*", "mcp__hydra_gateway__agentsmith__agentsmith_*"),
         ("mcp__pp_harness__", "mcp__hydra_gateway__pp_harness__"),
         ("mcp__pp_codex__", "mcp__hydra_gateway__pp_codex__"),
-        ("mcp__pp_gemini__", "mcp__hydra_gateway__pp_gemini__"),
+        ("mcp__pp_agy__", "mcp__hydra_gateway__pp_agy__"),
         ("mcp__eights__", "mcp__hydra_gateway__eights__"),
         ("mcp__agentsmith__", "mcp__hydra_gateway__agentsmith__"),
         ("mcp__hydra_memory__", "mcp__hydra_gateway__hydra_memory__"),

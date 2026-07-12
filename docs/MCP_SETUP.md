@@ -139,7 +139,7 @@ disagree, the template wins; regenerate `~/.hydra/backends.json` from it via
 |---|---|---|---|
 | `pp_harness` | pair-programmer | Node.js daemon | No |
 | `pp_codex` | pair-programmer | Node.js daemon | No |
-| `pp_gemini` | pair-programmer | Node.js daemon | No |
+| `pp_agy` | pair-programmer | Node.js daemon | No |
 | `eights` | TheEights | Node.js daemon | No |
 | `agentsmith` | AgentSmith | Node.js daemon | No |
 | `hydra_memory` | Hydra (in-repo) | Python shim | Yes (with Hydra) |

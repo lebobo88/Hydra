@@ -1097,7 +1097,7 @@ def build_supervisor(
         else:
             # RC4 fail-loud: a skeleton verdict is NOT a real evaluation. When the
             # squad IS enabled but no real critique client is wired (dry run, or
-            # pp_codex/pp_gemini unconfigured on a live run), surface that the
+            # pp_codex/pp_agy unconfigured on a live run), surface that the
             # verdict is a no-op skeleton rather than silently downgrading to
             # "revise" and churning Reflexion. On a real dispatcher run RC3/RC4
             # auto-wiring means critique_client is never None here.
@@ -1343,9 +1343,10 @@ def build_supervisor(
             bon_rubrics.extend(["brand-consistency@1", "audience-fit@1"])
 
         try:
-            # Gemini retired (2026-06): codex is the cross-vendor judge. Pass the
-            # full preferred-vendor list so a vendor outage degrades to an honest
-            # `skip` (excluded from Borda) rather than wedging best-of-N.
+            # agy is enabled by default (PP_DISABLE_AGY=0); codex is the primary
+            # cross-vendor judge. Pass the full preferred-vendor list so a vendor
+            # outage degrades to an honest `skip` (excluded from Borda) rather than
+            # wedging best-of-N.
             outcome = judge_and_rank(
                 candidates,
                 rubric_ids=bon_rubrics,

@@ -340,7 +340,7 @@ Plus **externally registered servers** from sibling projects (operator must inst
 |---|---|---|
 | `pp_harness` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | Engineering harness daemon (~42 tools) |
 | `pp_codex` | pair-programmer | Cross-vendor judge plane — Codex critiques |
-| `pp_gemini` | pair-programmer | Cross-vendor judge plane — Gemini critiques |
+| `pp_agy` | pair-programmer | Cross-vendor judge plane — Antigravity (agy) critiques |
 | `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Meta-governance — N1–N10 invariants |
 | `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Cross-project hybrid memory + audit graph + autogenesis loop |
 

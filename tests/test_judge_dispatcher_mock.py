@@ -42,7 +42,7 @@ def test_noop_client_returns_pass_with_skeleton_marker():
     verdict = dispatch_judge(
         envelope=_env(),
         rubric_id="board-decision-quality@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         workflow_id=wf,
         client=NoOpCritiqueClient(),
     )
@@ -62,7 +62,7 @@ def test_real_pass_with_substantive_scores_remains_pass():
     verdict = dispatch_judge(
         envelope=_env(),
         rubric_id="board-decision-quality@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         workflow_id=wf,
         client=client,
     )
@@ -80,7 +80,7 @@ def test_short_critique_pass_gets_downgraded():
     verdict = dispatch_judge(
         envelope=_env(),
         rubric_id="board-decision-quality@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         workflow_id=wf,
         client=client,
     )
@@ -97,7 +97,7 @@ def test_empty_scores_pass_gets_downgraded():
     verdict = dispatch_judge(
         envelope=_env(),
         rubric_id="board-decision-quality@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         workflow_id=wf,
         client=client,
     )
@@ -111,7 +111,7 @@ def test_client_exception_surfaces_as_dispatch_error():
         dispatch_judge(
             envelope=_env(),
             rubric_id="board-decision-quality@1",
-            judge_vendor="gemini",
+            judge_vendor="agy",
             workflow_id=wf,
             client=client,
         )
@@ -127,7 +127,7 @@ def test_rubric_body_is_passed_to_judge():
     dispatch_judge(
         envelope=_env(),
         rubric_id="constitution-alignment@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         workflow_id=wf,
         client=client,
     )
@@ -142,7 +142,7 @@ def test_unknown_rubric_raises():
         dispatch_judge(
             envelope=_env(),
             rubric_id="not-a-real-rubric@99",
-            judge_vendor="gemini",
+            judge_vendor="agy",
             workflow_id=wf,
             client=NoOpCritiqueClient(),
         )

@@ -58,7 +58,7 @@ def test_project_override_overlays_defaults(tmp_path: Path):
 # ---------------- MCP response normalization ----------------
 
 def test_normalize_pp_native_envelope_with_parsed_block():
-    """Real PP CodexResult / GeminiResult shape — verdict lives in parsed."""
+    """Real PP CodexResult / AgyResult shape — verdict lives in parsed."""
     raw = {
         "text": "raw stdout",
         "parsed": {
@@ -69,7 +69,7 @@ def test_normalize_pp_native_envelope_with_parsed_block():
         "tokens_in": 100,
         "tokens_out": 200,
         "cost_usd": 0.001,
-        "model": "gemini-2.5-pro",
+        "model": "agy-flash",
     }
     out = _normalize_pp_response(raw)
     assert out == {
@@ -136,11 +136,11 @@ def test_mcp_client_routes_codex_to_pp_codex():
     assert out["outcome"] == "pass"
 
 
-def test_mcp_client_routes_gemini_to_pp_gemini():
+def test_mcp_client_routes_agy_to_pp_agy():
     fake = _FakeDispatcher({"verdict": "revise", "critique": "x", "scores": {}})
     client = MCPCritiqueClient(dispatcher=fake, cwd="/tmp")
-    client.critique(vendor="gemini", artifact_text="hi", rubric_md="rubric")
-    assert fake.calls[0]["server"] == "pp_gemini"
+    client.critique(vendor="agy", artifact_text="hi", rubric_md="rubric")
+    assert fake.calls[0]["server"] == "pp_agy"
 
 
 def test_mcp_client_raises_on_failed_status():

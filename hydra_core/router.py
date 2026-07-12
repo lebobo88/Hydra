@@ -9,7 +9,7 @@ Two layers, mirroring `Enterprise Master AI Orchestration System Architecture.md
    squad, fall back to an LLM classifier with the squad descriptions as context.
 
 The LLM call is pluggable (`classify_callable`) so this module has no runtime
-dependency on any specific provider — Claude Code, Codex, Gemini, or a local
+dependency on any specific provider — Claude Code, Codex, Antigravity (agy), or a local
 classifier can all satisfy the protocol.
 """
 from __future__ import annotations

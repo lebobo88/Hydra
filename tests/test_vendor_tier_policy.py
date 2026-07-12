@@ -33,7 +33,7 @@ def test_vendor_pair_allowed_empty_is_permissive():
 def test_vendor_pair_allowed_enforced_when_configured():
     p = JudgePolicy(vendor_pairs=frozenset({("claude", "codex")}))
     assert p.vendor_pair_allowed("claude", "codex") is True
-    assert p.vendor_pair_allowed("codex", "gemini") is False
+    assert p.vendor_pair_allowed("codex", "agy") is False
 
 
 def test_cross_vendor_distinct():

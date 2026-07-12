@@ -18,7 +18,7 @@ from ..schemas import HydraEnvelope
 
 
 JudgeOutcome = Literal["pass", "revise", "fail", "skip"]
-JudgeVendor = Literal["codex", "gemini", "claude"]
+JudgeVendor = Literal["codex", "agy", "claude"]
 JudgeTier = Literal["cross_vendor", "same_vendor", "skip"]
 
 

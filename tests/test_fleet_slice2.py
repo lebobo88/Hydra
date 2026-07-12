@@ -1275,7 +1275,7 @@ class TestFleetDissentPrefixOnly:
         state.verdicts.append({
             "outcome": "revise",
             "critique_md": verbatim_critique,
-            "judge_vendor": "gemini",
+            "judge_vendor": "agy",
             "rubric_id": "quality@2",
             "target_envelope_id": str(env_dict.get("id")),
         })
@@ -1299,9 +1299,9 @@ class TestFleetDissentPrefixOnly:
             f"dissenting_opinions: {dissenting}\nRationale: {rationale[:400]!r}"
         )
         # [vendor@rubric] token MUST appear in non-fleet dissent.
-        vendor_rubric_pat = re.compile(r"\[gemini@quality@2\]")
+        vendor_rubric_pat = re.compile(r"\[agy@quality@2\]")
         assert vendor_rubric_pat.search(full_text), (
-            f"Non-fleet dissent must contain [gemini@quality@2] prefix; "
+            f"Non-fleet dissent must contain [agy@quality@2] prefix; "
             f"dissenting_opinions: {dissenting}\nRationale snippet: {rationale[:400]!r}"
         )
         # [repo:] tag must NOT appear in non-fleet dissent.
