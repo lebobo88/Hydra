@@ -36,10 +36,12 @@ escalation_keywords:
 # (generator, judge) allowed pairs — judge must differ from generator for
 # cross_vendor. NOT YET parsed/enforced by load_policy (tracked: Phase-2
 # hardening / F1-vendor-rule). agy (Antigravity) is enabled by default (opt-out
-# via PP_DISABLE_AGY=1); the primary live pair is (claude, codex); (codex, codex)
-# is same-vendor-degraded fallback only.
+# via PP_DISABLE_AGY=1); the primary live pair is (claude, codex); (claude, agy)
+# is a valid secondary cross-vendor pair; (codex, codex) is same-vendor-degraded
+# fallback only.
 vendor_pairs:
   - [claude, codex]
+  - [claude, agy]
   - [codex, codex]   # same-vendor degraded fallback (no host Claude producer)
 
 # Per-workflow tripwire. When the running judge cost exceeds this, the
