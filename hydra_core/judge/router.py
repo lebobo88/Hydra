@@ -172,7 +172,7 @@ def route_judge(
         return JudgeRoute(
             tier="cross_vendor",
             rubric_ids=["constitution-alignment@1", "synthesis-coherence@1"],
-            preferred_judge_vendors=["codex"],  # agy enabled by default; codex used here (opt-out via PP_DISABLE_AGY)
+            preferred_judge_vendors=["codex"],  # deliberately codex-only for this highest-stakes gate; agy remains a valid cross-vendor judge elsewhere (opt-out via PP_DISABLE_AGY)
             rationale="post-synthesis (final Cathedral artifact)",
         )
 
