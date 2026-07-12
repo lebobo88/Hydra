@@ -74,6 +74,25 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
    workflow `trace.jsonl` + task results and present a conversational summary +
    artifact/commit paths.
 
+## Resume after a timeout (G6)
+
+`step`/`submit` are sync CLI subprocesses with ceilings (defaults: plan 180s,
+step 900s, submit 1800s; env `HYDRA_PLAN/STEP/SUBMIT_TIMEOUT_S`). On overrun
+you get a structured `{error: "<label>_timeout", remediation, ...}`:
+
+- **submit timeout** — simply re-issue the SAME `submit_host_result` (same
+  `call_key`, same result payload). The cursor + `call_key` idempotency and the
+  `verdict_recorded_for` / `already_charged` markers guarantee every pp ledger
+  write and budget charge happens exactly once across retries.
+- **step timeout** — the killed subprocess can leave stale state, listed in the
+  error's `stale_state` field: the workflow's `resume.lock` (delete it), an
+  orphan pp run (`finalize_run` it `aborted` to release the project lock), and
+  an orphan `.harness/worktrees/attended-*` worktree (`git worktree remove`).
+  Clean those, then re-issue `step`. First-stage steps on large repos pay a
+  full-suite smoke **baseline** (cached per HEAD sha; a baseline that exceeds
+  `HYDRA_BASELINE_TIMEOUT_S` writes a degraded `<sha>.timeout.json` marker so
+  subsequent stages skip the re-run instead of re-paying it).
+
 ## Hard rules (unchanged)
 
 - You drive the REAL engine MCP tools — never hand-emulate the ledger, never
