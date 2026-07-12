@@ -14,3 +14,8 @@ Companion to `/hydra:approve`. Drives non-approve resume paths:
 - `--squads engineering,garland`: replace `selected_squads` and re-plan.
 
 Adopt `hydra-hitl-gate` to capture the operator decision, then resume the LangGraph checkpoint with the patched state.
+
+Note (G4): when the resume path would re-detach a background `hydra resume
+--live` subprocess (detached workflows), it is gated by
+`HYDRA_ALLOW_DETACHED=1` and otherwise returns `error: "detached_disabled"`.
+Attended workflows resume in-process and continue via `step`/`submit`.

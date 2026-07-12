@@ -15,3 +15,9 @@ Operationally:
 3. On confirmation, write the approval and resume.
 
 For rejection or budget mutation, use `/hydra:resume` instead.
+
+Note (G4): resuming a **detached** workflow re-detaches `hydra resume --live`
+in the background, which is gated by `HYDRA_ALLOW_DETACHED=1` — without the
+gate the server returns `error: "detached_disabled"`. Attended workflows are
+unaffected: approval continues in-process and the attended `step`/`submit`
+loop picks up from the cursor.
