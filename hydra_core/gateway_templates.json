@@ -16,13 +16,13 @@
     "required": false,
     "description": "Cross-vendor critique via OpenAI Codex"
   },
-  "pp_gemini": {
+  "pp_agy": {
     "type": "stdio",
     "command": "node",
-    "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp-gemini"],
+    "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp-agy"],
     "env": {},
     "required": false,
-    "description": "Cross-vendor critique via Google Gemini"
+    "description": "Cross-vendor critique via Antigravity (agy)"
   },
   "eights": {
     "type": "stdio",
