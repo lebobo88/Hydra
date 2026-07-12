@@ -33,7 +33,7 @@ def disp() -> MCPStdioDispatcher:
 
 @pytest.mark.parametrize("server,tool", [
     ("pp_codex", "generate"),
-    ("pp_gemini", "critique"),
+    ("pp_agy", "critique"),
     ("pp_codex", "foo.generate"),       # dotted → classified by tail
     ("pp_harness", "start_stage"),      # pp_harness LLM-wrapping stage tool
     ("pp_harness", "record_attempt"),

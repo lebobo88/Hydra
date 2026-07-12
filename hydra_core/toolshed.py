@@ -1,7 +1,7 @@
 """Toolshed — search-describe-execute meta-tool facade.
 
 Wraps MCP servers (pp_harness, eights, agentsmith, hydra_memory,
-executive_suite, rlm_creative, pp_codex, pp_gemini) behind search/
+executive_suite, rlm_creative, pp_codex, pp_agy) behind search/
 describe/execute meta-tools, reducing the context footprint from ~N tool
 schemas to a handful of constant-size meta-tools.
 
@@ -398,7 +398,7 @@ SENATE_TOOLS = [
 ]
 
 PP_CODEX_TOOLS = ["generate", "critique"]
-PP_GEMINI_TOOLS = ["generate", "critique"]
+PP_AGY_TOOLS = ["generate", "critique"]
 
 XENIA_KB_TOOLS = [
     "xenia-kb.search", "xenia-kb.get", "xenia-kb.list", "xenia-kb.ping",
@@ -870,7 +870,7 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
     shed.register_static_catalog("xenia", XENIA_TOOLS)
     shed.register_static_catalog("senate", SENATE_TOOLS)
     shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
-    shed.register_static_catalog("pp_gemini", PP_GEMINI_TOOLS)
+    shed.register_static_catalog("pp_agy", PP_AGY_TOOLS)
     shed.register_static_catalog("xenia_kb", XENIA_KB_TOOLS)
     shed.register_static_catalog("xenia_tickets", XENIA_TICKETS_TOOLS)
     # Optional / 3rd-party backends — present in backends.template.json and

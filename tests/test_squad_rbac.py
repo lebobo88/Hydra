@@ -39,7 +39,7 @@ LOOP_TOOLS = [
     ("pp_harness", "finalize_run"),
     ("pp_harness", "record_smoke_status"),
     ("pp_codex", "generate"),
-    ("pp_gemini", "critique"),
+    ("pp_agy", "critique"),
 ]
 
 

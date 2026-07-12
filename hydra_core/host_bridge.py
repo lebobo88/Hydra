@@ -799,7 +799,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     gate_rubric = str(gate_dec.get("rubric_id") or cursor["judge_rubric_id"])
     # producer is "claude": a sanctioned same-vendor Claude judge is allowed only
     # when cross-vendor is NOT required; otherwise the host must spawn the
-    # cross-vendor judge (codex/gemini critique).
+    # cross-vendor judge (codex/agy critique).
     judge_agent = "judge-cross-vendor" if required_cross else "judge-same-vendor"
     rubric_body = _rubric_md(gate_rubric)
     judge_text = _judge_artifact_text(

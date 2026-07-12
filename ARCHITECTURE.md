@@ -75,7 +75,7 @@ The supervisor graph has eight explicit nodes, mirroring `HYDRA.md` §2:
 | `planner` | `hydra-planner` | Decompose into typed `TaskState` entries, build a small DAG, populate `selected_squads`, draft a `CSuiteDecisionPacket`. |
 | `approval` | `hydra-hitl-gate` | `interrupt_before` checkpoint. Sets `pending_hitl`; supervisor halts until `/hydra:approve` resumes the thread. |
 | `dispatch` | `dispatcher` | Fan out to squad subgraphs in parallel via one of five adapters (mcp / subprocess / agent-impersonation / claude-skill / stub), materialize one envelope per task, produce a `SquadResult` per squad. |
-| `judge_per_squad` | cross-vendor judge | Per-squad rubric evaluation via `pp_codex` / `pp_gemini`. Reflexion ×1 retry on `revise`. Skips host-pickup envelopes. |
+| `judge_per_squad` | cross-vendor judge | Per-squad rubric evaluation via `pp_codex` / `pp_agy`. Reflexion ×1 retry on `revise`. Skips host-pickup envelopes. |
 | `synthesis` | `hydra-synthesizer` | Merge all `SquadResult`s into a single `DECISION_RECORD`, post artifacts to episodic memory, append a master-plan patch. |
 | `judge_synthesis` | cross-vendor judge | Judge the merged `DecisionRecord` against synthesis-level rubrics. HITL escalation on policy breach. |
 | `postcheck` | `hydra-cfo-gate` | Re-evaluate budget, loop ceiling, residual risk. May surface back to HITL or to `done`. |
@@ -219,7 +219,7 @@ mutation) and therefore enforce HITL-capability / WS-AUTH gating.
 |--------|---------------|---------|
 | `pp_harness` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | Engineering work: `start_run`, `start_stage`, `archive_artifact` |
 | `pp_codex` | pair-programmer daemon | Cross-vendor critique (OpenAI Codex) |
-| `pp_gemini` | pair-programmer daemon | Cross-vendor critique (Google Gemini) |
+| `pp_agy` | pair-programmer daemon | Cross-vendor critique (Antigravity/agy) |
 | `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Evolution, governance, memory, cells |
 | `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Artifact validation, audit, constitution attestation |
 

@@ -14,7 +14,7 @@ def _v(target: str, rubric: str, score: dict, workflow_id: UUID) -> JudgeVerdict
         target_envelope_id=UUID(target),
         outcome="pass",
         rubric_id=rubric,
-        judge_vendor="gemini",
+        judge_vendor="agy",
         critique_md="x" * 100,
         score_json=score,
     )

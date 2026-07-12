@@ -115,11 +115,11 @@ def test_happy_path_drives_full_loop(monkeypatch) -> None:
     assert fs["winner_attempt_id"] == "att_T"
 
     # Producer fell back to codex (no host engineer in the scripted dispatcher);
-    # codex judges (Gemini retired). Same-vendor here, marked degraded — see the
+    # codex judges (agy opt-out via PP_DISABLE_AGY). Same-vendor here, marked degraded — see the
     # _cross_vendor flag wired into the recorded verdict's score_json.
     assert ("pp_codex", "generate") in {(s, t) for (s, t, _a) in disp.calls}
     assert ("pp_codex", "critique") in {(s, t) for (s, t, _a) in disp.calls}
-    assert ("pp_gemini", "critique") not in {(s, t) for (s, t, _a) in disp.calls}
+    assert ("pp_agy", "critique") not in {(s, t) for (s, t, _a) in disp.calls}
 
 
 def test_revise_triggers_one_reflexion_then_surfaces() -> None:

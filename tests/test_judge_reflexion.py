@@ -21,7 +21,7 @@ def _verdict(outcome: str) -> JudgeVerdict:
         target_envelope_id=uuid4(),
         outcome=outcome,
         rubric_id="board-decision-quality@1",
-        judge_vendor="gemini",
+        judge_vendor="agy",
         critique_md="needs more rigor on financials" * 4,
     )
 

@@ -172,7 +172,7 @@ def route_judge(
         return JudgeRoute(
             tier="cross_vendor",
             rubric_ids=["constitution-alignment@1", "synthesis-coherence@1"],
-            preferred_judge_vendors=["codex"],  # Gemini retired (2026-06)
+            preferred_judge_vendors=["codex"],  # agy enabled by default; codex used here (opt-out via PP_DISABLE_AGY)
             rationale="post-synthesis (final Cathedral artifact)",
         )
 
@@ -245,12 +245,12 @@ def route_judge(
     if profile == "enterprise" and tier == "same_vendor":
         tier = "cross_vendor"
 
-    # Gemini retired (Google dropped the free tier, 2026-06 — IneligibleTierError).
-    # Codex is the sole MCP-wired judge vendor. For a cross_vendor gate the
-    # GENERATOR must differ from codex (Claude-tier generation) for the guarantee
-    # to actually hold; that distinctness is enforced downstream by the
-    # vendor-pair rule (judge.policy). For same_vendor the judge is the same
-    # vendor at same-or-higher tier (also enforced downstream).
+    # Vendor selection: agy (Antigravity CLI) is enabled by default and opt-out
+    # via PP_DISABLE_AGY=1. Codex is the primary MCP-wired judge; agy is the
+    # secondary. For a cross_vendor gate the GENERATOR must differ from the judge
+    # vendor for the guarantee to hold; that distinctness is enforced downstream
+    # by the vendor-pair rule (judge.policy). For same_vendor the judge is the
+    # same vendor at same-or-higher tier (also enforced downstream).
     preferred = ["codex"]
     return JudgeRoute(
         tier=tier,

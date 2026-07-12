@@ -7,7 +7,7 @@ the engineering squad reaches the pair-programmer daemon for a real
 `pp.harness.start_run`.
 
 Hydra no longer ships a project-scope `.mcp.json`; all squad backends
-(`pp_harness`, `pp_codex`, `pp_gemini`, `hydra_memory`, `executive_suite`,
+(`pp_harness`, `pp_codex`, `pp_agy`, `hydra_memory`, `executive_suite`,
 `rlm_creative`, `eights`, `agentsmith`) are registered once at user scope so
 every project — Hydra's own source tree, blank scratch dirs, and downstream
 consumers — sees the same set.
@@ -160,7 +160,7 @@ class MCPStdioDispatcher:
     _DEFAULT_LONG_TOOL_TIMEOUT = 1800.0
     _DEFAULT_MAX_TOOL_TIMEOUT = 3600.0
     # Calls that are an LLM generate/critique (slow) get the long timeout.
-    _LONG_TOOL_SERVERS = frozenset({"pp_codex", "pp_gemini"})
+    _LONG_TOOL_SERVERS = frozenset({"pp_codex", "pp_agy"})
     _LONG_TOOL_NAMES = frozenset({"generate", "critique"})
     _LONG_PP_HARNESS_TOOLS = frozenset({
         "start_stage", "start_best_of_stage", "record_attempt",

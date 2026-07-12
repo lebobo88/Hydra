@@ -1,6 +1,6 @@
 """Judge dispatcher.
 
-Invokes pair-programmer's `pp_codex.critique` or `pp_gemini.critique` MCP tools
+Invokes pair-programmer's `pp_codex.critique` or `pp_agy.critique` MCP tools
 to score an envelope against a rubric. Hydra never owns a critique CLI itself —
 the MCP wrappers PP already ships are the vendor abstraction layer.
 

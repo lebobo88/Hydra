@@ -35,8 +35,9 @@ escalation_keywords:
 
 # (generator, judge) allowed pairs — judge must differ from generator for
 # cross_vendor. NOT YET parsed/enforced by load_policy (tracked: Phase-2
-# hardening / F1-vendor-rule). Gemini retired (2026-06) so the live pair is
-# (claude, codex); (codex, codex) is same-vendor-degraded fallback only.
+# hardening / F1-vendor-rule). agy (Antigravity) is enabled by default (opt-out
+# via PP_DISABLE_AGY=1); the primary live pair is (claude, codex); (codex, codex)
+# is same-vendor-degraded fallback only.
 vendor_pairs:
   - [claude, codex]
   - [codex, codex]   # same-vendor degraded fallback (no host Claude producer)

@@ -40,7 +40,7 @@ tools:
   # in squad_node._via_mcp calls (start_run, ensure_agents_md, start_stage,
   # archive_artifact, record_attempt, record_verdict, record_smoke_status,
   # finalize_stage, finalize_run on pp_harness; generate on pp_codex;
-  # critique on pp_gemini)
+  # critique on pp_agy)
   # MUST be declared here or RBAC rejects it mid-run.
   - name: start_run
     mcp_server: pp_harness
@@ -91,7 +91,7 @@ tools:
     notes: >
       Record a judge verdict (pass/revise/fail + critique + score) against an
       attempt. Use for: persisting the cross-vendor critique result in the
-      drive loop. Not for: producing the critique — that is the gemini/codex
+      drive loop. Not for: producing the critique — that is the agy/codex
       critique tool.
   - name: finalize_stage
     mcp_server: pp_harness
@@ -114,23 +114,23 @@ tools:
     notes: >
       Generate code or artifacts via OpenAI Codex.
       Use for: code generation when cross-vendor diversity is needed.
-      Not for: critique/review — use the gemini critique tool instead.
+      Not for: critique/review — use the agy critique tool instead.
   - name: critique
-    mcp_server: pp_gemini
+    mcp_server: pp_agy
     privilege: execute
     notes: >
-      Judge/critique artifacts via Google Gemini.
+      Judge/critique artifacts via Antigravity (agy).
       Use for: cross-vendor review of generated artifacts.
       Not for: code generation — use the codex generate tool instead.
   - name: critique
     mcp_server: pp_codex
     privilege: execute
     notes: >
-      Judge/critique artifacts via OpenAI Codex — the live CROSS-vendor judge
-      (Gemini retired 2026-06). Use for: cross-vendor critique of a Claude-produced
-      change in the drive loop. The RBAC matcher keys on (name, mcp_server), so this
-      entry is REQUIRED for pp_codex.critique — the pp_gemini entry above does not
-      cover it. Not for: code generation — use the codex generate tool instead.
+      Judge/critique artifacts via OpenAI Codex — the primary CROSS-vendor judge.
+      Use for: cross-vendor critique of a Claude-produced change in the drive loop.
+      The RBAC matcher keys on (name, mcp_server), so this entry is REQUIRED for
+      pp_codex.critique — the pp_agy entry above does not cover it.
+      Not for: code generation — use the codex generate tool instead.
   - name: gate_eligible_judges
     mcp_server: pp_harness
     privilege: read

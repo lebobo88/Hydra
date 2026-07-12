@@ -1199,8 +1199,8 @@ def _drive_pp_stage_loop(
             # vendor. gate_eligible_judges decides cross- vs same-vendor for this
             # gate (pp: "Driver MUST call this before invoking any judge"); we
             # follow it. Default when the gate tool is unavailable (no daemon /
-            # scripted): prefer cross-vendor. Gemini retired 2026-06, so the
-            # cross-vendor judge is always codex.
+            # scripted): prefer cross-vendor. agy is enabled by default (opt-out
+            # via PP_DISABLE_AGY=1); codex is used here as the cross-vendor judge.
             gate_dec: dict[str, Any] = {}
             try:
                 gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
@@ -1242,8 +1242,8 @@ def _drive_pp_stage_loop(
             # cross_vendor := the judge vendor differs from the producer vendor.
             cross_vendor = judge_producer != producer
             # _judge_degraded: cross-vendor was REQUIRED but unattainable — only
-            # when codex generated AND must self-judge (Gemini being retired). A
-            # gate-sanctioned same-vendor Claude judge is NOT degraded.
+            # when codex generated AND must self-judge (agy unavailable, PP_DISABLE_AGY=1).
+            # A gate-sanctioned same-vendor Claude judge is NOT degraded.
             degraded = required_cross and not cross_vendor
 
             # F6: critique cost counts toward the run's budget charge too.

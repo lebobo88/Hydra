@@ -1,7 +1,7 @@
 """Hydra cross-model judge plane.
 
 Ports the principles of pair-programmer's rubber-duck-across-vendors judging into
-Hydra's supervisor lifecycle. Reuses PP's pp_codex / pp_gemini MCP servers as the
+Hydra's supervisor lifecycle. Reuses PP's pp_codex / pp_agy MCP servers as the
 vendor abstraction layer; adds Hydra-native rubrics for executive, garland, and
 cross-domain governance.
 

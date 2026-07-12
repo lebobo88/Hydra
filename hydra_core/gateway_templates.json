@@ -22,7 +22,7 @@
     "args_template": ["{PP_ROOT}/daemon/dist/index.js", "mcp-agy"],
     "env": {},
     "required": false,
-    "description": "Cross-vendor critique via Antigravity CLI (agy)"
+    "description": "Cross-vendor critique via Antigravity (agy)"
   },
   "eights": {
     "type": "stdio",

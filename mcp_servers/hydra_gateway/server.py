@@ -319,7 +319,7 @@ class AsyncBackendPool:
 
     # Backend tools whose FINAL dotted segment names an LLM generate/critique
     # call get the long default. Classified the same way as _is_idempotent_tool
-    # so "pp_codex.critique" / "pp_gemini.generate" resolve by "critique" /
+    # so "pp_codex.critique" / "pp_agy.generate" resolve by "critique" /
     # "generate" rather than a substring match on the whole name.
     _LONG_TOOL_FINAL_SEGMENTS: frozenset[str] = frozenset({
         "generate", "critique", "best_of",

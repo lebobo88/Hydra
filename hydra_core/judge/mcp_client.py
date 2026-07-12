@@ -1,12 +1,12 @@
 """MCP-backed critique client.
 
-Wraps the pair-programmer `pp_codex.critique` and `pp_gemini.critique` MCP tools
+Wraps the pair-programmer `pp_codex.critique` and `pp_agy.critique` MCP tools
 behind the `CritiqueClient` Protocol so the supervisor can score envelopes with
 real cross-vendor judgments. Reuses Hydra's existing `MCPStdioDispatcher` to
 avoid duplicating MCP-stdio plumbing.
 
 Configuration:
-  - `pp_codex` and `pp_gemini` servers must be reachable via the dispatcher.
+  - `pp_codex` and `pp_agy` servers must be reachable via the dispatcher.
     In standalone mode: registered in `~/.claude.json` mcpServers.
     In gateway mode: registered in `~/.hydra/backends.json` (the dispatcher
     checks both locations with backends.json as fallback).
@@ -28,7 +28,7 @@ from typing import Any
 from .schemas import JudgeVendor
 
 
-# P2.1: default wall-clock cap (ms) for a codex/gemini critique. Was a hardcoded
+# P2.1: default wall-clock cap (ms) for a codex/agy critique. Was a hardcoded
 # 30 min (1_800_000), which OVERRODE the pp daemon's own 5-min self-kill and let a
 # slow/mis-authed judge hold a stage for 30 min at ~0 CPU (indistinguishable from a
 # dispatch hang). 8 min is ample for a critique; a wedged judge now fails over to a
@@ -47,7 +47,7 @@ def _default_judge_timeout_ms() -> int:
 
 _VENDOR_TO_SERVER: dict[JudgeVendor, str] = {
     "codex": "pp_codex",
-    "gemini": "pp_gemini",
+    "agy": "pp_agy",
     # claude: served via Claude Code subagent dispatch (Phase 3+). Not wired here.
 }
 
@@ -109,7 +109,7 @@ def _normalize_pp_response(raw: Any) -> dict[str, Any]:
     """Coerce PP's critique payload into the {outcome, critique_md, score_json}
     shape the dispatcher's pragmatic-pass guard expects.
 
-    PP's MCP critique tool returns a CodexResult / GeminiResult envelope of
+    PP's MCP critique tool returns a CodexResult / AgyResult envelope of
     shape:
         {
           "text": "<raw CLI stdout>",
