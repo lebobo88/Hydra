@@ -6,6 +6,12 @@ model: haiku
 
 # /hydra:status
 
+<authority_boundary>
+This is a read-only Claude Code operator view over Hydra state. Query the
+structured status interface; do not reconstruct state by editing checkpoints,
+traces, budgets, or HITL records.
+</authority_boundary>
+
 ```
 /hydra:status                 # list workflows latest-first (by trace mtime)
 /hydra:status <workflow_id>   # structured tasks table + pending HITL + budget
@@ -31,4 +37,7 @@ Falls back to the last 30 trace events when the LangGraph checkpoint is unavaila
 
 ## Implementation
 
-`python -m hydra_core.cli status [<workflow_id>]`
+Run `python -m hydra_core.cli status [<workflow_id>]` and render the returned
+structured result without mutating the workflow. Hydra deliberately exposes
+this read-only view through its CLI rather than inventing a duplicate MCP
+state surface.

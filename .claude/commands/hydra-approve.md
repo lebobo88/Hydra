@@ -6,13 +6,22 @@ model: sonnet
 
 # /hydra:approve
 
-Adopt `hydra-hitl-gate`. Look up `HydraState.pending_hitl` for `<workflow_id>`. Append an approval entry to `hitl_history`, clear `pending_hitl`, and resume the LangGraph checkpoint.
+<authority_boundary>
+This command is only the native Claude Code operator interface for an explicit
+human decision. Hydra's resume API is the only authority allowed to validate a
+gate, append HITL history, patch checkpoint state, and continue the graph.
+</authority_boundary>
 
 Operationally:
 
-1. Verify the workflow exists and is in `phase ∈ {approval, synthesis, surfaced}`.
-2. Print the original HITL_REQUEST so the operator can re-verify what they're approving.
-3. On confirmation, write the approval and resume.
+1. Query `python -m hydra_core.cli status <workflow_id>` and render the pending
+   HITL request exactly enough for the operator to review.
+2. Obtain the operator's explicit confirmation. Never infer it from prior text.
+3. Call `hydra.workflow.resume` with `action: "approve"` (or
+   `python -m hydra_core.cli approve <workflow_id>`). Render the authoritative
+   response and stop again if it returns another gate.
+
+Do not directly edit `HydraState`, `hitl_history`, a checkpoint, or a trace.
 
 For rejection or budget mutation, use `/hydra:resume` instead.
 
