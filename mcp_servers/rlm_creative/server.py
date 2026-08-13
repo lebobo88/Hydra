@@ -31,18 +31,18 @@ def _tool_handlers():
 
     def skill_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "skills": list_dir(root, ".claude/skills", only_dirs=True)}
+                "skills": list_dir(root, "plugins/rlm-creative/skills", only_dirs=True)}
 
     def skill_get(args: dict[str, Any]) -> dict[str, Any]:
-        return read_markdown(root, f".claude/skills/{args.get('name','')}/SKILL.md")
+        return read_markdown(root, f"plugins/rlm-creative/skills/{args.get('name','')}/SKILL.md")
 
     def command_list(args: dict[str, Any]) -> dict[str, Any]:
-        all_cmds = list_dir(root, ".claude/commands", suffix=".md")
+        all_cmds = list_dir(root, "plugins/rlm-creative/commands", suffix=".md")
         rlm_only = [c for c in all_cmds if c["name"].startswith("rlm-")]
         return {"root": str(root), "commands": rlm_only}
 
     def command_get(args: dict[str, Any]) -> dict[str, Any]:
-        return read_markdown(root, f".claude/commands/{args.get('name','')}.md")
+        return read_markdown(root, f"plugins/rlm-creative/commands/{args.get('name','')}.md")
 
     def agent_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),

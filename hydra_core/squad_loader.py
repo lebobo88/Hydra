@@ -62,7 +62,7 @@ class SquadPack:
     description: str
     source_pack: Optional[str] = None        # filesystem path or None
     entrypoint: Literal["mcp", "subprocess", "agent-impersonation",
-                        "claude-skill", "stub"] = "stub"
+                        "claude-skill", "claude-native", "stub"] = "stub"
     industries: tuple[str, ...] = ()
     agents: tuple[AgentSpec, ...] = ()
     tools: tuple[ToolSpec, ...] = ()

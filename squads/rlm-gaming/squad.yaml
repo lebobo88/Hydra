@@ -13,7 +13,7 @@ description: >
   engine source or media binaries itself. Crown lead: The Director. Security
   gate (Cerberus-equivalent): The Sentinel. See cerberus.yaml + heads.yaml.
 source_pack: https://github.com/lebobo88/RLM-Gaming
-entrypoint: claude-skill
+entrypoint: claude-native
 best_of_n: 0   # design work is single-shot; greenlight uses HITL, not Borda
 industries:
   - games

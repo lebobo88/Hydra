@@ -109,7 +109,7 @@ def test_squads_emits_json_for_every_pack(capsys):
     assert "garland" in payload
     assert "executive" in payload
     assert "engineering" in payload
-    assert payload["garland"]["entrypoint"] == "claude-skill"
+    assert payload["garland"]["entrypoint"] == "claude-native"
     assert "brand-strategist" in payload["garland"]["agents"]
 
 

@@ -10,7 +10,7 @@ description: >
   Deliberates by the Law of Citations; halts at the Tribune's Veto.
   Wired to the Senate source pack.
 source_pack: https://github.com/lebobo88/Senate
-entrypoint: claude-skill
+entrypoint: claude-native
 industries: [legal, compliance, governance, privacy, ip, regulatory]
 
 agents:

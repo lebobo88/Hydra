@@ -1409,7 +1409,7 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     attended agent. We surface them in task-list order so the host can
     dispatch one at a time, mirroring the engineering attended flow."""
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
-    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "agent-impersonation"})
+    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "claude-native", "agent-impersonation"})
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
@@ -1429,6 +1429,9 @@ def _resolve_pack_lead_agent(pack) -> str:
     Priority: first agent with authority='gatekeeper', then first agent in the
     list, then 'general-purpose' as an absolute fallback.
     """
+    if getattr(pack, "entrypoint", None) == "claude-native":
+        from .native_packs import native_pack
+        return native_pack(pack.slug).qualified_lead_agent
     agents = list(getattr(pack, "agents", []) or [])
     for a in agents:
         if getattr(a, "authority", "") == "gatekeeper":
@@ -1445,6 +1448,9 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
     marketing packs (which are filesystem symlinks into MarketBliss) return
     their real path.  Falls back to the project root if not found.
     """
+    if getattr(pack, "entrypoint", None) == "claude-native":
+        from .native_packs import native_pack_root
+        return str(native_pack_root(pack.slug))
     from .squad_loader import SQUAD_DIR_NAMES, USER_SQUAD_DIR
     for dir_name in SQUAD_DIR_NAMES:
         candidate = project / dir_name / pack.slug
@@ -1734,6 +1740,28 @@ def _cmd_attended_submit(args) -> int:
             host_bridge.mark_charged(cfile)
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+            # The host returns the native pack artifact as text. Persist it only
+            # through the declared pack output root; the helper rejects escapes
+            # and non-text artifacts before producing the MemoryRef returned to
+            # the operator and telemetry.
+            squad_slug = str(res.get("squad_slug") or "")
+            artifact_text = str(res.get("artifact_text") or "")
+            if squad_slug and artifact_text:
+                try:
+                    from .artifact_store import write_native_artifact
+                    ref = write_native_artifact(
+                        squad_slug, f"attended/{res.get('task_id') or args.run_id}.md",
+                        artifact_text,
+                    )
+                    res["artifact_ref"] = ref.model_dump(mode="json")
+                    emit(project, wf, "attended.native_artifact_persisted", {
+                        "squad_slug": squad_slug, "memory_ref": ref.key,
+                    })
+                except (ValueError, OSError) as exc:
+                    res["artifact_persist_error"] = str(exc)
+                    emit(project, wf, "attended.native_artifact_persist_failed", {
+                        "squad_slug": squad_slug, "error": str(exc),
+                    })
             if not isinstance(sup, _PurePythonRunner):
                 config = {"configurable": {"thread_id": wf}}
                 snap = sup.get_state(config)
@@ -1785,6 +1813,60 @@ def _cmd_attended_submit(args) -> int:
                         })
                     except Exception as e:  # noqa: BLE001
                         emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+                    # A native pack may emit typed work for a sibling squad.
+                    # Route it through the same boundary validation, redaction,
+                    # claim-before-dispatch ledger, and checkpoint persistence
+                    # used by `hydra workflow submit-envelopes`.  This closes
+                    # the attended-host gap without creating an ungoverned
+                    # direct Agent fan-out.
+                    emitted = res.get("emitted_envelopes") or []
+                    if emitted:
+                        from .ingest import (
+                            claim_ingested_ids,
+                            dispatch_ingested_envelopes,
+                            load_ingested_ids,
+                            release_ingested_ids,
+                        )
+                        packs = discover_squads(project)
+                        if hasattr(dispatcher, "set_squad_packs"):
+                            dispatcher.set_squad_packs(packs)
+                        outcomes: list[dict[str, object]] = []
+                        processed = load_ingested_ids(project, wf)
+                        for raw in emitted:
+                            if not isinstance(raw, dict):
+                                outcomes.append({"status": "failed", "detail": "non-object envelope"})
+                                continue
+                            envelope_id = raw.get("id")
+                            if envelope_id is not None and str(envelope_id) in processed:
+                                outcomes.append({"envelope_id": str(envelope_id),
+                                                 "status": "skipped_duplicate"})
+                                continue
+                            if envelope_id is not None:
+                                claim_ingested_ids(project, wf, [str(envelope_id)])
+                            outcome = dispatch_ingested_envelopes(
+                                state, [raw], packs=packs, dispatcher=dispatcher,
+                                already_ingested=processed,
+                                emit_fn=lambda event, payload: emit(project, wf, event, payload),
+                            )
+                            item = outcome.items[-1] if outcome.items else None
+                            if envelope_id is not None and item is not None:
+                                if item.status == "unknown_target":
+                                    release_ingested_ids(project, wf, [str(envelope_id)])
+                                else:
+                                    processed.add(str(envelope_id))
+                            try:
+                                sup.update_state(config, {
+                                    "tasks": outcome.new_tasks,
+                                    "envelopes": outcome.new_envelopes,
+                                    "open_pp_runs": state.open_pp_runs,
+                                    "budget": state.budget.model_dump(mode="json"),
+                                })
+                            except Exception as exc:  # noqa: BLE001
+                                emit(project, wf, "attended.emitted_persist_failed",
+                                     {"error": str(exc)})
+                            outcomes.extend(vars(item) for item in outcome.items)
+                        res["ingest"] = outcomes
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),

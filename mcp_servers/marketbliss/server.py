@@ -8,11 +8,11 @@ marketing execution happens in the Claude Code session under the MarketBliss
 constitution.
 
 Tools:
-  mb.roster.list              — list .claude/agents/*.md (the 15 marketing agents)
+  mb.roster.list              — list plugin agents/*.md (the 15 marketing agents)
   mb.agent.get(slug)          — return one agent's markdown + path
-  mb.skill.list               — list .claude/skills/*
+  mb.skill.list               — list plugin skills/*
   mb.skill.get(name)          — return SKILL.md content for the named skill
-  mb.command.list             — list .claude/commands/*.md
+  mb.command.list             — list plugin commands/*.md
   mb.command.get(name)        — return one command's markdown
   mb.output.write(domain, topic, content) — persist under output/{domain}/
   mb.output.read(path)        — read a file under output/
@@ -37,27 +37,27 @@ def _tool_handlers():
 
     def roster_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "agents": list_dir(root, ".claude/agents", suffix=".md")}
+                "agents": list_dir(root, "plugins/marketbliss/agents", suffix=".md")}
 
     def agent_get(args: dict[str, Any]) -> dict[str, Any]:
         slug = args.get("slug", "")
-        return read_markdown(root, f".claude/agents/{slug}.md")
+        return read_markdown(root, f"plugins/marketbliss/agents/{slug}.md")
 
     def skill_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "skills": list_dir(root, ".claude/skills", only_dirs=True)}
+                "skills": list_dir(root, "plugins/marketbliss/skills", only_dirs=True)}
 
     def skill_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/skills/{name}/SKILL.md")
+        return read_markdown(root, f"plugins/marketbliss/skills/{name}/SKILL.md")
 
     def command_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "commands": list_dir(root, ".claude/commands", suffix=".md")}
+                "commands": list_dir(root, "plugins/marketbliss/commands", suffix=".md")}
 
     def command_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/commands/{name}.md")
+        return read_markdown(root, f"plugins/marketbliss/commands/{name}.md")
 
     def output_write(args: dict[str, Any]) -> dict[str, Any]:
         domain = args.get("domain", "marketing")

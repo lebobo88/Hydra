@@ -523,6 +523,7 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         "run_id": cursor.get("run_id"),
         "stage_id": cursor.get("stage_id"),
         "task_id": cursor.get("task_id"),
+        "squad_slug": cursor.get("squad_slug"),
         "state": state,
         "cursor_path": str(cursor_file),
         "cost_usd": float(cursor.get("cost_usd") or 0.0),
@@ -547,6 +548,11 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         # Rider (b): expose charged flag so _cmd_attended_submit can skip
         # duplicate budget charges on a retried submit-host-result call.
         res["already_charged"] = bool(cursor.get("charged", False))
+        if cursor.get("emitted_envelopes"):
+            res["emitted_envelopes"] = cursor["emitted_envelopes"]
+            res["emitted_envelope_count"] = len(cursor["emitted_envelopes"])
+        if cursor.get("artifact_text"):
+            res["artifact_text"] = cursor["artifact_text"]
     return res
 
 
@@ -1340,6 +1346,11 @@ def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
                             + int(result.get("tokens_out") or 0))
     cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
+    # Native pack results may delegate typed work to another squad.  Keep the
+    # raw list in the cursor so the CLI can validate/redact/ingest it under the
+    # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
+    emitted = result.get("emitted_envelopes", result.get("envelopes", []))
+    cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
     cursor["final_status"] = "complete"
     cursor["state"] = "complete"
     cursor["pending_action"] = None
@@ -1348,6 +1359,7 @@ def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
         "task_id": cursor.get("task_id"),
         "squad_slug": cursor.get("squad_slug"),
         "cost_usd": cursor.get("cost_usd"),
+        "emitted_envelope_count": len(cursor["emitted_envelopes"]),
     })
 
 

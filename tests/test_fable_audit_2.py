@@ -702,9 +702,7 @@ class TestResolvePackLeadAgent:
         # garland's first gatekeeper is brand-strategist (authority: gatekeeper)
         garland = packs["garland"]
         lead = _resolve_pack_lead_agent(garland)
-        gatekeeper_slugs = {a.slug for a in garland.agents
-                            if a.authority == "gatekeeper"}
-        assert lead in gatekeeper_slugs
+        assert lead == "rlm-creative:brand-strategist"
 
     def test_fallback_to_general_purpose_when_no_agents(self):
         from hydra_core.cli import _resolve_pack_lead_agent

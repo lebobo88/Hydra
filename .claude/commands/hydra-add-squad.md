@@ -1,6 +1,6 @@
 ---
 description: "Scaffold a new squad pack: creates squads/<slug>/squad.yaml from a template + registers keyword fingerprints."
-argument-hint: "<slug> --industries <a,b,c> [--entrypoint mcp|subprocess|agent-impersonation|claude-skill|stub]"
+argument-hint: "<slug> --industries <a,b,c> [--entrypoint mcp|subprocess|agent-impersonation|claude-skill|claude-native|stub]"
 model: sonnet
 ---
 

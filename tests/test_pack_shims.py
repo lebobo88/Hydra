@@ -24,23 +24,25 @@ HYDRA_ROOT = Path(__file__).resolve().parents[1]
 # ---------- fixtures ----------
 
 def _make_fake_es_root(root: Path) -> Path:
-    (root / ".claude/agents").mkdir(parents=True)
-    (root / ".claude/agents/ceo.md").write_text("# CEO\nrole: chief executive", encoding="utf-8")
-    (root / ".claude/agents/cfo.md").write_text("# CFO\nrole: chief financial", encoding="utf-8")
-    (root / ".claude/skills/financial-frameworks").mkdir(parents=True)
-    (root / ".claude/skills/financial-frameworks/SKILL.md").write_text("# Skill: WACC/IRR", encoding="utf-8")
-    (root / ".claude/commands").mkdir(parents=True)
-    (root / ".claude/commands/board-meeting.md").write_text("# /board-meeting", encoding="utf-8")
+    base = root / "plugins/executive-suite"
+    (base / "agents").mkdir(parents=True)
+    (base / "agents/ceo.md").write_text("# CEO\nrole: chief executive", encoding="utf-8")
+    (base / "agents/cfo.md").write_text("# CFO\nrole: chief financial", encoding="utf-8")
+    (base / "skills/financial-frameworks").mkdir(parents=True)
+    (base / "skills/financial-frameworks/SKILL.md").write_text("# Skill: WACC/IRR", encoding="utf-8")
+    (base / "commands").mkdir(parents=True)
+    (base / "commands/board-meeting.md").write_text("# /board-meeting", encoding="utf-8")
     return root
 
 
 def _make_fake_rlm_root(root: Path) -> Path:
-    (root / ".claude/skills/comfyui").mkdir(parents=True)
-    (root / ".claude/skills/comfyui/SKILL.md").write_text("# Skill: ComfyUI", encoding="utf-8")
-    (root / ".claude/commands").mkdir(parents=True)
-    (root / ".claude/commands/rlm-team.md").write_text("# /rlm-team", encoding="utf-8")
-    (root / ".claude/commands/rlm-video.md").write_text("# /rlm-video", encoding="utf-8")
-    (root / ".claude/commands/non-rlm.md").write_text("# /non-rlm  (should be filtered out)", encoding="utf-8")
+    base = root / "plugins/rlm-creative"
+    (base / "skills/comfyui").mkdir(parents=True)
+    (base / "skills/comfyui/SKILL.md").write_text("# Skill: ComfyUI", encoding="utf-8")
+    (base / "commands").mkdir(parents=True)
+    (base / "commands/rlm-team.md").write_text("# /rlm-team", encoding="utf-8")
+    (base / "commands/rlm-video.md").write_text("# /rlm-video", encoding="utf-8")
+    (base / "commands/non-rlm.md").write_text("# /non-rlm  (should be filtered out)", encoding="utf-8")
     (root / "RLM/agents").mkdir(parents=True)
     (root / "RLM/agents/master-architect.md").write_text("# Master Architect", encoding="utf-8")
     return root

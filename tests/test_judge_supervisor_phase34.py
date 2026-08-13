@@ -246,9 +246,9 @@ def test_reflexion_ceiling_exhausted_emits_override_hitl():
 
 # ---------------- Best-of-N path ----------------
 
-def test_best_of_n_produces_n_candidates_and_picks_winner():
-    """With pack.best_of_n=3, node_dispatch produces 3 candidates and
-    Borda-ranks them. The winner envelope is what flows downstream."""
+def test_native_pack_defers_instead_of_headless_best_of_n():
+    """A Claude-native pack requires a visible host cursor; it must not create
+    synthetic headless candidates for best-of-N selection."""
     from hydra_core.supervisor import build_supervisor
 
     client = _SequencedClient(queue=[])  # all passes
@@ -258,21 +258,16 @@ def test_best_of_n_produces_n_candidates_and_picks_winner():
         critique_client=client,
         force_pure_python=True,
     )
-    state = HydraState(root_goal="strategic OKR refresh")
+    state = HydraState(root_goal="strategic OKR refresh", selected_squads=["executive"])
     final = _invoke(sup, state)
 
-    # Look for the bon_losers artifact emitted by _dispatch_best_of_n.
     bon_artifact = next(
         (a for a in final.artifacts if a.get("kind") == "bon_losers"),
         None,
     )
-    assert bon_artifact is not None, "best-of-N path should emit bon_losers artifact"
-    assert len(bon_artifact["loser_envelope_ids"]) >= 1  # at least 1 loser when N=3
-    assert bon_artifact["squad"] == "executive"
-
-    # Synthesis judge still ran post-Borda.
-    rubric_ids = {v["rubric_id"] for v in final.verdicts}
-    assert "synthesis-coherence@1" in rubric_ids
+    assert bon_artifact is None
+    executive_task = next(task for task in final.tasks if task.owner_squad == "executive")
+    assert executive_task.status == "deferred_to_host"
 
 
 def test_best_of_n_falls_back_when_insufficient_candidates(monkeypatch):

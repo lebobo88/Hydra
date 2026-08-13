@@ -137,6 +137,16 @@ def execute_squad(
         result = _via_impersonation(state, pack, inbound, dispatcher)
     elif pack.entrypoint == "claude-skill":
         result = _via_claude_skill(state, pack, inbound, dispatcher)
+    elif pack.entrypoint == "claude-native":
+        # Native Claude Code packs are attended by the host cursor in cli.py.
+        # A non-hosted graph run must surface honestly rather than pretending a
+        # pack agent executed.
+        result = SquadResult(
+            envelopes=[], artifacts=[], status="deferred_to_host",
+            rationale=(f"native Claude Code squad {pack.slug!r} requires an "
+                       "attended host cursor"),
+            host_pickup_pending=True,
+        )
     elif pack.entrypoint == "subprocess":
         result = _via_subprocess(state, pack, inbound, dispatcher)
     else:

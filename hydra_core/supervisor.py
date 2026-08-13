@@ -1911,13 +1911,19 @@ def build_supervisor(
             # transport (hydra.workflow.submit_envelopes -> ingest). Stub/test
             # dispatchers (live_execution=False) keep the legacy in-graph path.
             #
+            # Native Claude Code plugins are *always* attended: even a
+            # deterministic/test dispatcher must not fabricate a best-of-N
+            # execution path for them. Other non-MCP packs keep their legacy
+            # in-graph behavior unless the dispatcher is live.
             # RA-5: stub squads are EXCLUDED from this live-defer pre-filter.
             # A stub squad has a real in-graph path (_stub) that returns a
             # canned [STUB] DecisionRecord with status="surfaced" — deferring
             # it to the host strands the task as deferred_to_host instead of
             # surfacing the honest stub signal. Only agent-impersonation and
             # claude-skill (which genuinely need a host executor) are deferred.
-            if getattr(dispatcher, "live_execution", False) and pack.entrypoint not in ("mcp", "stub"):
+            if (pack.entrypoint == "claude-native"
+                    or (getattr(dispatcher, "live_execution", False)
+                        and pack.entrypoint not in ("mcp", "stub"))):
                 emit_trace(judge_trace_root, state.workflow_id, "dispatch.deferred_to_host", {
                     "squad": pack.slug,
                     "entrypoint": pack.entrypoint,

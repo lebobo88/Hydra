@@ -7,7 +7,7 @@ description: >
   dialogue-mix, blender-model, blender-rig, governance-c2pa). Canonical source-of-truth
   lives at the RLM-Creative repo; this file is the Hydra-side copy kept in sync with it.
 source_pack: https://github.com/lebobo88/RLM-Creative
-entrypoint: claude-skill
+entrypoint: claude-native
 best_of_n: 3   # produce 3 candidate creative drafts, judge each, Borda-rank
 industries:
   - media

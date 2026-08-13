@@ -34,7 +34,7 @@ def test_creative_squad_loads_with_fifteen_agents(packs):
     # added when bd664c3 wired the Blender 3D pipeline into garland (the squad
     # rlm-gaming commissions for 3D assets). Was 13 before the blender subs.
     garland = packs["garland"]
-    assert garland.entrypoint == "claude-skill"
+    assert garland.entrypoint == "claude-native"
     assert "RLM-Creative" in (garland.source_pack or "")
     assert len(garland.agents) == 15
 

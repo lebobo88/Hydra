@@ -21,7 +21,7 @@ A project-level slug shadows a user-level slug of the same name.
 name: <human readable>
 description: <multi-line>
 source_pack: <abs path or null>                  # references the underlying repo if any
-entrypoint: mcp|subprocess|agent-impersonation|claude-skill|stub
+entrypoint: mcp|subprocess|agent-impersonation|claude-skill|claude-native|stub
 industries: [tag1, tag2]                          # router signal
 agents:    [{slug, role, authority, model_hint?}]
 tools:     [{name, mcp_server?, privilege}]

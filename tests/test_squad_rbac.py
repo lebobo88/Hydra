@@ -125,14 +125,12 @@ def test_exact_dotted_key_form_authorizes() -> None:
 
 # ── RA-3: claude-skill shim RBAC auto-authorization ──────────────────────────
 
-# Shim tool pairs for each claude-skill squad that appears in _SKILL_PACK_SHIMS.
+# Shim tool pairs for the remaining legacy claude-skill squad. Native Claude
+# plugins do not receive Hydra gateway-MCP authorization.
 # Parametrize against the squads present in THIS worktree's squads/ directory
 # (marketing-* are symlinks from MarketBliss; only test what discover_squads returns).
 _CLAUDE_SKILL_SHIM_CASES: list[tuple[str, str, str]] = [
     # (squad_slug, shim_server, shim_prefix)
-    ("garland",          "rlm_creative", "rlm"),
-    ("legal-compliance", "senate",       "senate"),
-    ("rlm-gaming",       "rlm_gaming",   "rlmgaming"),
     ("customer-support", "xenia",        "xenia"),
 ]
 

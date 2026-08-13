@@ -5,11 +5,11 @@ output writer matching the squad.yaml `output_dir: output/{domain}/{topic}-{date
 convention. The pack itself is markdown — this server does not run any LLM.
 
 Tools:
-  es.roster.list          — list .claude/agents/*.md
+  es.roster.list          — list plugin agents/*.md
   es.agent.get(slug)      — return one agent's markdown + path
-  es.skill.list           — list .claude/skills/*
+  es.skill.list           — list plugin skills/*
   es.skill.get(name)      — return SKILL.md content for the named skill
-  es.command.list         — list .claude/commands/*.md
+  es.command.list         — list plugin commands/*.md
   es.command.get(name)    — return one command's markdown
   es.output.write(domain, topic, content) — persist under output/{domain}/
   es.output.read(path)    — read a file under output/
@@ -34,27 +34,27 @@ def _tool_handlers():
 
     def roster_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "agents": list_dir(root, ".claude/agents", suffix=".md")}
+                "agents": list_dir(root, "plugins/executive-suite/agents", suffix=".md")}
 
     def agent_get(args: dict[str, Any]) -> dict[str, Any]:
         slug = args.get("slug", "")
-        return read_markdown(root, f".claude/agents/{slug}.md")
+        return read_markdown(root, f"plugins/executive-suite/agents/{slug}.md")
 
     def skill_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "skills": list_dir(root, ".claude/skills", only_dirs=True)}
+                "skills": list_dir(root, "plugins/executive-suite/skills", only_dirs=True)}
 
     def skill_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/skills/{name}/SKILL.md")
+        return read_markdown(root, f"plugins/executive-suite/skills/{name}/SKILL.md")
 
     def command_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "commands": list_dir(root, ".claude/commands", suffix=".md")}
+                "commands": list_dir(root, "plugins/executive-suite/commands", suffix=".md")}
 
     def command_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/commands/{name}.md")
+        return read_markdown(root, f"plugins/executive-suite/commands/{name}.md")
 
     def output_write(args: dict[str, Any]) -> dict[str, Any]:
         domain = args.get("domain", "general")

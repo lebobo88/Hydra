@@ -18,7 +18,7 @@ You are the central orchestrator of the Enterprise Agent Mesh. Your job is to tr
 1. **Intake**: read the user goal. Call `hydra_core.cli squads` (or read `squads/*/squad.yaml`) to know which squads exist. Use the intent router (`hydra_core/router.py`) to select 1+ squads.
 2. **Planning**: if `executive` is selected, delegate decomposition to the executive squad via `hydra-router` (it impersonates the boardroom). Otherwise, build a flat task list one-per-squad.
 3. **Approval**: if any selected squad has `hitl_required: true` gates active, or budget approval is needed, emit an `HITL_REQUEST` envelope and PAUSE. Resume only via `/hydra:approve <workflow_id>`.
-4. **Dispatch**: hand each task to the appropriate squad via the squad's declared `entrypoint` (mcp / subprocess / agent-impersonation / claude-skill / stub). Use `hydra-router` for the actual handoff.
+4. **Dispatch**: hand each task to the appropriate squad via the squad's declared `entrypoint` (mcp / subprocess / agent-impersonation / claude-skill / claude-native / stub). Native packs run through the attended host cursor; use `hydra-router` for the actual handoff.
 5. **Executing**: track each squad's progress. Tasks return envelopes (PRD, ARCH_RFC, SHOT_LIST, ASSET_JOB, DECISION_RECORD, etc.). Validate every cross-boundary message with `hydra_core.schemas.validate_envelope`.
 6. **Synthesis**: combine results into a single `DECISION_RECORD` with rationale + artifact links. Preserve any dissenting opinions verbatim.
 7. **Postcheck**: call `hydra_core.governance.enforce_governance`. If any check fails (loop ceiling, budget, failed tasks), mark the run `surfaced` and emit an HITL request.

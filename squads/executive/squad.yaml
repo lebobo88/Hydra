@@ -7,7 +7,7 @@ description: >
   capital-allocation / crisis-warroom / mna-cockpit sessions through Claude
   Code's sub-agent impersonation pattern (no spawned sub-processes).
 source_pack: https://github.com/lebobo88/ExecutiveSuite
-entrypoint: agent-impersonation
+entrypoint: claude-native
 best_of_n: 3   # produce 3 candidate boardroom drafts, judge each, Borda-rank
 industries:
   - cross-industry-strategic
