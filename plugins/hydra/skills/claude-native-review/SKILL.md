@@ -12,8 +12,8 @@ allowed-tools: Read Glob Grep
 Review `$ARGUMENTS` without editing files.
 
 <scope>
-Inspect `CLAUDE.md`, `.claude/settings.json`, `.claude/agents/`,
-`.claude/commands/`, `.claude/skills/`, `.claude/hooks/`, and relevant tests.
+Inspect `CLAUDE.md`, `.claude/settings.json`, `plugins/hydra/agents/`,
+`plugins/hydra/skills/`, `plugins/hydra/hooks/`, and relevant tests.
 Compare them with current official Anthropic and Claude Code documentation.
 </scope>
 

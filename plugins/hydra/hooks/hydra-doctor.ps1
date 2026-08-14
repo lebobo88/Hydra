@@ -7,7 +7,7 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent  # plugin root (two up from .claude/hooks)
+$root = Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent
 $env:PYTHONPATH = "$root;$env:PYTHONPATH"
 python -m hydra_core.cli --project "$root" @args
 exit 0

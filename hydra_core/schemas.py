@@ -198,12 +198,17 @@ class ShotList(HydraEnvelope):
 class AssetJob(HydraEnvelope):
     type: Literal["ASSET_JOB"] = "ASSET_JOB"
     shotlist_id: Optional[UUID] = None
-    model_type: Literal["diffusion", "nerf", "video_llm", "tts", "music"]
+    # `mesh` and `rig` are executed by Garland's existing blender-model and
+    # blender-rig workers. Their detailed DCC/rig contracts are persisted as
+    # MemoryRefs in the inherited `context_refs`, never invented as an inline
+    # payload field.
+    model_type: Literal["diffusion", "nerf", "video_llm", "tts", "music", "mesh", "rig"]
     resolution: str = "1920x1080"
     fps: int = 24
     style_refs: list[MemoryRef] = Field(default_factory=list)
     output_bucket: str
     max_render_cost_usd: float = 200.0
+    provenance_required: bool = False
 
 
 # ---------- governance ----------

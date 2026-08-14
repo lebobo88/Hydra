@@ -8,6 +8,12 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Changed — canonical plugin namespace (plugin 0.1.6)
+
+- Moved Hydra agents, skills, and portable hooks into `plugins/hydra/`.
+  Operator surfaces now resolve consistently as `/hydra:<verb>` and portable
+  hooks have a single plugin owner, avoiding duplicate project-local discovery.
+
 ### Changed — Claude Code-native host surface (plugin 0.1.5)
 
 Hydra now uses current Claude Code-native configuration surfaces wherever they

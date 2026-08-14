@@ -2,6 +2,7 @@
 description: "Resume a paused workflow with a non-approval action: reject, modify-budget, force-dispatch, change-squads."
 argument-hint: "<workflow_id> --reject | --modify-budget <usd> | --force-dispatch | --squads <a,b>"
 model: sonnet
+disable-model-invocation: true
 ---
 
 # /hydra:resume

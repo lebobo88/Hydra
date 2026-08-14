@@ -146,6 +146,99 @@ _register(Rubric(
     ),
 ))
 
+# ---------- marketing (MarketBliss) ----------
+# Bodies below mirror plugins/marketbliss/rubrics/<id>. The source text is
+# immutable per @version; a single completeness dimension lets the generic
+# judge require the listed requirements without inventing source criteria.
+
+_register(Rubric(
+    rubric_id="marketing-brief-clarity@1",
+    kind="marketing",
+    body_md=(
+        "# Marketing Brief Clarity @1\n"
+        "Require one objective, audience/JTBD, KPIs, constraints, evidence references, "
+        "channel roles, and explicit assumptions.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="creative-brief-completeness@1",
+    kind="marketing",
+    body_md=(
+        "# Creative Brief Completeness @1\n"
+        "Require core message, proof points, audience, channels, tone, aesthetic, "
+        "production constraints, approvals, and context references.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="attribution-soundness@1",
+    kind="marketing",
+    body_md=(
+        "# Attribution Soundness @1\n"
+        "Require a channel-appropriate method, causal assumptions, baseline, MDE, power, "
+        "and decision rule.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="regulated-claims-check@1",
+    kind="marketing",
+    body_md=(
+        "# Regulated Claims Check @1\n"
+        "Require jurisdiction, substantiation, disclosures, profile restrictions, and human "
+        "approval where required.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="experimentation-design@1",
+    kind="marketing",
+    body_md=(
+        "# Experimentation Design @1\n"
+        "Require hypothesis, primary metric, randomization unit, sample-size assumptions, "
+        "guardrails, stop rule, and analysis method.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="shot-list-coverage@1",
+    kind="marketing",
+    body_md=(
+        "# Shot List Coverage @1\n"
+        "Require every message and format to map to a shot with technical specification, "
+        "purpose, accessibility, and clearance status.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="production-plan-completeness@1",
+    kind="marketing",
+    body_md=(
+        "# Production Plan Completeness @1\n"
+        "Require schedule, budget, crew and equipment, location, contingencies, "
+        "post-production milestones, and approvals.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
+_register(Rubric(
+    rubric_id="ip-clearance@1",
+    kind="marketing",
+    body_md=(
+        "# IP Clearance @1\n"
+        "Require evidence, permitted usage scope, and escalation for every recognizable person, "
+        "location, music item, stock asset, and trademark.\n"
+    ),
+    score_dimensions=("requirements_complete",),
+))
+
 # ---------- compliance / healthcare ----------
 
 _register(Rubric(

@@ -1546,7 +1546,7 @@ def _cmd_attended_step(args) -> int:
             # F27: preflight — verify ALL THREE agent files exist before
             # staging host_actions that reference them.  If any is absent,
             # surface a clear dependency error rather than a broken host_action.
-            _agents_dir = project / ".claude" / "agents"
+            _agents_dir = project / "plugins" / "hydra" / "agents"
             _required_agents = {
                 "engineer.md": "code generator",
                 "judge-cross-vendor.md": "cross-vendor judge",
@@ -1562,8 +1562,8 @@ def _cmd_attended_step(args) -> int:
                     "detail": (
                         f"attended engineering requires agent stubs: "
                         f"{', '.join(_missing_agents)}. "
-                        "Create them under .claude/agents/ (or symlink from "
-                        "pair-programmer/.claude/agents/) to enable "
+                        "Install the Hydra plugin assets under plugins/hydra/agents/ "
+                        "to enable "
                         "attended engineering."
                     ),
                     "missing": _missing_agents,

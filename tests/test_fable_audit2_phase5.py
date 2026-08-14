@@ -3,12 +3,12 @@
 Covers:
   F1  — settings.json has HYDRA_ENFORCE_ROUTING=1 and
         hydra-block-direct-pp.ps1 has HYDRA_PP_STAGE_ACTIVE bypass.
-  F2  — hooks.json UserPromptSubmit includes hydra-route-directive entry.
+  F2  — plugin hooks/hooks.json UserPromptSubmit includes hydra-route-directive.
   F3  — `hydra budget` CLI (list / show / set) incl M3 capability gate.
   F4  — hydra-block-bash-writes.ps1 blocks echo redirect to .py and allows
         `git status` (pwsh subprocess test; skipped if pwsh absent).
   F6  — `_cmd_status` ordering (latest-first by trace mtime) + structured render.
-  F7  — .claude-plugin/hooks.json is gone; hooks.json has Task Pre/PostToolUse.
+  F7  — the plugin's standard hooks/hooks.json has Task Pre/PostToolUse.
   F15+M6 — gateway server.py docstring says 16 backends + 6 meta-tools.
   M1  — hydra-session-contract.ps1 has HYDRA_SCAFFOLD_CONTRACT=0 opt-out.
 """
@@ -26,10 +26,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
-HOOKS_JSON = HYDRA_ROOT / "hooks.json"
+PLUGIN_ROOT = HYDRA_ROOT / "plugins" / "hydra"
+HOOKS_JSON = PLUGIN_ROOT / "hooks" / "hooks.json"
 SETTINGS_JSON = HYDRA_ROOT / ".claude" / "settings.json"
-HOOKS_DIR = HYDRA_ROOT / ".claude" / "hooks"
-PLUGIN_DIR = HYDRA_ROOT / ".claude-plugin"
+HOOKS_DIR = PLUGIN_ROOT / "hooks"
+PLUGIN_DIR = PLUGIN_ROOT / ".claude-plugin"
 GATEWAY_SERVER = HYDRA_ROOT / "mcp_servers" / "hydra_gateway" / "server.py"
 
 
@@ -81,11 +82,11 @@ def test_block_direct_pp_has_pp_stage_bypass():
 
 
 # ---------------------------------------------------------------------------
-# F2 — hooks.json UserPromptSubmit has route-directive
+# F2 — plugin hooks.json UserPromptSubmit has route-directive
 # ---------------------------------------------------------------------------
 
 def test_hooks_json_has_route_directive_in_user_prompt_submit():
-    """hooks.json must register hydra-route-directive under UserPromptSubmit."""
+    """Plugin hooks.json must register hydra-route-directive under UserPromptSubmit."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     ups_groups = cfg.get("hooks", {}).get("UserPromptSubmit", [])
     all_commands = [
@@ -646,24 +647,20 @@ def test_budget_set_fail_closed_on_verify_exception_with_key(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# F7 — .claude-plugin/hooks.json deleted + Task entries in root hooks.json
+# F7 — standard plugin hooks file has Task entries
 # ---------------------------------------------------------------------------
 
-def test_claude_plugin_hooks_json_deleted():
-    """.claude-plugin/hooks.json must no longer exist (merged into root hooks.json)."""
-    orphan = PLUGIN_DIR / "hooks.json"
-    assert not orphan.exists(), (
-        ".claude-plugin/hooks.json still exists — it should be deleted after "
-        "the iolaus entries were merged into root hooks.json"
-    )
+def test_plugin_uses_standard_hooks_directory():
+    """Plugin hooks belong in the auto-discovered standard hooks directory."""
+    assert HOOKS_JSON.exists(), "plugins/hydra/hooks/hooks.json is missing"
 
 
 def test_hooks_json_has_task_pretooluse():
-    """Root hooks.json must have a Task PreToolUse entry (iolaus_check)."""
+    """Plugin hooks.json must have a Task PreToolUse entry (iolaus_check)."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     pre = cfg.get("hooks", {}).get("PreToolUse", [])
     task_groups = [g for g in pre if g.get("matcher") == "Task"]
-    assert task_groups, "No Task PreToolUse entry in root hooks.json"
+    assert task_groups, "No Task PreToolUse entry in plugin hooks.json"
     commands = [h.get("command", "") for g in task_groups for h in g.get("hooks", [])]
     assert any("iolaus_check" in cmd for cmd in commands), (
         f"iolaus_check not found in Task PreToolUse hooks: {commands}"
@@ -671,11 +668,11 @@ def test_hooks_json_has_task_pretooluse():
 
 
 def test_hooks_json_has_task_posttooluse():
-    """Root hooks.json must have a Task PostToolUse entry (iolaus_log)."""
+    """Plugin hooks.json must have a Task PostToolUse entry (iolaus_log)."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     post = cfg.get("hooks", {}).get("PostToolUse", [])
     task_groups = [g for g in post if g.get("matcher") == "Task"]
-    assert task_groups, "No Task PostToolUse entry in root hooks.json"
+    assert task_groups, "No Task PostToolUse entry in plugin hooks.json"
     commands = [h.get("command", "") for g in task_groups for h in g.get("hooks", [])]
     assert any("iolaus_log" in cmd for cmd in commands), (
         f"iolaus_log not found in Task PostToolUse hooks: {commands}"
@@ -683,11 +680,11 @@ def test_hooks_json_has_task_posttooluse():
 
 
 def test_hooks_json_has_bash_pretooluse():
-    """Root hooks.json must have a Bash PreToolUse entry (hydra-block-bash-writes)."""
+    """Plugin hooks.json must have a Bash PreToolUse entry (hydra-block-bash-writes)."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     pre = cfg.get("hooks", {}).get("PreToolUse", [])
     bash_groups = [g for g in pre if g.get("matcher") == "Bash"]
-    assert bash_groups, "No Bash PreToolUse entry in root hooks.json"
+    assert bash_groups, "No Bash PreToolUse entry in plugin hooks.json"
     commands = [h.get("command", "") for g in bash_groups for h in g.get("hooks", [])]
     assert any("hydra-block-bash-writes" in cmd for cmd in commands), (
         f"hydra-block-bash-writes not found in Bash PreToolUse hooks: {commands}"
@@ -786,14 +783,12 @@ def test_session_contract_logs_scaffolded_files():
 
 
 # ---------------------------------------------------------------------------
-# Structural: .claude-plugin/plugin.json hooks pointer
+# Structural: plugin standard hooks auto-discovery
 # ---------------------------------------------------------------------------
 
-def test_plugin_json_hooks_points_to_root():
-    """plugin.json must have hooks pointing at ./hooks.json (root)."""
+def test_plugin_json_relies_on_standard_hooks_auto_discovery():
+    """plugin.json must not duplicate the standard hooks/hooks.json declaration."""
     plugin_json = PLUGIN_DIR / "plugin.json"
     assert plugin_json.exists()
     cfg = json.loads(plugin_json.read_text(encoding="utf-8"))
-    assert cfg.get("hooks") == "./hooks.json", (
-        f"plugin.json hooks field should be './hooks.json', got {cfg.get('hooks')!r}"
-    )
+    assert "hooks" not in cfg, "standard hooks/hooks.json is auto-discovered"

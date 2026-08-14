@@ -13,9 +13,10 @@ if ($env:HYDRA_ENFORCE_ROUTING -ne '1') { exit 0 }
 if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
     $_stagedActive = $false
     try {
-        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 2 levels up from PSScriptRoot.
+        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 3 levels up from
+        # the canonical plugins/hydra/hooks directory.
         $_projRoot = $env:CLAUDE_PROJECT_DIR
-        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path $PSScriptRoot) }
+        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
             # Marker 1: any attended-* worktree directory under .harness\worktrees
             $_wtDir = Join-Path $_projRoot '.harness\worktrees'
@@ -53,7 +54,7 @@ if ($json.tool_name -ne 'Skill') { exit 0 }
 # Resolve the AI-app base dynamically so the path is portable across machines.
 # Preference order: AIAPP_BASE env -> parent of CLAUDE_PROJECT_DIR -> parent of
 # the Hydra repo root derived from $PSScriptRoot. The hook lives at
-# <HydraRoot>/.claude/hooks/, so three Split-Ups give HydraRoot and one more
+# <HydraRoot>/plugins/hydra/hooks/, so three Split-Ups give HydraRoot and one more
 # gives the base directory that holds both Hydra and pair-programmer.
 $base = $null
 if ($env:AIAPP_BASE) {

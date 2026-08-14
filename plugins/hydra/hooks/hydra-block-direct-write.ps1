@@ -27,9 +27,10 @@ if ($env:HYDRA_ENFORCE_ROUTING -ne '1') { exit 0 }
 if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
     $_stagedActive = $false
     try {
-        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 2 levels up from PSScriptRoot.
+        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 3 levels up from
+        # the canonical plugins/hydra/hooks directory.
         $_projRoot = $env:CLAUDE_PROJECT_DIR
-        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path $PSScriptRoot) }
+        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
             # Marker 1: any attended-* worktree directory under .harness\worktrees
             $_wtDir = Join-Path $_projRoot '.harness\worktrees'
@@ -72,9 +73,9 @@ if ($env:AIAPP_BASE) {
 } elseif ($env:CLAUDE_PROJECT_DIR) {
     $base = Split-Path $env:CLAUDE_PROJECT_DIR
 } else {
-    # Hook lives at <HydraRoot>\.claude\hooks\ — three Split-Ups: hooks ->
-    # .claude -> HydraRoot -> base (the dir that holds Hydra and pair-programmer).
-    $base = Split-Path (Split-Path (Split-Path $PSScriptRoot))
+    # Hook lives at <HydraRoot>\plugins\hydra\hooks\ — four Split-Ups give
+    # the base directory that holds Hydra and pair-programmer.
+    $base = Split-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot)))
 }
 $ppRepo = (Join-Path $base 'pair-programmer').Replace('/', '\').TrimEnd('\').ToLowerInvariant()
 if ($norm -eq $ppRepo -or $norm.StartsWith("$ppRepo\")) { exit 0 }

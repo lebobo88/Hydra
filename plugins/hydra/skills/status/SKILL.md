@@ -2,6 +2,7 @@
 description: "Show recent Hydra workflows or the structured state of a specific workflow."
 argument-hint: "[<workflow_id>]"
 model: haiku
+disable-model-invocation: true
 ---
 
 # /hydra:status

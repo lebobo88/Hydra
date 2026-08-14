@@ -5,7 +5,7 @@
   "plugins": [
     {
       "name": "hydra",
-      "source": "./",
+      "source": "./plugins/hydra",
       "description": "Hydra — supervisor that routes work across executive/engineering/creative squads."
     }
   ]

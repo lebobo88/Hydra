@@ -2641,7 +2641,7 @@ def build_supervisor(
         """Synthesize the workflow into a DecisionRecord.
 
         R3-tail post-mortem Fix 2.2 (2026-05-21): the `hydra-synthesizer`
-        Claude Code subagent (described in `.claude/agents/hydra-synthesizer.md`)
+        Claude Code subagent (described in `plugins/hydra/agents/hydra-synthesizer.md`)
         was previously not wired into the LangGraph — `node_synthesis` emitted
         a minimal boilerplate DecisionRecord and `node_judge_synthesis`
         validated against it. When the subagent dropped mid-action (R3-tail

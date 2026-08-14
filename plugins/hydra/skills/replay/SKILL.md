@@ -2,6 +2,7 @@
 description: "Replay a past workflow from checkpoint (LangGraph checkpoint → optionally pinned to original model/CLI versions)."
 argument-hint: "<workflow_id> [--from-phase intake|planning|dispatch|...] [--swap-model <id>]"
 model: sonnet
+disable-model-invocation: true
 ---
 
 # /hydra:replay

@@ -2,6 +2,7 @@
 description: "Run a goal through Hydra's full supervisor lifecycle. Routes to 1+ squads, executes, synthesizes, postchecks."
 argument-hint: "<goal text> [--squad slug,slug] [--budget 50] [--risk low|medium|high] [--repo repo_id] [--repos id,id,...]"
 model: opus
+disable-model-invocation: true
 ---
 
 # /hydra:run

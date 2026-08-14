@@ -28,7 +28,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
-HOOKS_DIR = HYDRA_ROOT / ".claude" / "hooks"
+HOOKS_DIR = HYDRA_ROOT / "plugins" / "hydra" / "hooks"
 
 _PWSH = shutil.which("pwsh") or shutil.which("powershell")
 

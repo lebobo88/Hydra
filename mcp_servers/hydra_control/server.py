@@ -118,7 +118,7 @@ _ENVELOPE_EXTRA_FIELDS: dict[str, frozenset[str]] = {
     }),
     "ASSET_JOB": frozenset({
         "shotlist_id", "model_type", "resolution", "fps", "style_refs",
-        "output_bucket", "max_render_cost_usd",
+        "output_bucket", "max_render_cost_usd", "provenance_required",
     }),
     "HITL_REQUEST": frozenset({
         "reason", "summary", "options", "default_option", "expires_at",

@@ -1,6 +1,7 @@
 ---
 description: "List discovered squad packs (registry resolution: project → user → built-in)."
 model: haiku
+disable-model-invocation: true
 ---
 
 # /hydra:squads

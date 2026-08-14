@@ -2,6 +2,7 @@
 description: "Show rolling budget consumption across workflows; optionally set a new cap."
 argument-hint: "[<workflow_id>] [--set <usd>]"
 model: haiku
+disable-model-invocation: true
 ---
 
 # /hydra:budget

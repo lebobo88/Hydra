@@ -6,20 +6,22 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = ROOT / "plugins" / "hydra"
 
 
-def test_claude_settings_registers_all_hydra_guard_hooks() -> None:
+def test_plugin_registers_all_hydra_guard_hooks_without_project_duplicates() -> None:
     settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    hooks = settings["hooks"]
+    hooks = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
 
     assert settings["env"]["HYDRA_ENFORCE_ROUTING"] == "1"
     assert settings["env"]["HYDRA_DISABLE_CLAUDE_ENGINEER"] == "1"
+    assert "hooks" not in settings
     # Tool search is already on by default. Do not force it through the Hydra
     # gateway because a proxy that does not forward tool_reference blocks must
     # be allowed to fall back to eager loading.
     assert "ENABLE_TOOL_SEARCH" not in settings["env"]
-    assert "hydra-session-contract.ps1" in hooks["SessionStart"][0]["hooks"][0]["command"]
-    assert "hydra-route-directive.ps1" in hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+    assert "hydra-session-contract.ps1" in hooks["SessionStart"][0]["hooks"][1]["command"]
+    assert "hydra-route-directive.ps1" in hooks["UserPromptSubmit"][0]["hooks"][1]["command"]
 
     pretool = {entry["matcher"]: entry["hooks"][0]["command"] for entry in hooks["PreToolUse"]}
     assert "hydra-block-direct-write.ps1" in pretool["Write|Edit|NotebookEdit"]
@@ -38,11 +40,11 @@ def test_claude_contract_preserves_governance_and_untrusted_data_boundary() -> N
 
 
 def test_attended_agents_use_current_sonnet_alias_and_evidence_policy() -> None:
-    engineer = (ROOT / ".claude" / "agents" / "engineer.md").read_text(encoding="utf-8")
-    same_vendor_judge = (ROOT / ".claude" / "agents" / "judge-same-vendor.md").read_text(
+    engineer = (PLUGIN_ROOT / "agents" / "engineer.md").read_text(encoding="utf-8")
+    same_vendor_judge = (PLUGIN_ROOT / "agents" / "judge-same-vendor.md").read_text(
         encoding="utf-8"
     )
-    cross_vendor_judge = (ROOT / ".claude" / "agents" / "judge-cross-vendor.md").read_text(
+    cross_vendor_judge = (PLUGIN_ROOT / "agents" / "judge-cross-vendor.md").read_text(
         encoding="utf-8"
     )
 
@@ -54,7 +56,7 @@ def test_attended_agents_use_current_sonnet_alias_and_evidence_policy() -> None:
 
 
 def test_claude_native_review_skill_is_read_only_and_governed() -> None:
-    skill = (ROOT / ".claude" / "skills" / "claude-native-review" / "SKILL.md").read_text(
+    skill = (PLUGIN_ROOT / "skills" / "claude-native-review" / "SKILL.md").read_text(
         encoding="utf-8"
     )
 
@@ -66,7 +68,7 @@ def test_claude_native_review_skill_is_read_only_and_governed() -> None:
 
 
 def test_router_prompt_matches_the_active_squad_registry() -> None:
-    router = (ROOT / ".claude" / "agents" / "hydra-router.md").read_text(encoding="utf-8")
+    router = (PLUGIN_ROOT / "agents" / "hydra-router.md").read_text(encoding="utf-8")
 
     assert "→ `garland`" in router
     assert "`legal-compliance` (stub" not in router
@@ -87,7 +89,7 @@ def test_scoped_rules_preserve_hydra_authority_and_content_boundaries() -> None:
 
 
 def test_native_host_skills_are_read_only_and_do_not_replace_hydra() -> None:
-    skills = ROOT / ".claude" / "skills"
+    skills = PLUGIN_ROOT / "skills"
     recovery = (skills / "workflow-recovery" / "SKILL.md").read_text(encoding="utf-8")
     evidence = (skills / "evidence-citation-review" / "SKILL.md").read_text(encoding="utf-8")
     legal = (skills / "legal-summary-intake" / "SKILL.md").read_text(encoding="utf-8")
@@ -102,7 +104,7 @@ def test_native_host_skills_are_read_only_and_do_not_replace_hydra() -> None:
 
 
 def test_host_agents_have_structured_authority_and_evidence_contracts() -> None:
-    agents = ROOT / ".claude" / "agents"
+    agents = PLUGIN_ROOT / "agents"
     for name in ("hydra-router.md", "hydra-planner.md", "hydra-synthesizer.md"):
         body = (agents / name).read_text(encoding="utf-8")
         assert "<authority_boundary>" in body or "<evidence_policy>" in body
@@ -110,10 +112,10 @@ def test_host_agents_have_structured_authority_and_evidence_contracts() -> None:
 
 
 def test_native_operator_commands_delegate_to_hydra_authority() -> None:
-    commands = ROOT / ".claude" / "commands"
-    status = (commands / "hydra-status.md").read_text(encoding="utf-8")
-    approve = (commands / "hydra-approve.md").read_text(encoding="utf-8")
-    resume = (commands / "hydra-resume.md").read_text(encoding="utf-8")
+    skills = PLUGIN_ROOT / "skills"
+    status = (skills / "status" / "SKILL.md").read_text(encoding="utf-8")
+    approve = (skills / "approve" / "SKILL.md").read_text(encoding="utf-8")
+    resume = (skills / "resume" / "SKILL.md").read_text(encoding="utf-8")
 
     assert "<authority_boundary>" in status
     assert "hydra_core.cli status" in status
@@ -124,7 +126,7 @@ def test_native_operator_commands_delegate_to_hydra_authority() -> None:
 
 
 def test_engineer_uses_hydra_provided_worktree_not_host_isolation() -> None:
-    engineer = (ROOT / ".claude" / "agents" / "engineer.md").read_text(encoding="utf-8")
+    engineer = (PLUGIN_ROOT / "agents" / "engineer.md").read_text(encoding="utf-8")
 
     assert "host action is authoritative" in engineer
     assert "do not create, select, or request a separate" in engineer
@@ -132,22 +134,22 @@ def test_engineer_uses_hydra_provided_worktree_not_host_isolation() -> None:
 
 
 def test_plugin_and_project_contexts_have_documented_activation_boundary() -> None:
-    manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.1.5"
+    assert manifest["version"] == "0.1.6"
     assert manifest["author"]["name"] == "rob"
-    assert manifest["hooks"] == "./hooks.json"
+    assert "hooks" not in manifest
     assert len(manifest["agents"]) == 9
     assert "### Activation contexts" in readme
     assert "consumer projects" in readme
 
 
 def test_plugin_manifest_references_existing_scoped_agents() -> None:
-    manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
 
     for relative_path in manifest["agents"]:
-        agent_path = ROOT / relative_path.removeprefix("./")
+        agent_path = PLUGIN_ROOT / relative_path.removeprefix("./")
         body = agent_path.read_text(encoding="utf-8")
         assert agent_path.is_file()
         assert body.startswith("---\n")
@@ -156,8 +158,24 @@ def test_plugin_manifest_references_existing_scoped_agents() -> None:
 
 
 def test_plugin_release_is_recorded_in_the_changelog() -> None:
-    manifest = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
     assert f"plugin {manifest['version']}" in changelog
     assert "MCP\n  gateway registration remains machine-local" in changelog
+
+
+def test_operator_skills_use_canonical_namespace_without_project_duplicates() -> None:
+    expected = {
+        "add-squad", "approve", "budget", "campaign", "drive",
+        "replay", "resume", "run", "squads", "status",
+    }
+    actual = {path.parent.name for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")}
+    assert expected <= actual
+    assert not any(
+        any((ROOT / ".claude" / directory).iterdir())
+        for directory in ("agents", "commands", "skills", "hooks")
+    )
+    for skill in expected:
+        body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+        assert "disable-model-invocation: true" in body

@@ -5,12 +5,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 20
           },
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-session-contract.ps1\"",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-session-contract.ps1\"",
             "timeout": 10
           }
         ]
@@ -21,12 +21,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" squads",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" squads",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-route-directive.ps1\"",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-route-directive.ps1\"",
             "timeout": 10
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-block-direct-write.ps1\"",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-block-direct-write.ps1\"",
             "timeout": 10
           }
         ]
@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-block-bash-writes.ps1\"",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-block-bash-writes.ps1\"",
             "timeout": 10
           }
         ]
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-block-direct-pp.ps1\"",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-block-direct-pp.ps1\"",
             "timeout": 10
           }
         ]
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hooks/iolaus_check.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/iolaus_check.py\"",
             "timeout": 10
           }
         ]
@@ -78,7 +78,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -88,7 +88,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -98,7 +98,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -108,7 +108,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/.claude/hooks/hydra-doctor.ps1\" doctor --quick",
+            "command": "pwsh -NoProfile -File \"${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1\" doctor --quick",
             "timeout": 10
           }
         ]
@@ -120,7 +120,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PLUGIN_ROOT}/.claude-plugin/hooks/iolaus_log.py\"",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/iolaus_log.py\"",
             "timeout": 10
           }
         ]

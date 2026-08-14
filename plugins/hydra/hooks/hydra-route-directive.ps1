@@ -32,7 +32,7 @@ if ($promptLower.StartsWith('/')) { exit 0 }
 $ecosystemAvailable = $false
 $base = if ($env:AIAPP_BASE) { $env:AIAPP_BASE }
         elseif ($env:CLAUDE_PROJECT_DIR) { Split-Path $env:CLAUDE_PROJECT_DIR }
-        else { Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
+        else { Split-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot))) }
 if (Test-Path (Join-Path $base 'pair-programmer/daemon/dist/index.js')) {
     $ecosystemAvailable = $true
 } elseif (Test-Path "$env:USERPROFILE\.pair-programmer\state.db") {

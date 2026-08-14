@@ -601,8 +601,8 @@ HYDRA_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_f27_engineer_md_agent_stub_exists():
-    """The .claude/agents/engineer.md stub must exist in the worktree."""
-    eng_file = HYDRA_ROOT / ".claude" / "agents" / "engineer.md"
+    """The canonical plugin's engineer.md stub must exist in the worktree."""
+    eng_file = HYDRA_ROOT / "plugins" / "hydra" / "agents" / "engineer.md"
     assert eng_file.exists(), (
         f"F27: engineer agent stub not found at {eng_file}")
     content = eng_file.read_text(encoding="utf-8")
@@ -612,23 +612,23 @@ def test_f27_engineer_md_agent_stub_exists():
 
 
 def test_f27_judge_cross_vendor_md_exists():
-    """The .claude/agents/judge-cross-vendor.md stub must exist."""
-    f = HYDRA_ROOT / ".claude" / "agents" / "judge-cross-vendor.md"
+    """The canonical plugin's judge-cross-vendor.md stub must exist."""
+    f = HYDRA_ROOT / "plugins" / "hydra" / "agents" / "judge-cross-vendor.md"
     assert f.exists(), f"F27: judge-cross-vendor.md not found at {f}"
     assert len(f.read_text(encoding="utf-8")) > 20
 
 
 def test_f27_judge_same_vendor_md_exists():
-    """The .claude/agents/judge-same-vendor.md stub must exist."""
-    f = HYDRA_ROOT / ".claude" / "agents" / "judge-same-vendor.md"
+    """The canonical plugin's judge-same-vendor.md stub must exist."""
+    f = HYDRA_ROOT / "plugins" / "hydra" / "agents" / "judge-same-vendor.md"
     assert f.exists(), f"F27: judge-same-vendor.md not found at {f}"
     assert len(f.read_text(encoding="utf-8")) > 20
 
 
 def test_f27_plugin_json_includes_agent_stubs():
-    """The .claude-plugin/plugin.json must list all three new agent stubs."""
+    """The canonical plugin manifest must list all three new agent stubs."""
     import json
-    pj = HYDRA_ROOT / ".claude-plugin" / "plugin.json"
+    pj = HYDRA_ROOT / "plugins" / "hydra" / ".claude-plugin" / "plugin.json"
     data = json.loads(pj.read_text(encoding="utf-8"))
     agents = data.get("agents", [])
     assert any("engineer.md" in a for a in agents), (
@@ -645,8 +645,8 @@ def test_f27_preflight_check_exists_in_cli(monkeypatch, tmp_path):
     Tests the guard logic directly by constructing the check condition.
     """
     project = tmp_path
-    # No .claude/agents/engineer.md here.
-    eng_agent_file = project / ".claude" / "agents" / "engineer.md"
+    # No canonical Hydra plugin agent here.
+    eng_agent_file = project / "plugins" / "hydra" / "agents" / "engineer.md"
     assert not eng_agent_file.exists(), "precondition: file must not exist"
     # The check from cli.py _cmd_attended_step:
     result_would_be_error = not eng_agent_file.exists()
@@ -1589,7 +1589,7 @@ def test_f7_preflight_missing_judge_same_vendor(tmp_path):
 def test_f7_engineer_md_has_self_verification():
     """engineer.md must contain the self-verification step (anti-pattern grep
     and do_not_touch) so the engineer sub-agent knows to run it."""
-    eng_file = HYDRA_ROOT / ".claude" / "agents" / "engineer.md"
+    eng_file = HYDRA_ROOT / "plugins" / "hydra" / "agents" / "engineer.md"
     content = eng_file.read_text(encoding="utf-8")
     assert "self-verif" in content.lower() or "anti-pattern" in content.lower(), (
         "Finding 7: engineer.md must mention self-verification or anti-pattern grep")
@@ -1600,7 +1600,7 @@ def test_f7_engineer_md_has_self_verification():
 def test_f7_judge_files_say_do_not_call_record_verdict():
     """Both judge stubs must explicitly say NOT to call record_verdict."""
     for name in ("judge-cross-vendor.md", "judge-same-vendor.md"):
-        f = HYDRA_ROOT / ".claude" / "agents" / name
+        f = HYDRA_ROOT / "plugins" / "hydra" / "agents" / name
         content = f.read_text(encoding="utf-8")
         assert "record_verdict" in content and (
             "not" in content.lower() or "do NOT" in content
@@ -1610,7 +1610,7 @@ def test_f7_judge_files_say_do_not_call_record_verdict():
 def test_f7_judge_files_tools_do_not_include_record_verdict():
     """Neither judge stub's tools frontmatter should list record_verdict."""
     for name in ("judge-cross-vendor.md", "judge-same-vendor.md"):
-        f = HYDRA_ROOT / ".claude" / "agents" / name
+        f = HYDRA_ROOT / "plugins" / "hydra" / "agents" / name
         content = f.read_text(encoding="utf-8")
         # Extract the tools line from frontmatter
         for line in content.splitlines():

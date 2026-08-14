@@ -42,9 +42,10 @@ if ($env:HYDRA_ENFORCE_ROUTING -ne '1') { exit 0 }
 if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
     $_stagedActive = $false
     try {
-        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 2 levels up from PSScriptRoot.
+        # Resolve project root: CLAUDE_PROJECT_DIR if set, else 3 levels up from
+        # the canonical plugins/hydra/hooks directory.
         $_projRoot = $env:CLAUDE_PROJECT_DIR
-        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path $PSScriptRoot) }
+        if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
             # Marker 1: any attended-* worktree directory under .harness\worktrees
             $_wtDir = Join-Path $_projRoot '.harness\worktrees'

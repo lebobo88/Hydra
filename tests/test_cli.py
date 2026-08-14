@@ -620,7 +620,7 @@ def test_attended_step_passes_hydra_workflow_id(tmp_path, monkeypatch, capsys):
     wf_id = str(state_val.workflow_id)  # real UUID — passes _WORKFLOW_ID_RE
 
     # Agent stubs so the preflight check passes
-    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir = tmp_path / "plugins" / "hydra" / "agents"
     agents_dir.mkdir(parents=True)
     for name in ["engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"]:
         (agents_dir / name).write_text("# stub\n")
@@ -705,7 +705,7 @@ def test_attended_step_threads_hydra_context_block(tmp_path, monkeypatch, capsys
     state_val = HydraState(root_goal="add a feature", tasks=[task])
     wf_id = str(state_val.workflow_id)
 
-    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir = tmp_path / "plugins" / "hydra" / "agents"
     agents_dir.mkdir(parents=True)
     for name in ["engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"]:
         (agents_dir / name).write_text("# stub\n")

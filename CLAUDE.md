@@ -24,7 +24,7 @@ the relevant test/build output, trace state, and artifact paths.
 </claude_execution_contract>
 
 Claude Code loads focused rules from `.claude/rules/` as relevant files are
-opened. Procedures belong in `.claude/skills/`; do not expand this root file
+opened. Procedures belong in `plugins/hydra/skills/`; do not expand this root file
 with task-specific runbooks or restate Hydra runtime implementation details.
 
 ## MANDATORY WORKFLOW ROUTING — READ EVERY TURN
@@ -103,7 +103,7 @@ a **parallel engineering fleet** across allow-listed sibling repos:
   results merge in submission order into one `DECISION_RECORD`. Cancellation
   propagates to not-yet-started repo runs.
 
-Full reference: `.claude/commands/hydra-campaign.md` and `ARCHITECTURE.md` §8a.
+Full reference: `plugins/hydra/skills/campaign/SKILL.md` and `ARCHITECTURE.md` §8a.
 
 ### Hard Rules
 

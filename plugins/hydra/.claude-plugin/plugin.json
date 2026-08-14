@@ -1,0 +1,19 @@
+{
+  "name": "hydra",
+  "author": {
+    "name": "rob"
+  },
+  "description": "Hydra — Enterprise Agent Mesh supervisor with native Claude Code host surfaces; routes work across executive, engineering, creative, legal, customer-support, and governed squad packs.",
+  "version": "0.1.6",
+  "agents": [
+    "./agents/hydra-cfo-gate.md",
+    "./agents/hydra-hitl-gate.md",
+    "./agents/hydra-planner.md",
+    "./agents/hydra-router.md",
+    "./agents/hydra-supervisor.md",
+    "./agents/hydra-synthesizer.md",
+    "./agents/engineer.md",
+    "./agents/judge-cross-vendor.md",
+    "./agents/judge-same-vendor.md"
+  ]
+}
