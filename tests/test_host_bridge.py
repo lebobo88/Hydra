@@ -269,6 +269,47 @@ def test_worktree_isolation_and_merge_back(tmp_path):
     assert not Path(wt).exists()
 
 
+def test_merge_worktree_back_excludes_byproduct_dirs(tmp_path):
+    """_merge_worktree_back must not stage .hydra/, .harness/, or *.log
+    byproducts left inside the worktree (e.g. by a nested tool run with
+    cwd=worktree) — only the engineer's actual code changes should land on
+    merge. Regression for the iolaus.log / trace.jsonl merge-conflict class of
+    bug where a byproduct written into the worktree's own copy of a
+    project-scratch directory collided with the same file at the repo root."""
+    _init_repo(tmp_path)
+    disp = FakeDispatcher()
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-bp", run_id="run-bp",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+
+    from pathlib import Path
+    # The engineer's real, mergeable change.
+    Path(wt, "feature.py").write_text("print('hi')\n", encoding="utf-8")
+    # Byproducts that must NOT be merged back.
+    (Path(wt) / ".hydra").mkdir(parents=True, exist_ok=True)
+    (Path(wt) / ".hydra" / "trace.jsonl").write_text("{}\n", encoding="utf-8")
+    (Path(wt) / ".harness").mkdir(parents=True, exist_ok=True)
+    (Path(wt) / ".harness" / "scratch.json").write_text("{}\n", encoding="utf-8")
+    (Path(wt) / "run.log").write_text("log line\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex"})
+    assert res["status"] == "complete"
+    assert res["merge"]["merged"] is True
+    # The real change landed...
+    assert (tmp_path / "feature.py").exists()
+    # ...but none of the byproducts did.
+    assert not (tmp_path / ".hydra" / "trace.jsonl").exists()
+    assert not (tmp_path / ".harness" / "scratch.json").exists()
+    assert not (tmp_path / "run.log").exists()
+
+
 def test_worktree_discarded_on_surface(tmp_path):
     """When the stage surfaces (judge revise × Reflexion x1), the worktree is
     discarded and the repo is left untouched.
@@ -318,6 +359,41 @@ def test_abort_releases_lock(tmp_path):
     aborts = [a for _s, t, a, _q in disp.calls
               if t == "finalize_run" and a.get("status") == "aborted"]
     assert len(aborts) == 1
+
+
+def test_begin_stage_writes_and_finalize_clears_stage_active_sentinel(tmp_path):
+    """begin_stage must WRITE .harness/stage-active — the sentinel the
+    PreToolUse write-enforcement hooks (hydra-block-direct-write.ps1 etc.)
+    check for their HYDRA_PP_STAGE_ACTIVE=1 bypass. Before this fix nothing
+    ever wrote it: it was dead code the hooks referenced but no producer ever
+    created, which is why the stale attended-* worktree-directory check was
+    load-bearing. A passing finalize must clear it again so a later, unrelated
+    session doesn't inherit a stale bypass."""
+    disp = FakeDispatcher()
+    res = _begin(disp, tmp_path)
+    sentinel = tmp_path / ".harness" / "stage-active"
+    assert sentinel.exists(), "begin_stage must write the stage-active sentinel"
+    assert sentinel.is_file()
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex"})
+    assert res["status"] == "complete"
+    assert not sentinel.exists(), "a terminal finalize must clear the sentinel"
+
+
+def test_abort_stage_clears_stage_active_sentinel(tmp_path):
+    """abort_stage must clear the sentinel too, not just a clean finalize."""
+    disp = FakeDispatcher()
+    res = _begin(disp, tmp_path)
+    sentinel = tmp_path / ".harness" / "stage-active"
+    assert sentinel.exists()
+    host_bridge.abort_stage(disp, cursor_file=res["cursor_path"],
+                            reason="operator_cancel")
+    assert not sentinel.exists(), "abort_stage must clear the sentinel"
 
 
 # --------------------------------------------------------------------------- #

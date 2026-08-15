@@ -18,15 +18,16 @@ if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
         $_projRoot = $env:CLAUDE_PROJECT_DIR
         if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
-            # Marker 1: any attended-* worktree directory under .harness\worktrees
-            $_wtDir = Join-Path $_projRoot '.harness\worktrees'
-            if ((Test-Path $_wtDir -PathType Container) -and
-                (Get-ChildItem -Path $_wtDir -Directory -Filter 'attended-*' -ErrorAction SilentlyContinue)) {
-                $_stagedActive = $true
-            }
-            # Marker 2: .harness\stage-active sentinel file
-            if (-not $_stagedActive -and
-                (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf)) {
+            # Run-scoped stage marker: hydra_core.host_bridge.begin_stage WRITES
+            # .harness\stage-active at stage start and CLEARS it at finalize/abort,
+            # so its presence is tied to the CURRENT active run only. The old
+            # "Marker 1" (any attended-* worktree directory exists under
+            # .harness\worktrees) is retired: stale worktrees accumulate across
+            # completed/aborted runs (17 were observed live in one session) and
+            # that check became permanently true, silently disabling enforcement
+            # repo-wide. Directory enumeration is no longer trusted; the sentinel
+            # written by the harness is the sole source of truth.
+            if (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf) {
                 $_stagedActive = $true
             }
         }

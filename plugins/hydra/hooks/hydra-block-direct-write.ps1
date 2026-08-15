@@ -32,15 +32,16 @@ if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
         $_projRoot = $env:CLAUDE_PROJECT_DIR
         if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
-            # Marker 1: any attended-* worktree directory under .harness\worktrees
-            $_wtDir = Join-Path $_projRoot '.harness\worktrees'
-            if ((Test-Path $_wtDir -PathType Container) -and
-                (Get-ChildItem -Path $_wtDir -Directory -Filter 'attended-*' -ErrorAction SilentlyContinue)) {
-                $_stagedActive = $true
-            }
-            # Marker 2: .harness\stage-active sentinel file
-            if (-not $_stagedActive -and
-                (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf)) {
+            # Run-scoped stage marker: hydra_core.host_bridge.begin_stage WRITES
+            # .harness\stage-active at stage start and CLEARS it at finalize/abort,
+            # so its presence is tied to the CURRENT active run only. The old
+            # "Marker 1" (any attended-* worktree directory exists under
+            # .harness\worktrees) is retired: stale worktrees accumulate across
+            # completed/aborted runs (17 were observed live in one session) and
+            # that check became permanently true, silently disabling enforcement
+            # repo-wide. Directory enumeration is no longer trusted; the sentinel
+            # written by the harness is the sole source of truth.
+            if (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf) {
                 $_stagedActive = $true
             }
         }
@@ -85,12 +86,38 @@ if ($norm -eq $ppRepo -or $norm.StartsWith("$ppRepo\")) { exit 0 }
 # like 'worktree.ts' or a dir 'myworktreehack' can NOT bypass the block — the
 # pp engineer's candidate worktrees live under '.harness\worktrees\' /
 # '.claude\worktrees\' (codex review item 4).
+#
+# Anchored (2026-08): a bare $norm.Contains($frag) matched ANY path anywhere on
+# disk that merely contained one of these segments (e.g. 'C:\elsewhere\dist\x.py'
+# would bypass). The allow-list now requires the target to resolve UNDER the
+# project root, OR under an explicit worktree root, before the fragment check
+# is even consulted. HYDRA_WORKTREE_ROOT overrides the default
+# '<projectRoot>\.harness\worktrees' resolution for non-standard layouts.
+$_arProjRoot = $env:CLAUDE_PROJECT_DIR
+if (-not $_arProjRoot) { $_arProjRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
+$_arProjRootNorm = $null
+if ($_arProjRoot) {
+    $_arResolved = (Resolve-Path -LiteralPath $_arProjRoot -ErrorAction SilentlyContinue)
+    if ($_arResolved) { $_arProjRootNorm = $_arResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
+}
+$_arWorktreeRootNorm = $null
+if ($env:HYDRA_WORKTREE_ROOT) {
+    $_arWtResolved = (Resolve-Path -LiteralPath $env:HYDRA_WORKTREE_ROOT -ErrorAction SilentlyContinue)
+    if ($_arWtResolved) { $_arWorktreeRootNorm = $_arWtResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
+} elseif ($_arProjRootNorm) {
+    $_arWorktreeRootNorm = "$_arProjRootNorm\.harness\worktrees"
+}
+$_arUnderProjRoot = $_arProjRootNorm -and ($norm -eq $_arProjRootNorm -or $norm.StartsWith("$_arProjRootNorm\"))
+$_arUnderWorktreeRoot = $_arWorktreeRootNorm -and ($norm -eq $_arWorktreeRootNorm -or $norm.StartsWith("$_arWorktreeRootNorm\"))
+
 $allowDirFragments = @(
     '\.harness\', '\.hydra\', '\worktrees\', '\node_modules\', '\.git\',
     '\dist\', '\build\', '\__pycache__\', '\.venv\', '\site-packages\'
 )
-foreach ($frag in $allowDirFragments) {
-    if ($norm.Contains($frag)) { exit 0 }
+if ($_arUnderProjRoot -or $_arUnderWorktreeRoot) {
+    foreach ($frag in $allowDirFragments) {
+        if ($norm.Contains($frag)) { exit 0 }
+    }
 }
 
 # --- Allow prose / docs / config so in-host design agents can persist GDDs ----
