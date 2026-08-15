@@ -47,15 +47,16 @@ if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
         $_projRoot = $env:CLAUDE_PROJECT_DIR
         if (-not $_projRoot) { $_projRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
         if ($_projRoot) {
-            # Marker 1: any attended-* worktree directory under .harness\worktrees
-            $_wtDir = Join-Path $_projRoot '.harness\worktrees'
-            if ((Test-Path $_wtDir -PathType Container) -and
-                (Get-ChildItem -Path $_wtDir -Directory -Filter 'attended-*' -ErrorAction SilentlyContinue)) {
-                $_stagedActive = $true
-            }
-            # Marker 2: .harness\stage-active sentinel file
-            if (-not $_stagedActive -and
-                (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf)) {
+            # Run-scoped stage marker: hydra_core.host_bridge.begin_stage WRITES
+            # .harness\stage-active at stage start and CLEARS it at finalize/abort,
+            # so its presence is tied to the CURRENT active run only. The old
+            # "Marker 1" (any attended-* worktree directory exists under
+            # .harness\worktrees) is retired: stale worktrees accumulate across
+            # completed/aborted runs (17 were observed live in one session) and
+            # that check became permanently true, silently disabling enforcement
+            # repo-wide. Directory enumeration is no longer trusted; the sentinel
+            # written by the harness is the sole source of truth.
+            if (Test-Path (Join-Path $_projRoot '.harness\stage-active') -PathType Leaf) {
                 $_stagedActive = $true
             }
         }
@@ -84,12 +85,60 @@ $allowDirFragments = @(
     '\dist\', '\build\', '\__pycache__\', '\.venv\', '\site-packages\'
 )
 
+# --- Anchored allow-list resolution (2026-08, twin of hydra-block-direct-write.ps1) ---
+# A bare fragment-Contains() matched ANY destination anywhere on disk that
+# merely contained one of the fragments above (e.g. 'C:\elsewhere\dist\x.py').
+# The destination is now resolved to an absolute path (relative to the
+# command's cwd when not already rooted) and the fragment check only fires
+# when that absolute path sits under the project root or the worktree root.
+# HYDRA_WORKTREE_ROOT overrides the default '<projectRoot>\.harness\worktrees'.
+#
+# $_bwCwd is taken ONLY from the payload's own $json.cwd (the actual Bash
+# tool's working directory, as Claude Code reports it) — it must NEVER fall
+# back to this hook process's own ambient (Get-Location).Path. That fallback
+# was a fail-OPEN hole: the hook script's own process cwd is incidental (e.g.
+# the shell that happens to invoke pwsh, or — concretely — a test/session
+# already running from inside a real .harness\worktrees\attended-*
+# directory), not a trustworthy signal of where the Bash TOOL CALL intended
+# to write. A relative destination with no reported cwd stays UNANCHORED
+# below and falls straight through to the plain extension check — fail
+# CLOSED, never waved through.
+$_bwCwd = $null
+if ($json.cwd) { $_bwCwd = "$($json.cwd)" }
+$_bwProjRoot = $env:CLAUDE_PROJECT_DIR
+if (-not $_bwProjRoot) { $_bwProjRoot = Split-Path (Split-Path (Split-Path $PSScriptRoot)) }
+$_bwProjRootNorm = $null
+if ($_bwProjRoot) {
+    $_bwResolved = (Resolve-Path -LiteralPath $_bwProjRoot -ErrorAction SilentlyContinue)
+    if ($_bwResolved) { $_bwProjRootNorm = $_bwResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
+}
+$_bwWorktreeRootNorm = $null
+if ($env:HYDRA_WORKTREE_ROOT) {
+    $_bwWtResolved = (Resolve-Path -LiteralPath $env:HYDRA_WORKTREE_ROOT -ErrorAction SilentlyContinue)
+    if ($_bwWtResolved) { $_bwWorktreeRootNorm = $_bwWtResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
+} elseif ($_bwProjRootNorm) {
+    $_bwWorktreeRootNorm = "$_bwProjRootNorm\.harness\worktrees"
+}
+
 function Test-BlockedDest {
     param([string]$dest)
     if (-not $dest) { return $false }
-    $norm = $dest.Trim('"''').Replace('/', '\').ToLowerInvariant()
-    foreach ($frag in $allowDirFragments) {
-        if ($norm.Contains($frag)) { return $false }
+    $raw = $dest.Trim('"''').Replace('/', '\')
+    $norm = $raw.ToLowerInvariant()
+
+    $absNorm = $norm
+    try {
+        if ($_bwCwd -and -not [System.IO.Path]::IsPathRooted($raw)) {
+            $absNorm = (Join-Path $_bwCwd $raw).Replace('/', '\').ToLowerInvariant()
+        }
+    } catch { $absNorm = $norm }
+
+    $underProjRoot = $_bwProjRootNorm -and ($absNorm -eq $_bwProjRootNorm -or $absNorm.StartsWith("$_bwProjRootNorm\"))
+    $underWorktreeRoot = $_bwWorktreeRootNorm -and ($absNorm -eq $_bwWorktreeRootNorm -or $absNorm.StartsWith("$_bwWorktreeRootNorm\"))
+    if ($underProjRoot -or $underWorktreeRoot) {
+        foreach ($frag in $allowDirFragments) {
+            if ($absNorm.Contains($frag)) { return $false }
+        }
     }
     return [bool]($norm -match $blockExtPat)
 }

@@ -5,9 +5,13 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # RA-1: Flag a leaked HYDRA_PP_STAGE_ACTIVE at session start (hygiene only).
 # This env var should only be set by the pp harness during an active engineer stage.
-# Since the S6 hardening, the write-block bypass ALSO requires a filesystem marker
-# (.harness/worktrees/attended-* or .harness/stage-active), so a bare leaked value
-# no longer disables routing enforcement — but it is still stale state worth clearing.
+# Since the S6 hardening, the write-block bypass ALSO requires a filesystem marker.
+# As of the 2026-08 hardening that marker is exclusively the run-scoped
+# .harness/stage-active sentinel (host_bridge writes it at begin_stage, clears it
+# at finalize/abort); the old "any .harness/worktrees/attended-* directory exists"
+# check was retired because stale worktrees made it permanently true. So a bare
+# leaked value no longer disables routing enforcement — but it is still stale
+# state worth clearing.
 if ($env:HYDRA_PP_STAGE_ACTIVE -eq '1') {
     Write-Output '[hydra-hook] NOTE: HYDRA_PP_STAGE_ACTIVE=1 detected at session start — this env var should only be set by the pp harness during an active engineer stage. Enforcement is NOT bypassed by the bare var (a filesystem stage marker is also required), but unset it if no harness stage is running.'
 }

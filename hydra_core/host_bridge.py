@@ -196,6 +196,9 @@ _BYPRODUCT_PATTERNS: list[str] = [
     "*.pyc",
     "node_modules/",
     ".tmp*/",
+    ".hydra/",
+    ".harness/",
+    "*.log",
 ]
 
 
@@ -262,6 +265,45 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> None:
     try:
         _git(["worktree", "remove", "--force", worktree_path], repo_root)
     except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Stage-active sentinel (Marker 2 for the PreToolUse write-enforcement hooks) #
+# --------------------------------------------------------------------------- #
+# The hooks (hydra-block-direct-write.ps1 / hydra-block-bash-writes.ps1 /
+# hydra-block-direct-pp.ps1) only honor a bare HYDRA_PP_STAGE_ACTIVE=1 when
+# this sentinel file exists — the old fallback of enumerating any attended-*
+# worktree directory ("Marker 1") was retired because stale worktrees
+# accumulate and make that check permanently true. This module is the ONLY
+# writer/clearer, so the sentinel's presence is a true run-scoped signal: it
+# exists exactly while begin_stage..._finalize/abort_stage spans one attended
+# stage, on the same project the hooks check.
+
+def _stage_active_sentinel_path(project_root: str | Path) -> Path:
+    return Path(project_root) / ".harness" / "stage-active"
+
+
+def _write_stage_active_sentinel(project_root: str | Path) -> None:
+    """Write the sentinel at stage start. Fail-soft: any I/O error is
+    swallowed so a write hiccup never blocks the attended stage — worst case
+    the hooks fall back to full enforcement (fail-closed, not fail-open)."""
+    try:
+        sentinel = _stage_active_sentinel_path(project_root)
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("1", encoding="utf-8")
+    except Exception:  # noqa: BLE001 — fail-soft
+        pass
+
+
+def _clear_stage_active_sentinel(project_root: str | Path) -> None:
+    """Remove the sentinel at finalize/abort so a later, unrelated session
+    doesn't inherit a stale bypass. Fail-soft."""
+    try:
+        sentinel = _stage_active_sentinel_path(project_root)
+        if sentinel.exists():
+            sentinel.unlink()
+    except Exception:  # noqa: BLE001 — fail-soft
         pass
 
 
@@ -635,6 +677,7 @@ def begin_stage(
     # by the engineer's changes.  Pass repo_root so pytest runs from the right
     # directory (worktrees don't carry their own tests/ dir).
     baseline_failures = _capture_baseline_failures(work_path, repo_root=repo_root)
+    root = project_root or project_path
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "workflow_id": workflow_id,
@@ -642,6 +685,7 @@ def begin_stage(
         "stage_id": stage_id,
         "task_id": task_id,
         "project_path": project_path,
+        "project_root": str(root),
         "work_path": work_path,
         "worktree_path": worktree_path,
         "branch": branch,
@@ -680,9 +724,11 @@ def begin_stage(
                 "model}} where `text` summarizes the change."),
         },
     }
-    root = project_root or project_path
     cfile = cursor_path(root, workflow_id, run_id)
     save_cursor(cfile, cursor)
+    # Marker 2: write the run-scoped sentinel the write-enforcement hooks
+    # check. Cleared in _finalize / abort_stage.
+    _write_stage_active_sentinel(root)
     _trace(cursor, "attended.stage_started", {"stage_id": stage_id})
     return _step_result(cursor, cfile)
 
@@ -1262,6 +1308,9 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
 
     cursor["pending_action"] = None
     cursor["finalized"] = True
+    # Marker 2: clear the run-scoped sentinel now that the stage is terminal —
+    # a later, unrelated session must not inherit a stale bypass.
+    _clear_stage_active_sentinel(cursor.get("project_root") or cursor["project_path"])
     # Rider (b): initialise the charged flag to False. _cmd_attended_submit sets
     # it to True after the first budget charge so retried submit calls don't
     # double-charge (the already_charged field in _step_result exposes this flag).
@@ -1452,6 +1501,9 @@ def abort_stage(dispatcher: Dispatcher, *, cursor_file: str | Path,
     if worktree_path and repo_root:
         _remove_worktree(repo_root, worktree_path)
         cursor["merge"] = {"merged": False, "error": "discarded_abort"}
+    # Marker 2: clear the run-scoped sentinel on abort too, not just a clean
+    # finalize — an aborted stage must not leave a stale bypass behind.
+    _clear_stage_active_sentinel(cursor.get("project_root") or cursor.get("project_path"))
     cursor["state"] = "aborted"
     cursor["final_status"] = "aborted"
     cursor["error"] = reason
