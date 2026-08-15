@@ -37,9 +37,18 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Allow-list: repo_id -> directory NAME under the shared base dir.
-# Keys are lower-case normalised identifiers.  Values are the EXACT folder
-# names on disk (case-sensitive on POSIX).
+# Allow-list: repo_id -> directory NAME (or forward-slash-separated relative
+# path) under the shared base dir. Keys are lower-case normalised identifiers.
+# Values are EXACT, hardcoded folder names/paths on disk (case-sensitive on
+# POSIX) -- never derived from user input. A value MAY contain "/" to reach a
+# repo nested one or more levels under base (e.g. "parent/child"); this is
+# safe because values are fixed at authoring time (not attacker-controlled
+# like the repo_id argument), and `base / value` still passes the
+# is_relative_to(base) escape guard plus the git-toplevel verification below.
+# Values must never contain ".." or be absolute -- this IS enforced, at import
+# time, by _validate_repo_dirnames() below, so a bad entry fails fast and
+# names the offending repo_id instead of surfacing later as an opaque
+# escape-guard or git-toplevel error.
 # ---------------------------------------------------------------------------
 _REPO_DIRNAMES: dict[str, str] = {
     "hydra": "Hydra",
@@ -54,7 +63,30 @@ _REPO_DIRNAMES: dict[str, str] = {
     "rlm-creative": "RLM-Creative",
     "rlm-gaming": "RLM-Gaming",
     "candc": "CandC",
+    "hydra-galaga": "galaga-game-deepseek/hydra-galaga",
 }
+
+
+def _validate_repo_dirnames(dirnames: dict[str, str]) -> None:
+    """Reject any hardcoded _REPO_DIRNAMES entry that isn't a safe relative,
+    downward-only path (no absolute values, no '..' traversal segments).
+
+    This is a contributor guard, not an attacker guard: values are authored
+    in code, never attacker-controlled. But this dict IS the allow-list's
+    injection guard, so a pasted-in absolute path or '..' segment should fail
+    fast and name the offending repo_id, rather than surfacing later as an
+    opaque base-escape or git-toplevel error at resolution time.
+    """
+    for rid, value in dirnames.items():
+        candidate = Path(value)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise RuntimeError(
+                f"invalid _REPO_DIRNAMES entry for {rid!r}: {value!r} "
+                f"(must be a relative, downward-only path)"
+            )
+
+
+_validate_repo_dirnames(_REPO_DIRNAMES)
 
 # ---------------------------------------------------------------------------
 # Base directory computation.
