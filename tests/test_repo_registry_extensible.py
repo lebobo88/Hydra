@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import hydra_core.repo_registry as repo_registry_module
 from hydra_core.repo_registry import (
     is_known_repo,
     resolve_repo_path,
@@ -155,6 +156,55 @@ def test_extra_repo_subpath_resolves(
     monkeypatch.setenv("HYDRA_EXTRA_REPOS", json.dumps({"withsub": str(repo)}))
     got = resolve_repo_project_path("withsub", "pkg")
     assert got == (repo / "pkg").resolve()
+
+
+def test_builtin_nested_relative_dirname_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hardcoded ``_REPO_DIRNAMES`` value MAY contain '/' to reach a repo
+    nested under the shared base (e.g. the real 'hydra-galaga' entry, which
+    maps to 'galaga-game-deepseek/hydra-galaga'). This exercises that shape
+    against a synthetic base/tree so the test does not depend on the real
+    checkout existing on the runner."""
+    base = tmp_path / "base"
+    base.mkdir()
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(base))
+
+    nested = base / "parent-dir" / "child-repo"
+    _git_init(nested)
+    monkeypatch.setitem(
+        repo_registry_module._REPO_DIRNAMES,
+        "nested-builtin",
+        "parent-dir/child-repo",
+    )
+
+    assert is_known_repo("nested-builtin") is True
+    assert resolve_repo_path("nested-builtin") == nested.resolve()
+
+
+def test_hydra_galaga_registry_entry_present() -> None:
+    """The 'hydra-galaga' repo_id is registered with its expected nested
+    directory value (galaga-game-deepseek/hydra-galaga under the shared base)."""
+    assert repo_registry_module._REPO_DIRNAMES.get("hydra-galaga") == (
+        "galaga-game-deepseek/hydra-galaga"
+    )
+    assert is_known_repo("hydra-galaga") is True
+
+
+def test_repo_dirnames_validation_passes_on_current_registry() -> None:
+    """Every current _REPO_DIRNAMES value is a safe relative, downward-only
+    path -- this is exactly what runs at import time, so it must not raise."""
+    repo_registry_module._validate_repo_dirnames(repo_registry_module._REPO_DIRNAMES)
+
+
+def test_repo_dirnames_validation_rejects_absolute_value() -> None:
+    with pytest.raises(RuntimeError, match="invalid _REPO_DIRNAMES entry"):
+        repo_registry_module._validate_repo_dirnames({"bad": "C:/somewhere/else"})
+
+
+def test_repo_dirnames_validation_rejects_parent_traversal() -> None:
+    with pytest.raises(RuntimeError, match="invalid _REPO_DIRNAMES entry"):
+        repo_registry_module._validate_repo_dirnames({"bad": "../escape"})
 
 
 def test_extra_repo_subpath_escape_rejected(
