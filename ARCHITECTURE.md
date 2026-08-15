@@ -194,7 +194,7 @@ The servers fall into three categories:
 |--------|----------|---------|
 | `hydra_memory` | `mcp_servers/hydra_memory/server.py` | Thin shim over SQLite episodic store + TheEights cells |
 | `executive_suite` | `mcp_servers/executive_suite/server.py` | Read-only introspection of ExecutiveSuite's `.claude/` directory (roster, skills, commands, output) |
-| `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of RLM-Creative's `.claude/` directory |
+| `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of the RLM-Creative plugin under `plugins/rlm-creative/` |
 | `hydra_toolshed` | `mcp_servers/hydra_toolshed/server.py` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
 | `hydra_gateway` | `mcp_servers/hydra_gateway/server.py` | Unified proxy — consolidates all backend servers behind a single MCP registration with static tool catalog and on-demand backend connections |
 | `hydra_control` | `mcp_servers/hydra_control/server.py` | Workflow-resume gate + cockpit audit filing. 3 tools: `hydra.control.ping`, `hydra.workflow.resume` (launches the CLI resume path for a paused HITL gate — approve/reject/modify-budget/force-dispatch), `hydra.cockpit.audit` (files a `cockpit_write` audit envelope through the attestor for actions taken from the mesh console) |

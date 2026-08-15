@@ -5,6 +5,7 @@ Exercises the bare-stdio fallback so these run without the optional `mcp` SDK.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,11 +41,13 @@ def _make_fake_rlm_root(root: Path) -> Path:
     (base / "skills/comfyui").mkdir(parents=True)
     (base / "skills/comfyui/SKILL.md").write_text("# Skill: ComfyUI", encoding="utf-8")
     (base / "commands").mkdir(parents=True)
-    (base / "commands/rlm-team.md").write_text("# /rlm-team", encoding="utf-8")
-    (base / "commands/rlm-video.md").write_text("# /rlm-video", encoding="utf-8")
-    (base / "commands/non-rlm.md").write_text("# /non-rlm  (should be filtered out)", encoding="utf-8")
-    (root / "RLM/agents").mkdir(parents=True)
-    (root / "RLM/agents/master-architect.md").write_text("# Master Architect", encoding="utf-8")
+    (base / "commands/creative-campaign.md").write_text("# /creative-campaign", encoding="utf-8")
+    (base / "commands/photo-direction.md").write_text("# /photo-direction", encoding="utf-8")
+    (base / "agents/helios-crew").mkdir(parents=True)
+    for head in ["calliope", "erato", "polyhymnia", "terpsichore", "euterpe", "clio", "urania", "helios"]:
+        (base / f"agents/{head}.md").write_text(f"# {head.capitalize()}", encoding="utf-8")
+    for sub in ["video-synth", "audio-foley", "music-score", "dialogue-mix", "blender-model", "blender-rig", "governance-c2pa"]:
+        (base / f"agents/helios-crew/{sub}.md").write_text(f"# {sub}", encoding="utf-8")
     return root
 
 
@@ -58,7 +61,7 @@ def _bare_call(module: str, root_env: dict[str, str], requests: list[dict]) -> l
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={**__import__("os").environ, **root_env,
+        env={**os.environ, **root_env,
              "HYDRA_MCP_BARE": "1", "PYTHONIOENCODING": "utf-8"},
         text=True,
         encoding="utf-8",
@@ -140,7 +143,7 @@ def test_executive_mcp_rejects_path_escape(tmp_path):
 
 # ---------- rlm_creative ----------
 
-def test_rlm_mcp_lists_skills_filters_commands(tmp_path):
+def test_rlm_mcp_lists_plugin_skills_commands_and_agents(tmp_path):
     root = _make_fake_rlm_root(tmp_path / "rlm")
     responses = _bare_call(
         "mcp_servers.rlm_creative",
@@ -159,11 +162,58 @@ def test_rlm_mcp_lists_skills_filters_commands(tmp_path):
     assert "comfyui" in skills
 
     cmds = [c["name"] for c in by_id["3"]["result"]["commands"]]
-    assert "rlm-team" in cmds and "rlm-video" in cmds
-    assert "non-rlm" not in cmds  # filtered
+    assert {"creative-campaign", "photo-direction"} <= set(cmds)
 
     agents = [a["name"] for a in by_id["4"]["result"]["agents"]]
-    assert "master-architect" in agents
+    assert {"brand-strategist", "blender-model"} <= set(agents)
+    assert len(agents) == 15
+
+
+def test_rlm_root_precedence(tmp_path):
+    root_primary = _make_fake_rlm_root(tmp_path / "rlm_primary")
+    root_secondary = _make_fake_rlm_root(tmp_path / "rlm_secondary")
+
+    # Primary overrides secondary
+    responses = _bare_call(
+        "mcp_servers.rlm_creative",
+        {"HYDRA_RLM_ROOT": str(root_primary), "HYDRA_RLM_CREATIVE_ROOT": str(root_secondary)},
+        [{"id": "1", "method": "rlm.ping", "params": {}}],
+    )
+    assert responses[0]["result"]["root"] == str(root_primary.resolve())
+
+    # Secondary used when primary absent
+    responses2 = _bare_call(
+        "mcp_servers.rlm_creative",
+        {"HYDRA_RLM_CREATIVE_ROOT": str(root_secondary)},
+        [{"id": "1", "method": "rlm.ping", "params": {}}],
+    )
+    assert responses2[0]["result"]["root"] == str(root_secondary.resolve())
+
+
+def test_rlm_creative_server_agent_catalog_validation(tmp_path):
+    from mcp_servers.rlm_creative.server import _tool_handlers
+    import os
+
+    # Incomplete root missing files raises FileNotFoundError
+    broken_root = tmp_path / "broken_rlm"
+    (broken_root / "plugins/rlm-creative/agents").mkdir(parents=True)
+    os.environ["HYDRA_RLM_ROOT"] = str(broken_root)
+    with pytest.raises(FileNotFoundError, match="Missing required Garland agent files"):
+        _tool_handlers()
+
+    # Unexpected extra files raises ValueError
+    full_root = _make_fake_rlm_root(tmp_path / "full_rlm")
+    (full_root / "plugins/rlm-creative/agents/stray.md").write_text("# Stray", encoding="utf-8")
+    os.environ["HYDRA_RLM_ROOT"] = str(full_root)
+    with pytest.raises(ValueError, match="Unexpected extra agent markdown files"):
+        _tool_handlers()
+
+    # Clean root succeeds and returns 9 tools
+    clean_root = _make_fake_rlm_root(tmp_path / "clean_rlm")
+    os.environ["HYDRA_RLM_ROOT"] = str(clean_root)
+    handlers = _tool_handlers()
+    assert len(handlers) == 9
+    assert len(handlers["rlm.agent.list"]({})["agents"]) == 15
 
 
 def test_rlm_mcp_write_roundtrip(tmp_path):
@@ -172,11 +222,28 @@ def test_rlm_mcp_write_roundtrip(tmp_path):
         "mcp_servers.rlm_creative",
         {"HYDRA_RLM_ROOT": str(root)},
         [{"id": "1", "method": "rlm.output.write",
-          "params": {"phase": "draft", "topic": "launch teaser", "content": "# Teaser"}}],
+          "params": {"phase": "brief", "topic": "launch-teaser", "content": "# Teaser",
+                     "domain": "creative", "scopes": ["team:garland-crew"]}}],
     )
     rel = responses[0]["result"]["relative"]
-    assert rel.startswith("RLM/output/draft/")
+    assert rel.startswith("RLM/output/brief/")
     assert (root / rel).exists()
+
+
+@pytest.mark.parametrize("params", [
+    {"phase": "brief", "topic": "launch-teaser", "content": "# Teaser", "domain": "other", "scopes": ["team:garland-crew"]},
+    {"phase": "draft", "topic": "launch-teaser", "content": "# Teaser", "domain": "creative", "scopes": ["team:garland-crew"]},
+    {"phase": "brief", "topic": "Launch Teaser", "content": "# Teaser", "domain": "creative", "scopes": ["team:garland-crew"]},
+    {"phase": "brief", "topic": "launch-teaser", "content": "# Teaser", "domain": "creative", "scopes": ["uncontrolled"]},
+])
+def test_rlm_mcp_rejects_invalid_output_contract(tmp_path, params):
+    root = _make_fake_rlm_root(tmp_path / "rlm")
+    responses = _bare_call(
+        "mcp_servers.rlm_creative", {"HYDRA_RLM_ROOT": str(root)},
+        [{"id": "1", "method": "rlm.output.write", "params": params}],
+    )
+    assert responses[0]["result"]["error"] == "invalid_output_contract"
+    assert not (root / "RLM/output").exists()
 
 
 # ---------- dispatcher enrichment ----------
@@ -260,10 +327,10 @@ def test_via_claude_skill_persists_real_memoryref():
         constraints=Constraints(),
     )
     dispatcher = _FakeDispatcher({
-        ("rlm_creative", "rlm.command.list"): {"commands": [{"name": "rlm-team"}, {"name": "rlm-video"}]},
+        ("rlm_creative", "rlm.command.list"): {"commands": [{"name": "creative-campaign"}, {"name": "photo-direction"}]},
         ("rlm_creative", "rlm.output.write"): {
-            "path": "C:/fake/RLM/output/draft/teaser-2026-05-19.md",
-            "relative": "RLM/output/draft/teaser-2026-05-19.md",
+            "path": "C:/fake/RLM/output/brief/teaser-2026-05-19.md",
+            "relative": "RLM/output/brief/teaser-2026-05-19.md",
             "bytes": 320,
         },
     })
@@ -271,11 +338,14 @@ def test_via_claude_skill_persists_real_memoryref():
     result = _via_claude_skill(HydraState(root_goal="x"), pack, inbound, dispatcher)
     assert result.envelopes
     decision = result.envelopes[0]
-    assert decision.artifacts[0].key.startswith("rlm:output:RLM/output/draft/")
+    assert decision.artifacts[0].key.startswith("rlm:output:RLM/output/brief/")
 
     seen_tools = [c[1] for c in dispatcher.calls]
     assert "rlm.command.list" in seen_tools
     assert "rlm.output.write" in seen_tools
+    write_args = next(call[2] for call in dispatcher.calls if call[1] == "rlm.output.write")
+    assert write_args["domain"] == "creative"
+    assert write_args["scopes"] == ["team:garland-crew"]
 
 
 def test_via_impersonation_falls_back_when_mcp_unreachable():

@@ -192,3 +192,23 @@ def test_user_scope_points_rlm_creative_at_new_root():
     root = rlm["env"]["HYDRA_RLM_ROOT"]
     assert "RLM-Creative" in root
     assert "RLM-CLI-Starter" not in root
+
+
+# --- memory boundary validation ----------------------------------------------
+
+def test_boundary_rejects_raw_blob_and_wrong_domain():
+    from hydra_core.schemas import CreativeBrief, MemoryRef, Constraints, validate_envelope
+    from pydantic import ValidationError
+    from uuid import uuid4
+
+    # Non-creative domain on MemoryRef in creative context raises ValidationError
+    with pytest.raises(ValidationError):
+        CreativeBrief(
+            workflow_id=uuid4(),
+            origin_squad="hydra",
+            campaign_id=uuid4(),
+            objective="test",
+            target_audience="test",
+            constraints=Constraints(),
+            brief_doc=MemoryRef(key="es:finance:plan", domain="finance"),  # invalid: domain must be creative
+        )

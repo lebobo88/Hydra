@@ -2532,7 +2532,7 @@ def _via_impersonation(
 # logs loudly and falls back to garland only so legacy packs don't hard-crash.
 _SKILL_PACK_SHIMS: dict[str, dict[str, str]] = {
     "garland": {
-        "server": "rlm_creative", "prefix": "rlm", "default_cmd": "/rlm-team",
+        "server": "rlm_creative", "prefix": "rlm", "default_cmd": "/rlm-creative:creative-campaign",
         "path_key": "phase", "label": "Creative work", "artifact_kind": "creative_output",
     },
     "legal-compliance": {
@@ -2796,6 +2796,8 @@ def _via_claude_skill(
     write_result = _mcp_call_safe(
         dispatcher, server, f"{prefix}.output.write",
         {shim["path_key"]: path_val, "topic": topic,
+         **({"domain": "creative", "scopes": ["team:garland-crew"]}
+            if server == "rlm_creative" else {}),
          "content": _render_session_md(f"{shim['label']} dispatch via {cmd}",
                                        f"command_hint={cmd}\navailable={available_cmds}",
                                        result)},
@@ -2935,8 +2937,10 @@ def _domain_for(pack: SquadPack, inbound: HydraEnvelope) -> str:
 
 
 def _phase_for(inbound: HydraEnvelope) -> str:
-    # CreativeBrief envelopes carry a `phase` field; default to "draft".
-    return getattr(inbound, "phase", None) or "draft"
+    # CreativeBrief envelopes may carry a valid output phase; intermediate
+    # dispatcher records belong to the RLM `brief` phase by default.
+    phase = getattr(inbound, "phase", None)
+    return phase if phase in {"launch", "photo", "brand", "brief", "pr", "paid", "seo", "governance"} else "brief"
 
 
 def _render_session_md(title: str, prompt: str, result: dict[str, Any]) -> str:

@@ -81,8 +81,41 @@ class SquadPack:
         return envelope_type in self.accepts or "*" in self.accepts
 
 
-def _coerce_pack(slug: str, data: dict[str, Any]) -> SquadPack:
-    agents = tuple(AgentSpec(**a) for a in data.get("agents", []))
+def resolve_agent_file_path(pack_root: Path, declared_rel_path: str) -> Path:
+    """Resolve declared agent_file path with dual-path legacy/modern fallback."""
+    primary = pack_root / declared_rel_path
+    if primary.is_file():
+        return primary
+    if declared_rel_path.startswith("plugins/rlm-creative/agents/"):
+        legacy_rel = ".claude/agents/" + declared_rel_path.removeprefix("plugins/rlm-creative/agents/")
+        legacy = pack_root / legacy_rel
+        if legacy.is_file():
+            return legacy
+    elif declared_rel_path.startswith(".claude/agents/"):
+        modern_rel = "plugins/rlm-creative/agents/" + declared_rel_path.removeprefix(".claude/agents/")
+        modern = pack_root / modern_rel
+        if modern.is_file():
+            return modern
+    raise FileNotFoundError(f"Agent file '{declared_rel_path}' not found in pack at {pack_root}")
+
+
+def _coerce_pack(slug: str, data: dict[str, Any], pack_root: Path | None = None) -> SquadPack:
+    agent_specs = []
+    seen_slugs: set[str] = set()
+    for a in data.get("agents", []):
+        spec_dict = dict(a)
+        if pack_root and spec_dict.get("agent_file"):
+            try:
+                resolved = resolve_agent_file_path(pack_root, spec_dict["agent_file"])
+                spec_dict["agent_file"] = resolved.relative_to(pack_root).as_posix()
+            except FileNotFoundError:
+                pass  # Allow overlay specs before repo checkout exists
+        spec = AgentSpec(**spec_dict)
+        if spec.slug in seen_slugs:
+            raise ValueError(f"Duplicate agent slug '{spec.slug}' in squad '{slug}'")
+        seen_slugs.add(spec.slug)
+        agent_specs.append(spec)
+    agents = tuple(agent_specs)
     tools = tuple(ToolSpec(**t) for t in data.get("tools", []))
     gates = tuple(GateSpec(**g) for g in data.get("gates", []))
     return SquadPack(
@@ -129,7 +162,7 @@ def discover_squads(project_root: Path | None = None) -> dict[str, SquadPack]:
                 raise ValueError(f"Malformed squad.yaml at {yml}: {e}") from e
             slug = child.name
             if slug not in packs:  # project shadow wins
-                packs[slug] = _coerce_pack(slug, data)
+                packs[slug] = _coerce_pack(slug, data, pack_root=child)
     return packs
 
 
