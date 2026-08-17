@@ -921,3 +921,728 @@ def test_capture_baseline_timeout_marker(tmp_path, monkeypatch):
     assert call_count[0] == 1, (
         "suite must NOT re-run when the timeout marker already exists for this sha"
     )
+
+
+# --------------------------------------------------------------------------- #
+# W2-2/W2-3/W2-4: transport-shaped record_verdict failure holds the cursor    #
+# open instead of downgrading + finalizing, and a sanctioned recovery path    #
+# drives a stranded stage to completion.                                     #
+# --------------------------------------------------------------------------- #
+
+class _FakeDispatcherVerdictTransportFail(FakeDispatcher):
+    """record_verdict fails with a transport-shaped error until `.recover()`
+    flips it to succeed — simulating the SQLITE_BUSY/cold-start race that
+    caused the incident this fix addresses."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.verdict_should_fail = True
+
+    def call_mcp(self, server: str, tool: str, args: dict,
+                 squad_id: str | None = None) -> dict:
+        if tool == "record_verdict" and self.verdict_should_fail:
+            self.calls.append((server, tool, dict(args), squad_id))
+            return {"status": "failed", "timeout": True,
+                    "error": "tool 'record_verdict' on 'pp_harness' timed out after 120s",
+                    "phase": "call_tool", "timeout_s": 120.0}
+        return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    def recover(self) -> None:
+        self.verdict_should_fail = False
+
+
+def test_classify_infra_failure_transport_vs_deterministic():
+    from hydra_core.host_bridge import _classify_infra_failure
+    assert _classify_infra_failure(None) == "deterministic"
+    assert _classify_infra_failure(RuntimeError(
+        "pp ledger call 'record_verdict' returned error (status='failed'): "
+        "\"tool 'record_verdict' on 'pp_harness' timed out after 120s\"")) == "transport"
+    assert _classify_infra_failure(RuntimeError(
+        "call_tool raised after connect: ConnectionResetError: [Errno 104]")) == "transport"
+    assert _classify_infra_failure(RuntimeError(
+        "pp ledger call 'record_verdict' returned error payload (status='rejected'): "
+        "'vendor pinning'")) == "deterministic"
+    assert _classify_infra_failure(RuntimeError(
+        "validation failed: rubric_id must be a known rubric")) == "deterministic"
+    # An unrecognized shape must fail the stage (deterministic), never mask a
+    # real rejection by guessing "transport".
+    assert _classify_infra_failure(RuntimeError("something odd happened")) == "deterministic"
+
+
+def test_classify_infra_failure_venom_gate_fail_closed_is_deterministic():
+    """A venom-gate fail-CLOSED rejection (dispatcher.py._venom_gate's
+    gate-internal-error branch) must classify as "deterministic" even when
+    its wrapped inner-exception text contains a transport-sounding phrase
+    like "database is locked" -- e.g. a degraded/locked episodic audit
+    store. The classification is keyed on the STRUCTURED rejection payload
+    (status == "rejected", gate_error, hitl_required), not on message text,
+    so this can never collide with the transport marker list no matter what
+    the underlying exception says."""
+    from hydra_core.host_bridge import PPLedgerError, _classify_infra_failure, _raise_on_error_payload
+
+    # Exactly the shape dispatcher.py._venom_gate's fail-closed branch returns.
+    venom_gate_payload = {
+        "status": "rejected",
+        "error": "venom gate internal error: database is locked",
+        "hitl_required": True,
+        "gate_error": True,
+    }
+    try:
+        _raise_on_error_payload(venom_gate_payload, "record_verdict")
+        assert False, "expected PPLedgerError"
+    except PPLedgerError as exc:
+        assert exc.payload == venom_gate_payload
+        assert _classify_infra_failure(exc) == "deterministic"
+
+    # Direct construction, in case a caller builds the exception by hand.
+    exc2 = PPLedgerError(
+        "pp ledger call 'record_verdict' returned error payload "
+        "(status='rejected'): 'venom gate internal error: database is locked'",
+        venom_gate_payload,
+    )
+    assert _classify_infra_failure(exc2) == "deterministic"
+
+    # A hitl_required/gate_error payload without status=="rejected" also
+    # forces deterministic via _DETERMINISTIC_PAYLOAD_KEYS.
+    exc3 = PPLedgerError(
+        "timeout: database is locked", {"gate_error": True},
+    )
+    assert _classify_infra_failure(exc3) == "deterministic"
+
+    # A genuine transport-shaped PPLedgerError (status=="failed", no
+    # deterministic payload keys) still falls through to the text markers.
+    exc4 = PPLedgerError(
+        "pp ledger call 'record_verdict' returned error (status='failed'): "
+        "\"tool 'record_verdict' on 'pp_harness' timed out after 120s\"",
+        {"status": "failed", "error": "timed out"},
+    )
+    assert _classify_infra_failure(exc4) == "transport"
+
+
+def test_transport_verdict_failure_holds_cursor_open_not_finalized(tmp_path):
+    """A transport-shaped record_verdict failure on a pass outcome must hold
+    the cursor open (state='stalled_infra'), NOT downgrade to revise/surfaced
+    and finalize. finalize_stage/finalize_run must never be called, and the
+    original judge pending_action (call_key) must survive untouched so a
+    re-issued submit_host_result can re-drive it."""
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
+
+    assert res["state"] == "stalled_infra"
+    assert res["status"] == "awaiting_host", "must not become a terminal status"
+    assert res.get("stalled_infra") is True
+    assert res["host_action"]["call_key"] == "judge-0", (
+        "pending_action must still carry the original judge call_key so a "
+        "re-drive can match it"
+    )
+    assert disp.count("finalize_stage") == 0
+    assert disp.count("finalize_run") == 0
+
+    cursor = host_bridge.load_cursor(cfile)
+    assert cursor.get("verdict_recorded_for") is None
+    assert cursor.get("pending_verdict_payload", {}).get("idempotency_token") == "judge-0"
+
+
+def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
+    """A re-issued submit_host_result carrying the SAME call_key/result after a
+    stalled_infra hold re-enters record_verdict (now succeeding), finalizes,
+    and does NOT double-count the judge's cost_usd/tokens."""
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
+    judge_result = {"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05,
+                    "tokens_in": 20, "tokens_out": 10}
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
+    assert res["state"] == "stalled_infra"
+    cost_after_stall = res["cost_usd"]
+
+    # The underlying transport issue clears; the SAME call_key/result is
+    # resubmitted (a real recovery caller resubmits exactly what it has).
+    disp.recover()
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
+
+    assert res2["status"] == "complete"
+    assert res2["cost_usd"] == cost_after_stall, (
+        "re-driving the same call_key must not double-count the judge's cost_usd"
+    )
+    # record_verdict was called twice at the transport layer (once failed, once
+    # succeeded) but pp's idempotency_token makes that safe; only ONE
+    # finalize_run/finalize_stage happened.
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    # Every record_verdict call carried the SAME idempotency_token.
+    tokens = {a.get("idempotency_token") for _s, t, a, _q in disp.calls
+              if t == "record_verdict"}
+    assert tokens == {"judge-0"}
+
+
+def test_recover_stalled_stage_via_resume_action(tmp_path):
+    """recover_stalled_stage (the W2-4 recovery function reachable only via
+    `hydra resume --action recover-stalled-stage`) drives a stalled_infra
+    cursor to completion: worktree merges, finalize runs, and record_verdict
+    is not double-recorded."""
+    from pathlib import Path
+    _init_repo(tmp_path)
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-rec", run_id="run-rec",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+    Path(wt, "feature.py").write_text("print('hi')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex"})
+    assert res["state"] == "stalled_infra"
+    # The worktree must still be present -- recovery needs it.
+    assert Path(wt).exists()
+
+    disp.recover()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
+
+    assert rec["status"] == "complete"
+    assert rec["merge"]["merged"] is True
+    assert (tmp_path / "feature.py").exists()
+    assert not Path(wt).exists()
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+
+
+def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path):
+    """The pre-fix shape: a cursor already finalized 'surfaced' with a
+    preserved_branch and no verdict_recorded_for (the worktree is gone, but
+    _preserve_non_complete_work already committed the change to the branch).
+    Recovery must re-issue record_verdict and merge directly from the branch
+    without needing a live worktree."""
+    _init_repo(tmp_path)
+    branch = "attended/legacy-run"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature.py").write_text("print('legacy')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy" / "attended" / "run_legacy.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy",
+        "run_id": "run_legacy",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,   # the original (buggy) submit already charged this
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    assert disp.count("record_verdict") == 1
+    verdict_call = next(a for _s, t, a, _q in disp.calls if t == "record_verdict")
+    assert verdict_call["idempotency_token"] == "judge-0"
+    assert rec["merge"]["merged"] is True
+    assert (tmp_path / "legacy_feature.py").exists()
+    # already_charged must be honoured: the caller (CLI) is responsible for
+    # skipping charge_and_gate, but recover_stalled_stage itself never touches
+    # budget -- confirm the flag survives untouched.
+    assert rec["already_charged"] is True
+
+
+def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_path, monkeypatch):
+    """WS2 fix: in the legacy 'surfaced' recovery shape the merge from the
+    preserved branch necessarily runs before smoke can (the worktree is
+    already gone, so repo_root is the only place left to run it). If smoke
+    then FAILS, the recovery must not leave the merge silently landed while
+    the cursor/pp ledger both say 'surfaced' -- it must revert the merge
+    commit it just created, and the repo's actual file state (not a mock call
+    count) must prove the code did not stay in the tree."""
+    _init_repo(tmp_path)
+    base_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    branch = "attended/legacy-run-failing-smoke"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature.py").write_text("print('legacy')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    # Override the autouse "smoke always passes" fixture: this test needs the
+    # post-merge smoke to FAIL to exercise the revert path.
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "unit tests failed"))
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy2" / "attended" / "run_legacy2.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy2",
+        "run_id": "run_legacy2",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-1",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    # The merge itself must have succeeded (that part of the ordering is
+    # unchanged and correct) ...
+    assert rec["merge"]["merged"] is True
+    # ... but since smoke failed, the code must not remain in the tree: the
+    # merge commit must have been reverted, and the repo's HEAD must be back
+    # at the pre-merge base (the observable that actually matters, not a
+    # mocked call count).
+    assert rec["merge"]["reverted"] is True
+    head_after = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    assert head_after != base_sha  # a revert commit was added, not a hard reset
+    assert not (tmp_path / "legacy_feature.py").exists(), (
+        "smoke failed but the merged file is still present in the working "
+        "tree -- the merge was not actually reverted")
+    # The cursor and pp ledger both agree the stage did not pass.
+    assert rec["status"] == "surfaced"
+    assert rec["final_status"] == "surfaced"
+
+
+def test_revert_merge_commit_conflict_clean_abort(tmp_path):
+    """When git revert fails but nothing else is wrong with repo_root, the
+    subsequent `git revert --abort` succeeds and cleanly restores the repo.
+    This must be distinguishable, on the repo's REAL state, from the case
+    where the abort itself fails (next test).
+
+    A revert of the tip commit against a working tree that exactly matches
+    it can never conflict on its own (the reverse patch is guaranteed to
+    apply cleanly against the very tree it was diffed from) -- the only real
+    way `git revert` fails here is exactly the "unrelated concurrent
+    activity" scenario named in the fix: a pre-existing, already-in-progress
+    (and independently abortable) revert sequencer left on an unrelated file.
+    That is reproduced for real below (an actual `git revert --no-commit`
+    that genuinely conflicts on `g.txt`), not simulated. The observable that
+    proves a clean abort: no revert sequencer state is left behind
+    (`.git/REVERT_HEAD` absent, `git status --porcelain` empty), the
+    unrelated file is restored to its pre-seed content, and HEAD is
+    unchanged."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c0", "--no-verify"], tmp_path)
+
+    (tmp_path / "g.txt").write_text("y\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c1-seed-target", "--no-verify"], tmp_path)
+    seed_target_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("z\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c2", "--no-verify"], tmp_path)
+
+    _git(["checkout", "-b", "feature"], tmp_path)
+    (tmp_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
+
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature"], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    # Seed a REAL, independently-abortable conflicted revert sequencer on the
+    # unrelated g.txt (context "y" no longer matches current "z" -- a
+    # genuine conflict, not a dirty-tree preflight refusal), then leave it
+    # dangling exactly as unrelated concurrent activity would.
+    seed = _git(["revert", "--no-commit", seed_target_sha], tmp_path)
+    assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+    assert (tmp_path / ".git" / "REVERT_HEAD").exists()
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
+
+    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+
+    assert out["reverted"] is False
+    assert out["abort_failed"] is False
+    assert out["abort_state"] == "clean"
+    assert out["error"] and "revert_failed" in out["error"]
+    assert "abort_failed" not in out["error"]
+
+    # Real observables (not a mock call count): the sequencer state left by
+    # the seeded conflict is gone, the unrelated file is back to its clean
+    # pre-seed content, and HEAD never moved -- proof the abort actually ran
+    # for real and restored repo_root.
+    assert not (tmp_path / ".git" / "REVERT_HEAD").exists()
+    status = _git(["status", "--porcelain"], tmp_path).stdout
+    assert status.strip() == "", f"expected a clean repo after abort, got: {status!r}"
+    assert (tmp_path / "g.txt").read_text(encoding="utf-8") == "z\n"
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
+
+
+def test_revert_merge_commit_preflight_refusal_is_not_reported_as_abort_failed(tmp_path):
+    """Regression guard for the false-positive the naive fix would have
+    introduced: when `git revert` refuses BEFORE ever starting a sequencer
+    (here, a dirty uncommitted edit overlapping the file it must touch --
+    git's real, unmocked "local changes would be overwritten" preflight
+    check), the subsequent `git revert --abort` legitimately exits nonzero
+    ("no revert in progress") even though repo_root was never left dirty by
+    this call at all. Checking the abort's exit code alone would misreport
+    this extremely common shape as abort_failed=True and send an operator to
+    inspect a repo that was already clean. The real observable that proves
+    it: no sequencer state (`.git/REVERT_HEAD` / `.git/sequencer`) was ever
+    created, so `abort_failed` must be False even though `git revert --abort`
+    itself returned nonzero."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (tmp_path / "conflict.py").write_text("line1\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c1", "--no-verify"], tmp_path)
+
+    _git(["checkout", "-b", "feature2"], tmp_path)
+    (tmp_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c2-feature", "--no-verify"], tmp_path)
+
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature2"], tmp_path)
+    assert merge_res.returncode == 0
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    # Dirty uncommitted edit overlapping the file the revert must touch --
+    # git refuses the revert upfront, before any sequencer exists.
+    (tmp_path / "conflict.py").write_text("uncommitted-dirty-edit\n", encoding="utf-8")
+
+    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+
+    assert out["reverted"] is False
+    # The key assertion this test exists for: NOT abort_failed, despite
+    # `git revert --abort` itself having exited nonzero underneath.
+    assert out["abort_failed"] is False
+    assert out["error"] and "revert_failed" in out["error"]
+    assert "abort_failed" not in out["error"]
+
+    # Real observables: no sequencer was ever created (nothing to clean up),
+    # the dirty edit git refused to touch is untouched, and HEAD never moved.
+    assert not (tmp_path / ".git" / "REVERT_HEAD").exists()
+    assert (tmp_path / "conflict.py").read_text(encoding="utf-8") == "uncommitted-dirty-edit\n"
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
+
+
+def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_path, monkeypatch):
+    """The failure mode this fix targets for real: a genuine sequencer is
+    active (seeded exactly as in the clean-abort test -- a real, conflicting
+    `git revert --no-commit` on an unrelated file, left dangling as unrelated
+    concurrent activity would) and the abort that should tear it down does
+    not. Only the `revert --abort` call itself is intercepted to not execute
+    (simulating e.g. a permission/lock failure on that specific operation);
+    the preceding revert failure and the seeded conflict are both real,
+    unmocked git state. The distinguishing observable from the clean-abort
+    case: the sequencer file genuinely still exists on disk afterward."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c0", "--no-verify"], tmp_path)
+
+    (tmp_path / "g.txt").write_text("y\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c1-seed-target", "--no-verify"], tmp_path)
+    seed_target_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("z\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c2", "--no-verify"], tmp_path)
+
+    _git(["checkout", "-b", "feature3"], tmp_path)
+    (tmp_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
+
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature3"], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    seed = _git(["revert", "--no-commit", seed_target_sha], tmp_path)
+    assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+    assert (tmp_path / ".git" / "REVERT_HEAD").exists()
+
+    real_git = host_bridge._git
+
+    def _sabotage_abort_only(args, cwd, *a, **k):
+        if args[:2] == ["revert", "--abort"]:
+            # Do NOT run the real abort -- the seeded sequencer state is left
+            # exactly as-is, as if the abort attempt itself failed to tear
+            # it down (disk lock, permission error, etc).
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout="",
+                stderr="fatal: simulated abort failure (sequencer untouched)",
+            )
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _sabotage_abort_only)
+
+    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+
+    assert out["reverted"] is False
+    assert out["abort_failed"] is True
+    assert out["abort_state"] == "active"
+    assert out["error"] and "abort_failed" in out["error"]
+
+    # Real observable that distinguishes this from both the clean-abort case
+    # AND the preflight-refusal case: the sequencer state is still genuinely
+    # present on disk -- repo_root was NOT restored, which is exactly what
+    # the operator needs to know before retrying anything.
+    assert (tmp_path / ".git" / "REVERT_HEAD").exists()
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
+
+
+def test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed(tmp_path, monkeypatch):
+    """Regression guard for the fail-open defect: if repo_root's git dir
+    cannot be resolved after the abort attempt, that is a THIRD, distinct
+    fact from both "sequencer active" and "sequencer clean" -- the state is
+    genuinely unverified, and the function must fail TOWARD abort_failed
+    (report it as unresolved, not silently as clean).
+
+    This seeds a REAL dangling conflicted sequencer, then only intercepts
+    the `git rev-parse --git-dir` call (simulating e.g. a disk or permission
+    error at exactly that check) -- the real `git revert --abort` call
+    underneath is left completely unmodified and genuinely runs, and
+    genuinely succeeds at cleaning up the seeded conflict (confirmed below
+    by an independent filesystem check that bypasses the function). The
+    point this proves: even though the repo ends up ACTUALLY clean, the
+    function must not report "clean" -- it never got to verify that, so it
+    must report "unknown" regardless of what really happened. It is not
+    allowed to peek at ground truth or get credit for a lucky outcome; only
+    a real, completed check is allowed to produce "clean"."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c0", "--no-verify"], tmp_path)
+
+    (tmp_path / "g.txt").write_text("y\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c1-seed-target", "--no-verify"], tmp_path)
+    seed_target_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("z\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c2", "--no-verify"], tmp_path)
+
+    _git(["checkout", "-b", "feature5"], tmp_path)
+    (tmp_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
+
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature5"], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    seed = _git(["revert", "--no-commit", seed_target_sha], tmp_path)
+    assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+    assert (tmp_path / ".git" / "REVERT_HEAD").exists()
+
+    real_git = host_bridge._git
+
+    def _sabotage_git_dir_resolution(args, cwd, *a, **k):
+        if args[:2] == ["rev-parse", "--git-dir"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=128, stdout="",
+                stderr="fatal: simulated inability to resolve the git dir",
+            )
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _sabotage_git_dir_resolution)
+
+    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+
+    assert out["reverted"] is False
+    # The key assertions this test exists for: uninspectable fails TOWARD
+    # abort_failed=True, with a marker distinct from the "found active" case
+    # -- an operator reading the error must be able to tell "we checked and
+    # it's dirty" apart from "we couldn't check at all".
+    assert out["abort_state"] == "unknown"
+    assert out["abort_failed"] is True
+    assert out["error"] and "abort_state_unknown" in out["error"]
+    assert "sequencer state still present" not in out["error"]
+
+    # Independent real observable (bypassing the function's own -- sabotaged
+    # -- git-dir check): the real, unmodified `git revert --abort` call
+    # underneath actually ran and actually succeeded, so the sequencer is
+    # genuinely gone and the repo is genuinely clean. The function had no
+    # way to know that (its own visibility into that fact was cut), and
+    # correctly reported "unknown" / abort_failed=True anyway -- proving it
+    # fails toward "go look" on real ignorance rather than defaulting to
+    # "clean" just because that happens to match reality here.
+    assert not (tmp_path / ".git" / "REVERT_HEAD").exists()
+    status = _git(["status", "--porcelain"], tmp_path).stdout
+    assert status.strip() == ""
+
+
+def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
+    """The abort-vs-state check must resolve repo_root's REAL git dir via
+    `git rev-parse --git-dir`, not assume `<repo_root>/.git` -- for a linked
+    worktree that assumption is wrong (the git dir lives under the main
+    repo's `.git/worktrees/<name>`), which would make the sequencer-state
+    check silently never fire (permanently see "no state" and always report
+    abort_failed=False, masking genuine failures) or, if some other path
+    assumption were used, look in the wrong place entirely. Reproduce the
+    exact clean-abort scenario from the dedicated test above, but with
+    repo_root itself being a real `git worktree add` checkout, and confirm
+    the function still correctly proves via the worktree's real git dir that
+    the abort actually cleaned up the seeded conflict."""
+    from pathlib import Path
+
+    main_repo = tmp_path / "main"
+    main_repo.mkdir()
+    _init_repo(main_repo)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=main_repo,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (main_repo / "g.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], main_repo)
+    _git(["commit", "-m", "c0", "--no-verify"], main_repo)
+
+    (main_repo / "g.txt").write_text("y\n", encoding="utf-8")
+    _git(["add", "-A"], main_repo)
+    _git(["commit", "-m", "c1-seed-target", "--no-verify"], main_repo)
+    seed_target_sha = _git(["rev-parse", "HEAD"], main_repo).stdout.strip()
+
+    (main_repo / "g.txt").write_text("z\n", encoding="utf-8")
+    _git(["add", "-A"], main_repo)
+    _git(["commit", "-m", "c2", "--no-verify"], main_repo)
+
+    _git(["checkout", "-b", "feature4"], main_repo)
+    (main_repo / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], main_repo)
+    _git(["commit", "-m", "cf", "--no-verify"], main_repo)
+    _git(["checkout", base_branch], main_repo)
+
+    wt_path = tmp_path / "linked-wt"
+    wt_branch = "attended/linked-wt"
+    wt_res = _git(["worktree", "add", "-b", wt_branch, str(wt_path), base_branch], main_repo)
+    assert wt_res.returncode == 0, wt_res.stderr
+    assert not (wt_path / ".git").is_dir(), "expected a linked worktree (gitdir file, not a real .git dir)"
+
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature4"], wt_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], wt_path).stdout.strip()
+
+    seed = _git(["revert", "--no-commit", seed_target_sha], wt_path)
+    assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+
+    # The real git dir for this worktree, resolved the same way the fix
+    # does -- used only to assert on, never assumed by the test setup above.
+    real_git_dir = Path(
+        _git(["rev-parse", "--git-dir"], wt_path).stdout.strip()
+    )
+    if not real_git_dir.is_absolute():
+        real_git_dir = wt_path / real_git_dir
+    assert real_git_dir.resolve() != (wt_path / ".git").resolve()
+    assert (real_git_dir / "REVERT_HEAD").exists()
+
+    out = host_bridge._revert_merge_commit(str(wt_path), merge_sha)
+
+    assert out["reverted"] is False
+    assert out["abort_failed"] is False
+    assert out["abort_state"] == "clean"
+    assert out["error"] and "revert_failed" in out["error"]
+
+    # Real observable, checked at the worktree's actual git dir (not
+    # `<wt_path>/.git`): the seeded sequencer is genuinely gone.
+    assert not (real_git_dir / "REVERT_HEAD").exists()
+    status = _git(["status", "--porcelain"], wt_path).stdout
+    assert status.strip() == "", f"expected a clean worktree after abort, got: {status!r}"
