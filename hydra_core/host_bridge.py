@@ -388,14 +388,59 @@ def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
     return out
 
 
+def _revert_sequencer_git_dir(repo_root: str) -> Path | None:
+    """Resolve repo_root's REAL git dir via ``git rev-parse --git-dir``,
+    never by assuming ``<repo_root>/.git`` -- that assumption is wrong for a
+    linked worktree, where the git dir lives under the main repo's
+    ``.git/worktrees/<name>`` instead. Returns None if it cannot be
+    resolved (never raises)."""
+    try:
+        res = _git(["rev-parse", "--git-dir"], repo_root)
+        if res.returncode != 0:
+            return None
+        gd = res.stdout.strip()
+        if not gd:
+            return None
+        path = Path(gd)
+        return path if path.is_absolute() else Path(repo_root) / path
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _revert_sequencer_active(repo_root: str) -> bool:
+    """True iff a revert/cherry-pick sequencer is still genuinely active in
+    repo_root's real git dir. This is the authority on whether an abort
+    "worked" -- NOT the abort command's own exit code, which is nonzero for
+    two unrelated reasons that must not be conflated: (1) a real sequencer
+    was active and the abort itself failed to tear it down (state remains,
+    genuinely bad), vs (2) the preceding revert never got far enough to
+    create a sequencer at all (e.g. refused upfront over a dirty file), so
+    "abort" has nothing to abort and correctly errors even though the repo
+    was already clean. Checking exit code alone would misreport case (2) as
+    a failed abort."""
+    git_dir = _revert_sequencer_git_dir(repo_root)
+    if git_dir is None:
+        return False
+    return (git_dir / "REVERT_HEAD").exists() or (git_dir / "sequencer" / "todo").exists()
+
+
 def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
     """Undo a merge commit this recovery itself just created, via ``git
     revert`` rather than ``git reset --hard`` -- it adds a new commit instead
     of rewriting history, so it never rewrites or discards any pre-existing
     commit. That guarantee is about commits, not about working-tree/index
-    cleanliness: if the abort step below itself fails, this leaves the repo
-    sitting mid-revert (conflicted index / half-applied working tree), which
-    ``out["error"]`` reports rather than hides.
+    cleanliness: if the abort step below fails to actually clear a real
+    sequencer, this leaves the repo sitting mid-revert (conflicted index /
+    half-applied working tree), which ``out["error"]`` reports rather than
+    hides.
+
+    Whether the abort "worked" is judged by the real post-abort repo state
+    (``_revert_sequencer_active``), not by the abort command's exit code --
+    ``git revert --abort`` legitimately exits nonzero when the preceding
+    revert refused before ever starting a sequencer (e.g. a dirty file in
+    the way), and that is NOT a failed cleanup, just nothing to clean up.
+    Only report ``abort_failed`` when sequencer state genuinely remains on
+    disk afterward.
 
     The "a non-passing recovery must not retain the merged code" property is
     conditional, not unconditional: it holds only when ``HEAD`` still equals
@@ -428,17 +473,22 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
         if rres.returncode != 0:
             revert_err = (rres.stderr or rres.stdout).strip()[:300]
             ares = _git(["revert", "--abort"], repo_root)
-            if ares.returncode != 0:
+            if _revert_sequencer_active(repo_root):
                 abort_err = (ares.stderr or ares.stdout).strip()[:300]
                 out["abort_failed"] = True
                 out["error"] = (
-                    f"revert_failed: {revert_err}; abort_failed: {abort_err} "
-                    "-- repo_root may be left mid-revert (conflicted index / "
-                    "half-applied working tree), not cleanly restored; "
-                    "operator must inspect repo_root's full state before any "
-                    "retry."
+                    f"revert_failed: {revert_err}; abort_failed: sequencer "
+                    f"state still present after abort (abort rc="
+                    f"{ares.returncode}: {abort_err}) -- repo_root is left "
+                    "mid-revert (conflicted index / half-applied working "
+                    "tree), not cleanly restored; operator must inspect "
+                    "repo_root's full state before any retry."
                 )
             else:
+                # abort's own exit code is irrelevant here: either it
+                # cleanly tore down a real sequencer, or there was never one
+                # to begin with (revert refused upfront) -- both leave
+                # repo_root genuinely clean, which is all that matters.
                 out["error"] = f"revert_failed: {revert_err}"
             return out
         out["reverted"] = True
