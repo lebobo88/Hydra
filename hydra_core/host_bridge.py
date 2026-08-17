@@ -388,6 +388,44 @@ def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
     return out
 
 
+def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
+    """Undo a merge commit this recovery itself just created, via ``git
+    revert`` rather than ``git reset --hard`` -- it adds a new commit instead
+    of rewriting history, so it is safe even if something else has touched
+    ``repo_root`` since (it will simply fail to apply cleanly, which is
+    reported rather than silently forced through) and never disturbs any
+    pre-existing commit.
+
+    Handles both a real merge commit (2 parents, needs ``-m 1`` to pick the
+    mainline parent) and a plain single-parent commit defensively, in case a
+    future caller passes a fast-forwarded SHA. Never raises."""
+    out: dict[str, Any] = {"reverted": False, "sha": None, "error": None}
+    try:
+        head = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+        if head != merge_sha:
+            out["error"] = (
+                f"revert_skipped_head_moved: HEAD={head} expected={merge_sha}")
+            return out
+        parents = _git(
+            ["rev-list", "--parents", "-n", "1", merge_sha], repo_root,
+        ).stdout.split()
+        is_merge_commit = len(parents) > 2  # [commit, parent1, parent2, ...]
+        revert_cmd = ["revert", "--no-edit"]
+        if is_merge_commit:
+            revert_cmd += ["-m", "1"]
+        revert_cmd.append(merge_sha)
+        rres = _git(revert_cmd, repo_root)
+        if rres.returncode != 0:
+            _git(["revert", "--abort"], repo_root)
+            out["error"] = f"revert_failed: {(rres.stderr or rres.stdout).strip()[:300]}"
+            return out
+        out["reverted"] = True
+        out["sha"] = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"revert_exception: {e!r}"[:300]
+    return out
+
+
 def _remove_worktree(repo_root: str, worktree_path: str) -> None:
     try:
         _git(["worktree", "remove", "--force", worktree_path], repo_root)
@@ -950,8 +988,11 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         pass
     # Finding 1: wrap record_attempt in try/except — an RPC failure here must
     # surface cleanly, not crash submit_host_result and orphan the stage.
-    # LV-1: _raise_on_error_payload converts error dicts into RuntimeError so
-    # the existing except clause fires for payload-level failures too.
+    # LV-1: _raise_on_error_payload converts error dicts into a RuntimeError
+    # (PPLedgerError) so the existing except clause fires for payload-level
+    # failures too -- and it preserves the original dict as ``.payload``,
+    # which is what venom-gate classification downstream reads to tell a
+    # structural rejection from a transport-shaped failure.
     # The pp schema accepts agent_type as an optional top-level string; strict
     # mode only rejects the literal 'general-purpose', not 'engineer'.
     try:
@@ -1158,7 +1199,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             save_cursor(cursor_file, cursor)
         # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
         # LV-1: _raise_on_error_payload converts error dicts (rejected/failed) into
-        # RuntimeError so the existing except fires for payload-level errors too.
+        # a RuntimeError (PPLedgerError) so the existing except fires for
+        # payload-level errors too -- and it preserves the original dict as
+        # ``.payload``, which is what venom-gate classification downstream
+        # reads to tell a structural rejection from a transport-shaped failure.
         try:
             _raise_on_error_payload(
                 cm("pp_harness", "record_verdict", _verdict_payload, squad_id=_SQ),
@@ -1426,8 +1470,11 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     attempt_id = cursor.get("attempt_id")
 
     # F26+M8: capture finalize_stage success; failure on pass → downgrade.
-    # LV-1: _raise_on_error_payload converts error dicts into RuntimeError so
-    # the existing except fires for payload-level rejections/failures too.
+    # LV-1: _raise_on_error_payload converts error dicts into a RuntimeError
+    # (PPLedgerError) so the existing except fires for payload-level
+    # rejections/failures too -- and it preserves the original dict as
+    # ``.payload``, which is what venom-gate classification downstream reads
+    # to tell a structural rejection from a transport-shaped failure.
     _finalize_stage_ok = True
     try:
         _raise_on_error_payload(
@@ -1756,29 +1803,118 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             pass
 
     # The original (pre-fix) submit already called finalize_stage/finalize_run
-    # with status="surfaced" once. Re-finalizing must be explicit and
-    # best-effort: report the outcome honestly rather than silently claiming
-    # success if pp rejects a second finalize on an already-terminal run.
+    # with status="surfaced" once, leaving the pp run-level record permanently
+    # "surfaced" even though this recovery may now find the stage passing.
+    # Re-finalizing must be explicit and best-effort: report the outcome
+    # honestly rather than silently claiming "complete" on the cursor while
+    # pp's ledger still disagrees. finalizeRun in pp's daemon
+    # (daemon/src/orchestrator/runs.ts) has no already-finalized guard -- it
+    # unconditionally re-runs the full finalize procedure (gates, DB write,
+    # master-plan patch) against whatever the stage rows say right now, so a
+    # second call is safe and is exactly what reconciles the two ledgers.
     passed = outcome == "pass" and cursor.get("smoke_status") == "pass"
+
+    # The merge above ran before the outcome was known (justified: in this
+    # legacy "surfaced" shape the worktree is already gone, so repo_root is
+    # the only place smoke can inspect the code). Now that the outcome IS
+    # known, a non-passing recovery must not silently retain the merged
+    # code -- that is the exact divergence class (repo has code no system of
+    # record acknowledges) this workstream exists to close, in the more
+    # dangerous direction of failing code landing quietly. Revert the merge
+    # commit this recovery itself created; if the revert itself fails, make
+    # the landed-but-unacknowledged state unmissable instead of pretending a
+    # clean revert happened.
+    revert: dict[str, Any] | None = None
+    if not passed and merge.get("merged") and merge.get("sha"):
+        revert = _revert_merge_commit(repo_root, merge["sha"])
+        cursor["merge"]["reverted"] = bool(revert.get("reverted"))
+        if revert.get("reverted"):
+            cursor["merge"]["revert_sha"] = revert.get("sha")
+        else:
+            cursor["merge"]["revert_error"] = revert.get("error")
+            cursor["error"] = (cursor.get("error") or "") + (
+                f"; recovery merge {merge['sha']} landed in {repo_root} on "
+                f"branch checked out there, but outcome={outcome!r} "
+                f"smoke={cursor.get('smoke_status')!r} did not pass and the "
+                f"automatic revert failed ({revert.get('error')}) -- code is "
+                "MERGED INTO THE REPO but UNACKNOWLEDGED by the pp ledger; "
+                "operator must inspect repo_root and revert manually."
+            )
+        _trace(cursor, "attended.recovery.merge_reverted", {
+            "stage_id": stage_id, "branch": branch,
+            "merge_sha": merge.get("sha"), "reverted": revert.get("reverted"),
+            "revert_error": revert.get("error"),
+        })
+
     try:
         _raise_on_error_payload(cm("pp_harness", "finalize_stage", {
             "stage_id": stage_id,
             "status": "passed" if passed else "surfaced",
             **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
         }, squad_id=_SQ), "finalize_stage")
-        fin_ok = True
+        fin_stage_ok = True
     except Exception as exc:  # noqa: BLE001
-        fin_ok = False
+        fin_stage_ok = False
         cursor["error"] = (cursor.get("error") or "") + f"; recovery finalize_stage failed: {exc}"
+    if passed and not fin_stage_ok:
+        passed = False
 
-    cursor["final_status"] = "complete" if (passed and fin_ok) else "surfaced"
+    # PP-VG-7 ordering: the stage row must already reflect "passed" (done
+    # above) BEFORE finalize_run(complete) is requested, or pp's
+    # surfaced-stages gate silently downgrades the run back to "surfaced" and
+    # undoes this reconciliation. Replay finalize_run so the run-level record
+    # matches reality instead of staying permanently stuck on the original
+    # pre-fix "surfaced" write.
+    summary = (f"Attended recovery: stage_outcome={outcome}; "
+               f"smoke={cursor.get('smoke_status')}; "
+               f"finalize_stage_ok={fin_stage_ok}.")
+    if revert is not None:
+        if revert.get("reverted"):
+            summary += f" Merge {merge.get('sha')} reverted ({revert.get('sha')})."
+        else:
+            summary += (
+                f" WARNING: merge {merge.get('sha')} landed in {repo_root} and "
+                f"the automatic revert FAILED ({revert.get('error')}) -- code "
+                "is merged but this stage did not pass; operator must revert "
+                "manually."
+            )
+    fin = cm("pp_harness", "finalize_run", {
+        "run_id": cursor["run_id"],
+        "status": "complete" if passed else "surfaced",
+        "summary_md": summary,
+    }, squad_id=_SQ)
+    fin_inner = _pp_inner(fin)
+    fin_status = fin_inner.get("effective_status") or fin_inner.get("status")
+    fin_downgraded = bool(fin_inner.get("downgraded"))
+    fin_run_ok = _pp_ok(fin)
+    if not fin_run_ok:
+        cursor["error"] = (cursor.get("error") or "") + \
+            f"; recovery finalize_run did not report success: {fin!r}"
+
+    # Never claim "complete" on the cursor unless pp's run-level record
+    # actually agrees -- if finalize_run failed outright, or pp itself
+    # downgraded (VG-7), or returned anything other than "complete", record
+    # what pp actually holds instead of a divergent cursor claim. Mirrors
+    # _finalize's downgrade-honouring check above.
+    if passed and fin_run_ok and not fin_downgraded \
+            and fin_status not in {"surfaced", "failed", "aborted", "blocked"}:
+        cursor["final_status"] = "complete"
+    else:
+        cursor["final_status"] = "surfaced"
+        if fin_downgraded:
+            cursor["error"] = (cursor.get("error") or "") + \
+                "; finalize_run downgraded complete->surfaced (PP-VG-7)"
     cursor["state"] = cursor["final_status"]
     cursor["pending_action"] = None
     cursor["finalized"] = True
     cursor.setdefault("charged", False)
     _trace(cursor, "attended.recovery.finalized", {
         "stage_id": stage_id, "final_status": cursor["final_status"],
-        "merged": True, "finalize_ok": fin_ok,
+        "merged": bool(merge.get("merged")),
+        "merge_reverted": bool(revert.get("reverted")) if revert is not None else None,
+        "finalize_stage_ok": fin_stage_ok,
+        "finalize_run_ok": fin_run_ok, "finalize_run_status": fin_status,
+        "finalize_run_downgraded": fin_downgraded,
     })
     save_cursor(cursor_file, cursor)
     out = _step_result(cursor, cursor_file)

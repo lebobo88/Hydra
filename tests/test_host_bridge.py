@@ -1194,3 +1194,88 @@ def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path
     # skipping charge_and_gate, but recover_stalled_stage itself never touches
     # budget -- confirm the flag survives untouched.
     assert rec["already_charged"] is True
+
+
+def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_path, monkeypatch):
+    """WS2 fix: in the legacy 'surfaced' recovery shape the merge from the
+    preserved branch necessarily runs before smoke can (the worktree is
+    already gone, so repo_root is the only place left to run it). If smoke
+    then FAILS, the recovery must not leave the merge silently landed while
+    the cursor/pp ledger both say 'surfaced' -- it must revert the merge
+    commit it just created, and the repo's actual file state (not a mock call
+    count) must prove the code did not stay in the tree."""
+    _init_repo(tmp_path)
+    base_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    branch = "attended/legacy-run-failing-smoke"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature.py").write_text("print('legacy')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    # Override the autouse "smoke always passes" fixture: this test needs the
+    # post-merge smoke to FAIL to exercise the revert path.
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "unit tests failed"))
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy2" / "attended" / "run_legacy2.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy2",
+        "run_id": "run_legacy2",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-1",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    # The merge itself must have succeeded (that part of the ordering is
+    # unchanged and correct) ...
+    assert rec["merge"]["merged"] is True
+    # ... but since smoke failed, the code must not remain in the tree: the
+    # merge commit must have been reverted, and the repo's HEAD must be back
+    # at the pre-merge base (the observable that actually matters, not a
+    # mocked call count).
+    assert rec["merge"]["reverted"] is True
+    head_after = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    assert head_after != base_sha  # a revert commit was added, not a hard reset
+    assert not (tmp_path / "legacy_feature.py").exists(), (
+        "smoke failed but the merged file is still present in the working "
+        "tree -- the merge was not actually reverted")
+    # The cursor and pp ledger both agree the stage did not pass.
+    assert rec["status"] == "surfaced"
+    assert rec["final_status"] == "surfaced"
