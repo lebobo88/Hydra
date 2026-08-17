@@ -605,6 +605,10 @@ def build_supervisor(
 
         # Fleet wiring based on how many distinct repos --repos/--fleet provided.
         _fleet_tasks: list[TaskState] = []
+        # Set below when --repos/--fleet degrades to single-repo mode; folded
+        # into the routing last_event assignment further down so the notice
+        # survives rather than being silently overwritten.
+        _fleet_degrade_note: str | None = None
         if len(_fleet_repo_ids) >= 2:
             # FLEET MODE: seed one engineering TaskState per distinct repo.
             # state.fleet_parallel = True signals node_dispatch to call dispatch_fleet.
@@ -653,15 +657,20 @@ def build_supervisor(
             # one id shouldn't have to retry with --repo instead). What was missing
             # was VISIBILITY: state.last_event previously stayed whatever it was
             # before intake, so an operator checking `/hydra:status` had no signal
-            # that fleet mode didn't happen. Set it explicitly here, alongside the
-            # existing trace, so the degrade is never silent.
+            # that fleet mode didn't happen. The naive fix (assigning
+            # state.last_event here) was itself dead: node_intake unconditionally
+            # overwrites state.last_event later with the routing decision
+            # ("intake: chose [...] (...)"), so the degrade note never survived to
+            # what an operator actually sees. Stash it in _fleet_degrade_note and
+            # fold it into that later assignment instead of losing it.
             state.fleet_parallel = False
             if not state.target_repo_id:
                 state.target_repo_id = _fleet_repo_ids[0]
-            state.last_event = (
+            _fleet_degrade_note = (
                 f"--repos/--fleet named a single distinct repo "
                 f"({_fleet_repo_ids[0]!r}) — running single-repo, not fleet mode"
             )
+            state.last_event = _fleet_degrade_note
             emit_trace(
                 judge_trace_root,
                 state.workflow_id,
@@ -843,7 +852,15 @@ def build_supervisor(
             "tool_count": tool_scope.tool_count,
         })
 
-        state.last_event = f"intake: chose {decision.squads} ({decision.rationale})"
+        _routing_event = f"intake: chose {decision.squads} ({decision.rationale})"
+        if _fleet_degrade_note:
+            # Fold the degrade note in rather than losing it — this assignment
+            # is the last write to last_event before intake returns, so any
+            # earlier notice not carried forward here would never reach an
+            # operator checking /hydra:status.
+            state.last_event = f"{_fleet_degrade_note}; {_routing_event}"
+        else:
+            state.last_event = _routing_event
 
         # Eights attestation: stamp the constitution hash into state and
         # record the receipt for audit. The local immortal_head check is
