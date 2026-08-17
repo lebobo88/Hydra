@@ -1341,6 +1341,7 @@ def test_revert_merge_commit_conflict_clean_abort(tmp_path):
 
     assert out["reverted"] is False
     assert out["abort_failed"] is False
+    assert out["abort_state"] == "clean"
     assert out["error"] and "revert_failed" in out["error"]
     assert "abort_failed" not in out["error"]
 
@@ -1470,6 +1471,7 @@ def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_pa
 
     assert out["reverted"] is False
     assert out["abort_failed"] is True
+    assert out["abort_state"] == "active"
     assert out["error"] and "abort_failed" in out["error"]
 
     # Real observable that distinguishes this from both the clean-abort case
@@ -1478,6 +1480,94 @@ def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_pa
     # the operator needs to know before retrying anything.
     assert (tmp_path / ".git" / "REVERT_HEAD").exists()
     assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
+
+
+def test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed(tmp_path, monkeypatch):
+    """Regression guard for the fail-open defect: if repo_root's git dir
+    cannot be resolved after the abort attempt, that is a THIRD, distinct
+    fact from both "sequencer active" and "sequencer clean" -- the state is
+    genuinely unverified, and the function must fail TOWARD abort_failed
+    (report it as unresolved, not silently as clean).
+
+    This seeds a REAL dangling conflicted sequencer, then only intercepts
+    the `git rev-parse --git-dir` call (simulating e.g. a disk or permission
+    error at exactly that check) -- the real `git revert --abort` call
+    underneath is left completely unmodified and genuinely runs, and
+    genuinely succeeds at cleaning up the seeded conflict (confirmed below
+    by an independent filesystem check that bypasses the function). The
+    point this proves: even though the repo ends up ACTUALLY clean, the
+    function must not report "clean" -- it never got to verify that, so it
+    must report "unknown" regardless of what really happened. It is not
+    allowed to peek at ground truth or get credit for a lucky outcome; only
+    a real, completed check is allowed to produce "clean"."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("x\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c0", "--no-verify"], tmp_path)
+
+    (tmp_path / "g.txt").write_text("y\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c1-seed-target", "--no-verify"], tmp_path)
+    seed_target_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    (tmp_path / "g.txt").write_text("z\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "c2", "--no-verify"], tmp_path)
+
+    _git(["checkout", "-b", "feature5"], tmp_path)
+    (tmp_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
+
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", "feature5"], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    seed = _git(["revert", "--no-commit", seed_target_sha], tmp_path)
+    assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+    assert (tmp_path / ".git" / "REVERT_HEAD").exists()
+
+    real_git = host_bridge._git
+
+    def _sabotage_git_dir_resolution(args, cwd, *a, **k):
+        if args[:2] == ["rev-parse", "--git-dir"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=128, stdout="",
+                stderr="fatal: simulated inability to resolve the git dir",
+            )
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _sabotage_git_dir_resolution)
+
+    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+
+    assert out["reverted"] is False
+    # The key assertions this test exists for: uninspectable fails TOWARD
+    # abort_failed=True, with a marker distinct from the "found active" case
+    # -- an operator reading the error must be able to tell "we checked and
+    # it's dirty" apart from "we couldn't check at all".
+    assert out["abort_state"] == "unknown"
+    assert out["abort_failed"] is True
+    assert out["error"] and "abort_state_unknown" in out["error"]
+    assert "sequencer state still present" not in out["error"]
+
+    # Independent real observable (bypassing the function's own -- sabotaged
+    # -- git-dir check): the real, unmodified `git revert --abort` call
+    # underneath actually ran and actually succeeded, so the sequencer is
+    # genuinely gone and the repo is genuinely clean. The function had no
+    # way to know that (its own visibility into that fact was cut), and
+    # correctly reported "unknown" / abort_failed=True anyway -- proving it
+    # fails toward "go look" on real ignorance rather than defaulting to
+    # "clean" just because that happens to match reality here.
+    assert not (tmp_path / ".git" / "REVERT_HEAD").exists()
+    status = _git(["status", "--porcelain"], tmp_path).stdout
+    assert status.strip() == ""
 
 
 def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
@@ -1548,6 +1638,7 @@ def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
 
     assert out["reverted"] is False
     assert out["abort_failed"] is False
+    assert out["abort_state"] == "clean"
     assert out["error"] and "revert_failed" in out["error"]
 
     # Real observable, checked at the worktree's actual git dir (not

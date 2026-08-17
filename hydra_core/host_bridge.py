@@ -407,21 +407,40 @@ def _revert_sequencer_git_dir(repo_root: str) -> Path | None:
         return None
 
 
-def _revert_sequencer_active(repo_root: str) -> bool:
-    """True iff a revert/cherry-pick sequencer is still genuinely active in
-    repo_root's real git dir. This is the authority on whether an abort
-    "worked" -- NOT the abort command's own exit code, which is nonzero for
-    two unrelated reasons that must not be conflated: (1) a real sequencer
-    was active and the abort itself failed to tear it down (state remains,
-    genuinely bad), vs (2) the preceding revert never got far enough to
-    create a sequencer at all (e.g. refused upfront over a dirty file), so
-    "abort" has nothing to abort and correctly errors even though the repo
-    was already clean. Checking exit code alone would misreport case (2) as
-    a failed abort."""
+def _revert_sequencer_state(repo_root: str) -> str:
+    """Inspect repo_root's real git dir for revert/cherry-pick sequencer
+    state. This is the authority on whether an abort "worked" -- NOT the
+    abort command's own exit code, which is nonzero for two unrelated
+    reasons that must not be conflated: (1) a real sequencer was active and
+    the abort itself failed to tear it down (state remains, genuinely bad),
+    vs (2) the preceding revert never got far enough to create a sequencer
+    at all (e.g. refused upfront over a dirty file), so "abort" has nothing
+    to abort and correctly errors even though the repo was already clean.
+    Checking exit code alone would misreport case (2) as a failed abort.
+
+    Returns one of three states, never just a bool -- collapsing "clean" and
+    "could not tell" into one falsy value is exactly the failure shape this
+    workstream exists to eliminate (a record claiming a state that was never
+    actually verified):
+
+      "active"  -- REVERT_HEAD or sequencer/todo genuinely present on disk.
+      "clean"   -- the git dir resolved and neither marker is present.
+      "unknown" -- the git dir itself could not be resolved (repo_root
+                   inaccessible, git errored, etc). This is NOT the same
+                   fact as "clean" -- it means the state could not be
+                   inspected at all, and callers must treat it as at least
+                   as bad as "active" (fail toward "go look"), never as an
+                   assurance of cleanliness.
+
+    Never raises."""
     git_dir = _revert_sequencer_git_dir(repo_root)
     if git_dir is None:
-        return False
-    return (git_dir / "REVERT_HEAD").exists() or (git_dir / "sequencer" / "todo").exists()
+        return "unknown"
+    try:
+        active = (git_dir / "REVERT_HEAD").exists() or (git_dir / "sequencer" / "todo").exists()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    return "active" if active else "clean"
 
 
 def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
@@ -435,12 +454,16 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
     hides.
 
     Whether the abort "worked" is judged by the real post-abort repo state
-    (``_revert_sequencer_active``), not by the abort command's exit code --
+    (``_revert_sequencer_state``), not by the abort command's exit code --
     ``git revert --abort`` legitimately exits nonzero when the preceding
     revert refused before ever starting a sequencer (e.g. a dirty file in
     the way), and that is NOT a failed cleanup, just nothing to clean up.
-    Only report ``abort_failed`` when sequencer state genuinely remains on
-    disk afterward.
+    ``out["abort_state"]`` carries that check's own three-way result
+    (``"active"`` / ``"clean"`` / ``"unknown"``); ``out["abort_failed"]`` is
+    True for BOTH ``"active"`` (sequencer genuinely still present) and
+    ``"unknown"`` (the git dir couldn't be resolved, so cleanliness could
+    not be verified) -- an uninspectable repo is never reported as clean,
+    only as a distinctly-worded, equally unmissable warning.
 
     The "a non-passing recovery must not retain the merged code" property is
     conditional, not unconditional: it holds only when ``HEAD`` still equals
@@ -454,6 +477,7 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
     future caller passes a fast-forwarded SHA. Never raises."""
     out: dict[str, Any] = {
         "reverted": False, "sha": None, "error": None, "abort_failed": False,
+        "abort_state": None,
     }
     try:
         head = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
@@ -473,7 +497,9 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
         if rres.returncode != 0:
             revert_err = (rres.stderr or rres.stdout).strip()[:300]
             ares = _git(["revert", "--abort"], repo_root)
-            if _revert_sequencer_active(repo_root):
+            seq_state = _revert_sequencer_state(repo_root)
+            out["abort_state"] = seq_state
+            if seq_state == "active":
                 abort_err = (ares.stderr or ares.stdout).strip()[:300]
                 out["abort_failed"] = True
                 out["error"] = (
@@ -484,11 +510,29 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
                     "tree), not cleanly restored; operator must inspect "
                     "repo_root's full state before any retry."
                 )
+            elif seq_state == "unknown":
+                # Fail TOWARD abort_failed here, not away from it: the git
+                # dir could not be resolved, so whether a sequencer remains
+                # is genuinely unverified -- reporting "clean" would convert
+                # ignorance into a false assurance. This is a DISTINCT fact
+                # from "found dirty" (seq_state == "active"), so it gets its
+                # own marker rather than being folded into the same text.
+                abort_err = (ares.stderr or ares.stdout).strip()[:300]
+                out["abort_failed"] = True
+                out["error"] = (
+                    f"revert_failed: {revert_err}; abort_state_unknown: "
+                    "could not resolve repo_root's git dir to verify whether "
+                    f"a sequencer remains after the abort (abort rc="
+                    f"{ares.returncode}: {abort_err}) -- this is NOT a "
+                    "confirmation that repo_root is clean, only an inability "
+                    "to check; operator must inspect repo_root's full state "
+                    "before any retry."
+                )
             else:
                 # abort's own exit code is irrelevant here: either it
                 # cleanly tore down a real sequencer, or there was never one
-                # to begin with (revert refused upfront) -- both leave
-                # repo_root genuinely clean, which is all that matters.
+                # to begin with (revert refused upfront) -- both are
+                # verified clean, which is all that matters.
                 out["error"] = f"revert_failed: {revert_err}"
             return out
         out["reverted"] = True
@@ -1905,7 +1949,20 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         else:
             cursor["merge"]["revert_error"] = revert.get("error")
             cursor["merge"]["abort_failed"] = bool(revert.get("abort_failed"))
-            if revert.get("abort_failed"):
+            cursor["merge"]["abort_state"] = revert.get("abort_state")
+            if revert.get("abort_state") == "unknown":
+                cursor["error"] = (cursor.get("error") or "") + (
+                    f"; recovery merge {merge['sha']} landed in {repo_root} on "
+                    f"branch checked out there, outcome={outcome!r} "
+                    f"smoke={cursor.get('smoke_status')!r} did not pass, the "
+                    f"automatic revert failed, and repo_root's post-abort "
+                    f"state could NOT be verified ({revert.get('error')}) -- "
+                    "code is MERGED INTO THE REPO, UNACKNOWLEDGED by the pp "
+                    "ledger, and whether repo_root is clean or mid-revert is "
+                    "UNKNOWN (not confirmed clean); operator must inspect "
+                    "repo_root's full state before any retry."
+                )
+            elif revert.get("abort_failed"):
                 cursor["error"] = (cursor.get("error") or "") + (
                     f"; recovery merge {merge['sha']} landed in {repo_root} on "
                     f"branch checked out there, outcome={outcome!r} "
@@ -1932,6 +1989,7 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             "merge_sha": merge.get("sha"), "reverted": revert.get("reverted"),
             "revert_error": revert.get("error"),
             "abort_failed": bool(revert.get("abort_failed")),
+            "abort_state": revert.get("abort_state"),
         })
 
     try:
@@ -1959,6 +2017,16 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     if revert is not None:
         if revert.get("reverted"):
             summary += f" Merge {merge.get('sha')} reverted ({revert.get('sha')})."
+        elif revert.get("abort_state") == "unknown":
+            summary += (
+                f" WARNING: merge {merge.get('sha')} landed in {repo_root}, the "
+                f"automatic revert FAILED, and repo_root's post-abort state "
+                f"could NOT be verified ({revert.get('error')}) -- code is "
+                "merged, this stage did not pass, and whether repo_root is "
+                "clean or mid-revert is UNKNOWN (not confirmed clean); "
+                "operator must inspect repo_root's full state before any "
+                "retry."
+            )
         elif revert.get("abort_failed"):
             summary += (
                 f" WARNING: merge {merge.get('sha')} landed in {repo_root}, the "
