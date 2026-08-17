@@ -26,14 +26,31 @@ from hydra_core.squad_loader import SquadPack
 from hydra_core.squad_node import _via_mcp
 from hydra_core.state import HydraState
 
+# Captured at import time -- BEFORE the autouse ``_no_git_harvest`` fixture
+# stubs the module attributes to no-ops. The regression guard below restores
+# these so it exercises the REAL scaffolding against the (already-scaffolded)
+# live repo, instead of passing trivially against the stub.
+from hydra_core.squad_node import (
+    ensure_target_repo_ignores as _real_ensure_target_repo_ignores,
+    ensure_target_repo_test_excludes as _real_ensure_target_repo_test_excludes,
+)
+
 
 @pytest.fixture(autouse=True)
 def _no_git_harvest(monkeypatch):
     """Some tests dispatch _via_mcp against the LIVE Hydra repo; never let the
     harvest step touch real git there (it is exercised hermetically in
-    tests/test_drive_loop_harvest_smoke.py)."""
+    tests/test_drive_loop_harvest_smoke.py). Likewise never let the target-repo
+    scaffolding helpers (.gitignore / test-runner exclude patching, added
+    alongside this file's target_repo_id plumbing) write into the real
+    checkout -- they are exercised hermetically against tmp_path in
+    tests/test_target_repo_scaffolding.py."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores",
+                        lambda _project_path: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_test_excludes",
+                        lambda _project_path: None)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +428,115 @@ def test_via_mcp_with_target_repo_id_uses_registry_path() -> None:
     assert captured[0]["project_path"] == expected_path, (
         f"Expected project_path={expected_path!r}, got {captured[0]['project_path']!r}"
     )
+
+
+def test_via_mcp_scaffolding_is_noop_on_already_scaffolded_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: when the target repo's ``.gitignore`` and
+    ``pyproject.toml`` are ALREADY scaffolded with the ``.harness``/``.hydra``
+    entries, dispatching _via_mcp with target_repo_id='hydra' must leave both
+    files byte-identical.
+
+    Unlike the sibling tests, this one *un-stubs* the scaffolding helpers (the
+    ``_no_git_harvest`` autouse fixture stubbed them to no-ops) and runs the
+    REAL implementations, so the byte-for-byte assertion is meaningful: it
+    proves the real functions are a genuine no-op on an already-configured
+    repo, rather than passing trivially because the helpers were stubbed out.
+
+    Hermetic by construction: 'hydra' is resolved via ``HYDRA_REPO_BASE``
+    (monkeypatched below) to a throwaway ``tmp_path / "Hydra"`` fixture repo
+    that this test seeds itself with already-scaffolded content -- never the
+    live checkout. This avoids depending on (and mutating) whatever state the
+    real repo happens to be in; see git history for the prior, non-hermetic
+    version of this test that wrote into the live tree. A regression that
+    makes either helper rewrite an already-scaffolded config is caught here.
+
+    The guarantee is unconditional, not merely true on this operator's current
+    config: ``resolve_repo_path`` consults the operator extras registry
+    (``~/.hydra/repos.json`` / ``HYDRA_EXTRA_REPOS``) *before* the
+    ``HYDRA_REPO_BASE`` path, so an extras entry for 'hydra' would silently
+    bypass the monkeypatch below and route to the live checkout. This test
+    forces the extras registry empty and clears ``HYDRA_EXTRA_REPOS`` so the
+    ``HYDRA_REPO_BASE`` fixture path is the only path 'hydra' can resolve
+    through, regardless of what the running operator has configured."""
+    # Restore the real implementations for this test only (the autouse fixture
+    # ran first and stubbed the module attributes to no-ops).
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_ignores",
+        _real_ensure_target_repo_ignores,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes",
+        _real_ensure_target_repo_test_excludes,
+    )
+
+    # Force the extras-registry path closed so 'hydra' cannot resolve through
+    # an operator's ~/.hydra/repos.json / HYDRA_EXTRA_REPOS entry (see
+    # docstring above) -- only HYDRA_REPO_BASE below may satisfy 'hydra'.
+    monkeypatch.setattr("hydra_core.repo_registry._load_extra_repos", lambda: {})
+    monkeypatch.delenv("HYDRA_EXTRA_REPOS", raising=False)
+
+    repo_root = tmp_path / "Hydra"
+    repo_root.mkdir()
+    _git_init(repo_root)
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
+
+    ignores_calls: list[tuple[Any, ...]] = []
+    excludes_calls: list[tuple[Any, ...]] = []
+
+    def _spy_ignores(*args: Any, **kwargs: Any) -> Any:
+        ignores_calls.append(args)
+        return _real_ensure_target_repo_ignores(*args, **kwargs)
+
+    def _spy_excludes(*args: Any, **kwargs: Any) -> Any:
+        excludes_calls.append(args)
+        return _real_ensure_target_repo_test_excludes(*args, **kwargs)
+
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores", _spy_ignores)
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes", _spy_excludes
+    )
+
+    # Seed already-scaffolded fixture content: both files already carry the
+    # .harness / .hydra entries the helpers would otherwise add.
+    gitignore = repo_root / ".gitignore"
+    gitignore.write_text("node_modules/\n.harness/\n.hydra/\n", encoding="utf-8")
+    pyproject = repo_root / "pyproject.toml"
+    pyproject.write_text(
+        "[tool.pytest.ini_options]\n"
+        'testpaths = ["tests"]\n'
+        'norecursedirs = ["node_modules", ".harness", ".hydra"]\n',
+        encoding="utf-8",
+    )
+
+    gitignore_before = gitignore.read_bytes()
+    pyproject_before = pyproject.read_bytes()
+
+    state = HydraState(root_goal="Fix something")
+    pack = _make_engineering_pack()
+    inbound = CSuiteDecisionPacket(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        origin="BOARDROOM",
+        objective="Fix something",
+        target_repo_id="hydra",
+    )
+    dispatcher, _captured = _make_stub_dispatcher()
+
+    _via_mcp(state, pack, inbound, dispatcher)
+
+    assert gitignore.read_bytes() == gitignore_before, (
+        "dispatch against an already-scaffolded repo must never rewrite its .gitignore"
+    )
+    assert pyproject.read_bytes() == pyproject_before, (
+        "dispatch against an already-scaffolded repo must never rewrite its pyproject.toml"
+    )
+    # Prove the no-op is because the real helpers ran and found nothing to
+    # change -- not because a regression stopped calling them on this path.
+    assert ignores_calls, "ensure_target_repo_ignores was never invoked"
+    assert excludes_calls, "ensure_target_repo_test_excludes was never invoked"
 
 
 def test_via_mcp_with_target_repo_subpath_uses_bounded_project_path(

@@ -75,6 +75,19 @@ def _patch_side_effects(monkeypatch) -> None:
         "hydra_core.squad_node._maybe_write_claude_shim",
         lambda _project_path: None,
     )
+    # These tests dispatch _via_mcp against the real HYDRA_ROOT checkout with
+    # run_id + status="done" -- stub the target-repo scaffolding helpers so
+    # they don't write .gitignore / test-runner exclude entries into it. They
+    # are exercised hermetically against tmp_path in
+    # tests/test_target_repo_scaffolding.py.
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_ignores",
+        lambda _project_path: None,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes",
+        lambda _project_path: None,
+    )
 
 
 def test_ensure_agents_md_called_after_start_run(monkeypatch) -> None:
