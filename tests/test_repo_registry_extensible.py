@@ -16,6 +16,7 @@ All git operations are local-only (git init / git rev-parse).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -116,6 +117,37 @@ def test_extra_repo_via_home_repos_json(
 
     assert is_known_repo("filereg") is True
     assert resolve_repo_path("filereg") == repo.resolve()
+
+
+def test_repos_json_path_resolves_per_call_not_at_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: ``_repos_json_path()`` (and ``_repos_lock_path()``)
+    must re-resolve ``Path.home()`` on every call, not freeze it at module
+    import time. A prior refactor hoisted these into module-level constants
+    evaluated once at import, which meant HOME/USERPROFILE changes made after
+    import (e.g. a test's monkeypatch, or any long-lived process whose
+    environment changes) were silently ignored -- the file the operator edits
+    would not necessarily be the file Hydra reads. This asserts the opposite:
+    changing HOME after import must be reflected immediately."""
+    first_home = Path("/tmp/first-home") if os.name != "nt" else Path("C:/first-home")
+    second_home = Path("/tmp/second-home") if os.name != "nt" else Path("C:/second-home")
+
+    monkeypatch.setenv("HOME", str(first_home))
+    monkeypatch.setenv("USERPROFILE", str(first_home))
+    first_resolved = repo_registry_module._repos_json_path()
+    assert first_resolved == first_home / ".hydra" / "repos.json"
+
+    monkeypatch.setenv("HOME", str(second_home))
+    monkeypatch.setenv("USERPROFILE", str(second_home))
+    second_resolved = repo_registry_module._repos_json_path()
+    assert second_resolved == second_home / ".hydra" / "repos.json"
+    assert second_resolved != first_resolved
+
+    # Same guard for the lock-file resolver.
+    assert repo_registry_module._repos_lock_path() == (
+        second_home / ".hydra" / "repos.json.lock"
+    )
 
 
 def test_malformed_extra_config_is_failsoft(

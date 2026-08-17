@@ -170,15 +170,26 @@ def _get_base() -> Path:
     return naive_base
 
 
-# Module-level (monkeypatchable) constants for the operator repos.json config
-# and its short-lived write lock. Defined here (once) so both the READ path
-# (_load_extra_repos, below) and the WRITE path (register_repo/unregister_repo,
-# further down) agree on the same file -- a prior version of this module had
-# _load_extra_repos hardcode ``Path.home() / ".hydra" / "repos.json"`` inline
-# while the write path referenced a separate module constant, which is exactly
-# the kind of two-copies drift WS1 exists to eliminate.
-_REPOS_JSON_PATH = Path.home() / ".hydra" / "repos.json"
-_REPOS_LOCK_PATH = Path.home() / ".hydra" / "repos.json.lock"
+# Call-time (monkeypatchable) resolvers for the operator repos.json config and
+# its short-lived write lock. Both the READ path (_load_extra_repos, below)
+# and the WRITE path (register_repo/unregister_repo, further down) call
+# through these -- a prior version of this module had _load_extra_repos
+# hardcode ``Path.home() / ".hydra" / "repos.json"`` inline while the write
+# path referenced a separate module constant, which is exactly the kind of
+# two-copies drift WS1 exists to eliminate.
+#
+# These are FUNCTIONS, not module-level constants, because Path.home() must be
+# re-resolved on every call: HOME/USERPROFILE can change after import (e.g. a
+# test's monkeypatch, or a long-lived process whose environment is mutated),
+# and freezing the path at import time would silently decouple "where the
+# operator edits repos.json" from "where Hydra actually reads it" -- the same
+# class of silent divergence this registry exists to prevent.
+def _repos_json_path() -> Path:
+    return Path.home() / ".hydra" / "repos.json"
+
+
+def _repos_lock_path() -> Path:
+    return Path.home() / ".hydra" / "repos.json.lock"
 
 
 def _load_extra_repos() -> dict[str, Path]:
@@ -197,8 +208,9 @@ def _load_extra_repos() -> dict[str, Path]:
     extra: dict[str, Path] = {}
     sources: list[str] = []
     try:
-        if _REPOS_JSON_PATH.is_file():
-            sources.append(_REPOS_JSON_PATH.read_text(encoding="utf-8"))
+        cfg = _repos_json_path()
+        if cfg.is_file():
+            sources.append(cfg.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- a bad config never breaks resolution
         pass
     env_val = os.environ.get("HYDRA_EXTRA_REPOS")
@@ -348,27 +360,28 @@ def _acquire_repos_lock(timeout_s: float = _REPOS_LOCK_TIMEOUT_S) -> int:
     resume claim), so a simple stale-reclaim by age is sufficient — no PID
     liveness tracking needed.
     """
-    _REPOS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _repos_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_s
     while True:
         try:
-            fd = os.open(str(_REPOS_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode())
             return fd
         except FileExistsError:
             try:
-                age = time.time() - _REPOS_LOCK_PATH.stat().st_mtime
+                age = time.time() - lock_path.stat().st_mtime
             except OSError:
                 age = 0.0
             if age >= _REPOS_LOCK_STALE_S:
                 try:
-                    _REPOS_LOCK_PATH.unlink()
+                    lock_path.unlink()
                 except OSError:
                     pass
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"timed out acquiring {_REPOS_LOCK_PATH} after {timeout_s}s "
+                    f"timed out acquiring {lock_path} after {timeout_s}s "
                     "(a concurrent register/unregister may be stuck)"
                 )
             time.sleep(_REPOS_LOCK_POLL_S)
@@ -379,7 +392,7 @@ def _release_repos_lock(fd: int) -> None:
         os.close(fd)
     finally:
         try:
-            _REPOS_LOCK_PATH.unlink()
+            _repos_lock_path().unlink()
         except OSError:
             pass
 
@@ -388,9 +401,10 @@ def _atomic_write_repos_json(data: dict[str, str]) -> None:
     """temp file + os.replace — the write is atomic even if the process dies
     mid-write; a torn read is what _load_extra_repos degrades on fail-soft,
     which is exactly the silent mis-target this registry exists to prevent."""
-    _REPOS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    repos_path = _repos_json_path()
+    repos_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path_str = tempfile.mkstemp(
-        dir=str(_REPOS_JSON_PATH.parent), prefix=".repos-", suffix=".json.tmp"
+        dir=str(repos_path.parent), prefix=".repos-", suffix=".json.tmp"
     )
     tmp_path = Path(tmp_path_str)
     try:
@@ -398,7 +412,7 @@ def _atomic_write_repos_json(data: dict[str, str]) -> None:
             json.dump(data, f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(str(tmp_path), str(_REPOS_JSON_PATH))
+        os.replace(str(tmp_path), str(repos_path))
     except Exception:
         try:
             tmp_path.unlink()
@@ -458,9 +472,10 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
 
     lock_fd = _acquire_repos_lock()
     try:
+        repos_path = _repos_json_path()
         prior_raw = (
-            _REPOS_JSON_PATH.read_text(encoding="utf-8")
-            if _REPOS_JSON_PATH.is_file() else None
+            repos_path.read_text(encoding="utf-8")
+            if repos_path.is_file() else None
         )
         try:
             data = json.loads(prior_raw) if prior_raw and prior_raw.strip() else {}
@@ -476,12 +491,12 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
         except Exception as verify_exc:  # noqa: BLE001 — roll back, then re-raise
             if prior_raw is not None:
                 try:
-                    _REPOS_JSON_PATH.write_text(prior_raw, encoding="utf-8")
+                    repos_path.write_text(prior_raw, encoding="utf-8")
                 except OSError:
                     pass
             else:
                 try:
-                    _REPOS_JSON_PATH.unlink()
+                    repos_path.unlink()
                 except OSError:
                     pass
             raise ValueError(
@@ -500,9 +515,10 @@ def unregister_repo(repo_id: str) -> dict[str, Any]:
         raise ValueError("repo_id is required")
     lock_fd = _acquire_repos_lock()
     try:
-        if not _REPOS_JSON_PATH.is_file():
+        repos_path = _repos_json_path()
+        if not repos_path.is_file():
             raise ValueError(f"{key!r} is not registered (no ~/.hydra/repos.json)")
-        raw = _REPOS_JSON_PATH.read_text(encoding="utf-8")
+        raw = repos_path.read_text(encoding="utf-8")
         try:
             data = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:

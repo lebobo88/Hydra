@@ -3,8 +3,8 @@
 `hydra repo register|unregister|list` CLI subcommand.
 
 All tests are offline (local git only) and hermetic: every test monkeypatches
-_REPOS_JSON_PATH / _REPOS_LOCK_PATH to a tmp_path location so the operator's
-real ~/.hydra/repos.json is never touched.
+the _repos_json_path() / _repos_lock_path() resolvers to a tmp_path location
+so the operator's real ~/.hydra/repos.json is never touched.
 """
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def _isolated_repos_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     HYDRA_EXTRA_REPOS so no operator env leaks into the test."""
     cfg = tmp_path / ".hydra" / "repos.json"
     lock = tmp_path / ".hydra" / "repos.json.lock"
-    monkeypatch.setattr(repo_registry, "_REPOS_JSON_PATH", cfg)
-    monkeypatch.setattr(repo_registry, "_REPOS_LOCK_PATH", lock)
+    monkeypatch.setattr(repo_registry, "_repos_json_path", lambda: cfg)
+    monkeypatch.setattr(repo_registry, "_repos_lock_path", lambda: lock)
     monkeypatch.delenv("HYDRA_EXTRA_REPOS", raising=False)
     return cfg
 
