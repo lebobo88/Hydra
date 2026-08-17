@@ -344,6 +344,15 @@ def build_supervisor(
 
     # ----- node implementations -----
 
+    def _first_quoted_token(msg: str) -> str:
+        """Pull the first single-quoted token out of a repr-formatted
+        ValueError message (e.g. "--repo 'foo' is not an allow-listed
+        repo_id"). Used only to enrich unknown-repo HITL payloads with the
+        attempted id for difflib suggestions — never touches parse_repo_arg /
+        parse_repos_arg themselves, which stay unchanged per WS1-B."""
+        m = re.search(r"'([^']*)'", msg)
+        return m.group(1) if m else ""
+
     def _emit_node_context(state: HydraState, node_name: str) -> None:
         """Emit node context to the trace for debugging/audit."""
         ctx = build_node_context(
@@ -410,6 +419,7 @@ def build_supervisor(
         except ValueError as _repo_err:
             # Unknown --repo id at tail position: surface immediately so the
             # operator sees the problem rather than silently targeting the wrong repo.
+            from hydra_core.repo_registry import unknown_repo_hitl_fields
             state.phase = "surfaced"
             _hitl_payload: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -418,6 +428,7 @@ def build_supervisor(
                 "summary": f"--repo argument rejected: {_repo_err}",
                 "options": ["abort"],
                 "default_option": "abort",
+                **unknown_repo_hitl_fields(_first_quoted_token(str(_repo_err))),
             }
             emit_trace(
                 judge_trace_root,
@@ -456,6 +467,7 @@ def build_supervisor(
             )
             _fleet_repo_ids, _fleet_cleaned = [], state.root_goal
         except ValueError as _repos_err:
+            from hydra_core.repo_registry import unknown_repo_hitl_fields
             state.phase = "surfaced"
             _repos_hitl: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -464,6 +476,7 @@ def build_supervisor(
                 "summary": f"--repos argument rejected: {_repos_err}",
                 "options": ["abort"],
                 "default_option": "abort",
+                **unknown_repo_hitl_fields(_first_quoted_token(str(_repos_err))),
             }
             emit_trace(
                 judge_trace_root,
@@ -529,6 +542,54 @@ def build_supervisor(
             }
         if _repo_subpath is not None and not state.target_repo_subpath:
             state.target_repo_subpath = _repo_subpath
+
+        # WS1-B: merge a pre-seeded structured target_repo_ids (CLI --repos /
+        # hydra.workflow.plan repos=, set directly on state before intake runs)
+        # into the fleet list when the goal text supplied none. Goal text always
+        # wins if both are present.
+        if not _fleet_repo_ids and state.target_repo_ids:
+            _fleet_repo_ids = list(dict.fromkeys(
+                str(r).strip().lower() for r in state.target_repo_ids if str(r).strip()
+            ))
+
+        # WS1-B: validate EVERY target_repo_id regardless of how it arrived --
+        # goal text (already validated above by parse_repo_arg/parse_repos_arg)
+        # or pre-seeded directly on state via the structured API path, which
+        # skips that validation entirely. Without this, a pre-seeded unknown id
+        # sails past intake and raises deep inside _resolve_task_project_path as
+        # a bare exception instead of surfacing this HITL.
+        from hydra_core.repo_registry import (
+            is_known_repo as _is_known_repo,
+            unknown_repo_hitl_fields as _unknown_repo_hitl_fields,
+        )
+        _preseed_bad: list[str] = []
+        if state.target_repo_id and not _is_known_repo(state.target_repo_id):
+            _preseed_bad.append(state.target_repo_id)
+        for _rid in _fleet_repo_ids:
+            if not _is_known_repo(_rid) and _rid not in _preseed_bad:
+                _preseed_bad.append(_rid)
+        if _preseed_bad:
+            state.phase = "surfaced"
+            _preseed_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": f"unknown target_repo_id(s) on pre-seeded state: {_preseed_bad}",
+                "options": ["abort"],
+                "default_option": "abort",
+                **_unknown_repo_hitl_fields(_preseed_bad[0]),
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.bad_preseeded_repo_id",
+                {"attempted": _preseed_bad},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _preseed_hitl,
+                "last_event": f"bad pre-seeded target_repo_id: {_preseed_bad}",
+            }
 
         # Fleet wiring based on how many distinct repos --repos/--fleet provided.
         _fleet_tasks: list[TaskState] = []

@@ -29,12 +29,15 @@ layouts or test fixtures.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
 import subprocess
+import tempfile
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Allow-list: repo_id -> directory NAME (or forward-slash-separated relative
@@ -167,6 +170,17 @@ def _get_base() -> Path:
     return naive_base
 
 
+# Module-level (monkeypatchable) constants for the operator repos.json config
+# and its short-lived write lock. Defined here (once) so both the READ path
+# (_load_extra_repos, below) and the WRITE path (register_repo/unregister_repo,
+# further down) agree on the same file -- a prior version of this module had
+# _load_extra_repos hardcode ``Path.home() / ".hydra" / "repos.json"`` inline
+# while the write path referenced a separate module constant, which is exactly
+# the kind of two-copies drift WS1 exists to eliminate.
+_REPOS_JSON_PATH = Path.home() / ".hydra" / "repos.json"
+_REPOS_LOCK_PATH = Path.home() / ".hydra" / "repos.json.lock"
+
+
 def _load_extra_repos() -> dict[str, Path]:
     """Operator-registered repos beyond the hardcoded allow-list.
 
@@ -182,10 +196,9 @@ def _load_extra_repos() -> dict[str, Path]:
     """
     extra: dict[str, Path] = {}
     sources: list[str] = []
-    cfg = Path.home() / ".hydra" / "repos.json"
     try:
-        if cfg.is_file():
-            sources.append(cfg.read_text(encoding="utf-8"))
+        if _REPOS_JSON_PATH.is_file():
+            sources.append(_REPOS_JSON_PATH.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 -- a bad config never breaks resolution
         pass
     env_val = os.environ.get("HYDRA_EXTRA_REPOS")
@@ -320,6 +333,211 @@ def known_repo_ids() -> set[str]:
     except Exception:  # noqa: BLE001
         pass
     return ids
+
+
+_REPOS_LOCK_TIMEOUT_S = 10.0
+_REPOS_LOCK_POLL_S = 0.05
+_REPOS_LOCK_STALE_S = 30.0  # unlink a lock this old regardless of owner (best-effort)
+
+
+def _acquire_repos_lock(timeout_s: float = _REPOS_LOCK_TIMEOUT_S) -> int:
+    """Short-lived O_CREAT|O_EXCL claim on ``~/.hydra/repos.json.lock``.
+
+    Held only for the duration of one read-modify-write cycle (register /
+    unregister are quick synchronous calls, unlike cli.py's long-running
+    resume claim), so a simple stale-reclaim by age is sufficient — no PID
+    liveness tracking needed.
+    """
+    _REPOS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fd = os.open(str(_REPOS_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            return fd
+        except FileExistsError:
+            try:
+                age = time.time() - _REPOS_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = 0.0
+            if age >= _REPOS_LOCK_STALE_S:
+                try:
+                    _REPOS_LOCK_PATH.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out acquiring {_REPOS_LOCK_PATH} after {timeout_s}s "
+                    "(a concurrent register/unregister may be stuck)"
+                )
+            time.sleep(_REPOS_LOCK_POLL_S)
+
+
+def _release_repos_lock(fd: int) -> None:
+    try:
+        os.close(fd)
+    finally:
+        try:
+            _REPOS_LOCK_PATH.unlink()
+        except OSError:
+            pass
+
+
+def _atomic_write_repos_json(data: dict[str, str]) -> None:
+    """temp file + os.replace — the write is atomic even if the process dies
+    mid-write; a torn read is what _load_extra_repos degrades on fail-soft,
+    which is exactly the silent mis-target this registry exists to prevent."""
+    _REPOS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path_str = tempfile.mkstemp(
+        dir=str(_REPOS_JSON_PATH.parent), prefix=".repos-", suffix=".json.tmp"
+    )
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(_REPOS_JSON_PATH))
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def register_repo(repo_id: str, path: str, *, force: bool = False,
+                   init: bool = False) -> dict[str, str]:
+    """Self-service registration into ``~/.hydra/repos.json`` (CLI-only — see
+    ``hydra repo register`` in ``cli.py``; never expose this over MCP, it
+    defines the allow-list). Atomic write under a short lock, verified by
+    re-resolving through ``resolve_repo_path`` after the write, with a
+    rollback to the prior file contents if verification fails.
+
+    Refuses to shadow a built-in ``_REPO_DIRNAMES`` id unless ``force=True``.
+    ``init=True`` creates the directory (if absent) and runs ``git init`` when
+    no ``.git`` is present, so a greenfield target (e.g. hydra-galaga) can be
+    registered in one step instead of requiring a manual pre-existing repo.
+    """
+    key = (repo_id or "").strip().lower()
+    if not key:
+        raise ValueError("repo_id is required")
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]{0,63}$", key):
+        raise ValueError(
+            f"invalid repo_id {repo_id!r}: must match ^[a-z0-9][a-z0-9-_]{{0,63}}$"
+        )
+    if key in _REPO_DIRNAMES and not force:
+        raise ValueError(
+            f"{key!r} is a built-in repo id; pass force=True to register an "
+            f"operator override (operator-registered entries take precedence "
+            f"over the built-in allow-list at resolution time)"
+        )
+
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        raise ValueError(f"path must be absolute; got {path!r}")
+
+    if init:
+        target.mkdir(parents=True, exist_ok=True)
+        if not (target / ".git").exists():
+            proc = subprocess.run(
+                ["git", "init", str(target)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if proc.returncode != 0:
+                raise ValueError(f"git init failed for {target}: {proc.stderr.strip()}")
+    else:
+        if not target.exists():
+            raise ValueError(f"{target} does not exist; pass --init to create it")
+        if not (target / ".git").exists():
+            raise ValueError(
+                f"{target} is not a git repo (no .git found); pass --init to "
+                f"run `git init`, or point repo_id at an existing git repo"
+            )
+
+    lock_fd = _acquire_repos_lock()
+    try:
+        prior_raw = (
+            _REPOS_JSON_PATH.read_text(encoding="utf-8")
+            if _REPOS_JSON_PATH.is_file() else None
+        )
+        try:
+            data = json.loads(prior_raw) if prior_raw and prior_raw.strip() else {}
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data[key] = str(target)
+        _atomic_write_repos_json(data)
+
+        try:
+            resolve_repo_path(key)
+        except Exception as verify_exc:  # noqa: BLE001 — roll back, then re-raise
+            if prior_raw is not None:
+                try:
+                    _REPOS_JSON_PATH.write_text(prior_raw, encoding="utf-8")
+                except OSError:
+                    pass
+            else:
+                try:
+                    _REPOS_JSON_PATH.unlink()
+                except OSError:
+                    pass
+            raise ValueError(
+                f"registration verification failed for {key!r}: {verify_exc}"
+            ) from verify_exc
+    finally:
+        _release_repos_lock(lock_fd)
+
+    return {"repo_id": key, "path": str(target)}
+
+
+def unregister_repo(repo_id: str) -> dict[str, Any]:
+    """Remove ``repo_id`` from ``~/.hydra/repos.json`` (atomic, CLI-only)."""
+    key = (repo_id or "").strip().lower()
+    if not key:
+        raise ValueError("repo_id is required")
+    lock_fd = _acquire_repos_lock()
+    try:
+        if not _REPOS_JSON_PATH.is_file():
+            raise ValueError(f"{key!r} is not registered (no ~/.hydra/repos.json)")
+        raw = _REPOS_JSON_PATH.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        normalised = {str(k).strip().lower(): v for k, v in data.items()}
+        if key not in normalised:
+            raise ValueError(f"{key!r} is not registered")
+        del normalised[key]
+        _atomic_write_repos_json(normalised)
+    finally:
+        _release_repos_lock(lock_fd)
+    return {"repo_id": key, "removed": True}
+
+
+def list_registered_repos() -> dict[str, str]:
+    """Return operator-registered repos (id -> absolute path string), sorted."""
+    return {k: str(v) for k, v in sorted(_load_extra_repos().items())}
+
+
+def unknown_repo_hitl_fields(attempted_id: str) -> dict[str, Any]:
+    """Actionable fields for an unknown-repo HITL payload (WS1-D): the exact
+    registration command to run, the full known-id list, and difflib
+    near-miss suggestions — so a typo doesn't require a source-code dig."""
+    ids = sorted(known_repo_ids())
+    suggestions = difflib.get_close_matches(attempted_id or "", ids, n=3, cutoff=0.6)
+    return {
+        "remediation": (
+            f"hydra repo register {attempted_id} <absolute-path-to-repo> "
+            f"[--init] [--force]"
+        ),
+        "known_ids": ids,
+        "suggested_ids": suggestions,
+    }
 
 
 def normalize_repo_subpath(subpath: str) -> str:
