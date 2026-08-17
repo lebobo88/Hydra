@@ -1482,6 +1482,129 @@ def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_pa
     assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
 
 
+def test_revert_merge_commit_active_vs_unknown_produce_distinguishable_state(tmp_path, monkeypatch):
+    """Regression guard against a future bool-collapse: ``abort_failed`` is
+    True for BOTH the "active" (genuine sequencer left dirty) and "unknown"
+    (git dir unresolvable, cleanliness unverified) cases -- that shared bool
+    is exactly the kind of value a future consumer could key on and silently
+    discard the distinction ``abort_state`` exists to preserve. This test
+    pins that ``abort_state`` (and the error text derived from it) must stay
+    genuinely different between the two cases, not merely the same truthy
+    ``abort_failed``, using two real, independently-seeded scenarios rather
+    than mocked call counts.
+
+    Scenario A ("active"): a real conflicting sequencer is seeded and the
+    `revert --abort` call is sabotaged to not run, so the sequencer
+    genuinely remains on disk afterward -- mirrors
+    test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state.
+
+    Scenario B ("unknown"): the same seeded conflict, but only
+    `rev-parse --git-dir` is sabotaged; the real `revert --abort`
+    underneath is left unmocked and genuinely succeeds, so the repo is
+    actually clean afterward, but the function never got to verify that --
+    mirrors
+    test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed.
+
+    If a future change collapsed both branches onto a single
+    ``abort_failed`` bool without keeping ``abort_state``/error text
+    distinct, this test fails."""
+
+    def _seed_conflicted_merge(repo_path, branch_name):
+        _init_repo(repo_path)
+        base_branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=repo_path,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+
+        (repo_path / "g.txt").write_text("x\n", encoding="utf-8")
+        _git(["add", "-A"], repo_path)
+        _git(["commit", "-m", "c0", "--no-verify"], repo_path)
+
+        (repo_path / "g.txt").write_text("y\n", encoding="utf-8")
+        _git(["add", "-A"], repo_path)
+        _git(["commit", "-m", "c1-seed-target", "--no-verify"], repo_path)
+        seed_target_sha = _git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        (repo_path / "g.txt").write_text("z\n", encoding="utf-8")
+        _git(["add", "-A"], repo_path)
+        _git(["commit", "-m", "c2", "--no-verify"], repo_path)
+
+        _git(["checkout", "-b", branch_name], repo_path)
+        (repo_path / "conflict.py").write_text("feature-change\n", encoding="utf-8")
+        _git(["add", "-A"], repo_path)
+        _git(["commit", "-m", "cf", "--no-verify"], repo_path)
+
+        _git(["checkout", base_branch], repo_path)
+        merge_res = _git(["merge", "--no-ff", "--no-edit", branch_name], repo_path)
+        assert merge_res.returncode == 0, merge_res.stderr
+        merge_sha = _git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        seed = _git(["revert", "--no-commit", seed_target_sha], repo_path)
+        assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
+        assert (repo_path / ".git" / "REVERT_HEAD").exists()
+        return merge_sha
+
+    # Scenario A: sequencer genuinely stays active (abort sabotaged).
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    merge_sha_a = _seed_conflicted_merge(repo_a, "feature-active")
+    real_git = host_bridge._git
+
+    def _sabotage_abort_only(args, cwd, *a, **k):
+        if args[:2] == ["revert", "--abort"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=1, stdout="",
+                stderr="fatal: simulated abort failure (sequencer untouched)",
+            )
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _sabotage_abort_only)
+    out_active = host_bridge._revert_merge_commit(str(repo_a), merge_sha_a)
+    monkeypatch.undo()
+
+    # Scenario B: sequencer state genuinely unverifiable (git-dir sabotaged),
+    # even though the real abort underneath actually succeeds.
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+    merge_sha_b = _seed_conflicted_merge(repo_b, "feature-unknown")
+    real_git_b = host_bridge._git
+
+    def _sabotage_git_dir_resolution(args, cwd, *a, **k):
+        if args[:2] == ["rev-parse", "--git-dir"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=128, stdout="",
+                stderr="fatal: simulated inability to resolve the git dir",
+            )
+        return real_git_b(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _sabotage_git_dir_resolution)
+    out_unknown = host_bridge._revert_merge_commit(str(repo_b), merge_sha_b)
+    monkeypatch.undo()
+
+    # Both share the same truthy abort_failed bool -- that alone must not
+    # be treated as proof the two cases are the same.
+    assert out_active["abort_failed"] is True
+    assert out_unknown["abort_failed"] is True
+
+    # The distinguishing fact must survive as a distinct abort_state value.
+    assert out_active["abort_state"] == "active"
+    assert out_unknown["abort_state"] == "unknown"
+    assert out_active["abort_state"] != out_unknown["abort_state"]
+
+    # And as distinct, non-overlapping error markers -- a consumer reading
+    # only out["error"] must also be able to tell the two apart.
+    assert out_active["error"] and "sequencer state still present" in out_active["error"]
+    assert "abort_state_unknown" not in out_active["error"]
+    assert out_unknown["error"] and "abort_state_unknown" in out_unknown["error"]
+    assert "sequencer state still present" not in out_unknown["error"]
+
+    # Confirm the two real, independently-seeded repos actually ended up in
+    # different physical states, so the distinction being pinned above is
+    # real and not an artifact of identical mocking.
+    assert (repo_a / ".git" / "REVERT_HEAD").exists()
+    assert not (repo_b / ".git" / "REVERT_HEAD").exists()
+
+
 def test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed(tmp_path, monkeypatch):
     """Regression guard for the fail-open defect: if repo_root's git dir
     cannot be resolved after the abort attempt, that is a THIRD, distinct

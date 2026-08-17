@@ -408,15 +408,20 @@ def _revert_sequencer_git_dir(repo_root: str) -> Path | None:
 
 
 def _revert_sequencer_state(repo_root: str) -> str:
-    """Inspect repo_root's real git dir for revert/cherry-pick sequencer
-    state. This is the authority on whether an abort "worked" -- NOT the
-    abort command's own exit code, which is nonzero for two unrelated
-    reasons that must not be conflated: (1) a real sequencer was active and
-    the abort itself failed to tear it down (state remains, genuinely bad),
-    vs (2) the preceding revert never got far enough to create a sequencer
-    at all (e.g. refused upfront over a dirty file), so "abort" has nothing
-    to abort and correctly errors even though the repo was already clean.
-    Checking exit code alone would misreport case (2) as a failed abort.
+    """Inspect repo_root's real git dir for REVERT sequencer state
+    (``REVERT_HEAD`` / ``sequencer/todo``). This function is only ever
+    called from ``_revert_merge_commit`` immediately after that same
+    function's own ``git revert``, so it never needs to distinguish a
+    revert sequencer from a cherry-pick one -- it does not check
+    ``CHERRY_PICK_HEAD`` and must not claim to. This is the authority on
+    whether an abort "worked" -- NOT the abort command's own exit code,
+    which is nonzero for two unrelated reasons that must not be conflated:
+    (1) a real sequencer was active and the abort itself failed to tear it
+    down (state remains, genuinely bad), vs (2) the preceding revert never
+    got far enough to create a sequencer at all (e.g. refused upfront over
+    a dirty file), so "abort" has nothing to abort and correctly errors
+    even though the repo was already clean. Checking exit code alone would
+    misreport case (2) as a failed abort.
 
     Returns one of three states, never just a bool -- collapsing "clean" and
     "could not tell" into one falsy value is exactly the failure shape this
