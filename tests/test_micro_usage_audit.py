@@ -638,7 +638,7 @@ def test_mu6b_smoke_failure_writes_full_log(tmp_path, monkeypatch):
         stdout = stdout_content
         stderr = ""
 
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
 
     status, reason = squad_node._run_smoke(
@@ -679,7 +679,7 @@ def test_mu6b_smoke_pass_writes_no_log(tmp_path, monkeypatch):
         stdout = "5 passed\n"
         stderr = ""
 
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
 
     status, reason = squad_node._run_smoke(
@@ -1815,7 +1815,7 @@ def test_p1_smoke_timeout_env(tmp_path, monkeypatch):
         return _FakeRes()
 
     monkeypatch.setattr(squad_node.subprocess, "run", _fake_run)
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="p1-timeout")
     assert captured, "P1(c): subprocess.run must be called"
     assert captured[0].get("timeout") == 123, (

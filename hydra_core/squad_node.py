@@ -395,8 +395,114 @@ def _resolve_worktree_main_root(project_path: Path) -> "Path | None":
         return None
 
 
+_SMOKE_NESTED_IGNORE_DIRS = frozenset({
+    "node_modules", ".git", ".harness", ".hg", ".svn", "dist", "build",
+    "__pycache__", ".venv", "venv", ".tox", ".pytest_cache", "coverage",
+    ".next", ".turbo", "target", "out",
+})
+
+
+def _find_nested_package_root(root: Path) -> Path | None:
+    """Locate a SINGLE immediate-subdirectory package root when the repo root
+    itself has no runnable ``package.json``.
+
+    W2 (nested package roots): pair-programmer's package root is ``daemon/``,
+    not the repo root, so ``_detect_smoke_command`` used to return ``None`` for
+    every pp stage and a passing candidate surfaced as "no runnable build/test
+    command detected". Detects EXACTLY ONE immediate subdirectory that either:
+
+    - has a ``package.json`` with a runnable ``test`` or ``build`` script, or
+    - is named in a root ``package.json`` ``workspaces`` list or a
+      ``pnpm-workspace.yaml`` (a non-glob, non-nested entry only).
+
+    Returns ``None`` (skip, as before) when zero or more than one subdirectory
+    qualifies — an ambiguous repo shape must never guess and run the wrong
+    command; that would be worse than the honest ``skipped`` it replaces.
+    """
+    import json as _json
+
+    workspace_dirs: set[str] = set()
+    root_pkg = root / "package.json"
+    if root_pkg.is_file():
+        try:
+            root_data = _json.loads(root_pkg.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            root_data = {}
+        ws = root_data.get("workspaces")
+        if isinstance(ws, dict):
+            ws = ws.get("packages")
+        if isinstance(ws, list):
+            for pat in ws:
+                if isinstance(pat, str) and "*" not in pat and "/" not in pat.strip("/"):
+                    workspace_dirs.add(pat.strip("/"))
+    pnpm_ws = root / "pnpm-workspace.yaml"
+    if pnpm_ws.is_file():
+        try:
+            for line in pnpm_ws.read_text(encoding="utf-8").splitlines():
+                entry = line.strip().lstrip("-").strip().strip("'\"")
+                if entry and "*" not in entry and "/" not in entry:
+                    workspace_dirs.add(entry)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        subdirs = [d for d in root.iterdir()
+                  if d.is_dir() and not d.name.startswith(".")
+                  and d.name not in _SMOKE_NESTED_IGNORE_DIRS]
+    except OSError:
+        return None
+
+    candidates: list[Path] = []
+    for d in subdirs:
+        pkg = d / "package.json"
+        if not pkg.is_file():
+            continue
+        qualifies = d.name in workspace_dirs
+        if not qualifies:
+            try:
+                scripts = (_json.loads(pkg.read_text(encoding="utf-8")) or {}).get("scripts", {})
+            except Exception:  # noqa: BLE001
+                scripts = {}
+            qualifies = isinstance(scripts, dict) and bool(
+                scripts.get("test") or scripts.get("build"))
+        if qualifies:
+            candidates.append(d)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _node_smoke_cmd_for(root: Path) -> list[str] | None:
+    """Return the npm test/build argv for ``root`` if its ``package.json``
+    declares one, else ``None``. Shared by the top-level and nested-root
+    detection paths so both apply the same test-over-build preference."""
+    import json as _json
+    pkg = root / "package.json"
+    if not pkg.is_file():
+        return None
+    try:
+        scripts = (_json.loads(pkg.read_text(encoding="utf-8")) or {}).get("scripts", {})
+    except Exception:  # noqa: BLE001
+        scripts = {}
+    if not isinstance(scripts, dict):
+        return None
+    if scripts.get("test"):
+        return ["npm", "test", "--silent"]
+    if scripts.get("build"):
+        return ["npm", "run", "build", "--silent"]
+    return None
+
+
 def _detect_smoke_command(project_path: str) -> list[str] | None:
     """Detect the project's build/test command, or ``None`` if there isn't one.
+
+    Thin wrapper over ``_detect_smoke_command_and_cwd`` kept for the existing
+    call sites that only need the argv (not the directory to run it in).
+    """
+    return _detect_smoke_command_and_cwd(project_path)[0]
+
+
+def _detect_smoke_command_and_cwd(project_path: str) -> tuple[list[str] | None, str]:
+    """Detect the project's build/test command AND the directory to run it in.
 
     Heuristic, ordered by specificity. Returns argv (no shell). Node projects
     prefer a declared ``test`` script, else ``build``; Python projects prefer
@@ -405,10 +511,12 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
 
     Operator-authored override: ``<project_path>/.harness/smoke_cmd.json`` is
     checked FIRST. When it exists and parses to ``{"cmd": [non-empty list of
-    strings]}``, that list is returned directly. Operator-accepted tradeoff:
-    PP-VG-5 still gets a real execution — the operator is responsible for
-    ensuring the command actually runs tests. Malformed or unreadable → logs a
-    warning and falls through to heuristic auto-detection.
+    strings]}``, that list is returned directly (cwd == project_path — an
+    operator-authored override is trusted to already know its own directory).
+    Operator-accepted tradeoff: PP-VG-5 still gets a real execution — the
+    operator is responsible for ensuring the command actually runs tests.
+    Malformed or unreadable → logs a warning and falls through to heuristic
+    auto-detection.
     """
     import json as _json
     root = Path(project_path)
@@ -421,7 +529,7 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
                     and isinstance(_data.get("cmd"), list)
                     and _data["cmd"]
                     and all(isinstance(x, str) for x in _data["cmd"])):
-                return _data["cmd"]
+                return _data["cmd"], str(root)
             _log.warning(
                 "_detect_smoke_command: %s malformed "
                 '(expected {"cmd": [non-empty list of strings]}); falling through',
@@ -450,7 +558,7 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
                             and isinstance(_wt_data.get("cmd"), list)
                             and _wt_data["cmd"]
                             and all(isinstance(x, str) for x in _wt_data["cmd"])):
-                        return _wt_data["cmd"]
+                        return _wt_data["cmd"], str(root)
                     _log.warning(
                         "_detect_smoke_command: worktree main-root override %s malformed; "
                         "falling through to auto-detection",
@@ -463,17 +571,9 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
                         _wt_override,
                     )
 
-    pkg = root / "package.json"
-    if pkg.is_file():
-        try:
-            scripts = (_json.loads(pkg.read_text(encoding="utf-8")) or {}).get("scripts", {})
-        except Exception:  # noqa: BLE001
-            scripts = {}
-        if isinstance(scripts, dict):
-            if scripts.get("test"):
-                return ["npm", "test", "--silent"]
-            if scripts.get("build"):
-                return ["npm", "run", "build", "--silent"]
+    _node_cmd = _node_smoke_cmd_for(root)
+    if _node_cmd:
+        return _node_cmd, str(root)
     if (root / "pyproject.toml").is_file() or (root / "pytest.ini").is_file() \
             or (root / "tox.ini").is_file() or (root / "setup.cfg").is_file() \
             or (root / "tests").is_dir():
@@ -482,12 +582,20 @@ def _detect_smoke_command(project_path: str) -> list[str] | None:
         # FileNotFoundError at LAUNCH (before pytest starts), which the old code
         # laundered into "skipped". `sys.executable -m pytest` is always runnable.
         import sys as _sys
-        return [_sys.executable, "-m", "pytest", "-q"]
+        return [_sys.executable, "-m", "pytest", "-q"], str(root)
     if (root / "go.mod").is_file():
-        return ["go", "build", "./..."]
+        return ["go", "build", "./..."], str(root)
     if (root / "Cargo.toml").is_file():
-        return ["cargo", "build"]
-    return None
+        return ["cargo", "build"], str(root)
+    # W2: nested package root (e.g. pair-programmer's daemon/) — only when the
+    # repo root itself had no runnable command above, and only when exactly
+    # ONE candidate subdirectory qualifies (see _find_nested_package_root).
+    _nested = _find_nested_package_root(root)
+    if _nested is not None:
+        _nested_cmd = _node_smoke_cmd_for(_nested)
+        if _nested_cmd:
+            return _nested_cmd, str(_nested)
+    return None, str(root)
 
 
 def _write_smoke_log(project_path: str, stage_id: str, content: str) -> str | None:
@@ -548,7 +656,11 @@ def _run_smoke(
     The ``dispatcher`` parameter is retained for call-site stability and possible
     future use; the host-side runner does not need it.
     """
-    cmd = _detect_smoke_command(project_path)
+    # W2: cmd may come from a NESTED package root (e.g. pair-programmer's
+    # daemon/) — smoke_cwd is where the command must actually run, which is
+    # project_path for every pre-existing detection path and only diverges
+    # for the new nested-root case.
+    cmd, smoke_cwd = _detect_smoke_command_and_cwd(project_path)
     if not cmd:
         # Genuinely no command — an honest non-pass that is NOT an infra failure.
         return "skipped", "no runnable build/test command detected"
@@ -558,7 +670,7 @@ def _run_smoke(
     try:
         res = subprocess.run(
             cmd if not _use_shell else " ".join(cmd),
-            cwd=project_path, capture_output=True, text=True,
+            cwd=smoke_cwd, capture_output=True, text=True,
             check=False, timeout=_timeout, shell=_use_shell,
         )
     except subprocess.TimeoutExpired as exc:
