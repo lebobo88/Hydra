@@ -543,11 +543,23 @@ def build_supervisor(
         if _repo_subpath is not None and not state.target_repo_subpath:
             state.target_repo_subpath = _repo_subpath
 
-        # WS1-B: merge a pre-seeded structured target_repo_ids (CLI --repos /
-        # hydra.workflow.plan repos=, set directly on state before intake runs)
-        # into the fleet list when the goal text supplied none. Goal text always
-        # wins if both are present.
-        if not _fleet_repo_ids and state.target_repo_ids:
+        # WS1 retry (finding 3): precedence between a pre-seeded structured
+        # field (CLI --repos / hydra.workflow.plan repos=, set directly on
+        # state before intake runs) and a --repos/--fleet token found in the
+        # goal text must match the single-repo rule immediately above (line
+        # ~447: `if _repo_id is not None and not state.target_repo_id`) —
+        # PRE-SEEDED WINS. Goal text is operator prose (can be pasted from a
+        # prior session, carry stale flags, or be LLM-composed); the
+        # structured field is the caller's explicit, current intent. Before
+        # this fix the fleet path inverted that rule (`if not _fleet_repo_ids
+        # and state.target_repo_ids`, i.e. goal text won whenever present) —
+        # the same conflict resolved in opposite directions depending only on
+        # whether one or two repo ids were involved. Unify: when a pre-seeded
+        # target_repo_ids is present, it is authoritative and goal-text
+        # --repos/--fleet is ignored outright (matching the single-id rule,
+        # which likewise never lets goal text overwrite an already-set
+        # target_repo_id).
+        if state.target_repo_ids:
             _fleet_repo_ids = list(dict.fromkeys(
                 str(r).strip().lower() for r in state.target_repo_ids if str(r).strip()
             ))
@@ -631,9 +643,25 @@ def build_supervisor(
             # no fleet, no per-repo task seeding).
             # Explicitly clear fleet_parallel — a caller that pre-seeded
             # fleet_parallel=True must NOT remain in fleet mode for a single-repo run.
+            #
+            # WS1 retry (finding 2): the ">=2 distinct ids" rule documented for
+            # --repos/--fleet (CLAUDE.md, cli.py help text) is intentionally NOT
+            # enforced as a hard rejection here — test_fleet_not_used_with_single_distinct_repo
+            # and test_single_repo_clears_pre_seeded_fleet_parallel already pin
+            # single-id --repos degrading to single-repo mode as correct behavior
+            # (e.g. a caller that computed a repo list which happened to dedupe to
+            # one id shouldn't have to retry with --repo instead). What was missing
+            # was VISIBILITY: state.last_event previously stayed whatever it was
+            # before intake, so an operator checking `/hydra:status` had no signal
+            # that fleet mode didn't happen. Set it explicitly here, alongside the
+            # existing trace, so the degrade is never silent.
             state.fleet_parallel = False
             if not state.target_repo_id:
                 state.target_repo_id = _fleet_repo_ids[0]
+            state.last_event = (
+                f"--repos/--fleet named a single distinct repo "
+                f"({_fleet_repo_ids[0]!r}) — running single-repo, not fleet mode"
+            )
             emit_trace(
                 judge_trace_root,
                 state.workflow_id,

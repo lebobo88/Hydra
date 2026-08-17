@@ -932,6 +932,46 @@ def test_preseeded_target_repo_ids_with_unknown_id_surfaces_hitl() -> None:
     assert "definitely-not-registered" in patch["pending_hitl"]["summary"]
 
 
+def test_preseeded_target_repo_id_wins_over_conflicting_goal_repo_flag() -> None:
+    """WS1 retry (finding 3): a pre-seeded state.target_repo_id must win over
+    a conflicting --repo token in goal text, not just when goal text has
+    none. This is the single-repo half of the precedence rule that the fleet
+    half (below) must match."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something --repo pair-programmer",
+        target_repo_id="hydra",
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.target_repo_id == "hydra"
+    assert patch.get("target_repo_id") == "hydra"
+
+
+def test_preseeded_target_repo_ids_win_over_conflicting_goal_repos_flag() -> None:
+    """WS1 retry (finding 3): a pre-seeded state.target_repo_ids must win over
+    a conflicting --repos/--fleet token in goal text. Before this fix, goal
+    text won whenever present (the opposite of the single-repo rule above),
+    so a stale/pasted --repos token in the goal could silently override an
+    explicit structured --repos flag."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something --repos senate,xenia",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.fleet_parallel is True
+    task_repo_ids = {t.target_repo_id for t in patch["tasks"]}
+    assert task_repo_ids == {"hydra", "pair-programmer"}, (
+        f"pre-seeded target_repo_ids must win; got {task_repo_ids}"
+    )
+
+
 def test_parse_repo_arg_short_typo_raises_valueerror() -> None:
     """P3: a short goal with a typo'd repo id (e.g. 'mc-tset') must raise plain
     ValueError, NOT RepoFlagIgnored — short strings are always tail (typo protection).

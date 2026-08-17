@@ -137,6 +137,46 @@ def test_register_repo_rolls_back_on_verify_failure(
     assert "will-fail" not in json.loads(prior_raw)
 
 
+def test_register_repo_rollback_uses_atomic_writer(
+    tmp_path: Path, _isolated_repos_json: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WS1 retry (finding 4): the rollback path on verify failure must go
+    through ``_atomic_write_repos_json`` (temp file + os.replace) rather than
+    a bare ``write_text`` -- a crash mid-rollback-write must never be able to
+    leave repos.json torn, the same guarantee the forward write already has."""
+    prior_target = _git_repo(tmp_path / "prior-good-2")
+    register_repo("prior-good-2", str(prior_target))
+
+    real_resolve = repo_registry.resolve_repo_path
+
+    def _failing_resolve(repo_id: str):
+        if repo_id == "will-fail-2":
+            raise ValueError("simulated verify failure")
+        return real_resolve(repo_id)
+
+    monkeypatch.setattr(repo_registry, "resolve_repo_path", _failing_resolve)
+
+    calls: list[dict] = []
+    real_atomic_write = repo_registry._atomic_write_repos_json
+
+    def _spy_atomic_write(data: dict) -> None:
+        calls.append(dict(data))
+        real_atomic_write(data)
+
+    monkeypatch.setattr(repo_registry, "_atomic_write_repos_json", _spy_atomic_write)
+
+    bad_target = _git_repo(tmp_path / "will-fail-2-dir")
+    with pytest.raises(ValueError, match="verification failed"):
+        register_repo("will-fail-2", str(bad_target))
+
+    # Two calls: the forward write (with will-fail-2 present) and the
+    # rollback write (without it) -- both went through the atomic writer.
+    assert len(calls) == 2
+    assert "will-fail-2" in calls[0]
+    assert "will-fail-2" not in calls[1]
+    assert "prior-good-2" in calls[1]
+
+
 def test_register_repo_concurrent_registration_both_land(tmp_path: Path, _isolated_repos_json: Path) -> None:
     """Two concurrent register_repo calls for DIFFERENT ids must both succeed
     and both be present afterward -- the lock serializes the read-modify-write

@@ -448,6 +448,20 @@ def _cmd_repo(args) -> int:
 
 def _cmd_run(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
+    # WS1 retry (finding 1): --repo and --repos are mutually exclusive on the
+    # CLI transport too. The MCP transport already rejects this combination
+    # (mcp_servers/hydra_control/server.py: _extract_repo_params), but the CLI
+    # path pre-seeds target_repo_id/target_repo_ids directly onto HydraState
+    # (see WS1-B below) — that bypasses node_intake's goal-text ambiguity
+    # guard entirely (it only compares ids parsed OUT of root_goal), so an
+    # operator passing both flags here would otherwise silently pick whichever
+    # field a downstream branch happens to prefer. Fail fast instead.
+    if getattr(args, "repo", None) and getattr(args, "repos", None):
+        print(
+            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            file=sys.stderr,
+        )
+        return 1
     # --workflow-id: use the caller-supplied id if present and valid; otherwise
     # mint a fresh uuid4(). The Hydra Cockpit bridge pre-allocates the id so it
     # can return it to the UI immediately (fire-and-attach) before the run ends.
@@ -2737,6 +2751,19 @@ def _cmd_replay(args) -> int:
         phase=from_phase,
         selected_squads=values.get("selected_squads", []),
     )
+    # WS1 retry (finding 5): carry the source run's repo-targeting fields
+    # forward. Without this, a replay of a --repo/--repos-targeted run
+    # silently drops back to intake's cwd-fallback path (the original bug
+    # this stage exists to fix) -- landing in a DIFFERENT repo than the run
+    # being replayed, which also breaks the determinism replay exists to
+    # provide. These are the exact three fields node_intake persists onto
+    # state for repo targeting (see node_intake's `update` dict above).
+    if values.get("target_repo_id") is not None:
+        replay_initial.target_repo_id = values["target_repo_id"]
+    if values.get("target_repo_ids"):
+        replay_initial.target_repo_ids = list(values["target_repo_ids"])
+    if values.get("target_repo_subpath") is not None:
+        replay_initial.target_repo_subpath = values["target_repo_subpath"]
     # Copy budget snapshot if present
     budget = values.get("budget")
     if budget is not None:

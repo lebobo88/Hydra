@@ -357,8 +357,19 @@ def _acquire_repos_lock(timeout_s: float = _REPOS_LOCK_TIMEOUT_S) -> int:
 
     Held only for the duration of one read-modify-write cycle (register /
     unregister are quick synchronous calls, unlike cli.py's long-running
-    resume claim), so a simple stale-reclaim by age is sufficient — no PID
-    liveness tracking needed.
+    resume claim).
+
+    WS1 retry (finding 4) — narrowed claim: stale reclaim is AGE-ONLY. The
+    PID written into the lock file (below) is diagnostic only — nothing
+    reads it back or checks liveness before unlinking. A lock still held by
+    a live process past ``_REPOS_LOCK_STALE_S`` (30s) CAN be reclaimed and
+    replaced by a second process; this module does not implement owner/PID
+    validation. In practice register/unregister are fast synchronous calls
+    (a handful of filesystem ops), so a 30s stall almost always means the
+    holder crashed or was killed mid-critical-section — but that is a
+    likelihood argument, not an enforced guarantee. If cross-process races
+    under this window become a real problem, add PID-liveness validation
+    here before trusting the age check alone.
     """
     lock_path = _repos_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,10 +500,19 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
         try:
             resolve_repo_path(key)
         except Exception as verify_exc:  # noqa: BLE001 — roll back, then re-raise
+            # WS1 retry (finding 4): route rollback through the same
+            # temp-file + os.replace atomic writer used for the forward
+            # write, instead of a bare write_text/unlink. A crash mid-write
+            # here previously could itself leave repos.json torn — which is
+            # exactly the failure mode _atomic_write_repos_json exists to
+            # prevent on the forward path, so the rollback path must not
+            # reintroduce it.
             if prior_raw is not None:
                 try:
-                    repos_path.write_text(prior_raw, encoding="utf-8")
-                except OSError:
+                    _atomic_write_repos_json(
+                        json.loads(prior_raw) if prior_raw.strip() else {}
+                    )
+                except Exception:  # noqa: BLE001 — best-effort rollback
                     pass
             else:
                 try:
