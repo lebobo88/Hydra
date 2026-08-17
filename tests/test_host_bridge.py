@@ -921,3 +921,361 @@ def test_capture_baseline_timeout_marker(tmp_path, monkeypatch):
     assert call_count[0] == 1, (
         "suite must NOT re-run when the timeout marker already exists for this sha"
     )
+
+
+# --------------------------------------------------------------------------- #
+# W2-2/W2-3/W2-4: transport-shaped record_verdict failure holds the cursor    #
+# open instead of downgrading + finalizing, and a sanctioned recovery path    #
+# drives a stranded stage to completion.                                     #
+# --------------------------------------------------------------------------- #
+
+class _FakeDispatcherVerdictTransportFail(FakeDispatcher):
+    """record_verdict fails with a transport-shaped error until `.recover()`
+    flips it to succeed — simulating the SQLITE_BUSY/cold-start race that
+    caused the incident this fix addresses."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.verdict_should_fail = True
+
+    def call_mcp(self, server: str, tool: str, args: dict,
+                 squad_id: str | None = None) -> dict:
+        if tool == "record_verdict" and self.verdict_should_fail:
+            self.calls.append((server, tool, dict(args), squad_id))
+            return {"status": "failed", "timeout": True,
+                    "error": "tool 'record_verdict' on 'pp_harness' timed out after 120s",
+                    "phase": "call_tool", "timeout_s": 120.0}
+        return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+    def recover(self) -> None:
+        self.verdict_should_fail = False
+
+
+def test_classify_infra_failure_transport_vs_deterministic():
+    from hydra_core.host_bridge import _classify_infra_failure
+    assert _classify_infra_failure(None) == "deterministic"
+    assert _classify_infra_failure(RuntimeError(
+        "pp ledger call 'record_verdict' returned error (status='failed'): "
+        "\"tool 'record_verdict' on 'pp_harness' timed out after 120s\"")) == "transport"
+    assert _classify_infra_failure(RuntimeError(
+        "call_tool raised after connect: ConnectionResetError: [Errno 104]")) == "transport"
+    assert _classify_infra_failure(RuntimeError(
+        "pp ledger call 'record_verdict' returned error payload (status='rejected'): "
+        "'vendor pinning'")) == "deterministic"
+    assert _classify_infra_failure(RuntimeError(
+        "validation failed: rubric_id must be a known rubric")) == "deterministic"
+    # An unrecognized shape must fail the stage (deterministic), never mask a
+    # real rejection by guessing "transport".
+    assert _classify_infra_failure(RuntimeError("something odd happened")) == "deterministic"
+
+
+def test_classify_infra_failure_venom_gate_fail_closed_is_deterministic():
+    """A venom-gate fail-CLOSED rejection (dispatcher.py._venom_gate's
+    gate-internal-error branch) must classify as "deterministic" even when
+    its wrapped inner-exception text contains a transport-sounding phrase
+    like "database is locked" -- e.g. a degraded/locked episodic audit
+    store. The classification is keyed on the STRUCTURED rejection payload
+    (status == "rejected", gate_error, hitl_required), not on message text,
+    so this can never collide with the transport marker list no matter what
+    the underlying exception says."""
+    from hydra_core.host_bridge import PPLedgerError, _classify_infra_failure, _raise_on_error_payload
+
+    # Exactly the shape dispatcher.py._venom_gate's fail-closed branch returns.
+    venom_gate_payload = {
+        "status": "rejected",
+        "error": "venom gate internal error: database is locked",
+        "hitl_required": True,
+        "gate_error": True,
+    }
+    try:
+        _raise_on_error_payload(venom_gate_payload, "record_verdict")
+        assert False, "expected PPLedgerError"
+    except PPLedgerError as exc:
+        assert exc.payload == venom_gate_payload
+        assert _classify_infra_failure(exc) == "deterministic"
+
+    # Direct construction, in case a caller builds the exception by hand.
+    exc2 = PPLedgerError(
+        "pp ledger call 'record_verdict' returned error payload "
+        "(status='rejected'): 'venom gate internal error: database is locked'",
+        venom_gate_payload,
+    )
+    assert _classify_infra_failure(exc2) == "deterministic"
+
+    # A hitl_required/gate_error payload without status=="rejected" also
+    # forces deterministic via _DETERMINISTIC_PAYLOAD_KEYS.
+    exc3 = PPLedgerError(
+        "timeout: database is locked", {"gate_error": True},
+    )
+    assert _classify_infra_failure(exc3) == "deterministic"
+
+    # A genuine transport-shaped PPLedgerError (status=="failed", no
+    # deterministic payload keys) still falls through to the text markers.
+    exc4 = PPLedgerError(
+        "pp ledger call 'record_verdict' returned error (status='failed'): "
+        "\"tool 'record_verdict' on 'pp_harness' timed out after 120s\"",
+        {"status": "failed", "error": "timed out"},
+    )
+    assert _classify_infra_failure(exc4) == "transport"
+
+
+def test_transport_verdict_failure_holds_cursor_open_not_finalized(tmp_path):
+    """A transport-shaped record_verdict failure on a pass outcome must hold
+    the cursor open (state='stalled_infra'), NOT downgrade to revise/surfaced
+    and finalize. finalize_stage/finalize_run must never be called, and the
+    original judge pending_action (call_key) must survive untouched so a
+    re-issued submit_host_result can re-drive it."""
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
+
+    assert res["state"] == "stalled_infra"
+    assert res["status"] == "awaiting_host", "must not become a terminal status"
+    assert res.get("stalled_infra") is True
+    assert res["host_action"]["call_key"] == "judge-0", (
+        "pending_action must still carry the original judge call_key so a "
+        "re-drive can match it"
+    )
+    assert disp.count("finalize_stage") == 0
+    assert disp.count("finalize_run") == 0
+
+    cursor = host_bridge.load_cursor(cfile)
+    assert cursor.get("verdict_recorded_for") is None
+    assert cursor.get("pending_verdict_payload", {}).get("idempotency_token") == "judge-0"
+
+
+def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
+    """A re-issued submit_host_result carrying the SAME call_key/result after a
+    stalled_infra hold re-enters record_verdict (now succeeding), finalizes,
+    and does NOT double-count the judge's cost_usd/tokens."""
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
+    judge_result = {"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05,
+                    "tokens_in": 20, "tokens_out": 10}
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
+    assert res["state"] == "stalled_infra"
+    cost_after_stall = res["cost_usd"]
+
+    # The underlying transport issue clears; the SAME call_key/result is
+    # resubmitted (a real recovery caller resubmits exactly what it has).
+    disp.recover()
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
+
+    assert res2["status"] == "complete"
+    assert res2["cost_usd"] == cost_after_stall, (
+        "re-driving the same call_key must not double-count the judge's cost_usd"
+    )
+    # record_verdict was called twice at the transport layer (once failed, once
+    # succeeded) but pp's idempotency_token makes that safe; only ONE
+    # finalize_run/finalize_stage happened.
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    # Every record_verdict call carried the SAME idempotency_token.
+    tokens = {a.get("idempotency_token") for _s, t, a, _q in disp.calls
+              if t == "record_verdict"}
+    assert tokens == {"judge-0"}
+
+
+def test_recover_stalled_stage_via_resume_action(tmp_path):
+    """recover_stalled_stage (the W2-4 recovery function reachable only via
+    `hydra resume --action recover-stalled-stage`) drives a stalled_infra
+    cursor to completion: worktree merges, finalize runs, and record_verdict
+    is not double-recorded."""
+    from pathlib import Path
+    _init_repo(tmp_path)
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-rec", run_id="run-rec",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+    Path(wt, "feature.py").write_text("print('hi')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
+        result={"outcome": "pass", "judge_producer": "codex"})
+    assert res["state"] == "stalled_infra"
+    # The worktree must still be present -- recovery needs it.
+    assert Path(wt).exists()
+
+    disp.recover()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
+
+    assert rec["status"] == "complete"
+    assert rec["merge"]["merged"] is True
+    assert (tmp_path / "feature.py").exists()
+    assert not Path(wt).exists()
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+
+
+def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path):
+    """The pre-fix shape: a cursor already finalized 'surfaced' with a
+    preserved_branch and no verdict_recorded_for (the worktree is gone, but
+    _preserve_non_complete_work already committed the change to the branch).
+    Recovery must re-issue record_verdict and merge directly from the branch
+    without needing a live worktree."""
+    _init_repo(tmp_path)
+    branch = "attended/legacy-run"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature.py").write_text("print('legacy')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy" / "attended" / "run_legacy.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy",
+        "run_id": "run_legacy",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,   # the original (buggy) submit already charged this
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    assert disp.count("record_verdict") == 1
+    verdict_call = next(a for _s, t, a, _q in disp.calls if t == "record_verdict")
+    assert verdict_call["idempotency_token"] == "judge-0"
+    assert rec["merge"]["merged"] is True
+    assert (tmp_path / "legacy_feature.py").exists()
+    # already_charged must be honoured: the caller (CLI) is responsible for
+    # skipping charge_and_gate, but recover_stalled_stage itself never touches
+    # budget -- confirm the flag survives untouched.
+    assert rec["already_charged"] is True
+
+
+def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_path, monkeypatch):
+    """WS2 fix: in the legacy 'surfaced' recovery shape the merge from the
+    preserved branch necessarily runs before smoke can (the worktree is
+    already gone, so repo_root is the only place left to run it). If smoke
+    then FAILS, the recovery must not leave the merge silently landed while
+    the cursor/pp ledger both say 'surfaced' -- it must revert the merge
+    commit it just created, and the repo's actual file state (not a mock call
+    count) must prove the code did not stay in the tree."""
+    _init_repo(tmp_path)
+    base_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    branch = "attended/legacy-run-failing-smoke"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature.py").write_text("print('legacy')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    # Override the autouse "smoke always passes" fixture: this test needs the
+    # post-merge smoke to FAIL to exercise the revert path.
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("fail", "unit tests failed"))
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy2" / "attended" / "run_legacy2.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy2",
+        "run_id": "run_legacy2",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-1",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    # The merge itself must have succeeded (that part of the ordering is
+    # unchanged and correct) ...
+    assert rec["merge"]["merged"] is True
+    # ... but since smoke failed, the code must not remain in the tree: the
+    # merge commit must have been reverted, and the repo's HEAD must be back
+    # at the pre-merge base (the observable that actually matters, not a
+    # mocked call count).
+    assert rec["merge"]["reverted"] is True
+    head_after = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    assert head_after != base_sha  # a revert commit was added, not a hard reset
+    assert not (tmp_path / "legacy_feature.py").exists(), (
+        "smoke failed but the merged file is still present in the working "
+        "tree -- the merge was not actually reverted")
+    # The cursor and pp ledger both agree the stage did not pass.
+    assert rec["status"] == "surfaced"
+    assert rec["final_status"] == "surfaced"
