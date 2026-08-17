@@ -391,15 +391,25 @@ def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
 def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
     """Undo a merge commit this recovery itself just created, via ``git
     revert`` rather than ``git reset --hard`` -- it adds a new commit instead
-    of rewriting history, so it is safe even if something else has touched
-    ``repo_root`` since (it will simply fail to apply cleanly, which is
-    reported rather than silently forced through) and never disturbs any
-    pre-existing commit.
+    of rewriting history, so it never rewrites or discards any pre-existing
+    commit. That guarantee is about commits, not about working-tree/index
+    cleanliness: if the abort step below itself fails, this leaves the repo
+    sitting mid-revert (conflicted index / half-applied working tree), which
+    ``out["error"]`` reports rather than hides.
+
+    The "a non-passing recovery must not retain the merged code" property is
+    conditional, not unconditional: it holds only when ``HEAD`` still equals
+    ``merge_sha`` at entry. If HEAD has moved (something else touched
+    repo_root since), the revert is skipped entirely and the merged code
+    remains in the repo -- only an error is recorded, nothing is forced
+    through.
 
     Handles both a real merge commit (2 parents, needs ``-m 1`` to pick the
     mainline parent) and a plain single-parent commit defensively, in case a
     future caller passes a fast-forwarded SHA. Never raises."""
-    out: dict[str, Any] = {"reverted": False, "sha": None, "error": None}
+    out: dict[str, Any] = {
+        "reverted": False, "sha": None, "error": None, "abort_failed": False,
+    }
     try:
         head = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
         if head != merge_sha:
@@ -416,8 +426,20 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
         revert_cmd.append(merge_sha)
         rres = _git(revert_cmd, repo_root)
         if rres.returncode != 0:
-            _git(["revert", "--abort"], repo_root)
-            out["error"] = f"revert_failed: {(rres.stderr or rres.stdout).strip()[:300]}"
+            revert_err = (rres.stderr or rres.stdout).strip()[:300]
+            ares = _git(["revert", "--abort"], repo_root)
+            if ares.returncode != 0:
+                abort_err = (ares.stderr or ares.stdout).strip()[:300]
+                out["abort_failed"] = True
+                out["error"] = (
+                    f"revert_failed: {revert_err}; abort_failed: {abort_err} "
+                    "-- repo_root may be left mid-revert (conflicted index / "
+                    "half-applied working tree), not cleanly restored; "
+                    "operator must inspect repo_root's full state before any "
+                    "retry."
+                )
+            else:
+                out["error"] = f"revert_failed: {revert_err}"
             return out
         out["reverted"] = True
         out["sha"] = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
@@ -1832,18 +1854,34 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             cursor["merge"]["revert_sha"] = revert.get("sha")
         else:
             cursor["merge"]["revert_error"] = revert.get("error")
-            cursor["error"] = (cursor.get("error") or "") + (
-                f"; recovery merge {merge['sha']} landed in {repo_root} on "
-                f"branch checked out there, but outcome={outcome!r} "
-                f"smoke={cursor.get('smoke_status')!r} did not pass and the "
-                f"automatic revert failed ({revert.get('error')}) -- code is "
-                "MERGED INTO THE REPO but UNACKNOWLEDGED by the pp ledger; "
-                "operator must inspect repo_root and revert manually."
-            )
+            cursor["merge"]["abort_failed"] = bool(revert.get("abort_failed"))
+            if revert.get("abort_failed"):
+                cursor["error"] = (cursor.get("error") or "") + (
+                    f"; recovery merge {merge['sha']} landed in {repo_root} on "
+                    f"branch checked out there, outcome={outcome!r} "
+                    f"smoke={cursor.get('smoke_status')!r} did not pass, the "
+                    f"automatic revert failed AND its abort also failed "
+                    f"({revert.get('error')}) -- code is MERGED INTO THE REPO, "
+                    "UNACKNOWLEDGED by the pp ledger, and repo_root is left "
+                    "mid-revert (not cleanly restored); operator must inspect "
+                    "repo_root's full state (conflicted index / half-applied "
+                    "working tree) before any retry, not just revert manually."
+                )
+            else:
+                cursor["error"] = (cursor.get("error") or "") + (
+                    f"; recovery merge {merge['sha']} landed in {repo_root} on "
+                    f"branch checked out there, but outcome={outcome!r} "
+                    f"smoke={cursor.get('smoke_status')!r} did not pass and the "
+                    f"automatic revert failed ({revert.get('error')}) -- code is "
+                    "MERGED INTO THE REPO but UNACKNOWLEDGED by the pp ledger; "
+                    "repo_root itself was cleanly restored (abort succeeded); "
+                    "operator must inspect repo_root and revert manually."
+                )
         _trace(cursor, "attended.recovery.merge_reverted", {
             "stage_id": stage_id, "branch": branch,
             "merge_sha": merge.get("sha"), "reverted": revert.get("reverted"),
             "revert_error": revert.get("error"),
+            "abort_failed": bool(revert.get("abort_failed")),
         })
 
     try:
@@ -1871,11 +1909,22 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     if revert is not None:
         if revert.get("reverted"):
             summary += f" Merge {merge.get('sha')} reverted ({revert.get('sha')})."
+        elif revert.get("abort_failed"):
+            summary += (
+                f" WARNING: merge {merge.get('sha')} landed in {repo_root}, the "
+                f"automatic revert FAILED AND its abort also FAILED "
+                f"({revert.get('error')}) -- code is merged, this stage did "
+                "not pass, and repo_root is left mid-revert (conflicted "
+                "index / half-applied working tree, not cleanly restored); "
+                "operator must inspect repo_root's full state before any "
+                "retry."
+            )
         else:
             summary += (
                 f" WARNING: merge {merge.get('sha')} landed in {repo_root} and "
                 f"the automatic revert FAILED ({revert.get('error')}) -- code "
-                "is merged but this stage did not pass; operator must revert "
+                "is merged but this stage did not pass; repo_root itself was "
+                "cleanly restored (abort succeeded); operator must revert "
                 "manually."
             )
     fin = cm("pp_harness", "finalize_run", {
