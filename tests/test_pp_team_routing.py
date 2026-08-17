@@ -69,6 +69,15 @@ def _eng_pack():
 def _run(monkeypatch, inbound) -> dict:
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # The fixture pack's project_path is "${project_root}", which resolves to
+    # the real Hydra checkout -- stub the target-repo scaffolding helpers so
+    # they don't write .gitignore / test-runner exclude entries into it. They
+    # are exercised hermetically against tmp_path in
+    # tests/test_target_repo_scaffolding.py.
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores",
+                        lambda _project_path: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_test_excludes",
+                        lambda _project_path: None)
     disp = _RecordingDispatcher()
     state = HydraState(root_goal="t")
     _via_mcp(state, _eng_pack(), inbound, disp)

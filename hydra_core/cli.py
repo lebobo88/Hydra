@@ -1615,6 +1615,12 @@ def _cmd_attended_step(args) -> int:
                 _maybe_write_claude_shim(project_path)
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from .squad_node import ensure_target_repo_ignores, ensure_target_repo_test_excludes
+                ensure_target_repo_ignores(project_path)
+                ensure_target_repo_test_excludes(project_path)
+            except Exception:  # noqa: BLE001
+                pass
 
             # Register the open pp run so postcheck/reap can finalize-abort it
             # if the workflow is abandoned mid-stage (run holds the .harness lock).

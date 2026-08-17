@@ -36,7 +36,7 @@ include = ["hydra_core*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["maf-template", "web", ".tmp*", ".harness"]
+norecursedirs = [".*", "build", "dist", "node_modules", "maf-template", "web", ".tmp*", ".harness", ".hydra"]
 
 [tool.ruff]
 line-length = 100

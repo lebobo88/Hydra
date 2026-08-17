@@ -30,6 +30,20 @@ from hydra_core.state import HydraState
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _no_real_repo_scaffolding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The _via_mcp integration tests below use _eng_pack() == the real
+    engineering squad discovered against HYDRA_ROOT, and dispatch with
+    run_id + status="done" -- stub the target-repo scaffolding helpers
+    (.gitignore / test-runner exclude patching) so they don't write into the
+    real checkout. They are exercised hermetically against tmp_path in
+    tests/test_target_repo_scaffolding.py."""
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores",
+                        lambda _project_path: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_test_excludes",
+                        lambda _project_path: None)
+
+
 def _happy_responses(outcome: str = "pass") -> dict[tuple[str, str], dict]:
     return {
         ("pp_harness", "start_run"): {"status": "done", "result": {"run_id": "run_T"}},

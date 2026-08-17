@@ -59,10 +59,23 @@ class _StubDispatcher:
 
 @pytest.fixture(autouse=True)
 def _patch_harvest(monkeypatch):
-    """Prevent git operations from running during tests."""
+    """Prevent git operations from running during tests. Also stub the
+    target-repo scaffolding helpers (.gitignore / test-runner exclude
+    patching) -- several tests here dispatch _via_mcp against the real
+    HYDRA_ROOT checkout, and those helpers would otherwise write into it.
+    They are exercised hermetically against tmp_path in
+    tests/test_target_repo_scaffolding.py."""
     monkeypatch.setattr(
         "hydra_core.squad_node.harvest_pp_run_artifacts",
         lambda **_k: None,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_ignores",
+        lambda _project_path: None,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes",
+        lambda _project_path: None,
     )
 
 

@@ -2033,6 +2033,594 @@ def _maybe_write_claude_shim(project_path: str) -> None:
         claude_md.write_text("@AGENTS.md\n", encoding="utf-8")
 
 
+# Directories every Hydra-dispatched target repo must gitignore + runner-exclude.
+# `.harness/` is the pp harness's own worktree/lock/smoke-log directory
+# (assumed-gitignored by _detect_smoke_command / _resolve_worktree_main_root
+# above); `.hydra/` is where telemetry.py and host_bridge.py write per-project
+# trace/cursor state regardless of where worktrees live.
+_TARGET_IGNORE_DIRS: tuple[str, ...] = ("harness", "hydra")
+
+
+def _gitignore_pattern_covers(line: str, dirname: str) -> bool:
+    """True if a single (non-comment, non-blank) .gitignore ``line`` already
+    covers ``.{dirname}/`` — either literally or via a broader glob pattern.
+    """
+    import fnmatch
+
+    pat = line.strip()
+    if not pat or pat.startswith("#"):
+        return False
+    # Normalize: drop a leading "!" (negation is a different concern — treat
+    # conservatively as NOT covering, so we still add our own entry) and any
+    # leading/trailing slashes / doubled-star anchors.
+    if pat.startswith("!"):
+        return False
+    norm = pat
+    for prefix in ("**/",):
+        if norm.startswith(prefix):
+            norm = norm[len(prefix):]
+    for suffix in ("/**", "/"):
+        if norm.endswith(suffix):
+            norm = norm[: -len(suffix)]
+    if norm.startswith("/"):
+        norm = norm[1:]
+    target = f".{dirname}"
+    if norm == target:
+        return True
+    # Broader glob (e.g. ".*", ".h*") that would also match our target dir.
+    try:
+        if fnmatch.fnmatch(target, norm):
+            return True
+    except Exception:  # noqa: BLE001 — malformed pattern, don't crash scaffolding
+        return False
+    return False
+
+
+def ensure_target_repo_ignores(project_path: str) -> None:
+    """Idempotently ensure the target repo's ``.gitignore`` covers ``.harness/``
+    and ``.hydra/``.
+
+    hydra_core.squad_node._detect_smoke_command already *assumes* `.harness/`
+    is gitignored in the target repo (see its RA-11 comment above); nothing
+    previously created that entry, so greenfield repos violated the
+    assumption. `.hydra/` is written unconditionally by telemetry.py /
+    host_bridge.py, independent of worktree layout.
+
+    - Creates ``.gitignore`` only when absent.
+    - Appends to an existing ``.gitignore`` rather than overwriting it.
+    - Does not add an entry that is already present verbatim, or already
+      covered by a broader existing pattern (checked via ``_gitignore_pattern_covers``,
+      an fnmatch-based heuristic — untested pattern shapes may not be recognized
+      as covering).
+    - Fail-soft: never raises. Callers must not let this abort a stage.
+    """
+    try:
+        root = Path(project_path)
+        gitignore = root / ".gitignore"
+        existing_lines: list[str] = []
+        if gitignore.is_file():
+            try:
+                existing_lines = gitignore.read_text(encoding="utf-8").splitlines()
+            except Exception:  # noqa: BLE001
+                existing_lines = []
+
+        missing = [
+            dirname for dirname in _TARGET_IGNORE_DIRS
+            if not any(_gitignore_pattern_covers(ln, dirname) for ln in existing_lines)
+        ]
+        if not missing:
+            return
+
+        new_entries = [f".{dirname}/" for dirname in missing]
+        if gitignore.is_file():
+            # Append: preserve the existing file verbatim, add a newline
+            # separator if the file doesn't already end with one.
+            current = gitignore.read_text(encoding="utf-8")
+            sep = "" if (not current or current.endswith("\n")) else "\n"
+            addition = "\n".join(new_entries) + "\n"
+            gitignore.write_text(current + sep + addition, encoding="utf-8")
+        else:
+            gitignore.write_text("\n".join(new_entries) + "\n", encoding="utf-8")
+    except Exception:  # noqa: BLE001 — scaffolding must never abort the stage
+        _log.warning("ensure_target_repo_ignores: fail-soft skip for %s", project_path, exc_info=True)
+
+
+def _merge_bracket_list(list_text: str, new_entries: list[str]) -> tuple[str, bool]:
+    """Merge ``new_entries`` (already-quoted source literals) into an existing
+    ``[...]`` source-literal list body, skipping any already present.
+
+    Returns ``(merged_body, changed)``. Best-effort textual merge — used for
+    config-file source lists (JS/TOML array literals), never for real code
+    execution.
+    """
+    to_add = [e for e in new_entries if e not in list_text]
+    if not to_add:
+        return list_text, False
+    body = list_text.rstrip()
+    if body.strip() == "":
+        merged = ", ".join(to_add)
+    else:
+        trailing_comma = body.rstrip().endswith(",")
+        sep = " " if trailing_comma else ", "
+        merged = body + sep + ", ".join(to_add)
+    return merged, True
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int | None:
+    """Return the index of the ``}`` that matches the ``{`` at ``text[open_idx]``.
+
+    None if the braces are unbalanced from that point on — callers must then
+    leave the file untouched rather than guess where the block ends.
+    """
+    depth = 0
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _mask_js_strings_and_comments(text: str) -> str:
+    """Return a SAME-LENGTH copy of ``text`` with the contents of string
+    literals (``'...'``, ``"..."``, `` `...` ``) and comments (``// ...``,
+    ``/* ... */``) blanked out to spaces (newlines preserved).
+
+    Brace-counting and key-matching must run against this masked text, never
+    the original — a ``}`` inside a string or comment (e.g. a filename like
+    ``'./weird-}-name.ts'`` or a comment ``// TODO: nested block } here``) is
+    not a real structural brace, and counting it as one truncates the actual
+    block early, leaving a real top-level key outside the scanned span. That
+    previously caused a duplicate ``exclude:``/``testPathIgnorePatterns:`` key
+    to be inserted alongside the operator's real one.
+
+    Length is preserved so indices computed against the masked text index
+    identically into the original text (for extraction/insertion there).
+    """
+    out = list(text)
+    i = 0
+    n = len(text)
+    quote: str | None = None
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\" and i + 1 < n:
+                out[i] = " "
+                out[i + 1] = " "
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            if c != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        if c in ("'", '"', "`"):
+            quote = c
+            out[i] = " "
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = i
+            while j < n and text[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = i
+            while j < n and not (text[j] == "*" and j + 1 < n and text[j + 1] == "/"):
+                if text[j] != "\n":
+                    out[j] = " "
+                j += 1
+            if j < n:
+                out[j] = " "
+                if j + 1 < n:
+                    out[j + 1] = " "
+                j += 2
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _top_level_array_match(block_text: str, key: str):
+    """Find a ``key: [...]`` assignment that is a DIRECT (brace-depth-0) child
+    of ``block_text`` — not nested inside a further object, e.g.
+    ``coverage: { exclude: [...] }`` inside a vitest ``test`` block, or
+    ``optimizeDeps: { exclude: [...] }`` alongside (not inside) it. Returns
+    the first such regex match, or None.
+
+    ``block_text`` must already be the MASKED text (see
+    ``_mask_js_strings_and_comments``) so brace/bracket punctuation inside
+    strings or comments doesn't distort the depth count.
+    """
+    import re
+
+    for m in re.finditer(re.escape(key) + r"\s*:\s*\[([^\]]*)\]", block_text):
+        depth = block_text.count("{", 0, m.start()) - block_text.count("}", 0, m.start())
+        if depth == 0:
+            return m
+    return None
+
+
+def _count_top_level_array_keys(block_text: str, key: str) -> int:
+    """Count depth-0 ``key: [...]`` matches in (masked) ``block_text``.
+
+    Used as a belt-and-braces post-edit invariant: our own scaffolding must
+    never leave a block with more than one top-level ``key`` — JS's
+    later-key-wins semantics would silently discard whichever one we intended
+    to keep, and strict toolchains reject duplicate object keys outright.
+    """
+    import re
+
+    count = 0
+    for m in re.finditer(re.escape(key) + r"\s*:\s*\[([^\]]*)\]", block_text):
+        depth = block_text.count("{", 0, m.start()) - block_text.count("}", 0, m.start())
+        if depth == 0:
+            count += 1
+    return count
+
+
+def _ensure_vitest_excludes(cfg_path: Path) -> bool:
+    """Extend a vitest/vite config's ``test.exclude`` with the harness/hydra
+    globs. When a new ``test.exclude`` key is created (no ``test:`` block, or
+    a ``test:`` block with no existing ``exclude`` array), it is seeded with
+    ``...configDefaults.exclude`` so vitest's own defaults are preserved. When
+    ``test.exclude`` already exists as an array, the new globs are merged into
+    that array as-is — vitest defaults are not (re-)introduced, since an
+    operator who wrote a bare array has already chosen to replace vitest's
+    defaults, and doing so would be an unrequested rewrite of their config.
+
+    Returns True if the file was modified. When a same-named ``exclude`` key
+    exists elsewhere in the file (e.g. ``optimizeDeps.exclude``, or a nested
+    ``test.coverage.exclude``) but not as a direct child of ``test``, this is
+    disambiguated correctly: the direct child of ``test`` is targeted (created
+    or merged into) and the other, unrelated ``exclude`` array is left
+    byte-identical.
+
+    This is a targeted textual merge, not a JS/TS parser, and genuine bail-out
+    cases remain: when the block's braces can't be reliably delimited (see
+    ``_find_matching_brace``), or when a shape outside the tested cases (e.g.
+    a regex literal containing a quote, which the masker cannot distinguish
+    from a string) defeats the masking, it returns False without writing
+    rather than guessing — see the masking blind-spot test coverage below.
+    """
+    import re
+
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+
+    new_globs = ["'**/.harness/**'", "'**/.hydra/**'"]
+    if all(g.strip("'") in text for g in ("**/.harness/**", "**/.hydra/**")):
+        return False  # already covered
+
+    original = text
+    # All structural scanning (brace matching, key location) runs against a
+    # masked copy so a `}` inside a string literal or comment can never be
+    # mistaken for a real block boundary. Extraction/insertion still happens
+    # against the real `text` at the same indices (masking preserves length).
+    masked = _mask_js_strings_and_comments(text)
+
+    test_block = re.search(r"\btest\s*:\s*\{", masked)
+    if test_block is None:
+        # No `test:` block — insert a minimal one right after the config's
+        # opening object, using configDefaults so we still extend (not
+        # replace) vitest's own excludes.
+        opener = re.search(r"defineConfig\s*\(\s*\{", masked)
+        if opener is None:
+            return False
+        insert_at = opener.end()
+        insertion = (
+            "\n  test: {\n"
+            "    exclude: [...configDefaults.exclude, "
+            "'**/.harness/**', '**/.hydra/**'],\n"
+            "  },"
+        )
+        text = text[:insert_at] + insertion + text[insert_at:]
+    else:
+        # Bound the search to the `test: { ... }` block itself — a naive
+        # unbounded search would happily match the FIRST `exclude:` array
+        # anywhere after `test:`, including an unrelated `optimizeDeps.exclude`
+        # sibling or a nested `test.coverage.exclude`. Brace-match the block
+        # (on the masked text) and only look for a depth-0 (direct-child)
+        # `exclude:` inside it.
+        open_brace_idx = test_block.end() - 1
+        close_idx = _find_matching_brace(masked, open_brace_idx)
+        if close_idx is None:
+            return False  # can't reliably delimit the block — leave it alone
+        block_start = test_block.end()
+        masked_block = masked[block_start:close_idx]
+
+        excl = _top_level_array_match(masked_block, "exclude")
+        if excl is not None:
+            body_start = block_start + excl.start(1)
+            body_end = block_start + excl.end(1)
+            merged_body, changed = _merge_bracket_list(text[body_start:body_end], new_globs)
+            if not changed:
+                return False
+            text = text[:body_start] + merged_body + text[body_end:]
+        else:
+            insertion = (
+                "\n    exclude: [...configDefaults.exclude, "
+                "'**/.harness/**', '**/.hydra/**'],"
+            )
+            text = text[:block_start] + insertion + text[block_start:]
+
+    # Belt-and-braces: even with masked-text scanning, never write out a file
+    # with two top-level `exclude:` keys inside `test:` — re-scan the edited
+    # text and bail out (discard the whole edit, return False) rather than
+    # risk a duplicate key. JS's later-key-wins semantics would silently
+    # discard our own edit anyway, and strict toolchains reject duplicate
+    # object keys outright.
+    verify_masked = _mask_js_strings_and_comments(text)
+    verify_test_block = re.search(r"\btest\s*:\s*\{", verify_masked)
+    if verify_test_block is not None:
+        v_open = verify_test_block.end() - 1
+        v_close = _find_matching_brace(verify_masked, v_open)
+        if v_close is not None:
+            v_block = verify_masked[verify_test_block.end():v_close]
+            if _count_top_level_array_keys(v_block, "exclude") > 1:
+                return False
+
+    # Ensure `configDefaults` is imported from 'vitest/config' whenever we
+    # referenced it above.
+    if "configDefaults.exclude" in text and "configDefaults" not in original:
+        import_match = re.search(r"import\s*\{([^}]*)\}\s*from\s*['\"]vitest/config['\"]", text)
+        if import_match is not None:
+            names = import_match.group(1)
+            if "configDefaults" not in names:
+                new_names = names.rstrip() + ", configDefaults"
+                text = text[:import_match.start(1)] + new_names + text[import_match.end(1):]
+        else:
+            text = "import { configDefaults } from 'vitest/config'\n" + text
+
+    if text == original:
+        return False
+    try:
+        cfg_path.write_text(text, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _ensure_jest_excludes(cfg_path: Path) -> bool:
+    """Merge ``testPathIgnorePatterns`` entries into a jest config file.
+
+    Supports jest.config.js/.cjs/.mjs (regex text edit) and jest.config.json
+    / a package.json ``"jest"`` block (real JSON edit).
+    """
+    import re
+
+    new_globs_json = ["<rootDir>/.harness/", "<rootDir>/.hydra/"]
+
+    if cfg_path.suffix == ".json" or cfg_path.name == "package.json":
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return False
+        if cfg_path.name == "package.json":
+            if not isinstance(data.get("jest"), dict):
+                return False  # no jest config here — nothing to extend
+            target = data["jest"]
+        else:
+            target = data
+        existing = target.get("testPathIgnorePatterns")
+        if existing is None:
+            existing = []
+        if not isinstance(existing, list):
+            return False
+        changed = False
+        for g in new_globs_json:
+            if not any(g in str(e) or str(e) in g for e in existing):
+                existing.append(g)
+                changed = True
+        if not changed:
+            return False
+        target["testPathIgnorePatterns"] = existing
+        try:
+            cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    # jest.config.js/.cjs/.mjs — best-effort regex text edit.
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+    new_globs = ["'/.harness/'", "'/.hydra/'"]
+    if all(g.strip("'") in text for g in ("/.harness/", "/.hydra/")):
+        return False
+
+    # Bound the search to the exported config object itself — an unbounded
+    # search could match a `testPathIgnorePatterns:` nested inside an
+    # unrelated sub-object (e.g. per-project entries under `projects: [...]`)
+    # and merge into the wrong scope. Brace-match the object (on masked text,
+    # so a `}` inside a string/comment can't truncate the block early) and
+    # only accept a depth-0 (direct-child) match inside it.
+    masked = _mask_js_strings_and_comments(text)
+    opener = re.search(r"module\.exports\s*=\s*\{", masked)
+    if opener is None:
+        opener = re.search(r"export\s+default\s*\{", masked)
+    if opener is None:
+        return False
+    open_brace_idx = opener.end() - 1
+    close_idx = _find_matching_brace(masked, open_brace_idx)
+    if close_idx is None:
+        return False  # can't reliably delimit the object — leave it alone
+    block_start = opener.end()
+    masked_block = masked[block_start:close_idx]
+
+    match = _top_level_array_match(masked_block, "testPathIgnorePatterns")
+    if match is not None:
+        body_start = block_start + match.start(1)
+        body_end = block_start + match.end(1)
+        merged_body, changed = _merge_bracket_list(text[body_start:body_end], new_globs)
+        if not changed:
+            return False
+        text = text[:body_start] + merged_body + text[body_end:]
+    else:
+        insertion = (
+            "\n  testPathIgnorePatterns: ['/.harness/', '/.hydra/'],"
+        )
+        text = text[:block_start] + insertion + text[block_start:]
+
+    # Belt-and-braces: never leave the config with two top-level
+    # `testPathIgnorePatterns:` keys — re-scan the edited text and bail out
+    # (discard the whole edit) rather than risk a duplicate key.
+    verify_masked = _mask_js_strings_and_comments(text)
+    v_opener = re.search(r"module\.exports\s*=\s*\{", verify_masked)
+    if v_opener is None:
+        v_opener = re.search(r"export\s+default\s*\{", verify_masked)
+    if v_opener is not None:
+        v_open = v_opener.end() - 1
+        v_close = _find_matching_brace(verify_masked, v_open)
+        if v_close is not None:
+            v_block = verify_masked[v_opener.end():v_close]
+            if _count_top_level_array_keys(v_block, "testPathIgnorePatterns") > 1:
+                return False
+
+    try:
+        cfg_path.write_text(text, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _ensure_pytest_norecursedirs(cfg_path: Path) -> bool:
+    """Merge ``.harness`` / ``.hydra`` into an existing ``norecursedirs`` (or
+    create the option minimally) in ``pyproject.toml`` / ``pytest.ini`` /
+    ``setup.cfg``. Best-effort text edit — a targeted regex against
+    single-line ``norecursedirs = [...]`` / ``norecursedirs = ...`` forms
+    avoids reformatting the file, but it is not a TOML/INI parser: multiline
+    or commented variants of the option are outside the tested shapes and are
+    not guaranteed to be recognized.
+    """
+    import re
+
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+
+    new_dirs = [".harness", ".hydra"]
+
+    if cfg_path.name == "pyproject.toml":
+        section = re.search(r"\[tool\.pytest\.ini_options\]", text)
+        if section is None:
+            return False  # no pytest config section — nothing to extend
+        # Look for norecursedirs = [ ... ] within this section (up to the
+        # next `[section]` header or EOF).
+        rest = text[section.end():]
+        next_section = re.search(r"\n\[", rest)
+        section_body_end = section.end() + (next_section.start() if next_section else len(rest))
+        match = re.search(r"norecursedirs\s*=\s*\[([^\]]*)\]", text[section.end():section_body_end])
+        if match is not None:
+            body_start = section.end() + match.start(1)
+            body_end = section.end() + match.end(1)
+            quoted_new = [f'"{d}"' for d in new_dirs]
+            merged_body, changed = _merge_bracket_list(text[body_start:body_end], quoted_new)
+            if not changed:
+                return False
+            text = text[:body_start] + merged_body + text[body_end:]
+        else:
+            quoted = ", ".join(f'"{d}"' for d in new_dirs)
+            insertion = f'\nnorecursedirs = [{quoted}]\n'
+            text = text[:section.end()] + insertion + text[section.end():]
+    elif cfg_path.name in ("pytest.ini", "setup.cfg"):
+        # pytest.ini declares its options under `[pytest]`; setup.cfg namespaces
+        # them under `[tool:pytest]` (a bare `[pytest]` is never read there).
+        # Using the wrong header would silently no-op every real setup.cfg.
+        header = r"\[tool:pytest\]" if cfg_path.name == "setup.cfg" else r"\[pytest\]"
+        section = re.search(header, text)
+        if section is None:
+            return False
+        rest = text[section.end():]
+        next_section = re.search(r"\n\[", rest)
+        section_body_end = section.end() + (next_section.start() if next_section else len(rest))
+        match = re.search(r"norecursedirs\s*=\s*(.*)", text[section.end():section_body_end])
+        if match is not None:
+            line_start = section.end() + match.start(1)
+            line_end = section.end() + match.end(1)
+            existing_line = text[line_start:line_end]
+            to_add = [d for d in new_dirs if d not in existing_line]
+            if not to_add:
+                return False
+            new_line = existing_line.rstrip() + " " + " ".join(to_add)
+            text = text[:line_start] + new_line + text[line_end:]
+        else:
+            insertion = f"\nnorecursedirs = {' '.join(new_dirs)}\n"
+            text = text[:section.end()] + insertion + text[section.end():]
+    else:
+        return False
+
+    try:
+        cfg_path.write_text(text, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def ensure_target_repo_test_excludes(project_path: str) -> None:
+    """Extend the target repo's own test-runner config (vitest/vite, jest, or
+    pytest — whichever it actually uses) to exclude ``.harness/`` and
+    ``.hydra/``.
+
+    Addresses the 62-vs-31 doubled-test-count failure mode: `_detect_smoke_command`
+    globs the whole project tree, so a harness worktree copy under
+    `.harness/worktrees/attended-*` gets re-collected as a second, stale copy
+    of the same suite — silently letting a *deleted* test keep "passing" from
+    the old copy.
+
+    Only touches a config file that already exists on disk (vitest/vite
+    config, jest config, `package.json`'s `jest` block, or `pyproject.toml`
+    / `pytest.ini` / `setup.cfg`). This function never creates a new config
+    file — a repo with a recognizable test-runner marker (e.g. a `jest` dep)
+    but no config file yet, or a repo using none of vitest/jest/pytest, is
+    left untouched, without error. Fail-soft: never raises.
+    """
+    try:
+        root = Path(project_path)
+
+        for name in (
+            "vitest.config.ts", "vitest.config.js", "vitest.config.mjs", "vitest.config.cjs",
+            "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs",
+        ):
+            cfg = root / name
+            if cfg.is_file():
+                _ensure_vitest_excludes(cfg)
+                break  # extend the first one found; don't double-patch a pair
+
+        for name in ("jest.config.js", "jest.config.cjs", "jest.config.mjs", "jest.config.json"):
+            cfg = root / name
+            if cfg.is_file():
+                _ensure_jest_excludes(cfg)
+                break
+        else:
+            pkg = root / "package.json"
+            if pkg.is_file():
+                try:
+                    has_jest = isinstance(json.loads(pkg.read_text(encoding="utf-8")).get("jest"), dict)
+                except Exception:  # noqa: BLE001
+                    has_jest = False
+                if has_jest:
+                    _ensure_jest_excludes(pkg)
+
+        for name in ("pyproject.toml", "pytest.ini", "setup.cfg"):
+            cfg = root / name
+            if cfg.is_file():
+                if _ensure_pytest_norecursedirs(cfg):
+                    break
+    except Exception:  # noqa: BLE001 — scaffolding must never abort the stage
+        _log.warning("ensure_target_repo_test_excludes: fail-soft skip for %s", project_path, exc_info=True)
+
+
 def _via_mcp(
     state: HydraState,
     pack: SquadPack,
@@ -2246,6 +2834,8 @@ def _via_mcp(
             _maybe_write_claude_shim(str(project_path))
         except Exception:  # noqa: BLE001 — AGENTS/CLAUDE bootstrap is fail-soft
             pass
+        ensure_target_repo_ignores(str(project_path))
+        ensure_target_repo_test_excludes(str(project_path))
 
     # Headless drive loop: the live CLI / fleet dispatcher sets drive_pp_loop so
     # the engineering squad DRIVES pp to actual code generation (start_run alone
