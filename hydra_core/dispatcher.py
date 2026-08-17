@@ -166,7 +166,18 @@ class MCPStdioDispatcher:
         "start_stage", "start_best_of_stage", "record_attempt",
         "retry_with_critique",
     })
-    _POOLED_SERVERS = frozenset({"eights"})
+    # W2-1: pp_harness joined the pool alongside eights. Every unpooled call
+    # opened a fresh stdio_client -> a brand-new pp daemon process -> `new
+    # Database()` + `applyMigrations()` INSIDE the SQLite write path (the same
+    # path record_verdict/finalize_stage/finalize_run write through). That
+    # cold start on every call was the dominant source of the SQLITE_BUSY
+    # contention the client-side busy_timeout/retry (pp commit 500298b) had to
+    # absorb. Pooling reuses one live session (and therefore one live daemon +
+    # one open DB handle) across an entire attended stage's tool calls, so the
+    # daemon initializes once instead of once per call. The pooling machinery
+    # (_async_call_pooled / _get_or_connect_pooled_session) is already
+    # server-agnostic — no pp_harness-specific behavior was added.
+    _POOLED_SERVERS = frozenset({"eights", "pp_harness"})
     # P1.3: overall-call backstop overhead (seconds). The per-op timeouts above
     # bound connect / initialize / call_tool, but NOT the stdio context-manager
     # __aexit__ teardown — a wedged child MCP server (pp_harness/pp_codex) can
@@ -912,15 +923,24 @@ class MCPStdioDispatcher:
         await self._close_partial_pool(pooled.stdio_cm, pooled.session_cm)
 
     async def _close_partial_pool(self, stdio_cm: Any, session_cm: Any) -> None:
+        # W2-1: bound each teardown with the same overall-deadline reasoning
+        # P1.3 applied to the non-pooled path. Pooling pp_harness means its
+        # session no longer tears down after every call (that's the point —
+        # it eliminates the per-call daemon cold start), but a DROPPED pooled
+        # session (on a call_tool error/timeout, see _async_call_pooled) still
+        # tears down via this method, and an MCP child wedged on teardown must
+        # not freeze the stage loop here either. `asyncio.wait_for` cancels the
+        # wedged `__aexit__` at the deadline so this always returns.
+        _deadline = self._connect_timeout()
         if session_cm is not None:
             try:
-                await session_cm.__aexit__(None, None, None)
-            except Exception:  # noqa: BLE001
+                await asyncio.wait_for(session_cm.__aexit__(None, None, None), _deadline)
+            except Exception:  # noqa: BLE001 — includes asyncio.TimeoutError
                 pass
         if stdio_cm is not None:
             try:
-                await stdio_cm.__aexit__(None, None, None)
-            except Exception:  # noqa: BLE001
+                await asyncio.wait_for(stdio_cm.__aexit__(None, None, None), _deadline)
+            except Exception:  # noqa: BLE001 — includes asyncio.TimeoutError
                 pass
 
 

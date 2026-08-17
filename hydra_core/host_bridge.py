@@ -74,8 +74,25 @@ _CALL_MCP_SUCCESS_STATUSES: frozenset[str] = frozenset(
 )
 
 
+class PPLedgerError(RuntimeError):
+    """A pp ledger call failed with a structured error payload.
+
+    ``payload`` carries the original ``call_mcp`` response dict so
+    ``_classify_infra_failure`` can key off the STRUCTURE of the rejection
+    (``status``, ``gate_error``, ``hitl_required``, ``venom_refused``)
+    rather than substring-matching the rendered message. A fail-CLOSED
+    rejection whose ``{exc}`` text happens to mention a transport-sounding
+    phrase (e.g. "database is locked") must still classify as deterministic
+    -- see the venom gate's fail-closed branch in dispatcher.py.
+    """
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
 def _raise_on_error_payload(resp: Any, tool: str) -> Any:
-    """Raise RuntimeError when a call_mcp response is a structured error dict.
+    """Raise PPLedgerError when a call_mcp response is a structured error dict.
 
     MCPStdioDispatcher.call_mcp returns error DICTS instead of raising for:
     - RBAC rejections:   {"status":"rejected","error":...}
@@ -86,7 +103,8 @@ def _raise_on_error_payload(resp: Any, tool: str) -> Any:
     _apply_judge, and _finalize only catch *raised* exceptions, so they silently
     passed through error dicts, which broke finalize/verdict/attempt tracking.
 
-    Raises RuntimeError on:
+    Raises PPLedgerError (a RuntimeError subclass carrying the original dict
+    as ``.payload`` for structural classification downstream) on:
     - ``status`` in {"rejected","failed","error"}, or
     - ``"error"`` key present and ``status`` not in the known-good set.
 
@@ -97,16 +115,91 @@ def _raise_on_error_payload(resp: Any, tool: str) -> Any:
         return resp
     status = resp.get("status")
     if status in {"rejected", "failed", "error"}:
-        raise RuntimeError(
+        raise PPLedgerError(
             f"pp ledger call {tool!r} returned error payload "
-            f"(status={status!r}): {resp.get('error', resp)!r}"
+            f"(status={status!r}): {resp.get('error', resp)!r}",
+            resp,
         )
     if status not in _CALL_MCP_SUCCESS_STATUSES and "error" in resp:
-        raise RuntimeError(
+        raise PPLedgerError(
             f"pp ledger call {tool!r} returned error (status={status!r}): "
-            f"{resp['error']!r}"
+            f"{resp['error']!r}",
+            resp,
         )
     return resp
+
+
+# W2-3: markers that positively identify a transport-shaped pp ledger failure
+# (timeout, connection drop, lock contention, cold-start race) as opposed to a
+# deterministic pp rejection (bad args, schema violation, business-rule
+# denial). These are a FALLBACK for exceptions that carry no structured
+# payload (see PPLedgerError.payload below, checked first) -- e.g. a raw
+# transport exception raised before a call_mcp response dict ever formed.
+# Deterministic markers are checked FIRST and win even when a transport word
+# also appears in the message, because a rejection's own validation text can
+# legitimately contain a word like "connection" — e.g. "connection_id
+# invalid". A message that matches neither list is treated as deterministic:
+# getting this discrimination wrong in the permissive direction would hide a
+# real rejection, so an ambiguous failure must fail the stage rather than
+# silently hold it open.
+_DETERMINISTIC_FAILURE_MARKERS: tuple[str, ...] = (
+    "validation", "invalid_", "schema", "attempt not found",
+    "attempt_id not found", "unknown attempt", "rubric not found",
+    "duplicate", "already recorded", "not authorized", "rbac",
+)
+_TRANSPORT_FAILURE_MARKERS: tuple[str, ...] = (
+    "timed out", "timeout", "'phase': 'call_tool'", '"phase": "call_tool"',
+    "connection", "brokenpipe", "not registered in backends.json",
+    "mcp sdk not installed", "sqlite_busy", "database is locked",
+    "busy_timeout", "call_tool raised after connect", "econnreset",
+    "epipe", "socket", "server not configured",
+)
+# Structured payload keys that ALWAYS mean "deterministic", regardless of
+# what the rendered message text says. A rejection dict (status=="rejected")
+# is a positive business/governance decision -- RBAC denial, or the Cerberus
+# venom gate's REFUSED / requires_human / fail-CLOSED-internal-error branches
+# (dispatcher.py._venom_gate) -- never a retryable transport blip, even when
+# the wrapped inner exception's text happens to contain a transport-sounding
+# phrase (e.g. a venom gate fail-closed on a locked episodic audit store:
+# "venom gate internal error: database is locked"). Only {"status":"failed"}
+# is ambiguous enough to fall through to the text markers above.
+_DETERMINISTIC_PAYLOAD_KEYS: tuple[str, ...] = (
+    "gate_error", "hitl_required", "venom_refused",
+)
+
+
+def _classify_infra_failure(exc: Exception | None) -> str:
+    """Classify a pp ledger call failure as "transport" or "deterministic".
+
+    Structural check FIRST: if ``exc`` is a ``PPLedgerError`` carrying the
+    original call_mcp response dict, a ``status == "rejected"`` payload (or
+    any of ``_DETERMINISTIC_PAYLOAD_KEYS`` present and truthy) is always
+    "deterministic" -- no message text is consulted. This is what keeps a
+    fail-closed venom-gate rejection from being misclassified as "transport"
+    just because its wrapped exception text contains a phrase like "database
+    is locked". Only when no such structure is available (a raw exception
+    that never became a call_mcp response dict) do we fall back to the
+    marker-based text match below.
+
+    Returns "transport" only when the exception text matches a known-good
+    transport signal and no deterministic-rejection signal. Any other case --
+    including ``exc is None`` -- returns "deterministic" so an unrecognized
+    failure shape still fails the stage instead of masking a real rejection.
+    """
+    if exc is None:
+        return "deterministic"
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        if payload.get("status") == "rejected":
+            return "deterministic"
+        if any(payload.get(k) for k in _DETERMINISTIC_PAYLOAD_KEYS):
+            return "deterministic"
+    msg = str(exc).lower()
+    if any(m in msg for m in _DETERMINISTIC_FAILURE_MARKERS):
+        return "deterministic"
+    if any(m in msg for m in _TRANSPORT_FAILURE_MARKERS):
+        return "transport"
+    return "deterministic"
 
 
 # --------------------------------------------------------------------------- #
@@ -251,6 +344,40 @@ def _merge_worktree_back(repo_root: str, worktree_path: str, branch: str) -> dic
         mres = _git(["merge", "--no-ff", "--no-edit", branch], repo_root)
         if mres.returncode != 0:
             # Abort a conflicted merge so the repo is left clean for the operator.
+            _git(["merge", "--abort"], repo_root)
+            out["error"] = f"merge_failed: {(mres.stderr or mres.stdout).strip()[:300]}"
+            return out
+        out["merged"] = True
+        out["sha"] = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"merge_exception: {e!r}"[:300]
+    return out
+
+
+def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
+    """W2-4: merge a ``preserved_branch`` into the repo's checked-out branch
+    WITHOUT a live worktree.
+
+    Used only by the recovery path (`recover_stalled_stage`): the worktree
+    that hosted ``branch`` was already removed by ``_finalize``, but
+    ``_preserve_non_complete_work`` committed every uncommitted engineer
+    change to the branch before that removal, so the branch itself still
+    carries the full change set. Unlike ``_merge_worktree_back`` this never
+    touches ``worktree_path`` (there isn't one) — it only reads/merges the
+    already-committed branch. Never raises."""
+    out: dict[str, Any] = {"merged": False, "sha": None, "error": None}
+    try:
+        chk = _git(["rev-parse", "--verify", branch], repo_root)
+        if chk.returncode != 0:
+            out["error"] = f"branch_not_found: {branch}"
+            return out
+        branch_sha = chk.stdout.strip()
+        base = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+        if branch_sha == base:
+            out["error"] = "no_changes_to_merge"
+            return out
+        mres = _git(["merge", "--no-ff", "--no-edit", branch], repo_root)
+        if mres.returncode != 0:
             _git(["merge", "--abort"], repo_root)
             out["error"] = f"merge_failed: {(mres.stderr or mres.stdout).strip()[:300]}"
             return out
@@ -574,6 +701,13 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
     }
     if status == "awaiting_host":
         res["host_action"] = _host_action(cursor)
+        if state == "stalled_infra":
+            # W2-3: surface the hold + reason on the non-terminal path too, not
+            # just on a terminal outcome — an operator/recovery caller needs
+            # to see this without the stage having been finalized.
+            res["stalled_infra"] = True
+            if cursor.get("error"):
+                res["error"] = cursor["error"]
     if state in _TERMINAL:
         res["final_status"] = cursor.get("final_status") or state
         res["stage_outcome"] = cursor.get("outcome")
@@ -916,9 +1050,32 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     gen_idx = cursor.get("generate_index", 0)   # GAP-f: 0=first attempt, 1=retry
     work_path = cursor.get("work_path") or cursor["project_path"]
 
-    cursor["cost_usd"] = float(cursor["cost_usd"]) + float(result.get("cost_usd") or 0.0)
-    cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
-    cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+    # W2-3: guard cost/token accrual against double-counting when a
+    # transport-shaped record_verdict failure holds the cursor open
+    # (state="stalled_infra") and the SAME judge result is resubmitted under
+    # the SAME call_key to re-drive the stage. Without this guard a re-drive
+    # would add the judge's cost_usd/tokens a second time.
+    _judge_cost_applied = (call_key is not None
+                           and cursor.get("judge_cost_applied_for") == call_key)
+    if not _judge_cost_applied:
+        # The double-counting guard above only activates when `call_key` is
+        # not None -- it relies on real judge submissions always carrying one
+        # (enforced by call topology: every host_action the driver hands out
+        # for a judge step sets pending_action["call_key"]). Make that
+        # structural rather than incidental: surface it in trace if it's ever
+        # violated, instead of silently accruing cost with no re-drive guard.
+        if call_key is None:
+            _trace(cursor, "attended.judge_cost_no_call_key", {
+                "stage_id": cursor.get("stage_id"),
+                "warning": ("submit_verdict called with call_key=None; the "
+                            "judge_cost_applied_for double-counting guard "
+                            "cannot protect this accrual on a re-drive"),
+            })
+        cursor["cost_usd"] = float(cursor["cost_usd"]) + float(result.get("cost_usd") or 0.0)
+        cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
+        cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+        if call_key is not None:
+            cursor["judge_cost_applied_for"] = call_key
 
     outcome = result.get("outcome") or result.get("verdict") or "revise"
     if outcome not in {"pass", "revise", "fail"}:
@@ -964,6 +1121,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     # that kills mid-_run_smoke (before the outer save_cursor at line ~1172) would
     # otherwise cause a retry to double-write the pp verdict ledger.
     _record_verdict_ok = True
+    _record_verdict_exc: Exception | None = None
     _verdict_already_recorded = (call_key is not None
                                   and cursor.get("verdict_recorded_for") == call_key)
     if _verdict_already_recorded:
@@ -973,21 +1131,37 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             "reason": "verdict_recorded_for marker matches — skipping duplicate record_verdict",
         })
     elif attempt_id:
+        # W2-4: persist the exact record_verdict payload BEFORE the call so a
+        # stage stranded by a transport-shaped failure that ends up needing
+        # the `/hydra:resume --action recover-stalled-stage` path (e.g. an
+        # older cursor from before the stalled_infra hold existed) can replay
+        # this call verbatim instead of needing the judge's raw result
+        # reconstructed from scratch.
+        _verdict_payload = {
+            "attempt_id": attempt_id,
+            "judge_producer": judge_producer,
+            "judge_model_id": str(result.get("judge_model_id")
+                                  or result.get("model") or f"{judge_producer}-default"),
+            "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
+            "critique_md": critique_md[:4000],
+            "score_json": score_json,
+            "rubric_id": gate_rubric,
+            # W2-3: the attended call_key doubles as pp's idempotency token. A
+            # re-drive after a stalled_infra hold resubmits the same call_key,
+            # so pp's recordVerdict returns the original verdict_id instead of
+            # inserting a duplicate row -- exactly-once even across a
+            # transport-shaped retry (or the W2-4 recovery replay).
+            **({"idempotency_token": call_key} if call_key else {}),
+        }
+        cursor["pending_verdict_payload"] = _verdict_payload
+        if cursor_file is not None:
+            save_cursor(cursor_file, cursor)
         # F26+M8: capture record_verdict success; a failure on a pass outcome downgrades.
         # LV-1: _raise_on_error_payload converts error dicts (rejected/failed) into
         # RuntimeError so the existing except fires for payload-level errors too.
         try:
             _raise_on_error_payload(
-                cm("pp_harness", "record_verdict", {
-                    "attempt_id": attempt_id,
-                    "judge_producer": judge_producer,
-                    "judge_model_id": str(result.get("judge_model_id")
-                                          or result.get("model") or f"{judge_producer}-default"),
-                    "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
-                    "critique_md": critique_md[:4000],
-                    "score_json": score_json,
-                    "rubric_id": gate_rubric,
-                }, squad_id=_SQ),
+                cm("pp_harness", "record_verdict", _verdict_payload, squad_id=_SQ),
                 "record_verdict",
             )
             # Persist marker before _run_smoke so a timeout mid-smoke leaves the
@@ -995,14 +1169,45 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             if call_key is not None and cursor_file is not None:
                 cursor["verdict_recorded_for"] = call_key
                 save_cursor(cursor_file, cursor)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # W2-2: capture the failure reason instead of discarding it. This
+            # exact swallow is what forced a manual forensic reconstruction of
+            # the first stalled-verdict incident -- the ledger had no verdict
+            # row and no trace explaining why.
             _record_verdict_ok = False
+            _record_verdict_exc = exc
     if outcome == "pass" and not _record_verdict_ok:
+        _rv_reason = str(_record_verdict_exc) if _record_verdict_exc is not None else "unknown error"
+        _rv_kind = _classify_infra_failure(_record_verdict_exc)
+        cursor["error"] = (cursor.get("error") or "") + \
+            f" record_verdict RPC failed ({_rv_kind}): {_rv_reason}"
+        _trace(cursor, "attended.verdict_rpc_failed", {
+            "stage_id": cursor.get("stage_id"), "tool": "record_verdict",
+            "call_key": call_key, "attempt_id": attempt_id,
+            "reason": _rv_reason, "kind": _rv_kind,
+        })
+        if _rv_kind == "transport":
+            # W2-3: hold the cursor open instead of downgrading the outcome
+            # and finalizing. pending_action is left untouched (still the
+            # judge's call_key), so a re-issued submit_host_result carrying
+            # the SAME judge result re-enters this function and retries
+            # record_verdict via the idempotency_token above. The worktree,
+            # pp attempt row, and any smoke result are NOT touched here, so
+            # they remain available to the recovery path (W2-4) or a manual
+            # retry.
+            cursor["state"] = "stalled_infra"
+            _trace(cursor, "attended.stalled_infra", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "attempt_id": attempt_id, "reason": _rv_reason,
+            })
+            return
+        # Deterministic pp rejection (or an ambiguous failure we could not
+        # positively classify as transport -- err toward failing the stage
+        # rather than silently masking a real rejection): keep today's
+        # behavior of downgrading to revise/surfaced.
         outcome = "revise"
         _infra_downgrade = True
         cursor["outcome"] = "revise"
-        cursor["error"] = (cursor.get("error") or "") + \
-            " record_verdict RPC failed; stage downgraded to surfaced"
 
     _trace(cursor, "attended.verdict", {
         "stage_id": cursor["stage_id"], "rubric_id": gate_rubric,
@@ -1412,6 +1617,175 @@ def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
     })
 
 
+def recover_stalled_stage(dispatcher: Dispatcher, *,
+                          cursor_file: str | Path) -> dict[str, Any]:
+    """W2-4: sanctioned recovery for an engineering stage stranded by a
+    transport-shaped pp-ledger failure.
+
+    Reachable ONLY via ``hydra resume --action recover-stalled-stage`` — never
+    a parallel CLI verb. Governance is explicit that a paused/stranded
+    workflow resumes only through approve/resume, so this is exposed as a
+    resume action rather than a standalone command (see ``_cmd_resume_locked``
+    in cli.py).
+
+    Handles two cursor shapes:
+
+    - ``state == "stalled_infra"`` (the W2-3 hold): the isolated worktree is
+      still on disk and the pp attempt is still open. Only ``record_verdict``
+      was skipped; everything downstream (smoke, merge, finalize) reuses the
+      existing ``_finalize`` machinery unchanged, so recovery for this shape
+      exercises the SAME code path a normal pass finalize does.
+    - ``state == "surfaced"`` with a ``preserved_branch`` and no
+      ``verdict_recorded_for`` (an older cursor stranded by the pre-fix
+      downgrade-then-finalize behavior): the worktree is already gone, but
+      ``_preserve_non_complete_work`` committed every uncommitted change to
+      the branch before removing it, so the branch still carries the full
+      diff. Recovery re-issues record_verdict, merges the branch directly via
+      ``_merge_branch_back``, and (best-effort) re-finalizes.
+
+    Idempotent: replays ``record_verdict`` with the payload's
+    ``idempotency_token`` (== the original judge call_key), so pp returns the
+    already-recorded verdict_id on a repeat call instead of a duplicate row.
+    Never double-charges: this function does not touch budget at all — the
+    caller reads ``already_charged`` off the returned step result exactly as
+    ``submit_host_result`` callers do and only calls ``charge_and_gate`` /
+    ``mark_charged`` when it is False, so a stage that was already charged (the
+    only way that can happen for the pre-fix "surfaced" shape, since its
+    original submit charged on the downgraded outcome before this fix existed)
+    is never charged a second time.
+    """
+    cm = dispatcher.call_mcp
+    cursor = load_cursor(cursor_file)
+    if cursor.get("kind") not in (None, "engineering"):
+        return {"ok": False, "error": "recovery only supports engineering stage cursors"}
+    state = cursor.get("state")
+    if state not in ("stalled_infra", "surfaced"):
+        return {"ok": False, "error": f"cursor state {state!r} is not recoverable"}
+    if state == "surfaced" and not cursor.get("preserved_branch"):
+        return {"ok": False, "error": "surfaced cursor has no preserved_branch to recover from"}
+
+    stage_id = cursor.get("stage_id")
+    attempt_id = cursor.get("attempt_id")
+    payload = cursor.get("pending_verdict_payload")
+
+    # Step 1: re-issue record_verdict if it was never recorded. Idempotent via
+    # the payload's idempotency_token (see the comment where it is built).
+    if not cursor.get("verdict_recorded_for"):
+        if not (payload and attempt_id):
+            return {"ok": False, "error": (
+                "no pending_verdict_payload captured on this cursor -- cannot "
+                "safely reconstruct the verdict. This cursor predates the "
+                "W2-4 payload capture; it needs a manual pp-side replay.")}
+        try:
+            _raise_on_error_payload(
+                cm("pp_harness", "record_verdict", payload, squad_id=_SQ),
+                "record_verdict",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _trace(cursor, "attended.recovery.verdict_failed", {
+                "stage_id": stage_id, "attempt_id": attempt_id, "reason": str(exc),
+            })
+            return {"ok": False, "error": f"record_verdict recovery failed: {exc}"}
+        cursor["verdict_recorded_for"] = payload.get("idempotency_token") or "recovery"
+        _trace(cursor, "attended.recovery.verdict_recorded", {
+            "stage_id": stage_id, "attempt_id": attempt_id,
+        })
+        save_cursor(cursor_file, cursor)
+
+    outcome = (payload.get("outcome") if payload else None) or cursor.get("outcome")
+
+    if state == "stalled_infra":
+        # The worktree + pp attempt are exactly as they were when the stage
+        # stalled -- everything past record_verdict is the SAME code the
+        # normal (non-stranded) path runs, so reuse it verbatim instead of
+        # re-implementing smoke/merge/finalize here.
+        passed = False
+        if outcome == "pass" and attempt_id:
+            work_path = cursor.get("work_path") or cursor["project_path"]
+            smoke_status, smoke_reason = _run_smoke(
+                dispatcher, project_path=work_path, stage_id=stage_id)
+            cursor["smoke_status"] = smoke_status
+            cursor["smoke_reason"] = smoke_reason
+            try:
+                _raise_on_error_payload(cm("pp_harness", "record_smoke_status", {
+                    "stage_id": stage_id, "candidate_index": 1,
+                    "status": smoke_status,
+                    "reason": (smoke_reason or "recovery smoke")[:300],
+                }, squad_id=_SQ), "record_smoke_status")
+            except Exception:  # noqa: BLE001
+                pass
+            passed = smoke_status == "pass"
+        _trace(cursor, "attended.recovery.resuming_finalize", {
+            "stage_id": stage_id, "outcome": outcome, "passed": passed,
+        })
+        _finalize(dispatcher, cursor, passed=passed, gen_failed=False)
+        save_cursor(cursor_file, cursor)
+        out = _step_result(cursor, cursor_file)
+        out["ok"] = True
+        return out
+
+    # state == "surfaced": pre-fix legacy shape. Worktree is gone; merge
+    # directly from the preserved branch, then best-effort re-finalize.
+    repo_root = cursor.get("repo_root") or cursor.get("project_path")
+    branch = cursor["preserved_branch"]
+    merge = _merge_branch_back(repo_root, branch)
+    cursor["merge"] = merge
+    _trace(cursor, "attended.recovery.merge", {
+        "stage_id": stage_id, "branch": branch, "merged": merge.get("merged"),
+        "error": merge.get("error"),
+    })
+    if not merge.get("merged"):
+        save_cursor(cursor_file, cursor)
+        out = _step_result(cursor, cursor_file)
+        out["ok"] = False
+        out["error"] = f"recovery merge failed: {merge.get('error')}"
+        return out
+
+    if outcome == "pass" and cursor.get("smoke_status") not in ("pass", "fail"):
+        smoke_status, smoke_reason = _run_smoke(
+            dispatcher, project_path=repo_root, stage_id=stage_id)
+        cursor["smoke_status"] = smoke_status
+        cursor["smoke_reason"] = smoke_reason
+        try:
+            _raise_on_error_payload(cm("pp_harness", "record_smoke_status", {
+                "stage_id": stage_id, "candidate_index": 1,
+                "status": smoke_status,
+                "reason": (smoke_reason or "recovery smoke (post-merge)")[:300],
+            }, squad_id=_SQ), "record_smoke_status")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # The original (pre-fix) submit already called finalize_stage/finalize_run
+    # with status="surfaced" once. Re-finalizing must be explicit and
+    # best-effort: report the outcome honestly rather than silently claiming
+    # success if pp rejects a second finalize on an already-terminal run.
+    passed = outcome == "pass" and cursor.get("smoke_status") == "pass"
+    try:
+        _raise_on_error_payload(cm("pp_harness", "finalize_stage", {
+            "stage_id": stage_id,
+            "status": "passed" if passed else "surfaced",
+            **({"winner_attempt_id": attempt_id} if (passed and attempt_id) else {}),
+        }, squad_id=_SQ), "finalize_stage")
+        fin_ok = True
+    except Exception as exc:  # noqa: BLE001
+        fin_ok = False
+        cursor["error"] = (cursor.get("error") or "") + f"; recovery finalize_stage failed: {exc}"
+
+    cursor["final_status"] = "complete" if (passed and fin_ok) else "surfaced"
+    cursor["state"] = cursor["final_status"]
+    cursor["pending_action"] = None
+    cursor["finalized"] = True
+    cursor.setdefault("charged", False)
+    _trace(cursor, "attended.recovery.finalized", {
+        "stage_id": stage_id, "final_status": cursor["final_status"],
+        "merged": True, "finalize_ok": fin_ok,
+    })
+    save_cursor(cursor_file, cursor)
+    out = _step_result(cursor, cursor_file)
+    out["ok"] = True
+    return out
+
+
 def submit_host_result(
     dispatcher: Dispatcher,
     *,
@@ -1443,7 +1817,14 @@ def submit_host_result(
 
     if state == "await_generate":
         _apply_generate(dispatcher, cursor, result)
-    elif state == "await_judge":
+    elif state in ("await_judge", "stalled_infra"):
+        # W2-3: "stalled_infra" is a non-terminal hold state entered when a
+        # transport-shaped record_verdict failure would otherwise have been
+        # downgraded + finalized. Its pending_action.call_key is left
+        # unchanged from the original judge step, so a re-issued
+        # submit_host_result carrying the same call_key/result re-enters
+        # _apply_judge here and retries record_verdict via the
+        # idempotency_token — exactly-once even across the re-drive.
         _apply_judge(dispatcher, cursor, result,
                      cursor_file=cursor_file, call_key=call_key)
     elif state == "await_squad_agent":

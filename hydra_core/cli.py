@@ -798,6 +798,14 @@ def _cmd_resume(args) -> int:
 
 
 def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int:
+    # W2-4: recover-stalled-stage does not touch the LangGraph checkpoint
+    # interrupt machinery the actions below use -- a stranded attended stage
+    # is a host_bridge cursor whose pp-ledger call never landed, not an
+    # HITL-paused graph. Route it separately, still under the same
+    # claim-and-resume lock `_cmd_resume` already acquired above (governance:
+    # a paused/stranded workflow resumes only via approve/resume).
+    if action == "recover-stalled-stage":
+        return _cmd_recover_stalled_stage(args, project, wf, option)
 
     critique_client = None
     if getattr(args, "live", False):
@@ -1681,6 +1689,79 @@ def _cmd_attended_step(args) -> int:
         return 0
     finally:
         _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
+    """``hydra resume <workflow_id> --action recover-stalled-stage --option <run_id>``.
+
+    W2-4: the sanctioned entry point for ``host_bridge.recover_stalled_stage``.
+    ``--option`` carries the stranded attended cursor's ``run_id`` (the same
+    id ``hydra attended step`` printed as ``run_id`` when the stage began).
+    Mirrors ``_cmd_attended_submit``'s post-terminal budget-charge block so a
+    recovered stage is charged exactly once: ``already_charged`` (read off the
+    cursor's persisted ``charged`` flag) gates the charge exactly as it does
+    for a normal retried submit.
+    """
+    from . import host_bridge
+    if not option:
+        print(json.dumps({"ok": False,
+                          "error": "recover-stalled-stage needs --option <run_id>"}),
+              file=sys.stderr)
+        return 1
+    run_id = str(option)
+    dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+    cfile = host_bridge.cursor_path(project, wf, run_id)
+    if not Path(cfile).exists():
+        print(json.dumps({"ok": False, "error": "cursor_not_found", "detail": str(cfile)}),
+              file=sys.stderr)
+        return 1
+
+    res = host_bridge.recover_stalled_stage(dispatcher, cursor_file=cfile)
+    if not res.get("ok", True):
+        print(json.dumps(res, indent=2, default=str), file=sys.stderr)
+        return 1
+
+    if res.get("status") in ("complete", "surfaced", "aborted") and not res.get("already_charged"):
+        host_bridge.mark_charged(cfile)
+        from .governance import charge_and_gate
+        from .supervisor import build_supervisor, _PurePythonRunner
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        if not isinstance(sup, _PurePythonRunner):
+            config = {"configurable": {"thread_id": wf}}
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
+                cost = float(res.get("cost_usd") or 0.0)
+                toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
+                block, downgrade = charge_and_gate(state, cost, toks)
+                tid = res.get("task_id")
+                completed = list(state.attended_completed_task_ids)
+                if tid is not None and str(tid) not in completed:
+                    completed.append(str(tid))
+                done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                if (res.get("status") == "complete" and tid is not None
+                        and str(tid) not in done_ids):
+                    done_ids.append(str(tid))
+                open_runs = [e for e in state.open_pp_runs
+                             if e.get("run_id") != res.get("run_id")]
+                res["budget_block"] = block
+                res["budget_downgrade"] = downgrade
+                res["spent_usd"] = state.budget.spent_usd
+                try:
+                    sup.update_state(config, {
+                        "attended_completed_task_ids": completed,
+                        "attended_done_task_ids": done_ids,
+                        "open_pp_runs": open_runs,
+                        "budget": state.budget.model_dump(mode="json"),
+                        "budget_downgrade_active": bool(downgrade),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+    emit(project, wf, "attended.recovery.resume",
+         {"run_id": run_id, "status": res.get("status")})
+    print(json.dumps({"ok": True, **res}, indent=2, default=str))
+    return 0
 
 
 def _cmd_attended_submit(args) -> int:
@@ -3070,10 +3151,12 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("workflow_id")
     rs.add_argument("--action", required=True,
                     choices=["approve", "reject", "modify-budget",
-                             "force-dispatch", "change-squads"])
+                             "force-dispatch", "change-squads",
+                             "recover-stalled-stage"])
     rs.add_argument("--option", help=(
         "Action argument: chosen option label, new budget USD for "
-        "modify-budget, or comma-separated squads for change-squads"))
+        "modify-budget, comma-separated squads for change-squads, or the "
+        "stalled attended cursor's run_id for recover-stalled-stage"))
     rs.add_argument("--live", action="store_true",
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
     rs.add_argument("--verbose", action="store_true")
