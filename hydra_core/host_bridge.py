@@ -673,11 +673,37 @@ def _revert_merge_commit(
     return out
 
 
-def _remove_worktree(repo_root: str, worktree_path: str) -> None:
+def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
+    """Remove a worktree checkout and report whether it actually happened.
+
+    Best-effort by design (callers here are cleanup paths, not a place to
+    raise), but "best-effort" must not mean "silently untruthful": the
+    returned dict tells the caller what really occurred rather than being a
+    fire-and-forget ``None``. Checks the git ``CompletedProcess`` returncode
+    (a nonzero exit does NOT raise -- `_git` doesn't check=True) AND verifies
+    the path is genuinely gone afterwards, rather than trusting either
+    signal alone. That before/after observation is the same discipline that
+    caught the merge-back no-op elsewhere in this module, where trusting
+    git's exit code was precisely the error.
+
+    Returns ``{"removed": bool, "error": str | None}``. Never raises.
+    """
+    err: str | None = None
     try:
-        _git(["worktree", "remove", "--force", worktree_path], repo_root)
-    except Exception:  # noqa: BLE001
-        pass
+        res = _git(["worktree", "remove", "--force", worktree_path], repo_root)
+        if res.returncode != 0:
+            err = (res.stderr or res.stdout or "").strip()[:300]
+    except Exception as exc:  # noqa: BLE001
+        err = f"exception: {exc!r}"[:300]
+    try:
+        still_present = Path(worktree_path).exists()
+    except Exception:  # noqa: BLE001 — treat an unverifiable path as "not proven gone"
+        still_present = True
+    if still_present:
+        return {"removed": False, "error": err or "git reported success but path still exists"}
+    # Path is genuinely gone -- that's a real removal even if git also
+    # reported a (now-moot) error, e.g. a racing caller removed it first.
+    return {"removed": True, "error": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -763,10 +789,21 @@ def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> di
                     "reason": f"non_terminal_state:{state}",
                 })
                 continue
-            _remove_worktree(repo_root, str(entry))
-            report["removed"].append({
-                "worktree": str(entry), "run_id": run_id, "state": state,
-            })
+            result = _remove_worktree(repo_root, str(entry))
+            if result.get("removed"):
+                report["removed"].append({
+                    "worktree": str(entry), "run_id": run_id, "state": state,
+                })
+            else:
+                # git refused (locked worktree, permission error, ...) or the
+                # path is still on disk after the attempt -- report that
+                # honestly rather than claiming a clean sweep. See
+                # `_remove_worktree`'s docstring for why the exit code alone
+                # is not trusted here.
+                report["errors"].append({
+                    "worktree": str(entry), "run_id": run_id,
+                    "error": result.get("error") or "removal_failed",
+                })
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the sweep
             report["errors"].append({
                 "worktree": str(entry), "run_id": run_id, "error": str(exc)[:300],
