@@ -1164,7 +1164,32 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["gate_rubric"] = gate_rubric
     cursor["required_cross"] = required_cross
     cursor["state"] = "await_judge"
-    judge_call_key = f"judge-{gen_idx}"  # GAP-f: judge-0 or judge-1
+    # LV-8: scope the call_key with run_id + stage_id, not just the generate
+    # index. This value round-trips verbatim as pp's record_verdict
+    # idempotency_token (see _apply_judge below); an unscoped "judge-0"/
+    # "judge-1" collides across every stage/run in the shared pp daemon DB,
+    # so a second stage's genuine first verdict call silently short-circuits
+    # into the *first* stage's verdict row via pp's unscoped idempotency
+    # lookup. Scoping keeps the retry-safety property (same stage + same
+    # gen_idx replay => same token => same idempotent short-circuit) while
+    # eliminating cross-stage/cross-run collisions.
+    #
+    # Retry-fix follow-up: also fold in attempt_id (set on the cursor a few
+    # lines above by record_attempt). run_id+stage_id+gen_idx is already
+    # unique for the lifetime of this stage's logical verdict slot -- pp's
+    # own findVerdictByIdempotencyToken/resolveIdempotentVerdict is what
+    # actually enforces exactly-once, not this token's uniqueness. But pp's
+    # guard error message itself tells callers to scope idempotency tokens by
+    # attempt, and this token didn't. Including attempt_id makes token<->
+    # attempt 1:1 by construction rather than by an argument spanning three
+    # call sites (this one, the finalize_stage fallback below, and
+    # recover_stalled_stage's replay) that a future refactor could silently
+    # invalidate. attempt_id is stable across a stalled-infra re-drive and
+    # across recover_stalled_stage (both replay the ORIGINAL captured
+    # call_key/payload rather than rebuilding it from cursor state), so this
+    # doesn't break retry-safety: the same judge call re-driven on the same
+    # attempt still produces the same token.
+    judge_call_key = f"judge-{run_id}-{stage_id}-{cursor['attempt_id']}-{gen_idx}"
     cursor["pending_action"] = {
         "call_key": judge_call_key,
         "agent_type": judge_agent,
