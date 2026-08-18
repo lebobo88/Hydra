@@ -981,6 +981,64 @@ def test_preseeded_target_repo_id_and_target_repo_ids_both_set_surfaces_hitl() -
     assert "ambiguous" in patch["pending_hitl"]["summary"]
 
 
+def test_single_distinct_preseeded_repos_does_not_persist_target_repo_ids() -> None:
+    """WS1 retry-2 (finding B follow-up): a single-distinct-id --repos run
+    (`hydra run --repos hydra`) pre-seeds target_repo_ids=["hydra"] then
+    degrades to single-repo mode, setting target_repo_id="hydra". The
+    finding-B pre-seed ambiguity guard trips when BOTH target_repo_id and
+    target_repo_ids are set. If node_intake persisted the (now vestigial)
+    single-element target_repo_ids alongside target_repo_id (finding A's
+    persist block), _cmd_replay would re-seed both and the guard would
+    FALSELY surface an "ambiguous" HITL on replay of a legitimate
+    single-repo run. The degrade branch must therefore clear
+    target_repo_ids: the patch must carry target_repo_id but NOT a truthy
+    target_repo_ids, and re-running intake on the persisted shape must not
+    surface."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something",
+        target_repo_ids=["hydra"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert patch.get("target_repo_id") == "hydra"
+    # Vestigial fleet list must NOT survive as a TRUTHY value. It may be
+    # persisted as an explicit empty list (to overwrite a pre-seeded channel
+    # value -- see the replay simulation below), but never as a non-empty list.
+    assert not patch.get("target_repo_ids"), (
+        "single-distinct --repos must not persist a truthy target_repo_ids; got "
+        f"{patch.get('target_repo_ids')!r}"
+    )
+
+    # Simulate replay faithfully. _cmd_replay reads snap.values -- the MERGED
+    # LangGraph checkpoint channel, NOT the raw intake patch delta. For a
+    # LastValue field (target_repo_ids has no reducer), a key is overwritten
+    # only when it is PRESENT in the patch; an absent key RETAINS the value
+    # pre-seeded onto the channel at graph start (here: ["hydra"] from the CLI
+    # --repos path). A degrade branch that clears state locally but omits the
+    # key from the patch would therefore leave ["hydra"] alive in the
+    # checkpoint -- and re-seeding both target_repo_id AND target_repo_ids on
+    # replay trips the finding-B ambiguity guard. Model that merge here.
+    checkpoint = {"target_repo_id": None, "target_repo_ids": ["hydra"]}
+    for _k in ("target_repo_id", "target_repo_ids"):
+        if _k in patch:
+            checkpoint[_k] = patch[_k]
+    replayed = HydraState(
+        root_goal="Fix something",
+        target_repo_id=checkpoint["target_repo_id"],
+        target_repo_ids=list(checkpoint["target_repo_ids"] or []),
+    )
+    replay_patch = intake(replayed)
+    assert replay_patch.get("phase") != "surfaced", (
+        "replay of a legitimate single-repo --repos run falsely surfaced an "
+        "ambiguous HITL: the degrade branch must persist an empty "
+        "target_repo_ids into the checkpoint (a LastValue channel keeps the "
+        "pre-seeded ['hydra'] otherwise)"
+    )
+
+
 def test_preseeded_target_repo_id_wins_over_conflicting_goal_repo_flag() -> None:
     """WS1 retry (finding 3): a pre-seeded state.target_repo_id must win over
     a conflicting --repo token in goal text, not just when goal text has

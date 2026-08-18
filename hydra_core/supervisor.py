@@ -696,6 +696,17 @@ def build_supervisor(
             state.fleet_parallel = False
             if not state.target_repo_id:
                 state.target_repo_id = _fleet_repo_ids[0]
+            # WS1 retry-2 (finding B follow-up): collapse the multi-repo field
+            # once we've degraded to single-repo mode. Leaving a pre-seeded
+            # single-element target_repo_ids set here would make BOTH
+            # target_repo_id (just set above) and target_repo_ids truthy, which
+            # the finding-A persist block below then writes to the checkpoint
+            # together. On replay _cmd_replay re-seeds both, and the finding-B
+            # pre-seed ambiguity guard (above) would falsely surface an
+            # "ambiguous" HITL for what is a legitimate single-repo run. It is
+            # also semantically correct: a single-repo run is not a fleet, so
+            # the fleet id list must not survive into the persisted state.
+            state.target_repo_ids = []
             _fleet_degrade_note = (
                 f"--repos/--fleet named a single distinct repo "
                 f"({_fleet_repo_ids[0]!r}) — running single-repo, not fleet mode"
@@ -926,6 +937,21 @@ def build_supervisor(
             # WS1-B block above) but never returned them, so the reader
             # the replay fix relies on was structurally unreachable.
             update["target_repo_ids"] = list(state.target_repo_ids)
+        elif len(_fleet_repo_ids) == 1:
+            # WS1 retry-2 (finding B follow-up, corrected): single-repo degrade
+            # from --repos/--fleet. The degrade branch above cleared
+            # state.target_repo_ids to [], but target_repo_ids is a LastValue
+            # channel -- OMITTING the key from this patch does NOT clear the
+            # checkpoint, it RETAINS whatever was pre-seeded onto the channel
+            # (e.g. `hydra run --repos hydra` pre-seeds target_repo_ids=["hydra"]
+            # via cli.py). _cmd_replay reads snap.values (the merged channel,
+            # not this delta) and would then re-seed BOTH target_repo_id and a
+            # surviving target_repo_ids=["hydra"], falsely tripping the finding-B
+            # ambiguity guard on replay of a legitimate single-repo run. Persist
+            # the empty list explicitly so the channel is overwritten. (Same
+            # LastValue rule the "must appear in the return dict" note above
+            # states for the write direction -- it applies to clears too.)
+            update["target_repo_ids"] = []
         if state.fleet_parallel:
             update["fleet_parallel"] = True
             update["selected_squads"] = ["engineering"]
