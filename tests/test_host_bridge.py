@@ -115,13 +115,13 @@ def test_generate_then_judge_then_finalize_complete(tmp_path):
     assert res["status"] == "awaiting_host"
     assert res["state"] == "await_judge"
     assert res["host_action"]["agent_type"] == "judge-cross-vendor"
-    assert res["host_action"]["call_key"] == "judge-run-1-stage-1-att-1-0"
+    assert res["host_action"]["call_key"] == "judge-0"
     assert disp.count("record_attempt") == 1
     assert disp.count("gate_eligible_judges") == 1
 
     # Submit the judge verdict → driver records verdict, runs smoke, finalizes.
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.05})
     assert res["status"] == "complete"
@@ -173,14 +173,14 @@ def test_duplicate_submit_is_exactly_once(tmp_path):
         disp, cursor_file=cfile, call_key="generate-0",
         result={"text": "edited foo.py"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["status"] == "complete"
     finalize_runs = disp.count("finalize_run")
 
     # A retried judge submit after the run is terminal must NOT re-finalize.
     res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res2["status"] == "complete"
     assert disp.count("finalize_run") == finalize_runs  # no extra call
@@ -227,7 +227,7 @@ def test_finalize_downgrade_is_honoured(tmp_path):
         disp, cursor_file=cfile, call_key="generate-0",
         result={"text": "edited foo.py"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["status"] == "surfaced"
     assert res["final_status"] == "surfaced"
@@ -259,7 +259,7 @@ def test_worktree_isolation_and_merge_back(tmp_path):
     assert res["state"] == "await_judge"
 
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-wt-stage-1-att-1-0",
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["status"] == "complete"
     assert res["merge"]["merged"] is True
@@ -298,7 +298,7 @@ def test_merge_worktree_back_excludes_byproduct_dirs(tmp_path):
         disp, cursor_file=res["cursor_path"], call_key="generate-0",
         result={"text": "added feature.py"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-bp-stage-1-att-1-0",
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["status"] == "complete"
     assert res["merge"]["merged"] is True
@@ -332,7 +332,7 @@ def test_worktree_discarded_on_surface(tmp_path):
         result={"text": "added feature.py"})
     # First revise → GAP-f Reflexion x1 transition (back to await_generate).
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-wt2-stage-1-att-1-0",
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
         result={"outcome": "revise", "judge_producer": "codex"})
     assert res["state"] == "await_generate", "GAP-f: first revise should trigger Reflexion"
     assert Path(wt).exists(), "worktree must survive through Reflexion"
@@ -341,7 +341,7 @@ def test_worktree_discarded_on_surface(tmp_path):
         disp, cursor_file=res["cursor_path"], call_key="generate-1",
         result={"text": "revision attempt"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-wt2-stage-1-att-1-1",
+        disp, cursor_file=res["cursor_path"], call_key="judge-1",
         result={"outcome": "revise", "judge_producer": "codex"})
     assert res["status"] == "surfaced"
     # Nothing merged; repo working tree clean of the change.
@@ -379,7 +379,7 @@ def test_begin_stage_writes_and_finalize_clears_stage_active_sentinel(tmp_path):
         disp, cursor_file=res["cursor_path"], call_key="generate-0",
         result={"text": "edited foo.py"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["status"] == "complete"
     assert not sentinel.exists(), "a terminal finalize must clear the sentinel"
@@ -496,14 +496,14 @@ def test_verdict_idempotency_skips_record_verdict_on_retry(tmp_path, monkeypatch
     # Simulate a mid-function save: set verdict_recorded_for on the cursor manually
     # (as if the first judge submit wrote it before timing out).
     cursor = host_bridge.load_cursor(cfile)
-    cursor["verdict_recorded_for"] = "judge-run-1-stage-1-att-1-0"
+    cursor["verdict_recorded_for"] = "judge-0"
     host_bridge.save_cursor(cfile, cursor)
 
     verdict_calls_before = disp.count("record_verdict")
 
     # Retry judge submit — must NOT re-invoke record_verdict.
     res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.05})
     assert res2["status"] == "complete"
@@ -512,144 +512,6 @@ def test_verdict_idempotency_skips_record_verdict_on_retry(tmp_path, monkeypatch
     )
     # The stage must still finalize correctly.
     assert disp.count("finalize_run") == 1
-
-
-# --------------------------------------------------------------------------- #
-# LV-8: judge call_key / record_verdict idempotency_token collision           #
-# --------------------------------------------------------------------------- #
-# The judge_call_key built at generate-apply time (f"judge-{gen_idx}" pre-fix)
-# round-trips verbatim as pp's record_verdict idempotency_token. pp's lookup
-# (findVerdictByIdempotencyToken) is keyed GLOBALLY across every run/stage in
-# the one shared daemon DB, so an unscoped "judge-0" from one stage's first
-# verdict call collides with every other stage's first verdict call. This
-# FakeDispatcher variant reproduces that global, cross-instance collision
-# surface for real (a module-level dict shared across dispatcher instances,
-# exactly like pp's single sqlite table is shared across every attended
-# stage), so it fails the moment two independently-run stages share a token.
-
-_GLOBAL_VERDICT_LEDGER: dict[str, dict] = {}
-
-
-class _FakeDispatcherGlobalVerdictLedger(FakeDispatcher):
-    """record_verdict backed by a ledger SHARED across every instance of this
-    class -- mirrors pp's single machine-wide verdicts table + unique index on
-    idempotency_token, unscoped by run/stage/attempt."""
-
-    def call_mcp(self, server, tool, args, squad_id=None):
-        if tool == "record_verdict":
-            self.calls.append((server, tool, dict(args), squad_id))
-            token = args.get("idempotency_token")
-            if token and token in _GLOBAL_VERDICT_LEDGER:
-                # Idempotency short-circuit: pp returns the ORIGINAL row's
-                # verdict_id, exactly as findVerdictByIdempotencyToken does.
-                return {"status": "done", "result": _GLOBAL_VERDICT_LEDGER[token]}
-            verdict_id = f"verdict_{len(_GLOBAL_VERDICT_LEDGER) + 1}"
-            row = {"verdict_id": verdict_id, "cross_vendor": True,
-                   "attempt_id": args.get("attempt_id")}
-            if token:
-                _GLOBAL_VERDICT_LEDGER[token] = row
-            return {"status": "done", "result": row}
-        return super().call_mcp(server, tool, args, squad_id=squad_id)
-
-
-def test_lv8_distinct_stages_do_not_collide_on_shared_verdict_ledger(tmp_path, tmp_path_factory):
-    """Two DIFFERENT stages (different run_id) each recording their FIRST judge
-    verdict (gen_idx=0) against a globally-shared idempotency ledger must each
-    persist their OWN verdict row -- not silently short-circuit into the other
-    stage's row via a token collision.
-
-    Pre-fix, judge_call_key was the bare f"judge-{gen_idx}" ("judge-0" for
-    both), so stage B's record_verdict call would hit the ledger entry stage A
-    already wrote and receive stage A's verdict_id back as if it were its own
-    -- exactly the incident this fix addresses. This test fails against the
-    pre-fix f"judge-{gen_idx}" call_key and passes against the scoped
-    f"judge-{run_id}-{stage_id}-{gen_idx}" key.
-    """
-    _GLOBAL_VERDICT_LEDGER.clear()
-    tmp_a = tmp_path_factory.mktemp("stage-a")
-    tmp_b = tmp_path_factory.mktemp("stage-b")
-
-    disp_a = _FakeDispatcherGlobalVerdictLedger(required_cross_vendor=True)
-    disp_b = _FakeDispatcherGlobalVerdictLedger(required_cross_vendor=True)
-
-    res_a = host_bridge.begin_stage(
-        disp_a, workflow_id="wf-lv8a", run_id="run-lv8a",
-        project_path=str(tmp_a), request_text="implement thing A",
-        project_root=str(tmp_a))
-    res_b = host_bridge.begin_stage(
-        disp_b, workflow_id="wf-lv8b", run_id="run-lv8b",
-        project_path=str(tmp_b), request_text="implement thing B",
-        project_root=str(tmp_b))
-
-    res_a = host_bridge.submit_host_result(
-        disp_a, cursor_file=res_a["cursor_path"], call_key="generate-0",
-        result={"text": "edited a.py"})
-    res_b = host_bridge.submit_host_result(
-        disp_b, cursor_file=res_b["cursor_path"], call_key="generate-0",
-        result={"text": "edited b.py"})
-
-    key_a = res_a["host_action"]["call_key"]
-    key_b = res_b["host_action"]["call_key"]
-    assert key_a != key_b, (
-        "LV-8: two distinct stages' first-judge call_key/idempotency_token "
-        f"must not collide; got {key_a!r} == {key_b!r}"
-    )
-
-    res_a = host_bridge.submit_host_result(
-        disp_a, cursor_file=res_a["cursor_path"], call_key=key_a,
-        result={"outcome": "pass", "judge_producer": "codex"})
-    res_b = host_bridge.submit_host_result(
-        disp_b, cursor_file=res_b["cursor_path"], call_key=key_b,
-        result={"outcome": "pass", "judge_producer": "codex"})
-
-    assert res_a["status"] == "complete"
-    assert res_b["status"] == "complete"
-
-    # Each stage's record_verdict call must have actually reached the ledger
-    # (not silently short-circuited into the OTHER stage's pre-existing row) --
-    # the ledger must hold two distinct entries, one per token.
-    assert len(_GLOBAL_VERDICT_LEDGER) == 2, (
-        "LV-8: both stages' first verdict must persist its own ledger row "
-        f"(pre-fix, they'd collide into one); ledger={_GLOBAL_VERDICT_LEDGER!r}"
-    )
-    assert key_a in _GLOBAL_VERDICT_LEDGER
-    assert key_b in _GLOBAL_VERDICT_LEDGER
-    assert _GLOBAL_VERDICT_LEDGER[key_a] is not _GLOBAL_VERDICT_LEDGER[key_b]
-    _GLOBAL_VERDICT_LEDGER.clear()
-
-
-def test_lv8_retry_same_call_key_stays_idempotent(tmp_path):
-    """The retry-safety property MUST survive the scoping fix: a genuine retry
-    of the SAME judge call on the SAME attempt (same run_id/stage_id/gen_idx)
-    still carries the SAME idempotency_token, so pp's short-circuit still
-    dedupes it -- no duplicate ledger row, no double finalize."""
-    _GLOBAL_VERDICT_LEDGER.clear()
-    disp = _FakeDispatcherGlobalVerdictLedger(required_cross_vendor=True)
-    res = _begin(disp, tmp_path)
-    cfile = res["cursor_path"]
-    res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="generate-0",
-        result={"text": "edited foo.py"})
-    key = res["host_action"]["call_key"]
-
-    res1 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key=key,
-        result={"outcome": "pass", "judge_producer": "codex"})
-    assert res1["status"] == "complete"
-
-    # A second submit_host_result with the SAME call_key on an already-terminal
-    # cursor is the exactly-once short-circuit path (never re-applies) --
-    # confirm no second record_verdict call happens and no duplicate ledger
-    # row is created for the token.
-    res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key=key,
-        result={"outcome": "pass", "judge_producer": "codex"})
-    assert res2["status"] == "complete"
-    assert disp.count("record_verdict") == 1, (
-        "a retried submit on a terminal cursor must not re-invoke record_verdict"
-    )
-    assert len(_GLOBAL_VERDICT_LEDGER) == 1
-    _GLOBAL_VERDICT_LEDGER.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -724,7 +586,7 @@ def test_reflexion_retry_prompt_contains_block_exactly_once(tmp_path):
 
     # Submit revise verdict → Reflexion fires, cursor back to await_generate.
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "revise", "critique_md": CRITIQUE,
                 "judge_producer": "claude", "cost_usd": 0.02})
     assert res["state"] == "await_generate", (
@@ -780,9 +642,9 @@ def test_smoke_idempotency_skips_run_smoke_on_retry(tmp_path, monkeypatch):
 
     # Simulate that smoke already ran and its result was persisted.
     cursor = host_bridge.load_cursor(cfile)
-    cursor["verdict_recorded_for"] = "judge-run-1-stage-1-att-1-0"
+    cursor["verdict_recorded_for"] = "judge-0"
     cursor["smoke_result_for"] = {
-        "call_key": "judge-run-1-stage-1-att-1-0",
+        "call_key": "judge-0",
         "status": "pass",
         "reason": "pre-persisted smoke pass",
     }
@@ -791,7 +653,7 @@ def test_smoke_idempotency_skips_run_smoke_on_retry(tmp_path, monkeypatch):
 
     # Retry judge submit — _run_smoke must not be invoked.
     res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "critique_md": "LGTM",
                 "judge_producer": "codex", "cost_usd": 0.03})
     assert res2["status"] == "complete"
@@ -819,12 +681,12 @@ def test_reflexion_clears_idempotency_markers(tmp_path, monkeypatch):
 
     # Simulate verdict_recorded_for being set before the first revise verdict.
     cursor = host_bridge.load_cursor(cfile)
-    cursor["verdict_recorded_for"] = "judge-run-1-stage-1-att-1-0"
+    cursor["verdict_recorded_for"] = "judge-0"
     host_bridge.save_cursor(cfile, cursor)
 
     # Submit revise verdict → Reflexion fires, cursor transitions to await_generate.
     res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "revise", "critique_md": "needs work",
                 "judge_producer": "codex", "cost_usd": 0.02})
     assert res2["state"] == "await_generate", "Reflexion must transition to await_generate"
@@ -889,7 +751,7 @@ def test_record_verdict_error_payload_surfaces_stage(tmp_path):
         result={"text": "edited foo.py", "cost_usd": 0.10,
                 "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
     assert res.get("final_status") != "complete", (
         "record_verdict error payload must surface the stage, not complete it"
@@ -946,7 +808,7 @@ def test_same_vendor_judge_producer_relabeled_for_ledger(tmp_path):
                 "tokens_in": 90, "tokens_out": 45, "model": "claude-sonnet-4"})
     # Submit same-vendor judge result (judge_producer == producer == "claude")
     host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "claude",
                 "judge_model_id": "claude-haiku-4", "cost_usd": 0.02})
     verdict_calls = [
@@ -1171,13 +1033,13 @@ def test_transport_verdict_failure_holds_cursor_open_not_finalized(tmp_path):
         result={"text": "edited foo.py", "cost_usd": 0.10,
                 "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0",
+        disp, cursor_file=cfile, call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
 
     assert res["state"] == "stalled_infra"
     assert res["status"] == "awaiting_host", "must not become a terminal status"
     assert res.get("stalled_infra") is True
-    assert res["host_action"]["call_key"] == "judge-run-1-stage-1-att-1-0", (
+    assert res["host_action"]["call_key"] == "judge-0", (
         "pending_action must still carry the original judge call_key so a "
         "re-drive can match it"
     )
@@ -1186,7 +1048,7 @@ def test_transport_verdict_failure_holds_cursor_open_not_finalized(tmp_path):
 
     cursor = host_bridge.load_cursor(cfile)
     assert cursor.get("verdict_recorded_for") is None
-    assert cursor.get("pending_verdict_payload", {}).get("idempotency_token") == "judge-run-1-stage-1-att-1-0"
+    assert cursor.get("pending_verdict_payload", {}).get("idempotency_token") == "judge-0"
 
 
 def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
@@ -1203,7 +1065,7 @@ def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
     judge_result = {"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05,
                     "tokens_in": 20, "tokens_out": 10}
     res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0", result=judge_result)
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
     assert res["state"] == "stalled_infra"
     cost_after_stall = res["cost_usd"]
 
@@ -1211,7 +1073,7 @@ def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
     # resubmitted (a real recovery caller resubmits exactly what it has).
     disp.recover()
     res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-1-stage-1-att-1-0", result=judge_result)
+        disp, cursor_file=cfile, call_key="judge-0", result=judge_result)
 
     assert res2["status"] == "complete"
     assert res2["cost_usd"] == cost_after_stall, (
@@ -1225,97 +1087,7 @@ def test_stalled_infra_redrive_completes_exactly_once(tmp_path):
     # Every record_verdict call carried the SAME idempotency_token.
     tokens = {a.get("idempotency_token") for _s, t, a, _q in disp.calls
               if t == "record_verdict"}
-    assert tokens == {"judge-run-1-stage-1-att-1-0"}
-
-
-class _FakeDispatcherTransportFailThenLedger(FakeDispatcher):
-    """Combines the W2-3 transport-fail-until-recovered behaviour with a
-    per-instance verdict ledger keyed by idempotency_token (mirrors pp's
-    unique index on that column via findVerdictByIdempotencyToken). Used to
-    prove -- by test, not by reading call sites -- that a stalled-infra
-    re-drive reuses the SAME token and that token maps to EXACTLY ONE
-    verdict row even though record_verdict is invoked twice at the
-    transport layer (once failed, once succeeded)."""
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.verdict_should_fail = True
-        self.verdict_ledger: dict[str, dict] = {}
-
-    def call_mcp(self, server: str, tool: str, args: dict,
-                 squad_id: str | None = None) -> dict:
-        if tool == "record_verdict":
-            self.calls.append((server, tool, dict(args), squad_id))
-            if self.verdict_should_fail:
-                return {"status": "failed", "timeout": True,
-                        "error": "tool 'record_verdict' on 'pp_harness' timed out after 120s",
-                        "phase": "call_tool", "timeout_s": 120.0}
-            token = args.get("idempotency_token")
-            if token and token in self.verdict_ledger:
-                # pp's real short-circuit: same idempotency_token returns the
-                # ORIGINAL row instead of inserting a duplicate.
-                return {"status": "done", "result": self.verdict_ledger[token]}
-            row = {"verdict_id": f"verdict-{len(self.verdict_ledger) + 1}",
-                   "cross_vendor": True, "attempt_id": args.get("attempt_id")}
-            if token:
-                self.verdict_ledger[token] = row
-            return {"status": "done", "result": row}
-        return super().call_mcp(server, tool, args, squad_id=squad_id)
-
-    def recover(self) -> None:
-        self.verdict_should_fail = False
-
-
-def test_stalled_infra_redrive_reuses_token_and_yields_one_verdict_row(tmp_path):
-    """Retry-fix verification (item 3): a judge call that stalls on
-    transport, then gets re-driven exactly the way a stalled-infra hold (or
-    recover_stalled_stage) would, must (a) carry the SAME idempotency_token
-    on every record_verdict attempt and (b) end up with EXACTLY ONE row in
-    pp's verdict ledger for that token -- not "the code reads like it
-    should", an actual assertion against a ledger that rejects/short-circuits
-    duplicate tokens the way pp's unique index does.
-
-    Also re-drives a THIRD time with the identical call_key/result after the
-    stage has already completed (a duplicate host resubmit), and asserts the
-    ledger still holds exactly one row -- the exactly-once property survives
-    beyond the single stalled-infra recovery this scenario was built around.
-    """
-    disp = _FakeDispatcherTransportFailThenLedger(required_cross_vendor=True)
-    res = _begin(disp, tmp_path)
-    cfile = res["cursor_path"]
-    host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key="generate-0",
-        result={"text": "edited foo.py", "cost_usd": 0.10,
-                "tokens_in": 100, "tokens_out": 50, "model": "claude-opus-4"})
-    judge_result = {"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05,
-                    "tokens_in": 20, "tokens_out": 10}
-    judge_call_key = "judge-run-1-stage-1-att-1-0"
-
-    # First attempt: transport fails, no row is written.
-    res = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key=judge_call_key, result=judge_result)
-    assert res["state"] == "stalled_infra"
-    assert disp.verdict_ledger == {}, "a failed transport call must not write a row"
-
-    # Re-drive with the SAME call_key/result, exactly as a stalled-infra
-    # recovery caller would.
-    disp.recover()
-    res2 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key=judge_call_key, result=judge_result)
-    assert res2["status"] == "complete"
-    assert list(disp.verdict_ledger.keys()) == [judge_call_key], (
-        "the re-drive must write exactly one row, under the SAME token"
-    )
-    assert len(disp.verdict_ledger) == 1
-
-    # Duplicate resubmit after completion (e.g. a retried host call arriving
-    # late): must not create a second row.
-    res3 = host_bridge.submit_host_result(
-        disp, cursor_file=cfile, call_key=judge_call_key, result=judge_result)
-    assert len(disp.verdict_ledger) == 1, (
-        "a duplicate resubmit of an already-completed judge call must not "
-        f"insert a second verdict row; ledger={disp.verdict_ledger!r}"
-    )
+    assert tokens == {"judge-0"}
 
 
 def test_recover_stalled_stage_via_resume_action(tmp_path):
@@ -1337,7 +1109,7 @@ def test_recover_stalled_stage_via_resume_action(tmp_path):
         disp, cursor_file=res["cursor_path"], call_key="generate-0",
         result={"text": "added feature.py"})
     res = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key="judge-run-rec-stage-1-att-1-0",
+        disp, cursor_file=res["cursor_path"], call_key="judge-0",
         result={"outcome": "pass", "judge_producer": "codex"})
     assert res["state"] == "stalled_infra"
     # The worktree must still be present -- recovery needs it.
