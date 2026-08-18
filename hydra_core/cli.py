@@ -413,8 +413,55 @@ def _cmd_squads(args) -> int:
     return 0
 
 
+def _cmd_repo(args) -> int:
+    """`hydra repo register|unregister|list` — WS1-C self-service admin of
+    ~/.hydra/repos.json. CLI-only by design; see repo_registry.register_repo."""
+    from .repo_registry import (
+        list_registered_repos,
+        register_repo,
+        unregister_repo,
+    )
+    if args.repocmd == "register":
+        try:
+            result = register_repo(
+                args.repo_id, args.path, force=args.force, init=args.init,
+            )
+        except (ValueError, TimeoutError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, **result}, indent=2))
+        return 0
+    if args.repocmd == "unregister":
+        try:
+            result = unregister_repo(args.repo_id)
+        except (ValueError, TimeoutError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, **result}, indent=2))
+        return 0
+    if args.repocmd == "list":
+        print(json.dumps({"ok": True, "repos": list_registered_repos()}, indent=2))
+        return 0
+    print(json.dumps({"ok": False, "error": f"unknown repocmd {args.repocmd!r}"}), file=sys.stderr)
+    return 1
+
+
 def _cmd_run(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
+    # WS1 retry (finding 1): --repo and --repos are mutually exclusive on the
+    # CLI transport too. The MCP transport already rejects this combination
+    # (mcp_servers/hydra_control/server.py: _extract_repo_params), but the CLI
+    # path pre-seeds target_repo_id/target_repo_ids directly onto HydraState
+    # (see WS1-B below) — that bypasses node_intake's goal-text ambiguity
+    # guard entirely (it only compares ids parsed OUT of root_goal), so an
+    # operator passing both flags here would otherwise silently pick whichever
+    # field a downstream branch happens to prefer. Fail fast instead.
+    if getattr(args, "repo", None) and getattr(args, "repos", None):
+        print(
+            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            file=sys.stderr,
+        )
+        return 1
     # --workflow-id: use the caller-supplied id if present and valid; otherwise
     # mint a fresh uuid4(). The Hydra Cockpit bridge pre-allocates the id so it
     # can return it to the UI immediately (fire-and-attach) before the run ends.
@@ -445,18 +492,25 @@ def _cmd_run(args) -> int:
                 workflow_id = uuid4()
     else:
         workflow_id = uuid4()
-    # Explicit --repo/--repos flags are folded into the goal text so the
-    # supervisor's intake parser (parse_repo_arg / parse_repos_arg) handles them
-    # through the single, tested code path — no second parser. Mutually exclusive
-    # (intake surfaces an HITL if both end up present).
+    # WS1-B: --repo/--repos/--subdir are structured argparse flags, so they are
+    # pre-seeded directly onto HydraState (target_repo_id / target_repo_ids /
+    # target_repo_subpath) rather than folded into the goal text. root_goal
+    # stays exactly what the operator typed. node_intake validates whatever
+    # arrives here (goal-text token OR pre-seeded field) through the same
+    # allow-list check and HITL shape either way. parse_repo_arg /
+    # parse_repos_arg are unchanged and remain solely for operator-typed goal
+    # text (e.g. a goal pasted into a chat UI with no separate --repo flag).
     _goal = args.goal
-    if getattr(args, "repo", None):
-        _goal = f"{_goal} --repo {args.repo}"
-    if getattr(args, "repos", None):
-        _goal = f"{_goal} --repos {args.repos}"
-    if getattr(args, "subdir", None):
-        _goal = f"{_goal} --subdir {args.subdir}"
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
+    if getattr(args, "repo", None):
+        initial.target_repo_id = str(args.repo).strip().lower()
+    if getattr(args, "repos", None):
+        initial.target_repo_ids = [
+            p.strip().lower() for p in str(args.repos).split(",") if p.strip()
+        ]
+    if getattr(args, "subdir", None):
+        from .repo_registry import normalize_repo_subpath
+        initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
     # --budget: set the workflow budget cap (the genuinely-missing wire — the
@@ -538,15 +592,19 @@ def _cmd_plan(args) -> int:
         except ValueError:
             workflow_id = uuid4()
 
+    # WS1-B: structured flags pre-seed HydraState directly; see _cmd_run for
+    # the full rationale. root_goal stays exactly what the operator typed.
     _goal = args.goal
-    if getattr(args, "repo", None):
-        _goal = f"{_goal} --repo {args.repo}"
-    if getattr(args, "repos", None):
-        _goal = f"{_goal} --repos {args.repos}"
-    if getattr(args, "subdir", None):
-        _goal = f"{_goal} --subdir {args.subdir}"
-
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
+    if getattr(args, "repo", None):
+        initial.target_repo_id = str(args.repo).strip().lower()
+    if getattr(args, "repos", None):
+        initial.target_repo_ids = [
+            p.strip().lower() for p in str(args.repos).split(",") if p.strip()
+        ]
+    if getattr(args, "subdir", None):
+        from .repo_registry import normalize_repo_subpath
+        initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
     if getattr(args, "budget", None) is not None:
@@ -2693,6 +2751,19 @@ def _cmd_replay(args) -> int:
         phase=from_phase,
         selected_squads=values.get("selected_squads", []),
     )
+    # WS1 retry (finding 5): carry the source run's repo-targeting fields
+    # forward. Without this, a replay of a --repo/--repos-targeted run
+    # silently drops back to intake's cwd-fallback path (the original bug
+    # this stage exists to fix) -- landing in a DIFFERENT repo than the run
+    # being replayed, which also breaks the determinism replay exists to
+    # provide. These are the exact three fields node_intake persists onto
+    # state for repo targeting (see node_intake's `update` dict above).
+    if values.get("target_repo_id") is not None:
+        replay_initial.target_repo_id = values["target_repo_id"]
+    if values.get("target_repo_ids"):
+        replay_initial.target_repo_ids = list(values["target_repo_ids"])
+    if values.get("target_repo_subpath") is not None:
+        replay_initial.target_repo_subpath = values["target_repo_subpath"]
     # Copy budget snapshot if present
     budget = values.get("budget")
     if budget is not None:
@@ -3064,7 +3135,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="Operator risk tolerance hint (recorded on the start event).")
     r.add_argument("--repo", default=None, metavar="ID",
                    help="Single allow-listed repo id for engineering targeting "
-                        "(folded into the goal; resolved by hydra_core.repo_registry).")
+                        "(pre-seeded onto HydraState.target_repo_id; resolved by "
+                        "hydra_core.repo_registry).")
     r.add_argument("--repos", default=None, metavar="ID,ID,...",
                    help="Comma-separated allow-listed repo ids for fleet mode "
                         "(>=2 distinct ids). Mutually exclusive with --repo.")
@@ -3103,7 +3175,8 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--budget", type=float, default=None,
                     help="Workflow budget cap in USD (sets BudgetLedger.budget_usd).")
     pl.add_argument("--repo", default=None, metavar="ID",
-                    help="Single allow-listed repo id (folded into the goal).")
+                    help="Single allow-listed repo id (pre-seeded onto "
+                         "HydraState.target_repo_id).")
     pl.add_argument("--repos", default=None, metavar="ID,ID,...",
                     help="Comma-separated allow-listed repo ids for fleet mode.")
     pl.add_argument("--subdir", default=None, metavar="PATH",
@@ -3266,11 +3339,32 @@ def main(argv: list[str] | None = None) -> int:
     mt.add_argument("--cells", required=True, help="Comma-separated cell slugs")
     mt.add_argument("--replace", action="store_true")
 
+    # WS1-C: `hydra repo register|unregister|list` — self-service ~/.hydra/repos.json
+    # administration. CLI-ONLY (never exposed as a writable MCP tool — see
+    # repo_registry.register_repo's docstring for the security rationale: the
+    # registry IS the allow-list, so a freely-callable MCP register tool would
+    # put allow-list authorship inside the supervisor LLM's reach).
+    repo_p = sub.add_parser("repo", help="Administer ~/.hydra/repos.json (operator-registered repo ids).")
+    repo_sub = repo_p.add_subparsers(dest="repocmd", required=True)
+    rreg = repo_sub.add_parser("register", help="Register (or overwrite) a repo id.")
+    rreg.add_argument("repo_id")
+    rreg.add_argument("path", help="Absolute path to the repo.")
+    rreg.add_argument("--init", action="store_true",
+                       help="Create the directory / run `git init` if it isn't a git repo yet.")
+    rreg.add_argument("--force", action="store_true",
+                       help="Allow shadowing a built-in repo id.")
+    rureg = repo_sub.add_parser("unregister", help="Remove a registered repo id.")
+    rureg.add_argument("repo_id")
+    repo_sub.add_parser("list", help="List operator-registered repo ids.")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "memory":
         memcmds = {"query": _cmd_memory_query, "tag": _cmd_memory_tag}
         return memcmds[args.memcmd](args)
+
+    if args.cmd == "repo":
+        return _cmd_repo(args)
 
     return {
         "doctor": _cmd_doctor,

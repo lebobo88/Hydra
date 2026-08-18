@@ -344,6 +344,15 @@ def build_supervisor(
 
     # ----- node implementations -----
 
+    def _first_quoted_token(msg: str) -> str:
+        """Pull the first single-quoted token out of a repr-formatted
+        ValueError message (e.g. "--repo 'foo' is not an allow-listed
+        repo_id"). Used only to enrich unknown-repo HITL payloads with the
+        attempted id for difflib suggestions — never touches parse_repo_arg /
+        parse_repos_arg themselves, which stay unchanged per WS1-B."""
+        m = re.search(r"'([^']*)'", msg)
+        return m.group(1) if m else ""
+
     def _emit_node_context(state: HydraState, node_name: str) -> None:
         """Emit node context to the trace for debugging/audit."""
         ctx = build_node_context(
@@ -410,6 +419,7 @@ def build_supervisor(
         except ValueError as _repo_err:
             # Unknown --repo id at tail position: surface immediately so the
             # operator sees the problem rather than silently targeting the wrong repo.
+            from hydra_core.repo_registry import unknown_repo_hitl_fields
             state.phase = "surfaced"
             _hitl_payload: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -418,6 +428,7 @@ def build_supervisor(
                 "summary": f"--repo argument rejected: {_repo_err}",
                 "options": ["abort"],
                 "default_option": "abort",
+                **unknown_repo_hitl_fields(_first_quoted_token(str(_repo_err))),
             }
             emit_trace(
                 judge_trace_root,
@@ -456,6 +467,7 @@ def build_supervisor(
             )
             _fleet_repo_ids, _fleet_cleaned = [], state.root_goal
         except ValueError as _repos_err:
+            from hydra_core.repo_registry import unknown_repo_hitl_fields
             state.phase = "surfaced"
             _repos_hitl: dict[str, Any] = {
                 "workflow_id": str(state.workflow_id),
@@ -464,6 +476,7 @@ def build_supervisor(
                 "summary": f"--repos argument rejected: {_repos_err}",
                 "options": ["abort"],
                 "default_option": "abort",
+                **unknown_repo_hitl_fields(_first_quoted_token(str(_repos_err))),
             }
             emit_trace(
                 judge_trace_root,
@@ -530,8 +543,72 @@ def build_supervisor(
         if _repo_subpath is not None and not state.target_repo_subpath:
             state.target_repo_subpath = _repo_subpath
 
+        # WS1 retry (finding 3): precedence between a pre-seeded structured
+        # field (CLI --repos / hydra.workflow.plan repos=, set directly on
+        # state before intake runs) and a --repos/--fleet token found in the
+        # goal text must match the single-repo rule immediately above (line
+        # ~447: `if _repo_id is not None and not state.target_repo_id`) —
+        # PRE-SEEDED WINS. Goal text is operator prose (can be pasted from a
+        # prior session, carry stale flags, or be LLM-composed); the
+        # structured field is the caller's explicit, current intent. Before
+        # this fix the fleet path inverted that rule (`if not _fleet_repo_ids
+        # and state.target_repo_ids`, i.e. goal text won whenever present) —
+        # the same conflict resolved in opposite directions depending only on
+        # whether one or two repo ids were involved. Unify: when a pre-seeded
+        # target_repo_ids is present, it is authoritative and goal-text
+        # --repos/--fleet is ignored outright (matching the single-id rule,
+        # which likewise never lets goal text overwrite an already-set
+        # target_repo_id).
+        if state.target_repo_ids:
+            _fleet_repo_ids = list(dict.fromkeys(
+                str(r).strip().lower() for r in state.target_repo_ids if str(r).strip()
+            ))
+
+        # WS1-B: validate EVERY target_repo_id regardless of how it arrived --
+        # goal text (already validated above by parse_repo_arg/parse_repos_arg)
+        # or pre-seeded directly on state via the structured API path, which
+        # skips that validation entirely. Without this, a pre-seeded unknown id
+        # sails past intake and raises deep inside _resolve_task_project_path as
+        # a bare exception instead of surfacing this HITL.
+        from hydra_core.repo_registry import (
+            is_known_repo as _is_known_repo,
+            unknown_repo_hitl_fields as _unknown_repo_hitl_fields,
+        )
+        _preseed_bad: list[str] = []
+        if state.target_repo_id and not _is_known_repo(state.target_repo_id):
+            _preseed_bad.append(state.target_repo_id)
+        for _rid in _fleet_repo_ids:
+            if not _is_known_repo(_rid) and _rid not in _preseed_bad:
+                _preseed_bad.append(_rid)
+        if _preseed_bad:
+            state.phase = "surfaced"
+            _preseed_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": f"unknown target_repo_id(s) on pre-seeded state: {_preseed_bad}",
+                "options": ["abort"],
+                "default_option": "abort",
+                **_unknown_repo_hitl_fields(_preseed_bad[0]),
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.bad_preseeded_repo_id",
+                {"attempted": _preseed_bad},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _preseed_hitl,
+                "last_event": f"bad pre-seeded target_repo_id: {_preseed_bad}",
+            }
+
         # Fleet wiring based on how many distinct repos --repos/--fleet provided.
         _fleet_tasks: list[TaskState] = []
+        # Set below when --repos/--fleet degrades to single-repo mode; folded
+        # into the routing last_event assignment further down so the notice
+        # survives rather than being silently overwritten.
+        _fleet_degrade_note: str | None = None
         if len(_fleet_repo_ids) >= 2:
             # FLEET MODE: seed one engineering TaskState per distinct repo.
             # state.fleet_parallel = True signals node_dispatch to call dispatch_fleet.
@@ -570,9 +647,30 @@ def build_supervisor(
             # no fleet, no per-repo task seeding).
             # Explicitly clear fleet_parallel — a caller that pre-seeded
             # fleet_parallel=True must NOT remain in fleet mode for a single-repo run.
+            #
+            # WS1 retry (finding 2): the ">=2 distinct ids" rule documented for
+            # --repos/--fleet (CLAUDE.md, cli.py help text) is intentionally NOT
+            # enforced as a hard rejection here — test_fleet_not_used_with_single_distinct_repo
+            # and test_single_repo_clears_pre_seeded_fleet_parallel already pin
+            # single-id --repos degrading to single-repo mode as correct behavior
+            # (e.g. a caller that computed a repo list which happened to dedupe to
+            # one id shouldn't have to retry with --repo instead). What was missing
+            # was VISIBILITY: state.last_event previously stayed whatever it was
+            # before intake, so an operator checking `/hydra:status` had no signal
+            # that fleet mode didn't happen. The naive fix (assigning
+            # state.last_event here) was itself dead: node_intake unconditionally
+            # overwrites state.last_event later with the routing decision
+            # ("intake: chose [...] (...)"), so the degrade note never survived to
+            # what an operator actually sees. Stash it in _fleet_degrade_note and
+            # fold it into that later assignment instead of losing it.
             state.fleet_parallel = False
             if not state.target_repo_id:
                 state.target_repo_id = _fleet_repo_ids[0]
+            _fleet_degrade_note = (
+                f"--repos/--fleet named a single distinct repo "
+                f"({_fleet_repo_ids[0]!r}) — running single-repo, not fleet mode"
+            )
+            state.last_event = _fleet_degrade_note
             emit_trace(
                 judge_trace_root,
                 state.workflow_id,
@@ -754,7 +852,15 @@ def build_supervisor(
             "tool_count": tool_scope.tool_count,
         })
 
-        state.last_event = f"intake: chose {decision.squads} ({decision.rationale})"
+        _routing_event = f"intake: chose {decision.squads} ({decision.rationale})"
+        if _fleet_degrade_note:
+            # Fold the degrade note in rather than losing it — this assignment
+            # is the last write to last_event before intake returns, so any
+            # earlier notice not carried forward here would never reach an
+            # operator checking /hydra:status.
+            state.last_event = f"{_fleet_degrade_note}; {_routing_event}"
+        else:
+            state.last_event = _routing_event
 
         # Eights attestation: stamp the constitution hash into state and
         # record the receipt for audit. The local immortal_head check is
