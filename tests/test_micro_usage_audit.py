@@ -225,7 +225,7 @@ def test_mu12_non_complete_finalize_preserves_work(tmp_path, monkeypatch):
 
     # Submit judge pass — smoke will fail → stage surfaces.
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-mu12-stage-mu12-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.005})
     assert res["status"] == "surfaced", (
@@ -281,7 +281,7 @@ def test_mu12_complete_path_merge_unchanged(tmp_path, monkeypatch):
     assert res["state"] == "await_judge"
 
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-mu12b-stage-mu12-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12b-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "lgtm",
                 "judge_producer": "codex", "cost_usd": 0.005})
 
@@ -352,7 +352,7 @@ def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
     assert res["state"] == "await_judge"
 
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-mu12c-stage-mu12-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12c-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "lgtm",
                 "judge_producer": "codex", "cost_usd": 0.005})
 
@@ -1658,7 +1658,7 @@ def test_mu13_byproduct_excluded_from_preserved_branch(tmp_path, monkeypatch):
 
     # Submit judge pass — smoke fails → preserve fires.
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-run-mu13-stage-mu12-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu13-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.005})
     assert res["status"] == "surfaced", (
