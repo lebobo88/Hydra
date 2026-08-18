@@ -51,7 +51,8 @@ sys.path.insert(0, str(_HERE.parents[2]))
 
 _HYDRA_ROOT = Path(os.environ.get("HYDRA_ROOT") or _HERE.parents[2])
 
-_RESUME_ACTIONS = ("approve", "reject", "modify-budget", "force-dispatch", "change-squads")
+_RESUME_ACTIONS = ("approve", "reject", "modify-budget", "force-dispatch",
+                   "change-squads", "recover-stalled-stage")
 
 # workflow_id is used as a subprocess argument — restrict to UUID-ish tokens
 # so a malicious payload can never smuggle flags or shell metacharacters.
@@ -63,7 +64,8 @@ _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
 # so the tool can record any action the cockpit emits.
 _COCKPIT_WRITE_ACTIONS = frozenset({
     "launch", "approve", "reject", "modify-budget",
-    "force-dispatch", "change-squads", "replay", "tag_memory",
+    "force-dispatch", "change-squads", "recover-stalled-stage",
+    "replay", "tag_memory",
 })
 
 # ---------------------------------------------------------------------------
