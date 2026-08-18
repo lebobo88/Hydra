@@ -206,13 +206,19 @@ def _classify_infra_failure(exc: Exception | None) -> str:
 # Worktree isolation (write-safety)                                           #
 # --------------------------------------------------------------------------- #
 # In attended mode the host's visible `engineer` subagent writes code. The
-# `hydra-block-direct-write` hook blocks engine-source writes unless the path is
-# under `\worktrees\` (or HYDRA_PP_STAGE_ACTIVE=1, which we must NOT set
-# session-wide). So we isolate the engineer into a linked git worktree under
-# `.harness/worktrees/` — already hook-allowed — and merge the result back into
-# the repo on a passing finalize. This keeps HYDRA_ENFORCE_ROUTING fully on and
-# the host session unable to hand-write project source. Fail-soft: if the repo
-# isn't git or worktree provisioning fails, fall back to in-place writes.
+# `hydra-block-direct-write` hook blocks engine-source writes unless the path
+# resolves under the project root's worktree root (or HYDRA_PP_STAGE_ACTIVE=1,
+# which we must NOT set session-wide). So we isolate the engineer into a linked
+# git worktree under `resolve_worktree_root()` (default
+# `<AIAPP_BASE>/.hydra-worktrees/<repo_id>/`, overridable via
+# `HYDRA_WORKTREE_ROOT`, NOT inside the target repo) — already hook-allowed —
+# and merge the result back into the repo on a passing finalize. Keeping the
+# worktree outside repo_root avoids two real incidents: a test runner globbing
+# `.harness/worktrees/**/tests` alongside the real `tests/` dir, and untracked
+# `.hydra/`/`.harness/` state nested inside the target repo aborting a merge.
+# This keeps HYDRA_ENFORCE_ROUTING fully on and the host session unable to
+# hand-write project source. Fail-soft: if the repo isn't git or worktree
+# provisioning fails, fall back to in-place writes.
 
 def _git_timeout_s() -> int:
     """Return the git subprocess timeout in seconds from ``HYDRA_GIT_TIMEOUT_S``
@@ -260,16 +266,68 @@ def _git_repo_root(path: str | Path) -> str | None:
     return res.stdout.strip() if res.returncode == 0 else None
 
 
+def _worktree_repo_id(repo_root: str) -> str:
+    """Stable per-repo directory-name id derived from ``repo_root``.
+
+    Used to namespace the shared worktree root so attended worktrees for
+    different repos never collide when they share ``HYDRA_WORKTREE_ROOT`` /
+    ``AIAPP_BASE``. Sanitized the same way ``_provision_worktree`` sanitizes
+    ``run_id`` — alnum/-/_ only, never empty.
+    """
+    name = Path(repo_root).resolve().name if repo_root else ""
+    safe = "".join(c for c in name if c.isalnum() or c in "-_")
+    return safe or "repo"
+
+
+def resolve_worktree_root(repo_root: str) -> Path:
+    """Resolve the directory under which attended worktrees for ``repo_root``
+    are provisioned, namespaced per-repo as ``<root>/<repo_id>``.
+
+    Resolution order (mirrors the ecosystem ``AIAPP_BASE`` convention
+    documented in ``docs/PORTABILITY.md``):
+
+      1. ``HYDRA_WORKTREE_ROOT`` env var — explicit override, honored as-is.
+      2. ``AIAPP_BASE`` env var — ``<AIAPP_BASE>/.hydra-worktrees``.
+      3. Sibling fallback — ``<parent of repo_root>/.hydra-worktrees``. This
+         mirrors the convention's own fallback (repo_root is normally a
+         direct child of the shared base directory), so a bare checkout with
+         no env configured still gets a real sibling location rather than an
+         error.
+
+    Moved OUT of ``<repo_root>/.harness/worktrees`` (2026-08): a test runner
+    that globs the repo tree from repo_root would otherwise pick up every
+    attended stage's worktree copy of ``tests/`` alongside the real one
+    (a greenfield project reported 62 tests where 31 existed), and untracked
+    ``.hydra/``/``.harness/`` state nested inside the target repo caused a
+    real merge abort. The write-block hooks' allow-list is anchored to this
+    same env var (see ``plugins/hydra/hooks/hydra-block-direct-write.ps1``),
+    so relocating here and there must be kept in lockstep.
+    """
+    env_override = os.environ.get("HYDRA_WORKTREE_ROOT")
+    if env_override:
+        base = Path(env_override)
+    else:
+        aiapp_base = os.environ.get("AIAPP_BASE")
+        if aiapp_base:
+            base = Path(aiapp_base) / ".hydra-worktrees"
+        else:
+            base = Path(repo_root).resolve().parent / ".hydra-worktrees"
+    return base / _worktree_repo_id(repo_root)
+
+
 def _provision_worktree(repo_root: str, run_id: str) -> tuple[str, str] | None:
     """Create a linked worktree + branch off HEAD for an attended stage.
 
     Returns ``(worktree_path, branch)`` or None on any failure (caller falls
-    back to in-place). The worktree lives under ``.harness/worktrees/`` so the
-    write-block hook permits the engineer's writes there.
+    back to in-place). The worktree lives under ``resolve_worktree_root()``
+    (default ``<AIAPP_BASE>/.hydra-worktrees/<repo_id>/``, overridable via
+    ``HYDRA_WORKTREE_ROOT``) — NOT inside ``repo_root`` — which the write-block
+    hook's allow-list resolves the same way so the engineer's writes there
+    stay hook-permitted.
     """
     safe = "".join(c for c in str(run_id) if c.isalnum() or c in "-_") or "run"
     branch = f"attended/{safe}"
-    wt = Path(repo_root) / ".harness" / "worktrees" / f"attended-{safe}"
+    wt = resolve_worktree_root(repo_root) / f"attended-{safe}"
     try:
         wt.parent.mkdir(parents=True, exist_ok=True)
         if wt.exists():
@@ -623,6 +681,100 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Attended-worktree janitor                                                   #
+# --------------------------------------------------------------------------- #
+# `_finalize` already removes a stage's worktree on every code path it reaches
+# (pass, surfaced, aborted). This janitor exists for the case it never
+# reaches: a killed session, a crashed host process, or any other exit mid
+# await_generate/await_judge that leaves the worktree (and its registered git
+# branch) on disk with nothing left to remove it. It is intentionally
+# separate from pp's `janitor.ts` (mtime-staleness based) — an attended run
+# can legitimately sit paused on HITL for days, and mtime staleness cannot
+# tell that apart from a truly abandoned worktree; only the Hydra cursor's
+# state can. pp's janitor must skip `attended/*` branches/worktrees entirely
+# rather than gain attended-awareness itself (kept out of this module's
+# scope; see docs/PORTABILITY.md-adjacent worktree relocation notes).
+#
+# Safety invariants (both required, neither may be relaxed by a caller):
+#   - NEVER remove a worktree whose cursor is non-terminal (state not in
+#     `_TERMINAL`), including a worktree with NO discoverable cursor at all —
+#     "no cursor found" is treated as "cannot prove terminal", not as "safe
+#     to remove". A worktree observed mid-provision (cursor not yet written)
+#     must never be swept out from under `begin_stage`.
+#   - NEVER delete a git branch. A preserved `attended/<run_id>` branch is the
+#     only remaining copy of surfaced/non-landed work; only the linked
+#     worktree checkout is removed, exactly like `_remove_worktree` does
+#     everywhere else in this module.
+
+def _find_attended_cursor(project_root: str, run_id: str) -> Path | None:
+    """Locate the cursor file for ``run_id`` under ``<project_root>/.hydra/``.
+
+    The cursor path is keyed by ``(workflow_id, run_id)`` and the janitor only
+    knows ``run_id`` (parsed from the worktree dirname), so this globs across
+    every workflow_id directory. Returns None if no match (or more than one
+    ambiguous match) is found — ambiguity is treated the same as "no cursor"
+    by the caller (fail toward not-removing).
+    """
+    root = Path(project_root) / ".hydra"
+    if not root.is_dir():
+        return None
+    safe_run = "".join(c for c in str(run_id) if c.isalnum() or c in "-_") or "run"
+    matches = sorted(root.glob(f"*/attended/{safe_run}.json"))
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> dict[str, Any]:
+    """Remove attended worktrees whose cursor has reached a terminal state;
+    skip (never remove) anything whose cursor is non-terminal or missing.
+
+    Scans ``resolve_worktree_root(repo_root)`` for ``attended-*`` directories
+    (the same naming ``_provision_worktree`` creates), looks up each one's
+    cursor via ``_find_attended_cursor``, and removes only the ones proven
+    terminal. Never deletes a branch. Never raises — per-entry failures are
+    collected in the returned report rather than aborting the sweep.
+
+    Returns ``{"removed": [...], "skipped": [...], "errors": [...]}`` where
+    each entry is ``{"worktree": path, "run_id": ..., "reason": ...}``.
+    """
+    report: dict[str, Any] = {"removed": [], "skipped": [], "errors": []}
+    root = project_root or repo_root
+    wt_root = resolve_worktree_root(repo_root)
+    if not wt_root.is_dir():
+        return report
+    for entry in sorted(wt_root.iterdir()):
+        if not entry.is_dir() or not entry.name.startswith("attended-"):
+            continue
+        run_id = entry.name[len("attended-"):]
+        try:
+            cursor_file = _find_attended_cursor(root, run_id)
+            if cursor_file is None:
+                report["skipped"].append({
+                    "worktree": str(entry), "run_id": run_id,
+                    "reason": "no_cursor_found",
+                })
+                continue
+            cursor = load_cursor(cursor_file)
+            state = cursor.get("state")
+            if state not in _TERMINAL:
+                report["skipped"].append({
+                    "worktree": str(entry), "run_id": run_id,
+                    "reason": f"non_terminal_state:{state}",
+                })
+                continue
+            _remove_worktree(repo_root, str(entry))
+            report["removed"].append({
+                "worktree": str(entry), "run_id": run_id, "state": state,
+            })
+        except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the sweep
+            report["errors"].append({
+                "worktree": str(entry), "run_id": run_id, "error": str(exc)[:300],
+            })
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # Stage-active sentinel (Marker 2 for the PreToolUse write-enforcement hooks) #
 # --------------------------------------------------------------------------- #
 # The hooks (hydra-block-direct-write.ps1 / hydra-block-bash-writes.ps1 /
@@ -765,9 +917,10 @@ def _capture_baseline_failures(
     inside a worktree) are captured as the baseline.  A later smoke-fail
     is treated as clean if current failures ⊆ baseline.
 
-    GAP-a2 (Fix 3): tries repo_root first when provided, since a worktree
-    at <repo>/.harness/worktrees/attended-X does NOT have a tests/ directory
-    of its own — the tests live in the repo root.  Without repo_root, falls
+    GAP-a2 (Fix 3): tries repo_root first when provided, since an attended
+    worktree (resolved via ``resolve_worktree_root()``, outside repo_root)
+    does NOT have a tests/ directory of its own — the tests live in the repo
+    root.  Without repo_root, falls
     back to project_path then project_path.parent (less reliable for worktrees,
     which may be several levels deep under the repo root).
     Fail-soft: any exception returns an empty list (no baseline → smoke
