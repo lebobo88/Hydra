@@ -1707,6 +1707,7 @@ def test_revert_merge_commit_conflict_clean_abort(tmp_path):
     _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
 
     _git(["checkout", base_branch], tmp_path)
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
     merge_res = _git(["merge", "--no-ff", "--no-edit", "feature"], tmp_path)
     assert merge_res.returncode == 0, merge_res.stderr
     merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
@@ -1720,7 +1721,8 @@ def test_revert_merge_commit_conflict_clean_abort(tmp_path):
     assert (tmp_path / ".git" / "REVERT_HEAD").exists()
     assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == merge_sha
 
-    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), merge_sha, expected_base=pre_merge_base)
 
     assert out["reverted"] is False
     assert out["abort_failed"] is False
@@ -1768,6 +1770,7 @@ def test_revert_merge_commit_preflight_refusal_is_not_reported_as_abort_failed(t
     _git(["commit", "-m", "c2-feature", "--no-verify"], tmp_path)
 
     _git(["checkout", base_branch], tmp_path)
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
     merge_res = _git(["merge", "--no-ff", "--no-edit", "feature2"], tmp_path)
     assert merge_res.returncode == 0
     merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
@@ -1776,7 +1779,8 @@ def test_revert_merge_commit_preflight_refusal_is_not_reported_as_abort_failed(t
     # git refuses the revert upfront, before any sequencer exists.
     (tmp_path / "conflict.py").write_text("uncommitted-dirty-edit\n", encoding="utf-8")
 
-    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), merge_sha, expected_base=pre_merge_base)
 
     assert out["reverted"] is False
     # The key assertion this test exists for: NOT abort_failed, despite
@@ -1827,6 +1831,7 @@ def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_pa
     _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
 
     _git(["checkout", base_branch], tmp_path)
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
     merge_res = _git(["merge", "--no-ff", "--no-edit", "feature3"], tmp_path)
     assert merge_res.returncode == 0, merge_res.stderr
     merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
@@ -1850,7 +1855,8 @@ def test_revert_merge_commit_genuine_abort_failure_leaves_sequencer_state(tmp_pa
 
     monkeypatch.setattr(host_bridge, "_git", _sabotage_abort_only)
 
-    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), merge_sha, expected_base=pre_merge_base)
 
     assert out["reverted"] is False
     assert out["abort_failed"] is True
@@ -1918,6 +1924,7 @@ def test_revert_merge_commit_active_vs_unknown_produce_distinguishable_state(tmp
         _git(["commit", "-m", "cf", "--no-verify"], repo_path)
 
         _git(["checkout", base_branch], repo_path)
+        pre_merge_base = _git(["rev-parse", "HEAD"], repo_path).stdout.strip()
         merge_res = _git(["merge", "--no-ff", "--no-edit", branch_name], repo_path)
         assert merge_res.returncode == 0, merge_res.stderr
         merge_sha = _git(["rev-parse", "HEAD"], repo_path).stdout.strip()
@@ -1925,12 +1932,12 @@ def test_revert_merge_commit_active_vs_unknown_produce_distinguishable_state(tmp
         seed = _git(["revert", "--no-commit", seed_target_sha], repo_path)
         assert seed.returncode != 0, "expected the seed revert to genuinely conflict"
         assert (repo_path / ".git" / "REVERT_HEAD").exists()
-        return merge_sha
+        return merge_sha, pre_merge_base
 
     # Scenario A: sequencer genuinely stays active (abort sabotaged).
     repo_a = tmp_path / "repo_a"
     repo_a.mkdir()
-    merge_sha_a = _seed_conflicted_merge(repo_a, "feature-active")
+    merge_sha_a, pre_merge_base_a = _seed_conflicted_merge(repo_a, "feature-active")
     real_git = host_bridge._git
 
     def _sabotage_abort_only(args, cwd, *a, **k):
@@ -1942,14 +1949,15 @@ def test_revert_merge_commit_active_vs_unknown_produce_distinguishable_state(tmp
         return real_git(args, cwd, *a, **k)
 
     monkeypatch.setattr(host_bridge, "_git", _sabotage_abort_only)
-    out_active = host_bridge._revert_merge_commit(str(repo_a), merge_sha_a)
+    out_active = host_bridge._revert_merge_commit(
+        str(repo_a), merge_sha_a, expected_base=pre_merge_base_a)
     monkeypatch.undo()
 
     # Scenario B: sequencer state genuinely unverifiable (git-dir sabotaged),
     # even though the real abort underneath actually succeeds.
     repo_b = tmp_path / "repo_b"
     repo_b.mkdir()
-    merge_sha_b = _seed_conflicted_merge(repo_b, "feature-unknown")
+    merge_sha_b, pre_merge_base_b = _seed_conflicted_merge(repo_b, "feature-unknown")
     real_git_b = host_bridge._git
 
     def _sabotage_git_dir_resolution(args, cwd, *a, **k):
@@ -1961,7 +1969,8 @@ def test_revert_merge_commit_active_vs_unknown_produce_distinguishable_state(tmp
         return real_git_b(args, cwd, *a, **k)
 
     monkeypatch.setattr(host_bridge, "_git", _sabotage_git_dir_resolution)
-    out_unknown = host_bridge._revert_merge_commit(str(repo_b), merge_sha_b)
+    out_unknown = host_bridge._revert_merge_commit(
+        str(repo_b), merge_sha_b, expected_base=pre_merge_base_b)
     monkeypatch.undo()
 
     # Both share the same truthy abort_failed bool -- that alone must not
@@ -2031,6 +2040,7 @@ def test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed(tmp
     _git(["commit", "-m", "cf", "--no-verify"], tmp_path)
 
     _git(["checkout", base_branch], tmp_path)
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
     merge_res = _git(["merge", "--no-ff", "--no-edit", "feature5"], tmp_path)
     assert merge_res.returncode == 0, merge_res.stderr
     merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
@@ -2051,7 +2061,8 @@ def test_revert_merge_commit_uninspectable_git_dir_fails_toward_abort_failed(tmp
 
     monkeypatch.setattr(host_bridge, "_git", _sabotage_git_dir_resolution)
 
-    out = host_bridge._revert_merge_commit(str(tmp_path), merge_sha)
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), merge_sha, expected_base=pre_merge_base)
 
     assert out["reverted"] is False
     # The key assertions this test exists for: uninspectable fails TOWARD
@@ -2123,6 +2134,7 @@ def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
     assert wt_res.returncode == 0, wt_res.stderr
     assert not (wt_path / ".git").is_dir(), "expected a linked worktree (gitdir file, not a real .git dir)"
 
+    pre_merge_base = _git(["rev-parse", "HEAD"], wt_path).stdout.strip()
     merge_res = _git(["merge", "--no-ff", "--no-edit", "feature4"], wt_path)
     assert merge_res.returncode == 0, merge_res.stderr
     merge_sha = _git(["rev-parse", "HEAD"], wt_path).stdout.strip()
@@ -2140,7 +2152,8 @@ def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
     assert real_git_dir.resolve() != (wt_path / ".git").resolve()
     assert (real_git_dir / "REVERT_HEAD").exists()
 
-    out = host_bridge._revert_merge_commit(str(wt_path), merge_sha)
+    out = host_bridge._revert_merge_commit(
+        str(wt_path), merge_sha, expected_base=pre_merge_base)
 
     assert out["reverted"] is False
     assert out["abort_failed"] is False
@@ -2152,3 +2165,259 @@ def test_revert_merge_commit_resolves_git_dir_for_linked_worktree(tmp_path):
     assert not (real_git_dir / "REVERT_HEAD").exists()
     status = _git(["status", "--porcelain"], wt_path).stdout
     assert status.strip() == "", f"expected a clean worktree after abort, got: {status!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Merge no-op / already-merged detection (data-loss fix)                      #
+# --------------------------------------------------------------------------- #
+# _merge_branch_back's old guard only caught "branch tip IS current HEAD"
+# (branch_sha == base). For a branch that was ALREADY merged earlier (tip
+# is an ANCESTOR of HEAD, not equal to it), `git merge --no-ff --no-edit
+# <branch>` prints "Already up to date.", exits 0, and creates no commit --
+# yet the old code unconditionally read `rev-parse HEAD` afterward and
+# reported it as a fabricated "merged" sha. `recover_stalled_stage` then
+# reverted that unrelated commit on any non-passing outcome. These tests
+# pin the fix (before/after HEAD comparison) and its downstream safety
+# consequence.
+
+def test_merge_branch_back_already_merged_branch_reports_no_merge_no_sha(tmp_path):
+    """A branch whose tip is an ancestor of HEAD (already merged earlier)
+    must be reported as merged=False with the already_merged marker and NO
+    sha -- not a fabricated merged=True pointing at whatever unrelated
+    commit HEAD already was.
+
+    This is the test that FAILS if Fix 1 is reverted: with the old
+    branch_sha == base guard, branch_sha (an ancestor, not equal to base)
+    does not match and the code falls through to git merge, which no-ops,
+    then unconditionally reports merged=True with HEAD's unrelated sha."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    branch = "attended/already-merged"
+    _git(["checkout", "-b", branch], tmp_path)
+    (tmp_path / "feature.py").write_text("print(1)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "feature work", "--no-verify"], tmp_path)
+    _git(["checkout", base_branch], tmp_path)
+
+    # Merge it in for real, exactly once, BEFORE calling the function under
+    # test -- this is what "already merged" means.
+    merge_res = _git(["merge", "--no-ff", "--no-edit", branch], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+
+    # An unrelated later commit lands on HEAD -- this is the commit that
+    # must NOT be mistaken for a fresh merge of `branch`.
+    (tmp_path / "unrelated.py").write_text("print(2)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "unrelated later work", "--no-verify"], tmp_path)
+    unrelated_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    out = host_bridge._merge_branch_back(str(tmp_path), branch)
+
+    assert out["merged"] is False
+    assert out["sha"] is None
+    assert out["error"] == "already_merged"
+    # The repo must be untouched -- no new commit, no rewritten HEAD.
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == unrelated_sha
+
+
+def test_merge_branch_back_genuine_merge_still_works_and_reports_base(tmp_path):
+    """The real merge path is unaffected by the fix: a branch with genuine
+    new commits merges normally, reports merged=True with the new sha, and
+    now additionally reports the pre-merge base for provenance."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    branch = "attended/genuine-merge"
+    _git(["checkout", "-b", branch], tmp_path)
+    (tmp_path / "feature2.py").write_text("print(2)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "feature2 work", "--no-verify"], tmp_path)
+    _git(["checkout", base_branch], tmp_path)
+
+    out = host_bridge._merge_branch_back(str(tmp_path), branch)
+
+    assert out["merged"] is True
+    assert out["error"] is None
+    assert out["base"] == pre_merge_base
+    head = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    assert out["sha"] == head
+    assert head != pre_merge_base
+    assert (tmp_path / "feature2.py").exists()
+
+
+def test_merge_branch_back_tip_equals_head_still_reports_no_changes_to_merge(tmp_path):
+    """The fast-path guard (branch tip IS current HEAD) must still work and
+    remain distinguishable from already_merged."""
+    _init_repo(tmp_path)
+    head = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    branch = "attended/tip-equals-head"
+    _git(["branch", branch], tmp_path)  # branch created AT current HEAD, no new commits
+
+    out = host_bridge._merge_branch_back(str(tmp_path), branch)
+
+    assert out["merged"] is False
+    assert out["sha"] is None
+    assert out["error"] == "no_changes_to_merge"
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == head
+
+
+def test_revert_merge_commit_refuses_provenance_mismatch_even_when_head_equals_it(tmp_path):
+    """Fix 2's safety invariant: _revert_merge_commit must refuse to revert
+    a commit it did not create, EVEN WHEN HEAD == merge_sha (the only
+    precondition the old code checked). This reproduces the live
+    incident's core defect directly: a caller passes a sha that happens to
+    be HEAD but was never produced by merging from the caller's claimed
+    expected_base.
+
+    This is the test that FAILS if Fix 2 is reverted (or expected_base is
+    dropped/ignored): the old code has no way to distinguish "a merge
+    commit this call produced" from "literally any commit that happens to
+    be HEAD right now", so it would proceed to revert unrelated_sha below,
+    discarding an operator's real work."""
+    _init_repo(tmp_path)
+
+    # A commit that is NOT a merge this recovery created -- an ordinary
+    # single-parent commit an operator made, standing in for the live
+    # incident's "merge of a different branch carrying a real fix".
+    (tmp_path / "operator_work.py").write_text("print(3)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "operators real work", "--no-verify"], tmp_path)
+    unrelated_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    # A claimed "expected_base" that does NOT match this commit's parent --
+    # the mismatch that must trigger refusal.
+    bogus_base = "0" * 40
+
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), unrelated_sha, expected_base=bogus_base)
+
+    assert out["reverted"] is False
+    assert "provenance_mismatch" in out["error"]
+    # The repo must be completely untouched -- no revert attempted at all.
+    assert _git(["rev-parse", "HEAD"], tmp_path).stdout.strip() == unrelated_sha
+    assert (tmp_path / "operator_work.py").exists()
+    status = _git(["status", "--porcelain"], tmp_path).stdout
+    assert status.strip() == ""
+
+
+def test_revert_merge_commit_accepts_matching_provenance_and_still_reverts(tmp_path):
+    """The provenance guard must not break the legitimate case: a real
+    merge commit whose mainline parent genuinely equals the caller's
+    observed expected_base still reverts correctly."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    pre_merge_base = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    branch = "attended/provenance-ok"
+    _git(["checkout", "-b", branch], tmp_path)
+    (tmp_path / "feature3.py").write_text("print(3)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "feature3 work", "--no-verify"], tmp_path)
+    _git(["checkout", base_branch], tmp_path)
+
+    merge_res = _git(["merge", "--no-ff", "--no-edit", branch], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+    merge_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    out = host_bridge._revert_merge_commit(
+        str(tmp_path), merge_sha, expected_base=pre_merge_base)
+
+    assert out["reverted"] is True
+    assert not (tmp_path / "feature3.py").exists()
+
+
+def test_recover_stalled_stage_already_merged_branch_reproduces_live_incident(tmp_path):
+    """Direct reproduction of the live incident: a repo with an
+    already-merged branch, plus an UNRELATED LATER commit at HEAD carrying
+    real operator work, driven through recover_stalled_stage with a
+    non-passing outcome. The unrelated commit must survive intact -- no
+    revert of any kind may touch it.
+
+    Before the fix, this exact shape caused _merge_branch_back to report
+    merged=True with the unrelated commit's sha, and the subsequent revert
+    (triggered by the non-passing outcome below) discarded it."""
+    _init_repo(tmp_path)
+    base_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=tmp_path,
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    branch = "attended/already-merged-recovery"
+    _git(["checkout", "-b", branch], tmp_path)
+    (tmp_path / "old_feature.py").write_text("print(4)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "old feature work", "--no-verify"], tmp_path)
+    _git(["checkout", base_branch], tmp_path)
+    merge_res = _git(["merge", "--no-ff", "--no-edit", branch], tmp_path)
+    assert merge_res.returncode == 0, merge_res.stderr
+
+    # This stands in for the "760b2bb" commit in the live incident: a real,
+    # unrelated, later merge carrying a genuine fix that must never be
+    # silently reverted.
+    (tmp_path / "important_fix.py").write_text("print(5)\n", encoding="utf-8")
+    _git(["add", "-A"], tmp_path)
+    _git(["commit", "-m", "unrelated real fix landed later", "--no-verify"], tmp_path)
+    protected_sha = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-incident" / "attended" / "run_incident.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-incident",
+        "run_id": "run_incident",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",  # non-passing outcome
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "revise",
+            "critique_md": "needs work",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-incident-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    # Recovery correctly fails to merge (there was nothing new to merge from
+    # the already-merged branch) -- but the point of this test is what did
+    # NOT happen: no revert of the protected, unrelated commit.
+    assert rec["merge"]["merged"] is False
+    assert rec["merge"]["error"] == "already_merged"
+    assert rec["merge"].get("reverted") is not True
+    head_after = _git(["rev-parse", "HEAD"], tmp_path).stdout.strip()
+    assert head_after == protected_sha, (
+        "the unrelated, already-landed commit was touched by recovery -- "
+        "this is the exact data-loss shape from the live incident")
+    assert (tmp_path / "important_fix.py").exists()
+    assert (tmp_path / "old_feature.py").exists()

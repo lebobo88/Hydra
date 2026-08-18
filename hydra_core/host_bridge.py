@@ -364,16 +364,38 @@ def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
     change to the branch before that removal, so the branch itself still
     carries the full change set. Unlike ``_merge_worktree_back`` this never
     touches ``worktree_path`` (there isn't one) — it only reads/merges the
-    already-committed branch. Never raises."""
-    out: dict[str, Any] = {"merged": False, "sha": None, "error": None}
+    already-committed branch.
+
+    Two DISTINCT no-op shapes exist and must not be collapsed into one
+    marker: ``branch_sha == base`` means the branch's tip IS the current
+    HEAD (nothing to merge, the branch and HEAD are literally the same
+    commit) -- reported as ``no_changes_to_merge``. But a branch that was
+    already merged EARLIER (its tip is an ancestor of HEAD, not equal to
+    it) does NOT hit that check: ``git merge --no-ff --no-edit <branch>``
+    for an already-merged branch prints "Already up to date.", exits 0,
+    and creates NO commit -- yet a naive caller that then does
+    ``rev-parse HEAD`` unconditionally would report a fabricated "merged"
+    sha (actually whatever unrelated commit HEAD already pointed to).  Do
+    NOT parse git's "Already up to date." text to detect this -- that
+    string is localizable and version-dependent. The only authoritative
+    check is comparing commit ids: capture HEAD before the merge attempt
+    and compare to HEAD after. If HEAD did not move, git created no
+    commit and nothing was merged, reported as ``already_merged`` (with no
+    sha) -- a genuinely different situation from ``no_changes_to_merge``
+    (branch has nothing new) worth keeping distinguishable for the
+    operator. ``out["base"]`` records the pre-merge HEAD whenever a merge
+    commit IS created, so ``_revert_merge_commit`` can verify it is
+    reverting a commit this call actually produced (mainline parent ==
+    base) rather than trusting the reported sha blindly. Never raises."""
+    out: dict[str, Any] = {"merged": False, "sha": None, "base": None, "error": None}
     try:
         chk = _git(["rev-parse", "--verify", branch], repo_root)
         if chk.returncode != 0:
             out["error"] = f"branch_not_found: {branch}"
             return out
         branch_sha = chk.stdout.strip()
-        base = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
-        if branch_sha == base:
+        pre_head = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+        if branch_sha == pre_head:
             out["error"] = "no_changes_to_merge"
             return out
         mres = _git(["merge", "--no-ff", "--no-edit", branch], repo_root)
@@ -381,8 +403,17 @@ def _merge_branch_back(repo_root: str, branch: str) -> dict[str, Any]:
             _git(["merge", "--abort"], repo_root)
             out["error"] = f"merge_failed: {(mres.stderr or mres.stdout).strip()[:300]}"
             return out
+        post_head = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+        if post_head == pre_head:
+            # git exited 0 but HEAD never moved -- "Already up to date.":
+            # branch_sha is an ancestor of pre_head, not equal to it, so the
+            # fast path above missed it. No commit was created; report the
+            # truth instead of a phantom "merged" sha.
+            out["error"] = "already_merged"
+            return out
         out["merged"] = True
-        out["sha"] = _git(["rev-parse", "HEAD"], repo_root).stdout.strip()
+        out["sha"] = post_head
+        out["base"] = pre_head
     except Exception as e:  # noqa: BLE001
         out["error"] = f"merge_exception: {e!r}"[:300]
     return out
@@ -448,7 +479,9 @@ def _revert_sequencer_state(repo_root: str) -> str:
     return "active" if active else "clean"
 
 
-def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
+def _revert_merge_commit(
+    repo_root: str, merge_sha: str, *, expected_base: str,
+) -> dict[str, Any]:
     """Undo a merge commit this recovery itself just created, via ``git
     revert`` rather than ``git reset --hard`` -- it adds a new commit instead
     of rewriting history, so it never rewrites or discards any pre-existing
@@ -457,6 +490,29 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
     sequencer, this leaves the repo sitting mid-revert (conflicted index /
     half-applied working tree), which ``out["error"]`` reports rather than
     hides.
+
+    Provenance guard (the safety invariant this function exists to hold):
+    ``HEAD == merge_sha`` alone is NOT sufficient proof that ``merge_sha``
+    is a commit this recovery created. It is trivially satisfied by ANY
+    commit that happens to be HEAD -- including an unrelated commit an
+    operator or another workflow made, if a caller passes a stale/wrong sha
+    while HEAD genuinely equals it. That gap is exactly how the live
+    incident happened: a caller reported a fabricated "merged" sha for a
+    merge that never occurred (see ``_merge_branch_back``'s ``already_merged``
+    fix), HEAD legitimately equalled that sha (it was some earlier, real
+    commit), and this function faithfully reverted it. When the caller
+    passes ``expected_base`` (the HEAD it observed immediately BEFORE
+    invoking the merge that supposedly produced ``merge_sha``), this
+    function additionally requires ``merge_sha`` to be an actual merge
+    commit (>1 parent) whose FIRST (mainline) parent is exactly
+    ``expected_base``. A merge commit's first parent is definitionally
+    "what HEAD was before this merge ran" -- so this checks the one fact
+    that proves the commit was produced by merging INTO ``expected_base``,
+    not merely that it happens to be checked out right now. ``expected_base``
+    is a required keyword-only argument -- there is no way to call this
+    function without supplying it, so the provenance guard can never be
+    silently skipped by a caller that simply omits an argument. Every
+    in-tree caller supplies it.
 
     Whether the abort "worked" is judged by the real post-abort repo state
     (``_revert_sequencer_state``), not by the abort command's exit code --
@@ -494,6 +550,18 @@ def _revert_merge_commit(repo_root: str, merge_sha: str) -> dict[str, Any]:
             ["rev-list", "--parents", "-n", "1", merge_sha], repo_root,
         ).stdout.split()
         is_merge_commit = len(parents) > 2  # [commit, parent1, parent2, ...]
+        mainline_parent = parents[1] if len(parents) > 1 else None
+        if not is_merge_commit or mainline_parent != expected_base:
+            out["error"] = (
+                f"revert_refused_provenance_mismatch: merge_sha={merge_sha} "
+                f"is_merge_commit={is_merge_commit} mainline_parent="
+                f"{mainline_parent!r} expected_base={expected_base!r} -- "
+                "this commit's mainline parent does not match the base "
+                "this recovery observed before merging, so it cannot be "
+                "proven this recovery created it. Refusing to revert; "
+                "repo_root is left untouched."
+            )
+            return out
         revert_cmd = ["revert", "--no-edit"]
         if is_merge_commit:
             revert_cmd += ["-m", "1"]
@@ -1979,7 +2047,22 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = False
-        out["error"] = f"recovery merge failed: {merge.get('error')}"
+        if merge.get("error") == "already_merged":
+            # State-shaped, not failure-shaped: the branch's work is
+            # ALREADY present in repo_root (git reported "Already up to
+            # date." -- no new commit was needed or created). That is not
+            # "recovery failed to land the work"; it is "there was nothing
+            # left for recovery to land". Still ok=False -- recovery itself
+            # did not run smoke/re-finalize here, so the caller must not
+            # treat this as a completed pass -- but the wording must not
+            # read as "work missing" when the opposite is true.
+            out["error"] = (
+                "recovery found no merge to perform: the branch's work is "
+                "already present in repo_root (already_merged) -- no new "
+                "merge commit was needed or created"
+            )
+        else:
+            out["error"] = f"recovery merge failed: {merge.get('error')}"
         return out
 
     if outcome == "pass" and cursor.get("smoke_status") not in ("pass", "fail"):
@@ -2020,7 +2103,8 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     # clean revert happened.
     revert: dict[str, Any] | None = None
     if not passed and merge.get("merged") and merge.get("sha"):
-        revert = _revert_merge_commit(repo_root, merge["sha"])
+        revert = _revert_merge_commit(
+            repo_root, merge["sha"], expected_base=merge.get("base"))
         cursor["merge"]["reverted"] = bool(revert.get("reverted"))
         if revert.get("reverted"):
             cursor["merge"]["revert_sha"] = revert.get("sha")
