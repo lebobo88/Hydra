@@ -520,11 +520,20 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
             # prevent on the forward path, so the rollback path must not
             # reintroduce it.
             if prior_raw is not None:
+                # Reparse outside the best-effort try: a malformed prior must
+                # still trigger a deliberate rollback write (to {}), not be
+                # swallowed by the same except that guards the write itself.
+                # "we tried and the disk refused" (write failure, below) is
+                # the only case this rollback is allowed to give up on --
+                # "we never tried" (a JSONDecodeError here) is the bug this
+                # split prevents.
                 try:
-                    _atomic_write_repos_json(
-                        json.loads(prior_raw) if prior_raw.strip() else {}
-                    )
-                except Exception:  # noqa: BLE001 — best-effort rollback
+                    rollback_data = json.loads(prior_raw) if prior_raw.strip() else {}
+                except json.JSONDecodeError:
+                    rollback_data = {}
+                try:
+                    _atomic_write_repos_json(rollback_data)
+                except Exception:  # noqa: BLE001 — best-effort rollback: I/O failure only
                     pass
             else:
                 try:
