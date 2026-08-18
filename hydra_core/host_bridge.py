@@ -480,7 +480,7 @@ def _revert_sequencer_state(repo_root: str) -> str:
 
 
 def _revert_merge_commit(
-    repo_root: str, merge_sha: str, *, expected_base: str | None = None,
+    repo_root: str, merge_sha: str, *, expected_base: str,
 ) -> dict[str, Any]:
     """Undo a merge commit this recovery itself just created, via ``git
     revert`` rather than ``git reset --hard`` -- it adds a new commit instead
@@ -508,10 +508,11 @@ def _revert_merge_commit(
     ``expected_base``. A merge commit's first parent is definitionally
     "what HEAD was before this merge ran" -- so this checks the one fact
     that proves the commit was produced by merging INTO ``expected_base``,
-    not merely that it happens to be checked out right now. Callers that
-    omit ``expected_base`` (or pass None) skip this guard and fall back to
-    the old HEAD-only check -- kept for callers with no base to offer, but
-    every in-tree caller MUST supply it.
+    not merely that it happens to be checked out right now. ``expected_base``
+    is a required keyword-only argument -- there is no way to call this
+    function without supplying it, so the provenance guard can never be
+    silently skipped by a caller that simply omits an argument. Every
+    in-tree caller supplies it.
 
     Whether the abort "worked" is judged by the real post-abort repo state
     (``_revert_sequencer_state``), not by the abort command's exit code --
@@ -549,19 +550,18 @@ def _revert_merge_commit(
             ["rev-list", "--parents", "-n", "1", merge_sha], repo_root,
         ).stdout.split()
         is_merge_commit = len(parents) > 2  # [commit, parent1, parent2, ...]
-        if expected_base is not None:
-            mainline_parent = parents[1] if len(parents) > 1 else None
-            if not is_merge_commit or mainline_parent != expected_base:
-                out["error"] = (
-                    f"revert_refused_provenance_mismatch: merge_sha={merge_sha} "
-                    f"is_merge_commit={is_merge_commit} mainline_parent="
-                    f"{mainline_parent!r} expected_base={expected_base!r} -- "
-                    "this commit's mainline parent does not match the base "
-                    "this recovery observed before merging, so it cannot be "
-                    "proven this recovery created it. Refusing to revert; "
-                    "repo_root is left untouched."
-                )
-                return out
+        mainline_parent = parents[1] if len(parents) > 1 else None
+        if not is_merge_commit or mainline_parent != expected_base:
+            out["error"] = (
+                f"revert_refused_provenance_mismatch: merge_sha={merge_sha} "
+                f"is_merge_commit={is_merge_commit} mainline_parent="
+                f"{mainline_parent!r} expected_base={expected_base!r} -- "
+                "this commit's mainline parent does not match the base "
+                "this recovery observed before merging, so it cannot be "
+                "proven this recovery created it. Refusing to revert; "
+                "repo_root is left untouched."
+            )
+            return out
         revert_cmd = ["revert", "--no-edit"]
         if is_merge_commit:
             revert_cmd += ["-m", "1"]
@@ -2047,7 +2047,22 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = False
-        out["error"] = f"recovery merge failed: {merge.get('error')}"
+        if merge.get("error") == "already_merged":
+            # State-shaped, not failure-shaped: the branch's work is
+            # ALREADY present in repo_root (git reported "Already up to
+            # date." -- no new commit was needed or created). That is not
+            # "recovery failed to land the work"; it is "there was nothing
+            # left for recovery to land". Still ok=False -- recovery itself
+            # did not run smoke/re-finalize here, so the caller must not
+            # treat this as a completed pass -- but the wording must not
+            # read as "work missing" when the opposite is true.
+            out["error"] = (
+                "recovery found no merge to perform: the branch's work is "
+                "already present in repo_root (already_merged) -- no new "
+                "merge commit was needed or created"
+            )
+        else:
+            out["error"] = f"recovery merge failed: {merge.get('error')}"
         return out
 
     if outcome == "pass" and cursor.get("smoke_status") not in ("pass", "fail"):
