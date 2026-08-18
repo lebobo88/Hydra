@@ -73,6 +73,16 @@ def _begin(disp, tmp_path):
 
 
 def _submit(disp, res, call_key, **result_kw):
+    # LV-8: judge call_keys are now scoped as f"judge-{run_id}-{stage_id}-{idx}"
+    # (see host_bridge._apply_generate) rather than the bare "judge-0"/"judge-1"
+    # this suite historically hardcoded. Resolve the legacy literal against the
+    # cursor's actual pending call_key so callers below don't need to know the
+    # run_id/stage_id in scope at each call site.
+    if call_key in ("judge-0", "judge-1"):
+        cursor = host_bridge.load_cursor(res["cursor_path"])
+        pending_key = (cursor.get("pending_action") or {}).get("call_key")
+        if pending_key and pending_key.startswith("judge-"):
+            call_key = pending_key
     return host_bridge.submit_host_result(
         disp, cursor_file=res["cursor_path"],
         call_key=call_key, result=dict(result_kw))
@@ -262,7 +272,17 @@ def test_gapf_first_revise_transitions_to_generate_1(tmp_path):
 
 
 def test_gapf_generate_1_judge_key_is_judge_1(tmp_path):
-    """After generate-1 submit, the next awaited action must be judge-1."""
+    """After generate-1 submit, the next awaited action must be the judge
+    call scoped to run_id + stage_id + attempt_id + gen_idx=1.
+
+    Pins the FULL expected key rather than a startswith/endswith pattern: a
+    prefix/suffix check accepts malformed strings like "judge-garbage-1", and
+    the whole point of scoping the token is that it must be unambiguously
+    attributable to this run/stage/attempt/generate-index, not merely
+    "judge"-shaped. _begin() below fixes run_id="run-p4"; FakeDispatcher.call_mcp
+    fixes stage_id="stage-1" (start_stage) and attempt_id="att-1"
+    (record_attempt) -- so the scoped key is fully deterministic here.
+    """
     disp = FakeDispatcher(required_cross_vendor=True)
     res = _begin(disp, tmp_path)
     res = _submit(disp, res, "generate-0", text="edit1")
@@ -271,7 +291,11 @@ def test_gapf_generate_1_judge_key_is_judge_1(tmp_path):
     assert res["state"] == "await_generate"
     res = _submit(disp, res, "generate-1", text="revision")
     assert res["state"] == "await_judge"
-    assert res["host_action"]["call_key"] == "judge-1"
+    assert res["host_action"]["call_key"] == "judge-run-p4-stage-1-att-1-1", (
+        "LV-8/retry-fix: the scoped judge call_key must be exactly "
+        "judge-{run_id}-{stage_id}-{attempt_id}-{gen_idx}, not merely "
+        f"judge-...-1 shaped; got {res['host_action']['call_key']!r}"
+    )
 
 
 def test_gapf_second_revise_surfaces_without_further_retry(tmp_path):
