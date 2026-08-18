@@ -1164,7 +1164,16 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["gate_rubric"] = gate_rubric
     cursor["required_cross"] = required_cross
     cursor["state"] = "await_judge"
-    judge_call_key = f"judge-{gen_idx}"  # GAP-f: judge-0 or judge-1
+    # LV-8: scope the call_key with run_id + stage_id, not just the generate
+    # index. This value round-trips verbatim as pp's record_verdict
+    # idempotency_token (see _apply_judge below); an unscoped "judge-0"/
+    # "judge-1" collides across every stage/run in the shared pp daemon DB,
+    # so a second stage's genuine first verdict call silently short-circuits
+    # into the *first* stage's verdict row via pp's unscoped idempotency
+    # lookup. Scoping keeps the retry-safety property (same stage + same
+    # gen_idx replay => same token => same idempotent short-circuit) while
+    # eliminating cross-stage/cross-run collisions.
+    judge_call_key = f"judge-{run_id}-{stage_id}-{gen_idx}"
     cursor["pending_action"] = {
         "call_key": judge_call_key,
         "agent_type": judge_agent,

@@ -73,6 +73,16 @@ def _begin(disp, tmp_path):
 
 
 def _submit(disp, res, call_key, **result_kw):
+    # LV-8: judge call_keys are now scoped as f"judge-{run_id}-{stage_id}-{idx}"
+    # (see host_bridge._apply_generate) rather than the bare "judge-0"/"judge-1"
+    # this suite historically hardcoded. Resolve the legacy literal against the
+    # cursor's actual pending call_key so callers below don't need to know the
+    # run_id/stage_id in scope at each call site.
+    if call_key in ("judge-0", "judge-1"):
+        cursor = host_bridge.load_cursor(res["cursor_path"])
+        pending_key = (cursor.get("pending_action") or {}).get("call_key")
+        if pending_key and pending_key.startswith("judge-"):
+            call_key = pending_key
     return host_bridge.submit_host_result(
         disp, cursor_file=res["cursor_path"],
         call_key=call_key, result=dict(result_kw))
@@ -271,7 +281,11 @@ def test_gapf_generate_1_judge_key_is_judge_1(tmp_path):
     assert res["state"] == "await_generate"
     res = _submit(disp, res, "generate-1", text="revision")
     assert res["state"] == "await_judge"
-    assert res["host_action"]["call_key"] == "judge-1"
+    assert res["host_action"]["call_key"].startswith("judge-") and \
+        res["host_action"]["call_key"].endswith("-1"), (
+        "LV-8: the scoped judge call_key must still track the generate index "
+        f"(gen_idx=1); got {res['host_action']['call_key']!r}"
+    )
 
 
 def test_gapf_second_revise_surfaces_without_further_retry(tmp_path):
