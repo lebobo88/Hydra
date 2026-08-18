@@ -1996,3 +1996,74 @@ def test_p3_fleet_mid_prose_unknown_token_no_intake_hitl(tmp_path, monkeypatch):
     assert "supervisor.bad_repos_arg" not in kinds, (
         f"P3(d): fleet prose token must not trip supervisor.bad_repos_arg; got {kinds}"
     )
+
+
+# ---------------------------------------------------------------------------
+# recover-stalled-stage MCP resume action — must be reachable over MCP, not
+# only via `hydra resume --action recover-stalled-stage` on the CLI, and the
+# two independent copies of the action enum (mcp_servers/hydra_control/server.py
+# and hydra_core/toolshed.py's SCHEMA_OVERRIDES) must stay in lock-step.
+# ---------------------------------------------------------------------------
+
+
+def test_recover_stalled_stage_accepted_by_workflow_resume_enum(monkeypatch):
+    """workflow_resume's action validation must accept 'recover-stalled-stage'
+    (not just approve/reject/modify-budget/force-dispatch/change-squads), and
+    forward it (with --option <run_id>) through the exact same
+    _launch_resume path every other resume action uses -- no parallel code
+    path, per governance (a stranded workflow resumes only via
+    approve/resume)."""
+    import mcp_servers.hydra_control.server as _srv
+
+    assert "recover-stalled-stage" in _srv._RESUME_ACTIONS, (
+        "recover-stalled-stage must be a valid workflow_resume action"
+    )
+
+    captured: dict = {}
+
+    def _fake_launch_resume(workflow_id, action, option):
+        captured["workflow_id"] = workflow_id
+        captured["action"] = action
+        captured["option"] = option
+        return {"ok": True, "launched": True, "pid": 1234,
+                "workflow_id": workflow_id, "action": action, "log": "x.log"}
+
+    monkeypatch.setattr(_srv, "_launch_resume", _fake_launch_resume)
+
+    handlers = _srv._tool_handlers()
+    resume = handlers["hydra.workflow.resume"]
+    res = resume({
+        "workflow_id": "wf-recover-1",
+        "action": "recover-stalled-stage",
+        "option": "run_stranded_abc123",
+    })
+
+    assert res["ok"] is True, res
+    assert res.get("error") is None
+    # Must have gone through _launch_resume (the sanctioned resume path),
+    # not a bespoke recovery tool/handler.
+    assert captured["workflow_id"] == "wf-recover-1"
+    assert captured["action"] == "recover-stalled-stage"
+    assert captured["option"] == "run_stranded_abc123"
+
+
+def test_recover_stalled_stage_schema_enum_matches_between_server_and_toolshed():
+    """The two independent copies of the resume-action enum (the live MCP
+    server's tool schema, and hydra_core.toolshed's SCHEMA_OVERRIDES used for
+    offline/gateway schema serving) must list the exact same actions -- a
+    drift here means one surface advertises a capability the other refuses,
+    which is exactly the parity bug class this test guards against."""
+    import mcp_servers.hydra_control.server as _srv
+    from hydra_core.toolshed import SCHEMA_OVERRIDES
+
+    server_actions = set(_srv._RESUME_ACTIONS)
+    toolshed_actions = set(
+        SCHEMA_OVERRIDES["hydra_control"]["hydra.workflow.resume"]
+        ["properties"]["action"]["enum"]
+    )
+    assert "recover-stalled-stage" in server_actions
+    assert "recover-stalled-stage" in toolshed_actions
+    assert server_actions == toolshed_actions, (
+        f"resume action enum drift: server={server_actions!r} "
+        f"toolshed={toolshed_actions!r}"
+    )

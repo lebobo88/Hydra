@@ -1803,13 +1803,26 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
       was skipped; everything downstream (smoke, merge, finalize) reuses the
       existing ``_finalize`` machinery unchanged, so recovery for this shape
       exercises the SAME code path a normal pass finalize does.
-    - ``state == "surfaced"`` with a ``preserved_branch`` and no
-      ``verdict_recorded_for`` (an older cursor stranded by the pre-fix
+    - ``state == "surfaced"`` (an older cursor stranded by the pre-fix
       downgrade-then-finalize behavior): the worktree is already gone, but
-      ``_preserve_non_complete_work`` committed every uncommitted change to
-      the branch before removing it, so the branch still carries the full
-      diff. Recovery re-issues record_verdict, merges the branch directly via
-      ``_merge_branch_back``, and (best-effort) re-finalizes.
+      the branch that hosted the stage's work (``cursor["branch"]``, set once
+      at worktree creation and never cleared) still carries every commit the
+      engineer made. If there was ALSO uncommitted work when the worktree was
+      torn down, ``_preserve_non_complete_work`` committed it and recorded
+      ``cursor["preserved_branch"]``; that is preferred when present. When
+      the engineer committed everything cleanly, ``preserved_branch`` is
+      never set (there was nothing uncommitted to preserve) even though the
+      branch is just as recoverable, so recovery falls back to
+      ``cursor["branch"]`` after confirming it still exists in the repo --
+      refusing recovery in that case would invert the incentive (the tidier
+      the engineer, the less recoverable the stage). Recovery re-issues
+      record_verdict, merges the resolved branch directly via
+      ``_merge_branch_back``, and (best-effort) re-finalizes. Which branch
+      was used, and whether it came from ``preserved_branch`` or the
+      fallback, is recorded on the cursor (``recovery_branch``,
+      ``recovery_branch_source``) and in the trace
+      (``attended.recovery.branch_resolved``) so an operator can tell what
+      was actually merged.
 
     Idempotent: replays ``record_verdict`` with the payload's
     ``idempotency_token`` (== the original judge call_key), so pp returns the
@@ -1829,8 +1842,42 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     state = cursor.get("state")
     if state not in ("stalled_infra", "surfaced"):
         return {"ok": False, "error": f"cursor state {state!r} is not recoverable"}
-    if state == "surfaced" and not cursor.get("preserved_branch"):
-        return {"ok": False, "error": "surfaced cursor has no preserved_branch to recover from"}
+
+    # Resolve which branch to recover from. `preserved_branch` is set only by
+    # `_preserve_non_complete_work`/the merge-failure path, which run when
+    # there was UNCOMMITTED work to rescue -- an engineer who committed
+    # everything cleanly leaves it unset even though `cursor["branch"]` (set
+    # once at worktree creation and never cleared) still names a real branch
+    # with every commit. Refusing recovery in that case inverts the
+    # incentive (the tidier the engineer, the less recoverable the stage), so
+    # fall back to `cursor["branch"]` -- but only after confirming the branch
+    # actually exists; a stale/garbage-collected branch name must still
+    # refuse cleanly rather than hand a bogus ref to git merge downstream.
+    recovery_branch: str | None = None
+    recovery_branch_source: str | None = None
+    if state == "surfaced":
+        preserved = cursor.get("preserved_branch")
+        if preserved:
+            recovery_branch = preserved
+            recovery_branch_source = "preserved_branch"
+        else:
+            fallback = cursor.get("branch")
+            fallback_repo_root = cursor.get("repo_root") or cursor.get("project_path")
+            if fallback and fallback_repo_root:
+                chk = _git(["rev-parse", "--verify", fallback], fallback_repo_root)
+                if chk.returncode == 0:
+                    recovery_branch = fallback
+                    recovery_branch_source = "branch_fallback"
+        if not recovery_branch:
+            return {"ok": False, "error": (
+                "surfaced cursor has no preserved_branch and no recoverable "
+                "branch (cursor['branch'] is absent or no longer exists in "
+                "the repo) to recover from")}
+        cursor["recovery_branch"] = recovery_branch
+        cursor["recovery_branch_source"] = recovery_branch_source
+        _trace(cursor, "attended.recovery.branch_resolved", {
+            "branch": recovery_branch, "source": recovery_branch_source,
+        })
 
     stage_id = cursor.get("stage_id")
     attempt_id = cursor.get("attempt_id")
@@ -1892,10 +1939,11 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         out["ok"] = True
         return out
 
-    # state == "surfaced": pre-fix legacy shape. Worktree is gone; merge
-    # directly from the preserved branch, then best-effort re-finalize.
+    # state == "surfaced": worktree is gone; merge directly from the
+    # resolved branch (preserved_branch, or the branch_fallback resolved
+    # above), then best-effort re-finalize.
     repo_root = cursor.get("repo_root") or cursor.get("project_path")
-    branch = cursor["preserved_branch"]
+    branch = recovery_branch
     merge = _merge_branch_back(repo_root, branch)
     cursor["merge"] = merge
     _trace(cursor, "attended.recovery.merge", {

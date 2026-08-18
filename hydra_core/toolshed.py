@@ -697,6 +697,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                         "modify-budget",
                         "force-dispatch",
                         "change-squads",
+                        "recover-stalled-stage",
                     ],
                 },
                 "option": {"type": "string"},

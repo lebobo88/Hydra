@@ -1281,6 +1281,161 @@ def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_p
     assert rec["final_status"] == "surfaced"
 
 
+def test_recover_stalled_stage_surfaced_no_preserved_branch_falls_back_to_branch(tmp_path):
+    """A cleanly-committed engineer leaves the worktree with nothing
+    uncommitted, so `_preserve_non_complete_work` never sets
+    `preserved_branch` -- but `cursor["branch"]` still names the real branch
+    with every commit. Recovery must fall back to it instead of refusing, and
+    must record on the cursor + trace which branch it used and that it came
+    from the fallback (not preserved_branch)."""
+    _init_repo(tmp_path)
+    branch = "attended/clean-commit-run"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "clean_feature.py").write_text("print('clean')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "clean work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-clean" / "attended" / "run_clean.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-clean",
+        "run_id": "run_clean",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        # NOTE: no preserved_branch -- the engineer committed everything
+        # cleanly, so _preserve_non_complete_work never ran/never set it.
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-clean-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is not False, rec.get("error")
+    assert rec["merge"]["merged"] is True
+    assert (tmp_path / "clean_feature.py").exists()
+    saved = host_bridge.load_cursor(cfile)
+    assert saved["recovery_branch"] == branch
+    assert saved["recovery_branch_source"] == "branch_fallback"
+
+
+def test_recover_stalled_stage_surfaced_no_branch_at_all_refuses(tmp_path):
+    """When neither preserved_branch nor a valid cursor['branch'] exists,
+    recovery must still refuse cleanly with a clear error rather than
+    fabricating a branch to merge from."""
+    _init_repo(tmp_path)
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-nobranch" / "attended" / "run_nobranch.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-nobranch",
+        "run_id": "run_nobranch",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        # branch names a ref that was never created (e.g. gc'd or never
+        # pushed) -- must not be treated as recoverable.
+        "branch": "attended/never-existed",
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "finalized": True,
+        "charged": True,
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is False
+    assert "no recoverable" in rec["error"] or "no preserved_branch" in rec["error"]
+    assert disp.count("record_verdict") == 0
+
+
+def test_recover_stalled_stage_branch_with_no_commits_beyond_base_surfaces_honestly(tmp_path):
+    """The fallback branch exists but was branched off HEAD and never
+    advanced (no commits beyond base) -- there is nothing to merge.
+    Recovery must surface `no_changes_to_merge` honestly rather than
+    reporting success."""
+    _init_repo(tmp_path)
+    branch = "attended/empty-branch-run"
+    subprocess.run(["git", "branch", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-empty" / "attended" / "run_empty.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-empty",
+        "run_id": "run_empty",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "finalized": True,
+        "charged": True,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-empty-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+
+    assert rec["ok"] is False
+    assert "no_changes_to_merge" in rec["error"]
+    saved = host_bridge.load_cursor(cfile)
+    # Must not claim complete/passed when there was nothing to merge.
+    assert saved.get("final_status") != "complete"
+
+
 def test_revert_merge_commit_conflict_clean_abort(tmp_path):
     """When git revert fails but nothing else is wrong with repo_root, the
     subsequent `git revert --abort` succeeds and cleanly restores the repo.
