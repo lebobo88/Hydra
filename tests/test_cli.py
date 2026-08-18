@@ -189,6 +189,35 @@ def test_run_smoke_with_stub_dispatcher(capsys):
     assert payload["workflow_id"]
 
 
+def test_run_rejects_repo_and_repos_together(capsys):
+    """WS1 retry (finding 1): --repo and --repos are documented as mutually
+    exclusive (cli.py --repos help text, CLAUDE.md multi-repo campaign
+    contract) and the MCP transport already enforces it
+    (mcp_servers/hydra_control/server.py: _extract_repo_params). The CLI
+    transport pre-seeds both fields directly onto HydraState, bypassing
+    node_intake's goal-text ambiguity guard entirely, so it needs its own
+    check — verify it rejects fast rather than silently preferring one."""
+    rc = _run(["run", "Fix something", "--repo", "hydra", "--repos", "hydra,senate"],
+              project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "mutually exclusive" in err
+
+
+def test_plan_rejects_repo_and_repos_together(capsys):
+    """WS1 retry-2 (finding B): _cmd_plan pre-seeds target_repo_id and
+    target_repo_ids independently, exactly like _cmd_run, so it needs the
+    same fast-reject guard -- `hydra plan --repo X --repos Y,Z` must not be
+    left to node_intake's goal-text ambiguity guard, which never sees this
+    structured path (it only compares ids parsed OUT of root_goal, both
+    empty here)."""
+    rc = _run(["plan", "Fix something", "--repo", "hydra", "--repos", "hydra,senate"],
+              project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "mutually exclusive" in err
+
+
 # --- plan (non-detaching attended planning surface) --------------------------
 
 def _extract_json(out: str):
@@ -521,6 +550,69 @@ def test_replay_mints_new_workflow_id(capsys, tmp_path, monkeypatch):
 
 
 # --- approve ----------------------------------------------------------------
+
+def test_replay_carries_repo_targeting_fields_forward(capsys, monkeypatch):
+    """WS1 retry (finding 5): replay must carry target_repo_id,
+    target_repo_ids, and target_repo_subpath from the source checkpoint onto
+    replay_initial. Before this fix these three fields were simply absent
+    from the HydraState(...) constructor call in _cmd_replay, so a replay of
+    a --repo/--repos-targeted run silently fell back through intake's
+    cwd-fallback path -- landing in a different repo than the run it
+    replays, and breaking the determinism replay exists to provide.
+
+    Exercised via a fake supervisor (no real langgraph run / checkpoint
+    needed): get_state returns a fake snapshot whose .values carries all
+    three fields, and invoke() records the HydraState it was actually
+    called with so we can assert on it directly.
+
+    Scope note: this only validates the READER half of the fix (_cmd_replay
+    pulling target_repo_id/target_repo_ids/target_repo_subpath out of
+    `values` into replay_initial). It intentionally fabricates `values`
+    rather than driving a real checkpoint, so it cannot catch the producer
+    side ever failing to write target_repo_ids in the first place -- that
+    is covered separately by
+    test_repo_targeting.py::test_intake_patch_persists_target_repo_ids_for_checkpoint,
+    which asserts on the real node_intake return dict (the actual value
+    LangGraph would persist as `values["target_repo_ids"]`).
+    """
+    from hydra_core import supervisor as supervisor_mod
+
+    captured: dict = {}
+
+    class _FakeSnapshot:
+        def __init__(self, values):
+            self.values = values
+
+    class _FakeSupervisor:
+        def get_state(self, config):
+            return _FakeSnapshot({
+                "root_goal": "Fix something",
+                "phase": "dispatch",
+                "selected_squads": ["engineering"],
+                "target_repo_id": "hydra",
+                "target_repo_ids": ["hydra", "pair-programmer"],
+                "target_repo_subpath": "some/subdir",
+            })
+
+        def invoke(self, state, config=None):
+            captured["state"] = state
+            return {"phase": "done"}
+
+    def _fake_build_supervisor(**kwargs):
+        return _FakeSupervisor()
+
+    monkeypatch.setattr(supervisor_mod, "build_supervisor", _fake_build_supervisor)
+
+    valid_wf = "5ebd4268-5de0-4dbf-a82d-42c596d4818e"
+    rc = _run(["replay", valid_wf, "--from-phase", "dispatch"], project_root=REPO_ROOT)
+    capsys.readouterr()  # flush
+
+    assert rc == 0
+    replayed_state = captured["state"]
+    assert replayed_state.target_repo_id == "hydra"
+    assert replayed_state.target_repo_ids == ["hydra", "pair-programmer"]
+    assert replayed_state.target_repo_subpath == "some/subdir"
+
 
 def test_approve_is_real_resume_now(capsys, tmp_path, monkeypatch):
     # C2 (mesh-console-unification): `approve` is no longer a stub pointing at

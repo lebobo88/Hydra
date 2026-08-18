@@ -404,7 +404,9 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
 
 
 def _launch_run(goal: str, *, squad: str | None, budget: float | None,
-                workflow_id: str | None, risk: str | None = None) -> dict[str, Any]:
+                workflow_id: str | None, risk: str | None = None,
+                repo: str | None = None, repos: str | None = None,
+                repo_subpath: str | None = None) -> dict[str, Any]:
     """Launch a NEW workflow via a DETACHED `hydra run --live`.
 
     The host-facing deterministic launch surface (generalises web/server's
@@ -431,6 +433,12 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
         cmd.extend(["--budget", str(budget)])
     if risk is not None:
         cmd.extend(["--risk", risk])
+    if repo:
+        cmd.extend(["--repo", repo])
+    if repos:
+        cmd.extend(["--repos", repos])
+    if repo_subpath:
+        cmd.extend(["--subdir", repo_subpath])
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
@@ -553,7 +561,9 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
 
 
 def _run_plan(goal: str, *, squad: str | None, budget: float | None,
-              workflow_id: str | None, risk: str | None = None) -> dict[str, Any]:
+              workflow_id: str | None, risk: str | None = None,
+              repo: str | None = None, repos: str | None = None,
+              repo_subpath: str | None = None) -> dict[str, Any]:
     """Run `hydra plan` SYNCHRONOUSLY and return the planner state IN-BAND.
 
     The non-detaching counterpart to `_launch_run`: attended (host-bridged)
@@ -572,6 +582,12 @@ def _run_plan(goal: str, *, squad: str | None, budget: float | None,
         cli_args.extend(["--budget", str(budget)])
     if risk is not None:
         cli_args.extend(["--risk", risk])
+    if repo:
+        cli_args.extend(["--repo", repo])
+    if repos:
+        cli_args.extend(["--repos", repos])
+    if repo_subpath:
+        cli_args.extend(["--subdir", repo_subpath])
     return _run_cli_json(cli_args, timeout_s=_PLAN_TIMEOUT_S,
                          err_label="plan", workflow_id=wf)
 
@@ -711,6 +727,33 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
 
     _RISK_VALUES = frozenset({"low", "medium", "high"})
+    # Repo/repos/subpath: loose transport-level shape only (comma/dash/underscore
+    # tokens). The allow-list check happens once, at Hydra intake, regardless of
+    # whether the id arrived via goal text or this structured param (WS1-B) —
+    # this regex just keeps the value shell/argv-safe on its way to the CLI.
+    _REPO_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-,]{1,300}$")
+    _REPO_SUBPATH_RE = re.compile(r"^[A-Za-z0-9_\-./\\]{1,300}$")
+
+    def _extract_repo_params(args: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, str | None]]:
+        """Shared repo/repos/repo_subpath extraction for launch + plan.
+
+        Returns (error_dict_or_None, {"repo":..., "repos":..., "repo_subpath":...}).
+        """
+        repo = args.get("repo")
+        repo = str(repo).strip() if repo not in (None, "") else None
+        if repo is not None and not _REPO_TOKEN_RE.match(repo):
+            return {"ok": False, "error": "invalid_repo"}, {}
+        repos = args.get("repos")
+        repos = str(repos).strip() if repos not in (None, "") else None
+        if repos is not None and not _REPO_TOKEN_RE.match(repos):
+            return {"ok": False, "error": "invalid_repos"}, {}
+        if repo is not None and repos is not None:
+            return {"ok": False, "error": "repo and repos are mutually exclusive"}, {}
+        repo_subpath = args.get("repo_subpath")
+        repo_subpath = str(repo_subpath).strip() if repo_subpath not in (None, "") else None
+        if repo_subpath is not None and not _REPO_SUBPATH_RE.match(repo_subpath):
+            return {"ok": False, "error": "invalid_repo_subpath"}, {}
+        return None, {"repo": repo, "repos": repos, "repo_subpath": repo_subpath}
 
     def workflow_launch(args: dict[str, Any]) -> dict[str, Any]:
         """Launch a NEW workflow deterministically (detached `hydra run --live`).
@@ -742,8 +785,12 @@ def _tool_handlers() -> dict[str, Any]:
         risk = str(risk) if risk not in (None, "") else None
         if risk is not None and risk not in _RISK_VALUES:
             return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
+        _repo_err, _repo_params = _extract_repo_params(args)
+        if _repo_err is not None:
+            return _repo_err
         try:
-            return _launch_run(goal, squad=squad, budget=budget, workflow_id=workflow_id, risk=risk)
+            return _launch_run(goal, squad=squad, budget=budget, workflow_id=workflow_id,
+                               risk=risk, **_repo_params)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("run launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
@@ -780,8 +827,12 @@ def _tool_handlers() -> dict[str, Any]:
         risk = str(risk) if risk not in (None, "") else None
         if risk is not None and risk not in _RISK_VALUES:
             return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
+        _repo_err, _repo_params = _extract_repo_params(args)
+        if _repo_err is not None:
+            return _repo_err
         try:
-            return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id, risk=risk)
+            return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id,
+                             risk=risk, **_repo_params)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("plan failed")
             return {"ok": False, "error": f"plan_failed: {e}"}
@@ -888,6 +939,39 @@ def _tool_handlers() -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.exception("squad_list: discovery failed")
             return {"ok": False, "error": f"squad_list failed: {exc}", "squads": []}
+
+    def repo_list(args: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+        """WS1-C: READ-ONLY repo allow-list listing (built-ins + operator-
+        registered). Registration itself (`hydra repo register`) is CLI-only —
+        never exposed here — because it defines the allow-list; see
+        hydra_core.repo_registry.register_repo's docstring."""
+        try:
+            from hydra_core.repo_registry import _REPO_DIRNAMES, list_registered_repos
+            return {
+                "ok": True,
+                "builtin": dict(sorted(_REPO_DIRNAMES.items())),
+                "registered": list_registered_repos(),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("repo_list failed")
+            return {"ok": False, "error": f"repo_list failed: {exc}"}
+
+    def repo_resolve(args: dict[str, Any]) -> dict[str, Any]:
+        """WS1-C: READ-ONLY resolution — validates repo_id against the
+        allow-list and returns its resolved path (real git-root check), or
+        ok=false with a message. Never writes; safe to expose over MCP."""
+        repo_id = str(args.get("repo_id") or "").strip()
+        if not repo_id:
+            return {"ok": False, "error": "repo_id is required"}
+        try:
+            from hydra_core.repo_registry import resolve_repo_path
+            path = resolve_repo_path(repo_id)
+            return {"ok": True, "repo_id": repo_id.lower(), "path": str(path)}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("repo_resolve failed")
+            return {"ok": False, "error": f"repo_resolve failed: {exc}"}
 
     def envelope_record(args: dict[str, Any]) -> dict[str, Any]:
         """Record an envelope to episodic db / trace.
@@ -1102,6 +1186,8 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.cockpit.audit": cockpit_audit,
         "hydra.venom.cross_check": venom_cross_check,
         "hydra.squad.list": squad_list,
+        "hydra.repo.list": repo_list,
+        "hydra.repo.resolve": repo_resolve,
         "hydra.envelope.record": envelope_record,
         "hydra.telemetry.tail": telemetry_tail,
     }
@@ -1148,6 +1234,16 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "description": "Pre-allocated workflow id (optional)."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
                          "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
+                "repo": {"type": "string",
+                         "description": ("Single allow-listed repo id for engineering targeting "
+                                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
+                                        "validated at intake). Mutually exclusive with repos.")},
+                "repos": {"type": "string",
+                          "description": ("Comma-separated allow-listed repo ids for fleet mode, "
+                                         ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo.")},
+                "repo_subpath": {"type": "string",
+                                 "description": ("Repo-relative engineering target under repo/repos "
+                                                "(forwarded as --subdir).")},
             },
             "required": ["goal"],
         },
@@ -1174,6 +1270,16 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "description": "Pre-allocated workflow id (optional)."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
                          "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
+                "repo": {"type": "string",
+                         "description": ("Single allow-listed repo id for engineering targeting "
+                                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
+                                        "validated at intake). Mutually exclusive with repos.")},
+                "repos": {"type": "string",
+                          "description": ("Comma-separated allow-listed repo ids for fleet mode, "
+                                         ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo.")},
+                "repo_subpath": {"type": "string",
+                                 "description": ("Repo-relative engineering target under repo/repos "
+                                                "(forwarded as --subdir).")},
             },
             "required": ["goal"],
         },
@@ -1324,6 +1430,27 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "inputSchema": {
             "type": "object",
             "properties": {},
+        },
+    },
+    "hydra.repo.list": {
+        "description": (
+            "READ-ONLY: list the repo allow-list -- built-in ids plus operator-"
+            "registered ids from ~/.hydra/repos.json. Registration itself is "
+            "CLI-only (`hydra repo register`) and NOT exposed over MCP, since "
+            "the registry IS the allow-list. Returns {ok, builtin, registered}."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "hydra.repo.resolve": {
+        "description": (
+            "READ-ONLY: resolve an allow-listed repo_id to its absolute path, "
+            "with a real git-root verification (same check used at dispatch "
+            "time). Returns {ok:true, repo_id, path} or {ok:false, error}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Allow-listed repo id to resolve."},
+            },
+            "required": ["repo_id"],
         },
     },
     "hydra.envelope.record": {

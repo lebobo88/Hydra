@@ -167,6 +167,12 @@ class HydraState(BaseModel):
     root_goal: str = ""
     target_repo_id: Optional[str] = None  # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
     target_repo_subpath: Optional[str] = None  # optional repo-relative engineering subdir under target_repo_id
+    # Pre-seeded multi-repo targets for the structured API path (CLI --repos /
+    # hydra.workflow.plan repos=). Mirrors the goal-text --repos/--fleet token
+    # but arrives directly on state instead of being folded into root_goal.
+    # node_intake merges this into the fleet-wiring path and validates every
+    # id against the allow-list regardless of how it arrived (WS1-B).
+    target_repo_ids: list[str] = Field(default_factory=list)
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",
