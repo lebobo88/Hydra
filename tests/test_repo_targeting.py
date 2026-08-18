@@ -932,6 +932,55 @@ def test_preseeded_target_repo_ids_with_unknown_id_surfaces_hitl() -> None:
     assert "definitely-not-registered" in patch["pending_hitl"]["summary"]
 
 
+def test_intake_patch_persists_target_repo_ids_for_checkpoint() -> None:
+    """Finding A (WS1 retry-2): node_intake's returned `update` dict must
+    include target_repo_ids alongside target_repo_id/target_repo_subpath,
+    or LangGraph never persists it to the checkpoint (a node's return dict
+    is the ONLY thing LangGraph writes -- mutating state in place is not
+    enough). Without this key in the patch, _cmd_replay's
+    `values.get("target_repo_ids")` read is fed by a producer that never
+    wrote the field, so replaying a fleet-targeted run silently drops back
+    to single-repo/cwd-fallback behaviour.
+
+    This asserts against the REAL patch dict returned by the REAL node_intake
+    callable (via the pure-python build_supervisor runner), not a hand-built
+    stand-in -- it is the actual producer _cmd_replay's reader depends on.
+    """
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something across repos",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert patch.get("target_repo_ids") == ["hydra", "pair-programmer"], (
+        "node_intake's return dict must carry target_repo_ids so LangGraph "
+        f"persists it to the checkpoint; got {patch.get('target_repo_ids')!r}"
+    )
+
+
+def test_preseeded_target_repo_id_and_target_repo_ids_both_set_surfaces_hitl() -> None:
+    """WS1 retry-2 (finding B): node_intake's own ambiguity guard only
+    compared ids parsed OUT of goal text, so a caller that pre-seeds BOTH
+    state.target_repo_id and state.target_repo_ids directly (bypassing any
+    CLI/MCP-transport-level guard) would sail through and be silently
+    resolved by whichever branch ran later. This must surface the same
+    high_risk HITL the goal-text ambiguity case does."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something",
+        target_repo_id="hydra",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    assert "ambiguous" in patch["pending_hitl"]["summary"]
+
+
 def test_preseeded_target_repo_id_wins_over_conflicting_goal_repo_flag() -> None:
     """WS1 retry (finding 3): a pre-seeded state.target_repo_id must win over
     a conflicting --repo token in goal text, not just when goal text has

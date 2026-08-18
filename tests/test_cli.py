@@ -204,6 +204,20 @@ def test_run_rejects_repo_and_repos_together(capsys):
     assert "mutually exclusive" in err
 
 
+def test_plan_rejects_repo_and_repos_together(capsys):
+    """WS1 retry-2 (finding B): _cmd_plan pre-seeds target_repo_id and
+    target_repo_ids independently, exactly like _cmd_run, so it needs the
+    same fast-reject guard -- `hydra plan --repo X --repos Y,Z` must not be
+    left to node_intake's goal-text ambiguity guard, which never sees this
+    structured path (it only compares ids parsed OUT of root_goal, both
+    empty here)."""
+    rc = _run(["plan", "Fix something", "--repo", "hydra", "--repos", "hydra,senate"],
+              project_root=REPO_ROOT)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "mutually exclusive" in err
+
+
 # --- plan (non-detaching attended planning surface) --------------------------
 
 def _extract_json(out: str):
@@ -550,6 +564,16 @@ def test_replay_carries_repo_targeting_fields_forward(capsys, monkeypatch):
     needed): get_state returns a fake snapshot whose .values carries all
     three fields, and invoke() records the HydraState it was actually
     called with so we can assert on it directly.
+
+    Scope note: this only validates the READER half of the fix (_cmd_replay
+    pulling target_repo_id/target_repo_ids/target_repo_subpath out of
+    `values` into replay_initial). It intentionally fabricates `values`
+    rather than driving a real checkpoint, so it cannot catch the producer
+    side ever failing to write target_repo_ids in the first place -- that
+    is covered separately by
+    test_repo_targeting.py::test_intake_patch_persists_target_repo_ids_for_checkpoint,
+    which asserts on the real node_intake return dict (the actual value
+    LangGraph would persist as `values["target_repo_ids"]`).
     """
     from hydra_core import supervisor as supervisor_mod
 

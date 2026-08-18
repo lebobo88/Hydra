@@ -177,6 +177,41 @@ def test_register_repo_rollback_uses_atomic_writer(
     assert "prior-good-2" in calls[1]
 
 
+def test_register_repo_rollback_of_malformed_prior_json_is_not_byte_faithful(
+    tmp_path: Path, _isolated_repos_json: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """WS1 retry-2 (finding C): the docstring on register_repo now names this
+    limit explicitly -- the rollback re-parses ``prior_raw`` with
+    ``json.loads`` and rewrites the RESULT, it does not replay the original
+    bytes. If the prior file was malformed JSON at call time, that means
+    the "rolled back" file is an empty registry, not a byte-for-byte revert
+    of the (already-broken) prior contents. This pins that documented
+    behaviour so a future change either preserves it deliberately or updates
+    the docstring alongside it."""
+    _isolated_repos_json.parent.mkdir(parents=True, exist_ok=True)
+    malformed = "{not valid json"
+    _isolated_repos_json.write_text(malformed, encoding="utf-8")
+
+    real_resolve = repo_registry.resolve_repo_path
+
+    def _failing_resolve(repo_id: str):
+        if repo_id == "will-fail-3":
+            raise ValueError("simulated verify failure")
+        return real_resolve(repo_id)
+
+    monkeypatch.setattr(repo_registry, "resolve_repo_path", _failing_resolve)
+
+    bad_target = _git_repo(tmp_path / "will-fail-3-dir")
+    with pytest.raises(ValueError, match="verification failed"):
+        register_repo("will-fail-3", str(bad_target))
+
+    # Not byte-identical to the malformed original -- it's a valid, empty
+    # registry instead, per the documented reparse limitation.
+    post = _isolated_repos_json.read_text(encoding="utf-8")
+    assert post != malformed
+    assert json.loads(post) == {}
+
+
 def test_register_repo_concurrent_registration_both_land(tmp_path: Path, _isolated_repos_json: Path) -> None:
     """Two concurrent register_repo calls for DIFFERENT ids must both succeed
     and both be present afterward -- the lock serializes the read-modify-write

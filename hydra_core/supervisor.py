@@ -513,6 +513,36 @@ def build_supervisor(
                 "last_event": "bad --repo/--repos: ambiguous (both set)",
             }
 
+        # WS1 retry-2 (finding B): the ambiguity guard above only compares ids
+        # parsed OUT of goal text (_repo_id / _fleet_repo_ids). It does not
+        # see a structured pre-seed of BOTH state.target_repo_id and
+        # state.target_repo_ids (e.g. a caller that set both directly, or a
+        # transport bug that pre-seeds both) -- that combination would
+        # otherwise sail through here and be silently resolved by whichever
+        # branch runs later, instead of being rejected like the goal-text
+        # case. Surface the identical HITL shape for this path too.
+        if state.target_repo_id and state.target_repo_ids:
+            state.phase = "surfaced"
+            _preseed_ambig_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "high_risk",
+                "gate_node": "intake",
+                "summary": "ambiguous: pre-seeded target_repo_id AND target_repo_ids both set",
+                "options": ["abort"],
+                "default_option": "abort",
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.ambiguous_preseeded_repo_args",
+                {"single": state.target_repo_id, "multi": list(state.target_repo_ids)},
+            )
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _preseed_ambig_hitl,
+                "last_event": "bad pre-seeded target_repo_id/target_repo_ids: ambiguous (both set)",
+            }
+
         # Optional repo-relative engineering subdir, shared across the targeted
         # repo(s). This stays scoped to engineering repo targeting only; it
         # never retargets non-engineering squads.
@@ -886,6 +916,16 @@ def build_supervisor(
             update["target_repo_id"] = state.target_repo_id
         if state.target_repo_subpath is not None:
             update["target_repo_subpath"] = state.target_repo_subpath
+        if state.target_repo_ids:
+            # Fleet path: persist the resolved id list into the LangGraph
+            # checkpoint too, mirroring target_repo_id/target_repo_subpath
+            # above. Without this, _cmd_replay's read of
+            # values.get("target_repo_ids") always sees an empty/absent
+            # field for real fleet runs -- node_intake normalizes and
+            # validates the ids onto state.target_repo_ids (see the
+            # WS1-B block above) but never returned them, so the reader
+            # the replay fix relies on was structurally unreachable.
+            update["target_repo_ids"] = list(state.target_repo_ids)
         if state.fleet_parallel:
             update["fleet_parallel"] = True
             update["selected_squads"] = ["engineering"]

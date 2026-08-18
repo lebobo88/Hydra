@@ -438,7 +438,19 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
     ``hydra repo register`` in ``cli.py``; never expose this over MCP, it
     defines the allow-list). Atomic write under a short lock, verified by
     re-resolving through ``resolve_repo_path`` after the write, with a
-    rollback to the prior file contents if verification fails.
+    BEST-EFFORT rollback attempt if verification fails: the prior file
+    contents are re-parsed with ``json.loads`` and rewritten via the same
+    atomic writer, then ``ValueError`` is raised regardless of whether the
+    rollback write itself succeeded (a rollback failure is swallowed, not
+    propagated — the verification failure is always the error the caller
+    sees). Two limits follow from this: (1) the rollback reconstructs the
+    prior state from its *parsed* form rather than replaying the original
+    bytes, so if the prior file was malformed JSON the "restored" file is an
+    empty registry (``{}``), not a faithful byte-for-byte revert; (2) if the
+    rollback write itself fails (e.g. disk full, permissions), the file is
+    left in the post-failed-verification state, not the pre-write state.
+    Callers must not assume ``~/.hydra/repos.json`` is guaranteed to match
+    its pre-call contents after a ``ValueError`` here.
 
     Refuses to shadow a built-in ``_REPO_DIRNAMES`` id unless ``force=True``.
     ``init=True`` creates the directory (if absent) and runs ``git init`` when

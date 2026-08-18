@@ -581,6 +581,20 @@ def _cmd_plan(args) -> int:
     """
     project = Path(args.project) if args.project else Path.cwd()
 
+    # WS1 retry-2 (finding B): --repo and --repos are mutually exclusive here
+    # too, mirroring _cmd_run's guard above. Without it, `hydra plan --repo X
+    # --repos Y,Z` pre-seeds target_repo_id AND target_repo_ids independently
+    # (see WS1-B below) and node_intake's goal-text ambiguity guard never
+    # fires for this structured path (it only compares ids parsed OUT of
+    # root_goal, both empty here) -- so the conflict is silently resolved by
+    # whichever branch happens to run instead of being rejected.
+    if getattr(args, "repo", None) and getattr(args, "repos", None):
+        print(
+            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            file=sys.stderr,
+        )
+        return 1
+
     # Mirror _cmd_run's workflow-id handling so a caller (the hydra.workflow.plan
     # MCP tool) can pre-allocate the id and attach to the same checkpoint.
     wf_id_override = getattr(args, "workflow_id_override", None)
