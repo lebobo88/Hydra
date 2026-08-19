@@ -42,9 +42,11 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
    b. The `host_action.agent_type` is `engineer` (first) or
       `judge-cross-vendor`/`judge-same-vendor` (after the attempt). **Spawn that
       visible `Agent` subagent** with the provided `prompt`/`artifact_text` and
-      `cwd` (an isolated `.harness/worktrees/` worktree — write-safe under the
-      `hydra-block-direct-write` hook; the engine merges it back on a passing
-      finalize).
+      `cwd` (an isolated worktree under `resolve_worktree_root()` — default
+      `<AIAPP_BASE>/.hydra-worktrees/<repo_id>/`, overridable via
+      `HYDRA_WORKTREE_ROOT`, outside the target repo — write-safe under the
+      `hydra-block-direct-write` hook, which resolves the same root; the
+      engine merges it back on a passing finalize).
    c. Call `hydra.workflow.submit_host_result {workflow_id, run_id, call_key,
       result}` with the subagent's output:
       - engineer → `{text, cost_usd, tokens_in, tokens_out, model}`
@@ -88,8 +90,11 @@ you get a structured `{error: "<label>_timeout", remediation, ...}`:
 - **step timeout** — the killed subprocess can leave stale state, listed in the
   error's `stale_state` field: the workflow's `resume.lock` (delete it), an
   orphan pp run (`finalize_run` it `aborted` to release the project lock), and
-  an orphan `.harness/worktrees/attended-*` worktree (`git worktree remove`).
-  Clean those, then re-issue `step`. First-stage steps on large repos pay a
+  an orphan `attended-*` worktree under `resolve_worktree_root()`
+  (`git worktree remove`, or let the Hydra-side janitor sweep it once the
+  cursor reaches a terminal state — it never removes a non-terminal or
+  cursor-less worktree, and never deletes a branch). Clean those, then
+  re-issue `step`. First-stage steps on large repos pay a
   full-suite smoke **baseline** (cached per HEAD sha; a baseline that exceeds
   `HYDRA_BASELINE_TIMEOUT_S` writes a degraded `<sha>.timeout.json` marker so
   subsequent stages skip the re-run instead of re-paying it).

@@ -27,8 +27,9 @@ Every interactive `/hydra:run` drives the lifecycle IN-CONTEXT so the operator
 follows along: `hydra.workflow.plan` → loop `hydra.workflow.step` (spawn the
 visible `engineer`/judge `Agent`) → `hydra.workflow.submit_host_result`. The
 engine stays authoritative (ledger, budget, judge routing, finalize gates); the
-engineer writes into an isolated `.harness/worktrees/` worktree merged back on
-pass. **This is exactly `/hydra:drive`** — see that command for the full
+engineer writes into an isolated worktree outside the target repo (under
+`resolve_worktree_root()`, default `<AIAPP_BASE>/.hydra-worktrees/<repo_id>/`)
+merged back on pass. **This is exactly `/hydra:drive`** — see that command for the full
 runbook. Do NOT call `hydra.workflow.launch` from an interactive session.
 
 Detached execution (`hydra.workflow.launch`, headless background stage loop)

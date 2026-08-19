@@ -84,6 +84,7 @@ Re-running is safe — every action is idempotent.
 | `HYDRA_RLM_ROOT` | RLM-Creative root | `<AIAPP_BASE>/RLM-Creative` |
 | `HYDRA_XENIA_ROOT` | Xenia root | `<AIAPP_BASE>/Xenia` |
 | `HYDRA_SENATE_ROOT` | Senate root | `<AIAPP_BASE>/Senate` |
+| `HYDRA_WORKTREE_ROOT` | Root dir for attended-engineering worktrees | `<AIAPP_BASE>/.hydra-worktrees` (per-repo subdir) |
 
 Persist `AIAPP_BASE` so every repo and tool agrees on the base:
 
