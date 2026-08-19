@@ -528,12 +528,20 @@ def test_remove_worktree_deregisters_only_its_own_admin_dir_but_verdict_stays_di
     test proves both halves: the scoped admin-dir removal actually happens
     when the listing is stale, AND the returned verdict is unaffected by it.
 
-    Reproducing a genuinely stale git registration after a real successful
-    removal isn't possible on this platform (this repo's git deregisters
-    correctly whenever it actually runs the removal -- see the empirical
-    note in the race test above), so only the single `git worktree list`
-    call is intercepted to report a stale entry; the `remove` call, the
-    `rev-parse --git-common-dir` call, and all directory state, are real.
+    Reproducing a genuinely stale admin dir that SURVIVES the call takes real
+    care: empirically, a real `git worktree remove --force` -- even on a
+    directory that's already gone -- deregisters cleanly AND deletes the
+    admin dir itself in the same call (verified by hand: creating a
+    worktree, `shutil.rmtree`-ing its checkout directory out from under git,
+    then running `git worktree remove --force` on it still removes
+    `.git/worktrees/<name>` with no stale leftover). So to make the admin
+    dir survive into the advisory cleanup step, only the single `worktree
+    remove` call is faked to a no-op success -- real git never runs, so it
+    never gets the chance to clean up the admin dir on its own -- while the
+    checkout directory is deleted for real via `shutil.rmtree` (bypassing
+    git entirely, the same AV-scanner/open-handle race the docstring
+    describes). `git worktree list`, `rev-parse --git-common-dir`, and the
+    admin-dir removal itself are all real, unmocked calls/filesystem state.
     """
     repo_root = _init_repo(tmp_path / "myrepo")
     prov = _provision_worktree(str(repo_root), "run_staleadmin")
@@ -545,14 +553,23 @@ def test_remove_worktree_deregisters_only_its_own_admin_dir_but_verdict_stays_di
     admin_dir = common_dir / "worktrees" / "attended-run_staleadmin"
     assert admin_dir.is_dir(), "provisioning must have created the admin dir"
 
+    shutil.rmtree(wt_path)
+    assert not Path(wt_path).exists()
+    assert admin_dir.is_dir(), (
+        "bypassing git for the directory deletion must leave the admin dir "
+        "behind -- this is the stale-registration race being reproduced"
+    )
+
     real_git = host_bridge._git
     prune_calls: list[list[str]] = []
 
     def _fake_git(args, cwd, *a, **k):
-        if len(args) >= 2 and args[0] == "worktree" and args[1] == "list":
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "remove":
+            # Never let the real removal run -- it would clean up the admin
+            # dir itself and defeat the stale-registration setup above.
             fake = type("_Fake", (), {})()
             fake.returncode = 0
-            fake.stdout = f"worktree {wt_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy\n"
+            fake.stdout = ""
             fake.stderr = ""
             return fake
         if len(args) >= 2 and args[0] == "worktree" and args[1] == "prune":
@@ -578,12 +595,26 @@ def test_remove_worktree_deregisters_only_its_own_admin_dir_but_verdict_stays_di
 
 def test_remove_worktree_admin_dir_cleanup_never_touches_a_live_sibling_worktree(
         tmp_path, monkeypatch):
-    """Concurrency safety net for the reviewer's exact scenario: while this
-    stage's worktree is being cleaned up, a SECOND, still-live attended
-    worktree exists in the same repo. The scoped admin-dir removal must never
-    deregister the sibling's registration, because there is no repo-wide
-    operation for a race to reach -- it can only ever touch the one admin
-    directory whose `gitdir` matches the worktree actually being removed.
+    """Concurrency safety net for the reviewer's exact scenario -- and it
+    must actually discriminate between the scoped fix and the reverted
+    repo-wide `git worktree prune`, not merely hold under both.
+
+    A test that only checks "the live sibling's directory still exists"
+    proves nothing: `git worktree prune` only ever deregisters entries whose
+    DIRECTORY IS MISSING, so a sibling with an intact directory survives a
+    repo-wide prune too, and such an assertion can't tell the two
+    implementations apart (confirmed by hand: swapping this test's
+    `_prune_single_worktree_admin_dir` call for the reverted `_git(["worktree",
+    "prune"], repo_root)` still passes it).
+
+    The actual risk the reviewer named is a sibling whose directory reads as
+    TRANSIENTLY ABSENT (slow filesystem, network mount, mid-write) while its
+    registration remains -- exactly the state `git worktree prune` acts on.
+    So the live sibling's checkout directory is moved away here (not
+    deleted -- its registration must stay completely real and unmocked) to
+    reproduce that state for real, and the decisive assertion is that its
+    REGISTRATION survives even though its directory is genuinely missing at
+    the moment the dying worktree's cleanup runs.
     """
     repo_root = _init_repo(tmp_path / "myrepo")
     prov_dead = _provision_worktree(str(repo_root), "run_dying")
@@ -593,15 +624,32 @@ def test_remove_worktree_admin_dir_cleanup_never_touches_a_live_sibling_worktree
     live_path, _live_branch = prov_live
     assert Path(live_path).is_dir()
 
+    # Reproduce transient absence for real: relocate (never delete) the live
+    # sibling's checkout directory so its git registration is untouched but
+    # its directory is genuinely gone at `live_path` -- the exact state a
+    # repo-wide `git worktree prune` would deregister.
+    live_relocated = tmp_path / "live-worktree-relocated-elsewhere"
+    shutil.move(live_path, live_relocated)
+    assert not Path(live_path).exists()
+
     real_git = host_bridge._git
+    real_listing_before = real_git(
+        ["worktree", "list", "--porcelain"], repo_root
+    ).stdout or ""
 
     def _fake_git(args, cwd, *a, **k):
         if len(args) >= 2 and args[0] == "worktree" and args[1] == "list":
+            # A real successful `worktree remove` on `dead_path` (below)
+            # cleanly deregisters it, leaving no stale entry to trigger the
+            # advisory cleanup -- so this lies that `dead_path` is still
+            # registered, same as the prior test's technique. The live
+            # sibling's line is real, captured before this call, and is
+            # otherwise untouched.
             fake = type("_Fake", (), {})()
             fake.returncode = 0
             fake.stdout = (
                 f"worktree {dead_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy\n\n"
-                f"worktree {live_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy-live\n"
+                + real_listing_before
             )
             fake.stderr = ""
             return fake
@@ -614,15 +662,22 @@ def test_remove_worktree_admin_dir_cleanup_never_touches_a_live_sibling_worktree
     assert result == {"removed": True, "error": None}
     monkeypatch.undo()
 
-    # The sibling's real, unmocked registration must still be intact.
-    listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout
+    # Decisive assertion: the live sibling's directory is STILL missing
+    # (never restored yet), but its registration survives untouched. A
+    # repo-wide `git worktree prune` would have deregistered it here.
+    listing_after = real_git(["worktree", "list", "--porcelain"], repo_root).stdout or ""
     normalized_live = str(Path(live_path)).replace("\\", "/")
+    assert not Path(live_path).exists(), "the sibling's directory must still be missing at this point"
     assert any(
         line.startswith("worktree ") and line[len("worktree "):].strip().replace("\\", "/") == normalized_live
-        for line in listing.splitlines()
-    ), "the live sibling worktree must remain registered"
-    assert Path(live_path).is_dir(), "the live sibling checkout must be untouched"
+        for line in listing_after.splitlines()
+    ), (
+        "the live sibling's registration must survive the dying worktree's "
+        "cleanup even though its own directory is (still) missing"
+    )
 
+    # Restore the sibling and tear it down cleanly.
+    shutil.move(str(live_relocated), live_path)
     _remove_worktree(str(repo_root), live_path)
 
 
