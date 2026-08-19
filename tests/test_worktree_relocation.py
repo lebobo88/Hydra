@@ -29,6 +29,7 @@ from hydra_core import host_bridge
 from hydra_core.host_bridge import (
     CURSOR_SCHEMA,
     _find_attended_cursor,
+    _prune_single_worktree_admin_dir,
     _provision_worktree,
     _remove_worktree,
     cursor_path,
@@ -748,6 +749,194 @@ def test_remove_worktree_path_exists_check_raising_fails_toward_not_removed(
     monkeypatch.undo()
 
     _remove_worktree(str(repo_root), wt_path)
+
+
+def test_prune_single_worktree_admin_dir_itself_never_raises_when_called_directly(
+        tmp_path, monkeypatch):
+    """Closes the gap the outer-wrap test above cannot: that test only proves
+    `_remove_worktree`'s own try/except swallows a failure from this helper
+    -- it never establishes that the helper's BODY is internally guarded, so
+    it can't tell "helper never raises" apart from "caller happens to catch
+    it". This test calls `_prune_single_worktree_admin_dir` DIRECTLY (no
+    `_remove_worktree` in between) so the outer wrap cannot be doing the
+    work. With the helper's own internal try/except in place this must
+    return None without raising; deleting that guard (restoring the
+    unguarded body) must make this test fail with the injected RuntimeError
+    propagating out.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+
+    real_git = host_bridge._git
+
+    def _fake_git(args, cwd, *a, **k):
+        if len(args) >= 2 and args[0] == "rev-parse" and args[1] == "--git-common-dir":
+            raise RuntimeError("simulated rev-parse crash")
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _fake_git)
+
+    # No try/except here on purpose -- an unguarded body would let this
+    # RuntimeError propagate straight out of the test call itself.
+    result = _prune_single_worktree_admin_dir(str(repo_root), str(tmp_path / "some-worktree"))
+
+    assert result is None, (
+        "_prune_single_worktree_admin_dir must swallow its own internal "
+        "failures and return quietly, matching its 'Never raises' docstring "
+        "on its own merits, not because some caller happens to catch it"
+    )
+
+
+# ===========================================================================
+# CLI operator entry point: `hydra sweep-worktrees`
+# ===========================================================================
+# sweep_stale_worktrees itself has no operator entry point -- these tests
+# cover the new `hydra sweep-worktrees [--apply]` subcommand (hydra_core.cli)
+# that wraps it: dry-run by default, --apply required to actually delete,
+# per-entry auditable reasons, and the same never-delete-a-branch /
+# never-remove-a-non-terminal-cursor invariants sweep_stale_worktrees itself
+# already guarantees.
+
+def _cli_main(argv):
+    from hydra_core.cli import main
+    return main(argv)
+
+
+def test_cli_sweep_worktrees_dry_run_default_deletes_nothing(tmp_path, capsys):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_clidry")
+    assert prov is not None
+    wt_path, branch = prov
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_clidry"), _cursor("complete"))
+
+    rc = _cli_main(["--project", str(repo_root), "sweep-worktrees"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert out["mode"] == "dry-run"
+    assert Path(wt_path).exists(), "dry-run (no --apply) must delete nothing"
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
+    assert any(e["decision"] == "would-remove" and e["run_id"] == "run_clidry"
+               for e in out["entries"])
+
+    _remove_worktree(str(repo_root), wt_path)
+
+
+def test_cli_sweep_worktrees_apply_actually_removes(tmp_path, capsys):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_cliapply")
+    assert prov is not None
+    wt_path, branch = prov
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_cliapply"), _cursor("complete"))
+
+    rc = _cli_main(["--project", str(repo_root), "sweep-worktrees", "--apply"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert out["mode"] == "apply"
+    assert not Path(wt_path).exists(), "--apply must actually remove an eligible worktree"
+    # Branch survives even under --apply -- only the checkout is removed.
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
+    assert any(e["decision"] == "removed" and e["run_id"] == "run_cliapply"
+               for e in out["entries"])
+
+
+def test_cli_sweep_worktrees_non_terminal_skipped_even_with_apply(tmp_path, capsys):
+    """The single most important safety property of the operator entry
+    point: --apply must not override the cursor-terminality gate. A run
+    paused on HITL for days must survive an operator running --apply for
+    unrelated stale entries."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_clilive")
+    assert prov is not None
+    wt_path, branch = prov
+    try:
+        save_cursor(cursor_path(str(repo_root), "wf-1", "run_clilive"), _cursor("await_judge"))
+
+        rc = _cli_main(["--project", str(repo_root), "sweep-worktrees", "--apply"])
+        out = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert Path(wt_path).exists(), (
+            "--apply must never remove a worktree whose cursor is non-terminal"
+        )
+        branches = _git(["branch", "--list", branch], repo_root).stdout
+        assert branch in branches
+        entry = next(e for e in out["entries"] if e["run_id"] == "run_clilive")
+        assert entry["decision"] == "skipped-non-terminal"
+        assert entry["cursor_state"] == "await_judge"
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_cli_sweep_worktrees_per_entry_reasons_for_each_decision_class(tmp_path, capsys, monkeypatch):
+    """One sweep, four worktrees, four distinct decisions -- proves the CLI
+    reports per-entry auditable reasons rather than a bare count, and that
+    the four documented decision labels (removed, skipped-non-terminal,
+    skipped-no-cursor, error) are exactly what each class produces."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+
+    prov_removed = _provision_worktree(str(repo_root), "run_ok")
+    prov_live = _provision_worktree(str(repo_root), "run_live")
+    prov_nocursor = _provision_worktree(str(repo_root), "run_nocursor")
+    prov_err = _provision_worktree(str(repo_root), "run_err")
+    assert all([prov_removed, prov_live, prov_nocursor, prov_err])
+    wt_removed, _b1 = prov_removed
+    wt_live, b_live = prov_live
+    wt_nocursor, b_nocursor = prov_nocursor
+    wt_err, b_err = prov_err
+
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_ok"), _cursor("complete"))
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_live"), _cursor("await_generate"))
+    # run_nocursor: deliberately no cursor file written.
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_err"), _cursor("surfaced"))
+
+    # Force removal of run_err's worktree to fail (rc==0 but path stays on
+    # disk -- the same AV/lock race `_remove_worktree`'s own tests use)
+    # while every other real `_git` call (including the other three
+    # worktrees' own removals) passes through untouched.
+    real_git = host_bridge._git
+
+    def _fake_git(args, cwd, *a, **k):
+        if (len(args) >= 2 and args[0] == "worktree" and args[1] == "remove"
+                and any(str(Path(wt_err)) in a for a in args)):
+            fake = type("_Fake", (), {})()
+            fake.returncode = 0
+            fake.stdout = ""
+            fake.stderr = ""
+            return fake
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _fake_git)
+
+    rc = _cli_main(["--project", str(repo_root), "sweep-worktrees", "--apply"])
+    out = json.loads(capsys.readouterr().out)
+    monkeypatch.undo()
+
+    assert rc == 0
+    by_run = {e["run_id"]: e for e in out["entries"]}
+    assert by_run["run_ok"]["decision"] == "removed"
+    assert by_run["run_live"]["decision"] == "skipped-non-terminal"
+    assert by_run["run_live"]["cursor_state"] == "await_generate"
+    assert by_run["run_nocursor"]["decision"] == "skipped-no-cursor"
+    assert by_run["run_err"]["decision"] == "error"
+    assert by_run["run_err"].get("error")
+
+    # Disk state matches the reported decisions.
+    assert not Path(wt_removed).exists()
+    assert Path(wt_live).exists()
+    assert Path(wt_nocursor).exists()
+    assert Path(wt_err).exists(), "the simulated removal failure must leave the checkout on disk"
+
+    # No branch deleted, for any of the four outcomes.
+    for b in (b_live, b_nocursor, b_err):
+        branches = _git(["branch", "--list", b], repo_root).stdout
+        assert b in branches
+
+    _remove_worktree(str(repo_root), wt_live)
+    _remove_worktree(str(repo_root), wt_nocursor)
+    _remove_worktree(str(repo_root), wt_err)
 
 
 # ===========================================================================

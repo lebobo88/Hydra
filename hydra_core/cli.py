@@ -2468,6 +2468,72 @@ def _cmd_reap(args) -> int:
     return 0
 
 
+def _cmd_sweep_worktrees(args) -> int:
+    """`hydra sweep-worktrees [--project PATH] [--apply]` — operator entry
+    point for `host_bridge.sweep_stale_worktrees` (the attended-worktree
+    janitor). See that function's docstring for the safety invariants this
+    command must never weaken: cursor-terminality gated, fails toward keeping
+    on a corrupt/unreadable/missing cursor, never deletes a git branch, and
+    per-entry failures are reported rather than silently dropped.
+
+    Dry-run by default — reports what WOULD be removed without touching disk.
+    Pass --apply to actually delete. This mirrors `reap`'s dry-run-by-default
+    convention above.
+    """
+    from .host_bridge import sweep_stale_worktrees
+
+    project = str(Path(args.project) if args.project else Path.cwd())
+    do_apply = bool(getattr(args, "apply", False))
+
+    report = sweep_stale_worktrees(project, project_root=project, dry_run=not do_apply)
+
+    # Normalize into one flat, auditable per-entry list: worktree path,
+    # cursor state (where known), and WHY each decision was made — a bare
+    # count would hide exactly the information an operator needs before
+    # trusting a destructive sweep.
+    entries: list[dict[str, Any]] = []
+    for e in report.get("removed", []):
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "cursor_state": e.get("state"),
+            "decision": "would-remove" if e.get("dry_run") else "removed",
+        })
+    for e in report.get("skipped", []):
+        reason = str(e.get("reason") or "")
+        if reason == "no_cursor_found":
+            decision, cursor_state = "skipped-no-cursor", None
+        elif reason.startswith("non_terminal_state:"):
+            decision, cursor_state = "skipped-non-terminal", reason.split(":", 1)[1]
+        else:
+            decision, cursor_state = "skipped", None
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "cursor_state": cursor_state,
+            "decision": decision,
+            "reason": reason,
+        })
+    for e in report.get("errors", []):
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "cursor_state": None,
+            "decision": "error",
+            "error": e.get("error"),
+        })
+
+    print(json.dumps({
+        "mode": "apply" if do_apply else "dry-run",
+        "project": project,
+        "count_removed": sum(1 for e in entries if e["decision"] in ("removed", "would-remove")),
+        "count_skipped": sum(1 for e in entries if e["decision"].startswith("skipped")),
+        "count_errors": sum(1 for e in entries if e["decision"] == "error"),
+        "entries": entries,
+    }, indent=2))
+    return 0
+
+
 def _cmd_status(args) -> int:
     """List recent workflows (latest-first) or show a specific workflow's state.
 
@@ -3229,6 +3295,15 @@ def main(argv: list[str] | None = None) -> int:
                          help="Only reap non-terminal workflows idle this long (default 24).")
     rp_reap.add_argument("--apply", action="store_true",
                          help="Actually transition stale workflows to 'surfaced' (default: dry-run).")
+
+    # Attended-worktree janitor operator entry point (host_bridge.sweep_stale_worktrees).
+    sw = sub.add_parser("sweep-worktrees", help=(
+        "Remove attended-run worktrees whose Hydra cursor has reached a "
+        "terminal state (complete/surfaced/aborted). Never deletes a git "
+        "branch. Dry-run by default; per-entry reasons are always reported."))
+    sw.add_argument("--apply", action="store_true",
+                    help="Actually remove eligible worktrees (default: dry-run, deletes nothing).")
+
     ap_approve = sub.add_parser("approve")
     ap_approve.add_argument("workflow_id")
     ap_approve.add_argument("--live", action="store_true",
@@ -3392,6 +3467,7 @@ def main(argv: list[str] | None = None) -> int:
         "trace": _cmd_trace,
         "budget": _cmd_budget,
         "reap": _cmd_reap,
+        "sweep-worktrees": _cmd_sweep_worktrees,
         # C2: approve == resume --action approve (the old stub printed a
         # plugin pointer and did nothing; resume is now first-class).
         "approve": lambda a: _cmd_resume(argparse.Namespace(

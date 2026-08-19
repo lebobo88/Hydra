@@ -763,36 +763,44 @@ def _prune_single_worktree_admin_dir(repo_root: str, worktree_path: str) -> None
     worktree's registration, live or stale, is left completely untouched:
     there is no repo-wide operation for a race to reach.
 
-    Never raises -- the caller already wraps this call in its own swallowing
-    try/except, since this is advisory cleanup that must never affect the
-    disk-based removal verdict.
+    Never raises -- the entire body below is wrapped in its own try/except so
+    the guarantee holds on its own merits, not merely because the caller
+    (``_remove_worktree``) also happens to swallow failures from here. Any
+    exception raised by ``_git``, filesystem iteration, or path/stat
+    operations is caught and treated as "could not prune" -- silently
+    returning, exactly like every other early-return branch in this function.
+    This is advisory cleanup only; a raise here must never propagate up into
+    the disk-based removal verdict its caller already decided.
     """
-    common = _git(["rev-parse", "--git-common-dir"], repo_root)
-    if common.returncode != 0:
-        return
-    common_dir = Path((common.stdout or "").strip())
-    if not common_dir.is_absolute():
-        common_dir = Path(repo_root) / common_dir
-    worktrees_dir = common_dir / "worktrees"
-    if not worktrees_dir.is_dir():
-        return
-    target = str(Path(worktree_path)).replace("\\", "/").rstrip("/")
-    for admin_dir in worktrees_dir.iterdir():
-        if not admin_dir.is_dir():
-            continue
-        gitdir_file = admin_dir / "gitdir"
-        if not gitdir_file.is_file():
-            continue
-        try:
-            pointed = gitdir_file.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:  # noqa: BLE001
-            continue
-        pointed_norm = pointed.replace("\\", "/").rstrip("/")
-        if pointed_norm.endswith("/.git"):
-            pointed_norm = pointed_norm[: -len("/.git")]
-        if pointed_norm == target:
-            shutil.rmtree(admin_dir, ignore_errors=True)
+    try:
+        common = _git(["rev-parse", "--git-common-dir"], repo_root)
+        if common.returncode != 0:
             return
+        common_dir = Path((common.stdout or "").strip())
+        if not common_dir.is_absolute():
+            common_dir = Path(repo_root) / common_dir
+        worktrees_dir = common_dir / "worktrees"
+        if not worktrees_dir.is_dir():
+            return
+        target = str(Path(worktree_path)).replace("\\", "/").rstrip("/")
+        for admin_dir in worktrees_dir.iterdir():
+            if not admin_dir.is_dir():
+                continue
+            gitdir_file = admin_dir / "gitdir"
+            if not gitdir_file.is_file():
+                continue
+            try:
+                pointed = gitdir_file.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                continue
+            pointed_norm = pointed.replace("\\", "/").rstrip("/")
+            if pointed_norm.endswith("/.git"):
+                pointed_norm = pointed_norm[: -len("/.git")]
+            if pointed_norm == target:
+                shutil.rmtree(admin_dir, ignore_errors=True)
+                return
+    except Exception:  # noqa: BLE001 -- earn the "Never raises" guarantee for real
+        return
 
 
 # --------------------------------------------------------------------------- #
@@ -840,7 +848,9 @@ def _find_attended_cursor(project_root: str, run_id: str) -> Path | None:
     return matches[0]
 
 
-def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> dict[str, Any]:
+def sweep_stale_worktrees(
+        repo_root: str, project_root: str | None = None,
+        dry_run: bool = False) -> dict[str, Any]:
     """Remove attended worktrees whose cursor has reached a terminal state;
     skip (never remove) anything whose cursor is non-terminal or missing.
 
@@ -849,6 +859,14 @@ def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> di
     cursor via ``_find_attended_cursor``, and removes only the ones proven
     terminal. Never deletes a branch. Never raises — per-entry failures are
     collected in the returned report rather than aborting the sweep.
+
+    ``dry_run=True`` (the CLI operator entry point's default) runs the exact
+    same terminality decision for every entry but never calls
+    ``_remove_worktree`` — a candidate that would be removed is still
+    appended to ``report["removed"]``, tagged ``"dry_run": True``, so callers
+    get an honest preview without touching disk. ``dry_run=False`` (this
+    function's own default, preserved for existing callers) behaves exactly
+    as before.
 
     Returns ``{"removed": [...], "skipped": [...], "errors": [...]}`` where
     each entry is ``{"worktree": path, "run_id": ..., "reason": ...}``.
@@ -876,6 +894,12 @@ def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> di
                 report["skipped"].append({
                     "worktree": str(entry), "run_id": run_id,
                     "reason": f"non_terminal_state:{state}",
+                })
+                continue
+            if dry_run:
+                report["removed"].append({
+                    "worktree": str(entry), "run_id": run_id, "state": state,
+                    "dry_run": True,
                 })
                 continue
             result = _remove_worktree(repo_root, str(entry))
