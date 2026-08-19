@@ -2496,6 +2496,7 @@ def _cmd_sweep_worktrees(args) -> int:
         entries.append({
             "worktree": e.get("worktree"),
             "run_id": e.get("run_id"),
+            "root": e.get("root"),
             "cursor_state": e.get("state"),
             "decision": "would-remove" if e.get("dry_run") else "removed",
         })
@@ -2510,6 +2511,7 @@ def _cmd_sweep_worktrees(args) -> int:
         entries.append({
             "worktree": e.get("worktree"),
             "run_id": e.get("run_id"),
+            "root": e.get("root"),
             "cursor_state": cursor_state,
             "decision": decision,
             "reason": reason,
@@ -2518,6 +2520,7 @@ def _cmd_sweep_worktrees(args) -> int:
         entries.append({
             "worktree": e.get("worktree"),
             "run_id": e.get("run_id"),
+            "root": e.get("root"),
             "cursor_state": None,
             "decision": "error",
             "error": e.get("error"),

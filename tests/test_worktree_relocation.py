@@ -29,6 +29,7 @@ from hydra_core import host_bridge
 from hydra_core.host_bridge import (
     CURSOR_SCHEMA,
     _find_attended_cursor,
+    _legacy_worktree_root,
     _prune_single_worktree_admin_dir,
     _provision_worktree,
     _remove_worktree,
@@ -937,6 +938,136 @@ def test_cli_sweep_worktrees_per_entry_reasons_for_each_decision_class(tmp_path,
     _remove_worktree(str(repo_root), wt_live)
     _remove_worktree(str(repo_root), wt_nocursor)
     _remove_worktree(str(repo_root), wt_err)
+
+
+# ===========================================================================
+# Migration-aware sweep: legacy <repo>/.harness/worktrees/ residue
+# ===========================================================================
+# WS3 moved WHERE NEW attended worktrees are provisioned; it did NOT migrate
+# ones that already existed at the pre-relocation location. A sweep that
+# only scans the new location reclaims nothing on a repo whose attended runs
+# predate the move -- exactly the residue this feature exists to reclaim.
+
+def _add_legacy_worktree(repo_root: Path, run_id: str) -> tuple[str, str]:
+    """Create a worktree at the PRE-relocation location
+    (``<repo_root>/.harness/worktrees/attended-<run_id>``) directly via git
+    -- deliberately NOT through ``_provision_worktree``, which now always
+    provisions at the new (``resolve_worktree_root``) location and so cannot
+    be used to reproduce legacy residue. Mirrors the same
+    ``attended-<run_id>`` directory / ``attended/<run_id>`` branch naming
+    ``_provision_worktree`` uses, so the janitor's parsing is exercised
+    identically to a real legacy leftover.
+    """
+    branch = f"attended/{run_id}"
+    wt_path = repo_root / ".harness" / "worktrees" / f"attended-{run_id}"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    _git(["worktree", "add", "-b", branch, str(wt_path)], repo_root)
+    return str(wt_path), branch
+
+
+def test_sweep_finds_and_removes_terminal_legacy_location_worktree_with_apply(tmp_path, capsys):
+    """The core falsification the operator asked for: a terminal-cursor
+    worktree sitting at the LEGACY `.harness/worktrees/` location must be
+    found and removed by `hydra sweep-worktrees --apply`, exactly like a
+    current-location one -- proving the feature actually reclaims the
+    residue it was built for, not just worktrees created after the move.
+    Verified live: this fails if the legacy scan is removed (see the
+    companion function-level test below for the same proof against
+    `sweep_stale_worktrees` directly).
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, branch = _add_legacy_worktree(repo_root, "run_legacyterm")
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_legacyterm"), _cursor("complete"))
+    assert Path(wt_path).is_dir()
+
+    rc = _cli_main(["--project", str(repo_root), "sweep-worktrees", "--apply"])
+    out = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    entry = next(e for e in out["entries"] if e["run_id"] == "run_legacyterm")
+    assert entry["decision"] == "removed"
+    assert entry["root"] == "legacy"
+    assert not Path(wt_path).exists(), "legacy-location terminal worktree must actually be removed"
+    # Branch survives even though it's a legacy entry -- same invariant as
+    # every other removal path in this module.
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
+
+
+def test_sweep_stale_worktrees_scans_legacy_root_directly(tmp_path):
+    """Same falsification at the function level (not just via the CLI):
+    `sweep_stale_worktrees` itself must find a terminal-cursor worktree at
+    the legacy location. Deliberately mirrors
+    `test_janitor_removes_terminal_cursor_worktree`'s shape for the
+    current-location case so the two are a matched pair.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, branch = _add_legacy_worktree(repo_root, "run_legacyfn")
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_legacyfn"), _cursor("surfaced"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert not Path(wt_path).exists(), "terminal-cursor legacy worktree must be removed"
+    matches = [e for e in report["removed"] if e["run_id"] == "run_legacyfn"]
+    assert len(matches) == 1
+    assert matches[0]["root"] == "legacy"
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches, "janitor must never delete the branch, legacy or not"
+
+
+def test_sweep_skips_non_terminal_legacy_worktree(tmp_path):
+    """The terminality gate applies identically to a legacy entry -- a
+    non-terminal legacy worktree must survive exactly like a
+    current-location one does. Regression guard against a "legacy path ==
+    fast path that skips the safety checks" shortcut.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, branch = _add_legacy_worktree(repo_root, "run_legacylive")
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_legacylive"), _cursor("await_generate"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert Path(wt_path).exists(), "non-terminal legacy worktree must survive"
+    matches = [e for e in report["skipped"] if e["run_id"] == "run_legacylive"]
+    assert len(matches) == 1, "must appear exactly once, not once per scanned root"
+    assert matches[0]["root"] == "legacy"
+    assert matches[0]["reason"] == "non_terminal_state:await_generate"
+
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
+    _remove_worktree(str(repo_root), wt_path)
+
+
+def test_sweep_dedupes_a_path_reachable_from_both_current_and_legacy_roots(tmp_path, monkeypatch):
+    """If an operator's HYDRA_WORKTREE_ROOT happens to coincide with the
+    legacy directory (unusual, but not prevented), the SAME worktree path is
+    reachable from both the current-root scan and the legacy-root scan.
+    Assert it is processed exactly once, not twice -- a double-processed
+    entry would otherwise appear twice in the report (harmless for a skip,
+    but for a real --apply removal, a second `_remove_worktree` call on an
+    already-gone path is exactly the kind of double-accounting this dedupe
+    exists to prevent).
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    legacy_root = _legacy_worktree_root(str(repo_root))
+    # Point the "current" resolver AT the legacy directory's parent so
+    # resolve_worktree_root(repo_root) == legacy_root -- the coincidence
+    # this test reproduces.
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(legacy_root))
+
+    wt_path, branch = _add_legacy_worktree(repo_root, "run_dupe")
+    save_cursor(cursor_path(str(repo_root), "wf-1", "run_dupe"), _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    matches = [e for e in report["removed"] if e["run_id"] == "run_dupe"]
+    assert len(matches) == 1, (
+        "a path reachable from both the current and legacy roots must be "
+        "processed exactly once"
+    )
+    assert not Path(wt_path).exists()
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
 
 
 # ===========================================================================
