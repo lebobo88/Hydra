@@ -763,36 +763,44 @@ def _prune_single_worktree_admin_dir(repo_root: str, worktree_path: str) -> None
     worktree's registration, live or stale, is left completely untouched:
     there is no repo-wide operation for a race to reach.
 
-    Never raises -- the caller already wraps this call in its own swallowing
-    try/except, since this is advisory cleanup that must never affect the
-    disk-based removal verdict.
+    Never raises -- the entire body below is wrapped in its own try/except so
+    the guarantee holds on its own merits, not merely because the caller
+    (``_remove_worktree``) also happens to swallow failures from here. Any
+    exception raised by ``_git``, filesystem iteration, or path/stat
+    operations is caught and treated as "could not prune" -- silently
+    returning, exactly like every other early-return branch in this function.
+    This is advisory cleanup only; a raise here must never propagate up into
+    the disk-based removal verdict its caller already decided.
     """
-    common = _git(["rev-parse", "--git-common-dir"], repo_root)
-    if common.returncode != 0:
-        return
-    common_dir = Path((common.stdout or "").strip())
-    if not common_dir.is_absolute():
-        common_dir = Path(repo_root) / common_dir
-    worktrees_dir = common_dir / "worktrees"
-    if not worktrees_dir.is_dir():
-        return
-    target = str(Path(worktree_path)).replace("\\", "/").rstrip("/")
-    for admin_dir in worktrees_dir.iterdir():
-        if not admin_dir.is_dir():
-            continue
-        gitdir_file = admin_dir / "gitdir"
-        if not gitdir_file.is_file():
-            continue
-        try:
-            pointed = gitdir_file.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:  # noqa: BLE001
-            continue
-        pointed_norm = pointed.replace("\\", "/").rstrip("/")
-        if pointed_norm.endswith("/.git"):
-            pointed_norm = pointed_norm[: -len("/.git")]
-        if pointed_norm == target:
-            shutil.rmtree(admin_dir, ignore_errors=True)
+    try:
+        common = _git(["rev-parse", "--git-common-dir"], repo_root)
+        if common.returncode != 0:
             return
+        common_dir = Path((common.stdout or "").strip())
+        if not common_dir.is_absolute():
+            common_dir = Path(repo_root) / common_dir
+        worktrees_dir = common_dir / "worktrees"
+        if not worktrees_dir.is_dir():
+            return
+        target = str(Path(worktree_path)).replace("\\", "/").rstrip("/")
+        for admin_dir in worktrees_dir.iterdir():
+            if not admin_dir.is_dir():
+                continue
+            gitdir_file = admin_dir / "gitdir"
+            if not gitdir_file.is_file():
+                continue
+            try:
+                pointed = gitdir_file.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                continue
+            pointed_norm = pointed.replace("\\", "/").rstrip("/")
+            if pointed_norm.endswith("/.git"):
+                pointed_norm = pointed_norm[: -len("/.git")]
+            if pointed_norm == target:
+                shutil.rmtree(admin_dir, ignore_errors=True)
+                return
+    except Exception:  # noqa: BLE001 -- earn the "Never raises" guarantee for real
+        return
 
 
 # --------------------------------------------------------------------------- #
@@ -840,34 +848,52 @@ def _find_attended_cursor(project_root: str, run_id: str) -> Path | None:
     return matches[0]
 
 
-def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> dict[str, Any]:
-    """Remove attended worktrees whose cursor has reached a terminal state;
-    skip (never remove) anything whose cursor is non-terminal or missing.
+def _legacy_worktree_root(repo_root: str) -> Path:
+    """Pre-relocation worktree location: ``<repo_root>/.harness/worktrees``.
 
-    Scans ``resolve_worktree_root(repo_root)`` for ``attended-*`` directories
-    (the same naming ``_provision_worktree`` creates), looks up each one's
-    cursor via ``_find_attended_cursor``, and removes only the ones proven
-    terminal. Never deletes a branch. Never raises — per-entry failures are
-    collected in the returned report rather than aborting the sweep.
-
-    Returns ``{"removed": [...], "skipped": [...], "errors": [...]}`` where
-    each entry is ``{"worktree": path, "run_id": ..., "reason": ...}``.
+    WS3 moved WHERE NEW attended worktrees are provisioned (see
+    ``resolve_worktree_root``'s docstring) but did not migrate worktrees that
+    already existed there — so this is still real, reclaimable residue on
+    any repo whose attended runs predate that move. The janitor must scan
+    both locations or the whole point of item 2 (reclaiming that residue) is
+    unmet.
     """
-    report: dict[str, Any] = {"removed": [], "skipped": [], "errors": []}
-    root = project_root or repo_root
-    wt_root = resolve_worktree_root(repo_root)
+    return Path(repo_root) / ".harness" / "worktrees"
+
+
+def _sweep_one_root(
+        wt_root: Path, root_label: str, repo_root: str, project_root: str,
+        dry_run: bool, report: dict[str, Any], seen: set[str]) -> None:
+    """Scan a single worktree root for ``attended-*`` directories and apply
+    the sweep decision to each, appending to the shared ``report``. Shared by
+    both the current (``resolve_worktree_root``) and legacy
+    (``_legacy_worktree_root``) locations so the decision logic — and every
+    safety invariant it enforces — is applied identically to both; a legacy
+    entry is not a fast path that skips any check the current-root entries
+    get. ``seen`` (a set of resolved absolute paths) is threaded across both
+    calls so a path reachable from both roots (e.g. via a symlink or an
+    env-var override that happens to coincide with the legacy path) is never
+    processed twice.
+    """
     if not wt_root.is_dir():
-        return report
+        return
     for entry in sorted(wt_root.iterdir()):
         if not entry.is_dir() or not entry.name.startswith("attended-"):
             continue
+        try:
+            resolved = str(entry.resolve())
+        except Exception:  # noqa: BLE001 — unresolvable path still dedupes on its raw str
+            resolved = str(entry)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         run_id = entry.name[len("attended-"):]
         try:
-            cursor_file = _find_attended_cursor(root, run_id)
+            cursor_file = _find_attended_cursor(project_root, run_id)
             if cursor_file is None:
                 report["skipped"].append({
                     "worktree": str(entry), "run_id": run_id,
-                    "reason": "no_cursor_found",
+                    "reason": "no_cursor_found", "root": root_label,
                 })
                 continue
             cursor = load_cursor(cursor_file)
@@ -875,13 +901,20 @@ def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> di
             if state not in _TERMINAL:
                 report["skipped"].append({
                     "worktree": str(entry), "run_id": run_id,
-                    "reason": f"non_terminal_state:{state}",
+                    "reason": f"non_terminal_state:{state}", "root": root_label,
+                })
+                continue
+            if dry_run:
+                report["removed"].append({
+                    "worktree": str(entry), "run_id": run_id, "state": state,
+                    "root": root_label, "dry_run": True,
                 })
                 continue
             result = _remove_worktree(repo_root, str(entry))
             if result.get("removed"):
                 report["removed"].append({
                     "worktree": str(entry), "run_id": run_id, "state": state,
+                    "root": root_label,
                 })
             else:
                 # git refused (locked worktree, permission error, ...) or the
@@ -892,11 +925,58 @@ def sweep_stale_worktrees(repo_root: str, project_root: str | None = None) -> di
                 report["errors"].append({
                     "worktree": str(entry), "run_id": run_id,
                     "error": result.get("error") or "removal_failed",
+                    "root": root_label,
                 })
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the sweep
             report["errors"].append({
                 "worktree": str(entry), "run_id": run_id, "error": str(exc)[:300],
+                "root": root_label,
             })
+
+
+def sweep_stale_worktrees(
+        repo_root: str, project_root: str | None = None,
+        dry_run: bool = False) -> dict[str, Any]:
+    """Remove attended worktrees whose cursor has reached a terminal state;
+    skip (never remove) anything whose cursor is non-terminal or missing.
+
+    Scans BOTH the current worktree root (``resolve_worktree_root(repo_root)``)
+    AND the pre-relocation legacy root (``<repo_root>/.harness/worktrees``,
+    see ``_legacy_worktree_root``) for ``attended-*`` directories (the same
+    naming ``_provision_worktree`` creates), looks up each one's cursor via
+    ``_find_attended_cursor``, and removes only the ones proven terminal.
+    Never deletes a branch. Never raises — per-entry failures are collected
+    in the returned report rather than aborting the sweep. A missing legacy
+    directory is the normal post-migration state, not an error -- it is
+    silently skipped exactly like a missing current root already was.
+
+    Both roots are scanned with the IDENTICAL decision logic (see
+    ``_sweep_one_root``): the cursor-terminality gate, fail-toward-keeping on
+    a corrupt/unreadable/missing cursor, never-delete-a-branch, and per-entry
+    error reporting all apply the same way to a legacy entry as to a current
+    one. Paths seen via both roots are deduplicated so nothing is processed
+    twice.
+
+    ``dry_run=True`` (the CLI operator entry point's default) runs the exact
+    same terminality decision for every entry but never calls
+    ``_remove_worktree`` — a candidate that would be removed is still
+    appended to ``report["removed"]``, tagged ``"dry_run": True``, so callers
+    get an honest preview without touching disk. ``dry_run=False`` (this
+    function's own default, preserved for existing callers) behaves exactly
+    as before.
+
+    Returns ``{"removed": [...], "skipped": [...], "errors": [...]}`` where
+    each entry is ``{"worktree": path, "run_id": ..., "root": "current" |
+    "legacy", "reason"/"state"/"error": ...}`` — ``root`` lets an operator
+    tell current-location entries apart from reclaimed legacy residue.
+    """
+    report: dict[str, Any] = {"removed": [], "skipped": [], "errors": []}
+    root = project_root or repo_root
+    seen: set[str] = set()
+    _sweep_one_root(resolve_worktree_root(repo_root), "current", repo_root, root,
+                    dry_run, report, seen)
+    _sweep_one_root(_legacy_worktree_root(repo_root), "legacy", repo_root, root,
+                    dry_run, report, seen)
     return report
 
 

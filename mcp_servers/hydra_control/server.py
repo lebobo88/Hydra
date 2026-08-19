@@ -976,6 +976,32 @@ def _tool_handlers() -> dict[str, Any]:
             logger.exception("repo_resolve failed")
             return {"ok": False, "error": f"repo_resolve failed: {exc}"}
 
+    def worktree_sweep_status(args: dict[str, Any]) -> dict[str, Any]:
+        """READ-ONLY preview of `hydra sweep-worktrees` (the attended-worktree
+        janitor). Always runs dry-run — the deleting form (`hydra
+        sweep-worktrees --apply`) stays CLI-only, same allow-list-authorship
+        boundary as `hydra repo register` (see repo_list above): a
+        destructive sweep an LLM can invoke over MCP is a worse footgun than
+        a convenient one. Any `apply`-shaped key in `args` is ignored on
+        purpose, not honored — this tool cannot be made to delete anything
+        regardless of what a caller passes.
+        """
+        project = args.get("project")
+        cli_args = ["sweep-worktrees"]
+        if project:
+            cli_args = ["--project", str(project), *cli_args]
+        try:
+            result = _run_cli_json(
+                cli_args, timeout_s=60, err_label="sweep_worktrees",
+            )
+            if not isinstance(result, dict):
+                return {"ok": False, "error": "sweep-worktrees command returned non-object"}
+            result.setdefault("ok", "error" not in result)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("worktree_sweep_status failed")
+            return {"ok": False, "error": f"sweep_status_failed: {exc}"}
+
     def envelope_record(args: dict[str, Any]) -> dict[str, Any]:
         """Record an envelope to episodic db / trace.
 
@@ -1191,6 +1217,7 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.squad.list": squad_list,
         "hydra.repo.list": repo_list,
         "hydra.repo.resolve": repo_resolve,
+        "hydra.worktree.sweep_status": worktree_sweep_status,
         "hydra.envelope.record": envelope_record,
         "hydra.telemetry.tail": telemetry_tail,
     }
@@ -1454,6 +1481,29 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "repo_id": {"type": "string", "description": "Allow-listed repo id to resolve."},
             },
             "required": ["repo_id"],
+        },
+    },
+    "hydra.worktree.sweep_status": {
+        "description": (
+            "READ-ONLY preview of the attended-worktree janitor "
+            "(host_bridge.sweep_stale_worktrees): reports, per worktree, "
+            "its cursor state and the decision that would be made -- "
+            "'removed'/'would-remove', 'skipped-non-terminal', "
+            "'skipped-no-cursor', or 'error' -- without deleting anything. "
+            "Always runs dry-run regardless of any input; the deleting form "
+            "(`hydra sweep-worktrees --apply`) is CLI-only and NOT exposed "
+            "over MCP, same allow-list-authorship boundary as `hydra repo "
+            "register` (see hydra.repo.list above). Never deletes a git "
+            "branch. Returns {ok, mode, project, count_removed, "
+            "count_skipped, count_errors, entries}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Project root to scan (defaults to this Hydra checkout).",
+                },
+            },
         },
     },
     "hydra.envelope.record": {
