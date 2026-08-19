@@ -686,6 +686,20 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
     caught the merge-back no-op elsewhere in this module, where trusting
     git's exit code was precisely the error.
 
+    The returned verdict is deliberately a *disk* verdict, not a *git
+    bookkeeping* verdict: ``removed=True`` means "the checkout directory is
+    confirmed gone", which is what the operator's original concern (worktree
+    disk occupancy) actually asks. It does NOT by itself mean git's own
+    ``.git/worktrees/<name>`` registration is deregistered -- on Windows an
+    AV scanner or an open handle can let the directory removal race ahead of
+    (or independently of) git's admin-dir cleanup, leaving `git worktree
+    list` still reporting a path whose directory is already gone. When the
+    directory is confirmed gone, this function best-effort re-checks that
+    registration and runs ``git worktree prune`` to clear a stale entry if
+    one is found -- but that follow-up is advisory only and never flips the
+    disk-based verdict already decided, since a prune failure doesn't change
+    whether the disk space was actually reclaimed.
+
     Returns ``{"removed": bool, "error": str | None}``. Never raises.
     """
     err: str | None = None
@@ -703,6 +717,21 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
         return {"removed": False, "error": err or "git reported success but path still exists"}
     # Path is genuinely gone -- that's a real removal even if git also
     # reported a (now-moot) error, e.g. a racing caller removed it first.
+    # Best-effort: if git's own worktree list still shows the (now-gone)
+    # path registered -- a stale admin dir -- prune it so git's bookkeeping
+    # doesn't keep pointing at a dead checkout. Failure here is swallowed on
+    # purpose: this is advisory cleanup, not part of the disk-based verdict.
+    try:
+        listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout or ""
+        normalized = str(Path(worktree_path)).replace("\\", "/")
+        still_registered = any(
+            line.startswith("worktree ") and line[len("worktree "):].strip().replace("\\", "/") == normalized
+            for line in listing.splitlines()
+        )
+        if still_registered:
+            _git(["worktree", "prune"], repo_root)
+    except Exception:  # noqa: BLE001 — advisory only, never affects the verdict below
+        pass
     return {"removed": True, "error": None}
 
 
