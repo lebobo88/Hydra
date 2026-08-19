@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -695,10 +696,17 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
     (or independently of) git's admin-dir cleanup, leaving `git worktree
     list` still reporting a path whose directory is already gone. When the
     directory is confirmed gone, this function best-effort re-checks that
-    registration and runs ``git worktree prune`` to clear a stale entry if
-    one is found -- but that follow-up is advisory only and never flips the
-    disk-based verdict already decided, since a prune failure doesn't change
-    whether the disk space was actually reclaimed.
+    registration and, if it finds this worktree's entry still stale-listed,
+    deregisters ONLY this worktree's own ``.git/worktrees/<name>`` admin
+    directory (see ``_prune_single_worktree_admin_dir``) -- deliberately NOT
+    ``git worktree prune``, which is repo-wide and takes effect immediately
+    with no grace period, and would deregister every missing worktree
+    registration in the repository, not just this one. Attended stages can
+    run concurrently; a repo-wide prune fired from one stage's cleanup could
+    deregister another stage's live worktree if its directory read as
+    transiently absent (slow filesystem, network mount, mid-write). This
+    follow-up is advisory only and never flips the disk-based verdict already
+    decided, since it doesn't change whether the disk space was reclaimed.
 
     Returns ``{"removed": bool, "error": str | None}``. Never raises.
     """
@@ -718,9 +726,10 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
     # Path is genuinely gone -- that's a real removal even if git also
     # reported a (now-moot) error, e.g. a racing caller removed it first.
     # Best-effort: if git's own worktree list still shows the (now-gone)
-    # path registered -- a stale admin dir -- prune it so git's bookkeeping
-    # doesn't keep pointing at a dead checkout. Failure here is swallowed on
-    # purpose: this is advisory cleanup, not part of the disk-based verdict.
+    # path registered -- a stale admin dir -- deregister ONLY this
+    # worktree's own admin directory (never a repo-wide `worktree prune`;
+    # see docstring). Failure here is swallowed on purpose: this is advisory
+    # cleanup, not part of the disk-based verdict.
     try:
         listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout or ""
         normalized = str(Path(worktree_path)).replace("\\", "/")
@@ -729,10 +738,61 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
             for line in listing.splitlines()
         )
         if still_registered:
-            _git(["worktree", "prune"], repo_root)
+            _prune_single_worktree_admin_dir(repo_root, worktree_path)
     except Exception:  # noqa: BLE001 — advisory only, never affects the verdict below
         pass
     return {"removed": True, "error": None}
+
+
+def _prune_single_worktree_admin_dir(repo_root: str, worktree_path: str) -> None:
+    """Best-effort deregister ONLY the admin directory for ``worktree_path``.
+
+    Deliberately does NOT call ``git worktree prune``: that command is
+    repo-wide and takes effect immediately with no default grace period
+    (verified empirically on Git 2.55.0.windows.3 in a scratch repo) -- it
+    deregisters every missing worktree registration in the repository, not
+    just the caller's own. Attended stages can run concurrently; a repo-wide
+    prune fired from one stage's per-worktree cleanup could deregister
+    another stage's live worktree if its directory happened to read as
+    transiently absent (slow filesystem, network mount, mid-write).
+
+    Instead, this walks ``<git-common-dir>/worktrees/*`` directly -- each
+    admin directory contains a ``gitdir`` file pointing back at
+    ``<worktree_path>/.git`` -- finds the single admin dir whose ``gitdir``
+    matches ``worktree_path``, and removes only that directory. Every other
+    worktree's registration, live or stale, is left completely untouched:
+    there is no repo-wide operation for a race to reach.
+
+    Never raises -- the caller already wraps this call in its own swallowing
+    try/except, since this is advisory cleanup that must never affect the
+    disk-based removal verdict.
+    """
+    common = _git(["rev-parse", "--git-common-dir"], repo_root)
+    if common.returncode != 0:
+        return
+    common_dir = Path((common.stdout or "").strip())
+    if not common_dir.is_absolute():
+        common_dir = Path(repo_root) / common_dir
+    worktrees_dir = common_dir / "worktrees"
+    if not worktrees_dir.is_dir():
+        return
+    target = str(Path(worktree_path)).replace("\\", "/").rstrip("/")
+    for admin_dir in worktrees_dir.iterdir():
+        if not admin_dir.is_dir():
+            continue
+        gitdir_file = admin_dir / "gitdir"
+        if not gitdir_file.is_file():
+            continue
+        try:
+            pointed = gitdir_file.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001
+            continue
+        pointed_norm = pointed.replace("\\", "/").rstrip("/")
+        if pointed_norm.endswith("/.git"):
+            pointed_norm = pointed_norm[: -len("/.git")]
+        if pointed_norm == target:
+            shutil.rmtree(admin_dir, ignore_errors=True)
+            return
 
 
 # --------------------------------------------------------------------------- #

@@ -505,35 +505,45 @@ def test_remove_worktree_race_git_errors_but_path_already_gone(tmp_path, monkeyp
     )
 
 
-def test_remove_worktree_prunes_stale_git_registration_but_verdict_stays_disk_based(
+def test_remove_worktree_deregisters_only_its_own_admin_dir_but_verdict_stays_disk_based(
         tmp_path, monkeypatch):
-    """Judgement call from the WS3 retry brief: `Path(...).exists()` proves
-    the checkout directory is gone, not that git's own `.git/worktrees/<name>`
-    registration is deregistered -- on Windows an AV/lock can let the
-    directory removal race ahead of git's admin-dir cleanup, and `git
-    worktree list` can keep reporting a path whose directory is already
-    gone. Strengthened (per the brief's stated preference) rather than just
-    narrowing the docstring: once the directory is confirmed gone,
-    `_remove_worktree` re-queries `git worktree list` and best-effort runs
-    `git worktree prune` if it finds a stale entry.
+    """Judgement call from the WS3 retry brief, REVERSED after the reviewer's
+    empirical finding: `git worktree prune` is repo-wide and takes effect
+    immediately with no grace period (verified on Git 2.55.0.windows.3 in a
+    scratch repo) -- it deregisters every missing worktree registration in
+    the repository, not just the one this cleanup cares about. Since attended
+    stages can run concurrently, a repo-wide prune fired from one stage's
+    cleanup could deregister a sibling stage's live worktree if its directory
+    briefly read as absent.
 
-    That follow-up is advisory only -- it must never flip the already-decided
-    disk-based verdict, since the operator-facing contract here is disk
-    occupancy, not git bookkeeping cleanliness. This test proves both halves:
-    prune actually gets invoked when the listing is stale, AND the returned
-    verdict is unaffected by it.
+    So `_remove_worktree` does NOT call `git worktree prune`. Instead, when
+    `Path(...).exists()` proves the checkout directory is gone but git's own
+    `.git/worktrees/<name>` registration is still stale-listed (an AV/lock
+    can let directory removal race ahead of git's admin-dir cleanup), it
+    calls `_prune_single_worktree_admin_dir`, which deregisters ONLY the one
+    admin directory whose `gitdir` file points at this worktree -- never a
+    repo-wide command. That follow-up is advisory only -- it must never flip
+    the already-decided disk-based verdict, since the operator-facing
+    contract here is disk occupancy, not git bookkeeping cleanliness. This
+    test proves both halves: the scoped admin-dir removal actually happens
+    when the listing is stale, AND the returned verdict is unaffected by it.
 
     Reproducing a genuinely stale git registration after a real successful
     removal isn't possible on this platform (this repo's git deregisters
     correctly whenever it actually runs the removal -- see the empirical
     note in the race test above), so only the single `git worktree list`
-    call is intercepted to report a stale entry; the `remove` and `prune`
-    calls, and all directory state, are real.
+    call is intercepted to report a stale entry; the `remove` call, the
+    `rev-parse --git-common-dir` call, and all directory state, are real.
     """
     repo_root = _init_repo(tmp_path / "myrepo")
     prov = _provision_worktree(str(repo_root), "run_staleadmin")
     assert prov is not None
     wt_path, _branch = prov
+
+    common = _git(["rev-parse", "--git-common-dir"], repo_root).stdout.strip()
+    common_dir = Path(common) if Path(common).is_absolute() else repo_root / common
+    admin_dir = common_dir / "worktrees" / "attended-run_staleadmin"
+    assert admin_dir.is_dir(), "provisioning must have created the admin dir"
 
     real_git = host_bridge._git
     prune_calls: list[list[str]] = []
@@ -554,10 +564,135 @@ def test_remove_worktree_prunes_stale_git_registration_but_verdict_stays_disk_ba
     result = _remove_worktree(str(repo_root), wt_path)
 
     assert result == {"removed": True, "error": None}, (
-        "the advisory prune follow-up must never change the disk-based verdict"
+        "the advisory admin-dir cleanup must never change the disk-based verdict"
     )
-    assert prune_calls, "a stale git worktree list entry must trigger a prune attempt"
+    assert not prune_calls, (
+        "must never invoke the repo-wide `git worktree prune` -- only the "
+        "single matching admin directory may be touched"
+    )
+    assert not admin_dir.exists(), (
+        "the stale entry's own admin dir must be deregistered directly"
+    )
     assert not Path(wt_path).exists()
+
+
+def test_remove_worktree_admin_dir_cleanup_never_touches_a_live_sibling_worktree(
+        tmp_path, monkeypatch):
+    """Concurrency safety net for the reviewer's exact scenario: while this
+    stage's worktree is being cleaned up, a SECOND, still-live attended
+    worktree exists in the same repo. The scoped admin-dir removal must never
+    deregister the sibling's registration, because there is no repo-wide
+    operation for a race to reach -- it can only ever touch the one admin
+    directory whose `gitdir` matches the worktree actually being removed.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov_dead = _provision_worktree(str(repo_root), "run_dying")
+    prov_live = _provision_worktree(str(repo_root), "run_still_alive")
+    assert prov_dead is not None and prov_live is not None
+    dead_path, _dead_branch = prov_dead
+    live_path, _live_branch = prov_live
+    assert Path(live_path).is_dir()
+
+    real_git = host_bridge._git
+
+    def _fake_git(args, cwd, *a, **k):
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "list":
+            fake = type("_Fake", (), {})()
+            fake.returncode = 0
+            fake.stdout = (
+                f"worktree {dead_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy\n\n"
+                f"worktree {live_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy-live\n"
+            )
+            fake.stderr = ""
+            return fake
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _fake_git)
+
+    result = _remove_worktree(str(repo_root), dead_path)
+
+    assert result == {"removed": True, "error": None}
+    monkeypatch.undo()
+
+    # The sibling's real, unmocked registration must still be intact.
+    listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout
+    normalized_live = str(Path(live_path)).replace("\\", "/")
+    assert any(
+        line.startswith("worktree ") and line[len("worktree "):].strip().replace("\\", "/") == normalized_live
+        for line in listing.splitlines()
+    ), "the live sibling worktree must remain registered"
+    assert Path(live_path).is_dir(), "the live sibling checkout must be untouched"
+
+    _remove_worktree(str(repo_root), live_path)
+
+
+def test_prune_single_worktree_admin_dir_failure_is_swallowed_and_never_flips_verdict(
+        tmp_path, monkeypatch):
+    """Closes the untested guarantee the retry brief flagged: nothing
+    previously made the scoped admin-dir cleanup itself raise, so
+    'failed cleanup doesn't flip the verdict' was unproven. Forces
+    `_prune_single_worktree_admin_dir` to raise (by making the intercepted
+    `rev-parse --git-common-dir` call blow up) and asserts `_remove_worktree`
+    still reports the real, already-decided disk-based verdict.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_pruneboom")
+    assert prov is not None
+    wt_path, _branch = prov
+
+    real_git = host_bridge._git
+
+    def _fake_git(args, cwd, *a, **k):
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "list":
+            fake = type("_Fake", (), {})()
+            fake.returncode = 0
+            fake.stdout = f"worktree {wt_path}\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/dummy\n"
+            fake.stderr = ""
+            return fake
+        if len(args) >= 2 and args[0] == "rev-parse" and args[1] == "--git-common-dir":
+            raise RuntimeError("simulated rev-parse crash")
+        return real_git(args, cwd, *a, **k)
+
+    monkeypatch.setattr(host_bridge, "_git", _fake_git)
+
+    result = _remove_worktree(str(repo_root), wt_path)
+
+    assert result == {"removed": True, "error": None}, (
+        "a raising advisory cleanup must be swallowed, not surfaced or "
+        "allowed to flip the disk-based verdict"
+    )
+
+
+def test_remove_worktree_path_exists_check_raising_fails_toward_not_removed(
+        tmp_path, monkeypatch):
+    """The docstring says exceptions from `_git` OR `Path.exists()` are
+    handled; only the `_git` half had a test. Forces `Path.exists()` itself
+    to raise (simulating e.g. a permission-denied `stat()` on a half-torn-down
+    mount) and asserts the function fails TOWARD "not proven removed" rather
+    than propagating or claiming success -- mirroring the same discipline
+    documented at the `still_present = True` fallback.
+    """
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_statboom")
+    assert prov is not None
+    wt_path, _branch = prov
+
+    real_exists = Path.exists
+
+    def _boom_exists(self):
+        if str(self) == str(Path(wt_path)):
+            raise OSError("simulated stat() failure")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _boom_exists)
+
+    result = _remove_worktree(str(repo_root), wt_path)
+
+    assert result["removed"] is False
+    assert result["error"] is not None
+    monkeypatch.undo()
+
+    _remove_worktree(str(repo_root), wt_path)
 
 
 # ===========================================================================
