@@ -539,8 +539,9 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
                 "resume.lock (the workflow's resume lock file)",
                 "orphan pp run — finalize-abort it via the pp harness",
                 (
-                    "orphan .harness/worktrees/attended-* worktree "
-                    "(git worktree remove <path>)"
+                    "orphan attended-* worktree under the resolved worktree "
+                    "root (git worktree remove <path>, or let the Hydra "
+                    "janitor sweep_stale_worktrees reap it once terminal)"
                 ),
             ]
         return _tout

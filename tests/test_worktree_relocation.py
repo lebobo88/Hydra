@@ -1,0 +1,403 @@
+"""WS3: attended worktrees relocate outside the target repo.
+
+Covers:
+  - `resolve_worktree_root` resolution order (HYDRA_WORKTREE_ROOT >
+    AIAPP_BASE > sibling-of-repo_root fallback), always outside repo_root.
+  - `_provision_worktree` actually lands under the resolved root, not
+    `<repo_root>/.harness/worktrees/`.
+  - `_remove_worktree` cleans an external (non-repo-root-nested) worktree.
+  - `_capture_baseline_failures` resolves via repo_root (containment math
+    doesn't break once the worktree moves outside repo_root — regression
+    guard for the existing GAP-a2 contract).
+  - The Hydra-side janitor (`sweep_stale_worktrees`): removes a
+    terminal-cursor worktree, refuses a non-terminal or cursor-less one,
+    and never deletes a branch.
+
+Real git repos, real filesystem paths — no mocks for the git plumbing.
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from hydra_core import host_bridge
+from hydra_core.host_bridge import (
+    CURSOR_SCHEMA,
+    _find_attended_cursor,
+    _provision_worktree,
+    _remove_worktree,
+    cursor_path,
+    resolve_worktree_root,
+    save_cursor,
+    sweep_stale_worktrees,
+)
+
+
+def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, check=False)
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q"], path)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t", "commit",
+          "--allow-empty", "-q", "-m", "init"], path)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    monkeypatch.delenv("HYDRA_WORKTREE_ROOT", raising=False)
+    monkeypatch.delenv("AIAPP_BASE", raising=False)
+
+
+# ===========================================================================
+# resolve_worktree_root
+# ===========================================================================
+
+def test_resolve_worktree_root_env_override(tmp_path, monkeypatch):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    custom = tmp_path / "custom-wt-root"
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(custom))
+
+    root = resolve_worktree_root(str(repo_root))
+
+    assert root == custom / "myrepo"
+
+
+def test_resolve_worktree_root_aiapp_base(tmp_path, monkeypatch):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    monkeypatch.setenv("AIAPP_BASE", str(tmp_path))
+
+    root = resolve_worktree_root(str(repo_root))
+
+    assert root == tmp_path / ".hydra-worktrees" / "myrepo"
+
+
+def test_resolve_worktree_root_sibling_fallback_no_env(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+
+    root = resolve_worktree_root(str(repo_root))
+
+    assert root == tmp_path / ".hydra-worktrees" / "myrepo"
+    # Never a subdirectory of repo_root.
+    assert not str(root).startswith(str(repo_root))
+
+
+# ===========================================================================
+# _provision_worktree lands under the resolved root, not <repo>/.harness/
+# ===========================================================================
+
+def test_provision_worktree_not_under_repo_harness(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+
+    prov = _provision_worktree(str(repo_root), "run_abc123")
+    assert prov is not None
+    wt_path, branch = prov
+    try:
+        expected_root = resolve_worktree_root(str(repo_root))
+        assert Path(wt_path).parent == expected_root
+        assert Path(wt_path) == expected_root / "attended-run_abc123"
+        # REGRESSION GUARD: this is the exact bug being fixed — a worktree
+        # nested inside the target repo pollutes any test-runner glob rooted
+        # at repo_root (e.g. `**/tests/**`) with a stale duplicate suite.
+        assert not (repo_root / ".harness" / "worktrees").exists(), (
+            "no .harness/worktrees/ may be created inside the target repo"
+        )
+        assert branch == "attended/run_abc123"
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+# ===========================================================================
+# _remove_worktree cleans an external path
+# ===========================================================================
+
+def test_remove_worktree_cleans_external_path(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_ext1")
+    assert prov is not None
+    wt_path, _branch = prov
+    assert Path(wt_path).is_dir()
+
+    _remove_worktree(str(repo_root), wt_path)
+
+    assert not Path(wt_path).exists()
+    listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout
+    assert wt_path.replace("\\", "/") not in listing.replace("\\", "/")
+
+
+# ===========================================================================
+# _capture_baseline_failures containment math survives the relocation
+# ===========================================================================
+
+def test_capture_baseline_failures_uses_repo_root_for_relocated_worktree(
+        tmp_path, monkeypatch):
+    from hydra_core.host_bridge import _capture_baseline_failures
+    from unittest.mock import MagicMock
+    import subprocess as _sp
+
+    repo_root = tmp_path / "myrepo"
+    (repo_root / "tests").mkdir(parents=True)
+    # Worktree now lives OUTSIDE repo_root entirely (sibling tree), unlike the
+    # old <repo>/.harness/worktrees/attended-X nesting -- project_path.parent
+    # would resolve to something unrelated to repo_root here.
+    worktree = tmp_path / ".hydra-worktrees" / "myrepo" / "attended-runX"
+    worktree.mkdir(parents=True)
+
+    _mock_proc = MagicMock()
+    _mock_proc.stdout = "FAILED tests/test_repo.py::test_r\n1 failed"
+    _mock_proc.stderr = ""
+    _mock_proc.returncode = 1
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _mock_proc)
+
+    result = _capture_baseline_failures(str(worktree), repo_root=str(repo_root))
+    assert any("test_repo" in r for r in result), (
+        "baseline must resolve via repo_root, not project_path.parent, once "
+        "the worktree is relocated outside repo_root"
+    )
+
+
+# ===========================================================================
+# Janitor: sweep_stale_worktrees
+# ===========================================================================
+
+def _cursor(state: str) -> dict:
+    return {
+        "schema": CURSOR_SCHEMA,
+        "workflow_id": "wf-1",
+        "run_id": "runA",
+        "state": state,
+    }
+
+
+def test_janitor_removes_terminal_cursor_worktree(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    project_root = repo_root
+    prov = _provision_worktree(str(repo_root), "runA")
+    assert prov is not None
+    wt_path, branch = prov
+
+    cfile = cursor_path(str(project_root), "wf-1", "runA")
+    save_cursor(cfile, _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(project_root))
+
+    assert not Path(wt_path).exists(), "terminal-cursor worktree must be removed"
+    assert len(report["removed"]) == 1
+    assert report["removed"][0]["run_id"] == "runA"
+    # Branch itself must survive -- only the worktree checkout is removed.
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches, "janitor must never delete the branch"
+
+
+def test_janitor_skips_non_terminal_cursor_worktree(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    project_root = repo_root
+    prov = _provision_worktree(str(repo_root), "runB")
+    assert prov is not None
+    wt_path, branch = prov
+    try:
+        cfile = cursor_path(str(project_root), "wf-1", "runB")
+        save_cursor(cfile, _cursor("await_judge"))
+
+        report = sweep_stale_worktrees(str(repo_root), str(project_root))
+
+        assert Path(wt_path).exists(), (
+            "non-terminal-cursor worktree (e.g. paused on HITL) must NOT be removed"
+        )
+        assert len(report["removed"]) == 0
+        assert any(s["run_id"] == "runB" for s in report["skipped"])
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_janitor_skips_worktree_with_no_cursor(tmp_path):
+    """A worktree observed mid-provision (cursor not yet written) must not be
+    swept -- 'no cursor found' is 'cannot prove terminal', not 'safe to remove'."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runC")
+    assert prov is not None
+    wt_path, _branch = prov
+    try:
+        # Deliberately do NOT write a cursor file for runC.
+        report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+        assert Path(wt_path).exists()
+        assert len(report["removed"]) == 0
+        assert any(s["run_id"] == "runC" and s["reason"] == "no_cursor_found"
+                   for s in report["skipped"])
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_janitor_never_deletes_branch_even_when_removing(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runD")
+    assert prov is not None
+    wt_path, branch = prov
+    cfile = cursor_path(str(repo_root), "wf-1", "runD")
+    save_cursor(cfile, _cursor("surfaced"))
+
+    sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    show = _git(["show-ref", "--verify", f"refs/heads/{branch}"], repo_root)
+    assert show.returncode == 0, "branch ref must still exist after the sweep"
+
+
+# ===========================================================================
+# _remove_worktree reports what actually happened (WS3 retry FINDING 1)
+# ===========================================================================
+# The original implementation returned None, swallowed every exception, and
+# never checked `_git`'s CompletedProcess.returncode -- a nonzero git exit
+# does not raise (`_git` doesn't `check=True`). `sweep_stale_worktrees` then
+# unconditionally appended to report["removed"] regardless of what really
+# happened. Fixed: `_remove_worktree` now returns {"removed": bool,
+# "error": str | None}, checking BOTH the returncode AND that the path is
+# genuinely gone afterwards (the same before/after discipline that caught
+# the merge-back no-op elsewhere in this module), and the janitor routes a
+# failed removal to report["errors"] instead of report["removed"].
+
+def test_remove_worktree_reports_success_dict(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_ext2")
+    assert prov is not None
+    wt_path, _branch = prov
+
+    result = _remove_worktree(str(repo_root), wt_path)
+
+    assert result == {"removed": True, "error": None}
+    assert not Path(wt_path).exists()
+
+
+def test_remove_worktree_reports_failure_when_git_fails(tmp_path, monkeypatch):
+    """Directly exercises the fixed contract: a nonzero git returncode with
+    the path still on disk must be reported as a failure, not swallowed."""
+    from unittest.mock import MagicMock
+
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "run_ext3")
+    assert prov is not None
+    wt_path, _branch = prov
+
+    fake = MagicMock()
+    fake.returncode = 128
+    fake.stdout = ""
+    fake.stderr = "fatal: unable to remove worktree: locked"
+    monkeypatch.setattr(host_bridge, "_git", lambda *a, **k: fake)
+
+    result = _remove_worktree(str(repo_root), wt_path)
+
+    assert result["removed"] is False
+    assert "locked" in result["error"]
+    assert Path(wt_path).exists(), (
+        "a reported failure must correspond to the path genuinely remaining"
+    )
+
+    monkeypatch.undo()
+    _remove_worktree(str(repo_root), wt_path)
+
+
+def test_janitor_reports_failed_removal_as_error_not_removed(tmp_path, monkeypatch):
+    """Falsification test for FINDING 1: force git to fail on the removal
+    call (locked worktree / permission error / any git-level failure) while
+    the directory stays in place, and assert the janitor's report tells the
+    truth about it.
+
+    Against the pre-fix `_remove_worktree` (fire-and-forget, `except: pass`,
+    no returncode check, `sweep_stale_worktrees` unconditionally appending to
+    report["removed"]) this test fails: the still-present worktree would be
+    reported as cleanly removed.
+    """
+    from unittest.mock import MagicMock
+
+    repo_root = _init_repo(tmp_path / "myrepo")
+    project_root = repo_root
+    prov = _provision_worktree(str(repo_root), "runE")
+    assert prov is not None
+    wt_path, branch = prov
+    cfile = cursor_path(str(project_root), "wf-1", "runE")
+    save_cursor(cfile, _cursor("complete"))
+
+    real_git = host_bridge._git
+
+    def _fake_git(args, cwd):
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "remove":
+            fake = MagicMock()
+            fake.returncode = 128
+            fake.stdout = ""
+            fake.stderr = "fatal: unable to remove worktree: locked"
+            return fake
+        return real_git(args, cwd)
+
+    monkeypatch.setattr(host_bridge, "_git", _fake_git)
+
+    report = sweep_stale_worktrees(str(repo_root), str(project_root))
+
+    assert Path(wt_path).exists(), "a failed removal must leave the path in place"
+    assert len(report["removed"]) == 0, "must not report a failed removal as removed"
+    assert not any(r["run_id"] == "runE" for r in report["removed"])
+    err_entries = [e for e in report["errors"] if e["run_id"] == "runE"]
+    assert err_entries, "a failed removal must land in errors, not be dropped or hidden"
+    assert "locked" in err_entries[0]["error"]
+
+    # Branch must still survive the failed sweep too.
+    branches = _git(["branch", "--list", branch], repo_root).stdout
+    assert branch in branches
+
+    monkeypatch.undo()
+    _remove_worktree(str(repo_root), wt_path)
+
+
+# ===========================================================================
+# resolve_worktree_root precedence stays in lockstep with the write-block
+# hooks (WS3 retry FINDING 2)
+# ===========================================================================
+# The three-tier precedence (HYDRA_WORKTREE_ROOT > AIAPP_BASE > sibling
+# fallback) is hand-mirrored in three places -- this Python function and two
+# PowerShell hooks -- with no shared source of truth. This is a textual
+# ordering check, not a behavioral one (it cannot execute the .ps1 scripts
+# portably in CI), but it catches the cheap, likely mistake: reordering or
+# dropping a tier in one copy while editing another. That's the same
+# duplication shape that let a hydra_control schema drift (`risk` missing
+# from one of two copies) unnoticed until WS1-A's bug surfaced it.
+
+def test_worktree_root_precedence_matches_hooks():
+    repo_root = Path(host_bridge.__file__).resolve().parents[1]
+    hook_paths = [
+        repo_root / "plugins" / "hydra" / "hooks" / "hydra-block-direct-write.ps1",
+        repo_root / "plugins" / "hydra" / "hooks" / "hydra-block-bash-writes.ps1",
+    ]
+    for hook_path in hook_paths:
+        assert hook_path.is_file(), f"missing hook: {hook_path}"
+        text = hook_path.read_text(encoding="utf-8")
+
+        # `AIAPP_BASE` is checked more than once per file (some hooks also
+        # use it for an unrelated project-root resolution earlier in the
+        # script) -- HYDRA_WORKTREE_ROOT only ever appears in the
+        # worktree-root precedence block itself, so anchor the search to
+        # AFTER that marker to scope in on the right block rather than
+        # picking up the unrelated earlier check.
+        m_env_override = re.search(r"if\s*\(\$env:HYDRA_WORKTREE_ROOT\)", text)
+        assert m_env_override, (
+            f"{hook_path.name} is missing the HYDRA_WORKTREE_ROOT tier -- "
+            "resolve_worktree_root's lockstep contract requires all three"
+        )
+        tail = text[m_env_override.end():]
+        m_aiapp_base = re.search(r"if\s*\(\$env:AIAPP_BASE\)", tail)
+        m_sibling = re.search(r"Split-Path[^\n]*'\.hydra-worktrees'", tail)
+
+        assert m_aiapp_base and m_sibling, (
+            f"{hook_path.name} is missing one of the three precedence tiers "
+            "-- resolve_worktree_root's lockstep contract requires all three"
+        )
+        assert m_aiapp_base.start() < m_sibling.start(), (
+            f"{hook_path.name}'s tier order has drifted from "
+            "resolve_worktree_root's HYDRA_WORKTREE_ROOT > AIAPP_BASE > "
+            "sibling-fallback precedence"
+        )

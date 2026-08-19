@@ -112,12 +112,31 @@ if ($_bwProjRoot) {
     $_bwResolved = (Resolve-Path -LiteralPath $_bwProjRoot -ErrorAction SilentlyContinue)
     if ($_bwResolved) { $_bwProjRootNorm = $_bwResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
 }
-$_bwWorktreeRootNorm = $null
+# Worktree roots where the pp/hydra engineer legitimately writes candidate code.
+# MUST stay in LOCKSTEP with hydra_core.host_bridge.resolve_worktree_root (twin
+# of hydra-block-direct-write.ps1): HYDRA_WORKTREE_ROOT >
+# <AIAPP_BASE>\.hydra-worktrees > <parent of repo_root>\.hydra-worktrees, each
+# namespaced per-repo (StartsWith on the base covers every <repo_id>\attended-*
+# child). The legacy <projectRoot>\.harness\worktrees is retained for
+# pair-programmer's own candidate worktrees.
+function _bwNormRoot([string]$p) {
+    if (-not $p) { return $null }
+    try { $full = [System.IO.Path]::GetFullPath($p) } catch { $full = $p }
+    return $full.Replace('/', '\').TrimEnd('\').ToLowerInvariant()
+}
+$_bwWtRoots = New-Object System.Collections.Generic.List[string]
 if ($env:HYDRA_WORKTREE_ROOT) {
-    $_bwWtResolved = (Resolve-Path -LiteralPath $env:HYDRA_WORKTREE_ROOT -ErrorAction SilentlyContinue)
-    if ($_bwWtResolved) { $_bwWorktreeRootNorm = $_bwWtResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
-} elseif ($_bwProjRootNorm) {
-    $_bwWorktreeRootNorm = "$_bwProjRootNorm\.harness\worktrees"
+    $_r = _bwNormRoot $env:HYDRA_WORKTREE_ROOT
+    if ($_r) { [void]$_bwWtRoots.Add($_r) }
+}
+if ($env:AIAPP_BASE) {
+    $_r = _bwNormRoot (Join-Path $env:AIAPP_BASE '.hydra-worktrees')
+    if ($_r) { [void]$_bwWtRoots.Add($_r) }
+}
+if ($_bwProjRootNorm) {
+    $_r = _bwNormRoot (Join-Path (Split-Path $_bwProjRootNorm) '.hydra-worktrees')
+    if ($_r) { [void]$_bwWtRoots.Add($_r) }
+    [void]$_bwWtRoots.Add("$_bwProjRootNorm\.harness\worktrees")
 }
 
 function Test-BlockedDest {
@@ -134,8 +153,15 @@ function Test-BlockedDest {
     } catch { $absNorm = $norm }
 
     $underProjRoot = $_bwProjRootNorm -and ($absNorm -eq $_bwProjRootNorm -or $absNorm.StartsWith("$_bwProjRootNorm\"))
-    $underWorktreeRoot = $_bwWorktreeRootNorm -and ($absNorm -eq $_bwWorktreeRootNorm -or $absNorm.StartsWith("$_bwWorktreeRootNorm\"))
-    if ($underProjRoot -or $underWorktreeRoot) {
+    $underWorktreeRoot = $false
+    foreach ($_wr in $_bwWtRoots) {
+        if ($_wr -and ($absNorm -eq $_wr -or $absNorm.StartsWith("$_wr\"))) { $underWorktreeRoot = $true; break }
+    }
+    # Under an isolated worktree root the engineer writes/commits real engine
+    # source by design — allow unconditionally. Within the project root itself,
+    # only the build / vcs / harness sub-dirs are exempt.
+    if ($underWorktreeRoot) { return $false }
+    if ($underProjRoot) {
         foreach ($frag in $allowDirFragments) {
             if ($absNorm.Contains($frag)) { return $false }
         }

@@ -100,21 +100,51 @@ if ($_arProjRoot) {
     $_arResolved = (Resolve-Path -LiteralPath $_arProjRoot -ErrorAction SilentlyContinue)
     if ($_arResolved) { $_arProjRootNorm = $_arResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
 }
-$_arWorktreeRootNorm = $null
+# Worktree roots where the pp/hydra engineer legitimately writes candidate code.
+# MUST stay in LOCKSTEP with hydra_core.host_bridge.resolve_worktree_root — its
+# resolution order is HYDRA_WORKTREE_ROOT > <AIAPP_BASE>\.hydra-worktrees >
+# <parent of repo_root>\.hydra-worktrees (each namespaced per-repo, so a
+# StartsWith on the base covers every <repo_id>\attended-* child). The Hydra
+# attended worktree was relocated OUT of <repo>\.harness\worktrees (2026-08) so
+# a repo-rooted test glob no longer double-counts the copied suite; the legacy
+# <projectRoot>\.harness\worktrees is still kept here because pair-programmer's
+# OWN candidate worktrees continue to live there.
+function _hydraNormRoot([string]$p) {
+    if (-not $p) { return $null }
+    try { $full = [System.IO.Path]::GetFullPath($p) } catch { $full = $p }
+    return $full.Replace('/', '\').TrimEnd('\').ToLowerInvariant()
+}
+$_arWtRoots = New-Object System.Collections.Generic.List[string]
 if ($env:HYDRA_WORKTREE_ROOT) {
-    $_arWtResolved = (Resolve-Path -LiteralPath $env:HYDRA_WORKTREE_ROOT -ErrorAction SilentlyContinue)
-    if ($_arWtResolved) { $_arWorktreeRootNorm = $_arWtResolved.Path.Replace('/', '\').TrimEnd('\').ToLowerInvariant() }
-} elseif ($_arProjRootNorm) {
-    $_arWorktreeRootNorm = "$_arProjRootNorm\.harness\worktrees"
+    $_r = _hydraNormRoot $env:HYDRA_WORKTREE_ROOT
+    if ($_r) { [void]$_arWtRoots.Add($_r) }
+}
+if ($env:AIAPP_BASE) {
+    $_r = _hydraNormRoot (Join-Path $env:AIAPP_BASE '.hydra-worktrees')
+    if ($_r) { [void]$_arWtRoots.Add($_r) }
+}
+if ($_arProjRootNorm) {
+    # Sibling fallback: <parent of projectRoot>\.hydra-worktrees
+    $_r = _hydraNormRoot (Join-Path (Split-Path $_arProjRootNorm) '.hydra-worktrees')
+    if ($_r) { [void]$_arWtRoots.Add($_r) }
+    # Legacy pair-programmer candidate-worktree location.
+    [void]$_arWtRoots.Add("$_arProjRootNorm\.harness\worktrees")
 }
 $_arUnderProjRoot = $_arProjRootNorm -and ($norm -eq $_arProjRootNorm -or $norm.StartsWith("$_arProjRootNorm\"))
-$_arUnderWorktreeRoot = $_arWorktreeRootNorm -and ($norm -eq $_arWorktreeRootNorm -or $norm.StartsWith("$_arWorktreeRootNorm\"))
+$_arUnderWorktreeRoot = $false
+foreach ($_wr in $_arWtRoots) {
+    if ($_wr -and ($norm -eq $_wr -or $norm.StartsWith("$_wr\"))) { $_arUnderWorktreeRoot = $true; break }
+}
 
+# Under an isolated worktree root the engineer writes real engine source by
+# design — allow unconditionally (no fragment gate). Within the project root
+# itself, only the build / vcs / harness sub-dirs are exempt.
+if ($_arUnderWorktreeRoot) { exit 0 }
 $allowDirFragments = @(
     '\.harness\', '\.hydra\', '\worktrees\', '\node_modules\', '\.git\',
     '\dist\', '\build\', '\__pycache__\', '\.venv\', '\site-packages\'
 )
-if ($_arUnderProjRoot -or $_arUnderWorktreeRoot) {
+if ($_arUnderProjRoot) {
     foreach ($frag in $allowDirFragments) {
         if ($norm.Contains($frag)) { exit 0 }
     }
