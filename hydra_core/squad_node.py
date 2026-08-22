@@ -2808,8 +2808,26 @@ def _via_mcp(
                     f"target_repo_subpath={target_repo_subpath!r}: {e}"
                 ),
             )
+    elif pack.slug == "engineering":
+        # WS1-E: the engineering squad must never silently fall back to the
+        # Hydra cwd. squad.yaml's `invoke.project_path` is a non-engineering
+        # config knob (see the branch below); engineering dispatch requires
+        # an explicit, resolved target_repo_id — surfaced here as a failed
+        # result rather than proceeding against an unintended tree. The
+        # attended path enforces the same contract earlier (node_planner's
+        # HITL, before any worktree is cut); this covers the legacy/detached
+        # `_via_mcp` dispatch path.
+        from hydra_core.repo_registry import unknown_repo_hitl_fields
+        return SquadResult(
+            envelopes=[], artifacts=[], status="failed",
+            rationale=(
+                "engineering dispatch has no resolved target repo (no "
+                "target_repo_id on the envelope or workflow). "
+                + unknown_repo_hitl_fields("<repo-id>")["remediation"]
+            ),
+        )
     else:
-        # No repo override (or non-engineering mcp squad) — use the trusted
+        # No repo override, non-engineering mcp squad — use the trusted
         # operator config from squad.yaml, with ${project_root} -> cwd.
         project_path = invoke.get("project_path") or str(state.workflow_id and __import__("pathlib").Path.cwd())
         if "${project_root}" in str(project_path):

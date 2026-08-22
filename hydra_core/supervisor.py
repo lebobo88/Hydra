@@ -369,6 +369,12 @@ def build_supervisor(
         })
 
     def node_intake(state: HydraState) -> dict:
+        # WS1-E: snapshot BEFORE any repo-arg parsing mutates state, so the
+        # target_repo_source assignments below can tell "pre-seeded onto
+        # state before this node ran" (explicit_param, e.g. CLI --repos /
+        # hydra.workflow.plan repos=) apart from "found while parsing goal
+        # text in THIS node" (goal_text_flag).
+        _preseed_had_target_repo_ids = bool(state.target_repo_ids)
         state.phase = "intake"
         _emit_node_context(state, "intake")
         state.bump_iteration()
@@ -446,6 +452,8 @@ def build_supervisor(
         # tests or a future structured API path).
         if _repo_id is not None and not state.target_repo_id:
             state.target_repo_id = _repo_id
+            if not state.target_repo_source:
+                state.target_repo_source = "goal_text_flag"
 
         # --repos / --fleet <id,id,...> extraction: parse an optional multi-repo
         # token and wire fleet mode when >=2 distinct valid repos are named.
@@ -649,6 +657,11 @@ def build_supervisor(
             # dispatch_fleet; node_synthesis aggregates fleet results.
             state.fleet_parallel = True
             state.selected_squads = ["engineering"]
+            if not state.target_repo_source:
+                state.target_repo_source = (
+                    "explicit_param" if _preseed_had_target_repo_ids
+                    else "goal_text_flag"
+                )
             for _rid in _fleet_repo_ids:
                 _fleet_tasks.append(TaskState(
                     owner_squad="engineering",
@@ -696,6 +709,16 @@ def build_supervisor(
             state.fleet_parallel = False
             if not state.target_repo_id:
                 state.target_repo_id = _fleet_repo_ids[0]
+                if not state.target_repo_source:
+                    # _fleet_repo_ids is either the pre-seeded structured
+                    # target_repo_ids (explicit_param) or a goal-text
+                    # --repos/--fleet token (goal_text_flag); state.target_repo_ids
+                    # was truthy before this branch iff the caller pre-seeded it
+                    # (the goal-text precedence override above only fires then).
+                    state.target_repo_source = (
+                        "explicit_param" if _preseed_had_target_repo_ids
+                        else "goal_text_flag"
+                    )
             # WS1 retry-2 (finding B follow-up): collapse the multi-repo field
             # once we've degraded to single-repo mode. Leaving a pre-seeded
             # single-element target_repo_ids set here would make BOTH
@@ -746,6 +769,8 @@ def build_supervisor(
                 if len(_cued_ids) == 1:
                     _inferred_id = next(iter(_cued_ids))
                     state.target_repo_id = _inferred_id
+                    if not state.target_repo_source:
+                        state.target_repo_source = "goal_text_inferred"
                     emit_trace(
                         judge_trace_root, state.workflow_id,
                         "intake.repo_inferred_from_goal",
@@ -925,6 +950,8 @@ def build_supervisor(
         # dict (not just be set on state) for LangGraph to persist them.
         if state.target_repo_id is not None:
             update["target_repo_id"] = state.target_repo_id
+        if state.target_repo_source is not None:
+            update["target_repo_source"] = state.target_repo_source
         if state.target_repo_subpath is not None:
             update["target_repo_subpath"] = state.target_repo_subpath
         if state.target_repo_ids:
@@ -1068,6 +1095,56 @@ def build_supervisor(
         # Full logical task set for gate evaluation.
         # Pre-seeded are authoritative; synthesised are appended after.
         full_tasks: list[TaskState] = existing_tasks + synthesised_tasks
+
+        # ---------------------------------------------------------------
+        # WS1-E: engineering dispatch must not proceed without an explicit,
+        # resolved target repo. Checked HERE — after routing/task synthesis,
+        # before approval or dispatch — because only now do we know whether
+        # "engineering" was actually selected; node_intake cannot see that.
+        # Fleet tasks always carry a per-task target_repo_id (seeded above by
+        # node_intake), so this only fires for a non-fleet engineering task
+        # with neither task.target_repo_id nor the workflow-level
+        # state.target_repo_id set — precisely the previously-silent cwd
+        # fallback in `_resolve_task_project_path` / `_via_mcp`. A misdirected
+        # goal now dies HERE, before any worktree is cut or pp stage started,
+        # instead of surfacing later as a wrong-repo diff.
+        # ---------------------------------------------------------------
+        _missing_target_squads = sorted({
+            t.owner_squad for t in full_tasks
+            if t.owner_squad == "engineering"
+            and not (getattr(t, "target_repo_id", None) or state.target_repo_id)
+        })
+        if _missing_target_squads:
+            from hydra_core.repo_registry import unknown_repo_hitl_fields
+            state.phase = "surfaced"
+            _no_target_hitl: dict[str, Any] = {
+                "workflow_id": str(state.workflow_id),
+                "reason": "missing_engineering_target",
+                "gate_node": "planner",
+                "summary": (
+                    "Engineering dispatch requires an explicit target repo — "
+                    "none was given (no --repo/--repos, and no target_repo_id "
+                    f"resolved). Goal: {state.root_goal!r}"
+                ),
+                "options": ["abort"],
+                "default_option": "abort",
+                # Reuse the exact WS1-D unknown-repo-id shape (remediation
+                # command + known_ids) rather than inventing a second error
+                # shape for "no target" vs. "bad target".
+                **unknown_repo_hitl_fields("<repo-id>"),
+            }
+            emit_trace(
+                judge_trace_root,
+                state.workflow_id,
+                "supervisor.missing_engineering_target",
+                {"goal": state.root_goal},
+            )
+            eights.hitl_request(_no_target_hitl, gate_node="planner")
+            return {
+                "phase": "surfaced",
+                "pending_hitl": _no_target_hitl,
+                "last_event": "engineering dispatch surfaced: no target repo resolved",
+            }
 
         # -----------------------------------------------------------------------
         # SHARED PER-TASK RISK HELPER

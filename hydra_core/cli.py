@@ -504,10 +504,12 @@ def _cmd_run(args) -> int:
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
     if getattr(args, "repo", None):
         initial.target_repo_id = str(args.repo).strip().lower()
+        initial.target_repo_source = "explicit_param"
     if getattr(args, "repos", None):
         initial.target_repo_ids = [
             p.strip().lower() for p in str(args.repos).split(",") if p.strip()
         ]
+        initial.target_repo_source = "explicit_param"
     if getattr(args, "subdir", None):
         from .repo_registry import normalize_repo_subpath
         initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
@@ -564,6 +566,30 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _build_resolved_target_view(state) -> dict | None:
+    """WS1-E ergonomic: what engineering-target resolved, and from where.
+
+    Surfaced on `hydra.workflow.plan` / `hydra.workflow.step` output (and
+    rendered on the approval HITL) so an operator sees the target BEFORE any
+    work happens, instead of discovering a wrong-repo diff at merge time.
+    Returns None when nothing has resolved (the missing-target HITL in
+    node_planner covers that case for engineering dispatch)."""
+    if getattr(state, "target_repo_ids", None):
+        return {
+            "mode": "fleet",
+            "repo_ids": list(state.target_repo_ids),
+            "source": getattr(state, "target_repo_source", None) or "unknown",
+        }
+    if getattr(state, "target_repo_id", None):
+        return {
+            "mode": "single",
+            "repo_id": state.target_repo_id,
+            "subpath": getattr(state, "target_repo_subpath", None),
+            "source": getattr(state, "target_repo_source", None) or "unknown",
+        }
+    return None
+
+
 def _cmd_plan(args) -> int:
     """Non-detaching planning surface for attended (host-bridged) execution.
 
@@ -612,10 +638,12 @@ def _cmd_plan(args) -> int:
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
     if getattr(args, "repo", None):
         initial.target_repo_id = str(args.repo).strip().lower()
+        initial.target_repo_source = "explicit_param"
     if getattr(args, "repos", None):
         initial.target_repo_ids = [
             p.strip().lower() for p in str(args.repos).split(",") if p.strip()
         ]
+        initial.target_repo_source = "explicit_param"
     if getattr(args, "subdir", None):
         from .repo_registry import normalize_repo_subpath
         initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
@@ -667,6 +695,7 @@ def _cmd_plan(args) -> int:
         "requires_human_approval": bool(getattr(final, "requires_human_approval", False)),
         "tasks": [_task_view(t) for t in getattr(final, "tasks", [])],
         "pending_hitl": pending if isinstance(pending, dict) else None,
+        "resolved_target": _build_resolved_target_view(final),
         "budget": final.budget.model_dump(mode="json") if hasattr(final, "budget") else {},
         "trace": str(trace_path(project, workflow_id)),
     }, indent=2))
@@ -1551,12 +1580,17 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
 
 def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
     """Resolve the engineering target dir: an allow-listed repo id when the task
-    (or the workflow, via `--repo`) targets one, else the workflow project root.
+    (or the workflow, via `--repo`) targets one.
 
     Mirrors node_dispatch's precedence (supervisor.py): per-task target_repo_id
     wins, else the workflow-level state.target_repo_id set by intake from
-    `--repo`. Without the state-level fallback, attended `step` would wrongly
-    target the Hydra cwd for a `--repo`-scoped goal."""
+    `--repo`.
+
+    WS1-E: raises `MissingEngineeringTargetError` when neither resolves --
+    engineering dispatch must not silently fall back to the Hydra cwd. The
+    primary gate is node_planner's HITL (fires before this is ever reached
+    for a fresh plan); this is defense-in-depth for a checkpoint written
+    before that gate existed."""
     rid = getattr(task, "target_repo_id", None) or getattr(state, "target_repo_id", None)
     if rid:
         from .repo_registry import resolve_repo_project_path
@@ -1566,7 +1600,21 @@ def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
         if sub:
             Path(p).mkdir(parents=True, exist_ok=True)
         return str(p)
-    return str(project)
+    raise MissingEngineeringTargetError(
+        "engineering dispatch has no resolved target repo (no --repo/--repos "
+        "and no target_repo_id on the task or workflow). This checkpoint "
+        "predates the WS1-E target gate, or was resumed after it was "
+        "bypassed -- register the intended repo and relaunch with an "
+        "explicit --repo/--repos."
+    )
+
+
+class MissingEngineeringTargetError(RuntimeError):
+    """Raised by `_resolve_task_project_path` when an engineering task has no
+    resolved target repo. WS1-E defense-in-depth: the primary gate is
+    node_planner's HITL, which stops a fresh plan before any worktree is cut
+    or stage started; this exception covers a checkpoint from before that
+    gate existed reaching `hydra attended step` directly."""
 
 
 def _cmd_attended_step(args) -> int:
@@ -1620,7 +1668,18 @@ def _cmd_attended_step(args) -> int:
         # --- Engineering task (mcp entrypoint) ---
         task = _next_engineering_task(state)
         if task is not None:
-            project_path = _resolve_task_project_path(task, state, project)
+            try:
+                project_path = _resolve_task_project_path(task, state, project)
+            except MissingEngineeringTargetError as _missing_target_err:
+                from .repo_registry import unknown_repo_hitl_fields
+                print(json.dumps({
+                    "ok": False,
+                    "error": "missing_engineering_target",
+                    "detail": str(_missing_target_err),
+                    "resolved_target": None,
+                    **unknown_repo_hitl_fields("<repo-id>"),
+                }, indent=2), file=sys.stderr)
+                return 1
             request_text = task.description or state.root_goal
 
             # F27: preflight — verify ALL THREE agent files exist before
@@ -1724,7 +1783,21 @@ def _cmd_attended_step(args) -> int:
             emit(project, wf, "attended.step", {"run_id": str(run_id),
                                                 "task_id": str(task.task_id),
                                                 "state": res.get("state")})
-            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            _resolved_target = _build_resolved_target_view(state)
+            if _resolved_target is None:
+                # Single-target, per-task override (fleet-degrade case etc.) --
+                # task.target_repo_id resolved even though state-level fields
+                # didn't. Surface it the same way for the step response.
+                _tr_id = getattr(task, "target_repo_id", None)
+                if _tr_id:
+                    _resolved_target = {
+                        "mode": "single",
+                        "repo_id": _tr_id,
+                        "subpath": getattr(task, "target_repo_subpath", None),
+                        "source": "task_override",
+                    }
+            print(json.dumps({"ok": True, "resolved_target": _resolved_target, **res},
+                             indent=2, default=str))
             return 0
 
         # --- Non-engineering task (claude-skill / agent-impersonation) ---

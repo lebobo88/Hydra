@@ -480,6 +480,8 @@ def test_mu15_completed_workflow_resumes_to_non_surfaced(tmp_path, monkeypatch, 
     # 1. Build the plan: intake → planner → halt before dispatch.
     initial = HydraState(workflow_id=wf, root_goal="MU15 e2e test: attended complete")
     initial.selected_squads = ["engineering"]
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    initial.target_repo_id = "hydra"
     sup_plan = build_supervisor(
         project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
     )
@@ -1697,6 +1699,8 @@ def test_mu15d_status_renders_done_attended(tmp_path, monkeypatch, capsys):
     # 1. Build the plan so a task is created in the checkpoint.
     initial = HydraState(workflow_id=wf, root_goal="MU15d status render test")
     initial.selected_squads = ["engineering"]
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    initial.target_repo_id = "hydra"
     sup = build_supervisor(
         project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
     )

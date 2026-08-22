@@ -589,6 +589,11 @@ def _inbound(state: HydraState) -> DevTask:
         repo="hydra",
         branch="wf",
         instructions="scaffold ignores coverage",
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo -- this file exercises the scaffolding side effect, not
+        # repo-targeting, so point at "hydra" (this checkout) rather than
+        # relying on the removed cwd fallback.
+        target_repo_id="hydra",
     )
 
 

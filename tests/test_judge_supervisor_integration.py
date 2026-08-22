@@ -106,7 +106,11 @@ def test_supervisor_skips_judge_when_pp_verdict_present(tmp_path):
         critique_client=client,
         force_pure_python=True,
     )
-    state = HydraState(root_goal="refactor the payments microservice")
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is judge-skip-on-pp-verdict, not repo-targeting,
+    # and the goal routes to engineering, so give it a real target.
+    state = HydraState(root_goal="refactor the payments microservice",
+                       target_repo_id="hydra")
     # The intake → planner path will create tasks for engineering. After
     # dispatch the squad's output envelope would normally be judged; but if
     # PP has already judged it we should skip.

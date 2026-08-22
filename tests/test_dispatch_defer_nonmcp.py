@@ -98,9 +98,13 @@ def test_live_engine_defers_nonmcp_and_dispatches_engineering():
         force_pure_python=True,
     )
     # Force-select a claude-skill squad + the mcp engineering squad.
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is nonmcp-defer-vs-engineering-dispatch, not
+    # repo-targeting, so point at "hydra" (this checkout).
     state = HydraState(
         root_goal="build the feature",
         selected_squads=["garland", "engineering"],
+        target_repo_id="hydra",
     )
     final = _invoke(runner, state)
 
