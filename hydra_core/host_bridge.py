@@ -744,6 +744,88 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> dict[str, Any]:
     return {"removed": True, "error": None}
 
 
+def _is_registered_worktree(repo_root: str, worktree_path: str) -> bool:
+    """Return True if ``worktree_path`` currently appears in ``git worktree
+    list`` for ``repo_root``.
+
+    Deliberately re-queries git on every call rather than accepting a cached
+    listing from the caller: the janitor's orphan-removal path needs the
+    answer to be true *at the moment of removal*, not at whatever moment an
+    earlier directory scan happened to run.
+
+    Fails toward "assume registered" when git itself can't be asked (raised
+    exception) -- an unverifiable answer must route the caller to the
+    conservative ``git worktree remove`` path, never to the raw-rmtree
+    orphan path.
+    """
+    try:
+        listing = _git(["worktree", "list", "--porcelain"], repo_root).stdout or ""
+    except Exception:  # noqa: BLE001
+        return True
+    normalized = str(Path(worktree_path)).replace("\\", "/")
+    return any(
+        line.startswith("worktree ")
+        and line[len("worktree "):].strip().replace("\\", "/") == normalized
+        for line in listing.splitlines()
+    )
+
+
+def _remove_orphan_directory(entry: Path, scan_root: Path, repo_root: str) -> dict[str, Any]:
+    """Recursively remove ``entry``, a directory git no longer tracks as a
+    worktree (deregistered by an earlier ``_finalize`` whose ``git worktree
+    remove`` never ran, or ran against an admin dir that had already gone
+    stale -- either way, the checkout survived on disk).
+
+    This is a raw ``shutil.rmtree`` -- NOT a git operation -- and unlike
+    ``git worktree remove`` it has no safety net of its own, so every guard
+    here is re-checked at the moment of removal rather than trusted from
+    whatever the caller's directory listing found earlier:
+
+      (a) resolved-path containment under ``scan_root`` (the actual root
+          that was scanned to find this entry) -- checked via
+          ``Path.relative_to`` on resolved paths, so a symlink or a ``..``
+          component cannot walk this call outside the root the sweep was
+          told to operate on;
+      (b) genuinely absent from ``git worktree list`` **right now** (via
+          ``_is_registered_worktree``), not merely absent from whatever
+          listing an earlier caller happened to observe.
+
+    The caller (``_sweep_one_root``) is responsible for the cursor-
+    terminality gate and the ``attended-<run_id>`` name-shape check before
+    ever reaching here; this function only re-verifies the two facts that
+    can change between an earlier scan and this removal.
+
+    Never deletes a git branch -- exactly like ``_remove_worktree``, this
+    only ever touches the checkout directory itself.
+
+    Returns ``{"removed": bool, "error": str | None}``. Never raises.
+    """
+    try:
+        resolved_entry = entry.resolve()
+        resolved_root = scan_root.resolve()
+    except Exception as exc:  # noqa: BLE001
+        return {"removed": False, "error": f"path_resolution_failed: {exc!r}"[:300]}
+    try:
+        resolved_entry.relative_to(resolved_root)
+    except ValueError:
+        return {
+            "removed": False,
+            "error": "containment_check_failed: entry resolves outside the scanned root",
+        }
+    if _is_registered_worktree(repo_root, str(entry)):
+        return {
+            "removed": False,
+            "error": "orphan_removal_refused: path is a registered git worktree as of removal time",
+        }
+    try:
+        shutil.rmtree(resolved_entry)
+    except Exception as exc:  # noqa: BLE001
+        return {"removed": False, "error": f"rmtree_failed: {exc!r}"[:300]}
+    if resolved_entry.exists():
+        return {"removed": False, "error": "rmtree reported success but path still exists"}
+    return {"removed": True, "error": None}
+
+
 def _prune_single_worktree_admin_dir(repo_root: str, worktree_path: str) -> None:
     """Best-effort deregister ONLY the admin directory for ``worktree_path``.
 
@@ -888,6 +970,7 @@ def _sweep_one_root(
             continue
         seen.add(resolved)
         run_id = entry.name[len("attended-"):]
+        state: str | None = None
         try:
             cursor_file = _find_attended_cursor(project_root, run_id)
             if cursor_file is None:
@@ -910,27 +993,44 @@ def _sweep_one_root(
                     "root": root_label, "dry_run": True,
                 })
                 continue
-            result = _remove_worktree(repo_root, str(entry))
+            # A worktree git still tracks goes through `git worktree remove`
+            # (the conservative, git-aware path). A directory that has
+            # already fallen out of `git worktree list` -- e.g. `_finalize`
+            # deregistered it but the checkout directory itself survived --
+            # is exactly the residue `git worktree remove` cannot touch
+            # (it fails with "is not a working tree"); that case routes to
+            # the raw-rmtree orphan path, which re-verifies containment and
+            # re-checks registration at removal time. See
+            # `_remove_orphan_directory`'s docstring for the safety gates.
+            if _is_registered_worktree(repo_root, str(entry)):
+                result = _remove_worktree(repo_root, str(entry))
+            else:
+                result = _remove_orphan_directory(entry, wt_root, repo_root)
             if result.get("removed"):
                 report["removed"].append({
                     "worktree": str(entry), "run_id": run_id, "state": state,
                     "root": root_label,
                 })
             else:
-                # git refused (locked worktree, permission error, ...) or the
-                # path is still on disk after the attempt -- report that
-                # honestly rather than claiming a clean sweep. See
-                # `_remove_worktree`'s docstring for why the exit code alone
-                # is not trusted here.
+                # git refused (locked worktree, permission error, ...), the
+                # orphan path's own guards refused, or the path is still on
+                # disk after the attempt -- report that honestly rather than
+                # claiming a clean sweep. See `_remove_worktree`'s and
+                # `_remove_orphan_directory`'s docstrings for why the exit
+                # code alone is not trusted here. Carries `cursor_state`
+                # through even on the error path -- the dry-run preview
+                # already proved this cursor was read successfully and
+                # terminal, so an operator investigating a failed removal
+                # should not have to re-derive that by hand.
                 report["errors"].append({
                     "worktree": str(entry), "run_id": run_id,
                     "error": result.get("error") or "removal_failed",
-                    "root": root_label,
+                    "root": root_label, "cursor_state": state,
                 })
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the sweep
             report["errors"].append({
                 "worktree": str(entry), "run_id": run_id, "error": str(exc)[:300],
-                "root": root_label,
+                "root": root_label, "cursor_state": state,
             })
 
 

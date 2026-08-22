@@ -29,9 +29,11 @@ from hydra_core import host_bridge
 from hydra_core.host_bridge import (
     CURSOR_SCHEMA,
     _find_attended_cursor,
+    _is_registered_worktree,
     _legacy_worktree_root,
     _prune_single_worktree_admin_dir,
     _provision_worktree,
+    _remove_orphan_directory,
     _remove_worktree,
     cursor_path,
     resolve_worktree_root,
@@ -1117,3 +1119,212 @@ def test_worktree_root_precedence_matches_hooks():
             "resolve_worktree_root's HYDRA_WORKTREE_ROOT > AIAPP_BASE > "
             "sibling-fallback precedence"
         )
+
+
+# ===========================================================================
+# Janitor: orphaned directories (deregistered by `_finalize` but the
+# checkout survived on disk) -- `git worktree remove` refuses these
+# ("is not a working tree"), so the sweep must fall back to a raw,
+# safety-gated `shutil.rmtree` instead.
+# ===========================================================================
+# A genuine orphan is constructed the same way the real bug produces one:
+# provision a real worktree (so a real branch exists), then deregister ONLY
+# its git admin dir via `_prune_single_worktree_admin_dir` -- exactly what a
+# `_finalize` that reaches `_remove_worktree`'s deregistration step but not
+# its directory removal would leave behind. The checkout directory survives;
+# `git worktree list` no longer knows about it.
+
+def _make_orphan(repo_root: Path, run_id: str) -> tuple[Path, str]:
+    prov = _provision_worktree(str(repo_root), run_id)
+    assert prov is not None
+    wt_path, branch = prov
+    _prune_single_worktree_admin_dir(str(repo_root), wt_path)
+    assert not _is_registered_worktree(str(repo_root), wt_path), (
+        "test setup failed to produce a genuine orphan"
+    )
+    assert Path(wt_path).is_dir(), "test setup must leave the directory on disk"
+    return Path(wt_path), branch
+
+
+def test_janitor_removes_orphan_with_terminal_cursor(tmp_path):
+    """FAILS IF REVERTED: without the orphan fallback, `_sweep_one_root`
+    always calls `_remove_worktree`, which shells out to `git worktree
+    remove` -- that fails ("is not a working tree") against a directory git
+    no longer tracks, so the orphan lands in report["errors"], never
+    report["removed"], and the directory survives on disk."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, branch = _make_orphan(repo_root, "orphanA")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanA")
+    save_cursor(cfile, _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert not wt_path.exists(), "orphaned terminal-cursor directory must be removed"
+    assert any(r["run_id"] == "orphanA" for r in report["removed"]), report
+    assert not report["errors"], report["errors"]
+    # The branch is untouched -- only the checkout directory is removed.
+    show = _git(["show-ref", "--verify", f"refs/heads/{branch}"], repo_root)
+    assert show.returncode == 0, "janitor must never delete the branch"
+
+
+def test_janitor_skips_orphan_with_non_terminal_cursor(tmp_path):
+    """FAILS IF REVERTED: if the orphan fallback were reachable without the
+    terminality gate (e.g. a refactor that special-cased orphans ahead of
+    the cursor check), this in-progress orphan would be rmtree'd out from
+    under a run still on HITL."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanB")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanB")
+    save_cursor(cfile, _cursor("await_judge"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert wt_path.exists(), "non-terminal-cursor orphan must NOT be removed"
+    assert not report["removed"]
+    assert any(s["run_id"] == "orphanB" for s in report["skipped"])
+
+
+def test_janitor_skips_orphan_with_no_cursor(tmp_path):
+    """FAILS IF REVERTED: 'no cursor found' must stay 'cannot prove
+    terminal' for orphans too -- not merely for still-registered worktrees.
+    Without the shared gate, an orphan discovered mid-provision (before its
+    cursor is written) would be swept."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanC")
+    # Deliberately no cursor file written for orphanC.
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert wt_path.exists()
+    assert not report["removed"]
+    assert any(s["run_id"] == "orphanC" and s["reason"] == "no_cursor_found"
+               for s in report["skipped"])
+
+
+def test_janitor_orphan_removal_refuses_path_outside_scanned_root(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: without the resolved-path containment re-check in
+    `_remove_orphan_directory`, a symlink inside the scanned root that
+    points outside it -- yet still matches the `attended-<run_id>` name
+    shape and carries a terminal cursor -- would be recursively deleted at
+    whatever it resolves to."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    monkeypatch.delenv("HYDRA_WORKTREE_ROOT", raising=False)
+    monkeypatch.delenv("AIAPP_BASE", raising=False)
+    wt_root = resolve_worktree_root(str(repo_root))
+    wt_root.mkdir(parents=True, exist_ok=True)
+
+    outside = tmp_path / "outside-payload"
+    outside.mkdir()
+    (outside / "canary.txt").write_text("do not delete me")
+
+    escape_link = wt_root / "attended-runEscape"
+    escape_link.symlink_to(outside, target_is_directory=True)
+
+    cfile = cursor_path(str(repo_root), "wf-1", "runEscape")
+    save_cursor(cfile, _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert outside.exists() and (outside / "canary.txt").exists(), (
+        "a path resolving outside the scanned root must never be removed, "
+        "even when its name matches attended-<run_id> and its cursor is terminal"
+    )
+    assert any(e["run_id"] == "runEscape" for e in report["errors"]), report
+    assert not any(r["run_id"] == "runEscape" for r in report["removed"]), report
+
+
+def test_janitor_registered_worktree_still_uses_git_remove_not_rmtree(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: a still-registered worktree must keep going
+    through `_remove_worktree` (git-aware), not the raw-rmtree orphan path
+    -- verified here by making `_remove_orphan_directory` explode if it is
+    ever invoked, and confirming a normal, still-registered terminal-cursor
+    worktree removal is unaffected (goes through `_remove_worktree` and
+    succeeds). Deliberately does NOT patch `shutil.rmtree` globally -- that
+    also intercepts pytest's own tmp_path teardown, which is a different
+    call path than the one this test needs to prove is untaken."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runReg")
+    assert prov is not None
+    wt_path, branch = prov
+    assert _is_registered_worktree(str(repo_root), wt_path), (
+        "test setup: this worktree must still be registered"
+    )
+    cfile = cursor_path(str(repo_root), "wf-1", "runReg")
+    save_cursor(cfile, _cursor("complete"))
+
+    def _boom(*_a, **_k):
+        raise AssertionError(
+            "_remove_orphan_directory must not be called for a registered worktree")
+
+    monkeypatch.setattr(host_bridge, "_remove_orphan_directory", _boom)
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert not Path(wt_path).exists()
+    assert any(r["run_id"] == "runReg" for r in report["removed"]), report
+    show = _git(["show-ref", "--verify", f"refs/heads/{branch}"], repo_root)
+    assert show.returncode == 0, "janitor must never delete the branch"
+
+
+def test_janitor_error_entry_carries_cursor_state_and_root(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: before this fix the error branch built its entry
+    without `cursor_state`, so a failed removal reported `cursor_state:
+    null` even though the cursor was read successfully and found terminal
+    (the dry-run preview for the same entry correctly showed it)."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanErr")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanErr")
+    save_cursor(cfile, _cursor("surfaced"))
+
+    # Force the orphan removal itself to fail so it lands in report["errors"].
+    monkeypatch.setattr(
+        host_bridge, "_remove_orphan_directory",
+        lambda *a, **k: {"removed": False, "error": "forced_failure_for_test"},
+    )
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    errs = [e for e in report["errors"] if e["run_id"] == "orphanErr"]
+    assert len(errs) == 1, report
+    assert errs[0]["cursor_state"] == "surfaced", errs[0]
+    assert errs[0]["root"] == "current", errs[0]
+    assert wt_path.exists(), "a failed removal must leave the directory in place"
+
+
+# ===========================================================================
+# _is_registered_worktree / _remove_orphan_directory unit-level coverage
+# ===========================================================================
+
+def test_is_registered_worktree_true_for_live_worktree(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runLive")
+    assert prov is not None
+    wt_path, _branch = prov
+    try:
+        assert _is_registered_worktree(str(repo_root), wt_path)
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_is_registered_worktree_false_for_plain_directory(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    plain = tmp_path / "not-a-worktree"
+    plain.mkdir()
+    assert not _is_registered_worktree(str(repo_root), str(plain))
+
+
+def test_remove_orphan_directory_refuses_when_still_registered(tmp_path):
+    """A caller that mis-routes a still-registered worktree into the orphan
+    path must be refused, not silently rmtree'd, by `_remove_orphan_directory`
+    itself -- it re-checks registration independently of the caller."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runStillReg")
+    assert prov is not None
+    wt_path, _branch = prov
+    try:
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(Path(wt_path), wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert Path(wt_path).exists()
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
