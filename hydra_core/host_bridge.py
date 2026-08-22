@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -818,12 +819,47 @@ def _remove_orphan_directory(entry: Path, scan_root: Path, repo_root: str) -> di
             "error": "orphan_removal_refused: path is a registered git worktree as of removal time",
         }
     try:
-        shutil.rmtree(resolved_entry)
+        shutil.rmtree(resolved_entry, onerror=_clear_readonly_and_retry)
     except Exception as exc:  # noqa: BLE001
         return {"removed": False, "error": f"rmtree_failed: {exc!r}"[:300]}
     if resolved_entry.exists():
         return {"removed": False, "error": "rmtree reported success but path still exists"}
     return {"removed": True, "error": None}
+
+
+def _clear_readonly_and_retry(func, path, excinfo) -> None:
+    """``shutil.rmtree`` ``onerror`` hook: clear a Windows read-only bit and
+    retry the single failing operation once.
+
+    git marks pack/object files (and sometimes whole directories) read-only
+    in a checkout -- on Windows that makes ``PermissionError`` the NORMAL
+    outcome of a bare ``shutil.rmtree`` against a worktree, not an edge
+    case, since ``rmtree`` does not clear the attribute itself before
+    deleting. This is the conventional remedy: ``os.chmod(path,
+    stat.S_IWRITE)`` clears ONLY the read-only bit -- it cannot grant access
+    to a path that is genuinely permission-denied for another reason (an
+    open handle, an ACL deny, ...), so a real permission problem still
+    fails the retried ``func(path)`` call below, and that exception
+    propagates out of ``rmtree`` for ``_remove_orphan_directory``'s own
+    try/except to catch and report honestly in ``report["errors"]`` --
+    never silently swallowed here.
+
+    Only ever called by ``shutil.rmtree`` from within
+    ``_remove_orphan_directory``, i.e. strictly inside a path that has
+    already cleared containment, live registration-absence, and (via the
+    caller) the terminal-cursor gate -- this hook changes HOW a file already
+    cleared for deletion gets deleted, never WHETHER it does.
+    """
+    exc = excinfo[1] if excinfo else None
+    if not isinstance(exc, PermissionError):
+        if exc is not None:
+            raise exc
+        raise OSError(f"rmtree onerror invoked for {func!r} on {path!r} with no exception info")
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except Exception:  # noqa: BLE001 -- chmod itself failed; surface the ORIGINAL PermissionError
+        raise exc
+    func(path)  # retry the single failing operation; re-raises on failure, propagating honestly
 
 
 def _prune_single_worktree_admin_dir(repo_root: str, worktree_path: str) -> None:

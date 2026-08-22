@@ -18,8 +18,10 @@ Real git repos, real filesystem paths — no mocks for the git plumbing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -1328,3 +1330,209 @@ def test_remove_orphan_directory_refuses_when_still_registered(tmp_path):
         assert Path(wt_path).exists()
     finally:
         _remove_worktree(str(repo_root), wt_path)
+
+
+def test_remove_orphan_directory_removes_readonly_file(tmp_path):
+    """git marks pack/object files read-only on Windows -- that must not
+    defeat `_remove_orphan_directory`. A bare `shutil.rmtree` raises
+    `PermissionError` on a read-only file rather than clearing the
+    attribute; the `onerror` hook must clear it and retry."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanRO")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result == {"removed": True, "error": None}, result
+        assert not wt_path.exists()
+    finally:
+        if wt_path.exists():
+            os.chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+def test_remove_orphan_directory_readonly_file_fails_without_onerror_handler(
+    tmp_path, monkeypatch
+):
+    """Falsifies the fix above: with the `onerror` hook neutered (so
+    `shutil.rmtree` runs exactly as it did before this change), removing a
+    directory containing a read-only file must fail with `PermissionError`
+    surfaced through `report["error"]`, and the directory must survive.
+    monkeypatch reverts the neutering automatically at teardown -- no
+    source edit is made or needs restoring."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanROFail")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        # Neuter the hook: re-raise the original error instead of clearing
+        # the read-only bit and retrying, reproducing pre-fix behavior.
+        def _neutered(func, path, excinfo):
+            raise excinfo[1]
+
+        monkeypatch.setattr(host_bridge, "_clear_readonly_and_retry", _neutered)
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert "PermissionError" in result["error"], result
+        assert wt_path.exists(), "directory must survive an honestly-reported failure"
+    finally:
+        if wt_path.exists():
+            os.chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+def test_remove_orphan_directory_reports_error_when_readonly_bit_cannot_be_cleared(
+    tmp_path, monkeypatch
+):
+    """A genuine permission denial (as opposed to a plain Windows read-only
+    bit) must still surface as an honest error, not a false "removed".
+
+    `os.chmod` on Windows only toggles the read-only attribute -- it cannot
+    construct a true ACL-deny or an open-file-handle lock from a test, so
+    this simulates "clearing the bit itself fails" by monkeypatching
+    `os.chmod` inside `host_bridge` to raise. That exercises the exact
+    fallback branch in `_clear_readonly_and_retry` (`except Exception:
+    raise exc`) that a real permission-denied chmod would also hit; it is
+    not a claim that a true OS-level ACL denial was reproduced on this
+    platform."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanROChmodFail")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        real_chmod = os.chmod
+
+        def _chmod_denied(path, mode, *a, **kw):
+            if Path(path) == ro_file:
+                raise PermissionError(13, "Access is denied (simulated)")
+            return real_chmod(path, mode, *a, **kw)
+
+        monkeypatch.setattr(host_bridge.os, "chmod", _chmod_denied)
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert "PermissionError" in result["error"], result
+        assert wt_path.exists(), "directory must survive an honestly-reported failure"
+    finally:
+        if wt_path.exists():
+            real_chmod = os.chmod
+            real_chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+# ===========================================================================
+# Orphan removal vs Windows read-only files
+# ===========================================================================
+# git marks pack/object files (and sometimes whole directories) read-only in
+# a real checkout -- on Windows that makes bare `shutil.rmtree` fail with
+# PermissionError as the NORMAL case for a worktree, not an edge case. The
+# `_clear_readonly_and_retry` onerror hook clears the read-only bit and
+# retries the single failing operation; a genuine permission problem (not
+# merely read-only) must still surface honestly in report["errors"].
+
+def test_janitor_removes_orphan_containing_a_readonly_file(tmp_path):
+    """FAILS IF REVERTED: without the onerror hook, `shutil.rmtree` raises
+    PermissionError on the first read-only file/dir it reaches on Windows
+    and never clears it -- the orphan lands in report["errors"] instead of
+    report["removed"], and the directory survives on disk."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanRO")
+    victim = wt_path / "readonly-object.pack"
+    victim.write_text("pretend git pack data")
+    os.chmod(victim, stat.S_IREAD)
+    try:
+        cfile = cursor_path(str(repo_root), "wf-1", "orphanRO")
+        save_cursor(cfile, _cursor("complete"))
+
+        report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+        assert not wt_path.exists(), (
+            "an orphan containing a read-only file must still be removed"
+        )
+        assert any(r["run_id"] == "orphanRO" for r in report["removed"]), report
+        assert not report["errors"], report["errors"]
+    finally:
+        # Best-effort cleanup if the assertion above already failed and left
+        # a read-only file behind (chmod so the test runner's own tmp_path
+        # teardown doesn't also trip over it).
+        if victim.exists():
+            os.chmod(victim, stat.S_IWRITE)
+
+
+def test_clear_readonly_and_retry_reraises_when_chmod_does_not_fix_it(tmp_path):
+    """A path that is genuinely permission-denied for a reason `os.chmod`
+    cannot fix (Windows only ever toggles the read-only attribute; it grants
+    no access back for e.g. an open file handle) must still fail loudly,
+    not be silently treated as removed.
+
+    Constructed by holding an open file handle on the victim file for the
+    duration of the rmtree call -- Windows refuses to delete an open file
+    even after its read-only bit is cleared, so the hook's chmod succeeds
+    but the retried delete still raises, and that exception must propagate
+    out of shutil.rmtree rather than be swallowed by the hook.
+
+    FAILS IF REVERTED to a version of `_clear_readonly_and_retry` that
+    swallows the retry's exception (e.g. `except Exception: return` instead
+    of letting it propagate): this test's `pytest.raises` would then see no
+    exception. It also fails against a version that raises unconditionally
+    without attempting the chmod/retry (a plain `raise exc` with no chmod at
+    all) in the *companion* test above, since that would refuse to remove
+    the merely-read-only orphan too -- this test isolates the "still fails
+    when chmod genuinely can't help" half of the contract on its own.
+    """
+    from hydra_core.host_bridge import _clear_readonly_and_retry
+
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_root = resolve_worktree_root(str(repo_root))
+    wt_root.mkdir(parents=True, exist_ok=True)
+    victim_dir = wt_root / "attended-orphanLocked"
+    victim_dir.mkdir()
+    victim = victim_dir / "locked.bin"
+    victim.write_bytes(b"locked")
+    os.chmod(victim, stat.S_IREAD)
+
+    handle = open(victim, "rb")  # noqa: SIM115 -- held open deliberately for the duration below
+    try:
+        with pytest.raises(PermissionError):
+            shutil.rmtree(victim_dir, onerror=_clear_readonly_and_retry)
+        # The read-only bit WAS cleared by the hook (that half of the
+        # contract ran) -- it's the delete itself that still fails while the
+        # handle is open, proving chmod alone doesn't fabricate access.
+        assert victim.exists(), "the genuinely locked file must survive"
+    finally:
+        handle.close()
+        os.chmod(victim, stat.S_IWRITE)
+        shutil.rmtree(victim_dir, ignore_errors=True)
+
+
+def test_remove_orphan_directory_reports_readonly_removal_failure_honestly(tmp_path):
+    """FAILS IF REVERTED to a hook that swallows a genuine permission
+    failure: `_remove_orphan_directory` must land the run_id in
+    report["errors"] with the real PermissionError text, never report it as
+    removed."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanLockedSweep")
+    victim = wt_path / "locked.bin"
+    victim.write_bytes(b"locked")
+    os.chmod(victim, stat.S_IREAD)
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanLockedSweep")
+    save_cursor(cfile, _cursor("complete"))
+
+    handle = open(victim, "rb")  # noqa: SIM115
+    try:
+        report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+        assert not any(r["run_id"] == "orphanLockedSweep" for r in report["removed"]), report
+        errs = [e for e in report["errors"] if e["run_id"] == "orphanLockedSweep"]
+        assert len(errs) == 1, report
+        assert "PermissionError" in errs[0]["error"], errs[0]
+        assert errs[0]["cursor_state"] == "complete", errs[0]
+    finally:
+        handle.close()
+        os.chmod(victim, stat.S_IWRITE)
+        shutil.rmtree(wt_path, ignore_errors=True)
