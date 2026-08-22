@@ -425,6 +425,10 @@ HYDRA_CONTROL_TOOLS = [
     # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
     "hydra.venom.cross_check",
     "hydra.squad.list",
+    # WS1-C: read-only repo allow-list tools. register/unregister are
+    # CLI-only (`hydra repo register`) and deliberately NOT listed here.
+    "hydra.repo.list",
+    "hydra.repo.resolve",
     "hydra.envelope.record",
     "hydra.telemetry.tail",
 ]
@@ -697,6 +701,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                         "modify-budget",
                         "force-dispatch",
                         "change-squads",
+                        "recover-stalled-stage",
                     ],
                 },
                 "option": {"type": "string"},
@@ -719,6 +724,30 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                     "type": "string",
                     "description": "Pre-allocated workflow id (optional).",
                 },
+                "risk": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": (
+                        "Single allow-listed repo id for engineering targeting "
+                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
+                        "validated at intake). Mutually exclusive with repos."
+                    ),
+                },
+                "repos": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated allow-listed repo ids for fleet mode, "
+                        ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo."
+                    ),
+                },
+                "repo_subpath": {
+                    "type": "string",
+                    "description": "Repo-relative engineering target under repo/repos (forwarded as --subdir).",
+                },
             },
             "required": ["goal"],
         },
@@ -736,7 +765,31 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
                 "workflow_id": {
                     "type": "string",
-                    "description": "Pre-allocated workflow id (optional; threads into resume).",
+                    "description": "Pre-allocated workflow id (optional).",
+                },
+                "risk": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
+                },
+                "repo": {
+                    "type": "string",
+                    "description": (
+                        "Single allow-listed repo id for engineering targeting "
+                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
+                        "validated at intake). Mutually exclusive with repos."
+                    ),
+                },
+                "repos": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated allow-listed repo ids for fleet mode, "
+                        ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo."
+                    ),
+                },
+                "repo_subpath": {
+                    "type": "string",
+                    "description": "Repo-relative engineering target under repo/repos (forwarded as --subdir).",
                 },
             },
             "required": ["goal"],
@@ -746,13 +799,26 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "properties": {"workflow_id": {"type": "string"}},
             "required": ["workflow_id"],
         },
+        "hydra.repo.list": {
+            "type": "object",
+            "properties": {},
+        },
+        "hydra.repo.resolve": {
+            "type": "object",
+            "properties": {
+                "repo_id": {"type": "string", "description": "Allow-listed repo id to resolve."},
+            },
+            "required": ["repo_id"],
+        },
         "hydra.workflow.submit_host_result": {
             "type": "object",
             "properties": {
                 "workflow_id": {"type": "string"},
                 "run_id": {"type": "string"},
-                "call_key": {"type": "string"},
-                "result": {"type": "object"},
+                "call_key": {"type": "string",
+                             "description": "The host_action.call_key being fulfilled."},
+                "result": {"type": "object",
+                           "description": "The host subagent's result object."},
             },
             "required": ["workflow_id", "run_id", "call_key", "result"],
         },
@@ -813,9 +879,18 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         "hydra.venom.cross_check": {
             "type": "object",
             "properties": {
-                "capability": {"type": "string"},
-                "context": {"type": "object"},
-                "args": {"type": "object"},
+                "capability": {
+                    "type": "string",
+                    "description": "Registered venom capability name (e.g. 'shell.destructive').",
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Proposed invocation context / args (optional).",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Alias for context (bridge compatibility).",
+                },
             },
             "required": ["capability"],
         },
@@ -825,22 +900,87 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         },
         "hydra.envelope.record": {
             "type": "object",
+            "additionalProperties": True,
+            "description": (
+                "Additional properties beyond the base fields are forwarded "
+                "to the envelope via a per-type allow-list; reserved outer "
+                "fields (id, type, origin_squad, target_squad, workflow_id, "
+                "created_at, parent_id) are always set from base args and can "
+                "never be overwritten by additional properties."),
             "properties": {
-                "kind": {"type": "string"},
-                "type": {"type": "string"},
-                "from_squad": {"type": "string"},
-                "origin_squad": {"type": "string"},
-                "to_squad": {"type": "string"},
-                "workflow_id": {"type": "string"},
-                "payload": {},
+                "kind": {
+                    "type": "string",
+                    "description": "Envelope type / kind (bridge field; use 'type' for Hydra-native).",
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Envelope type (Hydra-native; alias for kind).",
+                },
+                "from_squad": {
+                    "type": "string",
+                    "description": "Origin squad (bridge field).",
+                },
+                "origin_squad": {
+                    "type": "string",
+                    "description": "Origin squad (Hydra-native; alias for from_squad).",
+                },
+                "to_squad": {
+                    "type": "string",
+                    "description": "Target squad (optional).",
+                },
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Workflow id for audit lineage.",
+                },
+                "payload": {
+                    "description": (
+                        "Envelope payload blob (any). For typed envelopes, "
+                        "type-specific required fields may be nested here "
+                        "and will be promoted to the envelope top level. "
+                        "Keys 'workflow_id' and 'type' inside payload are "
+                        "never promoted (anti-shadow guard)."),
+                },
+                "decision": {
+                    "type": "string",
+                    "description": "DECISION_RECORD: decision text (required for that type).",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "DECISION_RECORD: rationale text (required for that type).",
+                },
+                "payload_envelope_id": {
+                    "type": "string",
+                    "description": "HANDOFF: UUID of the artifact being handed off (required for that type).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "HITL_REQUEST: reason literal (required for that type).",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "HITL_REQUEST: summary text (required for that type).",
+                },
+                "options": {
+                    "type": "array",
+                    "description": "HITL_REQUEST: option strings (required for that type).",
+                },
             },
         },
         "hydra.telemetry.tail": {
             "type": "object",
             "properties": {
-                "workflow_id": {"type": "string"},
-                "limit": {"type": "integer"},
-                "since": {"type": "string"},
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Workflow id to tail (optional — tails recent workflows if absent).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return (default 50, max 500).",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Cursor from a prior tail call — returns only events after this.",
+                },
             },
         },
     },

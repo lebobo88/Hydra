@@ -64,7 +64,15 @@ def _make_pack(*, hitl_required: bool = False, mode: str = "pp_run",
 
 
 def _make_inbound(*, model_tier: str | None = None):
-    """Build a CSuiteDecisionPacket with the given model_tier (may be None)."""
+    """Build a CSuiteDecisionPacket with the given model_tier (may be None).
+
+    WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    This module's concern is model_tier routing, not repo-targeting, so
+    every packet built here targets "hydra" (this checkout) rather than
+    relying on the removed cwd fallback -- without it, `_via_mcp` fails
+    closed on the missing target BEFORE the tier-routing logic under test
+    ever runs, for every caller of this helper.
+    """
     from hydra_core.schemas import CSuiteDecisionPacket
     return CSuiteDecisionPacket(
         workflow_id=uuid4(),
@@ -73,6 +81,7 @@ def _make_inbound(*, model_tier: str | None = None):
         origin="BOARDROOM",
         objective="implement the feature",
         model_tier=model_tier,
+        target_repo_id="hydra",
     )
 
 
@@ -310,7 +319,8 @@ class TestTaskModelTierPropagation:
         state = _make_state()
         disp = CaptureDispatcher()
 
-        # Simulate what node_dispatch builds after Fix 2:
+        # Simulate what node_dispatch builds after Fix 2. WS1-E: engineering
+        # dispatch requires an explicit, resolved target repo.
         packet = CSuiteDecisionPacket(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
@@ -318,6 +328,7 @@ class TestTaskModelTierPropagation:
             origin="BOARDROOM",
             objective="implement auth",
             model_tier="fable",
+            target_repo_id="hydra",
         )
         execute_squad(state, pack, packet, disp)
         calls = _pp_calls(disp)
@@ -334,7 +345,8 @@ class TestTaskModelTierPropagation:
         state = _make_state()
         disp = CaptureDispatcher()
 
-        # Simulate the retry packet built by _reflexion_retry (Fix 2):
+        # Simulate the retry packet built by _reflexion_retry (Fix 2). WS1-E:
+        # engineering dispatch requires an explicit, resolved target repo.
         retry_packet = CSuiteDecisionPacket(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
@@ -342,6 +354,7 @@ class TestTaskModelTierPropagation:
             origin="BOARDROOM",
             objective="retry with critique",
             model_tier="fable",   # preserved from original_env.get("model_tier")
+            target_repo_id="hydra",
         )
         execute_squad(state, pack, retry_packet, disp)
         calls = _pp_calls(disp)
@@ -447,10 +460,16 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_hi_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate fires before the AC gate this test
+        # exercises) -- give it a real target so the AC-gate assertion below
+        # actually exercises the AC gate rather than passing vacuously
+        # against the (different) missing-target reason.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="rewrite the entire payment system",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         # Pre-seed the engineering task with valid acceptance_criteria.
         state.tasks = [TaskState(
@@ -474,10 +493,15 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo -- without it, node_planner surfaces before rebuilding tasks
+        # at all, and this test would trivially pass on the unmodified
+        # pre-seeded task rather than exercising the real rebuild.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="implement feature",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         state.tasks = [TaskState(
             owner_squad="engineering",
@@ -519,10 +543,12 @@ class TestAcceptanceCriteriaGate:
         )
         planner = _build_planner({"engineering": eng_pack, "executive": exec_pack})
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="big change",
             selected_squads=["engineering", "executive"],
+            target_repo_id="hydra",
         )
         # engineering has criteria; executive does NOT.
         state.tasks = [
@@ -551,10 +577,12 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="critical production deploy",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         state.tasks = [TaskState(
             owner_squad="engineering",
@@ -574,10 +602,12 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="important feature",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         state.tasks = [TaskState(
             owner_squad="engineering",
@@ -594,10 +624,12 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="update README",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         state.tasks = [TaskState(
             owner_squad="engineering",
@@ -622,10 +654,12 @@ class TestAcceptanceCriteriaGate:
         from hydra_core.state import HydraState
         planner = _build_planner(_hi_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="rewrite the entire payment system",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         # No pre-seeded tasks — planner builds fresh criterion-less tasks.
         out = _run_planner(planner, state)
@@ -869,6 +903,9 @@ class TestFixARetryTierFromTask:
             origin="BOARDROOM",
             objective="retry with critique\n\n=== REFLEXION RETRY #1 ===",
             model_tier=getattr(_retry_task, "model_tier", None),  # from task, not DecisionRecord
+            # WS1-E: engineering dispatch requires an explicit, resolved
+            # target repo -- this test's concern is fable-tier retry routing.
+            target_repo_id="hydra",
         )
         execute_squad(state, pack, retry_packet, disp)
         calls = _pp_calls(disp)
@@ -918,10 +955,12 @@ class TestFixBExecutiveBranchPreservation:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_exec_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="critical system overhaul",
             selected_squads=["executive", "engineering"],
+            target_repo_id="hydra",
         )
         # Pre-seed a P0 engineering task with NO criteria.
         state.tasks = [
@@ -1051,10 +1090,12 @@ class TestFix1MultiTaskPerSquad:
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_hi_risk_packs())
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="dual-track feature work",
             selected_squads=["engineering"],
+            target_repo_id="hydra",
         )
         state.tasks = [
             # P0, high-risk squad, NO criteria — must trigger AC gate.
@@ -1780,10 +1821,12 @@ class TestRound7AcGateOutsideSelectedSquads:
         }
         planner = _build_planner(packs)
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="ship v2",
             selected_squads=["engineering"],   # 'security' deliberately absent
+            target_repo_id="hydra",
         )
         # Pre-seed a task for the 'security' squad (outside selected_squads).
         state.tasks = [
@@ -1902,10 +1945,12 @@ class TestRound8HolisticPlanner:
         }
         planner = _build_planner(packs)
 
+        # WS1-E: engineering dispatch requires an explicit, resolved target repo.
         state = HydraState(
             workflow_id=uuid4(),
             root_goal="ship v2",
             selected_squads=["engineering"],   # 'security' NOT in selected_squads
+            target_repo_id="hydra",
         )
         state.tasks = [
             TaskState(

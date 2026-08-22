@@ -1,7 +1,7 @@
 """Regression tests for `_mcp_call_safe` retry + observability.
 
 Verifies the silent-MCP-degradation guard documented in
-`.claude/agents/hydra-supervisor.md` (Silent-MCP-Degradation Guard section).
+`plugins/hydra/agents/hydra-supervisor.md` (Silent-MCP-Degradation Guard section).
 
 No network, no LLMs.
 """

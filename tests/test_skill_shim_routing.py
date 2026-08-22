@@ -132,8 +132,8 @@ def test_host_executor_runs_skill_and_surfaces_envelopes():
         }],
     }
     disp = _HostSkillDispatcher({
-        ("rlm_creative", "rlm.command.list"): {"commands": [{"name": "rlm-team"}]},
-        ("rlm_creative", "rlm.output.write"): {"relative": "RLM/output/draft/t.md"},
+        ("rlm_creative", "rlm.command.list"): {"commands": [{"name": "creative-campaign"}]},
+        ("rlm_creative", "rlm.output.write"): {"relative": "RLM/output/brief/t.md"},
     }, hosted)
 
     result = _via_claude_skill(HydraState(root_goal="x"), pack, inbound, disp)

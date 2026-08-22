@@ -13,7 +13,7 @@ description: >
   engine source or media binaries itself. Crown lead: The Director. Security
   gate (Cerberus-equivalent): The Sentinel. See cerberus.yaml + heads.yaml.
 source_pack: https://github.com/lebobo88/RLM-Gaming
-entrypoint: claude-skill
+entrypoint: claude-native
 best_of_n: 0   # design work is single-shot; greenlight uses HITL, not Borda
 industries:
   - games
@@ -35,20 +35,20 @@ agents:
     role: "Game Director — vision, pillars, greenlight, scope/quality/schedule. Crown Lead."
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/the-director.md
+    agent_file: plugins/rlm-gaming/agents/the-director.md
     notes: "Owns the master DECISION_RECORD. Fails closed to HITL greenlight."
   - slug: producer
     mythic: The Producer
     role: "Producer — backlog, milestones, sprints, cross-squad coordination, HITL control points."
     authority: gatekeeper
     model_tier: sonnet
-    agent_file: .claude/agents/the-producer.md
+    agent_file: plugins/rlm-gaming/agents/the-producer.md
   - slug: tech-director
     mythic: The Forgemaster
     role: "Technical Director — engine architecture, tech standards, perf budgets, build-vs-buy."
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/the-forgemaster.md
+    agent_file: plugins/rlm-gaming/agents/the-forgemaster.md
     notes: "Delegates implementation to engineering; owns game-perf-budget gate."
 
   # ---- Design layer ----
@@ -57,31 +57,31 @@ agents:
     role: "Systems Designer — mechanics, combat math, systemic interactions, exploit-resistance."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-systemsmith.md
+    agent_file: plugins/rlm-gaming/agents/the-systemsmith.md
   - slug: narrative-director
     mythic: The Loremaster
     role: "Narrative Director — world bibles, branching narrative, quest graphs, dialogue, themes."
     authority: advisory
     model_tier: opus
-    agent_file: .claude/agents/the-loremaster.md
+    agent_file: plugins/rlm-gaming/agents/the-loremaster.md
   - slug: level-design-director
     mythic: The Cartographer
     role: "Level/World Design Director — levels, mission flow, pacing, PCG, navigation, streaming."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-cartographer.md
+    agent_file: plugins/rlm-gaming/agents/the-cartographer.md
   - slug: encounter-designer
     mythic: The Duelist
     role: "Encounter/Combat Designer — encounters, bosses, enemy archetypes, AI tuning targets."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-duelist.md
+    agent_file: plugins/rlm-gaming/agents/the-duelist.md
   - slug: economy-designer
     mythic: The Economist
     role: "Economy/Monetization Designer — currencies, sinks/sources, gacha math, balance sim, retention."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-economist.md
+    agent_file: plugins/rlm-gaming/agents/the-economist.md
     notes: "Co-owns loot-box-jurisdiction gate with The Arbiter."
 
   # ---- Technical layer (delegates to engineering) ----
@@ -90,19 +90,19 @@ agents:
     role: "Runtime AI Director — BT/GOAP/HTN/Utility/EQS/perception design. Delegates code to game-ai-programmer."
     authority: advisory
     model_tier: sonnet
-    agent_file: .claude/agents/the-puppeteer.md
+    agent_file: plugins/rlm-gaming/agents/the-puppeteer.md
   - slug: netcode-lead
     mythic: The Netweaver
     role: "Netcode Lead — replication topology, server-authority, rollback/lockstep, host migration. Delegates to game-netcode-team."
     authority: advisory
     model_tier: sonnet
-    agent_file: .claude/agents/the-netweaver.md
+    agent_file: plugins/rlm-gaming/agents/the-netweaver.md
   - slug: tools-pipeline
     mythic: The Toolwright
     role: "Tools/Pipeline — editor tooling, import/build pipelines, asset processors, CI hooks."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-toolwright.md
+    agent_file: plugins/rlm-gaming/agents/the-toolwright.md
 
   # ---- Creative layer (delegates to garland) ----
   - slug: art-director
@@ -110,27 +110,27 @@ agents:
     role: "Art Director — style bible, art direction, LOD/poly budgets. Emits CREATIVE_BRIEF/ASSET_JOB to Garland."
     authority: advisory
     model_tier: opus
-    agent_file: .claude/agents/the-artisan.md
+    agent_file: plugins/rlm-gaming/agents/the-artisan.md
     notes: "Co-owns ai-content-provenance gate with The Sentinel."
   - slug: 3d-modeling-director
     mythic: The Sculptor
     role: "3D Modeling & DCC Director — geometry/topology standards, retopo/UV/PBR/LOD, axis/scale, the Blender/DCC commission contract. Commissions Garland blender-model/blender-rig (existing blender-mcp)."
     authority: advisory
     model_tier: opus
-    agent_file: .claude/agents/the-sculptor.md
+    agent_file: plugins/rlm-gaming/agents/the-sculptor.md
     notes: "Owns mesh-topology-budget gate. Hands deformation-ready topology to The Choreographer."
   - slug: audio-director
     mythic: The Conductor
     role: "Audio Director — adaptive audio, mix tiers, Wwise/FMOD middleware. Emits ASSET_JOB to Garland audio sub-crew."
     authority: advisory
     model_tier: sonnet
-    agent_file: .claude/agents/the-conductor.md
+    agent_file: plugins/rlm-gaming/agents/the-conductor.md
   - slug: animation-director
     mythic: The Choreographer
     role: "Animation Director — rigs, IK, blend trees, anim state machines, root-motion decisions."
     authority: advisory
     model_tier: sonnet
-    agent_file: .claude/agents/the-choreographer.md
+    agent_file: plugins/rlm-gaming/agents/the-choreographer.md
 
   # ---- Evaluation layer ----
   - slug: qa-balance-lead
@@ -138,32 +138,32 @@ agents:
     role: "QA & Balance Lead — test strategy, bot playthroughs, balance Monte Carlo, telemetry tuning. QA gate."
     authority: gatekeeper
     model_tier: sonnet
-    agent_file: .claude/agents/the-warden.md
+    agent_file: plugins/rlm-gaming/agents/the-warden.md
     notes: "Owns game-accessibility-guidelines gate."
   - slug: playtest-sim
     mythic: The Playtester
     role: "Playtest Simulation — synthetic players / persona simulation, fun-proxy metrics, friction reports."
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/the-playtester.md
+    agent_file: plugins/rlm-gaming/agents/the-playtester.md
   - slug: liveops-director
     mythic: The Custodian
     role: "Live-Ops Director — seasons, events, store A/B, hotfix flow, retention loops."
     authority: gatekeeper
     model_tier: sonnet
-    agent_file: .claude/agents/the-custodian.md
+    agent_file: plugins/rlm-gaming/agents/the-custodian.md
   - slug: compliance-cert
     mythic: The Arbiter
     role: "Ratings/Cert/Compliance — ESRB/PEGI/IARC/CERO, platform cert (TRC/XR/Lotcheck/Steamworks), loot-box law, CVAA."
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/the-arbiter.md
+    agent_file: plugins/rlm-gaming/agents/the-arbiter.md
   - slug: game-security-gate
     mythic: The Sentinel
     role: "Fair-play Security Gate — server authority, anti-cheat, exploit threat models. Cerberus-equivalent for the Arcade crown."
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/the-sentinel.md
+    agent_file: plugins/rlm-gaming/agents/the-sentinel.md
     notes: "Venom owner — see cerberus.yaml."
 
 # ---------------------------------------------------------------------------

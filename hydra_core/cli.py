@@ -413,8 +413,55 @@ def _cmd_squads(args) -> int:
     return 0
 
 
+def _cmd_repo(args) -> int:
+    """`hydra repo register|unregister|list` — WS1-C self-service admin of
+    ~/.hydra/repos.json. CLI-only by design; see repo_registry.register_repo."""
+    from .repo_registry import (
+        list_registered_repos,
+        register_repo,
+        unregister_repo,
+    )
+    if args.repocmd == "register":
+        try:
+            result = register_repo(
+                args.repo_id, args.path, force=args.force, init=args.init,
+            )
+        except (ValueError, TimeoutError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, **result}, indent=2))
+        return 0
+    if args.repocmd == "unregister":
+        try:
+            result = unregister_repo(args.repo_id)
+        except (ValueError, TimeoutError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, **result}, indent=2))
+        return 0
+    if args.repocmd == "list":
+        print(json.dumps({"ok": True, "repos": list_registered_repos()}, indent=2))
+        return 0
+    print(json.dumps({"ok": False, "error": f"unknown repocmd {args.repocmd!r}"}), file=sys.stderr)
+    return 1
+
+
 def _cmd_run(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
+    # WS1 retry (finding 1): --repo and --repos are mutually exclusive on the
+    # CLI transport too. The MCP transport already rejects this combination
+    # (mcp_servers/hydra_control/server.py: _extract_repo_params), but the CLI
+    # path pre-seeds target_repo_id/target_repo_ids directly onto HydraState
+    # (see WS1-B below) — that bypasses node_intake's goal-text ambiguity
+    # guard entirely (it only compares ids parsed OUT of root_goal), so an
+    # operator passing both flags here would otherwise silently pick whichever
+    # field a downstream branch happens to prefer. Fail fast instead.
+    if getattr(args, "repo", None) and getattr(args, "repos", None):
+        print(
+            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            file=sys.stderr,
+        )
+        return 1
     # --workflow-id: use the caller-supplied id if present and valid; otherwise
     # mint a fresh uuid4(). The Hydra Cockpit bridge pre-allocates the id so it
     # can return it to the UI immediately (fire-and-attach) before the run ends.
@@ -445,18 +492,27 @@ def _cmd_run(args) -> int:
                 workflow_id = uuid4()
     else:
         workflow_id = uuid4()
-    # Explicit --repo/--repos flags are folded into the goal text so the
-    # supervisor's intake parser (parse_repo_arg / parse_repos_arg) handles them
-    # through the single, tested code path — no second parser. Mutually exclusive
-    # (intake surfaces an HITL if both end up present).
+    # WS1-B: --repo/--repos/--subdir are structured argparse flags, so they are
+    # pre-seeded directly onto HydraState (target_repo_id / target_repo_ids /
+    # target_repo_subpath) rather than folded into the goal text. root_goal
+    # stays exactly what the operator typed. node_intake validates whatever
+    # arrives here (goal-text token OR pre-seeded field) through the same
+    # allow-list check and HITL shape either way. parse_repo_arg /
+    # parse_repos_arg are unchanged and remain solely for operator-typed goal
+    # text (e.g. a goal pasted into a chat UI with no separate --repo flag).
     _goal = args.goal
-    if getattr(args, "repo", None):
-        _goal = f"{_goal} --repo {args.repo}"
-    if getattr(args, "repos", None):
-        _goal = f"{_goal} --repos {args.repos}"
-    if getattr(args, "subdir", None):
-        _goal = f"{_goal} --subdir {args.subdir}"
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
+    if getattr(args, "repo", None):
+        initial.target_repo_id = str(args.repo).strip().lower()
+        initial.target_repo_source = "explicit_param"
+    if getattr(args, "repos", None):
+        initial.target_repo_ids = [
+            p.strip().lower() for p in str(args.repos).split(",") if p.strip()
+        ]
+        initial.target_repo_source = "explicit_param"
+    if getattr(args, "subdir", None):
+        from .repo_registry import normalize_repo_subpath
+        initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
     # --budget: set the workflow budget cap (the genuinely-missing wire — the
@@ -510,6 +566,30 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _build_resolved_target_view(state) -> dict | None:
+    """WS1-E ergonomic: what engineering-target resolved, and from where.
+
+    Surfaced on `hydra.workflow.plan` / `hydra.workflow.step` output (and
+    rendered on the approval HITL) so an operator sees the target BEFORE any
+    work happens, instead of discovering a wrong-repo diff at merge time.
+    Returns None when nothing has resolved (the missing-target HITL in
+    node_planner covers that case for engineering dispatch)."""
+    if getattr(state, "target_repo_ids", None):
+        return {
+            "mode": "fleet",
+            "repo_ids": list(state.target_repo_ids),
+            "source": getattr(state, "target_repo_source", None) or "unknown",
+        }
+    if getattr(state, "target_repo_id", None):
+        return {
+            "mode": "single",
+            "repo_id": state.target_repo_id,
+            "subpath": getattr(state, "target_repo_subpath", None),
+            "source": getattr(state, "target_repo_source", None) or "unknown",
+        }
+    return None
+
+
 def _cmd_plan(args) -> int:
     """Non-detaching planning surface for attended (host-bridged) execution.
 
@@ -527,6 +607,20 @@ def _cmd_plan(args) -> int:
     """
     project = Path(args.project) if args.project else Path.cwd()
 
+    # WS1 retry-2 (finding B): --repo and --repos are mutually exclusive here
+    # too, mirroring _cmd_run's guard above. Without it, `hydra plan --repo X
+    # --repos Y,Z` pre-seeds target_repo_id AND target_repo_ids independently
+    # (see WS1-B below) and node_intake's goal-text ambiguity guard never
+    # fires for this structured path (it only compares ids parsed OUT of
+    # root_goal, both empty here) -- so the conflict is silently resolved by
+    # whichever branch happens to run instead of being rejected.
+    if getattr(args, "repo", None) and getattr(args, "repos", None):
+        print(
+            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            file=sys.stderr,
+        )
+        return 1
+
     # Mirror _cmd_run's workflow-id handling so a caller (the hydra.workflow.plan
     # MCP tool) can pre-allocate the id and attach to the same checkpoint.
     wf_id_override = getattr(args, "workflow_id_override", None)
@@ -538,15 +632,21 @@ def _cmd_plan(args) -> int:
         except ValueError:
             workflow_id = uuid4()
 
+    # WS1-B: structured flags pre-seed HydraState directly; see _cmd_run for
+    # the full rationale. root_goal stays exactly what the operator typed.
     _goal = args.goal
-    if getattr(args, "repo", None):
-        _goal = f"{_goal} --repo {args.repo}"
-    if getattr(args, "repos", None):
-        _goal = f"{_goal} --repos {args.repos}"
-    if getattr(args, "subdir", None):
-        _goal = f"{_goal} --subdir {args.subdir}"
-
     initial = HydraState(workflow_id=workflow_id, root_goal=_goal)
+    if getattr(args, "repo", None):
+        initial.target_repo_id = str(args.repo).strip().lower()
+        initial.target_repo_source = "explicit_param"
+    if getattr(args, "repos", None):
+        initial.target_repo_ids = [
+            p.strip().lower() for p in str(args.repos).split(",") if p.strip()
+        ]
+        initial.target_repo_source = "explicit_param"
+    if getattr(args, "subdir", None):
+        from .repo_registry import normalize_repo_subpath
+        initial.target_repo_subpath = normalize_repo_subpath(str(args.subdir))
     if args.squad:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
     if getattr(args, "budget", None) is not None:
@@ -595,6 +695,7 @@ def _cmd_plan(args) -> int:
         "requires_human_approval": bool(getattr(final, "requires_human_approval", False)),
         "tasks": [_task_view(t) for t in getattr(final, "tasks", [])],
         "pending_hitl": pending if isinstance(pending, dict) else None,
+        "resolved_target": _build_resolved_target_view(final),
         "budget": final.budget.model_dump(mode="json") if hasattr(final, "budget") else {},
         "trace": str(trace_path(project, workflow_id)),
     }, indent=2))
@@ -798,6 +899,14 @@ def _cmd_resume(args) -> int:
 
 
 def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int:
+    # W2-4: recover-stalled-stage does not touch the LangGraph checkpoint
+    # interrupt machinery the actions below use -- a stranded attended stage
+    # is a host_bridge cursor whose pp-ledger call never landed, not an
+    # HITL-paused graph. Route it separately, still under the same
+    # claim-and-resume lock `_cmd_resume` already acquired above (governance:
+    # a paused/stranded workflow resumes only via approve/resume).
+    if action == "recover-stalled-stage":
+        return _cmd_recover_stalled_stage(args, project, wf, option)
 
     critique_client = None
     if getattr(args, "live", False):
@@ -1409,7 +1518,7 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     attended agent. We surface them in task-list order so the host can
     dispatch one at a time, mirroring the engineering attended flow."""
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
-    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "agent-impersonation"})
+    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "claude-native", "agent-impersonation"})
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
@@ -1429,6 +1538,9 @@ def _resolve_pack_lead_agent(pack) -> str:
     Priority: first agent with authority='gatekeeper', then first agent in the
     list, then 'general-purpose' as an absolute fallback.
     """
+    if getattr(pack, "entrypoint", None) == "claude-native":
+        from .native_packs import native_pack
+        return native_pack(pack.slug).qualified_lead_agent
     agents = list(getattr(pack, "agents", []) or [])
     for a in agents:
         if getattr(a, "authority", "") == "gatekeeper":
@@ -1445,6 +1557,9 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
     marketing packs (which are filesystem symlinks into MarketBliss) return
     their real path.  Falls back to the project root if not found.
     """
+    if getattr(pack, "entrypoint", None) == "claude-native":
+        from .native_packs import native_pack_root
+        return str(native_pack_root(pack.slug))
     from .squad_loader import SQUAD_DIR_NAMES, USER_SQUAD_DIR
     for dir_name in SQUAD_DIR_NAMES:
         candidate = project / dir_name / pack.slug
@@ -1465,12 +1580,17 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
 
 def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
     """Resolve the engineering target dir: an allow-listed repo id when the task
-    (or the workflow, via `--repo`) targets one, else the workflow project root.
+    (or the workflow, via `--repo`) targets one.
 
     Mirrors node_dispatch's precedence (supervisor.py): per-task target_repo_id
     wins, else the workflow-level state.target_repo_id set by intake from
-    `--repo`. Without the state-level fallback, attended `step` would wrongly
-    target the Hydra cwd for a `--repo`-scoped goal."""
+    `--repo`.
+
+    WS1-E: raises `MissingEngineeringTargetError` when neither resolves --
+    engineering dispatch must not silently fall back to the Hydra cwd. The
+    primary gate is node_planner's HITL (fires before this is ever reached
+    for a fresh plan); this is defense-in-depth for a checkpoint written
+    before that gate existed."""
     rid = getattr(task, "target_repo_id", None) or getattr(state, "target_repo_id", None)
     if rid:
         from .repo_registry import resolve_repo_project_path
@@ -1480,7 +1600,21 @@ def _resolve_task_project_path(task, state: HydraState, project: Path) -> str:
         if sub:
             Path(p).mkdir(parents=True, exist_ok=True)
         return str(p)
-    return str(project)
+    raise MissingEngineeringTargetError(
+        "engineering dispatch has no resolved target repo (no --repo/--repos "
+        "and no target_repo_id on the task or workflow). This checkpoint "
+        "predates the WS1-E target gate, or was resumed after it was "
+        "bypassed -- register the intended repo and relaunch with an "
+        "explicit --repo/--repos."
+    )
+
+
+class MissingEngineeringTargetError(RuntimeError):
+    """Raised by `_resolve_task_project_path` when an engineering task has no
+    resolved target repo. WS1-E defense-in-depth: the primary gate is
+    node_planner's HITL, which stops a fresh plan before any worktree is cut
+    or stage started; this exception covers a checkpoint from before that
+    gate existed reaching `hydra attended step` directly."""
 
 
 def _cmd_attended_step(args) -> int:
@@ -1534,13 +1668,24 @@ def _cmd_attended_step(args) -> int:
         # --- Engineering task (mcp entrypoint) ---
         task = _next_engineering_task(state)
         if task is not None:
-            project_path = _resolve_task_project_path(task, state, project)
+            try:
+                project_path = _resolve_task_project_path(task, state, project)
+            except MissingEngineeringTargetError as _missing_target_err:
+                from .repo_registry import unknown_repo_hitl_fields
+                print(json.dumps({
+                    "ok": False,
+                    "error": "missing_engineering_target",
+                    "detail": str(_missing_target_err),
+                    "resolved_target": None,
+                    **unknown_repo_hitl_fields("<repo-id>"),
+                }, indent=2), file=sys.stderr)
+                return 1
             request_text = task.description or state.root_goal
 
             # F27: preflight — verify ALL THREE agent files exist before
             # staging host_actions that reference them.  If any is absent,
             # surface a clear dependency error rather than a broken host_action.
-            _agents_dir = project / ".claude" / "agents"
+            _agents_dir = project / "plugins" / "hydra" / "agents"
             _required_agents = {
                 "engineer.md": "code generator",
                 "judge-cross-vendor.md": "cross-vendor judge",
@@ -1556,8 +1701,8 @@ def _cmd_attended_step(args) -> int:
                     "detail": (
                         f"attended engineering requires agent stubs: "
                         f"{', '.join(_missing_agents)}. "
-                        "Create them under .claude/agents/ (or symlink from "
-                        "pair-programmer/.claude/agents/) to enable "
+                        "Install the Hydra plugin assets under plugins/hydra/agents/ "
+                        "to enable "
                         "attended engineering."
                     ),
                     "missing": _missing_agents,
@@ -1609,6 +1754,12 @@ def _cmd_attended_step(args) -> int:
                 _maybe_write_claude_shim(project_path)
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                from .squad_node import ensure_target_repo_ignores, ensure_target_repo_test_excludes
+                ensure_target_repo_ignores(project_path)
+                ensure_target_repo_test_excludes(project_path)
+            except Exception:  # noqa: BLE001
+                pass
 
             # Register the open pp run so postcheck/reap can finalize-abort it
             # if the workflow is abandoned mid-stage (run holds the .harness lock).
@@ -1632,7 +1783,21 @@ def _cmd_attended_step(args) -> int:
             emit(project, wf, "attended.step", {"run_id": str(run_id),
                                                 "task_id": str(task.task_id),
                                                 "state": res.get("state")})
-            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            _resolved_target = _build_resolved_target_view(state)
+            if _resolved_target is None:
+                # Single-target, per-task override (fleet-degrade case etc.) --
+                # task.target_repo_id resolved even though state-level fields
+                # didn't. Surface it the same way for the step response.
+                _tr_id = getattr(task, "target_repo_id", None)
+                if _tr_id:
+                    _resolved_target = {
+                        "mode": "single",
+                        "repo_id": _tr_id,
+                        "subpath": getattr(task, "target_repo_subpath", None),
+                        "source": "task_override",
+                    }
+            print(json.dumps({"ok": True, "resolved_target": _resolved_target, **res},
+                             indent=2, default=str))
             return 0
 
         # --- Non-engineering task (claude-skill / agent-impersonation) ---
@@ -1669,6 +1834,79 @@ def _cmd_attended_step(args) -> int:
         return 0
     finally:
         _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
+    """``hydra resume <workflow_id> --action recover-stalled-stage --option <run_id>``.
+
+    W2-4: the sanctioned entry point for ``host_bridge.recover_stalled_stage``.
+    ``--option`` carries the stranded attended cursor's ``run_id`` (the same
+    id ``hydra attended step`` printed as ``run_id`` when the stage began).
+    Mirrors ``_cmd_attended_submit``'s post-terminal budget-charge block so a
+    recovered stage is charged exactly once: ``already_charged`` (read off the
+    cursor's persisted ``charged`` flag) gates the charge exactly as it does
+    for a normal retried submit.
+    """
+    from . import host_bridge
+    if not option:
+        print(json.dumps({"ok": False,
+                          "error": "recover-stalled-stage needs --option <run_id>"}),
+              file=sys.stderr)
+        return 1
+    run_id = str(option)
+    dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+    cfile = host_bridge.cursor_path(project, wf, run_id)
+    if not Path(cfile).exists():
+        print(json.dumps({"ok": False, "error": "cursor_not_found", "detail": str(cfile)}),
+              file=sys.stderr)
+        return 1
+
+    res = host_bridge.recover_stalled_stage(dispatcher, cursor_file=cfile)
+    if not res.get("ok", True):
+        print(json.dumps(res, indent=2, default=str), file=sys.stderr)
+        return 1
+
+    if res.get("status") in ("complete", "surfaced", "aborted") and not res.get("already_charged"):
+        host_bridge.mark_charged(cfile)
+        from .governance import charge_and_gate
+        from .supervisor import build_supervisor, _PurePythonRunner
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        if not isinstance(sup, _PurePythonRunner):
+            config = {"configurable": {"thread_id": wf}}
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
+                cost = float(res.get("cost_usd") or 0.0)
+                toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
+                block, downgrade = charge_and_gate(state, cost, toks)
+                tid = res.get("task_id")
+                completed = list(state.attended_completed_task_ids)
+                if tid is not None and str(tid) not in completed:
+                    completed.append(str(tid))
+                done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                if (res.get("status") == "complete" and tid is not None
+                        and str(tid) not in done_ids):
+                    done_ids.append(str(tid))
+                open_runs = [e for e in state.open_pp_runs
+                             if e.get("run_id") != res.get("run_id")]
+                res["budget_block"] = block
+                res["budget_downgrade"] = downgrade
+                res["spent_usd"] = state.budget.spent_usd
+                try:
+                    sup.update_state(config, {
+                        "attended_completed_task_ids": completed,
+                        "attended_done_task_ids": done_ids,
+                        "open_pp_runs": open_runs,
+                        "budget": state.budget.model_dump(mode="json"),
+                        "budget_downgrade_active": bool(downgrade),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+    emit(project, wf, "attended.recovery.resume",
+         {"run_id": run_id, "status": res.get("status")})
+    print(json.dumps({"ok": True, **res}, indent=2, default=str))
+    return 0
 
 
 def _cmd_attended_submit(args) -> int:
@@ -1734,6 +1972,28 @@ def _cmd_attended_submit(args) -> int:
             host_bridge.mark_charged(cfile)
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+            # The host returns the native pack artifact as text. Persist it only
+            # through the declared pack output root; the helper rejects escapes
+            # and non-text artifacts before producing the MemoryRef returned to
+            # the operator and telemetry.
+            squad_slug = str(res.get("squad_slug") or "")
+            artifact_text = str(res.get("artifact_text") or "")
+            if squad_slug and artifact_text:
+                try:
+                    from .artifact_store import write_native_artifact
+                    ref = write_native_artifact(
+                        squad_slug, f"attended/{res.get('task_id') or args.run_id}.md",
+                        artifact_text,
+                    )
+                    res["artifact_ref"] = ref.model_dump(mode="json")
+                    emit(project, wf, "attended.native_artifact_persisted", {
+                        "squad_slug": squad_slug, "memory_ref": ref.key,
+                    })
+                except (ValueError, OSError) as exc:
+                    res["artifact_persist_error"] = str(exc)
+                    emit(project, wf, "attended.native_artifact_persist_failed", {
+                        "squad_slug": squad_slug, "error": str(exc),
+                    })
             if not isinstance(sup, _PurePythonRunner):
                 config = {"configurable": {"thread_id": wf}}
                 snap = sup.get_state(config)
@@ -1785,6 +2045,60 @@ def _cmd_attended_submit(args) -> int:
                         })
                     except Exception as e:  # noqa: BLE001
                         emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+                    # A native pack may emit typed work for a sibling squad.
+                    # Route it through the same boundary validation, redaction,
+                    # claim-before-dispatch ledger, and checkpoint persistence
+                    # used by `hydra workflow submit-envelopes`.  This closes
+                    # the attended-host gap without creating an ungoverned
+                    # direct Agent fan-out.
+                    emitted = res.get("emitted_envelopes") or []
+                    if emitted:
+                        from .ingest import (
+                            claim_ingested_ids,
+                            dispatch_ingested_envelopes,
+                            load_ingested_ids,
+                            release_ingested_ids,
+                        )
+                        packs = discover_squads(project)
+                        if hasattr(dispatcher, "set_squad_packs"):
+                            dispatcher.set_squad_packs(packs)
+                        outcomes: list[dict[str, object]] = []
+                        processed = load_ingested_ids(project, wf)
+                        for raw in emitted:
+                            if not isinstance(raw, dict):
+                                outcomes.append({"status": "failed", "detail": "non-object envelope"})
+                                continue
+                            envelope_id = raw.get("id")
+                            if envelope_id is not None and str(envelope_id) in processed:
+                                outcomes.append({"envelope_id": str(envelope_id),
+                                                 "status": "skipped_duplicate"})
+                                continue
+                            if envelope_id is not None:
+                                claim_ingested_ids(project, wf, [str(envelope_id)])
+                            outcome = dispatch_ingested_envelopes(
+                                state, [raw], packs=packs, dispatcher=dispatcher,
+                                already_ingested=processed,
+                                emit_fn=lambda event, payload: emit(project, wf, event, payload),
+                            )
+                            item = outcome.items[-1] if outcome.items else None
+                            if envelope_id is not None and item is not None:
+                                if item.status == "unknown_target":
+                                    release_ingested_ids(project, wf, [str(envelope_id)])
+                                else:
+                                    processed.add(str(envelope_id))
+                            try:
+                                sup.update_state(config, {
+                                    "tasks": outcome.new_tasks,
+                                    "envelopes": outcome.new_envelopes,
+                                    "open_pp_runs": state.open_pp_runs,
+                                    "budget": state.budget.model_dump(mode="json"),
+                                })
+                            except Exception as exc:  # noqa: BLE001
+                                emit(project, wf, "attended.emitted_persist_failed",
+                                     {"error": str(exc)})
+                            outcomes.extend(vars(item) for item in outcome.items)
+                        res["ingest"] = outcomes
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
@@ -2227,6 +2541,75 @@ def _cmd_reap(args) -> int:
     return 0
 
 
+def _cmd_sweep_worktrees(args) -> int:
+    """`hydra sweep-worktrees [--project PATH] [--apply]` — operator entry
+    point for `host_bridge.sweep_stale_worktrees` (the attended-worktree
+    janitor). See that function's docstring for the safety invariants this
+    command must never weaken: cursor-terminality gated, fails toward keeping
+    on a corrupt/unreadable/missing cursor, never deletes a git branch, and
+    per-entry failures are reported rather than silently dropped.
+
+    Dry-run by default — reports what WOULD be removed without touching disk.
+    Pass --apply to actually delete. This mirrors `reap`'s dry-run-by-default
+    convention above.
+    """
+    from .host_bridge import sweep_stale_worktrees
+
+    project = str(Path(args.project) if args.project else Path.cwd())
+    do_apply = bool(getattr(args, "apply", False))
+
+    report = sweep_stale_worktrees(project, project_root=project, dry_run=not do_apply)
+
+    # Normalize into one flat, auditable per-entry list: worktree path,
+    # cursor state (where known), and WHY each decision was made — a bare
+    # count would hide exactly the information an operator needs before
+    # trusting a destructive sweep.
+    entries: list[dict[str, Any]] = []
+    for e in report.get("removed", []):
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "root": e.get("root"),
+            "cursor_state": e.get("state"),
+            "decision": "would-remove" if e.get("dry_run") else "removed",
+        })
+    for e in report.get("skipped", []):
+        reason = str(e.get("reason") or "")
+        if reason == "no_cursor_found":
+            decision, cursor_state = "skipped-no-cursor", None
+        elif reason.startswith("non_terminal_state:"):
+            decision, cursor_state = "skipped-non-terminal", reason.split(":", 1)[1]
+        else:
+            decision, cursor_state = "skipped", None
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "root": e.get("root"),
+            "cursor_state": cursor_state,
+            "decision": decision,
+            "reason": reason,
+        })
+    for e in report.get("errors", []):
+        entries.append({
+            "worktree": e.get("worktree"),
+            "run_id": e.get("run_id"),
+            "root": e.get("root"),
+            "cursor_state": None,
+            "decision": "error",
+            "error": e.get("error"),
+        })
+
+    print(json.dumps({
+        "mode": "apply" if do_apply else "dry-run",
+        "project": project,
+        "count_removed": sum(1 for e in entries if e["decision"] in ("removed", "would-remove")),
+        "count_skipped": sum(1 for e in entries if e["decision"].startswith("skipped")),
+        "count_errors": sum(1 for e in entries if e["decision"] == "error"),
+        "entries": entries,
+    }, indent=2))
+    return 0
+
+
 def _cmd_status(args) -> int:
     """List recent workflows (latest-first) or show a specific workflow's state.
 
@@ -2524,6 +2907,19 @@ def _cmd_replay(args) -> int:
         phase=from_phase,
         selected_squads=values.get("selected_squads", []),
     )
+    # WS1 retry (finding 5): carry the source run's repo-targeting fields
+    # forward. Without this, a replay of a --repo/--repos-targeted run
+    # silently drops back to intake's cwd-fallback path (the original bug
+    # this stage exists to fix) -- landing in a DIFFERENT repo than the run
+    # being replayed, which also breaks the determinism replay exists to
+    # provide. These are the exact three fields node_intake persists onto
+    # state for repo targeting (see node_intake's `update` dict above).
+    if values.get("target_repo_id") is not None:
+        replay_initial.target_repo_id = values["target_repo_id"]
+    if values.get("target_repo_ids"):
+        replay_initial.target_repo_ids = list(values["target_repo_ids"])
+    if values.get("target_repo_subpath") is not None:
+        replay_initial.target_repo_subpath = values["target_repo_subpath"]
     # Copy budget snapshot if present
     budget = values.get("budget")
     if budget is not None:
@@ -2895,7 +3291,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="Operator risk tolerance hint (recorded on the start event).")
     r.add_argument("--repo", default=None, metavar="ID",
                    help="Single allow-listed repo id for engineering targeting "
-                        "(folded into the goal; resolved by hydra_core.repo_registry).")
+                        "(pre-seeded onto HydraState.target_repo_id; resolved by "
+                        "hydra_core.repo_registry).")
     r.add_argument("--repos", default=None, metavar="ID,ID,...",
                    help="Comma-separated allow-listed repo ids for fleet mode "
                         "(>=2 distinct ids). Mutually exclusive with --repo.")
@@ -2934,7 +3331,8 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--budget", type=float, default=None,
                     help="Workflow budget cap in USD (sets BudgetLedger.budget_usd).")
     pl.add_argument("--repo", default=None, metavar="ID",
-                    help="Single allow-listed repo id (folded into the goal).")
+                    help="Single allow-listed repo id (pre-seeded onto "
+                         "HydraState.target_repo_id).")
     pl.add_argument("--repos", default=None, metavar="ID,ID,...",
                     help="Comma-separated allow-listed repo ids for fleet mode.")
     pl.add_argument("--subdir", default=None, metavar="PATH",
@@ -2973,6 +3371,15 @@ def main(argv: list[str] | None = None) -> int:
                          help="Only reap non-terminal workflows idle this long (default 24).")
     rp_reap.add_argument("--apply", action="store_true",
                          help="Actually transition stale workflows to 'surfaced' (default: dry-run).")
+
+    # Attended-worktree janitor operator entry point (host_bridge.sweep_stale_worktrees).
+    sw = sub.add_parser("sweep-worktrees", help=(
+        "Remove attended-run worktrees whose Hydra cursor has reached a "
+        "terminal state (complete/surfaced/aborted). Never deletes a git "
+        "branch. Dry-run by default; per-entry reasons are always reported."))
+    sw.add_argument("--apply", action="store_true",
+                    help="Actually remove eligible worktrees (default: dry-run, deletes nothing).")
+
     ap_approve = sub.add_parser("approve")
     ap_approve.add_argument("workflow_id")
     ap_approve.add_argument("--live", action="store_true",
@@ -2982,10 +3389,12 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("workflow_id")
     rs.add_argument("--action", required=True,
                     choices=["approve", "reject", "modify-budget",
-                             "force-dispatch", "change-squads"])
+                             "force-dispatch", "change-squads",
+                             "recover-stalled-stage"])
     rs.add_argument("--option", help=(
         "Action argument: chosen option label, new budget USD for "
-        "modify-budget, or comma-separated squads for change-squads"))
+        "modify-budget, comma-separated squads for change-squads, or the "
+        "stalled attended cursor's run_id for recover-stalled-stage"))
     rs.add_argument("--live", action="store_true",
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
     rs.add_argument("--verbose", action="store_true")
@@ -3095,11 +3504,32 @@ def main(argv: list[str] | None = None) -> int:
     mt.add_argument("--cells", required=True, help="Comma-separated cell slugs")
     mt.add_argument("--replace", action="store_true")
 
+    # WS1-C: `hydra repo register|unregister|list` — self-service ~/.hydra/repos.json
+    # administration. CLI-ONLY (never exposed as a writable MCP tool — see
+    # repo_registry.register_repo's docstring for the security rationale: the
+    # registry IS the allow-list, so a freely-callable MCP register tool would
+    # put allow-list authorship inside the supervisor LLM's reach).
+    repo_p = sub.add_parser("repo", help="Administer ~/.hydra/repos.json (operator-registered repo ids).")
+    repo_sub = repo_p.add_subparsers(dest="repocmd", required=True)
+    rreg = repo_sub.add_parser("register", help="Register (or overwrite) a repo id.")
+    rreg.add_argument("repo_id")
+    rreg.add_argument("path", help="Absolute path to the repo.")
+    rreg.add_argument("--init", action="store_true",
+                       help="Create the directory / run `git init` if it isn't a git repo yet.")
+    rreg.add_argument("--force", action="store_true",
+                       help="Allow shadowing a built-in repo id.")
+    rureg = repo_sub.add_parser("unregister", help="Remove a registered repo id.")
+    rureg.add_argument("repo_id")
+    repo_sub.add_parser("list", help="List operator-registered repo ids.")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "memory":
         memcmds = {"query": _cmd_memory_query, "tag": _cmd_memory_tag}
         return memcmds[args.memcmd](args)
+
+    if args.cmd == "repo":
+        return _cmd_repo(args)
 
     return {
         "doctor": _cmd_doctor,
@@ -3113,6 +3543,7 @@ def main(argv: list[str] | None = None) -> int:
         "trace": _cmd_trace,
         "budget": _cmd_budget,
         "reap": _cmd_reap,
+        "sweep-worktrees": _cmd_sweep_worktrees,
         # C2: approve == resume --action approve (the old stub printed a
         # plugin pointer and did nothing; resume is now first-class).
         "approve": lambda a: _cmd_resume(argparse.Namespace(

@@ -98,9 +98,13 @@ def test_live_engine_defers_nonmcp_and_dispatches_engineering():
         force_pure_python=True,
     )
     # Force-select a claude-skill squad + the mcp engineering squad.
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is nonmcp-defer-vs-engineering-dispatch, not
+    # repo-targeting, so point at "hydra" (this checkout).
     state = HydraState(
         root_goal="build the feature",
         selected_squads=["garland", "engineering"],
+        target_repo_id="hydra",
     )
     final = _invoke(runner, state)
 
@@ -115,18 +119,13 @@ def test_live_engine_defers_nonmcp_and_dispatches_engineering():
     assert ("pp_harness", "start_run") in disp.calls
 
 
-def test_stub_dispatcher_keeps_legacy_path():
-    """A non-live dispatcher (no live_execution) must NOT be pre-empted by Fix B —
-    Fix B (the live-defer pre-filter that skips non-mcp squads *without* invoking
-    them) is gated on live_execution, so a non-live dispatcher still runs the
-    in-graph skill path.
+def test_stub_dispatcher_defers_native_pack_without_legacy_shim_call():
+    """Native packs remain attended even under a non-live test dispatcher.
 
-    The observable discriminator is whether the skill was actually invoked: the
-    live path defers with ``skill_calls == []`` (see the test above), whereas the
-    non-live legacy path here invokes the skill in-process. F11 then maps the
-    skill's ``host_pickup_required`` placeholder to the honest ``deferred_to_host``
-    status — the same terminal status, but reached by actually running the leg
-    rather than skipping it. Status alone no longer distinguishes the two paths."""
+    Their Claude Code plugin agents require a host cursor, so Hydra must not
+    fall back to the retired in-graph skill invocation merely because a test
+    dispatcher lacks ``live_execution``.
+    """
     from hydra_core.supervisor import build_supervisor
 
     class _StubDispatcher:
@@ -154,10 +153,6 @@ def test_stub_dispatcher_keeps_legacy_path():
                        selected_squads=["garland"])
     final = _invoke(runner, state)
     by_squad = {t.owner_squad: t for t in final.tasks}
-    # Legacy behaviour: Fix B did NOT pre-empt — the in-graph skill path actually
-    # ran (the skill was invoked in-process), unlike the live path which skips it.
     assert by_squad.get("garland") is not None
-    assert disp.skill_calls, "non-live dispatcher must run the in-graph skill path"
-    # F11: the invoked skill returned the host_pickup_required placeholder, which
-    # is surfaced honestly as deferred_to_host (never a forged 'done').
+    assert disp.skill_calls == []
     assert by_squad["garland"].status == "deferred_to_host"

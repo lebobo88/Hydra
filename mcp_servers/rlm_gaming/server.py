@@ -13,7 +13,7 @@ fall back to the Garland (`rlm_creative`) shim and write into the wrong store.
 Tools:
   rlmgaming.skill.list / rlmgaming.skill.get(name)
   rlmgaming.command.list / rlmgaming.command.get(name)   — filters to game-* commands
-  rlmgaming.agent.list / rlmgaming.agent.get(slug)        — from .claude/agents/the-*.md
+  rlmgaming.agent.list / rlmgaming.agent.get(slug)        — from plugin agents/the-*.md
   rlmgaming.output.write(phase, topic, content)           — persist under RLM/output/gaming/{phase}/
   rlmgaming.output.read(path)
   rlmgaming.ping
@@ -38,25 +38,25 @@ def _tool_handlers():
 
     def skill_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "skills": list_dir(root, ".claude/skills", only_dirs=True)}
+                "skills": list_dir(root, "plugins/rlm-gaming/skills", only_dirs=True)}
 
     def skill_get(args: dict[str, Any]) -> dict[str, Any]:
-        return read_markdown(root, f".claude/skills/{args.get('name','')}/SKILL.md")
+        return read_markdown(root, f"plugins/rlm-gaming/skills/{args.get('name','')}/SKILL.md")
 
     def command_list(args: dict[str, Any]) -> dict[str, Any]:
-        all_cmds = list_dir(root, ".claude/commands", suffix=".md")
+        all_cmds = list_dir(root, "plugins/rlm-gaming/commands", suffix=".md")
         game_only = [c for c in all_cmds if c["name"].startswith("game-")]
         return {"root": str(root), "commands": game_only}
 
     def command_get(args: dict[str, Any]) -> dict[str, Any]:
-        return read_markdown(root, f".claude/commands/{args.get('name','')}.md")
+        return read_markdown(root, f"plugins/rlm-gaming/commands/{args.get('name','')}.md")
 
     def agent_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "agents": list_dir(root, ".claude/agents", suffix=".md")}
+                "agents": list_dir(root, "plugins/rlm-gaming/agents", suffix=".md")}
 
     def agent_get(args: dict[str, Any]) -> dict[str, Any]:
-        return read_markdown(root, f".claude/agents/{args.get('slug','')}.md")
+        return read_markdown(root, f"plugins/rlm-gaming/agents/{args.get('slug','')}.md")
 
     def output_write(args: dict[str, Any]) -> dict[str, Any]:
         phase = args.get("phase", "general")

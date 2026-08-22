@@ -32,7 +32,7 @@ def packs():
 
 def test_legal_squad_loads_with_twelve_jurists(packs):
     senate = packs["legal-compliance"]
-    assert senate.entrypoint == "claude-skill"
+    assert senate.entrypoint == "claude-native"
     assert "Senate" in (senate.source_pack or "")
     assert len(senate.agents) == 12
 

@@ -59,10 +59,23 @@ class _StubDispatcher:
 
 @pytest.fixture(autouse=True)
 def _patch_harvest(monkeypatch):
-    """Prevent git operations from running during tests."""
+    """Prevent git operations from running during tests. Also stub the
+    target-repo scaffolding helpers (.gitignore / test-runner exclude
+    patching) -- several tests here dispatch _via_mcp against the real
+    HYDRA_ROOT checkout, and those helpers would otherwise write into it.
+    They are exercised hermetically against tmp_path in
+    tests/test_target_repo_scaffolding.py."""
     monkeypatch.setattr(
         "hydra_core.squad_node.harvest_pp_run_artifacts",
         lambda **_k: None,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_ignores",
+        lambda _project_path: None,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes",
+        lambda _project_path: None,
     )
 
 
@@ -143,9 +156,13 @@ def test_ra12a_attended_done_emits_trace(monkeypatch):
     )
     assert isinstance(sup, _PurePythonRunner)
 
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is the attended_already_complete trace, so give
+    # it a real target ("hydra", this checkout).
     state = HydraState(
         root_goal="fix the bug",
         selected_squads=["engineering"],
+        target_repo_id="hydra",
         tasks=[TaskState(
             task_id=task_id,
             owner_squad="engineering",
@@ -180,9 +197,13 @@ def test_ra12a_non_done_task_still_dispatches():
     sup = _build_sup(disp)
     assert isinstance(sup, _PurePythonRunner)
 
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is non-done tasks still dispatching, so give it
+    # a real target ("hydra", this checkout).
     state = HydraState(
         root_goal="fix the bug",
         selected_squads=["engineering"],
+        target_repo_id="hydra",
         tasks=[
             TaskState(
                 task_id=done_task_id,
@@ -217,9 +238,13 @@ def test_ra12a_empty_attended_done_dispatches_all():
     sup = _build_sup(disp)
     assert isinstance(sup, _PurePythonRunner)
 
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is the empty-attended-done-ids path, so give it
+    # a real target ("hydra", this checkout).
     state = HydraState(
         root_goal="implement the feature",
         selected_squads=["engineering"],
+        target_repo_id="hydra",
         tasks=[TaskState(
             task_id=task_id,
             owner_squad="engineering",
@@ -249,10 +274,14 @@ def test_ra12b_start_run_carries_workflow_id():
     sup = _build_sup(disp)
     assert isinstance(sup, _PurePythonRunner)
 
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is workflow_id threading, so give it a real
+    # target ("hydra", this checkout).
     state = HydraState(
         workflow_id=wf_id,
         root_goal="implement the feature",
         selected_squads=["engineering"],
+        target_repo_id="hydra",
     )
     sup.invoke(state)
 
@@ -284,12 +313,16 @@ def test_ra12b_start_run_carries_envelope_enrichment():
     state = HydraState(workflow_id=wf_id, root_goal="implement the feature")
     disp = _StubDispatcher()
 
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is envelope-enrichment threading, so give it a
+    # real target ("hydra", this checkout).
     inbound = CSuiteDecisionPacket(
         workflow_id=wf_id,
         origin_squad="hydra",
         target_squad="engineering",
         origin="BOARDROOM",
         objective="implement the feature",
+        target_repo_id="hydra",
     )
 
     _via_mcp(state, pack, inbound, disp)

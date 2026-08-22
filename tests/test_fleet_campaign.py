@@ -379,6 +379,41 @@ class TestNodeIntakeFleet:
         tasks = result.get("tasks", [])
         assert len(tasks) == 0, f"unexpected tasks for single-repo: {tasks}"
 
+    def test_single_repo_sets_visible_last_event(self):
+        """WS1 retry finding 2: a single distinct --repos id still degrades to
+        single-repo mode (correct, pinned by test_single_repo_sets_target_repo_id_not_fleet
+        and test_fleet.py::test_fleet_not_used_with_single_distinct_repo), but the
+        degrade must no longer be silent — state.last_event must name the repo id
+        so an operator checking /hydra:status sees it happened.
+        """
+        result, state = _node_intake_result(f"Goal --repos {_R1}")
+        # Degrade behaviour unchanged: single-repo mode, not fleet.
+        assert not result.get("fleet_parallel"), f"fleet_parallel should be False, got: {result}"
+        repo_set = result.get("target_repo_id") or state.target_repo_id
+        assert repo_set == _R1, f"expected {_R1}, got {repo_set}"
+        assert len(result.get("tasks", [])) == 0
+        # Visibility: last_event must carry the degrade message naming the repo id.
+        assert state.last_event is not None, "last_event was not set on single-repo degrade"
+        assert "single distinct repo" in state.last_event, (
+            f"expected degrade message in last_event, got: {state.last_event!r}"
+        )
+        assert _R1 in state.last_event, (
+            f"expected repo id {_R1!r} named in last_event, got: {state.last_event!r}"
+        )
+
+    def test_dup_repos_dedupe_to_single_sets_visible_last_event(self):
+        """The more surprising variant: two --repos tokens that dedupe to one
+        distinct id must ALSO degrade visibly, not just a literally-single token.
+        """
+        result, state = _node_intake_result(f"Goal --repos {_R1},{_R1}")
+        assert not result.get("fleet_parallel"), f"fleet_parallel should be False, got: {result}"
+        repo_set = result.get("target_repo_id") or state.target_repo_id
+        assert repo_set == _R1, f"expected {_R1}, got {repo_set}"
+        assert len(result.get("tasks", [])) == 0
+        assert state.last_event is not None, "last_event was not set on dedup single-repo degrade"
+        assert "single distinct repo" in state.last_event
+        assert _R1 in state.last_event
+
     def test_single_repo_subdir_sets_target_repo_subpath(self):
         result, state = _node_intake_result(f"Goal --repos {_R1} --subdir test-5")
         assert (result.get("target_repo_subpath") or state.target_repo_subpath) == "test-5"

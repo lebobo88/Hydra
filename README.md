@@ -376,7 +376,7 @@ For the public per-crown surface, see [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CRO
 
 ## Install
 
-Hydra ships as a Claude Code plugin distributed via a local marketplace that lives in the repo itself (`.claude-plugin/marketplace.json`). Installation is two steps: install the Python runtime, then register the plugin with Claude Code so its slash commands, agents, skills, and MCP servers are available in any project session.
+Hydra ships as a Claude Code plugin distributed via a local marketplace that lives in the repo itself (`.claude-plugin/marketplace.json`). Installation is two steps: install the Python runtime, then register the plugin with Claude Code so its slash commands, agents, skills, and hooks are available in any project session. The MCP gateway remains a separate machine-local registration, as documented in [MCP setup](docs/MCP_SETUP.md).
 
 ### 1. Clone and install the Python runtime
 
@@ -406,6 +406,17 @@ Inside any Claude Code session, from the repo directory:
 
 This registers the local marketplace, copies the plugin into `~/.claude/plugins/cache/hydra-local/hydra/<version>/`, and enables it in `~/.claude/settings.json`. Slash commands are now available in every Claude Code session, not just sessions opened from the Hydra repo.
 
+### Activation contexts
+
+Use the installed Hydra plugin in **consumer projects**. When working inside the
+Hydra repository itself, use its checked-in project configuration (`CLAUDE.md`,
+`.claude/rules/`, and `.claude/settings.json`) as the native host surface;
+avoid also enabling the installed Hydra plugin in that same source-repository
+session. Both contexts intentionally carry the same fail-closed routing guards,
+so loading both would duplicate lifecycle notifications without adding
+authority. This does not affect AgentSmith, TheEights, or any squad pack: they
+remain connected through Hydra's declared gateway and typed-envelope contract.
+
 Verify:
 
 ```
@@ -424,7 +435,9 @@ After bumping the `version` field in `.claude-plugin/plugin.json`:
 /reload-plugins
 ```
 
-For active development with live edits, launch Claude Code with `--plugin-dir`:
+For active plugin development with live edits, launch Claude Code with
+`--plugin-dir` from a consumer test project (rather than the Hydra source
+repository, whose project hooks are already active):
 
 ```bash
 claude --plugin-dir .
@@ -516,7 +529,7 @@ Hydra/
 ├── scripts/install.ps1               ← Python runtime installer
 ├── scripts/hydra.ps1                 ← convenience wrapper around `python -m hydra_core.cli`
 ├── .claude-plugin/                   ← Claude Code plugin manifest + hooks
-│   ├── plugin.json                   ← version, MCP server registrations
+│   ├── plugin.json                   ← metadata + Claude Code component paths
 │   ├── marketplace.json              ← local marketplace metadata
 │   └── hooks.json                    ← SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop
 ├── templates/                        ← squad / agent / hook templates

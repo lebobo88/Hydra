@@ -16,11 +16,13 @@ All git operations are local-only (git init / git rev-parse).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+import hydra_core.repo_registry as repo_registry_module
 from hydra_core.repo_registry import (
     is_known_repo,
     resolve_repo_path,
@@ -117,6 +119,37 @@ def test_extra_repo_via_home_repos_json(
     assert resolve_repo_path("filereg") == repo.resolve()
 
 
+def test_repos_json_path_resolves_per_call_not_at_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: ``_repos_json_path()`` (and ``_repos_lock_path()``)
+    must re-resolve ``Path.home()`` on every call, not freeze it at module
+    import time. A prior refactor hoisted these into module-level constants
+    evaluated once at import, which meant HOME/USERPROFILE changes made after
+    import (e.g. a test's monkeypatch, or any long-lived process whose
+    environment changes) were silently ignored -- the file the operator edits
+    would not necessarily be the file Hydra reads. This asserts the opposite:
+    changing HOME after import must be reflected immediately."""
+    first_home = Path("/tmp/first-home") if os.name != "nt" else Path("C:/first-home")
+    second_home = Path("/tmp/second-home") if os.name != "nt" else Path("C:/second-home")
+
+    monkeypatch.setenv("HOME", str(first_home))
+    monkeypatch.setenv("USERPROFILE", str(first_home))
+    first_resolved = repo_registry_module._repos_json_path()
+    assert first_resolved == first_home / ".hydra" / "repos.json"
+
+    monkeypatch.setenv("HOME", str(second_home))
+    monkeypatch.setenv("USERPROFILE", str(second_home))
+    second_resolved = repo_registry_module._repos_json_path()
+    assert second_resolved == second_home / ".hydra" / "repos.json"
+    assert second_resolved != first_resolved
+
+    # Same guard for the lock-file resolver.
+    assert repo_registry_module._repos_lock_path() == (
+        second_home / ".hydra" / "repos.json.lock"
+    )
+
+
 def test_malformed_extra_config_is_failsoft(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -155,6 +188,55 @@ def test_extra_repo_subpath_resolves(
     monkeypatch.setenv("HYDRA_EXTRA_REPOS", json.dumps({"withsub": str(repo)}))
     got = resolve_repo_project_path("withsub", "pkg")
     assert got == (repo / "pkg").resolve()
+
+
+def test_builtin_nested_relative_dirname_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hardcoded ``_REPO_DIRNAMES`` value MAY contain '/' to reach a repo
+    nested under the shared base (e.g. the real 'hydra-galaga' entry, which
+    maps to 'galaga-game-deepseek/hydra-galaga'). This exercises that shape
+    against a synthetic base/tree so the test does not depend on the real
+    checkout existing on the runner."""
+    base = tmp_path / "base"
+    base.mkdir()
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(base))
+
+    nested = base / "parent-dir" / "child-repo"
+    _git_init(nested)
+    monkeypatch.setitem(
+        repo_registry_module._REPO_DIRNAMES,
+        "nested-builtin",
+        "parent-dir/child-repo",
+    )
+
+    assert is_known_repo("nested-builtin") is True
+    assert resolve_repo_path("nested-builtin") == nested.resolve()
+
+
+def test_hydra_galaga_registry_entry_present() -> None:
+    """The 'hydra-galaga' repo_id is registered with its expected nested
+    directory value (galaga-game-deepseek/hydra-galaga under the shared base)."""
+    assert repo_registry_module._REPO_DIRNAMES.get("hydra-galaga") == (
+        "galaga-game-deepseek/hydra-galaga"
+    )
+    assert is_known_repo("hydra-galaga") is True
+
+
+def test_repo_dirnames_validation_passes_on_current_registry() -> None:
+    """Every current _REPO_DIRNAMES value is a safe relative, downward-only
+    path -- this is exactly what runs at import time, so it must not raise."""
+    repo_registry_module._validate_repo_dirnames(repo_registry_module._REPO_DIRNAMES)
+
+
+def test_repo_dirnames_validation_rejects_absolute_value() -> None:
+    with pytest.raises(RuntimeError, match="invalid _REPO_DIRNAMES entry"):
+        repo_registry_module._validate_repo_dirnames({"bad": "C:/somewhere/else"})
+
+
+def test_repo_dirnames_validation_rejects_parent_traversal() -> None:
+    with pytest.raises(RuntimeError, match="invalid _REPO_DIRNAMES entry"):
+        repo_registry_module._validate_repo_dirnames({"bad": "../escape"})
 
 
 def test_extra_repo_subpath_escape_rejected(

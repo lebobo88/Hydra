@@ -20,9 +20,9 @@ from typing import Any, Callable
 
 # --------- filesystem helpers (path-trust enforced) ---------
 
-def resolve_root(env_var: str, default: str) -> Path:
-    root = Path(os.environ.get(env_var, default)).resolve()
-    return root
+def resolve_root(env_var: str, default: str, fallback_env: str | None = None) -> Path:
+    val = os.environ.get(env_var) or (os.environ.get(fallback_env) if fallback_env else None)
+    return Path(val).resolve() if val else Path(default).resolve()
 
 
 def _safe_join(root: Path, relative: str) -> Path:

@@ -5,9 +5,10 @@ description: >
   Eight Garland Heads crew (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio,
   Urania, Helios) plus seven Helios sub-agents (video-synth, audio-foley, music-score,
   dialogue-mix, blender-model, blender-rig, governance-c2pa). Canonical source-of-truth
-  lives at the RLM-Creative repo; this file is the Hydra-side copy kept in sync with it.
+  lives at the RLM-Creative repo; this runtime overlay keeps crew-contract fields in sync
+  while retaining Hydra-specific source_pack, entrypoint, and best_of_n settings.
 source_pack: https://github.com/lebobo88/RLM-Creative
-entrypoint: claude-skill
+entrypoint: claude-native
 best_of_n: 3   # produce 3 candidate creative drafts, judge each, Borda-rank
 industries:
   - media
@@ -24,56 +25,56 @@ agents:
     role: "Brand Strategist — Crew Lead"
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/calliope.md
+    agent_file: plugins/rlm-creative/agents/calliope.md
 
   - slug: copywriter
     mythic: Erato
     role: "Copywriter"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/erato.md
+    agent_file: plugins/rlm-creative/agents/erato.md
 
   - slug: content-strategist
     mythic: Polyhymnia
     role: "Content Strategist"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/polyhymnia.md
+    agent_file: plugins/rlm-creative/agents/polyhymnia.md
 
   - slug: social-community
     mythic: Terpsichore
     role: "Social & Community"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/terpsichore.md
+    agent_file: plugins/rlm-creative/agents/terpsichore.md
 
   - slug: paid-acquisition
     mythic: Euterpe
     role: "Paid Acquisition"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/euterpe.md
+    agent_file: plugins/rlm-creative/agents/euterpe.md
 
   - slug: pr-earned
     mythic: Clio
     role: "PR & Earned Media"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/clio.md
+    agent_file: plugins/rlm-creative/agents/clio.md
 
   - slug: seo-discovery
     mythic: Urania
     role: "SEO & Discovery"
     authority: execute
     model_tier: sonnet
-    agent_file: .claude/agents/urania.md
+    agent_file: plugins/rlm-creative/agents/urania.md
 
   - slug: photo-cinema
     mythic: Helios
     role: "Photo & Cinema — Sub-Crew Lead"
     authority: gatekeeper
     model_tier: opus
-    agent_file: .claude/agents/helios.md
+    agent_file: plugins/rlm-creative/agents/helios.md
 
   # Helios sub-agents
   - slug: video-synth
@@ -81,28 +82,28 @@ agents:
     role: "Video Synthesis"
     authority: execute
     model_tier: haiku
-    agent_file: .claude/agents/helios-crew/video-synth.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/video-synth.md
 
   - slug: audio-foley
     parent: photo-cinema
     role: "Audio Foley & SFX"
     authority: execute
     model_tier: haiku
-    agent_file: .claude/agents/helios-crew/audio-foley.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/audio-foley.md
 
   - slug: music-score
     parent: photo-cinema
     role: "Music Score"
     authority: execute
     model_tier: haiku
-    agent_file: .claude/agents/helios-crew/music-score.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/music-score.md
 
   - slug: dialogue-mix
     parent: photo-cinema
     role: "Dialogue Mix"
     authority: execute
     model_tier: haiku
-    agent_file: .claude/agents/helios-crew/dialogue-mix.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/dialogue-mix.md
 
   - slug: blender-model
     parent: photo-cinema
@@ -110,7 +111,7 @@ agents:
     authority: execute
     model_tier: sonnet
     notes: "Executes mesh ASSET_JOBs (model_type=mesh) on the existing blender-mcp to The Sculptor's dcc_contract; self-checks mesh-topology-budget; signs via governance-c2pa."
-    agent_file: .claude/agents/helios-crew/blender-model.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/blender-model.md
 
   - slug: blender-rig
     parent: photo-cinema
@@ -118,7 +119,7 @@ agents:
     authority: execute
     model_tier: sonnet
     notes: "Executes rig ASSET_JOBs (model_type=rig) on the existing blender-mcp to The Choreographer's rig contract; self-checks rig-quality; signs via governance-c2pa."
-    agent_file: .claude/agents/helios-crew/blender-rig.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/blender-rig.md
 
   - slug: governance-c2pa
     parent: photo-cinema
@@ -127,7 +128,7 @@ agents:
     model_tier: opus
     hitl_trigger: true
     notes: "HITL required on IP-clearance failure, brand-safety failure, or any asset pending C2PA signing."
-    agent_file: .claude/agents/helios-crew/governance-c2pa.md
+    agent_file: plugins/rlm-creative/agents/helios-crew/governance-c2pa.md
 
 tools:
   - name: comfyui
@@ -207,9 +208,9 @@ gates:
     when: always
 
 invoke:
-  command_hint: "/creative-campaign"
+  command_hint: "/rlm-creative:creative-campaign"
   fallback_commands:
-    - /photo-direction
-    - /brand-refresh
-    - /rlm-team
+    - /rlm-creative:photo-direction
+    - /rlm-creative:brand-refresh
+    - /rlm-creative:creative-campaign
   output_dir: "RLM/output/{phase}/{topic}-{date}.md"

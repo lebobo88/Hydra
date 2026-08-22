@@ -26,14 +26,31 @@ from hydra_core.squad_loader import SquadPack
 from hydra_core.squad_node import _via_mcp
 from hydra_core.state import HydraState
 
+# Captured at import time -- BEFORE the autouse ``_no_git_harvest`` fixture
+# stubs the module attributes to no-ops. The regression guard below restores
+# these so it exercises the REAL scaffolding against the (already-scaffolded)
+# live repo, instead of passing trivially against the stub.
+from hydra_core.squad_node import (
+    ensure_target_repo_ignores as _real_ensure_target_repo_ignores,
+    ensure_target_repo_test_excludes as _real_ensure_target_repo_test_excludes,
+)
+
 
 @pytest.fixture(autouse=True)
 def _no_git_harvest(monkeypatch):
     """Some tests dispatch _via_mcp against the LIVE Hydra repo; never let the
     harvest step touch real git there (it is exercised hermetically in
-    tests/test_drive_loop_harvest_smoke.py)."""
+    tests/test_drive_loop_harvest_smoke.py). Likewise never let the target-repo
+    scaffolding helpers (.gitignore / test-runner exclude patching, added
+    alongside this file's target_repo_id plumbing) write into the real
+    checkout -- they are exercised hermetically against tmp_path in
+    tests/test_target_repo_scaffolding.py."""
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores",
+                        lambda _project_path: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_test_excludes",
+                        lambda _project_path: None)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +430,115 @@ def test_via_mcp_with_target_repo_id_uses_registry_path() -> None:
     )
 
 
+def test_via_mcp_scaffolding_is_noop_on_already_scaffolded_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: when the target repo's ``.gitignore`` and
+    ``pyproject.toml`` are ALREADY scaffolded with the ``.harness``/``.hydra``
+    entries, dispatching _via_mcp with target_repo_id='hydra' must leave both
+    files byte-identical.
+
+    Unlike the sibling tests, this one *un-stubs* the scaffolding helpers (the
+    ``_no_git_harvest`` autouse fixture stubbed them to no-ops) and runs the
+    REAL implementations, so the byte-for-byte assertion is meaningful: it
+    proves the real functions are a genuine no-op on an already-configured
+    repo, rather than passing trivially because the helpers were stubbed out.
+
+    Hermetic by construction: 'hydra' is resolved via ``HYDRA_REPO_BASE``
+    (monkeypatched below) to a throwaway ``tmp_path / "Hydra"`` fixture repo
+    that this test seeds itself with already-scaffolded content -- never the
+    live checkout. This avoids depending on (and mutating) whatever state the
+    real repo happens to be in; see git history for the prior, non-hermetic
+    version of this test that wrote into the live tree. A regression that
+    makes either helper rewrite an already-scaffolded config is caught here.
+
+    The guarantee is unconditional, not merely true on this operator's current
+    config: ``resolve_repo_path`` consults the operator extras registry
+    (``~/.hydra/repos.json`` / ``HYDRA_EXTRA_REPOS``) *before* the
+    ``HYDRA_REPO_BASE`` path, so an extras entry for 'hydra' would silently
+    bypass the monkeypatch below and route to the live checkout. This test
+    forces the extras registry empty and clears ``HYDRA_EXTRA_REPOS`` so the
+    ``HYDRA_REPO_BASE`` fixture path is the only path 'hydra' can resolve
+    through, regardless of what the running operator has configured."""
+    # Restore the real implementations for this test only (the autouse fixture
+    # ran first and stubbed the module attributes to no-ops).
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_ignores",
+        _real_ensure_target_repo_ignores,
+    )
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes",
+        _real_ensure_target_repo_test_excludes,
+    )
+
+    # Force the extras-registry path closed so 'hydra' cannot resolve through
+    # an operator's ~/.hydra/repos.json / HYDRA_EXTRA_REPOS entry (see
+    # docstring above) -- only HYDRA_REPO_BASE below may satisfy 'hydra'.
+    monkeypatch.setattr("hydra_core.repo_registry._load_extra_repos", lambda: {})
+    monkeypatch.delenv("HYDRA_EXTRA_REPOS", raising=False)
+
+    repo_root = tmp_path / "Hydra"
+    repo_root.mkdir()
+    _git_init(repo_root)
+    monkeypatch.setenv("HYDRA_REPO_BASE", str(tmp_path))
+
+    ignores_calls: list[tuple[Any, ...]] = []
+    excludes_calls: list[tuple[Any, ...]] = []
+
+    def _spy_ignores(*args: Any, **kwargs: Any) -> Any:
+        ignores_calls.append(args)
+        return _real_ensure_target_repo_ignores(*args, **kwargs)
+
+    def _spy_excludes(*args: Any, **kwargs: Any) -> Any:
+        excludes_calls.append(args)
+        return _real_ensure_target_repo_test_excludes(*args, **kwargs)
+
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores", _spy_ignores)
+    monkeypatch.setattr(
+        "hydra_core.squad_node.ensure_target_repo_test_excludes", _spy_excludes
+    )
+
+    # Seed already-scaffolded fixture content: both files already carry the
+    # .harness / .hydra entries the helpers would otherwise add.
+    gitignore = repo_root / ".gitignore"
+    gitignore.write_text("node_modules/\n.harness/\n.hydra/\n", encoding="utf-8")
+    pyproject = repo_root / "pyproject.toml"
+    pyproject.write_text(
+        "[tool.pytest.ini_options]\n"
+        'testpaths = ["tests"]\n'
+        'norecursedirs = ["node_modules", ".harness", ".hydra"]\n',
+        encoding="utf-8",
+    )
+
+    gitignore_before = gitignore.read_bytes()
+    pyproject_before = pyproject.read_bytes()
+
+    state = HydraState(root_goal="Fix something")
+    pack = _make_engineering_pack()
+    inbound = CSuiteDecisionPacket(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        origin="BOARDROOM",
+        objective="Fix something",
+        target_repo_id="hydra",
+    )
+    dispatcher, _captured = _make_stub_dispatcher()
+
+    _via_mcp(state, pack, inbound, dispatcher)
+
+    assert gitignore.read_bytes() == gitignore_before, (
+        "dispatch against an already-scaffolded repo must never rewrite its .gitignore"
+    )
+    assert pyproject.read_bytes() == pyproject_before, (
+        "dispatch against an already-scaffolded repo must never rewrite its pyproject.toml"
+    )
+    # Prove the no-op is because the real helpers ran and found nothing to
+    # change -- not because a regression stopped calling them on this path.
+    assert ignores_calls, "ensure_target_repo_ignores was never invoked"
+    assert excludes_calls, "ensure_target_repo_test_excludes was never invoked"
+
+
 def test_via_mcp_with_target_repo_subpath_uses_bounded_project_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -442,9 +568,21 @@ def test_via_mcp_with_target_repo_subpath_uses_bounded_project_path(
     assert Path(expected_path).is_dir(), "engineering target subdir should be created on demand"
 
 
-def test_via_mcp_without_target_repo_id_falls_back_to_cwd() -> None:
-    """Engineering squad without target_repo_id -> project_path is cwd (default fallback)."""
-    import os
+def test_via_mcp_without_target_repo_id_surfaces_instead_of_falling_back_to_cwd() -> None:
+    """Engineering squad without target_repo_id -> failed, never a silent cwd fallback.
+
+    WS1-E deliberately removed the cwd fallback this test used to assert (see
+    git history for the prior `..._falls_back_to_cwd` version). That fallback
+    was the ROOT CAUSE this item closes: `hydra.workflow.plan`/`launch`
+    without an explicit --repo/--repos silently dispatched engineering into
+    whatever the Hydra host process's cwd happened to be, with no error and
+    no HITL — the operator only discovered the misdirection later, as a diff
+    landed in the wrong tree. Engineering dispatch now requires an explicit,
+    resolved target; an absent one is an operator error that must surface
+    immediately (here: `_via_mcp` returns status="failed" with an actionable
+    remediation) rather than being silently "resolved" to cwd. dispatcher is
+    never called — no pp run starts against an unintended tree.
+    """
     state = HydraState(root_goal="Fix something else")
     pack = _make_engineering_pack()  # invoke has no project_path key
     inbound = CSuiteDecisionPacket(
@@ -459,10 +597,16 @@ def test_via_mcp_without_target_repo_id_falls_back_to_cwd() -> None:
 
     result = _via_mcp(state, pack, inbound, dispatcher)
 
-    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
-    assert len(captured) == 1
-    # The fallback resolves to cwd at call time.
-    assert captured[0]["project_path"] == str(Path.cwd())
+    assert result.status == "failed", (
+        "engineering dispatch with no resolved target must fail closed, not "
+        f"silently fall back to cwd; got status={result.status!r}"
+    )
+    assert "target" in result.rationale.lower()
+    assert "hydra repo register" in result.rationale, (
+        "failure must name the actionable remediation (WS1-D unknown_repo_hitl_fields "
+        "shape), not just say 'no target'"
+    )
+    assert not captured, "no pp run should ever be started without a resolved target"
 
 
 def test_via_mcp_non_engineering_squad_ignores_target_repo_id() -> None:
@@ -685,6 +829,272 @@ def test_node_postcheck_preserves_surfaced_phase() -> None:
             f"Expected phase='surfaced' to be preserved, got {final_phase!r}. "
             "node_postcheck must not overwrite a pre-surfaced phase with 'done'."
         )
+
+
+# ---------------------------------------------------------------------------
+# WS1-B / WS1-D: pre-seeded target_repo_id(s) validated AT INTAKE, and the
+# unknown-repo HITL payload carries actionable remediation fields.
+# ---------------------------------------------------------------------------
+
+
+def _intake_fn():
+    """The bare node_intake callable off a pure-python supervisor runner —
+    mirrors the pattern used by test_node_postcheck_preserves_surfaced_phase."""
+    from hydra_core.squad_node import Dispatcher
+    from hydra_core.supervisor import build_supervisor
+
+    stub_dispatcher = MagicMock(spec=Dispatcher)
+    stub_dispatcher._tool_tracker = None
+    runner = build_supervisor(
+        project_root=Path("C:/AiAppDeployments/Hydra"),
+        dispatcher=stub_dispatcher,
+        force_pure_python=True,
+    )
+    fn = dict(runner.steps).get("intake")
+    assert fn is not None, "intake step not found in runner"
+    return fn
+
+
+def test_bad_repo_goal_text_hitl_has_remediation_fields() -> None:
+    """--repo 'nope' at goal-text tail must surface an HITL that carries the
+    exact `hydra repo register` command, the full known-id list, and (empty,
+    for a wildly wrong id) suggestions -- not just a bare summary string."""
+    intake = _intake_fn()
+    state = HydraState(root_goal="Fix something --repo totally-bogus-repo-id")
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    hitl = patch["pending_hitl"]
+    assert hitl["remediation"].startswith("hydra repo register totally-bogus-repo-id ")
+    assert "hydra" in hitl["known_ids"]
+    assert "suggested_ids" in hitl
+
+
+def test_bad_repo_goal_text_hitl_suggests_near_miss() -> None:
+    """A near-miss typo ('hydraa') should surface a difflib suggestion."""
+    intake = _intake_fn()
+    state = HydraState(root_goal="Fix something --repo hydraa")
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    assert "hydra" in patch["pending_hitl"]["suggested_ids"]
+
+
+def test_preseeded_unknown_target_repo_id_surfaces_hitl_not_exception() -> None:
+    """WS1-B: a target_repo_id set directly on HydraState (the structured API
+    path -- e.g. from CLI --repo or hydra.workflow.plan repo=) BYPASSES
+    parse_repo_arg entirely (no --repo token in the goal text). Without
+    intake-side validation this would sail through and raise deep inside
+    _resolve_task_project_path; it must instead surface this same HITL shape."""
+    intake = _intake_fn()
+    state = HydraState(root_goal="Fix something", target_repo_id="not-a-real-repo")
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    hitl = patch["pending_hitl"]
+    assert "not-a-real-repo" in hitl["summary"]
+    assert hitl["remediation"].startswith("hydra repo register not-a-real-repo ")
+    assert "hydra" in hitl["known_ids"]
+
+
+def test_preseeded_valid_target_repo_id_passes_intake_unchanged() -> None:
+    """The happy path: a pre-seeded, VALID target_repo_id must sail through
+    intake with no HITL and the id preserved (regression guard for the
+    validation block added alongside the above)."""
+    intake = _intake_fn()
+    state = HydraState(root_goal="Fix something", target_repo_id="hydra")
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.target_repo_id == "hydra"
+
+
+def test_preseeded_target_repo_ids_merge_into_fleet_when_goal_has_none() -> None:
+    """WS1-B: state.target_repo_ids (the structured multi-repo path, e.g. CLI
+    --repos) must be merged into the fleet-wiring path exactly like a goal-text
+    --repos/--fleet token would be, when the goal text itself has none."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something across repos",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.fleet_parallel is True
+    assert state.selected_squads == ["engineering"]
+    # Fleet tasks are seeded onto the returned patch (LangGraph append reducer
+    # applies them to state.tasks); node_intake itself does not mutate
+    # state.tasks in place.
+    task_repo_ids = {t.target_repo_id for t in patch["tasks"]}
+    assert task_repo_ids == {"hydra", "pair-programmer"}
+
+
+def test_preseeded_target_repo_ids_with_unknown_id_surfaces_hitl() -> None:
+    """A pre-seeded target_repo_ids list containing an unknown id must surface
+    the same unknown-repo HITL, not raise later."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something across repos",
+        target_repo_ids=["hydra", "definitely-not-registered"],
+    )
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    assert "definitely-not-registered" in patch["pending_hitl"]["summary"]
+
+
+def test_intake_patch_persists_target_repo_ids_for_checkpoint() -> None:
+    """Finding A (WS1 retry-2): node_intake's returned `update` dict must
+    include target_repo_ids alongside target_repo_id/target_repo_subpath,
+    or LangGraph never persists it to the checkpoint (a node's return dict
+    is the ONLY thing LangGraph writes -- mutating state in place is not
+    enough). Without this key in the patch, _cmd_replay's
+    `values.get("target_repo_ids")` read is fed by a producer that never
+    wrote the field, so replaying a fleet-targeted run silently drops back
+    to single-repo/cwd-fallback behaviour.
+
+    This asserts against the REAL patch dict returned by the REAL node_intake
+    callable (via the pure-python build_supervisor runner), not a hand-built
+    stand-in -- it is the actual producer _cmd_replay's reader depends on.
+    """
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something across repos",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert patch.get("target_repo_ids") == ["hydra", "pair-programmer"], (
+        "node_intake's return dict must carry target_repo_ids so LangGraph "
+        f"persists it to the checkpoint; got {patch.get('target_repo_ids')!r}"
+    )
+
+
+def test_preseeded_target_repo_id_and_target_repo_ids_both_set_surfaces_hitl() -> None:
+    """WS1 retry-2 (finding B): node_intake's own ambiguity guard only
+    compared ids parsed OUT of goal text, so a caller that pre-seeds BOTH
+    state.target_repo_id and state.target_repo_ids directly (bypassing any
+    CLI/MCP-transport-level guard) would sail through and be silently
+    resolved by whichever branch ran later. This must surface the same
+    high_risk HITL the goal-text ambiguity case does."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something",
+        target_repo_id="hydra",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch["phase"] == "surfaced"
+    assert "ambiguous" in patch["pending_hitl"]["summary"]
+
+
+def test_single_distinct_preseeded_repos_does_not_persist_target_repo_ids() -> None:
+    """WS1 retry-2 (finding B follow-up): a single-distinct-id --repos run
+    (`hydra run --repos hydra`) pre-seeds target_repo_ids=["hydra"] then
+    degrades to single-repo mode, setting target_repo_id="hydra". The
+    finding-B pre-seed ambiguity guard trips when BOTH target_repo_id and
+    target_repo_ids are set. If node_intake persisted the (now vestigial)
+    single-element target_repo_ids alongside target_repo_id (finding A's
+    persist block), _cmd_replay would re-seed both and the guard would
+    FALSELY surface an "ambiguous" HITL on replay of a legitimate
+    single-repo run. The degrade branch must therefore clear
+    target_repo_ids: the patch must carry target_repo_id but NOT a truthy
+    target_repo_ids, and re-running intake on the persisted shape must not
+    surface."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something",
+        target_repo_ids=["hydra"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert patch.get("target_repo_id") == "hydra"
+    # Vestigial fleet list must NOT survive as a TRUTHY value. It may be
+    # persisted as an explicit empty list (to overwrite a pre-seeded channel
+    # value -- see the replay simulation below), but never as a non-empty list.
+    assert not patch.get("target_repo_ids"), (
+        "single-distinct --repos must not persist a truthy target_repo_ids; got "
+        f"{patch.get('target_repo_ids')!r}"
+    )
+
+    # Simulate replay faithfully. _cmd_replay reads snap.values -- the MERGED
+    # LangGraph checkpoint channel, NOT the raw intake patch delta. For a
+    # LastValue field (target_repo_ids has no reducer), a key is overwritten
+    # only when it is PRESENT in the patch; an absent key RETAINS the value
+    # pre-seeded onto the channel at graph start (here: ["hydra"] from the CLI
+    # --repos path). A degrade branch that clears state locally but omits the
+    # key from the patch would therefore leave ["hydra"] alive in the
+    # checkpoint -- and re-seeding both target_repo_id AND target_repo_ids on
+    # replay trips the finding-B ambiguity guard. Model that merge here.
+    checkpoint = {"target_repo_id": None, "target_repo_ids": ["hydra"]}
+    for _k in ("target_repo_id", "target_repo_ids"):
+        if _k in patch:
+            checkpoint[_k] = patch[_k]
+    replayed = HydraState(
+        root_goal="Fix something",
+        target_repo_id=checkpoint["target_repo_id"],
+        target_repo_ids=list(checkpoint["target_repo_ids"] or []),
+    )
+    replay_patch = intake(replayed)
+    assert replay_patch.get("phase") != "surfaced", (
+        "replay of a legitimate single-repo --repos run falsely surfaced an "
+        "ambiguous HITL: the degrade branch must persist an empty "
+        "target_repo_ids into the checkpoint (a LastValue channel keeps the "
+        "pre-seeded ['hydra'] otherwise)"
+    )
+
+
+def test_preseeded_target_repo_id_wins_over_conflicting_goal_repo_flag() -> None:
+    """WS1 retry (finding 3): a pre-seeded state.target_repo_id must win over
+    a conflicting --repo token in goal text, not just when goal text has
+    none. This is the single-repo half of the precedence rule that the fleet
+    half (below) must match."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something --repo pair-programmer",
+        target_repo_id="hydra",
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.target_repo_id == "hydra"
+    assert patch.get("target_repo_id") == "hydra"
+
+
+def test_preseeded_target_repo_ids_win_over_conflicting_goal_repos_flag() -> None:
+    """WS1 retry (finding 3): a pre-seeded state.target_repo_ids must win over
+    a conflicting --repos/--fleet token in goal text. Before this fix, goal
+    text won whenever present (the opposite of the single-repo rule above),
+    so a stale/pasted --repos token in the goal could silently override an
+    explicit structured --repos flag."""
+    intake = _intake_fn()
+    state = HydraState(
+        root_goal="Fix something --repos senate,xenia",
+        target_repo_ids=["hydra", "pair-programmer"],
+    )
+
+    patch = intake(state)
+
+    assert patch.get("phase") != "surfaced"
+    assert state.fleet_parallel is True
+    task_repo_ids = {t.target_repo_id for t in patch["tasks"]}
+    assert task_repo_ids == {"hydra", "pair-programmer"}, (
+        f"pre-seeded target_repo_ids must win; got {task_repo_ids}"
+    )
 
 
 def test_parse_repo_arg_short_typo_raises_valueerror() -> None:

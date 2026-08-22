@@ -7,11 +7,11 @@ this server does not run any LLM, render any legal opinion, or bypass any
 gate; counsel happens in the Claude Code session under the Twelve Tables.
 
 Tools:
-  senate.roster.list          — list .claude/agents/*.md (the 12 jurists)
+  senate.roster.list          — list plugin agents/*.md (the 12 jurists)
   senate.agent.get(slug)      — return one jurist's markdown + path
-  senate.skill.list           — list .claude/skills/*
+  senate.skill.list           — list plugin skills/*
   senate.skill.get(name)      — return SKILL.md content for the named skill
-  senate.command.list         — list .claude/commands/*.md
+  senate.command.list         — list plugin commands/*.md
   senate.command.get(name)    — return one command's markdown
   senate.output.write(domain, topic, content) — persist under output/{domain}/
   senate.output.read(path)    — read a file under output/
@@ -36,27 +36,27 @@ def _tool_handlers():
 
     def roster_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "agents": list_dir(root, ".claude/agents", suffix=".md")}
+                "agents": list_dir(root, "plugins/senate/agents", suffix=".md")}
 
     def agent_get(args: dict[str, Any]) -> dict[str, Any]:
         slug = args.get("slug", "")
-        return read_markdown(root, f".claude/agents/{slug}.md")
+        return read_markdown(root, f"plugins/senate/agents/{slug}.md")
 
     def skill_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "skills": list_dir(root, ".claude/skills", only_dirs=True)}
+                "skills": list_dir(root, "plugins/senate/skills", only_dirs=True)}
 
     def skill_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/skills/{name}/SKILL.md")
+        return read_markdown(root, f"plugins/senate/skills/{name}/SKILL.md")
 
     def command_list(args: dict[str, Any]) -> dict[str, Any]:
         return {"root": str(root),
-                "commands": list_dir(root, ".claude/commands", suffix=".md")}
+                "commands": list_dir(root, "plugins/senate/commands", suffix=".md")}
 
     def command_get(args: dict[str, Any]) -> dict[str, Any]:
         name = args.get("name", "")
-        return read_markdown(root, f".claude/commands/{name}.md")
+        return read_markdown(root, f"plugins/senate/commands/{name}.md")
 
     def output_write(args: dict[str, Any]) -> dict[str, Any]:
         domain = args.get("domain", "legal")

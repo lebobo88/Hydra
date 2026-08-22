@@ -69,6 +69,15 @@ def _eng_pack():
 def _run(monkeypatch, inbound) -> dict:
     monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
                         lambda **_k: None)
+    # The fixture pack's project_path is "${project_root}", which resolves to
+    # the real Hydra checkout -- stub the target-repo scaffolding helpers so
+    # they don't write .gitignore / test-runner exclude entries into it. They
+    # are exercised hermetically against tmp_path in
+    # tests/test_target_repo_scaffolding.py.
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_ignores",
+                        lambda _project_path: None)
+    monkeypatch.setattr("hydra_core.squad_node.ensure_target_repo_test_excludes",
+                        lambda _project_path: None)
     disp = _RecordingDispatcher()
     state = HydraState(root_goal="t")
     _via_mcp(state, _eng_pack(), inbound, disp)
@@ -122,7 +131,12 @@ def test_via_mcp_explicit_pp_team(monkeypatch) -> None:
     env = DevTask(workflow_id=HydraState().workflow_id, origin_squad="rlm-gaming",
                   owner="backend", repo="candc", branch="wf",
                   instructions="build the fog-of-war system",
-                  pp_team="game-netcode-team")
+                  pp_team="game-netcode-team",
+                  # WS1-E: engineering dispatch requires an explicit, resolved
+                  # target repo -- this test's `repo="candc"` already names
+                  # the intended target, so thread it through target_repo_id
+                  # too (the field _via_mcp actually resolves on).
+                  target_repo_id="candc")
     args = _run(monkeypatch, env)
     assert args["mode"] == "team"
     assert args["team"] == "game-netcode-team"
@@ -131,7 +145,8 @@ def test_via_mcp_explicit_pp_team(monkeypatch) -> None:
 def test_via_mcp_rlm_gaming_autodefaults_game_team(monkeypatch) -> None:
     env = DevTask(workflow_id=HydraState().workflow_id, origin_squad="rlm-gaming",
                   owner="backend", repo="candc", branch="wf",
-                  instructions="implement the tech tree")
+                  instructions="implement the tech tree",
+                  target_repo_id="candc")
     args = _run(monkeypatch, env)
     assert args["mode"] == "team"
     assert args["team"] == "game-feature-team"
@@ -142,9 +157,13 @@ def test_via_mcp_plain_engineering_unchanged(monkeypatch) -> None:
     # declares invoke.mode=pp_best_of (Claude producer writes files locally; codex
     # is the sandboxed cross-vendor critic in this env), so the dispatched mode is
     # best_of with n=3 and NO team key.
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo;
+    # this packet has no `repo` field, so point at "hydra" (this checkout) --
+    # the honest stand-in target for a mode-shape test.
     env = CSuiteDecisionPacket(workflow_id=HydraState().workflow_id,
                                origin_squad="hydra", origin="BOARDROOM",
-                               objective="add idempotency keys to the payments API")
+                               objective="add idempotency keys to the payments API",
+                               target_repo_id="hydra")
     args = _run(monkeypatch, env)
     assert args["mode"] == "best_of"
     assert args["n"] == 3

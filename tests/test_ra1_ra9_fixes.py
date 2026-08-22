@@ -28,7 +28,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
-HOOKS_DIR = HYDRA_ROOT / ".claude" / "hooks"
+HOOKS_DIR = HYDRA_ROOT / "plugins" / "hydra" / "hooks"
 
 _PWSH = shutil.which("pwsh") or shutil.which("powershell")
 
@@ -189,13 +189,23 @@ def test_direct_pp_bypasses_with_stage_active_file(tmp_path):
 
 
 # ===========================================================================
-# RA-1 — .harness/worktrees/attended-* directory marker also enables bypass
+# RA-1 hardening (2026-08) — a stale .harness/worktrees/attended-* directory
+# alone no longer satisfies the bypass. Historically ("Marker 1") the mere
+# existence of ANY attended-* worktree directory was treated as proof of an
+# active stage; stale worktrees accumulate across completed/aborted runs
+# (17 were observed live in one session), which made that check permanently
+# true and silently disabled write enforcement repo-wide. The bypass is now
+# tied exclusively to the .harness/stage-active sentinel, which
+# hydra_core.host_bridge writes at begin_stage and clears at
+# finalize/abort — a run-scoped signal a leftover directory can't fake.
 # ===========================================================================
 
 
 @pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
-def test_bash_writes_bypasses_with_attended_worktree_dir(tmp_path):
-    """hydra-block-bash-writes: bypasses when .harness/worktrees/attended-* dir exists."""
+def test_bash_writes_stale_worktree_dir_alone_does_not_bypass(tmp_path):
+    """hydra-block-bash-writes: a bare attended-* worktree dir (no stage-active
+    sentinel) must NOT bypass — this is the exact stale-directory bug being
+    hardened against."""
     worktrees = tmp_path / ".harness" / "worktrees"
     worktrees.mkdir(parents=True)
     (worktrees / "attended-run_XYZTEST").mkdir()
@@ -206,10 +216,198 @@ def test_bash_writes_bypasses_with_attended_worktree_dir(tmp_path):
         env_extras={"HYDRA_ENFORCE_ROUTING": "1", "HYDRA_PP_STAGE_ACTIVE": "1"},
         project_dir=tmp_path,
     )
-    assert result.returncode == 0, (
-        f"Expected exit 0 (bypass) when attended-* worktree dir exists; "
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) — a stale attended-* worktree dir alone "
+        f"must not satisfy the bypass; "
         f"rc={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
     )
+    assert "BLOCKED" in result.stderr or "block" in result.stderr.lower()
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_requires_genuinely_written_sentinel(tmp_path):
+    """hydra-block-bash-writes: the bypass requires an actual stage-active
+    sentinel FILE on disk — bare env var + an unrelated directory tree is not
+    enough, even when that tree looks plausible (nested .harness dirs, an
+    empty stage-active-like name that isn't the real leaf file)."""
+    # A directory (not a file) named 'stage-active' must not count as a leaf
+    # sentinel — Test-Path -PathType Leaf in the hook requires a real file.
+    (tmp_path / ".harness").mkdir()
+    (tmp_path / ".harness" / "stage-active").mkdir()
+
+    result = _run_hook(
+        "hydra-block-bash-writes.ps1",
+        {"tool_name": "Bash", "tool_input": {"command": "echo x > foo.py"}},
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1", "HYDRA_PP_STAGE_ACTIVE": "1"},
+        project_dir=tmp_path,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) — a stage-active DIRECTORY is not a "
+        f"genuinely written sentinel file; "
+        f"rc={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+    # Now write the real sentinel FILE (what host_bridge.begin_stage does) —
+    # bypass must engage.
+    (tmp_path / ".harness" / "stage-active").rmdir()
+    (tmp_path / ".harness" / "stage-active").write_text("1", encoding="utf-8")
+    result2 = _run_hook(
+        "hydra-block-bash-writes.ps1",
+        {"tool_name": "Bash", "tool_input": {"command": "echo x > foo.py"}},
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1", "HYDRA_PP_STAGE_ACTIVE": "1"},
+        project_dir=tmp_path,
+    )
+    assert result2.returncode == 0, (
+        f"Expected exit 0 (bypass) once the real sentinel file exists; "
+        f"rc={result2.returncode}\nstdout={result2.stdout}\nstderr={result2.stderr}"
+    )
+
+
+# ===========================================================================
+# Anchored allow-list (2026-08) — hydra-block-direct-write.ps1 /
+# hydra-block-bash-writes.ps1 must not treat an UNANCHORED substring match
+# ('\worktrees\', '\dist\', '\build\', '\.hydra\', ...) anywhere on disk as
+# proof of a legitimate pp-engineer output path. The allow fragment check now
+# only fires once the target resolves under the project root (or an explicit
+# HYDRA_WORKTREE_ROOT).
+# ===========================================================================
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_direct_write_rejects_out_of_root_path_containing_worktrees_fragment(tmp_path):
+    """A target path OUTSIDE the project root that merely contains
+    '\\worktrees\\' must still be BLOCKED — the old unanchored
+    $norm.Contains($frag) check let a write to ANY such path bypass
+    regardless of where it actually lived on disk."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    outside_dir = tmp_path / "elsewhere" / "worktrees" / "not-mine"
+    outside_dir.mkdir(parents=True)
+    outside_target = outside_dir / "evil.py"
+
+    result = _run_hook(
+        "hydra-block-direct-write.ps1",
+        {"tool_name": "Write", "tool_input": {"file_path": str(outside_target)}},
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1"},
+        project_dir=project_dir,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for an out-of-root path that merely "
+        f"contains '\\worktrees\\'; rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "BLOCKED" in result.stderr
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_direct_write_allows_in_root_worktree_path(tmp_path):
+    """A target genuinely under <projectRoot>\\.harness\\worktrees\\ is still
+    allowed — anchoring must not break the legitimate pp-engineer path."""
+    project_dir = tmp_path / "project"
+    wt_dir = project_dir / ".harness" / "worktrees" / "attended-run1"
+    wt_dir.mkdir(parents=True)
+    target = wt_dir / "feature.py"
+
+    result = _run_hook(
+        "hydra-block-direct-write.ps1",
+        {"tool_name": "Write", "tool_input": {"file_path": str(target)}},
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1"},
+        project_dir=project_dir,
+    )
+    assert result.returncode == 0, (
+        f"Expected exit 0 (allow) for a path under the project's own "
+        f".harness\\worktrees\\; rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_rejects_out_of_root_path_containing_worktrees_fragment(tmp_path):
+    """Twin of the direct-write anchoring test for the Bash write-idiom hook:
+    an out-of-root destination that merely contains '\\worktrees\\' must still
+    be blocked."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    outside_dir = tmp_path / "elsewhere" / "worktrees" / "not-mine"
+    outside_dir.mkdir(parents=True)
+    outside_target = outside_dir / "evil.py"
+
+    result = _run_hook(
+        "hydra-block-bash-writes.ps1",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": f'echo x > "{outside_target}"'},
+            "cwd": str(project_dir),
+        },
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1"},
+        project_dir=project_dir,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for an out-of-root redirection target that "
+        f"merely contains '\\worktrees\\'; rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "BLOCKED" in result.stderr
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_allows_in_root_worktree_path(tmp_path):
+    """A redirection target genuinely under <projectRoot>\\.harness\\worktrees\\
+    is still allowed."""
+    project_dir = tmp_path / "project"
+    wt_dir = project_dir / ".harness" / "worktrees" / "attended-run1"
+    wt_dir.mkdir(parents=True)
+    target = wt_dir / "feature.py"
+
+    result = _run_hook(
+        "hydra-block-bash-writes.ps1",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": f'echo x > "{target}"'},
+            "cwd": str(project_dir),
+        },
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1"},
+        project_dir=project_dir,
+    )
+    assert result.returncode == 0, (
+        f"Expected exit 0 (allow) for a redirection target under the "
+        f"project's own .harness\\worktrees\\; rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+@pytest.mark.skipif(_PWSH is None, reason="pwsh/powershell not on PATH")
+def test_bash_writes_relative_dest_without_cwd_still_blocks(tmp_path):
+    """Regression pin: an unresolvable/relative destination (no `cwd` reported
+    in the payload) must still reach the blocked-extension check and BLOCK —
+    it must never be treated as "anchored" via an ambient fallback.
+
+    This is the exact fail-open the anchoring rewrite introduced and then had
+    to be corrected for: Test-BlockedDest originally fell back to this hook
+    PROCESS's own (Get-Location).Path when the payload had no `cwd`. That
+    ambient cwd is incidental — concretely, when the hook (or its test suite)
+    happens to run from inside a real `.harness\\worktrees\\attended-*`
+    directory, a bare relative destination like 'foo.py' would resolve
+    against that ambient cwd, land "under" the worktree root, and be waved
+    through by the allow-fragment check even though nothing tied it to the
+    actual Bash tool call's real working directory. No `cwd` in the payload
+    now means the destination is UNANCHORED and falls straight through to the
+    plain extension block: fail closed, never fail open."""
+    # No "cwd" key in the payload at all — the exact shape of the pre-existing
+    # test_bash_writes_hook_blocks_redirect_to_py-style callers.
+    result = _run_hook(
+        "hydra-block-bash-writes.ps1",
+        {"tool_name": "Bash", "tool_input": {"command": "echo x > foo.py"}},
+        env_extras={"HYDRA_ENFORCE_ROUTING": "1"},
+        project_dir=tmp_path,
+    )
+    assert result.returncode == 2, (
+        f"Expected exit 2 (block) for a relative destination with no cwd "
+        f"reported — an unresolvable destination must fail CLOSED, not be "
+        f"waved through by the anchor gate; rc={result.returncode}\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "BLOCKED" in result.stderr
 
 
 # ===========================================================================
@@ -241,7 +439,19 @@ def test_bash_writes_emits_warning_when_bare_stage_active(tmp_path):
 
 
 def test_hooks_contain_stage_active_marker_check():
-    """All three enforcement hooks must reference both marker types."""
+    """All three enforcement hooks must gate the bypass on the run-scoped
+    .harness/stage-active sentinel — and must NOT resurrect the retired
+    "Marker 1" directory-enumeration bypass.
+
+    Historically the hooks also treated the mere existence of any
+    .harness/worktrees/attended-* directory as proof of an active stage
+    ("Marker 1"). Stale worktrees accumulate across completed/aborted runs and
+    made that check permanently true, silently disabling enforcement
+    repo-wide, so it was retired: the sentinel host_bridge writes at
+    begin_stage / clears at finalize/abort is now the sole source of truth.
+    This test pins that contract so a future edit can't quietly reintroduce
+    the directory-enumeration bypass.
+    """
     for name in (
         "hydra-block-direct-write.ps1",
         "hydra-block-bash-writes.ps1",
@@ -249,8 +459,17 @@ def test_hooks_contain_stage_active_marker_check():
     ):
         text = (HOOKS_DIR / name).read_text(encoding="utf-8")
         assert "stage-active" in text, f"{name}: missing stage-active marker check"
-        assert "attended-*" in text or "attended" in text, (
-            f"{name}: missing attended-* worktree marker check"
+        # The retired Marker-1 enumeration (Get-ChildItem ... -Filter
+        # 'attended-*') must be gone as a live bypass. A prose mention of
+        # "attended-*" in the retirement comment is fine; the active
+        # directory-filter idiom is not.
+        assert "Filter 'attended-*'" not in text, (
+            f"{name}: retired Marker-1 attended-* directory enumeration "
+            f"reintroduced — the bypass must be sentinel-only"
+        )
+        assert "retired" in text.lower(), (
+            f"{name}: missing documentation that the attended-* directory "
+            f"marker was retired in favor of the stage-active sentinel"
         )
         assert "bare HYDRA_PP_STAGE_ACTIVE" in text or "no active stage marker" in text, (
             f"{name}: missing warning message for bare HYDRA_PP_STAGE_ACTIVE"
@@ -261,10 +480,11 @@ def test_session_contract_warns_on_leaked_stage_active():
     """hydra-session-contract.ps1 must flag HYDRA_PP_STAGE_ACTIVE=1 at session start.
 
     The hook was updated from a WARNING to a NOTE that documents the S6
-    hardening: enforcement is NOT bypassed by the bare env var alone — a
-    filesystem stage marker (.harness/stage-active or attended-* worktree) is
-    also required.  This test verifies the note is present with the correct
-    marker-required semantics (not the old literal 'WARNING').
+    hardening: enforcement is NOT bypassed by the bare env var alone — the
+    run-scoped .harness/stage-active sentinel is also required (the old
+    attended-* worktree-directory marker was retired). This test verifies the
+    note is present with the correct marker-required semantics (not the old
+    literal 'WARNING').
     """
     text = (HOOKS_DIR / "hydra-session-contract.ps1").read_text(encoding="utf-8")
     assert "HYDRA_PP_STAGE_ACTIVE" in text, (

@@ -167,6 +167,23 @@ class HydraState(BaseModel):
     root_goal: str = ""
     target_repo_id: Optional[str] = None  # allow-listed repo_id for engineering dispatch targeting (None = workflow project_root)
     target_repo_subpath: Optional[str] = None  # optional repo-relative engineering subdir under target_repo_id
+    # Pre-seeded multi-repo targets for the structured API path (CLI --repos /
+    # hydra.workflow.plan repos=). Mirrors the goal-text --repos/--fleet token
+    # but arrives directly on state instead of being folded into root_goal.
+    # node_intake merges this into the fleet-wiring path and validates every
+    # id against the allow-list regardless of how it arrived (WS1-B).
+    target_repo_ids: list[str] = Field(default_factory=list)
+    # WS1-E: where target_repo_id/target_repo_ids resolved FROM, for the
+    # plan/step "resolved_target" ergonomic (operator-visible provenance) and
+    # for the "checkpoint inheritance" case (a value already set on a resumed
+    # checkpoint is never overwritten -- see node_intake's `if not
+    # state.target_repo_source` guards). One of: "explicit_param" (structured
+    # --repo/--repos CLI flag or hydra.workflow.plan/launch repo=/repos=
+    # param, pre-seeded onto state before node_intake runs), "goal_text_flag"
+    # (an explicit --repo/--repos token found in goal-text prose),
+    # "goal_text_inferred" (MU5 conservative cue-based inference), or None
+    # when no target has resolved.
+    target_repo_source: Optional[str] = None
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",

@@ -225,7 +225,7 @@ def test_mu12_non_complete_finalize_preserves_work(tmp_path, monkeypatch):
 
     # Submit judge pass — smoke will fail → stage surfaces.
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.005})
     assert res["status"] == "surfaced", (
@@ -281,7 +281,7 @@ def test_mu12_complete_path_merge_unchanged(tmp_path, monkeypatch):
     assert res["state"] == "await_judge"
 
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12b-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "lgtm",
                 "judge_producer": "codex", "cost_usd": 0.005})
 
@@ -352,7 +352,7 @@ def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
     assert res["state"] == "await_judge"
 
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu12c-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "lgtm",
                 "judge_producer": "codex", "cost_usd": 0.005})
 
@@ -480,6 +480,8 @@ def test_mu15_completed_workflow_resumes_to_non_surfaced(tmp_path, monkeypatch, 
     # 1. Build the plan: intake → planner → halt before dispatch.
     initial = HydraState(workflow_id=wf, root_goal="MU15 e2e test: attended complete")
     initial.selected_squads = ["engineering"]
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    initial.target_repo_id = "hydra"
     sup_plan = build_supervisor(
         project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
     )
@@ -638,7 +640,7 @@ def test_mu6b_smoke_failure_writes_full_log(tmp_path, monkeypatch):
         stdout = stdout_content
         stderr = ""
 
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
 
     status, reason = squad_node._run_smoke(
@@ -679,7 +681,7 @@ def test_mu6b_smoke_pass_writes_no_log(tmp_path, monkeypatch):
         stdout = "5 passed\n"
         stderr = ""
 
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     monkeypatch.setattr(squad_node.subprocess, "run", lambda *_a, **_k: _Res())
 
     status, reason = squad_node._run_smoke(
@@ -1658,7 +1660,7 @@ def test_mu13_byproduct_excluded_from_preserved_branch(tmp_path, monkeypatch):
 
     # Submit judge pass — smoke fails → preserve fires.
     res = _hb.submit_host_result(
-        disp, cursor_file=cfile, call_key="judge-0",
+        disp, cursor_file=cfile, call_key="judge-run-mu13-stage-mu12-att-mu12-0",
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex", "cost_usd": 0.005})
     assert res["status"] == "surfaced", (
@@ -1697,6 +1699,8 @@ def test_mu15d_status_renders_done_attended(tmp_path, monkeypatch, capsys):
     # 1. Build the plan so a task is created in the checkpoint.
     initial = HydraState(workflow_id=wf, root_goal="MU15d status render test")
     initial.selected_squads = ["engineering"]
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    initial.target_repo_id = "hydra"
     sup = build_supervisor(
         project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
     )
@@ -1815,7 +1819,7 @@ def test_p1_smoke_timeout_env(tmp_path, monkeypatch):
         return _FakeRes()
 
     monkeypatch.setattr(squad_node.subprocess, "run", _fake_run)
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: ["pytest", "-q"])
+    monkeypatch.setattr(squad_node, "_detect_smoke_command_and_cwd", lambda _p: (["pytest", "-q"], _p))
     squad_node._run_smoke(None, project_path=str(tmp_path), stage_id="p1-timeout")
     assert captured, "P1(c): subprocess.run must be called"
     assert captured[0].get("timeout") == 123, (
@@ -1995,4 +1999,75 @@ def test_p3_fleet_mid_prose_unknown_token_no_intake_hitl(tmp_path, monkeypatch):
     # And it must NOT have surfaced the fleet bad-arg trace.
     assert "supervisor.bad_repos_arg" not in kinds, (
         f"P3(d): fleet prose token must not trip supervisor.bad_repos_arg; got {kinds}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# recover-stalled-stage MCP resume action — must be reachable over MCP, not
+# only via `hydra resume --action recover-stalled-stage` on the CLI, and the
+# two independent copies of the action enum (mcp_servers/hydra_control/server.py
+# and hydra_core/toolshed.py's SCHEMA_OVERRIDES) must stay in lock-step.
+# ---------------------------------------------------------------------------
+
+
+def test_recover_stalled_stage_accepted_by_workflow_resume_enum(monkeypatch):
+    """workflow_resume's action validation must accept 'recover-stalled-stage'
+    (not just approve/reject/modify-budget/force-dispatch/change-squads), and
+    forward it (with --option <run_id>) through the exact same
+    _launch_resume path every other resume action uses -- no parallel code
+    path, per governance (a stranded workflow resumes only via
+    approve/resume)."""
+    import mcp_servers.hydra_control.server as _srv
+
+    assert "recover-stalled-stage" in _srv._RESUME_ACTIONS, (
+        "recover-stalled-stage must be a valid workflow_resume action"
+    )
+
+    captured: dict = {}
+
+    def _fake_launch_resume(workflow_id, action, option):
+        captured["workflow_id"] = workflow_id
+        captured["action"] = action
+        captured["option"] = option
+        return {"ok": True, "launched": True, "pid": 1234,
+                "workflow_id": workflow_id, "action": action, "log": "x.log"}
+
+    monkeypatch.setattr(_srv, "_launch_resume", _fake_launch_resume)
+
+    handlers = _srv._tool_handlers()
+    resume = handlers["hydra.workflow.resume"]
+    res = resume({
+        "workflow_id": "wf-recover-1",
+        "action": "recover-stalled-stage",
+        "option": "run_stranded_abc123",
+    })
+
+    assert res["ok"] is True, res
+    assert res.get("error") is None
+    # Must have gone through _launch_resume (the sanctioned resume path),
+    # not a bespoke recovery tool/handler.
+    assert captured["workflow_id"] == "wf-recover-1"
+    assert captured["action"] == "recover-stalled-stage"
+    assert captured["option"] == "run_stranded_abc123"
+
+
+def test_recover_stalled_stage_schema_enum_matches_between_server_and_toolshed():
+    """The two independent copies of the resume-action enum (the live MCP
+    server's tool schema, and hydra_core.toolshed's SCHEMA_OVERRIDES used for
+    offline/gateway schema serving) must list the exact same actions -- a
+    drift here means one surface advertises a capability the other refuses,
+    which is exactly the parity bug class this test guards against."""
+    import mcp_servers.hydra_control.server as _srv
+    from hydra_core.toolshed import SCHEMA_OVERRIDES
+
+    server_actions = set(_srv._RESUME_ACTIONS)
+    toolshed_actions = set(
+        SCHEMA_OVERRIDES["hydra_control"]["hydra.workflow.resume"]
+        ["properties"]["action"]["enum"]
+    )
+    assert "recover-stalled-stage" in server_actions
+    assert "recover-stalled-stage" in toolshed_actions
+    assert server_actions == toolshed_actions, (
+        f"resume action enum drift: server={server_actions!r} "
+        f"toolshed={toolshed_actions!r}"
     )

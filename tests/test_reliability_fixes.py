@@ -444,6 +444,10 @@ class TestPreDispatchBudgetCheck:
         initial.budget.spent_usd = 100.0
         initial.budget.budget_usd = 100.0  # exactly 100% = should block
         initial.phase = "dispatch"
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate runs before this test reaches the
+        # pre-dispatch budget check) -- give it a real target.
+        initial.target_repo_id = "hydra"
         initial.tasks = [TaskState(owner_squad="engineering", description="test")]
 
         # Invoke node_dispatch directly via the runner's internal function
@@ -1287,6 +1291,10 @@ class TestBestOfNBudgetSurfaces:
         s.budget.budget_usd = 100.0
         s.budget.spent_usd = 100.0  # at limit — pre-dispatch check will fire
         s.phase = "dispatch"
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate runs before this test reaches the
+        # pre-dispatch budget check) -- give it a real target.
+        s.target_repo_id = "hydra"
         s.tasks = [TaskState(owner_squad="engineering", description="test")]
 
         final = runner.invoke(s, stop_before="judge_per_squad")
@@ -1401,6 +1409,13 @@ class TestJudgePerSquadHaltsOnSurfaced:
         s = HydraState(root_goal="judge-halt-routing-test")
         s.budget.budget_usd = 10.0
         s.budget.spent_usd = 10.0  # at limit
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo. The pure-python runner always replays from node_intake
+        # (there is no phase-based early exit), so the manually pre-seeded
+        # phase="surfaced" below is clobbered and this test actually relies
+        # on the REAL pre-dispatch over_budget check in node_dispatch firing
+        # -- which needs a resolved engineering target to be reached at all.
+        s.target_repo_id = "hydra"
         s.phase = "surfaced"
         s.pending_hitl = {
             "reason": "over_budget",
@@ -1471,7 +1486,11 @@ class TestJudgePerSquadHaltsOnSurfaced:
 
         # A normal (non-surfaced) state starting at dispatch should reach
         # synthesis (not be stuck at judge_per_squad).
-        s = HydraState(root_goal="normal-flow-test")
+        # WS1-E: the runner replays from node_intake, whose router selects
+        # "engineering" for this generic goal and (since tasks=[] below
+        # leaves no pre-seeded task) the planner synthesises a fresh
+        # engineering task -- give it a real target so that doesn't surface.
+        s = HydraState(root_goal="normal-flow-test", target_repo_id="hydra")
         s.budget.budget_usd = 100.0
         s.budget.spent_usd = 0.0
         s.phase = "dispatch"

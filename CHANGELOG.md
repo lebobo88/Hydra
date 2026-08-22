@@ -8,6 +8,43 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Changed — canonical plugin namespace (plugin 0.1.6)
+
+- Moved Hydra agents, skills, and portable hooks into `plugins/hydra/`.
+  Operator surfaces now resolve consistently as `/hydra:<verb>` and portable
+  hooks have a single plugin owner, avoiding duplicate project-local discovery.
+
+### Changed — Claude Code-native host surface (plugin 0.1.5)
+
+Hydra now uses current Claude Code-native configuration surfaces wherever they
+directly mirror existing host behavior, while keeping the Python supervisor and
+all governance authority unchanged.
+
+- **Plugin metadata and release hygiene** — plugin manifest now carries author
+  metadata and version `0.1.5`; strict Claude Code manifest validation is part
+  of regression coverage.
+- **Native host interfaces** — project-scoped rules, skills, hooks, current
+  `sonnet` model aliases, and structured agent authority/evidence contracts
+  make the Claude Code surface explicit without replacing Hydra state,
+  gateway/RBAC, HITL, telemetry, replay, or typed envelopes/`MemoryRef`.
+- **Operator commands** — `/hydra:status`, `/hydra:approve`, and
+  `/hydra:resume` are documented as thin Claude Code interfaces over the
+  authoritative Hydra CLI/control-plane resume path; they never mutate
+  checkpoints or HITL state directly.
+- **Plugin activation** — source-repository project hooks and the installed
+  plugin are documented as separate activation contexts, preventing duplicate
+  lifecycle hooks. The installed plugin remains for consumer projects; MCP
+  gateway registration remains machine-local under the existing setup contract.
+- **Engineering isolation** — the pair-programmer stage worktree returned by
+  Hydra remains authoritative; Claude Code native worktree isolation is not a
+  substitute.
+
+### Tests
+
+- Added `tests/test_claude_native_configuration.py` to pin the native host
+  surface, plugin agent-path integrity, activation boundary, and preservation
+  of Hydra governance ownership.
+
 ### Added — Senate: the legal-compliance squad goes active (the Curia Crown)
 
 The `legal-compliance` stub is promoted to an active `claude-skill` squad

@@ -64,9 +64,11 @@ def test_clean_success_returns_none():
 # ─── _run_smoke: host-side execution, exit code authoritative ──────────────
 
 def test_smoke_pass_on_zero_exit(monkeypatch):
+    # W2: _run_smoke resolves argv+cwd via _detect_smoke_command_and_cwd; patch
+    # that seam (cwd == "." mirrors the pre-nested-root default).
     monkeypatch.setattr(
-        squad_node, "_detect_smoke_command",
-        lambda _p: ["python", "-c", "import sys; sys.exit(0)"],
+        squad_node, "_detect_smoke_command_and_cwd",
+        lambda _p: (["python", "-c", "import sys; sys.exit(0)"], "."),
     )
     status, reason = _run_smoke(object(), project_path=".", stage_id="s1")
     assert status == "pass"
@@ -75,8 +77,8 @@ def test_smoke_pass_on_zero_exit(monkeypatch):
 
 def test_smoke_fail_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr(
-        squad_node, "_detect_smoke_command",
-        lambda _p: ["python", "-c", "import sys; sys.exit(3)"],
+        squad_node, "_detect_smoke_command_and_cwd",
+        lambda _p: (["python", "-c", "import sys; sys.exit(3)"], "."),
     )
     status, reason = _run_smoke(object(), project_path=".", stage_id="s1")
     assert status == "fail"
@@ -84,7 +86,8 @@ def test_smoke_fail_on_nonzero_exit(monkeypatch):
 
 
 def test_smoke_skipped_when_no_command(monkeypatch):
-    monkeypatch.setattr(squad_node, "_detect_smoke_command", lambda _p: None)
+    monkeypatch.setattr(
+        squad_node, "_detect_smoke_command_and_cwd", lambda _p: (None, "."))
     status, reason = _run_smoke(object(), project_path=".", stage_id="s1")
     assert status == "skipped"
     assert "no runnable" in reason

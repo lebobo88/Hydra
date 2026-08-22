@@ -166,7 +166,19 @@ def test_wedged_teardown_hits_overall_deadline_backstop(monkeypatch, disp):
     # stdio __aexit__ teardown. A child that wedges on teardown (the observed
     # 45-min stall at dispatch) must be abandoned at the overall deadline
     # (tool_timeout + overhead), not freeze the stage loop.
-    monkeypatch.setenv("HYDRA_DISPATCH_TOOL_TIMEOUT_S", "0.1")
+    #
+    # W2-1: this backstop is specific to the NON-pooled `_async_call` path
+    # (every call tears down its stdio session). pp_harness moved to the
+    # pooled path (_POOLED_SERVERS), whose session persists across calls and
+    # so never exercises a per-call teardown on the happy path at all — see
+    # test_pp_harness_calls_reuse_one_pooled_session below for that path's own
+    # coverage, and test_pooled_session_drop_hits_teardown_deadline for its
+    # equivalent wedged-teardown protection (on DROP, not every call). Use
+    # pp_codex here — still non-pooled — so this test keeps validating the
+    # P1.3 backstop it was written for. pp_codex is itself a _LONG_TOOL_SERVER
+    # (every tool call gets the long timeout class), so override the LONG
+    # timeout rather than the short one.
+    monkeypatch.setenv("HYDRA_DISPATCH_LONG_TOOL_TIMEOUT_S", "0.1")
     monkeypatch.setenv("HYDRA_DISPATCH_OVERALL_OVERHEAD_S", "0.3")
 
     sess = _FakeSession()  # fast call_tool; the HANG is in stdio teardown below
@@ -191,7 +203,7 @@ def test_wedged_teardown_hits_overall_deadline_backstop(monkeypatch, disp):
 
     import time as _t
     t0 = _t.monotonic()
-    res = disp.call_mcp("pp_harness", "start_run", {})
+    res = disp.call_mcp("pp_codex", "generate", {})
     elapsed = _t.monotonic() - t0
 
     assert res["status"] == "failed"
@@ -199,6 +211,82 @@ def test_wedged_teardown_hits_overall_deadline_backstop(monkeypatch, disp):
     assert res.get("timeout") is True
     assert elapsed < 5.0                    # abandoned ~0.4s, not the 30s hang
     assert sess.call_count == 1            # the tool DID run before teardown wedged
+
+
+def test_pp_harness_calls_reuse_one_pooled_session(monkeypatch, disp):
+    # W2-1: pp_harness joined _POOLED_SERVERS so its daemon (new Database() +
+    # applyMigrations() on every cold stdio connect) initializes once per
+    # dispatcher lifetime instead of once per tool call. Mirrors
+    # test_eights_calls_reuse_one_pooled_session.
+    sess = _FakeSession()
+    enters = {"stdio": 0}
+
+    class _CountingStdioCtx:
+        async def __aenter__(self):
+            enters["stdio"] += 1
+            return (None, None)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    mcp = types.ModuleType("mcp")
+    mcp.ClientSession = lambda read, write: sess
+    mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
+    client = types.ModuleType("mcp.client")
+    stdio = types.ModuleType("mcp.client.stdio")
+    stdio.stdio_client = lambda params: _CountingStdioCtx()
+    monkeypatch.setitem(sys.modules, "mcp", mcp)
+    monkeypatch.setitem(sys.modules, "mcp.client", client)
+    monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
+
+    first = disp.call_mcp("pp_harness", "start_run", {})
+    second = disp.call_mcp("pp_harness", "record_verdict", {})
+
+    assert first["status"] == "done"
+    assert second["status"] == "done"
+    assert enters["stdio"] == 1            # ONE stdio connect, not two cold starts
+    assert sess.init_count == 1
+    assert sess.call_count == 2
+
+
+def test_pooled_session_drop_hits_teardown_deadline(monkeypatch, disp):
+    # W2-1: a pooled session is torn down on drop (call_tool timeout/error —
+    # see _async_call_pooled/_drop_pooled_session). _close_partial_pool wraps
+    # that teardown in the same overall-deadline reasoning P1.3 gave the
+    # non-pooled path, so a wedged child does not hang the DROP path either.
+    monkeypatch.setenv("HYDRA_DISPATCH_CONNECT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("HYDRA_DISPATCH_TOOL_TIMEOUT_S", "0.1")
+
+    sess = _FakeSession(call_delay=10.0)  # call_tool times out -> triggers drop
+
+    class _HangingTeardownStdioCtx:
+        async def __aenter__(self):
+            return (None, None)
+
+        async def __aexit__(self, *exc):
+            await asyncio.sleep(30)  # wedged on drop's teardown
+            return False
+
+    mcp = types.ModuleType("mcp")
+    mcp.ClientSession = lambda read, write: sess
+    mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
+    client = types.ModuleType("mcp.client")
+    stdio = types.ModuleType("mcp.client.stdio")
+    stdio.stdio_client = lambda params: _HangingTeardownStdioCtx()
+    monkeypatch.setitem(sys.modules, "mcp", mcp)
+    monkeypatch.setitem(sys.modules, "mcp.client", client)
+    monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
+
+    import time as _t
+    t0 = _t.monotonic()
+    res = disp.call_mcp("pp_harness", "start_run", {})
+    elapsed = _t.monotonic() - t0
+
+    assert res["status"] == "failed"
+    assert res.get("timeout") is True
+    assert elapsed < 5.0   # the drop's teardown wedge was abandoned, not hung 30s
+    # The session was dropped (not left cached in a half-torn-down state).
+    assert "pp_harness" not in disp._pooled_sessions
 
 
 def test_eights_calls_reuse_one_pooled_session(monkeypatch, disp):
