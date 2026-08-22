@@ -191,6 +191,11 @@ def _inbound(state: HydraState) -> DevTask:
         workflow_id=state.workflow_id, origin_squad="hydra",
         owner="backend", repo="hydra", branch="wf",
         instructions="add a NOTES.md file",
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo -- these tests exercise the pp drive loop itself, not
+        # repo-targeting, so point at "hydra" (this checkout) rather than
+        # relying on the removed cwd fallback.
+        target_repo_id="hydra",
     )
 
 

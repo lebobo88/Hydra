@@ -568,9 +568,21 @@ def test_via_mcp_with_target_repo_subpath_uses_bounded_project_path(
     assert Path(expected_path).is_dir(), "engineering target subdir should be created on demand"
 
 
-def test_via_mcp_without_target_repo_id_falls_back_to_cwd() -> None:
-    """Engineering squad without target_repo_id -> project_path is cwd (default fallback)."""
-    import os
+def test_via_mcp_without_target_repo_id_surfaces_instead_of_falling_back_to_cwd() -> None:
+    """Engineering squad without target_repo_id -> failed, never a silent cwd fallback.
+
+    WS1-E deliberately removed the cwd fallback this test used to assert (see
+    git history for the prior `..._falls_back_to_cwd` version). That fallback
+    was the ROOT CAUSE this item closes: `hydra.workflow.plan`/`launch`
+    without an explicit --repo/--repos silently dispatched engineering into
+    whatever the Hydra host process's cwd happened to be, with no error and
+    no HITL — the operator only discovered the misdirection later, as a diff
+    landed in the wrong tree. Engineering dispatch now requires an explicit,
+    resolved target; an absent one is an operator error that must surface
+    immediately (here: `_via_mcp` returns status="failed" with an actionable
+    remediation) rather than being silently "resolved" to cwd. dispatcher is
+    never called — no pp run starts against an unintended tree.
+    """
     state = HydraState(root_goal="Fix something else")
     pack = _make_engineering_pack()  # invoke has no project_path key
     inbound = CSuiteDecisionPacket(
@@ -585,10 +597,16 @@ def test_via_mcp_without_target_repo_id_falls_back_to_cwd() -> None:
 
     result = _via_mcp(state, pack, inbound, dispatcher)
 
-    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
-    assert len(captured) == 1
-    # The fallback resolves to cwd at call time.
-    assert captured[0]["project_path"] == str(Path.cwd())
+    assert result.status == "failed", (
+        "engineering dispatch with no resolved target must fail closed, not "
+        f"silently fall back to cwd; got status={result.status!r}"
+    )
+    assert "target" in result.rationale.lower()
+    assert "hydra repo register" in result.rationale, (
+        "failure must name the actionable remediation (WS1-D unknown_repo_hitl_fields "
+        "shape), not just say 'no target'"
+    )
+    assert not captured, "no pp run should ever be started without a resolved target"
 
 
 def test_via_mcp_non_engineering_squad_ignores_target_repo_id() -> None:

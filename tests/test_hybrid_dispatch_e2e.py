@@ -90,6 +90,12 @@ def _dev_task(state: HydraState, **over) -> dict:
         "workflow_id": str(state.workflow_id),
         "owner": "backend",
         "repo": "hydra",
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo -- these tests exercise the ingest/dispatch loop itself, not
+        # repo-targeting, so point at "hydra" (this checkout, allow-listed by
+        # default in hydra_core.repo_registry) rather than relying on the
+        # removed cwd fallback.
+        "target_repo_id": "hydra",
         "branch": "wf",
         "instructions": "Implement deterministic fog-of-war reveal in src/sim/fow.ts",
         "pp_team": "game-feature-team",
