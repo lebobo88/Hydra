@@ -1419,8 +1419,12 @@ def test_remove_orphan_directory_reports_error_when_readonly_bit_cannot_be_clear
         assert "PermissionError" in result["error"], result
         assert wt_path.exists(), "directory must survive an honestly-reported failure"
     finally:
+        # NOTE: `real_chmod` was captured BEFORE `monkeypatch.setattr` above and
+        # must not be re-fetched here -- `monkeypatch` only reverts `os.chmod`
+        # at test teardown, which hasn't happened yet inside this `finally`, so
+        # re-reading `os.chmod` here would grab the still-active `_chmod_denied`
+        # patch and immediately re-raise on `ro_file`, breaking cleanup.
         if wt_path.exists():
-            real_chmod = os.chmod
             real_chmod(ro_file, stat.S_IWRITE)
             shutil.rmtree(wt_path, ignore_errors=True)
 
