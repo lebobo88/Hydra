@@ -236,7 +236,12 @@ def test_plan_halts_before_dispatch_without_executing(capsys, tmp_path, monkeypa
     the TaskState plan with the task still `pending` (never executed). This is
     the non-detaching surface attended (host-bridged) mode drives."""
     monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp.db"))
-    rc = _run(["plan", "fix a small typo in the README", "--squad", "engineering"],
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo.
+    # This test's concern is the plan/dispatch halt boundary, not
+    # repo-targeting, so supply the real target it means: "hydra" (this
+    # checkout) via --repo, rather than relying on the removed cwd fallback.
+    rc = _run(["plan", "fix a small typo in the README", "--squad", "engineering",
+              "--repo", "hydra"],
               project_root=REPO_ROOT)
     out = capsys.readouterr().out
     payload = _extract_json(out)
@@ -245,6 +250,10 @@ def test_plan_halts_before_dispatch_without_executing(capsys, tmp_path, monkeypa
     assert payload["ok"] is True
     # Single-squad, no approval needed → halts at the dispatch interrupt.
     assert payload["phase"] == "dispatch"
+    assert payload["resolved_target"] == {
+        "mode": "single", "repo_id": "hydra", "subpath": None,
+        "source": "explicit_param",
+    }
     assert payload["requires_human_approval"] is False
     assert payload["pending_hitl"] is None
     assert "engineering" in payload["selected_squads"]
@@ -706,8 +715,11 @@ def test_attended_step_passes_hydra_workflow_id(tmp_path, monkeypatch, capsys):
     from hydra_core import cli
     from hydra_core.state import HydraState, TaskState
 
-    # Engineering task (no explicit envelope_id)
-    task = TaskState(owner_squad="engineering", description="implement the feature")
+    # Engineering task (no explicit envelope_id). WS1-E: engineering dispatch
+    # requires an explicit, resolved target repo -- this test's concern is
+    # workflow_id threading through start_run, not repo-targeting.
+    task = TaskState(owner_squad="engineering", description="implement the feature",
+                     target_repo_id="hydra")
     state_val = HydraState(root_goal="implement the feature", tasks=[task])
     wf_id = str(state_val.workflow_id)  # real UUID — passes _WORKFLOW_ID_RE
 
@@ -793,7 +805,11 @@ def test_attended_step_threads_hydra_context_block(tmp_path, monkeypatch, capsys
     from hydra_core import cli
     from hydra_core.state import HydraState, TaskState
 
-    task = TaskState(owner_squad="engineering", description="add a feature")
+    # WS1-E: engineering dispatch requires an explicit, resolved target repo
+    # -- this test's concern is hydra_context_block threading, not
+    # repo-targeting.
+    task = TaskState(owner_squad="engineering", description="add a feature",
+                     target_repo_id="hydra")
     state_val = HydraState(root_goal="add a feature", tasks=[task])
     wf_id = str(state_val.workflow_id)
 

@@ -225,7 +225,12 @@ class TestSupervisorStatusCoercion:
 
         from hydra_core.state import HydraState, TaskState
         # Pre-seed selected_squads so intake skips the LLM router.
-        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (checked in node_planner, before node_dispatch even runs) --
+        # this test's concern is node_dispatch's status coercion, so give it
+        # a real target ("hydra", this checkout) to reach that node at all.
+        state = HydraState(root_goal="test", selected_squads=["engineering"],
+                           target_repo_id="hydra")
         task = TaskState(owner_squad="engineering", description="implement x")
         state.tasks.append(task)
 
@@ -790,7 +795,11 @@ class TestF9ResumableHitlGate:
         from hydra_core.state import HydraState, TaskState
         runner = self._make_runner(monkeypatch)
 
-        state = HydraState(root_goal="build X", selected_squads=["engineering"])
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate, before node_dispatch) -- this test's
+        # concern is the pre-dispatch budget gate, so give it a real target.
+        state = HydraState(root_goal="build X", selected_squads=["engineering"],
+                           target_repo_id="hydra")
         # Exhaust the budget (spent == budget_usd = 50.0).
         state.budget.spent_usd = 50.0
         task = TaskState(owner_squad="engineering", description="implement X")
@@ -811,7 +820,11 @@ class TestF9ResumableHitlGate:
         from hydra_core.schemas import HydraEnvelope
         runner = self._make_runner(monkeypatch)
 
-        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate, before node_dispatch) -- this test's
+        # concern is the envelope-ceiling gate, so give it a real target.
+        state = HydraState(root_goal="test", selected_squads=["engineering"],
+                           target_repo_id="hydra")
         state.envelope_ceiling = 2
         for _ in range(3):
             env = HydraEnvelope(
@@ -879,7 +892,11 @@ class TestF10OptionDispatchTable:
             project_root=HYDRA_ROOT, dispatcher=None, force_pure_python=True,
         )
         assert isinstance(runner, _PurePythonRunner)
-        state = HydraState(root_goal="test", selected_squads=["engineering"])
+        # WS1-E: engineering dispatch requires an explicit, resolved target
+        # repo (node_planner's gate, before node_dispatch) -- this test's
+        # concern is the envelope-ceiling option table, so give it a real target.
+        state = HydraState(root_goal="test", selected_squads=["engineering"],
+                           target_repo_id="hydra")
         state.envelope_ceiling = 2
         for _ in range(3):
             env = HydraEnvelope(
