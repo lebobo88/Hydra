@@ -18,8 +18,10 @@ Real git repos, real filesystem paths — no mocks for the git plumbing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -29,9 +31,11 @@ from hydra_core import host_bridge
 from hydra_core.host_bridge import (
     CURSOR_SCHEMA,
     _find_attended_cursor,
+    _is_registered_worktree,
     _legacy_worktree_root,
     _prune_single_worktree_admin_dir,
     _provision_worktree,
+    _remove_orphan_directory,
     _remove_worktree,
     cursor_path,
     resolve_worktree_root,
@@ -1117,3 +1121,422 @@ def test_worktree_root_precedence_matches_hooks():
             "resolve_worktree_root's HYDRA_WORKTREE_ROOT > AIAPP_BASE > "
             "sibling-fallback precedence"
         )
+
+
+# ===========================================================================
+# Janitor: orphaned directories (deregistered by `_finalize` but the
+# checkout survived on disk) -- `git worktree remove` refuses these
+# ("is not a working tree"), so the sweep must fall back to a raw,
+# safety-gated `shutil.rmtree` instead.
+# ===========================================================================
+# A genuine orphan is constructed the same way the real bug produces one:
+# provision a real worktree (so a real branch exists), then deregister ONLY
+# its git admin dir via `_prune_single_worktree_admin_dir` -- exactly what a
+# `_finalize` that reaches `_remove_worktree`'s deregistration step but not
+# its directory removal would leave behind. The checkout directory survives;
+# `git worktree list` no longer knows about it.
+
+def _make_orphan(repo_root: Path, run_id: str) -> tuple[Path, str]:
+    prov = _provision_worktree(str(repo_root), run_id)
+    assert prov is not None
+    wt_path, branch = prov
+    _prune_single_worktree_admin_dir(str(repo_root), wt_path)
+    assert not _is_registered_worktree(str(repo_root), wt_path), (
+        "test setup failed to produce a genuine orphan"
+    )
+    assert Path(wt_path).is_dir(), "test setup must leave the directory on disk"
+    return Path(wt_path), branch
+
+
+def test_janitor_removes_orphan_with_terminal_cursor(tmp_path):
+    """FAILS IF REVERTED: without the orphan fallback, `_sweep_one_root`
+    always calls `_remove_worktree`, which shells out to `git worktree
+    remove` -- that fails ("is not a working tree") against a directory git
+    no longer tracks, so the orphan lands in report["errors"], never
+    report["removed"], and the directory survives on disk."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, branch = _make_orphan(repo_root, "orphanA")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanA")
+    save_cursor(cfile, _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert not wt_path.exists(), "orphaned terminal-cursor directory must be removed"
+    assert any(r["run_id"] == "orphanA" for r in report["removed"]), report
+    assert not report["errors"], report["errors"]
+    # The branch is untouched -- only the checkout directory is removed.
+    show = _git(["show-ref", "--verify", f"refs/heads/{branch}"], repo_root)
+    assert show.returncode == 0, "janitor must never delete the branch"
+
+
+def test_janitor_skips_orphan_with_non_terminal_cursor(tmp_path):
+    """FAILS IF REVERTED: if the orphan fallback were reachable without the
+    terminality gate (e.g. a refactor that special-cased orphans ahead of
+    the cursor check), this in-progress orphan would be rmtree'd out from
+    under a run still on HITL."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanB")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanB")
+    save_cursor(cfile, _cursor("await_judge"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert wt_path.exists(), "non-terminal-cursor orphan must NOT be removed"
+    assert not report["removed"]
+    assert any(s["run_id"] == "orphanB" for s in report["skipped"])
+
+
+def test_janitor_skips_orphan_with_no_cursor(tmp_path):
+    """FAILS IF REVERTED: 'no cursor found' must stay 'cannot prove
+    terminal' for orphans too -- not merely for still-registered worktrees.
+    Without the shared gate, an orphan discovered mid-provision (before its
+    cursor is written) would be swept."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanC")
+    # Deliberately no cursor file written for orphanC.
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert wt_path.exists()
+    assert not report["removed"]
+    assert any(s["run_id"] == "orphanC" and s["reason"] == "no_cursor_found"
+               for s in report["skipped"])
+
+
+def test_janitor_orphan_removal_refuses_path_outside_scanned_root(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: without the resolved-path containment re-check in
+    `_remove_orphan_directory`, a symlink inside the scanned root that
+    points outside it -- yet still matches the `attended-<run_id>` name
+    shape and carries a terminal cursor -- would be recursively deleted at
+    whatever it resolves to."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    monkeypatch.delenv("HYDRA_WORKTREE_ROOT", raising=False)
+    monkeypatch.delenv("AIAPP_BASE", raising=False)
+    wt_root = resolve_worktree_root(str(repo_root))
+    wt_root.mkdir(parents=True, exist_ok=True)
+
+    outside = tmp_path / "outside-payload"
+    outside.mkdir()
+    (outside / "canary.txt").write_text("do not delete me")
+
+    escape_link = wt_root / "attended-runEscape"
+    escape_link.symlink_to(outside, target_is_directory=True)
+
+    cfile = cursor_path(str(repo_root), "wf-1", "runEscape")
+    save_cursor(cfile, _cursor("complete"))
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert outside.exists() and (outside / "canary.txt").exists(), (
+        "a path resolving outside the scanned root must never be removed, "
+        "even when its name matches attended-<run_id> and its cursor is terminal"
+    )
+    assert any(e["run_id"] == "runEscape" for e in report["errors"]), report
+    assert not any(r["run_id"] == "runEscape" for r in report["removed"]), report
+
+
+def test_janitor_registered_worktree_still_uses_git_remove_not_rmtree(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: a still-registered worktree must keep going
+    through `_remove_worktree` (git-aware), not the raw-rmtree orphan path
+    -- verified here by making `_remove_orphan_directory` explode if it is
+    ever invoked, and confirming a normal, still-registered terminal-cursor
+    worktree removal is unaffected (goes through `_remove_worktree` and
+    succeeds). Deliberately does NOT patch `shutil.rmtree` globally -- that
+    also intercepts pytest's own tmp_path teardown, which is a different
+    call path than the one this test needs to prove is untaken."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runReg")
+    assert prov is not None
+    wt_path, branch = prov
+    assert _is_registered_worktree(str(repo_root), wt_path), (
+        "test setup: this worktree must still be registered"
+    )
+    cfile = cursor_path(str(repo_root), "wf-1", "runReg")
+    save_cursor(cfile, _cursor("complete"))
+
+    def _boom(*_a, **_k):
+        raise AssertionError(
+            "_remove_orphan_directory must not be called for a registered worktree")
+
+    monkeypatch.setattr(host_bridge, "_remove_orphan_directory", _boom)
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    assert not Path(wt_path).exists()
+    assert any(r["run_id"] == "runReg" for r in report["removed"]), report
+    show = _git(["show-ref", "--verify", f"refs/heads/{branch}"], repo_root)
+    assert show.returncode == 0, "janitor must never delete the branch"
+
+
+def test_janitor_error_entry_carries_cursor_state_and_root(tmp_path, monkeypatch):
+    """FAILS IF REVERTED: before this fix the error branch built its entry
+    without `cursor_state`, so a failed removal reported `cursor_state:
+    null` even though the cursor was read successfully and found terminal
+    (the dry-run preview for the same entry correctly showed it)."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanErr")
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanErr")
+    save_cursor(cfile, _cursor("surfaced"))
+
+    # Force the orphan removal itself to fail so it lands in report["errors"].
+    monkeypatch.setattr(
+        host_bridge, "_remove_orphan_directory",
+        lambda *a, **k: {"removed": False, "error": "forced_failure_for_test"},
+    )
+
+    report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+    errs = [e for e in report["errors"] if e["run_id"] == "orphanErr"]
+    assert len(errs) == 1, report
+    assert errs[0]["cursor_state"] == "surfaced", errs[0]
+    assert errs[0]["root"] == "current", errs[0]
+    assert wt_path.exists(), "a failed removal must leave the directory in place"
+
+
+# ===========================================================================
+# _is_registered_worktree / _remove_orphan_directory unit-level coverage
+# ===========================================================================
+
+def test_is_registered_worktree_true_for_live_worktree(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runLive")
+    assert prov is not None
+    wt_path, _branch = prov
+    try:
+        assert _is_registered_worktree(str(repo_root), wt_path)
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_is_registered_worktree_false_for_plain_directory(tmp_path):
+    repo_root = _init_repo(tmp_path / "myrepo")
+    plain = tmp_path / "not-a-worktree"
+    plain.mkdir()
+    assert not _is_registered_worktree(str(repo_root), str(plain))
+
+
+def test_remove_orphan_directory_refuses_when_still_registered(tmp_path):
+    """A caller that mis-routes a still-registered worktree into the orphan
+    path must be refused, not silently rmtree'd, by `_remove_orphan_directory`
+    itself -- it re-checks registration independently of the caller."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    prov = _provision_worktree(str(repo_root), "runStillReg")
+    assert prov is not None
+    wt_path, _branch = prov
+    try:
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(Path(wt_path), wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert Path(wt_path).exists()
+    finally:
+        _remove_worktree(str(repo_root), wt_path)
+
+
+def test_remove_orphan_directory_removes_readonly_file(tmp_path):
+    """git marks pack/object files read-only on Windows -- that must not
+    defeat `_remove_orphan_directory`. A bare `shutil.rmtree` raises
+    `PermissionError` on a read-only file rather than clearing the
+    attribute; the `onerror` hook must clear it and retry."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanRO")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result == {"removed": True, "error": None}, result
+        assert not wt_path.exists()
+    finally:
+        if wt_path.exists():
+            os.chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+def test_remove_orphan_directory_readonly_file_fails_without_onerror_handler(
+    tmp_path, monkeypatch
+):
+    """Falsifies the fix above: with the `onerror` hook neutered (so
+    `shutil.rmtree` runs exactly as it did before this change), removing a
+    directory containing a read-only file must fail with `PermissionError`
+    surfaced through `report["error"]`, and the directory must survive.
+    monkeypatch reverts the neutering automatically at teardown -- no
+    source edit is made or needs restoring."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanROFail")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        # Neuter the hook: re-raise the original error instead of clearing
+        # the read-only bit and retrying, reproducing pre-fix behavior.
+        def _neutered(func, path, excinfo):
+            raise excinfo[1]
+
+        monkeypatch.setattr(host_bridge, "_clear_readonly_and_retry", _neutered)
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert "PermissionError" in result["error"], result
+        assert wt_path.exists(), "directory must survive an honestly-reported failure"
+    finally:
+        if wt_path.exists():
+            os.chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+def test_remove_orphan_directory_reports_error_when_readonly_bit_cannot_be_cleared(
+    tmp_path, monkeypatch
+):
+    """A genuine permission denial (as opposed to a plain Windows read-only
+    bit) must still surface as an honest error, not a false "removed".
+
+    `os.chmod` on Windows only toggles the read-only attribute -- it cannot
+    construct a true ACL-deny or an open-file-handle lock from a test, so
+    this simulates "clearing the bit itself fails" by monkeypatching
+    `os.chmod` inside `host_bridge` to raise. That exercises the exact
+    fallback branch in `_clear_readonly_and_retry` (`except Exception:
+    raise exc`) that a real permission-denied chmod would also hit; it is
+    not a claim that a true OS-level ACL denial was reproduced on this
+    platform."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanROChmodFail")
+    ro_file = wt_path / "locked.txt"
+    ro_file.write_text("pretend this is a git pack file")
+    os.chmod(ro_file, stat.S_IREAD)
+    try:
+        real_chmod = os.chmod
+
+        def _chmod_denied(path, mode, *a, **kw):
+            if Path(path) == ro_file:
+                raise PermissionError(13, "Access is denied (simulated)")
+            return real_chmod(path, mode, *a, **kw)
+
+        monkeypatch.setattr(host_bridge.os, "chmod", _chmod_denied)
+        wt_root = resolve_worktree_root(str(repo_root))
+        result = _remove_orphan_directory(wt_path, wt_root, str(repo_root))
+        assert result["removed"] is False
+        assert "PermissionError" in result["error"], result
+        assert wt_path.exists(), "directory must survive an honestly-reported failure"
+    finally:
+        # NOTE: `real_chmod` was captured BEFORE `monkeypatch.setattr` above and
+        # must not be re-fetched here -- `monkeypatch` only reverts `os.chmod`
+        # at test teardown, which hasn't happened yet inside this `finally`, so
+        # re-reading `os.chmod` here would grab the still-active `_chmod_denied`
+        # patch and immediately re-raise on `ro_file`, breaking cleanup.
+        if wt_path.exists():
+            real_chmod(ro_file, stat.S_IWRITE)
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+
+# ===========================================================================
+# Orphan removal vs Windows read-only files
+# ===========================================================================
+# git marks pack/object files (and sometimes whole directories) read-only in
+# a real checkout -- on Windows that makes bare `shutil.rmtree` fail with
+# PermissionError as the NORMAL case for a worktree, not an edge case. The
+# `_clear_readonly_and_retry` onerror hook clears the read-only bit and
+# retries the single failing operation; a genuine permission problem (not
+# merely read-only) must still surface honestly in report["errors"].
+
+def test_janitor_removes_orphan_containing_a_readonly_file(tmp_path):
+    """FAILS IF REVERTED: without the onerror hook, `shutil.rmtree` raises
+    PermissionError on the first read-only file/dir it reaches on Windows
+    and never clears it -- the orphan lands in report["errors"] instead of
+    report["removed"], and the directory survives on disk."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanRO")
+    victim = wt_path / "readonly-object.pack"
+    victim.write_text("pretend git pack data")
+    os.chmod(victim, stat.S_IREAD)
+    try:
+        cfile = cursor_path(str(repo_root), "wf-1", "orphanRO")
+        save_cursor(cfile, _cursor("complete"))
+
+        report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+        assert not wt_path.exists(), (
+            "an orphan containing a read-only file must still be removed"
+        )
+        assert any(r["run_id"] == "orphanRO" for r in report["removed"]), report
+        assert not report["errors"], report["errors"]
+    finally:
+        # Best-effort cleanup if the assertion above already failed and left
+        # a read-only file behind (chmod so the test runner's own tmp_path
+        # teardown doesn't also trip over it).
+        if victim.exists():
+            os.chmod(victim, stat.S_IWRITE)
+
+
+def test_clear_readonly_and_retry_reraises_when_chmod_does_not_fix_it(tmp_path):
+    """A path that is genuinely permission-denied for a reason `os.chmod`
+    cannot fix (Windows only ever toggles the read-only attribute; it grants
+    no access back for e.g. an open file handle) must still fail loudly,
+    not be silently treated as removed.
+
+    Constructed by holding an open file handle on the victim file for the
+    duration of the rmtree call -- Windows refuses to delete an open file
+    even after its read-only bit is cleared, so the hook's chmod succeeds
+    but the retried delete still raises, and that exception must propagate
+    out of shutil.rmtree rather than be swallowed by the hook.
+
+    FAILS IF REVERTED to a version of `_clear_readonly_and_retry` that
+    swallows the retry's exception (e.g. `except Exception: return` instead
+    of letting it propagate): this test's `pytest.raises` would then see no
+    exception. It also fails against a version that raises unconditionally
+    without attempting the chmod/retry (a plain `raise exc` with no chmod at
+    all) in the *companion* test above, since that would refuse to remove
+    the merely-read-only orphan too -- this test isolates the "still fails
+    when chmod genuinely can't help" half of the contract on its own.
+    """
+    from hydra_core.host_bridge import _clear_readonly_and_retry
+
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_root = resolve_worktree_root(str(repo_root))
+    wt_root.mkdir(parents=True, exist_ok=True)
+    victim_dir = wt_root / "attended-orphanLocked"
+    victim_dir.mkdir()
+    victim = victim_dir / "locked.bin"
+    victim.write_bytes(b"locked")
+    os.chmod(victim, stat.S_IREAD)
+
+    handle = open(victim, "rb")  # noqa: SIM115 -- held open deliberately for the duration below
+    try:
+        with pytest.raises(PermissionError):
+            shutil.rmtree(victim_dir, onerror=_clear_readonly_and_retry)
+        # The read-only bit WAS cleared by the hook (that half of the
+        # contract ran) -- it's the delete itself that still fails while the
+        # handle is open, proving chmod alone doesn't fabricate access.
+        assert victim.exists(), "the genuinely locked file must survive"
+    finally:
+        handle.close()
+        os.chmod(victim, stat.S_IWRITE)
+        shutil.rmtree(victim_dir, ignore_errors=True)
+
+
+def test_remove_orphan_directory_reports_readonly_removal_failure_honestly(tmp_path):
+    """FAILS IF REVERTED to a hook that swallows a genuine permission
+    failure: `_remove_orphan_directory` must land the run_id in
+    report["errors"] with the real PermissionError text, never report it as
+    removed."""
+    repo_root = _init_repo(tmp_path / "myrepo")
+    wt_path, _branch = _make_orphan(repo_root, "orphanLockedSweep")
+    victim = wt_path / "locked.bin"
+    victim.write_bytes(b"locked")
+    os.chmod(victim, stat.S_IREAD)
+    cfile = cursor_path(str(repo_root), "wf-1", "orphanLockedSweep")
+    save_cursor(cfile, _cursor("complete"))
+
+    handle = open(victim, "rb")  # noqa: SIM115
+    try:
+        report = sweep_stale_worktrees(str(repo_root), str(repo_root))
+
+        assert not any(r["run_id"] == "orphanLockedSweep" for r in report["removed"]), report
+        errs = [e for e in report["errors"] if e["run_id"] == "orphanLockedSweep"]
+        assert len(errs) == 1, report
+        assert "PermissionError" in errs[0]["error"], errs[0]
+        assert errs[0]["cursor_state"] == "complete", errs[0]
+    finally:
+        handle.close()
+        os.chmod(victim, stat.S_IWRITE)
+        shutil.rmtree(wt_path, ignore_errors=True)
