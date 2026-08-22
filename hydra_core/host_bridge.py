@@ -751,8 +751,12 @@ def _is_registered_worktree(repo_root: str, worktree_path: str) -> bool:
 
     Deliberately re-queries git on every call rather than accepting a cached
     listing from the caller: the janitor's orphan-removal path needs the
-    answer to be true *at the moment of removal*, not at whatever moment an
-    earlier directory scan happened to run.
+    answer to be true *at check time, immediately before removal*, not at
+    whatever moment an earlier directory scan happened to run. This still
+    leaves a narrow gap between this check returning and the caller's
+    ``rmtree`` actually running -- see ``_remove_orphan_directory`` for why
+    that residual race exists and can't be closed without an atomic
+    check-and-delete primitive.
 
     Fails toward "assume registered" when git itself can't be asked (raised
     exception) -- an unverifiable answer must route the caller to the
@@ -779,22 +783,35 @@ def _remove_orphan_directory(entry: Path, scan_root: Path, repo_root: str) -> di
 
     This is a raw ``shutil.rmtree`` -- NOT a git operation -- and unlike
     ``git worktree remove`` it has no safety net of its own, so every guard
-    here is re-checked at the moment of removal rather than trusted from
-    whatever the caller's directory listing found earlier:
+    here is re-checked immediately before removal rather than trusted from
+    whatever the caller's directory listing found earlier. This is
+    best-effort pre-delete validation, not a removal-time guarantee: the
+    checks and the ``rmtree`` call below are separate operations, not one
+    atomic step, and no atomic primitive is available here (there is no
+    "check-and-remove" syscall this can be built on). A registration or
+    directory recreation that lands in the gap between the check and the
+    ``rmtree`` call is a real, if narrow, residual race -- it is merely much
+    less likely to be hit than trusting a listing from an earlier scan
+    would be, since the gap is now microseconds instead of however long the
+    caller's own work took:
 
       (a) resolved-path containment under ``scan_root`` (the actual root
           that was scanned to find this entry) -- checked via
           ``Path.relative_to`` on resolved paths, so a symlink or a ``..``
           component cannot walk this call outside the root the sweep was
           told to operate on;
-      (b) genuinely absent from ``git worktree list`` **right now** (via
+      (b) absent from ``git worktree list`` **at check time** (via
           ``_is_registered_worktree``), not merely absent from whatever
-          listing an earlier caller happened to observe.
+          listing an earlier caller happened to observe -- but another
+          process can still re-register or recreate a worktree at this
+          path after the check returns and before ``rmtree`` runs.
 
     The caller (``_sweep_one_root``) is responsible for the cursor-
     terminality gate and the ``attended-<run_id>`` name-shape check before
     ever reaching here; this function only re-verifies the two facts that
-    can change between an earlier scan and this removal.
+    can change between an earlier scan and this removal, and does so as
+    close to the removal as this codebase can get without an atomic
+    check-and-delete primitive.
 
     Never deletes a git branch -- exactly like ``_remove_worktree``, this
     only ever touches the checkout directory itself.
