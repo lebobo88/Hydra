@@ -704,10 +704,11 @@ class TestResolvePackLeadAgent:
         from hydra_core.squad_loader import discover_squads
 
         packs = discover_squads(HYDRA_ROOT)
-        # garland's first gatekeeper is brand-strategist (authority: gatekeeper)
+        # garland is claude-native, so the lead comes from NATIVE_PACKS, whose
+        # lead_agent must be the RLM-Creative plugin agent name (E2-29).
         garland = packs["garland"]
         lead = _resolve_pack_lead_agent(garland)
-        assert lead == "rlm-creative:brand-strategist"
+        assert lead == "rlm-creative:calliope"
 
     def test_fallback_to_general_purpose_when_no_agents(self):
         from hydra_core.cli import _resolve_pack_lead_agent
