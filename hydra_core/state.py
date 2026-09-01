@@ -310,6 +310,23 @@ class HydraState(BaseModel):
     # Replace-by-default (no _append reducer) so update_state can grow the list.
     attended_done_task_ids: list[str] = Field(default_factory=list)
 
+    # E2-30: one record per attended task the host drove to a terminal outcome
+    # (engineering stage OR claude-skill/impersonation squad cursor). This is
+    # the ONLY durable trace of an attended squad's output on the checkpointed
+    # state — the in-graph dispatch path never ran for these tasks, so
+    # `envelopes`/`artifacts` stay empty until `hydra finalize` materialises
+    # these records into squad DECISION_RECORDs + artifact rows and resumes the
+    # graph at `synthesis`. Replace-by-default so out-of-graph update_state can
+    # grow it (the same reason attended_completed_task_ids is not appended).
+    # Shape: {task_id, owner_squad, run_id, status, artifact_ref?, summary}.
+    attended_results: list[dict[str, Any]] = Field(default_factory=list)
+
+    # E2-30 idempotency marker: the DECISION_RECORD id `hydra finalize` produced
+    # for this workflow. Set once the attended synthesis leg has run; a second
+    # finalize returns {status:"already_finalized"} with this id instead of
+    # re-synthesizing (which would double-write episodic rows).
+    attended_finalized_record_id: Optional[str] = None
+
     def bump_iteration(self) -> None:
         self.iteration_count += 1
 

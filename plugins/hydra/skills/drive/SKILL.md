@@ -37,8 +37,8 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
 3. **Drive engineering, one stage at a time.** Loop:
    a. Call `hydra.workflow.step {workflow_id}`. It scaffolds a pp run for the next
       engineering task and returns `{status:"awaiting_host", host_action, run_id}`
-      — or `{status:"no_pending_engineering_task"}` when engineering is done
-      (exit the loop).
+      — or `{status:"ready_to_finalize"}` when every task is attended-done
+      (exit the loop and go to step 5).
    b. The `host_action.agent_type` is `engineer` (first) or
       `judge-cross-vendor`/`judge-same-vendor` (after the attempt). **Spawn that
       visible `Agent` subagent** with the provided `prompt`/`artifact_text` and
@@ -73,9 +73,19 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
    submits), and marks the task attended-done (RA-12a: a later resume will NOT
    re-dispatch it). If the pack emits engineering envelopes (DEV_TASK/PRD),
    submit them via `hydra.workflow.submit_envelopes` as before.
-5. **Synthesis.** When engineering is done and skills are resolved, read the
-   workflow `trace.jsonl` + task results and present a conversational summary +
-   artifact/commit paths.
+5. **Synthesis — call the engine, do not improvise it.** When every task is
+   attended-done, `step` returns `{status:"ready_to_finalize"}` (the legacy
+   `no_pending_task` field is still set for older hosts). Call
+   `hydra.workflow.finalize {workflow_id}`: it materialises every attended
+   result into squad `DECISION_RECORD` envelopes + artifact rows and resumes the
+   graph so `synthesis → judge_synthesis → postcheck` run over the real outputs,
+   persisting the engine `DECISION_RECORD` to episodic memory (RA-8) and driving
+   the phase terminal. Then present THAT record — its decision line, rationale,
+   preserved dissents and `artifact_refs` — plus the commit/worktree paths from
+   the stage results. `{status:"tasks_pending", pending:[...]}` means a task is
+   still open: go back to (3)/(4). A second finalize is a no-op
+   (`{status:"already_finalized", decision_record_id}`). Never hand the operator
+   a hand-written summary in place of the engine record.
 
 ## Resume after a timeout (G6)
 

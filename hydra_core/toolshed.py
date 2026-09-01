@@ -420,6 +420,7 @@ XENIA_TICKETS_TOOLS = [
 HYDRA_CONTROL_TOOLS = [
     "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.plan",
     "hydra.workflow.step", "hydra.workflow.submit_host_result",
+    "hydra.workflow.finalize",
     "hydra.workflow.resume", "hydra.workflow.submit_envelopes",
     "hydra.cockpit.audit",
     # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
@@ -795,6 +796,11 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "required": ["goal"],
         },
         "hydra.workflow.step": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+        "hydra.workflow.finalize": {
             "type": "object",
             "properties": {"workflow_id": {"type": "string"}},
             "required": ["workflow_id"],

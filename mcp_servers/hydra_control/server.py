@@ -478,6 +478,7 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 _PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
 _STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "900"))
 _SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "1800"))
+_FINALIZE_TIMEOUT_S = int(os.environ.get("HYDRA_FINALIZE_TIMEOUT_S", "600"))
 
 
 def _run_cli_json(cli_args: list[str], *, timeout_s: int,
@@ -515,6 +516,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             "plan": "HYDRA_PLAN_TIMEOUT_S",
             "step": "HYDRA_STEP_TIMEOUT_S",
             "submit": "HYDRA_SUBMIT_TIMEOUT_S",
+            "finalize": "HYDRA_FINALIZE_TIMEOUT_S",
         }
         _knob = _knob_map.get(err_label,
                                f"HYDRA_{err_label.upper()}_TIMEOUT_S")
@@ -617,6 +619,12 @@ def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
         ["submit-host-result", workflow_id, "--run-id", run_id,
          "--call-key", call_key, "--result", str(res_file)],
         timeout_s=_SUBMIT_TIMEOUT_S, err_label="submit", workflow_id=workflow_id)
+
+
+def _run_finalize(workflow_id: str) -> dict[str, Any]:
+    """Materialise attended results and resume the graph through synthesis."""
+    return _run_cli_json(["finalize", workflow_id], timeout_s=_FINALIZE_TIMEOUT_S,
+                         err_label="finalize", workflow_id=workflow_id)
 
 
 def _tool_handlers() -> dict[str, Any]:
@@ -882,6 +890,24 @@ def _tool_handlers() -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("attended submit failed")
             return {"ok": False, "error": f"submit_failed: {e}"}
+
+    def workflow_finalize(args: dict[str, Any]) -> dict[str, Any]:
+        """Close an attended workflow: synthesis -> judge_synthesis -> postcheck.
+
+        E2-30: the attended step/submit loop marks tasks done but never
+        re-enters the graph, so an interactive workflow otherwise ends with no
+        engine DECISION_RECORD, no postcheck and no episodic row. Call this
+        once `hydra.workflow.step` returns {status:"ready_to_finalize"}.
+        Idempotent: a second call returns {status:"already_finalized"}.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        if not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        try:
+            return _run_finalize(workflow_id)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("attended finalize failed")
+            return {"ok": False, "error": f"finalize_failed: {e}"}
 
     # ------------------------------------------------------------------
     # F32-H: four new governance-federation tools called by AgentSmith's
@@ -1209,6 +1235,7 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.workflow.plan": workflow_plan,
         "hydra.workflow.step": workflow_step,
         "hydra.workflow.submit_host_result": workflow_submit_host_result,
+        "hydra.workflow.finalize": workflow_finalize,
         "hydra.workflow.resume": workflow_resume,
         "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
         "hydra.workflow.budget": workflow_budget,
@@ -1352,6 +1379,26 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                            "description": "The host subagent's result object."},
             },
             "required": ["workflow_id", "run_id", "call_key", "result"],
+        },
+    },
+    "hydra.workflow.finalize": {
+        "description": (
+            "Attended execution: close the workflow through the ENGINE. Call it "
+            "once hydra.workflow.step returns {status:'ready_to_finalize'}. "
+            "Materialises every attended task result (engineering stages and "
+            "claude-skill/impersonation squad cursors) into squad DECISION_RECORD "
+            "envelopes + artifact rows, then resumes the graph so synthesis -> "
+            "judge_synthesis -> postcheck run over the real outputs: the engine "
+            "DECISION_RECORD is persisted to episodic memory (RA-8) and the phase "
+            "becomes terminal. Returns {ok:true, status:'finalized', "
+            "decision_record_id, phase, artifact_refs} or {ok:false, "
+            "status:'tasks_pending', pending:[task_id,...]} when the attended loop "
+            "is not done. Idempotent: a second call returns "
+            "{ok:true, status:'already_finalized', decision_record_id}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
         },
     },
     "hydra.workflow.submit_envelopes": {

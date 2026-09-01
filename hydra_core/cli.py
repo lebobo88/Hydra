@@ -1532,6 +1532,125 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     return None, None
 
 
+def _attended_result_record(state: HydraState, res: dict) -> dict | None:
+    """Project a terminal attended cursor result into the durable record
+    `hydra finalize` later materialises into a squad DECISION_RECORD (E2-30).
+
+    Returns None when the result carries no task_id (nothing to attribute).
+    The record is deliberately small and JSON-only: the checkpoint is the
+    authoritative store and must stay serialisable.
+    """
+    tid = res.get("task_id")
+    if tid is None:
+        return None
+    tid = str(tid)
+    owner = str(res.get("squad_slug") or "")
+    if not owner:
+        for t in getattr(state, "tasks", []):
+            if str(t.task_id) == tid:
+                owner = t.owner_squad
+                break
+    record: dict[str, object] = {
+        "task_id": tid,
+        "owner_squad": owner or "engineering",
+        "run_id": str(res.get("run_id") or tid),
+        "status": str(res.get("status") or "complete"),
+        "final_status": str(res.get("final_status") or res.get("status") or ""),
+        "stage_id": res.get("stage_id"),
+        "summary": (str(res.get("stage_outcome") or "") or None),
+        "changed_paths": list(res.get("changed_paths") or [])[:50],
+        "cost_usd": float(res.get("cost_usd") or 0.0),
+    }
+    if isinstance(res.get("artifact_ref"), dict):
+        record["artifact_ref"] = res["artifact_ref"]
+    if res.get("error"):
+        record["error"] = str(res["error"])[:500]
+    return record
+
+
+def _merge_attended_result(existing: list[dict], record: dict | None) -> list[dict]:
+    """Upsert an attended result by task_id (last terminal outcome wins)."""
+    if record is None:
+        return list(existing or [])
+    out = [r for r in (existing or []) if str(r.get("task_id")) != record["task_id"]]
+    out.append(record)
+    return out
+
+
+def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> list[str]:
+    """Task ids the attended loop has NOT driven to a terminal outcome.
+
+    A task counts as attended-done when its id is in
+    ``attended_completed_task_ids`` (the same signal `_next_engineering_task`
+    and `_next_nonengineering_attended_task` honour), OR when the in-graph
+    dispatch already carried it to a terminal status.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    pending: list[str] = []
+    for t in getattr(state, "tasks", []):
+        tid = str(t.task_id)
+        if tid in done:
+            continue
+        if t.status in ("done", "failed", "cancelled"):
+            continue
+        pending.append(tid)
+    return pending
+
+
+def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[dict]]:
+    """Turn attended task records into the state shape `node_synthesis` reads.
+
+    `node_synthesis` groups `state.envelopes` by `origin_squad` and mints one
+    MemoryRef per `state.artifacts` entry. Attended tasks never went through
+    `node_dispatch`, so neither channel holds their output. This builds, per
+    attended result, one squad-origin DECISION_RECORD envelope plus one
+    artifact row keyed by the persisted MemoryRef (native pack artifact) or the
+    pp run id (engineering stage).
+    """
+    from .schemas import DecisionRecord, MemoryRef
+
+    envelopes: list[dict] = []
+    artifacts: list[dict] = []
+    seen_envelope_tasks = {
+        str(e.get("_task_id")) for e in (state.envelopes or []) if e.get("_task_id")
+    }
+    for rec in (getattr(state, "attended_results", []) or []):
+        tid = str(rec.get("task_id"))
+        if tid in seen_envelope_tasks:
+            continue  # an in-graph / ingest envelope already represents this task
+        squad = str(rec.get("owner_squad") or "engineering")
+        ref_obj = rec.get("artifact_ref") if isinstance(rec.get("artifact_ref"), dict) else None
+        ref_key = str((ref_obj or {}).get("key") or rec.get("run_id") or tid)
+        kind = "attended_squad_artifact" if ref_obj else "attended_pp_run"
+        status = str(rec.get("final_status") or rec.get("status") or "complete")
+        detail = rec.get("summary") or rec.get("error") or ""
+        record = DecisionRecord(
+            workflow_id=state.workflow_id,
+            origin_squad=squad,
+            target_squad="hydra",
+            decision=(f"Attended {squad} task {tid} finished: {status}"),
+            rationale=(
+                f"Driven in-context by the attended host loop (run {rec.get('run_id')}). "
+                f"outcome={status}; artifact={ref_key}"
+                + (f"; detail={str(detail)[:300]}" if detail else "")
+            ),
+            artifacts=[MemoryRef(tier="episodic", key=ref_key, summary=kind)],
+            sealed=(status == "complete"),
+        )
+        env = record.model_dump(mode="json")
+        env["_task_id"] = tid
+        env["_attended"] = True
+        envelopes.append(env)
+        artifacts.append({
+            "kind": kind,
+            "ref": ref_key,
+            "task_id": tid,
+            "squad": squad,
+            "status": status,
+        })
+    return envelopes, artifacts
+
+
 def _resolve_pack_lead_agent(pack) -> str:
     """Resolve the supervisor / lead agent slug for a squad pack.
 
@@ -1828,8 +1947,14 @@ def _cmd_attended_step(args) -> int:
             print(json.dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
-        # No pending tasks of any kind.
-        print(json.dumps({"ok": True, "status": "no_pending_task",
+        # No pending tasks of any kind. E2-30: this is not the end of the
+        # workflow — the attended results still have to go through
+        # synthesis/judge_synthesis/postcheck. Tell the host to call
+        # `hydra finalize` (status), keeping `no_pending_task` as a
+        # compatibility alias for hosts pinned to the old contract.
+        print(json.dumps({"ok": True, "status": "ready_to_finalize",
+                          "no_pending_task": True,
+                          "next_action": "hydra.workflow.finalize",
                           "workflow_id": wf}))
         return 0
     finally:
@@ -1892,10 +2017,13 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
                 res["budget_block"] = block
                 res["budget_downgrade"] = downgrade
                 res["spent_usd"] = state.budget.spent_usd
+                attended_results = _merge_attended_result(
+                    state.attended_results, _attended_result_record(state, res))
                 try:
                     sup.update_state(config, {
                         "attended_completed_task_ids": completed,
                         "attended_done_task_ids": done_ids,
+                        "attended_results": attended_results,
                         "open_pp_runs": open_runs,
                         "budget": state.budget.model_dump(mode="json"),
                         "budget_downgrade_active": bool(downgrade),
@@ -2035,10 +2163,16 @@ def _cmd_attended_submit(args) -> int:
                     res["budget_block"] = block
                     res["budget_downgrade"] = downgrade
                     res["spent_usd"] = state.budget.spent_usd
+                    # E2-30: persist the attended outcome so `hydra finalize`
+                    # can materialise it into a squad result envelope for
+                    # node_synthesis (the in-graph dispatch never ran here).
+                    attended_results = _merge_attended_result(
+                        state.attended_results, _attended_result_record(state, res))
                     try:
                         sup.update_state(config, {
                             "attended_completed_task_ids": completed,
                             "attended_done_task_ids": done_ids,
+                            "attended_results": attended_results,
                             "open_pp_runs": open_runs,
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),
@@ -2105,6 +2239,145 @@ def _cmd_attended_submit(args) -> int:
                                               "status": res.get("status")})
         print(json.dumps({"ok": True, **res}, indent=2, default=str))
         return 0
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_finalize(args) -> int:
+    """``hydra finalize <workflow_id>`` — close an attended workflow properly.
+
+    E2-30: the attended loop (`hydra step` / `hydra submit-host-result`) marks
+    tasks attended-done but never re-enters the graph, so an interactive
+    workflow died at `phase="synthesis"` with no engine DECISION_RECORD, no
+    judge_synthesis verdict, no postcheck governance pass and no RA-8 episodic
+    row. This command is the missing leg: it materialises the attended results
+    into the state shape `node_synthesis` expects and resumes the graph so
+    `synthesis -> judge_synthesis -> postcheck` run over real squad output.
+
+    Contract:
+      * any task still pending -> ``{ok:false, status:"tasks_pending", pending}``
+      * already finalized      -> ``{ok:true, status:"already_finalized",
+                                     decision_record_id}`` (idempotent)
+      * otherwise              -> ``{ok:true, status:"finalized",
+                                     decision_record_id, phase, artifact_refs}``
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+    if not _WORKFLOW_ID_RE.match(wf):
+        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+              file=sys.stderr)
+        return 1
+
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "status": "resume_in_progress",
+                          "lock": str(lock_path)}))
+        return 0
+    try:
+        from .supervisor import build_supervisor, _PurePythonRunner
+        dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        if isinstance(sup, _PurePythonRunner):
+            print(json.dumps({
+                "ok": False,
+                "error": "langgraph unavailable — finalize requires the checkpointing supervisor",
+            }), file=sys.stderr)
+            return 1
+        config = {"configurable": {"thread_id": wf}}
+        snap = sup.get_state(config)
+        if snap is None or not snap.values:
+            print(json.dumps({"ok": False, "workflow_id": wf, "error": "not_found"}),
+                  file=sys.stderr)
+            return 1
+        try:
+            state = HydraState.model_validate(snap.values)
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({"ok": False, "workflow_id": wf,
+                              "error": f"checkpoint_invalid: {e}"}), file=sys.stderr)
+            return 1
+
+        # Idempotent: a second call never re-synthesizes (that would duplicate
+        # the episodic rows RA-8 writes inside node_synthesis).
+        if state.attended_finalized_record_id:
+            print(json.dumps({
+                "ok": True, "status": "already_finalized", "workflow_id": wf,
+                "decision_record_id": state.attended_finalized_record_id,
+                "phase": state.phase,
+            }, indent=2, default=str))
+            return 0
+
+        pending = _attended_pending_task_ids(state)
+        if pending:
+            print(json.dumps({
+                "ok": False, "status": "tasks_pending", "workflow_id": wf,
+                "pending": pending,
+                "detail": ("attended tasks still open — drive them with "
+                           "`hydra step` / `hydra submit-host-result` first"),
+            }, indent=2, default=str))
+            return 0
+
+        envelopes, artifacts = _materialize_attended_results(state)
+        patch: dict[str, object] = {
+            "phase": "synthesis",
+            "pending_hitl": None,
+            "hitl_return_node": None,
+        }
+        if envelopes:
+            patch["envelopes"] = envelopes
+        if artifacts:
+            patch["artifacts"] = artifacts
+        emit(project, wf, "finalize.materialized", {
+            "envelopes": len(envelopes), "artifacts": len(artifacts),
+            "attended_results": len(state.attended_results or []),
+        })
+        # as_node="judge_per_squad": its conditional edge routes to `synthesis`
+        # for a non-surfaced phase, so the graph re-enters exactly where the
+        # attended loop left off.
+        sup.update_state(config, patch, as_node="judge_per_squad")
+
+        # `synthesis` and `judge_synthesis` are interrupt_before nodes; drive
+        # the tail deterministically until the graph has no next task (END) or
+        # it parks on a HITL gate.
+        for _ in range(6):
+            cur = sup.get_state(config)
+            if not getattr(cur, "next", None):
+                break
+            sup.invoke(None, config=config)
+            after = sup.get_state(config)
+            if (after.values or {}).get("pending_hitl") and                     (after.values or {}).get("phase") == "surfaced":
+                break
+
+        final_snap = sup.get_state(config)
+        final_state = HydraState.model_validate(final_snap.values)
+        record = next(
+            (e for e in reversed(final_state.envelopes)
+             if e.get("type") == "DECISION_RECORD" and e.get("origin_squad") == "hydra"),
+            None,
+        )
+        record_id = str((record or {}).get("id") or "")
+        if record_id:
+            try:
+                sup.update_state(config, {"attended_finalized_record_id": record_id})
+            except Exception as e:  # noqa: BLE001
+                emit(project, wf, "finalize.persist_failed", {"error": str(e)})
+        emit(project, wf, "finalize.complete", {
+            "decision_record_id": record_id or None,
+            "phase": final_state.phase,
+        })
+        payload = {
+            "ok": bool(record_id),
+            "status": "finalized" if record_id else "no_decision_record",
+            "workflow_id": wf,
+            "decision_record_id": record_id or None,
+            "phase": final_state.phase,
+            "artifact_refs": [a.get("key") for a in ((record or {}).get("artifacts") or [])],
+            "dissent_count": len((record or {}).get("dissenting_opinions") or []),
+            "sealed": (record or {}).get("sealed"),
+            "pending_hitl": final_state.pending_hitl,
+            "trace": str(trace_path(project, wf)),
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        return 0 if record_id else 1
     finally:
         _release_resume_lock(lock_fd, lock_path)
 
@@ -3359,6 +3632,12 @@ def main(argv: list[str] | None = None) -> int:
                      help="Path to a JSON file with the subagent's result object.")
     shr.add_argument("--verbose", action="store_true")
 
+    fin = sub.add_parser("finalize", help=(
+        "Attended mode: materialise the attended task results and resume the "
+        "graph through synthesis -> judge_synthesis -> postcheck (idempotent)."))
+    fin.add_argument("workflow_id")
+    fin.add_argument("--verbose", action="store_true")
+
     s = sub.add_parser("status")
     s.add_argument("workflow_id", nargs="?")
     t = sub.add_parser("trace")
@@ -3539,6 +3818,7 @@ def main(argv: list[str] | None = None) -> int:
         "plan": _cmd_plan,
         "step": _cmd_attended_step,
         "submit-host-result": _cmd_attended_submit,
+        "finalize": _cmd_finalize,
         "status": _cmd_status,
         "trace": _cmd_trace,
         "budget": _cmd_budget,
