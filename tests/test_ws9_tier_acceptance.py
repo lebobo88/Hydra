@@ -20,6 +20,10 @@ import pytest
 @dataclass
 class CaptureDispatcher:
     """Fake dispatcher that records all call_mcp invocations."""
+    # E2-22: this suite exercises the in-graph mcp dispatch path with a
+    # scripted pp harness. Opt in explicitly — node_dispatch otherwise
+    # defers mcp packs to the attended host on a non-live dispatcher.
+    allow_offline_mcp_dispatch: bool = True
     calls: list[dict[str, Any]] = field(default_factory=list)
     mcp_result: dict[str, Any] = field(default_factory=lambda: {
         "status": "done",
