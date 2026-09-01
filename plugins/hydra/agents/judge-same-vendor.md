@@ -41,3 +41,11 @@ vendor pinning (`recordVerdict`) rejects a verdict whose `judge_producer` and
 `judge_model_id` both equal the generator's, and the attended generator is
 also Claude — often the same model id. The `-same-vendor-host` label keeps
 the model id honest while satisfying the pinning check (`cross_vendor=0`).
+
+Report `judge_model_id` exactly as returned by the critique tool; if the tool
+response does not state a model, use the pinned id given in
+`allowed_judge_model_ids` for your `judge_producer`. Never invent a model id.
+pp pins no Claude critique model, so report the Claude model you actually ran
+as — but `judge_producer` must stay `"claude-same-vendor-host"`, since the
+host only recognizes real vendor slugs (optionally carrying that suffix) and
+bounces anything else back for correction.

@@ -37,3 +37,12 @@ Return to the parent (hydra.workflow.submit_host_result) with:
 ```
 {call_key: "<as given>", result: {outcome: "pass"|"revise"|"fail", critique_md: "<findings with file paths>", judge_producer: "<your vendor>", judge_model_id: "<model>", score_json: {<per-dimension scores>}, cost_usd: <your cost>}}
 ```
+
+Report `judge_model_id` exactly as returned by the critique tool; if the tool
+response does not state a model, use the pinned id given in
+`allowed_judge_model_ids` for your `judge_producer`. Never invent a model id.
+pp's `record_verdict` hard-pins the critique model for `codex` and `agy`, so a
+guessed id (e.g. `"gpt-5.1-codex"`) is rejected at the ledger. The host
+normalizes an off-pin id and keeps your claim in
+`score_json.judge_model_id_reported`, but it can only do so when the producer
+itself is one it knows — so `judge_producer` must be a real vendor slug.

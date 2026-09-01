@@ -205,6 +205,150 @@ def _classify_infra_failure(exc: Exception | None) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# E2-27: judge_model_id validation / normalization                            #
+# --------------------------------------------------------------------------- #
+# pp's ``recordVerdict`` hard-pins the model id a judge may report for the
+# vendors whose critique CLI is itself pinned (codex, agy). A visible judge
+# subagent that reports the model it *thinks* it used (e.g. "gpt-5.1-codex")
+# rather than the id pp's critique tool actually served made record_verdict
+# throw a validation error; the bridge classified that as deterministic-fatal
+# and surfaced an otherwise-PASSING stage with the merge discarded (E2-27).
+#
+# The host now (a) tells the judge which ids are acceptable via the judge
+# host_action, (b) normalizes a mislabeled id to the producer's pinned
+# critique model before calling record_verdict (keeping the reported value in
+# ``score_json["judge_model_id_reported"]``), and (c) treats a pp pin error as
+# host-correctable rather than fatal.
+
+# Suffix the same-vendor Claude judge appends to its producer label (LV-3) so
+# pp's generator-identical producer+model check does not reject the verdict.
+# It is a LABEL, not a vendor: strip it before looking up model pins.
+_SAME_VENDOR_HOST_SUFFIX = "-same-vendor-host"
+
+# Static fallback for pp's pinned critique model ids, used when the
+# ``pp_harness.doctor`` probe is unavailable. Mirrors pp's DEFAULT_MODELS
+# (``codex_critique`` / ``codex_critique_escalated`` / ``agy_critique``).
+# ``claude`` is present with an EMPTY tuple on purpose: pp does not pin Claude
+# critique models, so any id is acceptable and no normalization applies -- but
+# "claude" must still be a KNOWN producer so the same-vendor judge is not
+# rejected as unsupported.
+_STATIC_JUDGE_MODEL_PINS: dict[str, tuple[str, ...]] = {
+    "codex": ("gpt-5.4", "gpt-5.5"),
+    "agy": ("gemini-3.1-pro-preview",),
+    "claude": (),
+}
+
+# Substring identifying pp's judge-model pin rejection on record_verdict.
+# Such a rejection is host-correctable (re-report the model id) rather than a
+# fatal defect in the artifact, so it must NOT surface a passing stage.
+_JUDGE_PIN_ERROR_MARKER = "must record judge_model_id"
+
+# Bound on how many times one judge call_key may be bounced back to the host
+# for a model-id/producer correction before the bridge stops asking and lets
+# the normal (pp-authoritative) path run. Without a bound a host that keeps
+# re-reporting the same unsupported producer would livelock the stage.
+_MAX_JUDGE_MODEL_CORRECTIONS = 2
+
+# Process-level cache of the doctor probe (fail-soft, refreshed on demand).
+_JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
+
+
+def _base_judge_vendor(producer: Any) -> str:
+    """Strip the LV-3 ``-same-vendor-host`` label suffix off a judge producer."""
+    p = str(producer or "")
+    if p.endswith(_SAME_VENDOR_HOST_SUFFIX):
+        return p[: -len(_SAME_VENDOR_HOST_SUFFIX)]
+    return p
+
+
+def allowed_judge_model_ids(dispatcher: Dispatcher | None,
+                            *, refresh: bool = False) -> dict[str, list[str]]:
+    """Return ``{judge_producer: [acceptable model ids]}``.
+
+    Sourced from ``pp_harness.doctor``'s ``judge_capabilities`` map (the
+    authority on what each vendor's critique tool is pinned to), UNIONED with
+    the static fallback above -- doctor reports only the DEFAULT critique
+    model, while pp additionally accepts codex's escalated id, so neither
+    source alone is complete.
+
+    Fail-soft in every direction: a missing dispatcher, an RBAC denial, a
+    transport error, or a malformed payload all fall back to the static map.
+    An empty list means "this producer is known but pp pins no model for it"
+    (claude), which disables normalization rather than rejecting the verdict.
+    """
+    global _JUDGE_MODEL_PIN_CACHE
+    if _JUDGE_MODEL_PIN_CACHE is not None and not refresh:
+        return {k: list(v) for k, v in _JUDGE_MODEL_PIN_CACHE.items()}
+    pins: dict[str, list[str]] = {
+        k: list(v) for k, v in _STATIC_JUDGE_MODEL_PINS.items()
+    }
+    if dispatcher is not None:
+        try:
+            caps = _pp_inner(_raise_on_error_payload(
+                dispatcher.call_mcp("pp_harness", "doctor", {}, squad_id=_SQ),
+                "doctor",
+            )).get("judge_capabilities")
+            if isinstance(caps, dict):
+                for vendor, summary in caps.items():
+                    if not isinstance(summary, dict):
+                        continue
+                    bucket = pins.setdefault(str(vendor), [])
+                    model = summary.get("critique_model")
+                    if model and str(model) not in bucket:
+                        # Front of the list: doctor's value is the vendor's
+                        # DEFAULT pin, which is what normalization targets.
+                        bucket.insert(0, str(model))
+        except Exception:  # noqa: BLE001 — never block a stage on a probe
+            pass
+    _JUDGE_MODEL_PIN_CACHE = {k: tuple(v) for k, v in pins.items()}
+    return {k: list(v) for k, v in pins.items()}
+
+
+def _reset_judge_model_pin_cache() -> None:
+    """Test hook: drop the cached doctor probe."""
+    global _JUDGE_MODEL_PIN_CACHE
+    _JUDGE_MODEL_PIN_CACHE = None
+
+
+def _is_judge_pin_error(exc: Exception | None) -> bool:
+    """True when a record_verdict failure is pp's judge-model pin rejection.
+
+    That rejection is a LABEL problem the host can correct by re-reporting the
+    model id -- it says nothing about the artifact -- so it must be routed to
+    the host-correctable path instead of ``_classify_infra_failure``'s
+    deterministic-fatal default (which matches on "validation").
+    """
+    if exc is None:
+        return False
+    if _JUDGE_PIN_ERROR_MARKER in str(exc).lower():
+        return True
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        return _JUDGE_PIN_ERROR_MARKER in str(payload.get("error", "")).lower()
+    return False
+
+
+def _judge_correction_budget_left(cursor: dict[str, Any],
+                                  call_key: str | None) -> bool:
+    """Whether this judge call_key may still be bounced back for a correction."""
+    counts = cursor.get("judge_model_corrections")
+    if not isinstance(counts, dict):
+        return True
+    return int(counts.get(str(call_key), 0)) < _MAX_JUDGE_MODEL_CORRECTIONS
+
+
+def _record_judge_correction(cursor: dict[str, Any],
+                             call_key: str | None) -> int:
+    counts = cursor.get("judge_model_corrections")
+    if not isinstance(counts, dict):
+        counts = {}
+        cursor["judge_model_corrections"] = counts
+    key = str(call_key)
+    counts[key] = int(counts.get(key, 0)) + 1
+    return counts[key]
+
+
+# --------------------------------------------------------------------------- #
 # Worktree isolation (write-safety)                                           #
 # --------------------------------------------------------------------------- #
 # In attended mode the host's visible `engineer` subagent writes code. The
@@ -1770,6 +1914,10 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # doesn't break retry-safety: the same judge call re-driven on the same
     # attempt still produces the same token.
     judge_call_key = f"judge-{run_id}-{stage_id}-{cursor['attempt_id']}-{gen_idx}"
+    # E2-27: hand the host the model ids pp will accept for each judge
+    # producer, so the judge subagent reports a pinned id instead of guessing
+    # one that record_verdict then rejects.
+    allowed_models = allowed_judge_model_ids(dispatcher)
     cursor["pending_action"] = {
         "call_key": judge_call_key,
         "agent_type": judge_agent,
@@ -1778,11 +1926,16 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         "artifact_text": judge_text,
         "rubric_md": rubric_body,
         "cwd": work_path,
+        "allowed_judge_model_ids": allowed_models,
         "instructions": (
             f"Spawn the visible `{judge_agent}` subagent to judge the diff "
             f"against rubric {gate_rubric}. Then call submit-host-result with "
             "{call_key, result:{outcome:pass|revise|fail, critique_md, "
-            "judge_producer, judge_model_id, score_json, cost_usd}}."),
+            "judge_producer, judge_model_id, score_json, cost_usd}}. "
+            "Report judge_model_id exactly as the critique tool returned it; "
+            "if the tool named no model, use the pinned id for that producer "
+            f"from allowed_judge_model_ids ({allowed_models!r}). Never invent "
+            "a model id."),
     }
     _trace(cursor, "attended.attempt_recorded", {
         "stage_id": stage_id, "attempt_id": cursor["attempt_id"],
@@ -1795,7 +1948,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any],
                  *, cursor_file: "str | Path | None" = None,
-                 call_key: str | None = None) -> None:
+                 call_key: str | None = None) -> dict[str, Any] | None:
     """await_judge -> terminal (or back to await_generate for Reflexion x1).
 
     F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
@@ -1808,6 +1961,14 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     Fix-1b: idempotency markers (verdict_recorded_for / smoke_result_for) written
     mid-function so a retried submit after a timeout never double-records in the
     pp ledger or restarts the ~28-min smoke.
+    E2-27: an unsupported judge_producer, or a pp judge-model pin rejection on
+    record_verdict, is HOST-CORRECTABLE -- the cursor stays in ``await_judge``
+    with its pending_action (and call_key) untouched and this function returns
+    a ``{"ok": False, "retryable": True, ...}`` dict for the caller to relay,
+    instead of surfacing a passing stage.
+
+    Returns ``None`` on a normal transition, or the host-correctable error
+    dict described above.
     """
     cm = dispatcher.call_mcp
     producer = cursor["producer"]
@@ -1816,6 +1977,46 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     required_cross = bool(cursor.get("required_cross"))
     gen_idx = cursor.get("generate_index", 0)   # GAP-f: 0=first attempt, 1=retry
     work_path = cursor.get("work_path") or cursor["project_path"]
+
+    # E2-27: validate the judge's self-reported producer BEFORE anything is
+    # accrued or written. An unsupported producer means the host cannot build
+    # a valid record_verdict payload, and pp does not police non-{codex,agy}
+    # vendors -- so a bogus label would otherwise land a bogus vendor in the
+    # ledger. Bounce it back as host-correctable: the cursor is left exactly
+    # as it was (state "await_judge"/"stalled_infra", same pending_action,
+    # same call_key), so a corrected resubmit re-enters here cleanly.
+    allowed_models = allowed_judge_model_ids(dispatcher)
+    _reported_producer = str(result.get("judge_producer")
+                             or ("codex" if required_cross else "claude"))
+    _reported_vendor = _base_judge_vendor(_reported_producer)
+    if _reported_vendor not in allowed_models:
+        if _judge_correction_budget_left(cursor, call_key):
+            n = _record_judge_correction(cursor, call_key)
+            _trace(cursor, "attended.judge_producer_unsupported", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "judge_producer": _reported_producer,
+                "correction_attempt": n,
+                "allowed_judge_model_ids": allowed_models,
+            })
+            if cursor_file is not None:
+                save_cursor(cursor_file, cursor)
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": (
+                    f"judge_producer {_reported_producer!r} is not a supported "
+                    f"judge vendor; resubmit the SAME call_key with a "
+                    f"judge_producer in {sorted(allowed_models)} and a "
+                    f"judge_model_id from allowed_judge_model_ids"),
+                "allowed_judge_model_ids": allowed_models,
+            }
+        # Correction budget exhausted — stop bouncing and let the normal path
+        # run so the stage reaches a decision instead of livelocking.
+        _trace(cursor, "attended.judge_producer_unsupported_accepted", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "judge_producer": _reported_producer,
+            "reason": "correction budget exhausted; proceeding to pp",
+        })
 
     # W2-3: guard cost/token accrual against double-counting when a
     # transport-shaped record_verdict failure holds the cursor open
@@ -1869,6 +2070,30 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if degraded:
         score_json["_judge_degraded"] = True
 
+    # E2-27: normalize the reported judge_model_id against pp's pins BEFORE
+    # record_verdict. pp pins codex/agy critique models; a judge that names
+    # the model it believes it used ("gpt-5.1-codex") rather than the id the
+    # critique tool served made record_verdict throw, which used to discard a
+    # passing stage. Normalize to the vendor's pinned critique model and keep
+    # the judge's own claim in score_json for audit. Vendors pp does not pin
+    # (claude -> empty list) are passed through untouched.
+    _judge_vendor = _base_judge_vendor(judge_producer)
+    _reported_model = str(result.get("judge_model_id")
+                          or result.get("model") or "").strip()
+    judge_model_id = _reported_model or f"{judge_producer}-default"
+    _vendor_pins = allowed_models.get(_judge_vendor) or []
+    if _vendor_pins and judge_model_id not in _vendor_pins:
+        _pinned = _vendor_pins[0]
+        score_json["judge_model_id_reported"] = _reported_model or None
+        _trace(cursor, "attended.judge_model_id_normalized", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "judge_producer": judge_producer,
+            "reported": _reported_model or None,
+            "normalized_to": _pinned,
+            "allowed_judge_model_ids": _vendor_pins,
+        })
+        judge_model_id = _pinned
+
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
     # immediately — Reflexion is reserved for code defects the engineer can fix.
@@ -1907,8 +2132,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         _verdict_payload = {
             "attempt_id": attempt_id,
             "judge_producer": judge_producer,
-            "judge_model_id": str(result.get("judge_model_id")
-                                  or result.get("model") or f"{judge_producer}-default"),
+            "judge_model_id": judge_model_id,
             "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
             "critique_md": critique_md[:4000],
             "score_json": score_json,
@@ -1946,6 +2170,45 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             # row and no trace explaining why.
             _record_verdict_ok = False
             _record_verdict_exc = exc
+
+    # E2-27: pp's judge-model pin rejection is a LABEL problem, not an
+    # artifact defect. `_classify_infra_failure` calls it "deterministic"
+    # (its text matches the "validation" marker), which used to surface a
+    # PASSING stage and discard the merge. Route it to the host-correctable
+    # path instead: nothing about the cursor state or pending_action changes,
+    # so a resubmit under the SAME call_key with a corrected judge_model_id
+    # re-enters here and retries record_verdict (no verdict row was written,
+    # so `verdict_recorded_for` is unset and there is nothing to double-write).
+    if not _record_verdict_ok and _is_judge_pin_error(_record_verdict_exc):
+        _pin_reason = str(_record_verdict_exc)
+        if _judge_correction_budget_left(cursor, call_key):
+            n = _record_judge_correction(cursor, call_key)
+            _trace(cursor, "attended.judge_model_id_pin_rejected", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "attempt_id": attempt_id,
+                "judge_producer": judge_producer,
+                "judge_model_id": judge_model_id,
+                "correction_attempt": n,
+                "reason": _pin_reason,
+                "allowed_judge_model_ids": allowed_models,
+            })
+            if cursor_file is not None:
+                save_cursor(cursor_file, cursor)
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": (
+                    "pp rejected the judge model id: " + _pin_reason +
+                    " — resubmit the SAME call_key with a judge_model_id from "
+                    "allowed_judge_model_ids"),
+                "allowed_judge_model_ids": allowed_models,
+            }
+        _trace(cursor, "attended.judge_model_id_pin_unrecoverable", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "reason": _pin_reason,
+            "correction_budget": _MAX_JUDGE_MODEL_CORRECTIONS,
+        })
+
     if outcome == "pass" and not _record_verdict_ok:
         _rv_reason = str(_record_verdict_exc) if _record_verdict_exc is not None else "unknown error"
         _rv_kind = _classify_infra_failure(_record_verdict_exc)
@@ -2802,8 +3065,18 @@ def submit_host_result(
         # submit_host_result carrying the same call_key/result re-enters
         # _apply_judge here and retries record_verdict via the
         # idempotency_token — exactly-once even across the re-drive.
-        _apply_judge(dispatcher, cursor, result,
-                     cursor_file=cursor_file, call_key=call_key)
+        # E2-27: a host-correctable judge label problem (unsupported producer,
+        # or pp's judge-model pin rejection) comes back as a retryable error
+        # dict. The cursor is unchanged and still holds this judge's
+        # pending_action/call_key, so the host corrects the label and
+        # resubmits under the SAME call_key rather than losing the stage.
+        _judge_err = _apply_judge(dispatcher, cursor, result,
+                                  cursor_file=cursor_file, call_key=call_key)
+        if _judge_err is not None:
+            save_cursor(cursor_file, cursor)
+            out = _step_result(cursor, cursor_file)
+            out.update(_judge_err)
+            return out
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
         _apply_squad_result(cursor, result)

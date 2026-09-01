@@ -131,6 +131,16 @@ tools:
       The RBAC matcher keys on (name, mcp_server), so this entry is REQUIRED for
       pp_codex.critique — the pp_agy entry above does not cover it.
       Not for: code generation — use the codex generate tool instead.
+  - name: doctor
+    mcp_server: pp_harness
+    privilege: read
+    notes: >
+      Read pp's health summary — CLI versions, configured vendors, and the
+      judge_capabilities map naming each vendor's PINNED critique model. The
+      attended bridge reads judge_capabilities so it can hand the judge agent
+      the model ids pp's record_verdict will accept, and normalize a
+      mislabeled judge_model_id instead of losing a passing stage (E2-27).
+      Read-only; called without `smoke` so it never exercises a vendor CLI.
   - name: gate_eligible_judges
     mcp_server: pp_harness
     privilege: read
