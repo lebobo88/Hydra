@@ -66,8 +66,73 @@ _SPOOLABLE_TOOLS = frozenset({
     "eights.constitution.attest",
     "eights.hydra.envelope.record",
     "eights.governance.hitl.request",
+    # E2-17: a terminal-transition resolve MUST survive an offline daemon —
+    # otherwise the ticket it was meant to close stays pending forever (the
+    # exact zombie class this finding is about). The spooled args carry their
+    # own `envelope` (with the capability token), which `replay_pending`
+    # preserves because the spooled args override the default envelope. A
+    # token minted now may have expired by replay time; the replay then fails
+    # and is retried/aged out like any other spool entry.
+    "eights.governance.hitl.resolve",
     "eights.evolution.propose",
 })
+
+# E2-17: HITL request expiry. `plugins/hydra/skills/hitl-protocol/SKILL.md`
+# documents the wait behaviour as "mark the workflow `surfaced` after
+# `expires_at` (default 24h)", so 24h is the protocol default here.
+# Override with HYDRA_HITL_EXPIRY_HOURS.
+_HITL_EXPIRY_HOURS_DEFAULT = 24.0
+
+
+def hitl_expiry_hours() -> float:
+    """Configured HITL expiry window in hours (HYDRA_HITL_EXPIRY_HOURS).
+
+    Falls back to the protocol default on an unset, unparseable or
+    non-positive value — an expiry of zero would file already-expired
+    requests, which is worse than no expiry at all.
+    """
+    raw = (_os.environ.get("HYDRA_HITL_EXPIRY_HOURS") or "").strip()
+    if not raw:
+        return _HITL_EXPIRY_HOURS_DEFAULT
+    try:
+        hours = float(raw)
+    except ValueError:
+        return _HITL_EXPIRY_HOURS_DEFAULT
+    return hours if hours > 0 else _HITL_EXPIRY_HOURS_DEFAULT
+
+
+def hitl_expires_at(now: Any = None) -> str:
+    """ISO-8601 UTC instant at which a HITL request filed *now* expires."""
+    from datetime import datetime, timedelta, timezone
+    base = now or datetime.now(timezone.utc)
+    stamp = (base + timedelta(hours=hitl_expiry_hours())).replace(microsecond=0)
+    return stamp.isoformat().replace("+00:00", "Z")
+
+
+def _mint_hitl_resolve_token(*, request_id: str, workflow_id: str) -> Optional[dict]:
+    """Mint the WS-AUTH operator-capability token `hitl.resolve` requires.
+
+    TheEights' `hitlResolve` fails closed without a token whose capability is
+    `hitl.resolve` and whose resource_id is the request id. When
+    HYDRA_OPERATOR_KEY is unset the mint degrades (sig.value=None) and the
+    daemon rejects it — the resolve then spools like any other failed call.
+    """
+    try:
+        import time as _t
+        from ..auth.capability import mint_capability
+        now = int(_t.time())
+        return mint_capability({
+            "v": 1,
+            "actor_id": _os.environ.get("HYDRA_OPERATOR_ACTOR") or "hydra.supervisor",
+            "actor_kind": "human",
+            "capability": "hitl.resolve",
+            "resource_id": str(request_id),
+            "workflow_id": str(workflow_id or request_id),
+            "issued_at": now,
+            "exp": now + 900,
+        }, now=now)
+    except Exception:  # noqa: BLE001 — a mint failure must never block the resolve
+        return None
 
 _REPLAY_THREADS: dict[str, threading.Thread] = {}
 _REPLAY_THREADS_LOCK = threading.Lock()
@@ -650,9 +715,76 @@ class EightsAttestor:
                 "options": list(hitl_envelope.get("options") or []),
                 "default_option": hitl_envelope.get("default_option"),
                 "gate_node": gate_node or "unspecified",
-                "expires_at": hitl_envelope.get("expires_at"),
+                # E2-17: never file an immortal request. An unset expires_at is
+                # what left 858 pending zombies in the shared ledger.
+                "expires_at": hitl_envelope.get("expires_at") or hitl_expires_at(),
             },
         }, guard_key="hitl_request")
+
+    def hitl_list(
+        self,
+        *,
+        status: str = "pending",
+        kind: Optional[str] = "hydra_gate",
+    ) -> Optional[list[dict]]:
+        """List HITL rows from the shared ledger (E2-17).
+
+        Returns the rows, or ``None`` when the daemon did not service the call
+        (unreachable / disabled) so callers can distinguish "no backlog" from
+        "backlog unknown". ``kind`` filters to Hydra-filed gates by default;
+        pass ``None`` for every consumer's rows.
+
+        Not routed through ``_call``: hitl.list returns a JSON *array*, which
+        ``_call`` would discard as a non-dict result. It is also read-only, so
+        there is nothing to spool on failure.
+        """
+        if not self.enabled or self.dispatcher is None:
+            return None
+        args = {"envelope": self._eights_envelope(), "status": status}
+        try:
+            result = self._dispatch_call("eights.governance.hitl.list", args)
+        except Exception:  # noqa: BLE001 — read-only probe, never raises upward
+            return None
+        if not self._is_success_envelope(result):
+            return None
+        inner = result.get("result", result) if isinstance(result, dict) else None
+        if isinstance(inner, dict):
+            inner = inner.get("rows") or inner.get("requests")
+        if not isinstance(inner, list):
+            return None
+        rows = [r for r in inner if isinstance(r, dict)]
+        if kind:
+            rows = [r for r in rows if r.get("kind") == kind]
+        return rows
+
+    def hitl_resolve(
+        self,
+        *,
+        request_id: str,
+        decision: str = "rejected",
+        note: str = "",
+        workflow_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Resolve one pending HITL request in the shared ledger (E2-17).
+
+        Fail-soft and spooled like every other durable eights write: a
+        rejected or unreachable call returns None and replays on drain.
+        """
+        rid = str(request_id or "").strip()
+        if not rid:
+            return None
+        envelope = self._eights_envelope(workflow_id=workflow_id)
+        token = _mint_hitl_resolve_token(
+            request_id=rid, workflow_id=str(workflow_id or ""),
+        )
+        if token is not None:
+            envelope["capability_token"] = token
+        return self._call("eights.governance.hitl.resolve", {
+            "envelope": envelope,
+            "request_id": rid,
+            "decision": decision,
+            "note": note,
+        })
 
     # ---------- redaction ----------
 
