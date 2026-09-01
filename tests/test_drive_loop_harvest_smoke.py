@@ -135,33 +135,156 @@ def _init_repo(root):
     _git(root, "commit", "-q", "-m", "init")
 
 
-def test_harvest_commits_only_run_scoped_paths(tmp_path):
-    _init_repo(tmp_path)
-    # Track a second file so we can leave an UNRELATED operator edit on it.
-    (tmp_path / "other.ts").write_text("// tracked\n", encoding="utf-8")
-    _git(tmp_path, "add", "other.ts")
-    _git(tmp_path, "commit", "-q", "-m", "track other")
+def _branch(root):
+    return _git(root, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
 
+
+def _rev(root, ref="HEAD"):
+    return _git(root, "rev-parse", "--verify", "--quiet", ref).stdout.strip()
+
+
+def _seed_run(root, run_id="run_X"):
+    """Leave a run-scoped edit + archived metadata in the tree, and an
+    UNRELATED operator WIP edit that must never be swept in."""
+    (root / "other.ts").write_text("// tracked\n", encoding="utf-8")
+    _git(root, "add", "other.ts")
+    _git(root, "commit", "-q", "-m", "track other")
     # The run edits src.ts (codex could not commit it itself).
-    (tmp_path / "src.ts").write_text("const a = 2; // fixed\n", encoding="utf-8")
+    (root / "src.ts").write_text("const a = 2; // fixed\n", encoding="utf-8")
     # The operator has an unrelated WIP edit open on other.ts — NOT this run's.
-    (tmp_path / "other.ts").write_text("// operator's WIP edit\n", encoding="utf-8")
-    # The run's archived metadata.
-    hdir = tmp_path / ".harness" / "run_X"
+    (root / "other.ts").write_text("// operator's WIP edit\n", encoding="utf-8")
+    hdir = root / ".harness" / run_id
     hdir.mkdir(parents=True)
     (hdir / "summary.md").write_text("ok", encoding="utf-8")
 
-    sha = harvest_pp_run_artifacts(
-        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
-        changed_paths=["src.ts"])
 
-    assert sha
+def test_harvest_commits_only_run_scoped_paths(tmp_path, monkeypatch):
+    """A judged-pass run on a non-default branch commits directly — and stages
+    only what THIS run touched."""
+    monkeypatch.delenv("HYDRA_HARVEST_DIRECT_COMMIT", raising=False)
+    _init_repo(tmp_path)
+    _git(tmp_path, "checkout", "-q", "-b", "feat/e2-38")
+    _seed_run(tmp_path)
+
+    res = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="complete", verdict_outcome="pass")
+
+    assert res and res["sha"] and res["preserved"] is False
+    assert res["branch"] == "feat/e2-38"
     committed = _git(tmp_path, "show", "--stat", "--name-only", "HEAD").stdout
     assert "src.ts" in committed          # the run's edit landed
     assert "other.ts" not in committed    # operator's unrelated WIP was NOT swept
     # operator's WIP is still uncommitted in the tree
     porcelain = _git(tmp_path, "status", "--porcelain").stdout
     assert "other.ts" in porcelain
+    # E2-38: the direct path reports harvest.committed.
+    trace = (tmp_path / ".hydra" / "wf1" / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"harvest.committed"' in trace
+
+
+def test_harvest_preserves_surfaced_run_on_run_branch(tmp_path, monkeypatch):
+    """E2-38: a surfaced run whose verdict was `revise` must NOT touch the
+    checked-out branch; its delta is parked on hydra/harvest/<run_id>."""
+    monkeypatch.delenv("HYDRA_HARVEST_DIRECT_COMMIT", raising=False)
+    _init_repo(tmp_path)
+    _seed_run(tmp_path)
+    main = _branch(tmp_path)
+    before = _rev(tmp_path)
+
+    res = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="surfaced", verdict_outcome="revise")
+
+    assert res and res["preserved"] is True
+    assert res["branch"] == "hydra/harvest/run_X"
+    assert res["reason"] == "unjudged"
+    # The operator's branch is byte-for-byte where it was.
+    assert _branch(tmp_path) == main
+    assert _rev(tmp_path) == before
+    # The work is recoverable on the harvest branch.
+    assert _rev(tmp_path, "refs/heads/hydra/harvest/run_X") == res["sha"]
+    on_branch = _git(tmp_path, "show", "--stat", "--name-only", res["sha"]).stdout
+    assert "src.ts" in on_branch
+    assert "other.ts" not in on_branch
+    # Nothing left staged on the operator's branch, and the files are still there.
+    assert not _git(tmp_path, "diff", "--cached", "--name-only").stdout.strip()
+    assert (tmp_path / "src.ts").read_text(encoding="utf-8") == "const a = 2; // fixed\n"
+    trace = (tmp_path / ".hydra" / "wf1" / "trace.jsonl").read_text(encoding="utf-8")
+    assert '"harvest.preserved"' in trace
+    assert '"hydra/harvest/run_X"' in trace
+
+
+def test_harvest_preserves_when_no_verdict_recorded(tmp_path, monkeypatch):
+    """No verdict at all (the live run_r4kIwmtZSoaR attempt 1) is not a pass."""
+    monkeypatch.delenv("HYDRA_HARVEST_DIRECT_COMMIT", raising=False)
+    _init_repo(tmp_path)
+    _git(tmp_path, "checkout", "-q", "-b", "feat/no-verdict")
+    _seed_run(tmp_path)
+    before = _rev(tmp_path)
+
+    res = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="complete", verdict_outcome=None)
+
+    assert res and res["preserved"] is True and res["reason"] == "unjudged"
+    assert _rev(tmp_path) == before
+
+
+def test_harvest_preserves_on_default_branch_even_when_passed(tmp_path, monkeypatch):
+    """Guard 2: pass or not, the default branch is never written without the
+    operator's explicit opt-in."""
+    monkeypatch.delenv("HYDRA_HARVEST_DIRECT_COMMIT", raising=False)
+    _init_repo(tmp_path)
+    _git(tmp_path, "branch", "-M", "main")
+    _seed_run(tmp_path)
+    before = _rev(tmp_path)
+
+    res = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="complete", verdict_outcome="pass")
+
+    assert res and res["preserved"] is True
+    assert res["reason"] == "default_branch"
+    assert res["branch"] == "hydra/harvest/run_X"
+    assert _branch(tmp_path) == "main"
+    assert _rev(tmp_path) == before
+
+
+def test_harvest_direct_commit_on_default_branch_with_operator_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("HYDRA_HARVEST_DIRECT_COMMIT", "1")
+    _init_repo(tmp_path)
+    _git(tmp_path, "branch", "-M", "main")
+    _seed_run(tmp_path)
+    before = _rev(tmp_path)
+
+    res = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="complete", verdict_outcome="pass")
+
+    assert res and res["preserved"] is False
+    assert res["branch"] == "main"
+    assert _rev(tmp_path) != before
+    assert "src.ts" in _git(tmp_path, "show", "--stat", "--name-only", "HEAD").stdout
+
+
+def test_harvest_reharvest_stacks_on_existing_branch(tmp_path, monkeypatch):
+    """A second surfaced harvest for the same run extends its branch — an
+    existing harvest branch is never deleted or moved backwards."""
+    monkeypatch.delenv("HYDRA_HARVEST_DIRECT_COMMIT", raising=False)
+    _init_repo(tmp_path)
+    _seed_run(tmp_path)
+    first = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="surfaced", verdict_outcome="revise")
+    (tmp_path / "src.ts").write_text("const a = 3; // second pass\n", encoding="utf-8")
+    second = harvest_pp_run_artifacts(
+        project_path=str(tmp_path), run_id="run_X", workflow_id="wf1",
+        changed_paths=["src.ts"], pp_status="surfaced", verdict_outcome="revise")
+
+    assert first and second and second["sha"] != first["sha"]
+    parents = _git(tmp_path, "rev-list", "--parents", "-n", "1", second["sha"]).stdout
+    assert first["sha"] in parents
 
 
 def test_harvest_returns_none_when_nothing_to_commit(tmp_path):
