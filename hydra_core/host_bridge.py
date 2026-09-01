@@ -37,7 +37,7 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import re as _re
 
@@ -2338,6 +2338,67 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     })
 
 
+def _build_squad_prompt(
+    *,
+    workflow_id: str,
+    task_id: str,
+    squad_slug: str,
+    request_text: str,
+    goal: str | None = None,
+    envelope_id: str | None = None,
+    upstream_refs: Sequence[str] | None = None,
+    budget_usd: float | None = None,
+    budget_remaining_usd: float | None = None,
+    risk: str | None = None,
+    priority: str | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+) -> str:
+    """E2-28: build the non-engineering squad host_action prompt.
+
+    Mirrors the engineering path's ``## Hydra context`` block so a squad leg is
+    reproducible from the trace alone: workflow/task identity, the root goal,
+    the task description, and the governing constraints.
+
+    ``upstream_refs`` carries MemoryRef handles / envelope ids of prior completed
+    work ONLY — never raw upstream artifact content, which must not cross a squad
+    boundary un-redacted (AGENTS.md hard rule 3).
+    """
+    _none = "(none)"
+    refs = [str(r).strip() for r in (upstream_refs or []) if str(r).strip()]
+    crit = [str(c).strip() for c in (acceptance_criteria or []) if str(c).strip()]
+
+    if budget_usd is None and budget_remaining_usd is None:
+        budget_line = "unknown"
+    elif budget_usd is None:
+        budget_line = f"{budget_remaining_usd:.2f}"
+    elif budget_remaining_usd is None:
+        budget_line = f"of {budget_usd:.2f} total"
+    else:
+        budget_line = f"{budget_remaining_usd:.2f} remaining of {budget_usd:.2f} total"
+
+    lines = [
+        "## Hydra context",
+        f"workflow_id: {workflow_id}",
+        f"task_id: {task_id}",
+        f"squad: {squad_slug}",
+        f"envelope_id: {envelope_id or _none}",
+        f"upstream_refs: {', '.join(refs) if refs else _none}",
+        "",
+        "## Goal",
+        (goal or "").strip() or _none,
+        "",
+        "## Task",
+        (request_text or "").strip() or _none,
+        "",
+        "## Constraints",
+        (f"budget_usd: {budget_line}, risk: {risk or 'unknown'}, "
+         f"priority: {priority or 'unknown'}"),
+        "acceptance_criteria: " + (_none if not crit else ""),
+    ]
+    lines.extend(f"- {c}" for c in crit)
+    return "\n".join(lines)
+
+
 def begin_squad_stage(
     *,
     workflow_id: str,
@@ -2348,6 +2409,14 @@ def begin_squad_stage(
     pack_cwd: str,
     request_text: str,
     project_root: str | Path,
+    goal: str | None = None,
+    envelope_id: str | None = None,
+    upstream_refs: Sequence[str] | None = None,
+    budget_usd: float | None = None,
+    budget_remaining_usd: float | None = None,
+    risk: str | None = None,
+    priority: str | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -2359,8 +2428,26 @@ def begin_squad_stage(
 
     Returns an ``awaiting_host`` step result whose ``host_action`` tells the host
     to spawn the visible pack agent subagent in ``pack_cwd``.
+
+    E2-28: ``host_action.prompt`` is the full context-bearing prompt built by
+    ``_build_squad_prompt``; the bare planner task label stays available as
+    ``host_action.task_description``.
     """
     call_key = f"squad-{task_id}-0"
+    prompt = _build_squad_prompt(
+        workflow_id=workflow_id,
+        task_id=task_id,
+        squad_slug=squad_slug,
+        request_text=request_text,
+        goal=goal,
+        envelope_id=envelope_id,
+        upstream_refs=upstream_refs,
+        budget_usd=budget_usd,
+        budget_remaining_usd=budget_remaining_usd,
+        risk=risk,
+        priority=priority,
+        acceptance_criteria=acceptance_criteria,
+    )
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "kind": "squad",
@@ -2382,7 +2469,8 @@ def begin_squad_stage(
             "call_key": call_key,
             "agent_type": lead_agent,
             "cwd": pack_cwd,
-            "prompt": request_text,
+            "prompt": prompt,
+            "task_description": request_text,
             "instructions": "Run the pack agent and submit the artifact.",
         },
     }

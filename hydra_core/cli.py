@@ -1821,6 +1821,20 @@ def _cmd_attended_step(args) -> int:
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
             lead_agent = _resolve_pack_lead_agent(ne_pack)
 
+            # E2-28: upstream context as HANDLES only (never raw artifact text
+            # across a squad boundary) — completed tasks' envelope ids plus the
+            # workflow's episodic MemoryRef keys.
+            _done_ids = set(getattr(state, "attended_completed_task_ids", []) or [])
+            _upstream_refs: list[str] = []
+            for _t in getattr(state, "tasks", []):
+                if str(_t.task_id) not in _done_ids:
+                    continue
+                _rid = getattr(_t, "result_envelope_id", None) or getattr(_t, "envelope_id", None)
+                if _rid:
+                    _upstream_refs.append(f"envelope:{_rid} ({_t.owner_squad})")
+            _upstream_refs.extend(
+                f"episodic:{k}" for k in (getattr(state, "episodic_refs", []) or []))
+
             res = host_bridge.begin_squad_stage(
                 workflow_id=wf,
                 task_id=task_id,
@@ -1830,6 +1844,16 @@ def _cmd_attended_step(args) -> int:
                 pack_cwd=pack_cwd,
                 request_text=request_text,
                 project_root=project,
+                goal=state.root_goal,
+                envelope_id=(str(ne_task.envelope_id)
+                             if getattr(ne_task, "envelope_id", None) else None),
+                upstream_refs=_upstream_refs,
+                budget_usd=state.budget.budget_usd,
+                budget_remaining_usd=state.budget.usd_remaining,
+                risk=("high" if getattr(state, "requires_human_approval", False)
+                      else "normal"),
+                priority=getattr(ne_task, "priority", None),
+                acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
             )
             emit(project, wf, "attended.step", {
                 "run_id": task_id,
