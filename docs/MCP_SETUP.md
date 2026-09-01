@@ -128,6 +128,54 @@ In gateway mode, `~/.claude.json` contains only `hydra_gateway`. The actual back
 
 `~/.hydra/backends.json` is machine-local and **never committed** (it holds resolved absolute paths). The committed source of truth is `scripts/backends.template.json`, which uses `{{AIAPP_BASE}}` / `{{HYDRA_ROOT}}` placeholders. Regenerate it by re-running `scripts/setup.{ps1,sh}` — never hand-edit absolute paths into the registry. See [`PORTABILITY.md`](./PORTABILITY.md).
 
+### Referencing secrets from the environment
+
+A backend spec's `env` map is handed verbatim to the child process, so writing a
+secret directly into `~/.hydra/backends.json` leaves long-lived key material in
+a plaintext config that every dispatcher reads and `hydra gateway-backup`
+copies. Reference the launching environment instead:
+
+```jsonc
+"xenia_tickets": {
+  "env": {
+    "PYTHONPATH": "/path/to/Hydra",
+    "HYDRA_OPERATOR_KEY": "${HYDRA_OPERATOR_KEY}",
+    "PP_TIER": "${PP_TIER:-standard}"
+  }
+}
+```
+
+Both the gateway backend pool and Hydra's internal dispatcher resolve these
+references through `hydra_core/backends_env.py` just before building the stdio
+process parameters, so the two paths cannot drift. The same expansion applies to
+`args`, `command`, and `cwd`.
+
+| Form | Resolves to |
+|---|---|
+| `${VAR}` | the value of `VAR`, or `""` plus a WARNING naming the variable when unset |
+| `${VAR:-default}` | the value of `VAR` when set and non-empty, otherwise `default` (never warns) |
+| `$${VAR}` | the literal text `${VAR}` |
+
+Expansion is fail-soft: a missing variable never crashes a dispatch. The backend
+fails on its own terms instead, which for `HYDRA_OPERATOR_KEY` means WS-AUTH
+degrades and Xenia's `send_response` / `execute_approved` reject.
+
+Set the variable before starting Claude Code so it is inherited by the gateway:
+
+```bash
+export HYDRA_OPERATOR_KEY="…"      # macOS / Linux / Git Bash
+```
+
+```powershell
+$env:HYDRA_OPERATOR_KEY = "…"      # PowerShell (or set it as a user env var)
+```
+
+`hydra gateway-export-backends` rewrites any inline 64-hex env value it finds to
+the matching `${VAR}` reference on the way out, and `hydra doctor` warns when
+`backends.json` still holds one. Both are shape checks — neither ever prints the
+value. `hydra doctor` reports `source=env` when the operator key arrives through
+a `${VAR}` reference, and `source=backends.json` only when it is still inline.
+
 ## Available Backends
 
 The 16 backends below mirror `scripts/backends.template.json` — the **single

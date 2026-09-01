@@ -312,26 +312,58 @@ def _cmd_doctor(args) -> int:
     # print the key or its length. OK when HYDRA_OPERATOR_KEY is non-empty in
     # os.environ OR present under any backend spec's env block in
     # ~/.hydra/backends.json (read-only parse, fail-soft on IO/parse errors).
+    #
+    # E2-5: a backends.json value may now be a "${HYDRA_OPERATOR_KEY}"
+    # reference rather than the key itself. A reference that resolves reports
+    # source=env (the key lives in the environment, not the file); one that does
+    # not resolve leaves the probe unprovisioned. Only a literal value still
+    # reports source=backends.json, and any inline 64-hex-shaped value in the
+    # file draws a WARN naming its backend and key — never its content.
     try:
+        from .backends_env import (
+            expand_env_refs, has_env_ref, looks_like_inline_secret,
+        )
+
         _wsauth_src: str | None = None
+        # E2-5: names of backends whose env holds an inline-secret-shaped value.
+        # Shape check only — no value is ever read into the message.
+        _inline_hits: list[str] = []
         if os.environ.get("HYDRA_OPERATOR_KEY"):
             _wsauth_src = "env"
-        else:
-            try:
-                _bj_path = Path.home() / ".hydra" / "backends.json"
-                if _bj_path.exists():
-                    _bj = json.loads(_bj_path.read_text(encoding="utf-8"))
-                    if isinstance(_bj, dict):
-                        for _bj_spec in _bj.values():
-                            if (
-                                isinstance(_bj_spec, dict)
-                                and isinstance(_bj_spec.get("env"), dict)
-                                and _bj_spec["env"].get("HYDRA_OPERATOR_KEY")
-                            ):
-                                _wsauth_src = "backends.json"
-                                break
-            except Exception:  # noqa: BLE001 — fail-soft on parse / IO errors
-                pass
+        try:
+            _bj_path = Path.home() / ".hydra" / "backends.json"
+            if _bj_path.exists():
+                _bj = json.loads(_bj_path.read_text(encoding="utf-8"))
+                if isinstance(_bj, dict):
+                    for _bj_name, _bj_spec in _bj.items():
+                        if not (
+                            isinstance(_bj_spec, dict)
+                            and isinstance(_bj_spec.get("env"), dict)
+                        ):
+                            continue
+                        for _ek, _ev in _bj_spec["env"].items():
+                            if looks_like_inline_secret(_ev):
+                                _inline_hits.append(f"{_bj_name}.env.{_ek}")
+                        _raw = _bj_spec["env"].get("HYDRA_OPERATOR_KEY")
+                        if _wsauth_src or not _raw:
+                            continue
+                        if has_env_ref(_raw):
+                            # E2-5: a ${VAR} reference — the key really lives in
+                            # the environment, so report source=env when it
+                            # resolves, and stay unprovisioned when it does not.
+                            if expand_env_refs(_raw):
+                                _wsauth_src = "env"
+                        else:
+                            _wsauth_src = "backends.json"
+        except Exception:  # noqa: BLE001 — fail-soft on parse / IO errors
+            pass
+        if _inline_hits:
+            print(
+                "WARN: backends.json holds inline secret-shaped value(s) at "
+                f"{', '.join(sorted(_inline_hits))} — replace with a "
+                "${VAR} reference and export the variable instead "
+                "(see docs/MCP_SETUP.md)"
+            )
         if _wsauth_src:
             print(f"OK:   WS-AUTH operator key configured (source={_wsauth_src})")
         else:
@@ -3002,6 +3034,29 @@ def _cmd_gateway_backup(args) -> int:
     return 0
 
 
+def _redact_inline_secrets(spec: dict) -> list[str]:
+    """Rewrite inline-secret-shaped env values in ``spec`` to ``${KEY}`` refs.
+
+    Mutates ``spec["env"]`` in place and returns the sorted list of env keys
+    that were rewritten. Detection is a shape check only
+    (``backends_env.looks_like_inline_secret``); the value is never printed,
+    logged, or returned.
+    """
+    from .backends_env import looks_like_inline_secret
+
+    if not isinstance(spec, dict):
+        return []
+    env = spec.get("env")
+    if not isinstance(env, dict):
+        return []
+    rewritten: list[str] = []
+    for key, value in list(env.items()):
+        if looks_like_inline_secret(value):
+            env[key] = "${" + str(key) + "}"
+            rewritten.append(str(key))
+    return sorted(rewritten)
+
+
 def _cmd_gateway_export_backends(args) -> int:
     """Export mcpServers block from ~/.claude.json to ~/.hydra/backends.json."""
     from .dispatcher import _load_user_scope_mcp, BACKEND_REGISTRY
@@ -3009,6 +3064,17 @@ def _cmd_gateway_export_backends(args) -> int:
     if not servers:
         print("No mcpServers found in ~/.claude.json")
         return 1
+    # E2-5: never copy inline secret material into backends.json. Any env value
+    # that looks like a 64-hex key is rewritten to a ${VAR} reference resolved
+    # at dispatch time from the launching environment. The value itself is
+    # neither printed nor retained.
+    for _name, _spec in servers.items():
+        _redacted = _redact_inline_secrets(_spec)
+        for _key in _redacted:
+            print(
+                f"  NOTE: {_name}.env.{_key} rewritten to ${{{_key}}} — "
+                f"export {_key} in the environment that launches Hydra."
+            )
     BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
     BACKEND_REGISTRY.write_text(
         json.dumps(servers, indent=2, default=str), encoding="utf-8"

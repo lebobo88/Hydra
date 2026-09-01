@@ -148,7 +148,8 @@
     "cwd_template": "{HYDRA_ROOT}",
     "env_template": {
       "PYTHONPATH": "{HYDRA_ROOT}",
-      "HYDRA_XENIA_ROOT": "{XENIA_ROOT}"
+      "HYDRA_XENIA_ROOT": "{XENIA_ROOT}",
+      "HYDRA_OPERATOR_KEY": "${HYDRA_OPERATOR_KEY}"
     },
     "check_path_template": "{XENIA_ROOT}",
     "required": false,
@@ -161,7 +162,8 @@
     "cwd_template": "{HYDRA_ROOT}",
     "env_template": {
       "PYTHONPATH": "{HYDRA_ROOT}",
-      "HYDRA_ROOT": "{HYDRA_ROOT}"
+      "HYDRA_ROOT": "{HYDRA_ROOT}",
+      "HYDRA_OPERATOR_KEY": "${HYDRA_OPERATOR_KEY}"
     },
     "check_path_template": "{HYDRA_ROOT}",
     "required": true,
