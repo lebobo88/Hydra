@@ -2421,3 +2421,67 @@ def test_recover_stalled_stage_already_merged_branch_reproduces_live_incident(tm
         "this is the exact data-loss shape from the live incident")
     assert (tmp_path / "important_fix.py").exists()
     assert (tmp_path / "old_feature.py").exists()
+
+
+# --------------------------------------------------------------------------- #
+# E2-28 — squad host_action prompt carries full Hydra context                  #
+# --------------------------------------------------------------------------- #
+
+def test_squad_stage_prompt_carries_hydra_context(tmp_path):
+    """The squad host_action prompt must be reproducible from the trace alone:
+    Hydra context block, root goal, task description and budget constraints."""
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-e228", task_id="task-11", squad_slug="executive",
+        entrypoint="agent-impersonation", lead_agent="executive-suite:boardroom",
+        pack_cwd=str(tmp_path), request_text="Decompose goal + budget split",
+        project_root=str(tmp_path),
+        goal="Build Hydra Pulse, a live workflow dashboard",
+        envelope_id="env-42",
+        upstream_refs=["envelope:env-1 (executive)", "episodic:wf-e228/plan"],
+        budget_usd=20.0, budget_remaining_usd=17.5,
+        risk="high", priority="P1",
+        acceptance_criteria=["A budget split per squad", "One page of rationale"],
+    )
+    prompt = res["host_action"]["prompt"]
+    assert prompt.startswith("## Hydra context")
+    assert "workflow_id: wf-e228" in prompt
+    assert "task_id: task-11" in prompt
+    assert "squad: executive" in prompt
+    assert "envelope_id: env-42" in prompt
+    assert "envelope:env-1 (executive)" in prompt
+    assert "episodic:wf-e228/plan" in prompt
+    assert "Build Hydra Pulse, a live workflow dashboard" in prompt
+    assert "Decompose goal + budget split" in prompt
+    assert "17.50 remaining of 20.00 total" in prompt
+    assert "risk: high" in prompt
+    assert "priority: P1" in prompt
+    assert "- A budget split per squad" in prompt
+    # The bare planner label stays available for hosts that want just the task.
+    assert res["host_action"]["task_description"] == "Decompose goal + budget split"
+
+
+def test_squad_stage_prompt_degrades_without_context(tmp_path):
+    """With no optional context the prompt still carries identity + the task,
+    and marks the missing fields explicitly rather than omitting them."""
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-bare", task_id="task-12", squad_slug="garland",
+        entrypoint="claude-skill", lead_agent="calliope",
+        pack_cwd=str(tmp_path), request_text="draft the brand brief",
+        project_root=str(tmp_path))
+    prompt = res["host_action"]["prompt"]
+    assert "workflow_id: wf-bare" in prompt
+    assert "envelope_id: (none)" in prompt
+    assert "upstream_refs: (none)" in prompt
+    assert "acceptance_criteria: (none)" in prompt
+    assert "budget_usd: unknown" in prompt
+    assert "draft the brand brief" in prompt
+    assert res["host_action"]["task_description"] == "draft the brand brief"
+
+
+def test_squad_prompt_builder_omits_raw_upstream_content():
+    """Hard rule 3: only handles cross a squad boundary, never blobs. The
+    builder has no parameter that could carry raw upstream artifact text."""
+    import inspect
+    params = set(inspect.signature(host_bridge._build_squad_prompt).parameters)
+    assert "upstream_refs" in params
+    assert not {"upstream_text", "upstream_content", "artifacts"} & params
