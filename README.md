@@ -470,10 +470,13 @@ python -m hydra_core.cli status
 python -m hydra_core.cli trace 7f3c…
 python -m hydra_core.cli doctor
 python -m hydra_core.cli eights-drain   # drain the pending eights spool (--limit N, default 500)
+python -m hydra_core.cli eights-hitl-reconcile          # dry-run: pending HITL rows vs workflow state
+python -m hydra_core.cli eights-hitl-reconcile --apply  # resolve rows whose workflow is terminal/unknown
 ```
 
-`doctor` surfaces three additional probes beyond the basic squad/constitution checks:
+`doctor` surfaces four additional probes beyond the basic squad/constitution checks:
 - **eights spool depth** — warns when the pending spool exceeds `HYDRA_EIGHTS_SPOOL_WARN` (default 100); suggests `hydra eights-drain` when over threshold.
+- **eights HITL backlog** — warns when pending `hydra_gate` requests in TheEights exceed `HYDRA_HITL_PENDING_THRESHOLD` (default 25); suggests `hydra eights-hitl-reconcile`. Distinct from the spool line: the spool counts undelivered calls, this counts gates the shared ledger still holds open.
 - **AgentSmith venom back-channel** — probes `agentsmith.venom.cross_check` and surfaces the smith→hydra back-channel state (rationale field); `hydra-mcp-unavailable` means the gateway is not wired into backends.json.
 - **WS-AUTH operator key** — checks whether `HYDRA_OPERATOR_KEY` is provisioned (env or any backend spec's `env` block in `~/.hydra/backends.json`); unprovisioned means `xenia send_response` / `execute_approved` reject all tokens fail-closed.
 

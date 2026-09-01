@@ -440,6 +440,14 @@ Behaviour:
   500 per run). Drain is fail-soft: entries remain on disk when the daemon is
   still unreachable; stale `.partial` crash-residue files older than 1 hour are
   removed unconditionally.
+- **HITL lifecycle reconciliation (E2-17)**: every `hydra_gate` request Hydra
+  files with TheEights carries `expires_at` = now + `HYDRA_HITL_EXPIRY_HOURS`
+  (default 24h, the hitl-protocol wait window). Terminal transitions —
+  `hydra resume` (gate-scoped), the `abort` option, `hydra reap --apply` —
+  issue `eights.governance.hitl.resolve`, fail-soft and spooled. `hydra doctor`
+  WARNs above `HYDRA_HITL_PENDING_THRESHOLD` (default 25) pending rows, and
+  `hydra eights-hitl-reconcile [--apply]` sweeps the queue against the
+  checkpoint store, resolving only terminal/unknown workflows' rows.
 
 ## 8. Delegation to PP, ES, and RLM
 

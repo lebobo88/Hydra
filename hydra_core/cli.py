@@ -29,6 +29,7 @@ import re
 import sys
 import warnings
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 # Validation regex for workflow ids supplied via --workflow-id.
@@ -100,6 +101,22 @@ class _NullDispatcher:
         return {"status": "stub", "summary": f"would invoke /{skill}", "args": args}
     def run_host_agent(self, agent_type, prompt, *, cwd=None, timeout_s=None):
         return None
+
+
+def _hitl_backlog_line(rows: list | None, threshold: int) -> str:
+    """Render the doctor's TheEights HITL backlog line (E2-17).
+
+    Pure so it is testable without a daemon. ``rows=None`` means the daemon
+    did not answer — a WARN, never a FAIL (doctor degrades open on eights).
+    """
+    if rows is None:
+        return ("WARN: eights HITL backlog unknown — daemon did not answer "
+                "hitl.list (pending gates may be accumulating)")
+    if len(rows) > threshold:
+        return (f"WARN: eights HITL pending={len(rows)} exceeds "
+                f"threshold={threshold} — run `hydra eights-hitl-reconcile` "
+                "to see which are zombies, then --apply to close them")
+    return f"OK:   eights HITL pending={len(rows)} (threshold={threshold})"
 
 
 def _cmd_doctor(args) -> int:
@@ -255,6 +272,25 @@ def _cmd_doctor(args) -> int:
             err = (res.get("error", "(no error field)")
                    if isinstance(res, dict) else f"non-dict {type(res).__name__}")
             print(f"WARN: {server} unreachable — {err}")
+
+    # --- E2-17: TheEights HITL backlog (consumer hydra) ---------------------
+    # Separate from the spool-depth line above: the spool counts calls Hydra
+    # could not deliver, this counts gates the ledger still holds open.
+    try:
+        _hitl_thresh = int(os.environ.get("HYDRA_HITL_PENDING_THRESHOLD", "25"))
+    except ValueError:
+        _hitl_thresh = 25
+    if "eights" in servers:
+        try:
+            from .eights.attestation import EightsAttestor
+            _hitl_rows = EightsAttestor(dispatcher=dispatcher).hitl_list()
+        except Exception as _hitl_exc:  # noqa: BLE001 — never crash doctor
+            print(_hitl_backlog_line(None, _hitl_thresh)
+                  + f" ({type(_hitl_exc).__name__}: {_hitl_exc})")
+        else:
+            print(_hitl_backlog_line(_hitl_rows, _hitl_thresh))
+    else:
+        print("WARN: eights not registered — skipping HITL backlog check")
 
     # --- RA-6: AgentSmith venom cross-check / smith→hydra back-channel ------
     # Informational only: surfaces the back-channel state (rationale field) but
@@ -853,6 +889,77 @@ def _prune_spooled_hitl_requests(workflow_id: str, gate_node: str | None) -> int
     return pruned
 
 
+def _reconcile_attestor(project: Path):
+    """Build an EightsAttestor bound to the live MCP dispatcher (E2-17).
+
+    Its own seam so terminal-transition reconciliation is stubbable in tests
+    without spawning the eights daemon.
+    """
+    from .dispatcher import MCPStdioDispatcher
+    from .eights.attestation import EightsAttestor
+    return EightsAttestor(dispatcher=MCPStdioDispatcher(project))
+
+
+def _make_phase_lookup(project: Path) -> Callable[[str], str | None]:
+    """Return ``workflow_id -> phase | None`` over Hydra's checkpoint store.
+
+    ``None`` means Hydra has no state for that workflow — an orphan row from
+    a wiped checkpoint db or a foreign run id. Results are memoized because
+    a reconcile sweep sees many rows per workflow.
+    """
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+    if isinstance(sup, _PurePythonRunner):
+        # No checkpointer → every workflow is "unknown"; the reconcile caller
+        # still resolves those rows (they can never be advanced again).
+        return lambda _wf: None
+
+    cache: dict[str, str | None] = {}
+
+    def _lookup(workflow_id: str) -> str | None:
+        if workflow_id in cache:
+            return cache[workflow_id]
+        phase: str | None = None
+        try:
+            snap = sup.get_state({"configurable": {"thread_id": workflow_id}})
+            if snap is not None and snap.values:
+                phase = snap.values.get("phase")
+        except Exception:  # noqa: BLE001 — one bad thread never aborts a sweep
+            phase = None
+        cache[workflow_id] = phase
+        return phase
+
+    return _lookup
+
+
+def _resolve_eights_hitl_for_workflow(
+    project: Path, workflow_id: str, *, note: str, decision: str = "rejected",
+    gate_node: str | None = None, dispatcher=None,
+) -> dict:
+    """Close a workflow's pending TheEights HITL rows. Never raises (E2-17).
+
+    ``dispatcher`` reuses a caller's already-built transport instead of
+    spawning a second eights connection. A caller holding a null dispatcher
+    (``hydra resume`` without ``--live``) therefore no-ops here rather than
+    starting the daemon mid-resume; those rows are swept by
+    ``hydra eights-hitl-reconcile`` / ``hydra reap --apply`` instead.
+    """
+    try:
+        from .eights.hitl_reconcile import resolve_for_workflow
+        if dispatcher is not None:
+            from .eights.attestation import EightsAttestor
+            attestor = EightsAttestor(dispatcher=dispatcher, workflow_id=workflow_id)
+        else:
+            attestor = _reconcile_attestor(project)
+        return resolve_for_workflow(
+            attestor, workflow_id,
+            note=note, decision=decision, gate_node=gate_node,
+        )
+    except Exception as exc:  # noqa: BLE001 — reconciliation is never a gate
+        return {"pending": 0, "resolved": 0, "failed": 0, "unavailable": True,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _release_resume_lock(fd, lock_path) -> None:
     import os as _os
     try:
@@ -1229,11 +1336,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # C3: prevent a later spool replay from filing a ticket for this
     # now-resolved gate (late-spool orphan reconciliation, gate-identity-keyed).
     pruned_spool = _prune_spooled_hitl_requests(wf, resolution.get("gate_node"))
+
+    # E2-17: the gate is now resolved on the Hydra side — close the matching
+    # row in TheEights' shared ledger too, or it stays pending forever. Scoped
+    # to the resolved gate identity (same key the spool prune uses), so another
+    # open gate in this workflow survives. Fail-soft: an unreachable daemon
+    # spools the resolve for the next drain.
+    _terminal_resolution = action == "reject" or option == "abort"
+    _eights_hitl = _resolve_eights_hitl_for_workflow(
+        project, wf,
+        note=("workflow terminal: surfaced" if _terminal_resolution
+              else f"hydra resume: {action}"),
+        decision="rejected" if _terminal_resolution else "approved",
+        gate_node=resolution.get("gate_node") or None,
+        dispatcher=dispatcher,
+    )
     emit(project, wf, "hitl_resumed", {
         "action": action,
         "option": option,
         "gate_node": resolution.get("gate_node"),
         "pruned_spooled_hitl_requests": pruned_spool,
+        "eights_hitl_resolved": _eights_hitl.get("resolved", 0),
     })
 
     # F10: abort option → park the workflow surfaced without resuming the graph.
@@ -2529,9 +2652,32 @@ def _cmd_reap(args) -> int:
             finally:
                 _release_resume_lock(lock_fd, lock_path)
 
+    # E2-17: a reaped workflow is terminal — close its pending rows in
+    # TheEights' shared ledger. One hitl.list for the whole sweep; fail-soft
+    # (an unreachable daemon leaves the rows and spools nothing to lose).
+    eights_hitl = {"resolved": 0, "failed": 0, "pending": 0}
+    if do_apply and reaped:
+        try:
+            from .eights.hitl_reconcile import resolve_for_workflow
+            attestor = _reconcile_attestor(project)
+            rows = attestor.hitl_list()
+            if rows is None:
+                eights_hitl["unavailable"] = True
+            else:
+                for wf in reaped:
+                    s = resolve_for_workflow(
+                        attestor, wf, rows=rows,
+                        note="workflow terminal: surfaced",
+                    )
+                    for k in ("resolved", "failed", "pending"):
+                        eights_hitl[k] += s.get(k, 0)
+        except Exception as exc:  # noqa: BLE001 — never fail a reap on this
+            eights_hitl["error"] = f"{type(exc).__name__}: {exc}"
+
     print(json.dumps({
         "mode": "apply" if do_apply else "dry-run",
         "older_than_hours": older_than_h,
+        "eights_hitl": eights_hitl,
         "scanned": len(thread_ids),
         "candidate_count": len(candidates),
         "candidates": candidates,
@@ -3265,6 +3411,36 @@ def _cmd_eights_drain(args) -> int:
     return 0
 
 
+def _cmd_eights_hitl_reconcile(args) -> int:
+    """`hydra eights-hitl-reconcile [--apply] [--limit N]` (E2-17).
+
+    Lists TheEights' pending `hydra_gate` requests, matches each row's
+    workflow_id against Hydra's checkpoint store, and resolves the rows whose
+    workflow is terminal (done/surfaced) or unknown to Hydra. Rows for an
+    ACTIVE workflow are never touched — those are real gates awaiting a human.
+
+    Dry-run by default (mirrors `reap`); prints a JSON summary either way.
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    do_apply = bool(getattr(args, "apply", False))
+    limit = getattr(args, "limit", None)
+
+    from .eights.hitl_reconcile import reconcile
+    try:
+        attestor = _reconcile_attestor(project)
+        lookup = _make_phase_lookup(project)
+    except Exception as exc:  # noqa: BLE001 — report, never traceback
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
+              file=sys.stderr)
+        return 1
+
+    summary = reconcile(attestor, lookup, apply=do_apply,
+                        limit=int(limit) if limit is not None else None)
+    summary["mode"] = "apply" if do_apply else "dry-run"
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hydra", description="Enterprise Agent Mesh supervisor")
     ap.add_argument("--project", help="Project root (defaults to cwd)")
@@ -3483,6 +3659,25 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    # E2-17: HITL lifecycle reconciliation against TheEights' shared ledger.
+    ehr = sub.add_parser(
+        "eights-hitl-reconcile",
+        help=(
+            "Reconcile TheEights' pending HITL requests against Hydra "
+            "workflow state. Resolves rows whose workflow is terminal or "
+            "unknown; leaves active gates alone. Dry-run unless --apply. "
+            "Prints JSON: {pending, terminal, unknown, active, resolved}."
+        ),
+    )
+    ehr.add_argument(
+        "--apply", action="store_true",
+        help="Actually resolve the zombie rows (default: dry-run report only).",
+    )
+    ehr.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Examine at most N pending rows (default: all).",
+    )
+
     # gateway management
     sub.add_parser("gateway-backup")
     sub.add_parser("gateway-export-backends")
@@ -3553,6 +3748,7 @@ def main(argv: list[str] | None = None) -> int:
         "ingest": _cmd_ingest,
         "replay": _cmd_replay,
         "eights-drain": _cmd_eights_drain,
+        "eights-hitl-reconcile": _cmd_eights_hitl_reconcile,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,
         "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,
