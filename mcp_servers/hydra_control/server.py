@@ -299,6 +299,11 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -369,6 +374,11 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -444,6 +454,11 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -488,6 +503,11 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
     cmd = [sys.executable, "-m", "hydra_core.cli", *cli_args]
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, validated tokens
             cmd, cwd=str(_HYDRA_ROOT), env=env,
@@ -498,7 +518,8 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             # (lseek on fd 0 → NtQueryInformationFile blocks forever). Mirrors
             # _launch_run, which already passes DEVNULL for the same reason.
             stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=timeout_s,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
         # MU8b: surface whatever partial output was buffered so callers can

@@ -138,7 +138,7 @@ def _get_base() -> Path:
             proc = subprocess.run(
                 ["git", "-C", str(repo_dir), "rev-parse", "--git-common-dir"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8", errors="replace",
                 timeout=5,
                 check=False,
             )
@@ -298,7 +298,7 @@ def resolve_repo_path(repo_id: str) -> Path:
         proc = subprocess.run(
             ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
             check=False,
         )
@@ -480,7 +480,8 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
         if not (target / ".git").exists():
             proc = subprocess.run(
                 ["git", "init", str(target)],
-                capture_output=True, text=True, timeout=30, check=False,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, check=False,
             )
             if proc.returncode != 0:
                 raise ValueError(f"git init failed for {target}: {proc.stderr.strip()}")
