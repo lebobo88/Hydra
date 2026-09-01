@@ -186,7 +186,9 @@ def _cmd_doctor(args) -> int:
         _spool_warn_thresh = int(
             os.environ.get("HYDRA_EIGHTS_SPOOL_WARN", "100")
         )
-        _spool_depth = PendingSpool().count()
+        _spool_root, _dead_root = _resolve_eights_spool_roots()
+        _spool = PendingSpool(root=_spool_root, dead_letter_root=_dead_root)
+        _spool_depth = _spool.count()
         if _spool_depth > _spool_warn_thresh:
             print(
                 f"WARN: eights spool depth={_spool_depth} exceeds "
@@ -196,6 +198,16 @@ def _cmd_doctor(args) -> int:
         else:
             print(f"OK:   eights spool  depth={_spool_depth} "
                   f"(threshold={_spool_warn_thresh})")
+        # E2-3: dead letters are records that were never delivered. Depth > 0
+        # is always operator-actionable, independent of the pending depth.
+        _dead_depth = _spool.dead_letter_count()
+        if _dead_depth > 0:
+            print(
+                f"WARN: eights dead-letter depth={_dead_depth} — "
+                "run `hydra eights-drain --replay-dead-letter`"
+            )
+        else:
+            print(f"OK:   eights dead-letter  depth={_dead_depth}")
     except Exception as _spool_exc:
         print(f"WARN: eights spool check — {_spool_exc}")
 
@@ -3200,6 +3212,24 @@ def _interpolate(template: str, values: dict[str, str]) -> str:
     return result
 
 
+def _resolve_eights_spool_roots() -> tuple[Path, Path]:
+    """Resolve (spool_root, dead_letter_root), honouring the env overrides.
+
+    ``HYDRA_EIGHTS_SPOOL`` / ``HYDRA_EIGHTS_DEAD_LETTER`` let tests (and an
+    operator inspecting a copied spool) point the drain + doctor checks at a
+    scratch directory instead of ``~/.hydra/eights-pending``.
+    """
+    from .eights.pending_spool import DEFAULT_SPOOL_ROOT, DEFAULT_DEAD_LETTER_ROOT
+
+    spool_root = Path(
+        os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT
+    )
+    dead_root = Path(
+        os.environ.get("HYDRA_EIGHTS_DEAD_LETTER") or DEFAULT_DEAD_LETTER_ROOT
+    )
+    return spool_root, dead_root
+
+
 def _cmd_eights_drain(args) -> int:
     """Drain the eights-pending spool in a bounded batch.
 
@@ -3207,21 +3237,30 @@ def _cmd_eights_drain(args) -> int:
     via the live MCPStdioDispatcher.  Also removes stale .partial staging
     files older than 1 hour (these are crash residue from interrupted writes).
 
-    Prints JSON: {drained, failed, remaining, partial_removed, spool_root}.
+    Prints JSON: {drained, failed, skipped, dead_lettered, dead_letter_depth,
+    remaining, partial_removed, spool_root, dead_letter_root}.
     ``drained`` = successfully re-sent; ``failed`` = attempted but daemon
-    rejected; ``remaining`` = still on disk after this run.
+    rejected; ``skipped`` = corrupt / concurrently-removed / TTL-expired;
+    ``dead_lettered`` = moved to the dead-letter dir on THIS run;
+    ``dead_letter_depth`` = total entries sitting in the dead-letter dir.
+
+    E2-3: entries older than --max-age-hours are dead-lettered WITHOUT a
+    replay attempt.  That used to be invisible, so an eights outage longer
+    than the 24h default silently converted the whole backlog into
+    unreplayable dead letters.  A WARN now goes to stderr whenever an entry
+    is dead-lettered for age, and `--replay-dead-letter` re-queues them.
 
     If the eights daemon is not reachable the replay attempts all fail; spool
     entries remain in place for the next run (fail-soft, never destructive).
     """
     import time as _time
-    from .eights.pending_spool import PendingSpool, DEFAULT_SPOOL_ROOT
+    from .eights.pending_spool import PendingSpool
 
     limit = int(getattr(args, "limit", 500))
+    max_age_hours = float(getattr(args, "max_age_hours", 24.0))
+    replay_dead_letter = bool(getattr(args, "replay_dead_letter", False))
     project = Path(args.project) if args.project else Path.cwd()
-    spool_root = Path(
-        os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT
-    )
+    spool_root, dead_root = _resolve_eights_spool_roots()
 
     # Remove stale .partial files (crash residue from interrupted spool writes).
     partial_removed = 0
@@ -3235,9 +3274,21 @@ def _cmd_eights_drain(args) -> int:
             except OSError:
                 pass
 
-    spool = PendingSpool(root=spool_root)
+    spool = PendingSpool(root=spool_root, dead_letter_root=dead_root)
+
+    # E2-3: --replay-dead-letter moves dead letters back into the pending
+    # spool (attempts reset) and drains THAT pass with the age check off —
+    # otherwise every re-queued entry would immediately expire again.
+    requeued = 0
+    if replay_dead_letter:
+        requeued = spool.requeue_dead_letters(limit=limit)
+        max_age_hours = 0.0
+
     drained = 0
     failed = 0
+    skipped = 0
+    dead_lettered = 0
+    dead_lettered_expired = 0
     drain_error: str | None = None
 
     try:
@@ -3245,22 +3296,46 @@ def _cmd_eights_drain(args) -> int:
         from .eights.attestation import EightsAttestor
         dispatcher = MCPStdioDispatcher(project)
         attestor = EightsAttestor(dispatcher=dispatcher, spool=spool)
-        summary = attestor.replay_pending(max_replays=limit)
+        summary = attestor.replay_pending(
+            max_replays=limit, max_age_hours=max_age_hours
+        )
         drained = summary.get("sent", 0)
         failed = summary.get("failed", 0)
+        skipped = summary.get("skipped", 0)
+        dead_lettered = summary.get("dead_lettered", 0)
+        dead_lettered_expired = summary.get("dead_lettered_expired", 0)
     except Exception as exc:  # noqa: BLE001 — dispatcher not available → partial drain report
         drain_error = f"{type(exc).__name__}: {exc}"
 
     remaining = spool.count()
+    dead_letter_depth = spool.dead_letter_count()
     out: dict = {
         "drained": drained,
         "failed": failed,
+        "skipped": skipped,
+        "dead_lettered": dead_lettered,
+        "dead_letter_depth": dead_letter_depth,
         "remaining": remaining,
         "partial_removed": partial_removed,
         "spool_root": str(spool_root),
+        "dead_letter_root": str(dead_root),
     }
+    if replay_dead_letter:
+        out["requeued_from_dead_letter"] = requeued
     if drain_error is not None:
         out["error"] = drain_error
+
+    if dead_lettered_expired > 0:
+        print(
+            f"WARN: {dead_lettered_expired} spool entr"
+            f"{'y' if dead_lettered_expired == 1 else 'ies'} dead-lettered for "
+            f"age (older than --max-age-hours={max_age_hours}). They were NOT "
+            "replayed. Recover them with "
+            "`hydra eights-drain --replay-dead-letter`, or raise "
+            "--max-age-hours before the next drain.",
+            file=sys.stderr,
+        )
+
     print(json.dumps(out, indent=2))
     return 0
 
@@ -3468,7 +3543,8 @@ def main(argv: list[str] | None = None) -> int:
             "Drain the eights-pending spool in a bounded batch. "
             "Re-issues spooled calls to the eights daemon and removes stale "
             ".partial files older than 1 hour. "
-            "Prints JSON: {drained, failed, remaining}."
+            "Prints JSON: {drained, failed, skipped, dead_lettered, "
+            "dead_letter_depth, remaining}."
         ),
     )
     ed.add_argument(
@@ -3480,6 +3556,29 @@ def main(argv: list[str] | None = None) -> int:
             "Maximum number of spool entries to attempt in this run "
             "(default 500). Remaining entries stay in the spool for the next "
             "call."
+        ),
+    )
+    ed.add_argument(
+        "--max-age-hours",
+        dest="max_age_hours",
+        type=float,
+        default=24.0,
+        metavar="H",
+        help=(
+            "Dead-letter spool entries older than H hours WITHOUT attempting "
+            "a replay (default 24, kept for backwards compatibility; 0 "
+            "disables the age check entirely). Entries dead-lettered for age "
+            "emit a WARN on stderr — recover them with --replay-dead-letter."
+        ),
+    )
+    ed.add_argument(
+        "--replay-dead-letter",
+        dest="replay_dead_letter",
+        action="store_true",
+        help=(
+            "Move up to --limit entries from the dead-letter directory back "
+            "into the pending spool (attempts reset to 0) and drain them with "
+            "the age check disabled for that pass."
         ),
     )
 
