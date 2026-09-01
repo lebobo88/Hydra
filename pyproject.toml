@@ -37,6 +37,9 @@ include = ["hydra_core*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = [".*", "build", "dist", "node_modules", "maf-template", "web", ".tmp*", ".harness", ".hydra"]
+markers = [
+  "live_daemon: test needs a real MCP stdio daemon (TheEights / pair-programmer / AgentSmith). Skipped by default; run with `pytest -m live_daemon`, which also lifts the HYDRA_TEST_NO_DAEMONS spawn guard (E2-26).",
+]
 
 [tool.ruff]
 line-length = 100
