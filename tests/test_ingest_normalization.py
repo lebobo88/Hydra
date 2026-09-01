@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -31,6 +31,7 @@ from hydra_core.ingest import (
     default_dev_task_branch,
     dispatch_ingested_envelopes,
     infer_dev_task_owner,
+    normalize_for_ingest,
     normalize_pack_envelope,
     slugify,
 )
@@ -58,9 +59,9 @@ def _no_git_harvest(monkeypatch):
 
 def _pack_dev_task(workflow_id: str, **over) -> dict:
     """The shape RLM-Gaming's Director actually emitted on workflow 166fc7ee:
-    no ``owner``, no ``branch``, plus three keys DevTask does not define."""
+    no ``id``, no ``owner``, no ``branch``, plus three keys DevTask does not
+    define. Deliberately id-less — injecting a UUID here would mask the gap."""
     d = {
-        "id": str(uuid4()),
         "type": "DEV_TASK",
         "origin_squad": "rlm-gaming",
         "target_squad": "engineering",
@@ -136,7 +137,7 @@ def test_pack_dev_task_normalizes_and_validates() -> None:
     out = normalize_pack_envelope(raw)
 
     fields = out.pop("_normalized_fields")
-    assert "owner" in fields and "branch" in fields
+    assert "owner" in fields and "branch" in fields and "id" in fields
 
     env = validate_envelope(out)
     # Nothing in pp_team/title/instructions matches a keyword — safe default.
@@ -177,12 +178,14 @@ def test_unknown_extra_keys_are_folded_into_instructions() -> None:
     assert "estimated_hours: 12" in env.instructions
 
 
-def test_non_dev_task_envelope_passes_through_unchanged() -> None:
+def test_non_dev_task_envelope_only_gets_its_id_normalized() -> None:
     src = {"type": "PRD", "origin_squad": "hydra", "workflow_id": str(uuid4()),
            "source_goal_id": str(uuid4()), "summary": "s"}
     out = normalize_pack_envelope(src)
-    assert out == src
     assert out is not src
+    assert out.pop("_normalized_fields") == ["id"]
+    assert UUID(str(out.pop("id")))
+    assert out == src          # nothing else touched on a non-DEV_TASK
 
 
 # --------------------------------------------------------------------------- #
@@ -230,7 +233,7 @@ def test_unrepairable_envelope_is_rejected_with_trace_event(packs) -> None:
     )
 
     assert [it.status for it in outcome.items] == ["failed"]
-    assert outcome.rejected and outcome.rejected[0].envelope_id == hopeless["id"]
+    assert outcome.rejected
     assert any(e["field"] == "owner" for e in outcome.rejected[0].errors)
     # Nothing was dispatched.
     assert not disp.calls
@@ -293,3 +296,123 @@ def test_record_rejected_envelopes_is_a_noop_on_empty(tmp_path) -> None:
     before = cursor_file.read_text(encoding="utf-8")
     host_bridge.record_rejected_envelopes(cursor_file, [])
     assert cursor_file.read_text(encoding="utf-8") == before
+
+
+# --------------------------------------------------------------------------- #
+# id normalization (agy review of PR #40)                                     #
+# --------------------------------------------------------------------------- #
+
+def test_missing_id_is_synthesized_as_a_uuid() -> None:
+    out = normalize_pack_envelope(_pack_dev_task(str(uuid4())))
+    assert "id" in out["_normalized_fields"]
+    assert UUID(str(out["id"]))                 # a real UUID, not a label
+    assert out.get("external_id") is None       # nothing to preserve
+
+
+def test_non_uuid_id_is_replaced_and_preserved_as_external_id() -> None:
+    """The exact shape from issue #31: submit_envelopes accepted this id and the
+    detached ingest then died on "id Input should be a valid UUID"."""
+    raw = _pack_dev_task(str(uuid4()), id="devtask-hydra-heads-166fc7ee")
+    out = normalize_pack_envelope(raw)
+
+    assert set(["id", "external_id"]).issubset(out["_normalized_fields"])
+    assert UUID(str(out["id"]))
+    assert out["external_id"] == "devtask-hydra-heads-166fc7ee"
+
+    env = validate_envelope({k: v for k, v in out.items()
+                             if k != "_normalized_fields"})
+    assert str(env.id) == out["id"]
+    assert env.external_id == "devtask-hydra-heads-166fc7ee"
+
+
+def test_valid_uuid_id_is_left_alone() -> None:
+    eid = str(uuid4())
+    out = normalize_pack_envelope(_pack_dev_task(str(uuid4()), id=eid))
+    assert out["id"] == eid
+    assert out.get("external_id") is None
+    assert "id" not in out.get("_normalized_fields", [])
+
+
+def test_explicit_external_id_is_not_overwritten() -> None:
+    out = normalize_pack_envelope(
+        _pack_dev_task(str(uuid4()), id="not-a-uuid", external_id="keep-me"))
+    assert out["external_id"] == "keep-me"
+    assert UUID(str(out["id"]))
+
+
+def test_normalize_for_ingest_strips_marker_and_emits_once() -> None:
+    events: list[tuple[str, dict]] = []
+    once = normalize_for_ingest(_pack_dev_task(str(uuid4()), id="devtask-abc"),
+                                lambda e, p: events.append((e, p)))
+    assert "_normalized_fields" not in once
+    assert [e for (e, _p) in events] == ["ingest.envelope_normalized"]
+    assert events[0][1]["external_id"] == "devtask-abc"
+    assert "id" in events[0][1]["fields_defaulted"]
+
+    # Idempotent: re-normalizing an already-normalized envelope changes nothing
+    # and emits nothing. This is what lets the CLI normalize for dedup and still
+    # hand the dict to dispatch_ingested_envelopes.
+    events.clear()
+    twice = normalize_for_ingest(dict(once), lambda e, p: events.append((e, p)))
+    assert twice == once
+    assert events == []
+
+
+def test_ingest_dedups_id_less_envelopes_by_normalized_id(packs) -> None:
+    """Without id normalization two id-less envelopes both bypass `processed`.
+    After it, the same dict submitted twice carries the same normalized id and
+    the second is skipped."""
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    normalized = normalize_for_ingest(_pack_dev_task(str(state.workflow_id)))
+
+    outcome = dispatch_ingested_envelopes(
+        state, [normalized, dict(normalized)], packs=packs, dispatcher=disp)
+    assert sorted(it.status for it in outcome.items) == ["done", "skipped_duplicate"]
+
+
+# --------------------------------------------------------------------------- #
+# MCP verb-level rejection                                                    #
+# --------------------------------------------------------------------------- #
+
+def test_verb_normalizes_and_validates_before_launching(monkeypatch) -> None:
+    from mcp_servers.hydra_control import server as hydra_server
+
+    launched: list[tuple[str, list]] = []
+    monkeypatch.setattr(hydra_server, "_launch_ingest",
+                        lambda wf, envs: launched.append((wf, envs))
+                        or {"ok": True, "launched": True, "pid": 1})
+
+    wf = "166fc7ee-1111-4222-8333-444455556666"
+    handler = hydra_server._tool_handlers()["hydra.workflow.submit_envelopes"]
+    res = handler({"workflow_id": wf,
+                   "envelopes": [_pack_dev_task(wf, id="devtask-hydra-heads-166fc7ee")]})
+
+    assert res["ok"] is True and res["launched"] is True
+    # The DETACHED child receives the repaired envelope, not the raw one.
+    (_wf, sent), = launched
+    assert UUID(str(sent[0]["id"]))
+    assert sent[0]["external_id"] == "devtask-hydra-heads-166fc7ee"
+    assert sent[0]["owner"] in {"frontend", "backend", "fullstack", "devops", "data"}
+
+
+def test_verb_rejects_unrepairable_envelope_without_launching(monkeypatch) -> None:
+    from mcp_servers.hydra_control import server as hydra_server
+
+    launched: list = []
+    monkeypatch.setattr(hydra_server, "_launch_ingest",
+                        lambda wf, envs: launched.append((wf, envs)) or {"ok": True})
+
+    wf = "166fc7ee-1111-4222-8333-444455556666"
+    handler = hydra_server._tool_handlers()["hydra.workflow.submit_envelopes"]
+    res = handler({"workflow_id": wf,
+                   "envelopes": [_pack_dev_task(wf, owner="wizard")]})
+
+    assert res["ok"] is False
+    assert res["launched"] is False
+    assert res["status"] == "envelopes_rejected"
+    assert any(e["field"] == "owner" for e in res["rejected"][0]["errors"])
+    assert res["rejected"][0]["index"] == 0
+    # Nothing was dispatched — the rejection is returned by the verb itself,
+    # not buried in .hydra/<wf>/ingest.log.
+    assert launched == []

@@ -29,6 +29,15 @@ Every envelope also requires the base fields `type`, `origin_squad`,
 required must be present or `validate_envelope` raises and the envelope is
 rejected — it is **not** dispatched.
 
+**`id` must be a UUID.** Omit it and one is generated. A human-readable label
+such as `"devtask-hydra-heads-166fc7ee"` does not validate; when a pack sends
+one, `normalize_pack_envelope` mints a UUID and preserves the original in the
+optional `external_id` field, so the pack's own reference still resolves. The
+`hydra.workflow.submit_envelopes` verb now runs that repair and the schema check
+synchronously and returns `status="envelopes_rejected"` without launching, so a
+bad envelope is never accepted with `{launched: true}` and rejected later in
+`ingest.log`.
+
 | Type | Required beyond the base | Notes |
 |---|---|---|
 | `C_SUITE_DECISION_PACKET` | `origin` (one of `CEO`, `CFO`, `CMO`, `CTO`, `CRO`, `CAIO`, `BOARDROOM`), `objective` | `proposed_tasks` optional but usually the point |

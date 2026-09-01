@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import UUID, uuid4
 
 from .governance import charge_and_gate, redact_for_squad_boundary
 from .schemas import HydraEnvelope, validate_envelope
@@ -159,14 +160,41 @@ def default_dev_task_branch(workflow_id: Any, title: str | None,
 _DEV_TASK_PACK_ONLY_KEYS: tuple[str, ...] = ("title", "acceptance_criteria", "budget_usd")
 
 
+def _normalize_envelope_id(out: dict, defaulted: list[str]) -> None:
+    """Guarantee ``out["id"]`` is a UUID string, preserving a non-UUID original.
+
+    ``HydraEnvelope.id`` is a ``UUID``. A host-run pack labels its envelopes
+    however it likes — the observed case was ``"devtask-hydra-heads-166fc7ee"``,
+    which ``hydra.workflow.submit_envelopes`` accepted and the detached ingest
+    then rejected with "id Input should be a valid UUID", visible only in
+    ``ingest.log``. We mint a UUID4 and keep the original in ``external_id`` so
+    the pack's own reference still resolves.
+
+    A MISSING id is synthesized too: the dedup ledger keys on the id, so an
+    envelope without one would bypass ``processed`` entirely.
+    """
+    raw_id = out.get("id")
+    if raw_id is not None and str(raw_id).strip():
+        try:
+            UUID(str(raw_id))
+            return
+        except (ValueError, AttributeError, TypeError):
+            if not out.get("external_id"):
+                out["external_id"] = str(raw_id)
+                defaulted.append("external_id")
+    out["id"] = str(uuid4())
+    defaulted.append("id")
+
+
 def normalize_pack_envelope(env: dict) -> dict:
     """Fill safe defaults on a pack-emitted envelope before schema validation.
 
-    Normalizes ``DEV_TASK`` (the type packs hand-write most often); any other
-    type comes back as an unchanged shallow copy. The returned dict carries
-    ``_normalized_fields`` — the list of fields defaulted or folded — which the
-    caller emits as ``ingest.envelope_normalized``. Pydantic treats that key as
-    an extra and drops it at validation.
+    ``id`` is normalized for EVERY envelope type (see ``_normalize_envelope_id``);
+    the remaining repairs apply to ``DEV_TASK``, the type packs hand-write most
+    often. The returned dict carries ``_normalized_fields`` — the list of fields
+    defaulted or folded — which the caller emits as
+    ``ingest.envelope_normalized``. Pydantic treats that key as an extra and
+    drops it at validation.
 
     Never raises: a shape this cannot repair falls through to validation, which
     then reports the real error.
@@ -174,10 +202,12 @@ def normalize_pack_envelope(env: dict) -> dict:
     if not isinstance(env, dict):
         return env
     out = dict(env)
-    if out.get("type") != "DEV_TASK":
-        return out
-
     defaulted: list[str] = []
+    _normalize_envelope_id(out, defaulted)
+    if out.get("type") != "DEV_TASK":
+        if defaulted:
+            out["_normalized_fields"] = defaulted
+        return out
 
     title = out.get("title") if isinstance(out.get("title"), str) else None
     instructions = out.get("instructions") if isinstance(out.get("instructions"), str) else None
@@ -261,6 +291,33 @@ def normalize_pack_envelope(env: dict) -> dict:
 
     if defaulted:
         out["_normalized_fields"] = defaulted
+    return out
+
+
+def normalize_for_ingest(env: dict,
+                         emit_fn: Callable[[str, dict], None] | None = None) -> dict:
+    """``normalize_pack_envelope`` + the ``ingest.envelope_normalized`` trace.
+
+    Returns the normalized dict with the ``_normalized_fields`` marker stripped,
+    so callers can hand it straight to ``validate_envelope`` or persist it.
+    Idempotent: normalizing an already-normalized envelope defaults nothing and
+    emits nothing, which is what lets the CLI normalize once for dedup and still
+    pass the dict through ``dispatch_ingested_envelopes``.
+    """
+    if not isinstance(env, dict):
+        return env
+    out = normalize_pack_envelope(env)
+    fields_defaulted = out.pop("_normalized_fields", None)
+    if fields_defaulted and emit_fn is not None:
+        try:
+            emit_fn("ingest.envelope_normalized", {
+                "envelope_id": str(out.get("id", "?")),
+                "external_id": out.get("external_id"),
+                "type": out.get("type"),
+                "fields_defaulted": list(fields_defaulted),
+            })
+        except Exception:  # noqa: BLE001 — tracing must never break ingest
+            pass
     return out
 
 
@@ -385,16 +442,7 @@ def dispatch_ingested_envelopes(
         # goes through normalize_pack_envelope, which supplies the required
         # fields the prose contract never documented (owner/branch) and folds
         # pack-only keys into real schema fields.
-        normalized = raw
-        if isinstance(raw, dict):
-            normalized = normalize_pack_envelope(dict(raw))
-            fields_defaulted = normalized.pop("_normalized_fields", None)
-            if fields_defaulted:
-                _emit("ingest.envelope_normalized", {
-                    "envelope_id": str(normalized.get("id", "?")),
-                    "type": normalized.get("type"),
-                    "fields_defaulted": list(fields_defaulted),
-                })
+        normalized = normalize_for_ingest(raw, _emit) if isinstance(raw, dict) else raw
         try:
             env = (normalized if isinstance(normalized, HydraEnvelope)
                    else validate_envelope(dict(normalized)))

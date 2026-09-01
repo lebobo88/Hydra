@@ -53,6 +53,10 @@ Every envelope carries the base fields `type`, `origin_squad`, and
 is not dispatched, and the delegation it carried is rejected — so fill these in
 rather than relying on the ingest normalizer.
 
+`id` is optional but MUST be a UUID when set. A readable label such as
+`"devtask-hydra-heads-166fc7ee"` is rejected; the normalizer replaces it with a
+UUID and keeps the original in `external_id`.
+
 | Type | Required beyond the base |
 |---|---|
 | `C_SUITE_DECISION_PACKET` | `origin` (`CEO`\|`CFO`\|`CMO`\|`CTO`\|`CRO`\|`CAIO`\|`BOARDROOM`), `objective` |

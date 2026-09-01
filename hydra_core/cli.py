@@ -1412,7 +1412,7 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     # and (b) leaves open_pp_runs durable up to the prior item. The in-flight
     # item is at-most-once; its pp run, if started, is finalize-aborted by the
     # drive loop's own exception handler or drained by `hydra reap`.
-    from .ingest import IngestItemResult, release_ingested_ids
+    from .ingest import IngestItemResult, normalize_for_ingest, release_ingested_ids
     # Only un-claim a status that PROVABLY never reached execute_squad, so a
     # corrected re-submit with the same id is not suppressed. `unknown_target`
     # qualifies (routing rejected it before any squad call). `failed` does NOT —
@@ -1425,6 +1425,10 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     agg_items: list = []
     over_budget = False
     for env_dict in envelopes:
+        # E2-34: normalize first so a missing or non-UUID pack id becomes a real
+        # UUID before it is used as the ledger key — otherwise such an envelope
+        # bypasses `processed` and can dispatch twice.
+        env_dict = normalize_for_ingest(env_dict, _emit_ingest)
         eid = env_dict.get("id")
         eid = str(eid) if eid is not None else None
         if eid and eid in processed:
@@ -1440,8 +1444,15 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         )
         # Un-claim if this envelope never reached a squad (wrong type/parse fail)
         # so it can be re-submitted after correction; otherwise mark it processed.
-        item_status = out_i.items[-1].status if out_i.items else "failed"
-        if eid and item_status in _NOT_DISPATCHED:
+        last_item = out_i.items[-1] if out_i.items else None
+        item_status = last_item.status if last_item is not None else "failed"
+        # E2-34: a SCHEMA-rejected item (structured field errors) provably never
+        # reached execute_squad either — it failed before any pp call — so it is
+        # un-claimed like unknown_target. That is narrower than `failed` at
+        # large, which can be a post-start_run abort and must stay claimed.
+        schema_rejected = bool(last_item is not None and last_item.errors)
+        if eid and (item_status in _NOT_DISPATCHED
+                    or (item_status == "failed" and schema_rejected)):
             release_ingested_ids(project, wf, [eid])
         elif eid:
             processed.add(eid)
@@ -2058,6 +2069,7 @@ def _cmd_attended_submit(args) -> int:
                             claim_ingested_ids,
                             dispatch_ingested_envelopes,
                             load_ingested_ids,
+                            normalize_for_ingest,
                             release_ingested_ids,
                         )
                         packs = discover_squads(project)
@@ -2080,6 +2092,14 @@ def _cmd_attended_submit(args) -> int:
                                      {"envelope_id": None, "type": None,
                                       "errors": bad["errors"]})
                                 continue
+                            # E2-34: normalize BEFORE reading the id. A pack may
+                            # omit `id` or use a non-UUID label; keying dedup on
+                            # the raw value would let such an envelope bypass
+                            # `processed` and dispatch twice.
+                            raw = normalize_for_ingest(
+                                raw,
+                                lambda event, payload: emit(project, wf, event, payload),
+                            )
                             envelope_id = raw.get("id")
                             if envelope_id is not None and str(envelope_id) in processed:
                                 outcomes.append({"envelope_id": str(envelope_id),
