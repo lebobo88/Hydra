@@ -323,11 +323,18 @@ class EightsAttestor:
 
         Called by `node_intake` at the start of every workflow so the spool
         naturally drains the next time eights is healthy. Returns the same
-        ``{sent, failed, skipped}`` summary as `PendingSpool.replay` so
+        ``{sent, failed, skipped, dead_lettered, dead_lettered_expired}``
+        summary as `PendingSpool.replay` so
         callers can emit a trace event.
         """
         if not self.enabled or self.dispatcher is None:
-            return {"sent": 0, "failed": 0, "skipped": 0}
+            return {
+                "sent": 0,
+                "failed": 0,
+                "skipped": 0,
+                "dead_lettered": 0,
+                "dead_lettered_expired": 0,
+            }
 
         def _send(spooled_call: SpooledCall) -> Any:
             args = {
@@ -349,7 +356,13 @@ class EightsAttestor:
                 max_age_hours=max_age_hours,
             )
         except Exception:  # noqa: BLE001
-            return {"sent": 0, "failed": 0, "skipped": 0}
+            return {
+                "sent": 0,
+                "failed": 0,
+                "skipped": 0,
+                "dead_lettered": 0,
+                "dead_lettered_expired": 0,
+            }
 
     def replay_pending_async(
         self,
