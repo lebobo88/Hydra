@@ -26,7 +26,7 @@ class NativePack:
 
 NATIVE_PACKS: dict[str, NativePack] = {
     "executive": NativePack("executive-suite", "executivesuite", "boardroom", "output"),
-    "garland": NativePack("rlm-creative", "rlm-creative", "brand-strategist", "RLM/output"),
+    "garland": NativePack("rlm-creative", "rlm-creative", "calliope", "RLM/output"),
     "legal-compliance": NativePack("senate", "senate", "general-counsel", "output"),
     "rlm-gaming": NativePack("rlm-gaming", "rlm-gaming", "the-director", "RLM/output"),
     "marketing-strategy": NativePack("marketbliss", "marketbliss", "marketing-supervisor", "output"),
