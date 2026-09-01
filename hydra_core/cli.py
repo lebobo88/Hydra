@@ -1518,7 +1518,6 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     attended agent. We surface them in task-list order so the host can
     dispatch one at a time, mirroring the engineering attended flow."""
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
-    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "claude-native", "agent-impersonation"})
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
@@ -1527,9 +1526,43 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
         pack = packs.get(t.owner_squad)
         if pack is None:
             continue
-        if pack.entrypoint in _NON_ENG_ENTRYPOINTS:
+        if pack.entrypoint in _NON_ENG_ATTENDED_ENTRYPOINTS:
             return t, pack
     return None, None
+
+
+_NON_ENG_ATTENDED_ENTRYPOINTS = frozenset(
+    {"claude-skill", "claude-native", "agent-impersonation"})
+
+
+def _next_attended_task(state: HydraState, packs: dict):
+    """First attended-eligible task in ``state.tasks`` list order.
+
+    E2-23: selection must follow the planner's task order, not drain
+    engineering first.  ``/hydra:campaign`` pre-wires executive -> creative ->
+    engineering; picking the engineering task first inverted that DAG and ran
+    the engineer without its upstream envelopes.
+
+    Returns ``(task, kind, pack)`` where ``kind`` is ``"engineering"`` (pack is
+    None — engineering opens a pp run cursor) or ``"squad"`` (pack is the
+    non-engineering squad pack whose entrypoint is host-attended).  Returns
+    ``(None, None, None)`` when nothing is pending.  Tasks already recorded in
+    ``attended_completed_task_ids`` are skipped, and non-engineering tasks
+    whose squad is unknown or headless-dispatchable are passed over (they are
+    not host-attended) so engineering behind them is still reachable.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    for t in getattr(state, "tasks", []):
+        if str(t.task_id) in done:
+            continue
+        if t.owner_squad == "engineering":
+            return t, "engineering", None
+        pack = (packs or {}).get(t.owner_squad)
+        if pack is None:
+            continue
+        if pack.entrypoint in _NON_ENG_ATTENDED_ENTRYPOINTS:
+            return t, "squad", pack
+    return None, None, None
 
 
 def _resolve_pack_lead_agent(pack) -> str:
@@ -1665,9 +1698,15 @@ def _cmd_attended_step(args) -> int:
             return 1
         state = HydraState.model_validate(snap.values)
 
+        # E2-23: pick the next attended task in task-list order.  The squad
+        # only decides WHICH cursor is opened (pp run vs squad stage) — it must
+        # not reorder the planner's dependency chain.
+        packs = _discover(project)
+        _sel_task, _sel_kind, _sel_pack = _next_attended_task(state, packs)
+
         # --- Engineering task (mcp entrypoint) ---
-        task = _next_engineering_task(state)
-        if task is not None:
+        if _sel_kind == "engineering":
+            task = _sel_task
             try:
                 project_path = _resolve_task_project_path(task, state, project)
             except MissingEngineeringTargetError as _missing_target_err:
@@ -1801,9 +1840,8 @@ def _cmd_attended_step(args) -> int:
             return 0
 
         # --- Non-engineering task (claude-skill / agent-impersonation) ---
-        packs = _discover(project)
-        ne_task, ne_pack = _next_nonengineering_attended_task(state, packs)
-        if ne_task is not None:
+        if _sel_kind == "squad":
+            ne_task, ne_pack = _sel_task, _sel_pack
             task_id = str(ne_task.task_id)
             request_text = ne_task.description or state.root_goal
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
