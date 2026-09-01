@@ -123,12 +123,38 @@ To regenerate after moving repos or editing the template, just re-run setup.
 
 Path resolution across the ecosystem is OS-agnostic (env override → anchor-relative
 → sibling → fail loud, with forward slashes). The one remaining OS-specific surface
-is the Claude Code **hooks**, which are authored in PowerShell (`.claude/hooks/*.ps1`)
-and registered with `pwsh -NoProfile -File "$CLAUDE_PROJECT_DIR/.claude/hooks/<name>.ps1"`.
+is the Claude Code **hooks**, which are authored in PowerShell (`*.ps1`).
 
-- The hook **commands no longer hardcode absolute paths** — every repo's hook
-  registration now uses `$CLAUDE_PROJECT_DIR`, which Claude Code injects at
-  hook-execution time. So the *path* is portable.
+Hydra and the squad packs ship their hooks as **Claude Code plugins**. For this
+repo that means the scripts live at `plugins/hydra/hooks/*.ps1` and are declared
+in `plugins/hydra/hooks/hooks.json` — *not* in `.claude/settings.json`. The
+portable path token for a plugin-shipped hook is **`${CLAUDE_PLUGIN_ROOT}`**,
+which resolves to the plugin's installation directory:
+
+```
+pwsh -NoProfile -File "${CLAUDE_PLUGIN_ROOT}/hooks/<name>.ps1"
+```
+
+`${CLAUDE_PLUGIN_ROOT}` is the documented placeholder for plugin-relative hook
+paths (Claude Code Hooks Reference § Path Placeholders,
+<https://code.claude.com/docs/en/hooks.md>). It supersedes `$CLAUDE_PROJECT_DIR`
+for hooks that a plugin owns; `$CLAUDE_PROJECT_DIR` remains correct for hooks a
+repo still registers directly in its own `.claude/settings.json`.
+
+Note this is a **host-interface** detail only — where Claude Code finds and
+launches the guard scripts. Hydra remains authoritative for workflow state,
+HITL, budgets, envelope validation, and RBAC regardless of how the hooks are
+registered.
+
+- The hook **commands no longer hardcode absolute paths** — plugin-shipped hooks
+  use `${CLAUDE_PLUGIN_ROOT}` and any remaining repo-registered hooks use
+  `$CLAUDE_PROJECT_DIR`. Both are injected by Claude Code at hook-execution
+  time, so the *path* is portable either way.
+- **Migration caveat:** when hooks move into a plugin, delete the superseded
+  registrations from `.claude/settings.json` (and from user-scope
+  `~/.claude/settings.json`). Hook definitions from all settings levels **merge
+  rather than replace** each other, so a leftover entry does not get overridden
+  — it keeps firing, and points at a script that no longer exists.
 - To **run** the PowerShell hooks on macOS/Linux you need **PowerShell 7+ (`pwsh`)**
   installed and on `PATH` (`brew install powershell` / `apt install powershell`).
   `pwsh` is itself cross-platform, so the existing `.ps1` hooks run unmodified.
