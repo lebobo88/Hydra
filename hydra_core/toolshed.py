@@ -282,7 +282,7 @@ def _extract_tags(name: str, description: str) -> list[str]:
 # ---------- static catalogs for known servers ----------
 
 PP_HARNESS_TOOLS = [
-    "analyze_autogenesis", "agents_md_status", "apply_agents_md_patch",
+    "ack_run", "analyze_autogenesis", "agents_md_status", "apply_agents_md_patch",
     "apply_master_plan_patch", "archive_artifact", "archive_winner_and_losers",
     "artifact_validate", "audit_status", "borda_count", "browser_validation_finalize",
     "browser_validation_start", "budget_status", "completion_checklist",
