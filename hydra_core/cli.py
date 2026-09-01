@@ -1532,6 +1532,115 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     return None, None
 
 
+def _pack_lead_agent_spec(pack):
+    """The pack's lead AgentSpec: first gatekeeper, else first agent, else None."""
+    agents = list(getattr(pack, "agents", []) or [])
+    for a in agents:
+        if getattr(a, "authority", "") == "gatekeeper":
+            return a
+    return agents[0] if agents else None
+
+
+def _skill_pack_checkout(pack) -> Path | None:
+    """Real on-disk checkout of a claude-skill pack, or None.
+
+    ``squads/<slug>/`` holds only Hydra's squad.yaml overlay -- the agents and
+    the pack's slash command live in the sibling repo named by ``source_pack``
+    (a repo URL, or a filesystem path for a locally vendored pack). The repo id
+    is the URL's last segment, resolved through the allow-listed registry.
+    """
+    src = str(getattr(pack, "source_pack", None) or "").strip()
+    if not src:
+        return None
+    if "://" not in src:
+        p = Path(src).expanduser()
+        if p.is_dir():
+            return p.resolve()
+    repo_id = src.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+    if repo_id.endswith(".git"):
+        repo_id = repo_id[:-4]
+    if not repo_id:
+        return None
+    try:
+        from .repo_registry import resolve_repo_path
+        return resolve_repo_path(repo_id.lower())
+    except Exception:  # noqa: BLE001 -- unregistered/absent checkout is not fatal
+        return None
+
+
+def _agent_frontmatter_name(agent_path: Path) -> str | None:
+    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+    try:
+        text = agent_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    block = text[3:end] if end != -1 else text[3:]
+    for line in block.splitlines():
+        if line.startswith("name:"):  # top-level key only (no indent)
+            return line[len("name:"):].strip().strip("\"'") or None
+    return None
+
+
+def _resolve_claude_skill_host_action(pack) -> dict:
+    """Host-action fields for a claude-skill pack's attended lead agent.
+
+    E2-31: the bare squad.yaml slug (e.g. ``support-supervisor``) is NOT a
+    spawnable agent type -- pack agents live in the sibling checkout under their
+    own frontmatter names. Resolve a spawnable identity instead:
+
+    * pack installed as a Claude Code plugin (``.claude-plugin/plugin.json``)
+      -> ``"<plugin-name>:<agent frontmatter name>"``;
+    * otherwise -> ``"general-purpose"`` plus ``skill`` (the pack's slash
+      command) and ``tool_scope`` (its MCP shim prefix) so the host drives the
+      pack through its declared command and MCP tools.
+
+    ``lead_agent_file`` is always included when resolvable, for transparency.
+    """
+    action: dict = {"agent_type": "general-purpose"}
+    checkout = _skill_pack_checkout(pack)
+    spec = _pack_lead_agent_spec(pack)
+
+    agent_path: Path | None = None
+    if checkout is not None and spec is not None and getattr(spec, "agent_file", None):
+        from .squad_loader import resolve_agent_file_path
+        try:
+            agent_path = resolve_agent_file_path(checkout, spec.agent_file)
+        except FileNotFoundError:
+            candidate = checkout / spec.agent_file
+            agent_path = candidate if candidate.is_file() else None
+    if agent_path is not None:
+        action["lead_agent_file"] = str(agent_path)
+
+    plugin_name: str | None = None
+    if checkout is not None:
+        manifest = checkout / ".claude-plugin" / "plugin.json"
+        if manifest.is_file():
+            try:
+                plugin_name = (json.loads(manifest.read_text(encoding="utf-8"))
+                               .get("name") or None)
+            except (OSError, ValueError):
+                plugin_name = None
+
+    if plugin_name and agent_path is not None:
+        agent_name = _agent_frontmatter_name(agent_path) or agent_path.stem
+        action["agent_type"] = f"{plugin_name}:{agent_name}"
+        return action
+
+    # Not plugin-loadable: drive the pack's slash command through its MCP shim.
+    from .squad_node import _SKILL_PACK_SHIMS
+    shim = _SKILL_PACK_SHIMS.get(pack.slug) or {}
+    invoke = getattr(pack, "invoke", None) or {}
+    command = invoke.get("command_hint") or shim.get("default_cmd")
+    if command:
+        action["skill"] = command
+    if shim.get("prefix"):
+        action["tool_scope"] = shim["prefix"]
+    return action
+
+
 def _resolve_pack_lead_agent(pack) -> str:
     """Resolve the supervisor / lead agent slug for a squad pack.
 
@@ -1541,13 +1650,10 @@ def _resolve_pack_lead_agent(pack) -> str:
     if getattr(pack, "entrypoint", None) == "claude-native":
         from .native_packs import native_pack
         return native_pack(pack.slug).qualified_lead_agent
-    agents = list(getattr(pack, "agents", []) or [])
-    for a in agents:
-        if getattr(a, "authority", "") == "gatekeeper":
-            return a.slug
-    if agents:
-        return agents[0].slug
-    return "general-purpose"
+    if getattr(pack, "entrypoint", None) == "claude-skill":
+        return _resolve_claude_skill_host_action(pack)["agent_type"]
+    spec = _pack_lead_agent_spec(pack)
+    return spec.slug if spec is not None else "general-purpose"
 
 
 def _resolve_pack_cwd(pack, project: Path) -> str:
@@ -1560,6 +1666,12 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
     if getattr(pack, "entrypoint", None) == "claude-native":
         from .native_packs import native_pack_root
         return str(native_pack_root(pack.slug))
+    if getattr(pack, "entrypoint", None) == "claude-skill":
+        # E2-31: squads/<slug>/ is only Hydra's overlay -- the agents, skills and
+        # slash command live in the pack's own checkout.
+        checkout = _skill_pack_checkout(pack)
+        if checkout is not None:
+            return str(checkout)
     from .squad_loader import SQUAD_DIR_NAMES, USER_SQUAD_DIR
     for dir_name in SQUAD_DIR_NAMES:
         candidate = project / dir_name / pack.slug
@@ -1807,9 +1919,15 @@ def _cmd_attended_step(args) -> int:
             task_id = str(ne_task.task_id)
             request_text = ne_task.description or state.root_goal
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
-            lead_agent = _resolve_pack_lead_agent(ne_pack)
+            action_extras = None
+            if ne_pack.entrypoint == "claude-skill":
+                action_extras = _resolve_claude_skill_host_action(ne_pack)
+                lead_agent = action_extras.pop("agent_type")
+            else:
+                lead_agent = _resolve_pack_lead_agent(ne_pack)
 
             res = host_bridge.begin_squad_stage(
+                action_extras=action_extras,
                 workflow_id=wf,
                 task_id=task_id,
                 squad_slug=ne_pack.slug,
