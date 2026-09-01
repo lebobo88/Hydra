@@ -18,6 +18,18 @@
 #   - Shell heredoc (<<WORD) redirected into a blocked-extension file
 #   - PowerShell here-string (@'...'@ or @"..."@) piped to Set-Content/Out-File
 #
+# EFFECTIVE-CWD RULE (E2-18) — a relative destination is resolved against the
+# cwd the command has actually reached, not blindly against the payload's
+# session cwd. The command string is scanned for `cd` / `pushd` /
+# `Set-Location` directory tokens (quoted or bare, separated by `&&`, `;`,
+# `||`, or newline); the LAST such directory BEFORE the write idiom wins, and
+# a relative `cd` composes onto the previous effective cwd (starting from
+# $json.cwd). Without this, `cd <worktree> && echo x >> tests/p.py` resolved to
+# <projectRoot>\tests\p.py and was BLOCKED while the Edit tool on the very same
+# file was ALLOWED by hydra-block-direct-write.ps1 — the two guards disagreed.
+# An unresolvable `cd` target (variable/`-`) leaves the effective cwd unchanged,
+# which keeps the resolution inside the project root: fail CLOSED.
+#
 # RESIDUAL LIMITS — this is a guardrail, not a sandbox:
 #   - Obfuscated writes (variable indirection, eval, base64 payloads,
 #     pipes to write-capable sub-processes) can evade detection.
@@ -139,16 +151,55 @@ if ($_bwProjRootNorm) {
     [void]$_bwWtRoots.Add("$_bwProjRootNorm\.harness\worktrees")
 }
 
+# --- E2-18: effective cwd derived from cd/pushd/Set-Location in the command ---
+# Test-BlockedDest used to join a relative destination with $_bwCwd (the
+# payload's session cwd), ignoring any directory change earlier in the SAME
+# command. Build an ordered table of (end-offset -> effective cwd) so each
+# write idiom resolves against the directory in force at its own position.
+$_bwCdPat = '(?i)(?:^|[;&|\n]|\bthen\b|\bdo\b)\s*(?:cd|pushd|Set-Location|sl)\s+(?:-\w+\s+)*(?:"([^"]+)"|''([^'']+)''|([^\s;&|]+))'
+$_bwCdPoints = New-Object System.Collections.Generic.List[object]
+if ($_bwCwd) {
+    $_bwEff = $_bwCwd
+    foreach ($_cdm in [regex]::Matches($cmd, $_bwCdPat)) {
+        $_cdDir = $null
+        foreach ($_gi in 1, 2, 3) {
+            if ($_cdm.Groups[$_gi].Success) { $_cdDir = $_cdm.Groups[$_gi].Value; break }
+        }
+        if (-not $_cdDir) { continue }
+        $_cdDir = $_cdDir.Replace('/', '\')
+        # Unresolvable targets (shell/PS variable expansion, `cd -`, `~`): leave
+        # the effective cwd unchanged. That keeps resolution anchored where it
+        # already was rather than optimistically relocating it — fail CLOSED.
+        if ($_cdDir -eq '-' -or $_cdDir -eq '~' -or
+            $_cdDir.Contains('$') -or $_cdDir.Contains('%') -or $_cdDir.Contains('`')) { continue }
+        try {
+            if ([System.IO.Path]::IsPathRooted($_cdDir)) { $_bwEff = $_cdDir }
+            else { $_bwEff = (Join-Path $_bwEff $_cdDir) }
+            $_bwEff = [System.IO.Path]::GetFullPath($_bwEff)
+        } catch { continue }
+        [void]$_bwCdPoints.Add([pscustomobject]@{ Index = $_cdm.Index + $_cdm.Length; Cwd = $_bwEff })
+    }
+}
+
+function _bwEffCwdAt([int]$atIndex) {
+    $eff = $_bwCwd
+    foreach ($p in $_bwCdPoints) {
+        if ($p.Index -le $atIndex) { $eff = $p.Cwd } else { break }
+    }
+    return $eff
+}
+
 function Test-BlockedDest {
-    param([string]$dest)
+    param([string]$dest, [int]$atIndex = [int]::MaxValue)
     if (-not $dest) { return $false }
     $raw = $dest.Trim('"''').Replace('/', '\')
     $norm = $raw.ToLowerInvariant()
 
+    $_effCwd = _bwEffCwdAt $atIndex
     $absNorm = $norm
     try {
-        if ($_bwCwd -and -not [System.IO.Path]::IsPathRooted($raw)) {
-            $absNorm = (Join-Path $_bwCwd $raw).Replace('/', '\').ToLowerInvariant()
+        if ($_effCwd -and -not [System.IO.Path]::IsPathRooted($raw)) {
+            $absNorm = ([System.IO.Path]::GetFullPath((Join-Path $_effCwd $raw))).Replace('/', '\').ToLowerInvariant()
         }
     } catch { $absNorm = $norm }
 
@@ -177,7 +228,7 @@ $reason  = ''
 if (-not $matched) {
     $hits = [regex]::Matches($cmd, '>{1,2}\s*[''"]?([^\s''";|&<>]+)')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value) {
+        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
             $matched = $true
             $reason = "output redirection to '$($hit.Groups[1].Value)'"
             break
@@ -190,7 +241,7 @@ if (-not $matched) {
 if (-not $matched) {
     $hits = [regex]::Matches($cmd, '\btee\s+(?:-[ai]\s+)*[''"]?([^\s''";|&<>\-][^\s''";|&<>]*)')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value) {
+        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
             $matched = $true
             $reason = "tee to '$($hit.Groups[1].Value)'"
             break
@@ -205,7 +256,7 @@ if (-not $matched) {
     $hits = [regex]::Matches($cmd,
         '\b(?:cp|mv|copy|move)\b\s+\S.*?\s+([''"]?[^\s''";|&<>]+[''"]?)(?=\s*(?:$|[;&|]))')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value) {
+        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
             $matched = $true
             $reason = "cp/mv/copy/move to '$($hit.Groups[1].Value)'"
             break
@@ -241,7 +292,7 @@ if (-not $matched) {
     $plMatches = [regex]::Matches($cmd,
         "\bPath\s*\(\s*[`"']([^`"']+)[`"']\s*\)\s*\.\s*write_(?:text|bytes)\b")
     foreach ($pm in $plMatches) {
-        if (Test-BlockedDest $pm.Groups[1].Value) {
+        if (Test-BlockedDest $pm.Groups[1].Value $pm.Index) {
             $matched = $true
             $reason = "pathlib.Path.write_text/write_bytes to '$($pm.Groups[1].Value)'"
             break
@@ -283,7 +334,7 @@ if (-not $matched) {
         $nextIsPathValue = $false
         foreach ($tok in $tokens) {
             if ($nextIsPathValue) {
-                if (Test-BlockedDest $tok) {
+                if (Test-BlockedDest $tok $m.Index) {
                     $matched = $true
                     $reason = "Set-Content/Out-File to '$tok'"
                     break
@@ -293,7 +344,7 @@ if (-not $matched) {
                 # Flag with inline value (-Path:foo.py) or flag expecting next token
                 $inline = ($tok -replace '^-(?:Path|FilePath|LiteralPath):', '')
                 if ($inline -and ($inline -ne $tok)) {
-                    if (Test-BlockedDest $inline) {
+                    if (Test-BlockedDest $inline $m.Index) {
                         $matched = $true
                         $reason = "Set-Content/Out-File to '$inline'"
                         break
@@ -303,7 +354,7 @@ if (-not $matched) {
                 }
             } elseif ($tok -notmatch '^-') {
                 # Positional argument (not a flag name or flag value)
-                if (Test-BlockedDest $tok) {
+                if (Test-BlockedDest $tok $m.Index) {
                     $matched = $true
                     $reason = "Set-Content/Out-File to '$tok'"
                     break
@@ -319,7 +370,7 @@ if (-not $matched) {
 if (-not $matched) {
     $hits = [regex]::Matches($cmd, '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*[''"]?([^\s''";|&<>]+)')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value) {
+        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
             $matched = $true
             $reason = "heredoc into '$($hit.Groups[1].Value)'"
             break
