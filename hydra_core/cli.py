@@ -1820,6 +1820,157 @@ def _resolve_claude_skill_host_action(pack) -> dict:
     return action
 
 
+def _next_stub_attended_task(state: HydraState, packs: dict):
+    """E2-32: first pending task (task-list order) owned by a squad whose pack
+    entrypoint is ``stub``, that the host has not yet completed.
+
+    A stub squad has no host action to spawn and no MCP leg to drive — its
+    whole contract is the canned ``[STUB]`` DecisionRecord that
+    ``squad_node._stub`` returns. Before this, ``_next_engineering_task`` and
+    ``_next_nonengineering_attended_task`` both skipped stub tasks, so an
+    attended workflow whose only task was a stub squad reported
+    ``no_pending_task`` forever and never advanced.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    for t in getattr(state, "tasks", []):
+        if str(t.task_id) in done:
+            continue
+        pack = packs.get(t.owner_squad)
+        if pack is not None and getattr(pack, "entrypoint", None) == "stub":
+            return t, pack
+    return None, None
+
+
+def _task_precedes(state: HydraState, task, other) -> bool:
+    """True when `task` comes before `other` in the workflow's task list.
+    A None `other` (no competing candidate) means `task` wins by default."""
+    if other is None:
+        return True
+    order = [str(t.task_id) for t in getattr(state, "tasks", [])]
+    try:
+        return order.index(str(task.task_id)) < order.index(str(other.task_id))
+    except ValueError:  # pragma: no cover — both ids come from state.tasks
+        return True
+
+
+def _drive_stub_task(sup, config: dict, project: Path, wf: str,
+                     state: HydraState, task, pack) -> dict:
+    """E2-32: run a stub squad's in-process path and record it as the task
+    result, with the same checkpoint bookkeeping ``submit-host-result`` does
+    for a squad result.
+
+    Idempotent with the in-graph path: when a headless dispatch pass already
+    produced this squad's ``[STUB]`` DecisionRecord (RA-5 keeps stubs OUT of
+    the live-defer pre-filter, so ``node_dispatch`` runs ``_stub`` itself), the
+    existing envelope is reused instead of emitting a second one. The task is
+    marked attended-complete but deliberately NOT added to
+    ``attended_done_task_ids`` — a stub is `surfaced`, not `done`, and
+    ``enforce_governance`` must keep surfacing the workflow for human
+    follow-up.
+    """
+    from .squad_node import _stub
+    from .schemas import CSuiteDecisionPacket
+
+    task_id = str(task.task_id)
+    existing: dict | None = None
+    for e in getattr(state, "envelopes", []) or []:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("origin_squad") == pack.slug
+                and "[STUB]" in str(e.get("decision") or "")):
+            existing = e
+            break
+
+    new_envelopes: list[dict] = []
+    if existing is None:
+        inbound = CSuiteDecisionPacket(
+            workflow_id=state.workflow_id,
+            origin_squad="hydra",
+            target_squad=pack.slug,
+            origin="BOARDROOM",
+            objective=task.description or state.root_goal,
+        )
+        result = _stub(pack, inbound)
+        from .ingest import _redact_envelope_dict
+        for produced in result.envelopes:
+            d = _redact_envelope_dict(produced.model_dump(mode="json"))
+            d["_task_id"] = task_id
+            new_envelopes.append(d)
+        existing = new_envelopes[0] if new_envelopes else None
+
+    completed = list(getattr(state, "attended_completed_task_ids", []) or [])
+    if task_id not in completed:
+        completed.append(task_id)
+    patch: dict = {"attended_completed_task_ids": completed}
+    if new_envelopes:
+        # `envelopes` uses an append reducer — emit only the NEW records.
+        patch["envelopes"] = new_envelopes
+    try:
+        sup.update_state(config, patch)
+    except Exception as e:  # noqa: BLE001
+        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+    envelope_id = (str(existing.get("id"))
+                   if isinstance(existing, dict) and existing.get("id") is not None
+                   else None)
+    emit(project, wf, "dispatch.stub_surfaced", {
+        "task_id": task_id,
+        "squad_slug": pack.slug,
+        "entrypoint": "stub",
+        "envelope_id": envelope_id,
+        "reused_in_graph_record": not new_envelopes,
+    })
+    return {
+        "status": "stub_surfaced",
+        "task_id": task_id,
+        "squad_slug": pack.slug,
+        "envelope_id": envelope_id,
+        "decision_record": existing,
+    }
+
+
+def _run_first_step_dispatch_pass(sup, config: dict, project: Path, wf: str,
+                                  snap, state: HydraState) -> bool:
+    """E2-32: run the headless dispatch pass `hydra approve` runs, on the FIRST
+    attended step of a workflow that has no approval gate.
+
+    ``hydra plan`` adds ``dispatch`` to ``interrupt_before``, so every planned
+    workflow parks at a bare interrupt. A gated workflow leaves that interrupt
+    via ``/hydra:approve``; a workflow whose planner set
+    ``requires_human_approval=False`` had NO caller for that pass at all, so
+    claude-skill / agent-impersonation tasks never got their
+    ``dispatch.deferred_to_host`` marking and the phase never left ``dispatch``.
+
+    Guards (all required): a bare LangGraph interrupt is pending, no HITL gate
+    is open, the planner did not require approval, and nothing has been driven
+    attended yet (this is a first-step bootstrap, not a per-step resume).
+    A pending engineering task suppresses the pass — the attended engineering
+    cursor below owns that dispatch and engineering deferral semantics are out
+    of scope here (fix-E2-22).
+
+    Returns True when the pass ran, so the caller re-reads the checkpoint.
+    """
+    if getattr(state, "requires_human_approval", False):
+        return False
+    if state.pending_hitl:
+        return False
+    if getattr(state, "attended_completed_task_ids", None):
+        return False
+    if not (getattr(snap, "next", ()) or ()):
+        return False
+    if _next_engineering_task(state) is not None:
+        return False
+    emit(project, wf, "attended.no_approval_dispatch_pass", {
+        "interrupted_before": list(getattr(snap, "next", ()) or ()),
+    })
+    try:
+        sup.invoke(None, config=config)
+    except Exception as e:  # noqa: BLE001 — the attended cursor still proceeds
+        emit(project, wf, "attended.dispatch_pass_failed", {"error": str(e)})
+        return False
+    return True
+
+
 def _resolve_pack_lead_agent(pack) -> str:
     """Resolve the supervisor / lead agent slug for a squad pack.
 
@@ -1955,6 +2106,13 @@ def _cmd_attended_step(args) -> int:
                   file=sys.stderr)
             return 1
         state = HydraState.model_validate(snap.values)
+
+        # E2-32: no-approval workflows have no `approve` caller to leave the
+        # plan_only dispatch interrupt — run that same pass here, once.
+        if _run_first_step_dispatch_pass(sup, config, project, wf, snap, state):
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
 
         # E2-23: pick the next attended task in task-list order.  The squad
         # only decides WHICH cursor is opened (pp run vs squad stage) — it must
@@ -2098,6 +2256,17 @@ def _cmd_attended_step(args) -> int:
             return 0
 
         # --- Non-engineering task (claude-skill / agent-impersonation) ---
+        # E2-32: a stub squad has no host action to spawn — drive it in-process.
+        # Resolved against the E2-23 attended selection in TASK-LIST ORDER:
+        # whichever candidate appears first in state.tasks wins, so a stub
+        # never jumps the queue and is never skipped forever.
+        stub_task, stub_pack = _next_stub_attended_task(state, packs)
+        if stub_task is not None and _task_precedes(state, stub_task, _sel_task):
+            res = _drive_stub_task(sup, config, project, wf, state,
+                                   stub_task, stub_pack)
+            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            return 0
+
         if _sel_kind == "squad":
             ne_task, ne_pack = _sel_task, _sel_pack
             task_id = str(ne_task.task_id)
