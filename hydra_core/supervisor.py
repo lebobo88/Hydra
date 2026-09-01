@@ -1172,7 +1172,17 @@ def build_supervisor(
 
         # (a) requires_human_approval: any high-risk task anywhere in full_tasks.
         high_risk = any(_task_is_high_risk(t) for t in full_tasks)
-        state.requires_human_approval = high_risk or state.is_over_budget()
+        # E2-32: an UNFUNDED workflow (budget_usd == 0) is not a risk signal.
+        # `is_over_budget()` is `spent >= budget`, which is trivially True for
+        # budget_usd == 0.0 at spent 0.0 -- so the identical goal/squad/risk
+        # required approval at --budget 0 and did not at --budget 0.1. Budget
+        # exhaustion is the dispatch-time gate (`budget.pre_dispatch_block` in
+        # node_dispatch, which fires on the same `spent >= budget` predicate
+        # and includes the zero-budget case); the approval gate stays purely
+        # risk-driven. A funded workflow that is genuinely over budget before
+        # dispatch still requires approval, exactly as before.
+        budget_exhausted = state.budget.budget_usd > 0 and state.is_over_budget()
+        state.requires_human_approval = high_risk or budget_exhausted
 
         # squad_gate_high_risk: True when any task's squad has an explicit
         # hitl_required gate (independent of task priority).  This is the
