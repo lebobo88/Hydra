@@ -22,6 +22,66 @@ Every artifact that crosses a squad boundary is a Pydantic envelope defined in `
 | `DECISION_RECORD` | synthesizer | decision, rationale, dissenting_opinions, artifacts |
 | `HANDOFF` | supervisor → squad | granted_tools, granted_memory_scopes, payload_envelope_id |
 
+## Required fields per type
+
+Every envelope also requires the base fields `type`, `origin_squad`,
+`workflow_id` (a UUID). `id` and `created_at` default. Anything below marked
+required must be present or `validate_envelope` raises and the envelope is
+rejected — it is **not** dispatched.
+
+| Type | Required beyond the base | Notes |
+|---|---|---|
+| `C_SUITE_DECISION_PACKET` | `origin` (one of `CEO`, `CFO`, `CMO`, `CTO`, `CRO`, `CAIO`, `BOARDROOM`), `objective` | `proposed_tasks` optional but usually the point |
+| `PRD` | `source_goal_id` (UUID), `summary` | `user_stories`, `acceptance_criteria`, `non_functional_requirements` default to `[]` |
+| `ARCH_RFC` | `risk_assessment`, `rollout_plan` | `related_prd` optional; `proposed_changes` defaults to `[]` |
+| `DEV_TASK` | `owner`, `repo`, `branch`, `instructions` | see below |
+| `CREATIVE_BRIEF` | `campaign_id` (UUID), `objective`, `target_audience` | |
+| `SHOT_LIST` | `brief_id` (UUID) | `shots` defaults to `[]` |
+| `ASSET_JOB` | `model_type`, `output_bucket` | |
+| `HITL_REQUEST` | `reason`, `summary`, `options` | `options` must be non-empty to be answerable |
+| `DECISION_RECORD` | `decision`, `rationale` | `dissenting_opinions` are preserved, never dropped |
+| `HANDOFF` | `payload_envelope_id` (UUID) | grants default to empty (no privilege) |
+
+`DEV_TASK.owner` is a closed literal set — no other value validates:
+
+```
+"frontend" | "backend" | "fullstack" | "devops" | "data"
+```
+
+`DEV_TASK.status` is likewise a literal set (`pending`, `in_progress`, `done`,
+`blocked`, `surfaced`) and defaults to `pending`.
+
+### Minimum DEV_TASK
+
+```json
+{
+  "type": "DEV_TASK",
+  "origin_squad": "rlm-gaming",
+  "target_squad": "engineering",
+  "workflow_id": "166fc7ee-0000-4000-8000-000000000000",
+  "owner": "frontend",
+  "repo": "RLMplatform",
+  "branch": "hydra/166fc7ee/pause-menu-overlay",
+  "instructions": "Implement the pause-menu overlay described in the level spec."
+}
+```
+
+Optional but strongly preferred: `test_plan` (list of strings), `files_touched`,
+`target_repo_id` (an allow-listed repo id — the `repo` free-text field is never
+used for path resolution), `pp_team`, `pp_profile`, and
+`constraints.budget_usd`.
+
+**Normalization is a safety net, not the contract.** `hydra_core.ingest.
+normalize_pack_envelope` fills a missing `owner` (inferred from `pp_team` /
+`title` / `instructions` keywords, defaulting to `fullstack`) and a missing
+`branch` (`hydra/<workflow-short8>/<slug>`), maps an allow-listed `repo` onto
+`target_repo_id`, and folds pack-only keys (`title`, `acceptance_criteria`,
+`budget_usd`) into `instructions` / `test_plan` / `constraints`. It emits
+`ingest.envelope_normalized` with the list of fields it had to supply. Emit the
+fields yourself: an inferred owner or branch is a guess, and anything the
+normalizer still cannot repair is rejected with `ingest.invalid_envelope` and a
+top-level `status="envelopes_rejected"`.
+
 ## Rules
 
 1. NEVER serialize a raw blob across a boundary. Use `MemoryRef` handles (`tier`, `key`, `summary`) and let the receiver resolve via the memory MCP server.

@@ -46,6 +46,51 @@ the task cannot be planned safely.
 4. Set `Constraints` on every envelope: `budget_usd`, `deadline_ts`, `risk_tolerance`, `priority`, `industries`. These propagate downstream.
 5. Sign every envelope with `origin_squad="hydra"` and a fresh `parent_id` pointing at the planning record.
 
+## Required Fields Per Envelope Type
+
+Every envelope carries the base fields `type`, `origin_squad`, and
+`workflow_id` (a UUID). An envelope missing a required field does not validate,
+is not dispatched, and the delegation it carried is rejected — so fill these in
+rather than relying on the ingest normalizer.
+
+| Type | Required beyond the base |
+|---|---|
+| `C_SUITE_DECISION_PACKET` | `origin` (`CEO`\|`CFO`\|`CMO`\|`CTO`\|`CRO`\|`CAIO`\|`BOARDROOM`), `objective` |
+| `PRD` | `source_goal_id` (UUID), `summary` |
+| `ARCH_RFC` | `risk_assessment`, `rollout_plan` |
+| `DEV_TASK` | `owner`, `repo`, `branch`, `instructions` |
+| `CREATIVE_BRIEF` | `campaign_id` (UUID), `objective`, `target_audience` |
+| `SHOT_LIST` | `brief_id` (UUID) |
+| `ASSET_JOB` | `model_type`, `output_bucket` |
+| `HITL_REQUEST` | `reason`, `summary`, `options` |
+| `DECISION_RECORD` | `decision`, `rationale` |
+| `HANDOFF` | `payload_envelope_id` (UUID) |
+
+`DEV_TASK.owner` is a closed literal set: `"frontend"`, `"backend"`,
+`"fullstack"`, `"devops"`, `"data"`. Nothing else validates.
+
+### Minimum DEV_TASK
+
+```json
+{
+  "type": "DEV_TASK",
+  "origin_squad": "hydra",
+  "target_squad": "engineering",
+  "workflow_id": "166fc7ee-0000-4000-8000-000000000000",
+  "owner": "backend",
+  "repo": "RLMplatform",
+  "branch": "hydra/166fc7ee/idempotency-key-support",
+  "instructions": "Honor Idempotency-Key on POST /payments; replay the prior result."
+}
+```
+
+Prefer also setting `test_plan`, `target_repo_id` (an allow-listed repo id;
+`repo` is free text and is never used for path resolution), `pp_team`, and
+`constraints.budget_usd`. `hydra_core.ingest.normalize_pack_envelope` will
+infer a missing `owner` and synthesize a missing `branch`, and it emits
+`ingest.envelope_normalized` naming every field it had to supply — treat that
+event as a defect in your output, not as a feature.
+
 ## Authority Bounds
 
 - You DO NOT call MCP tools directly. You produce envelopes; the supervisor dispatches them.
