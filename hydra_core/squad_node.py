@@ -1165,6 +1165,12 @@ def _drive_pp_stage_loop(
     cm = dispatcher.call_mcp
     out: dict[str, Any] = {
         "final_status": "aborted", "stage_outcome": None,
+        # E2-38: the LAST recorded judge verdict for this stage ("pass"/
+        # "revise"/"fail"), kept SEPARATE from ``stage_outcome`` because the
+        # latter is overwritten with "surfaced" by the readiness / finalize
+        # downgrades. The harvest gate reads THIS: output that no judge
+        # passed must never land on the operator's current branch.
+        "verdict_outcome": None,
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
@@ -1424,6 +1430,12 @@ def _drive_pp_stage_loop(
                 out["error"] = (out.get("error") or "") + \
                     " required_cross_vendor=true but judge was same-vendor; downgraded"
 
+            # E2-38: record the effective verdict for THIS attempt. The last
+            # loop iteration wins, which is exactly the "last recorded verdict"
+            # the harvest gate needs. Set after the F26/F31 downgrades so an
+            # infra-degraded "pass" is never read back as a real pass.
+            out["verdict_outcome"] = outcome
+
             if outcome == "pass":
                 break  # accept; no Reflexion needed
             if _infra_downgrade:
@@ -1631,6 +1643,12 @@ def _drive_best_of_loop(
     cm = dispatcher.call_mcp
     out: dict[str, Any] = {
         "final_status": "aborted", "stage_outcome": None,
+        # E2-38: the LAST recorded judge verdict for this stage ("pass"/
+        # "revise"/"fail"), kept SEPARATE from ``stage_outcome`` because the
+        # latter is overwritten with "surfaced" by the readiness / finalize
+        # downgrades. The harvest gate reads THIS: output that no judge
+        # passed must never land on the operator's current branch.
+        "verdict_outcome": None,
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
@@ -1947,6 +1965,7 @@ def _drive_best_of_loop(
 
         out["attempt_id"] = winner["att"]
         out["stage_outcome"] = winner["outcome"]
+        out["verdict_outcome"] = winner["outcome"]  # E2-38 harvest gate input
         out["critique"] = str(winner["critique"])[:1000]
         out["smoke_status"] = winner["smoke"]
 
@@ -3007,6 +3026,8 @@ def _via_mcp(
     # visible on a branch — Discovery agent E2's research artifacts hit this
     # exact failure mode in the bootstrap session.
     commit_sha: str | None = None
+    preserved_branch: str | None = None
+    preserved_reason: str | None = None
     # Harvest when pp reported a terminal status, OR when the drive loop reports
     # codex wrote changes (covers the case where codex produced good code but its
     # own commit was blocked by the workspace-write sandbox — the harness must
@@ -3014,15 +3035,39 @@ def _via_mcp(
     wrote = bool(loop_outcome and loop_outcome.get("wrote_changes"))
     if run_id and project_path and (pp_status in {"done", "complete", "surfaced"} or wrote):
         try:
-            commit_sha = harvest_pp_run_artifacts(
+            # E2-38: the harvest may only touch the CURRENT branch when the run
+            # finished AND its last judge verdict passed. Everything else —
+            # surfaced, revise/fail, no verdict recorded — is preserved on
+            # hydra/harvest/<run_id> instead. `verdict_outcome` is None on the
+            # legacy scaffold-only path (no drive loop ran), which the gate
+            # correctly reads as "not passed".
+            harvest = harvest_pp_run_artifacts(
                 project_path=str(project_path),
                 run_id=str(run_id),
                 workflow_id=inbound.workflow_id,
                 changed_paths=(loop_outcome or {}).get("changed_paths"),
+                pp_status=pp_status,
+                verdict_outcome=(loop_outcome or {}).get("verdict_outcome"),
             )
+            harvest = harvest if isinstance(harvest, dict) else {}
+            if harvest.get("preserved"):
+                preserved_branch = harvest.get("branch")
+                preserved_reason = harvest.get("reason")
+                _log.info(
+                    "harvest PRESERVED run=%s branch=%s reason=%s sha=%s",
+                    run_id, preserved_branch, preserved_reason,
+                    harvest.get("sha") or "none",
+                )
+            else:
+                # Only a direct, judged-pass commit reports a commit_sha — a
+                # preserved sha lives on a side branch and must never be read
+                # as "this landed on the operator's branch".
+                commit_sha = harvest.get("sha")
+                _log.info("harvest committed run=%s sha=%s", run_id, commit_sha or "none")
             if loop_outcome is not None:
                 loop_outcome["harvest_sha"] = commit_sha
-            _log.info("harvest committed run=%s sha=%s", run_id, commit_sha or "none")
+                loop_outcome["harvest_preserved_branch"] = preserved_branch
+                loop_outcome["harvest_preserved_reason"] = preserved_reason
         except Exception as e:  # noqa: BLE001 — never crash dispatch on a git failure
             commit_sha = None
             if loop_outcome is not None:
@@ -3043,6 +3088,11 @@ def _via_mcp(
                if loop_outcome.get("harvest_sha") else "")
             + (f", harvest_error={loop_outcome.get('harvest_error')}"
                if loop_outcome.get("harvest_error") else "")
+            # E2-38: synthesis MUST be able to tell the operator where unjudged
+            # work was parked instead of silently reporting nothing landed.
+            + (f", harvest_preserved_branch={loop_outcome.get('harvest_preserved_branch')}"
+               f" (reason={loop_outcome.get('harvest_preserved_reason')})"
+               if loop_outcome.get("harvest_preserved_branch") else "")
             + (f", error={loop_outcome.get('error')}" if loop_outcome.get("error") else "")
         )
     else:
@@ -3060,13 +3110,18 @@ def _via_mcp(
             f"pp_profile={getattr(inbound, 'pp_profile', None) or 'default'}; "
             f"model_tier={effective_tier or 'default'}; "
             f"pp dispatch status: {pp_status}; "
-            f"commit_sha={commit_sha or 'none'}{loop_summary}; inner: {str(inner)[:240]}"
+            f"commit_sha={commit_sha or 'none'}; "
+            + (f"harvest_preserved_branch={preserved_branch} "
+               f"(reason={preserved_reason}); " if preserved_branch else "")
+            + f"{loop_summary}; inner: {str(inner)[:240]}"
         ),
         artifacts=[MemoryRef(tier="episodic", key=f"pp:run:{run_id or 'unknown'}")] if run_id else [],
     )
     return SquadResult(
         envelopes=[decision],
         artifacts=[{"kind": "pp_run", "ref": run_id, "raw": result, "commit_sha": commit_sha,
+                    "harvest_preserved_branch": preserved_branch,
+                    "harvest_preserved_reason": preserved_reason,
                     "drive_loop": loop_outcome}],
         status=result_status,
         # A driven run has already been cross-vendor judged inside pp — exempt
@@ -3075,28 +3130,71 @@ def _via_mcp(
     )
 
 
+_HARVEST_BRANCH_PREFIX = "hydra/harvest/"
+_PROTECTED_BRANCHES = {"main", "master"}
+
+
+def _harvest_default_branch(git: Any) -> str:
+    """Best-effort name of the repo's default branch.
+
+    ``origin/HEAD`` when a remote publishes it, else ``init.defaultBranch``,
+    else ``main``. Only ever used to make the guard MORE protective — the
+    caller unions the result with ``main``/``master``.
+    """
+    r = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    ref = r.stdout.strip() if r.returncode == 0 else ""
+    if ref:
+        return ref.split("/", 1)[-1]
+    r = git("config", "--get", "init.defaultBranch")
+    return (r.stdout.strip() if r.returncode == 0 else "") or "main"
+
+
 def harvest_pp_run_artifacts(
     *,
     project_path: str,
     run_id: str,
     workflow_id: str,
     changed_paths: list[str] | None = None,
-) -> str | None:
-    """Stage and commit the pp run's outputs into the project tree.
+    pp_status: str | None = None,
+    verdict_outcome: str | None = None,
+) -> dict[str, Any] | None:
+    """Land the pp run's outputs — on the current branch ONLY when a judge passed.
 
-    Returns the commit SHA on success, or ``None`` when there is nothing to
-    commit, the project isn't a git repo, or any git invocation fails. The
-    helper is deliberately fail-soft — Hydra's dispatch path must never
-    crash because the operator chose a non-git project root.
+    Returns ``{"sha", "branch", "preserved", "reason"}`` on success, or ``None``
+    when there is nothing to commit, the project isn't a git repo, or any git
+    invocation fails. The helper is deliberately fail-soft — Hydra's dispatch
+    path must never crash because the operator chose a non-git project root.
 
     Why this exists: codex (the headless generator) edits files DIRECTLY in the
     project tree under ``--sandbox workspace-write`` but CANNOT ``git commit``
     itself — that sandbox makes ``.git`` read-only (``.git/index.lock`` →
     Permission denied). pp-harness additionally archives metadata under
     ``<project>/.harness/<run_id>/``. Both are stranded if no one commits them.
-    This helper lands them, OUTSIDE the sandbox, in one
-    ``chore(hydra): harvest pp run <run_id>`` commit so synthesis + the upstream
-    merge see the work.
+
+    **E2-38 — the verdict gate.** This helper used to commit onto whatever
+    branch was checked out, with no outcome check at all, so a *surfaced* run
+    whose only verdict was ``revise`` (or that had no verdict at all) still
+    landed unreviewed, sometimes truncated, code on the target repo's ``main``.
+    Two conditions now guard the direct commit, mirroring what the attended path
+    already does with its ``attended/<run>`` preserved branches:
+
+    1. ``pp_status`` is ``done``/``complete`` AND the last recorded judge
+       verdict is ``pass``. Anything else — surfaced, revise, fail, or simply
+       unknown — is treated as NOT passed.
+    2. The checkout is not on the repo's default branch, unless
+       ``HYDRA_HARVEST_DIRECT_COMMIT=1`` says the operator allows it.
+
+    When either guard trips the delta is preserved rather than discarded: it is
+    committed onto ``hydra/harvest/<run_id>`` and the original branch is left
+    exactly as it was (HEAD never moves, the working tree is never touched, and
+    no branch is ever deleted). The branch name comes back in the result so
+    synthesis can tell the operator where to pick the work up.
+
+    The preserve path is deliberately stash-free and checkout-free: the staged
+    index is turned into a tree with ``git write-tree``, committed off to the
+    side with ``git commit-tree``, and published with ``git update-ref``. A
+    dirty working tree — the normal state here, since the operator may have
+    unrelated WIP open — is therefore never disturbed.
 
     Scope (RUN-SCOPED — never a blanket ``git add -u``): stages exactly
     ``changed_paths`` (the files THIS run dirtied, computed by the drive loop as
@@ -3121,30 +3219,104 @@ def harvest_pp_run_artifacts(
             check=False,
         )
 
+    def _emit(kind: str, payload: dict[str, Any]) -> None:
+        if not workflow_id:
+            return
+        try:
+            from . import telemetry as _tel
+            _tel.emit(root, workflow_id, kind, {"run_id": run_id, **payload})
+        except Exception:  # noqa: BLE001 — never crash harvest on a trace write
+            pass
+
+    # ── stage the run-scoped delta ────────────────────────────────────────
+    staged_specs: list[str] = []
     # 1) archived run metadata (best-effort — may not exist on every path).
     harness_dir = root / ".harness" / run_id
     if harness_dir.is_dir():
-        _git("add", "--", str(harness_dir))
+        spec = str(harness_dir)
+        if _git("add", "--", spec).returncode == 0:
+            staged_specs.append(spec)
     # 2) ONLY the files this run touched (explicit pathspecs, .gitignore-aware).
     for rel in (changed_paths or []):
         rel = str(rel).strip()
         if rel and ".." not in rel:  # defensive: no path escape
-            _git("add", "--", rel)
+            if _git("add", "--", rel).returncode == 0:
+                staged_specs.append(rel)
 
     # Anything staged? `git diff --cached --quiet` exits 1 when there is.
     if _git("diff", "--cached", "--quiet").returncode == 0:
         return None  # nothing new to commit
 
-    commit = _git(
-        "-c", "user.name=hydra-dispatcher",
-        "-c", "user.email=hydra@local",
-        "commit",
-        "-m", f"chore(hydra): harvest pp run {run_id} (workflow={workflow_id})",
+    # ── decide where it may land ──────────────────────────────────────────
+    sym = _git("symbolic-ref", "--quiet", "--short", "HEAD")
+    current_branch = sym.stdout.strip() if sym.returncode == 0 else ""
+    judged_pass = (
+        str(pp_status or "").strip().lower() in {"done", "complete"}
+        and str(verdict_outcome or "").strip().lower() == "pass"
     )
-    if commit.returncode != 0:
+    allow_default = os.environ.get("HYDRA_HARVEST_DIRECT_COMMIT") == "1"
+    protected = _PROTECTED_BRANCHES | {_harvest_default_branch(_git)}
+
+    reason: str | None = None
+    if not judged_pass:
+        reason = "unjudged"
+    elif not current_branch:
+        # Detached HEAD: a commit made here is unreachable once HEAD moves on.
+        reason = "detached_head"
+    elif current_branch in protected and not allow_default:
+        reason = "default_branch"
+
+    message = f"chore(hydra): harvest pp run {run_id} (workflow={workflow_id})"
+    ident = ("-c", "user.name=hydra-dispatcher", "-c", "user.email=hydra@local")
+
+    # ── direct commit: judged pass, on a non-default branch ───────────────
+    if reason is None:
+        if _git(*ident, "commit", "-m", message).returncode != 0:
+            return None
+        sha = _git("rev-parse", "HEAD").stdout.strip() or None
+        if not sha:
+            return None
+        _emit("harvest.committed", {"sha": sha, "branch": current_branch})
+        return {"sha": sha, "branch": current_branch,
+                "preserved": False, "reason": None}
+
+    # ── preserve: commit off to the side, leave this branch untouched ─────
+    branch = f"{_HARVEST_BRANCH_PREFIX}{run_id}"
+    ref = f"refs/heads/{branch}"
+
+    def _unstage() -> None:
+        """Restore the index for exactly the specs we staged."""
+        has_head = _git("rev-parse", "--verify", "--quiet", "HEAD").returncode == 0
+        for spec in staged_specs:
+            if has_head:
+                _git("reset", "-q", "HEAD", "--", spec)
+            else:
+                _git("rm", "--cached", "-q", "-r", "--", spec)
+
+    tree = _git("write-tree").stdout.strip()
+    if not tree:
+        _unstage()
         return None
-    sha = _git("rev-parse", "HEAD")
-    return sha.stdout.strip() or None
+    # Re-harvesting the same run stacks onto its existing branch rather than
+    # rewriting it — a harvest branch is never deleted or moved backwards.
+    parent = _git("rev-parse", "--verify", "--quiet", ref).stdout.strip()
+    if not parent:
+        parent = _git("rev-parse", "--verify", "--quiet", "HEAD").stdout.strip()
+    ct_args = [*ident, "commit-tree", tree, "-m", message]
+    if parent:
+        ct_args += ["-p", parent]
+    ct = _git(*ct_args)
+    sha = ct.stdout.strip()
+    if ct.returncode != 0 or not sha:
+        _unstage()
+        return None
+    if _git("update-ref", ref, sha).returncode != 0:
+        _unstage()
+        return None
+    _unstage()
+    _emit("harvest.preserved",
+          {"branch": branch, "run_id": run_id, "reason": reason, "sha": sha})
+    return {"sha": sha, "branch": branch, "preserved": True, "reason": reason}
 
 
 def _via_impersonation(
