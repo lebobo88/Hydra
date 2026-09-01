@@ -32,6 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .backends_env import expand_spec_env
+from .proc import run_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,7 +83,29 @@ def _load_user_scope_mcp() -> dict[str, dict[str, Any]]:
     return {name: _strip_comments(spec) for name, spec in servers.items()}
 
 
-BACKEND_REGISTRY = Path.home() / ".hydra" / "backends.json"
+# E2-26: `HYDRA_BACKENDS` redirects the Hydra-owned backend registry. It is
+# read at import time because `hydra_core.cli` imports the constant directly
+# (and WRITES to it in `hydra export-backends` / `hydra setup`), so a single
+# resolved path must be shared by every consumer. The pytest conftest points
+# it at a temp file holding no stdio backends, so a test run can neither read
+# the operator's real server specs nor overwrite them.
+BACKEND_REGISTRY = Path(
+    os.environ.get("HYDRA_BACKENDS")
+    or (Path.home() / ".hydra" / "backends.json")
+)
+
+# E2-26: hard kill-switch for daemon spawning. When `HYDRA_TEST_NO_DAEMONS=1`
+# the live dispatcher refuses to open a stdio session, so no `node
+# TheEights/daemon/dist/index.js` (or pp / AgentSmith) child is ever forked
+# from a pytest process. Set by the test conftest; unset for tests carrying
+# the `live_daemon` marker.
+NO_DAEMONS_ENV = "HYDRA_TEST_NO_DAEMONS"
+NO_DAEMONS_ERROR = "daemons disabled under tests (HYDRA_TEST_NO_DAEMONS=1)"
+
+
+def daemons_disabled() -> bool:
+    """True when stdio daemon spawning is disabled for this process."""
+    return os.environ.get(NO_DAEMONS_ENV) == "1"
 
 
 def _load_backend_registry() -> dict[str, dict[str, Any]]:
@@ -339,6 +364,13 @@ class MCPStdioDispatcher:
         if venom_block is not None:
             self._record_tool_usage(server, tool, squad_id, "rejected")
             return venom_block
+        # E2-26: refuse to fork a stdio daemon under the test guard. Placed
+        # AFTER the RBAC and venom gates so their (non-spawning) verdicts keep
+        # their exact semantics, and immediately BEFORE the only two code
+        # paths that open an `stdio_client`.
+        if daemons_disabled():
+            self._record_tool_usage(server, tool, squad_id, "failed")
+            return {"status": "failed", "error": NO_DAEMONS_ERROR}
         import time as _time
         _t0 = _time.monotonic()
         if server in self._POOLED_SERVERS:
@@ -456,8 +488,8 @@ class MCPStdioDispatcher:
         if venom_block is not None:
             return venom_block
         try:
-            res = subprocess.run(
-                cmd, env=env, capture_output=True, text=True, timeout=300,
+            res = run_text(
+                cmd, env=env, capture_output=True, timeout=300,
             )
             return {
                 "returncode": res.returncode,
@@ -602,6 +634,9 @@ class MCPStdioDispatcher:
                 ),
             }
 
+        # E2-5: resolve ${VAR} / ${VAR:-default} references so a secret can live
+        # in the launching environment instead of inline in backends.json.
+        spec = expand_spec_env(spec, server=server)
         params = StdioServerParameters(
             command=spec["command"],
             args=list(spec.get("args", [])),
@@ -868,6 +903,8 @@ class MCPStdioDispatcher:
             if spec is None:
                 raise KeyError(server)
 
+            # E2-5: same ${VAR} expansion as the one-shot path above.
+            spec = expand_spec_env(spec, server=server)
             params = StdioServerParameters(
                 command=spec["command"],
                 args=list(spec.get("args", [])),

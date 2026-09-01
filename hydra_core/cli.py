@@ -29,6 +29,7 @@ import re
 import sys
 import warnings
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 # Validation regex for workflow ids supplied via --workflow-id.
@@ -100,6 +101,22 @@ class _NullDispatcher:
         return {"status": "stub", "summary": f"would invoke /{skill}", "args": args}
     def run_host_agent(self, agent_type, prompt, *, cwd=None, timeout_s=None):
         return None
+
+
+def _hitl_backlog_line(rows: list | None, threshold: int) -> str:
+    """Render the doctor's TheEights HITL backlog line (E2-17).
+
+    Pure so it is testable without a daemon. ``rows=None`` means the daemon
+    did not answer — a WARN, never a FAIL (doctor degrades open on eights).
+    """
+    if rows is None:
+        return ("WARN: eights HITL backlog unknown — daemon did not answer "
+                "hitl.list (pending gates may be accumulating)")
+    if len(rows) > threshold:
+        return (f"WARN: eights HITL pending={len(rows)} exceeds "
+                f"threshold={threshold} — run `hydra eights-hitl-reconcile` "
+                "to see which are zombies, then --apply to close them")
+    return f"OK:   eights HITL pending={len(rows)} (threshold={threshold})"
 
 
 def _cmd_doctor(args) -> int:
@@ -186,7 +203,9 @@ def _cmd_doctor(args) -> int:
         _spool_warn_thresh = int(
             os.environ.get("HYDRA_EIGHTS_SPOOL_WARN", "100")
         )
-        _spool_depth = PendingSpool().count()
+        _spool_root, _dead_root = _resolve_eights_spool_roots()
+        _spool = PendingSpool(root=_spool_root, dead_letter_root=_dead_root)
+        _spool_depth = _spool.count()
         if _spool_depth > _spool_warn_thresh:
             print(
                 f"WARN: eights spool depth={_spool_depth} exceeds "
@@ -196,6 +215,16 @@ def _cmd_doctor(args) -> int:
         else:
             print(f"OK:   eights spool  depth={_spool_depth} "
                   f"(threshold={_spool_warn_thresh})")
+        # E2-3: dead letters are records that were never delivered. Depth > 0
+        # is always operator-actionable, independent of the pending depth.
+        _dead_depth = _spool.dead_letter_count()
+        if _dead_depth > 0:
+            print(
+                f"WARN: eights dead-letter depth={_dead_depth} — "
+                "run `hydra eights-drain --replay-dead-letter`"
+            )
+        else:
+            print(f"OK:   eights dead-letter  depth={_dead_depth}")
     except Exception as _spool_exc:
         print(f"WARN: eights spool check — {_spool_exc}")
 
@@ -256,6 +285,25 @@ def _cmd_doctor(args) -> int:
                    if isinstance(res, dict) else f"non-dict {type(res).__name__}")
             print(f"WARN: {server} unreachable — {err}")
 
+    # --- E2-17: TheEights HITL backlog (consumer hydra) ---------------------
+    # Separate from the spool-depth line above: the spool counts calls Hydra
+    # could not deliver, this counts gates the ledger still holds open.
+    try:
+        _hitl_thresh = int(os.environ.get("HYDRA_HITL_PENDING_THRESHOLD", "25"))
+    except ValueError:
+        _hitl_thresh = 25
+    if "eights" in servers:
+        try:
+            from .eights.attestation import EightsAttestor
+            _hitl_rows = EightsAttestor(dispatcher=dispatcher).hitl_list()
+        except Exception as _hitl_exc:  # noqa: BLE001 — never crash doctor
+            print(_hitl_backlog_line(None, _hitl_thresh)
+                  + f" ({type(_hitl_exc).__name__}: {_hitl_exc})")
+        else:
+            print(_hitl_backlog_line(_hitl_rows, _hitl_thresh))
+    else:
+        print("WARN: eights not registered — skipping HITL backlog check")
+
     # --- RA-6: AgentSmith venom cross-check / smith→hydra back-channel ------
     # Informational only: surfaces the back-channel state (rationale field) but
     # NEVER fails the doctor — a missing or degraded AgentSmith is a WARN.
@@ -312,26 +360,58 @@ def _cmd_doctor(args) -> int:
     # print the key or its length. OK when HYDRA_OPERATOR_KEY is non-empty in
     # os.environ OR present under any backend spec's env block in
     # ~/.hydra/backends.json (read-only parse, fail-soft on IO/parse errors).
+    #
+    # E2-5: a backends.json value may now be a "${HYDRA_OPERATOR_KEY}"
+    # reference rather than the key itself. A reference that resolves reports
+    # source=env (the key lives in the environment, not the file); one that does
+    # not resolve leaves the probe unprovisioned. Only a literal value still
+    # reports source=backends.json, and any inline 64-hex-shaped value in the
+    # file draws a WARN naming its backend and key — never its content.
     try:
+        from .backends_env import (
+            expand_env_refs, has_env_ref, looks_like_inline_secret,
+        )
+
         _wsauth_src: str | None = None
+        # E2-5: names of backends whose env holds an inline-secret-shaped value.
+        # Shape check only — no value is ever read into the message.
+        _inline_hits: list[str] = []
         if os.environ.get("HYDRA_OPERATOR_KEY"):
             _wsauth_src = "env"
-        else:
-            try:
-                _bj_path = Path.home() / ".hydra" / "backends.json"
-                if _bj_path.exists():
-                    _bj = json.loads(_bj_path.read_text(encoding="utf-8"))
-                    if isinstance(_bj, dict):
-                        for _bj_spec in _bj.values():
-                            if (
-                                isinstance(_bj_spec, dict)
-                                and isinstance(_bj_spec.get("env"), dict)
-                                and _bj_spec["env"].get("HYDRA_OPERATOR_KEY")
-                            ):
-                                _wsauth_src = "backends.json"
-                                break
-            except Exception:  # noqa: BLE001 — fail-soft on parse / IO errors
-                pass
+        try:
+            _bj_path = Path.home() / ".hydra" / "backends.json"
+            if _bj_path.exists():
+                _bj = json.loads(_bj_path.read_text(encoding="utf-8"))
+                if isinstance(_bj, dict):
+                    for _bj_name, _bj_spec in _bj.items():
+                        if not (
+                            isinstance(_bj_spec, dict)
+                            and isinstance(_bj_spec.get("env"), dict)
+                        ):
+                            continue
+                        for _ek, _ev in _bj_spec["env"].items():
+                            if looks_like_inline_secret(_ev):
+                                _inline_hits.append(f"{_bj_name}.env.{_ek}")
+                        _raw = _bj_spec["env"].get("HYDRA_OPERATOR_KEY")
+                        if _wsauth_src or not _raw:
+                            continue
+                        if has_env_ref(_raw):
+                            # E2-5: a ${VAR} reference — the key really lives in
+                            # the environment, so report source=env when it
+                            # resolves, and stay unprovisioned when it does not.
+                            if expand_env_refs(_raw):
+                                _wsauth_src = "env"
+                        else:
+                            _wsauth_src = "backends.json"
+        except Exception:  # noqa: BLE001 — fail-soft on parse / IO errors
+            pass
+        if _inline_hits:
+            print(
+                "WARN: backends.json holds inline secret-shaped value(s) at "
+                f"{', '.join(sorted(_inline_hits))} — replace with a "
+                "${VAR} reference and export the variable instead "
+                "(see docs/MCP_SETUP.md)"
+            )
         if _wsauth_src:
             print(f"OK:   WS-AUTH operator key configured (source={_wsauth_src})")
         else:
@@ -853,6 +933,77 @@ def _prune_spooled_hitl_requests(workflow_id: str, gate_node: str | None) -> int
     return pruned
 
 
+def _reconcile_attestor(project: Path):
+    """Build an EightsAttestor bound to the live MCP dispatcher (E2-17).
+
+    Its own seam so terminal-transition reconciliation is stubbable in tests
+    without spawning the eights daemon.
+    """
+    from .dispatcher import MCPStdioDispatcher
+    from .eights.attestation import EightsAttestor
+    return EightsAttestor(dispatcher=MCPStdioDispatcher(project))
+
+
+def _make_phase_lookup(project: Path) -> Callable[[str], str | None]:
+    """Return ``workflow_id -> phase | None`` over Hydra's checkpoint store.
+
+    ``None`` means Hydra has no state for that workflow — an orphan row from
+    a wiped checkpoint db or a foreign run id. Results are memoized because
+    a reconcile sweep sees many rows per workflow.
+    """
+    from .supervisor import build_supervisor, _PurePythonRunner
+    sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
+    if isinstance(sup, _PurePythonRunner):
+        # No checkpointer → every workflow is "unknown"; the reconcile caller
+        # still resolves those rows (they can never be advanced again).
+        return lambda _wf: None
+
+    cache: dict[str, str | None] = {}
+
+    def _lookup(workflow_id: str) -> str | None:
+        if workflow_id in cache:
+            return cache[workflow_id]
+        phase: str | None = None
+        try:
+            snap = sup.get_state({"configurable": {"thread_id": workflow_id}})
+            if snap is not None and snap.values:
+                phase = snap.values.get("phase")
+        except Exception:  # noqa: BLE001 — one bad thread never aborts a sweep
+            phase = None
+        cache[workflow_id] = phase
+        return phase
+
+    return _lookup
+
+
+def _resolve_eights_hitl_for_workflow(
+    project: Path, workflow_id: str, *, note: str, decision: str = "rejected",
+    gate_node: str | None = None, dispatcher=None,
+) -> dict:
+    """Close a workflow's pending TheEights HITL rows. Never raises (E2-17).
+
+    ``dispatcher`` reuses a caller's already-built transport instead of
+    spawning a second eights connection. A caller holding a null dispatcher
+    (``hydra resume`` without ``--live``) therefore no-ops here rather than
+    starting the daemon mid-resume; those rows are swept by
+    ``hydra eights-hitl-reconcile`` / ``hydra reap --apply`` instead.
+    """
+    try:
+        from .eights.hitl_reconcile import resolve_for_workflow
+        if dispatcher is not None:
+            from .eights.attestation import EightsAttestor
+            attestor = EightsAttestor(dispatcher=dispatcher, workflow_id=workflow_id)
+        else:
+            attestor = _reconcile_attestor(project)
+        return resolve_for_workflow(
+            attestor, workflow_id,
+            note=note, decision=decision, gate_node=gate_node,
+        )
+    except Exception as exc:  # noqa: BLE001 — reconciliation is never a gate
+        return {"pending": 0, "resolved": 0, "failed": 0, "unavailable": True,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _release_resume_lock(fd, lock_path) -> None:
     import os as _os
     try:
@@ -1229,11 +1380,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # C3: prevent a later spool replay from filing a ticket for this
     # now-resolved gate (late-spool orphan reconciliation, gate-identity-keyed).
     pruned_spool = _prune_spooled_hitl_requests(wf, resolution.get("gate_node"))
+
+    # E2-17: the gate is now resolved on the Hydra side — close the matching
+    # row in TheEights' shared ledger too, or it stays pending forever. Scoped
+    # to the resolved gate identity (same key the spool prune uses), so another
+    # open gate in this workflow survives. Fail-soft: an unreachable daemon
+    # spools the resolve for the next drain.
+    _terminal_resolution = action == "reject" or option == "abort"
+    _eights_hitl = _resolve_eights_hitl_for_workflow(
+        project, wf,
+        note=("workflow terminal: surfaced" if _terminal_resolution
+              else f"hydra resume: {action}"),
+        decision="rejected" if _terminal_resolution else "approved",
+        gate_node=resolution.get("gate_node") or None,
+        dispatcher=dispatcher,
+    )
     emit(project, wf, "hitl_resumed", {
         "action": action,
         "option": option,
         "gate_node": resolution.get("gate_node"),
         "pruned_spooled_hitl_requests": pruned_spool,
+        "eights_hitl_resolved": _eights_hitl.get("resolved", 0),
     })
 
     # F10: abort option → park the workflow surfaced without resuming the graph.
@@ -1412,7 +1579,7 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     # and (b) leaves open_pp_runs durable up to the prior item. The in-flight
     # item is at-most-once; its pp run, if started, is finalize-aborted by the
     # drive loop's own exception handler or drained by `hydra reap`.
-    from .ingest import IngestItemResult, release_ingested_ids
+    from .ingest import IngestItemResult, normalize_for_ingest, release_ingested_ids
     # Only un-claim a status that PROVABLY never reached execute_squad, so a
     # corrected re-submit with the same id is not suppressed. `unknown_target`
     # qualifies (routing rejected it before any squad call). `failed` does NOT —
@@ -1425,6 +1592,10 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     agg_items: list = []
     over_budget = False
     for env_dict in envelopes:
+        # E2-34: normalize first so a missing or non-UUID pack id becomes a real
+        # UUID before it is used as the ledger key — otherwise such an envelope
+        # bypasses `processed` and can dispatch twice.
+        env_dict = normalize_for_ingest(env_dict, _emit_ingest)
         eid = env_dict.get("id")
         eid = str(eid) if eid is not None else None
         if eid and eid in processed:
@@ -1440,8 +1611,15 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         )
         # Un-claim if this envelope never reached a squad (wrong type/parse fail)
         # so it can be re-submitted after correction; otherwise mark it processed.
-        item_status = out_i.items[-1].status if out_i.items else "failed"
-        if eid and item_status in _NOT_DISPATCHED:
+        last_item = out_i.items[-1] if out_i.items else None
+        item_status = last_item.status if last_item is not None else "failed"
+        # E2-34: a SCHEMA-rejected item (structured field errors) provably never
+        # reached execute_squad either — it failed before any pp call — so it is
+        # un-claimed like unknown_target. That is narrower than `failed` at
+        # large, which can be a post-start_run abort and must stay claimed.
+        schema_rejected = bool(last_item is not None and last_item.errors)
+        if eid and (item_status in _NOT_DISPATCHED
+                    or (item_status == "failed" and schema_rejected)):
             release_ingested_ids(project, wf, [eid])
         elif eid:
             processed.add(eid)
@@ -1518,7 +1696,6 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
     attended agent. We surface them in task-list order so the host can
     dispatch one at a time, mirroring the engineering attended flow."""
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
-    _NON_ENG_ENTRYPOINTS = frozenset({"claude-skill", "claude-native", "agent-impersonation"})
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
@@ -1527,9 +1704,422 @@ def _next_nonengineering_attended_task(state: HydraState, packs: dict):
         pack = packs.get(t.owner_squad)
         if pack is None:
             continue
-        if pack.entrypoint in _NON_ENG_ENTRYPOINTS:
+        if pack.entrypoint in _NON_ENG_ATTENDED_ENTRYPOINTS:
             return t, pack
     return None, None
+
+
+_NON_ENG_ATTENDED_ENTRYPOINTS = frozenset(
+    {"claude-skill", "claude-native", "agent-impersonation"})
+
+
+def _next_attended_task(state: HydraState, packs: dict):
+    """First attended-eligible task in ``state.tasks`` list order.
+
+    E2-23: selection must follow the planner's task order, not drain
+    engineering first.  ``/hydra:campaign`` pre-wires executive -> creative ->
+    engineering; picking the engineering task first inverted that DAG and ran
+    the engineer without its upstream envelopes.
+
+    Returns ``(task, kind, pack)`` where ``kind`` is ``"engineering"`` (pack is
+    None — engineering opens a pp run cursor) or ``"squad"`` (pack is the
+    non-engineering squad pack whose entrypoint is host-attended).  Returns
+    ``(None, None, None)`` when nothing is pending.  Tasks already recorded in
+    ``attended_completed_task_ids`` are skipped, and non-engineering tasks
+    whose squad is unknown or headless-dispatchable are passed over (they are
+    not host-attended) so engineering behind them is still reachable.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    for t in getattr(state, "tasks", []):
+        if str(t.task_id) in done:
+            continue
+        if t.owner_squad == "engineering":
+            return t, "engineering", None
+        pack = (packs or {}).get(t.owner_squad)
+        if pack is None:
+            continue
+        if pack.entrypoint in _NON_ENG_ATTENDED_ENTRYPOINTS:
+            return t, "squad", pack
+    return None, None, None
+
+
+def _pack_lead_agent_spec(pack):
+    """The pack's lead AgentSpec: first gatekeeper, else first agent, else None."""
+    agents = list(getattr(pack, "agents", []) or [])
+    for a in agents:
+        if getattr(a, "authority", "") == "gatekeeper":
+            return a
+    return agents[0] if agents else None
+
+
+def _skill_pack_checkout(pack) -> Path | None:
+    """Real on-disk checkout of a claude-skill pack, or None.
+
+    ``squads/<slug>/`` holds only Hydra's squad.yaml overlay -- the agents and
+    the pack's slash command live in the sibling repo named by ``source_pack``
+    (a repo URL, or a filesystem path for a locally vendored pack). The repo id
+    is the URL's last segment, resolved through the allow-listed registry.
+    """
+    src = str(getattr(pack, "source_pack", None) or "").strip()
+    if not src:
+        return None
+    if "://" not in src:
+        p = Path(src).expanduser()
+        if p.is_dir():
+            return p.resolve()
+    repo_id = src.rstrip("/").replace("\\", "/").rsplit("/", 1)[-1]
+    if repo_id.endswith(".git"):
+        repo_id = repo_id[:-4]
+    if not repo_id:
+        return None
+    try:
+        from .repo_registry import resolve_repo_path
+        return resolve_repo_path(repo_id.lower())
+    except Exception:  # noqa: BLE001 -- unregistered/absent checkout is not fatal
+        return None
+
+
+def _agent_frontmatter_name(agent_path: Path) -> str | None:
+    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+    try:
+        text = agent_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    block = text[3:end] if end != -1 else text[3:]
+    for line in block.splitlines():
+        if line.startswith("name:"):  # top-level key only (no indent)
+            return line[len("name:"):].strip().strip("\"'") or None
+    return None
+
+
+def _resolve_claude_skill_host_action(pack) -> dict:
+    """Host-action fields for a claude-skill pack's attended lead agent.
+
+    E2-31: the bare squad.yaml slug (e.g. ``support-supervisor``) is NOT a
+    spawnable agent type -- pack agents live in the sibling checkout under their
+    own frontmatter names. Resolve a spawnable identity instead:
+
+    * pack installed as a Claude Code plugin (``.claude-plugin/plugin.json``)
+      -> ``"<plugin-name>:<agent frontmatter name>"``;
+    * otherwise -> ``"general-purpose"`` plus ``skill`` (the pack's slash
+      command) and ``tool_scope`` (its MCP shim prefix) so the host drives the
+      pack through its declared command and MCP tools.
+
+    ``lead_agent_file`` is always included when resolvable, for transparency.
+    """
+    action: dict = {"agent_type": "general-purpose"}
+    checkout = _skill_pack_checkout(pack)
+    spec = _pack_lead_agent_spec(pack)
+
+    agent_path: Path | None = None
+    if checkout is not None and spec is not None and getattr(spec, "agent_file", None):
+        from .squad_loader import resolve_agent_file_path
+        try:
+            agent_path = resolve_agent_file_path(checkout, spec.agent_file)
+        except FileNotFoundError:
+            candidate = checkout / spec.agent_file
+            agent_path = candidate if candidate.is_file() else None
+    if agent_path is not None:
+        action["lead_agent_file"] = str(agent_path)
+
+    plugin_name: str | None = None
+    if checkout is not None:
+        manifest = checkout / ".claude-plugin" / "plugin.json"
+        if manifest.is_file():
+            try:
+                plugin_name = (json.loads(manifest.read_text(encoding="utf-8"))
+                               .get("name") or None)
+            except (OSError, ValueError):
+                plugin_name = None
+
+    if plugin_name and agent_path is not None:
+        agent_name = _agent_frontmatter_name(agent_path) or agent_path.stem
+        action["agent_type"] = f"{plugin_name}:{agent_name}"
+        return action
+
+    # Not plugin-loadable: drive the pack's slash command through its MCP shim.
+    from .squad_node import _SKILL_PACK_SHIMS
+    shim = _SKILL_PACK_SHIMS.get(pack.slug) or {}
+    invoke = getattr(pack, "invoke", None) or {}
+    command = invoke.get("command_hint") or shim.get("default_cmd")
+    if command:
+        action["skill"] = command
+    if shim.get("prefix"):
+        action["tool_scope"] = shim["prefix"]
+    return action
+
+
+def _next_stub_attended_task(state: HydraState, packs: dict):
+    """E2-32: first pending task (task-list order) owned by a squad whose pack
+    entrypoint is ``stub``, that the host has not yet completed.
+
+    A stub squad has no host action to spawn and no MCP leg to drive — its
+    whole contract is the canned ``[STUB]`` DecisionRecord that
+    ``squad_node._stub`` returns. Before this, ``_next_engineering_task`` and
+    ``_next_nonengineering_attended_task`` both skipped stub tasks, so an
+    attended workflow whose only task was a stub squad reported
+    ``no_pending_task`` forever and never advanced.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    for t in getattr(state, "tasks", []):
+        if str(t.task_id) in done:
+            continue
+        pack = packs.get(t.owner_squad)
+        if pack is not None and getattr(pack, "entrypoint", None) == "stub":
+            return t, pack
+    return None, None
+
+
+def _task_precedes(state: HydraState, task, other) -> bool:
+    """True when `task` comes before `other` in the workflow's task list.
+    A None `other` (no competing candidate) means `task` wins by default."""
+    if other is None:
+        return True
+    order = [str(t.task_id) for t in getattr(state, "tasks", [])]
+    try:
+        return order.index(str(task.task_id)) < order.index(str(other.task_id))
+    except ValueError:  # pragma: no cover — both ids come from state.tasks
+        return True
+
+
+def _drive_stub_task(sup, config: dict, project: Path, wf: str,
+                     state: HydraState, task, pack) -> dict:
+    """E2-32: run a stub squad's in-process path and record it as the task
+    result, with the same checkpoint bookkeeping ``submit-host-result`` does
+    for a squad result.
+
+    Idempotent with the in-graph path: when a headless dispatch pass already
+    produced this squad's ``[STUB]`` DecisionRecord (RA-5 keeps stubs OUT of
+    the live-defer pre-filter, so ``node_dispatch`` runs ``_stub`` itself), the
+    existing envelope is reused instead of emitting a second one. The task is
+    marked attended-complete but deliberately NOT added to
+    ``attended_done_task_ids`` — a stub is `surfaced`, not `done`, and
+    ``enforce_governance`` must keep surfacing the workflow for human
+    follow-up.
+    """
+    from .squad_node import _stub
+    from .schemas import CSuiteDecisionPacket
+
+    task_id = str(task.task_id)
+    existing: dict | None = None
+    for e in getattr(state, "envelopes", []) or []:
+        if not isinstance(e, dict):
+            continue
+        if (e.get("origin_squad") == pack.slug
+                and "[STUB]" in str(e.get("decision") or "")):
+            existing = e
+            break
+
+    new_envelopes: list[dict] = []
+    if existing is None:
+        inbound = CSuiteDecisionPacket(
+            workflow_id=state.workflow_id,
+            origin_squad="hydra",
+            target_squad=pack.slug,
+            origin="BOARDROOM",
+            objective=task.description or state.root_goal,
+        )
+        result = _stub(pack, inbound)
+        from .ingest import _redact_envelope_dict
+        for produced in result.envelopes:
+            d = _redact_envelope_dict(produced.model_dump(mode="json"))
+            d["_task_id"] = task_id
+            new_envelopes.append(d)
+        existing = new_envelopes[0] if new_envelopes else None
+
+    completed = list(getattr(state, "attended_completed_task_ids", []) or [])
+    if task_id not in completed:
+        completed.append(task_id)
+    patch: dict = {"attended_completed_task_ids": completed}
+    if new_envelopes:
+        # `envelopes` uses an append reducer — emit only the NEW records.
+        patch["envelopes"] = new_envelopes
+    try:
+        sup.update_state(config, patch)
+    except Exception as e:  # noqa: BLE001
+        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+    envelope_id = (str(existing.get("id"))
+                   if isinstance(existing, dict) and existing.get("id") is not None
+                   else None)
+    emit(project, wf, "dispatch.stub_surfaced", {
+        "task_id": task_id,
+        "squad_slug": pack.slug,
+        "entrypoint": "stub",
+        "envelope_id": envelope_id,
+        "reused_in_graph_record": not new_envelopes,
+    })
+    return {
+        "status": "stub_surfaced",
+        "task_id": task_id,
+        "squad_slug": pack.slug,
+        "envelope_id": envelope_id,
+        "decision_record": existing,
+    }
+
+
+def _run_first_step_dispatch_pass(sup, config: dict, project: Path, wf: str,
+                                  snap, state: HydraState) -> bool:
+    """E2-32: run the headless dispatch pass `hydra approve` runs, on the FIRST
+    attended step of a workflow that has no approval gate.
+
+    ``hydra plan`` adds ``dispatch`` to ``interrupt_before``, so every planned
+    workflow parks at a bare interrupt. A gated workflow leaves that interrupt
+    via ``/hydra:approve``; a workflow whose planner set
+    ``requires_human_approval=False`` had NO caller for that pass at all, so
+    claude-skill / agent-impersonation tasks never got their
+    ``dispatch.deferred_to_host`` marking and the phase never left ``dispatch``.
+
+    Guards (all required): a bare LangGraph interrupt is pending, no HITL gate
+    is open, the planner did not require approval, and nothing has been driven
+    attended yet (this is a first-step bootstrap, not a per-step resume).
+    A pending engineering task suppresses the pass — the attended engineering
+    cursor below owns that dispatch and engineering deferral semantics are out
+    of scope here (fix-E2-22).
+
+    Returns True when the pass ran, so the caller re-reads the checkpoint.
+    """
+    if getattr(state, "requires_human_approval", False):
+        return False
+    if state.pending_hitl:
+        return False
+    if getattr(state, "attended_completed_task_ids", None):
+        return False
+    if not (getattr(snap, "next", ()) or ()):
+        return False
+    if _next_engineering_task(state) is not None:
+        return False
+    emit(project, wf, "attended.no_approval_dispatch_pass", {
+        "interrupted_before": list(getattr(snap, "next", ()) or ()),
+    })
+    try:
+        sup.invoke(None, config=config)
+    except Exception as e:  # noqa: BLE001 — the attended cursor still proceeds
+        emit(project, wf, "attended.dispatch_pass_failed", {"error": str(e)})
+        return False
+    return True
+
+
+def _attended_result_record(state: HydraState, res: dict) -> dict | None:
+    """Project a terminal attended cursor result into the durable record
+    `hydra finalize` later materialises into a squad DECISION_RECORD (E2-30).
+
+    Returns None when the result carries no task_id (nothing to attribute).
+    The record is deliberately small and JSON-only: the checkpoint is the
+    authoritative store and must stay serialisable.
+    """
+    tid = res.get("task_id")
+    if tid is None:
+        return None
+    tid = str(tid)
+    owner = str(res.get("squad_slug") or "")
+    if not owner:
+        for t in getattr(state, "tasks", []):
+            if str(t.task_id) == tid:
+                owner = t.owner_squad
+                break
+    record: dict[str, object] = {
+        "task_id": tid,
+        "owner_squad": owner or "engineering",
+        "run_id": str(res.get("run_id") or tid),
+        "status": str(res.get("status") or "complete"),
+        "final_status": str(res.get("final_status") or res.get("status") or ""),
+        "stage_id": res.get("stage_id"),
+        "summary": (str(res.get("stage_outcome") or "") or None),
+        "changed_paths": list(res.get("changed_paths") or [])[:50],
+        "cost_usd": float(res.get("cost_usd") or 0.0),
+    }
+    if isinstance(res.get("artifact_ref"), dict):
+        record["artifact_ref"] = res["artifact_ref"]
+    if res.get("error"):
+        record["error"] = str(res["error"])[:500]
+    return record
+
+
+def _merge_attended_result(existing: list[dict], record: dict | None) -> list[dict]:
+    """Upsert an attended result by task_id (last terminal outcome wins)."""
+    if record is None:
+        return list(existing or [])
+    out = [r for r in (existing or []) if str(r.get("task_id")) != record["task_id"]]
+    out.append(record)
+    return out
+
+
+def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> list[str]:
+    """Task ids the attended loop has NOT driven to a terminal outcome.
+
+    A task counts as attended-done when its id is in
+    ``attended_completed_task_ids`` (the same signal `_next_engineering_task`
+    and `_next_nonengineering_attended_task` honour), OR when the in-graph
+    dispatch already carried it to a terminal status.
+    """
+    done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    pending: list[str] = []
+    for t in getattr(state, "tasks", []):
+        tid = str(t.task_id)
+        if tid in done:
+            continue
+        if t.status in ("done", "failed", "cancelled"):
+            continue
+        pending.append(tid)
+    return pending
+
+
+def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[dict]]:
+    """Turn attended task records into the state shape `node_synthesis` reads.
+
+    `node_synthesis` groups `state.envelopes` by `origin_squad` and mints one
+    MemoryRef per `state.artifacts` entry. Attended tasks never went through
+    `node_dispatch`, so neither channel holds their output. This builds, per
+    attended result, one squad-origin DECISION_RECORD envelope plus one
+    artifact row keyed by the persisted MemoryRef (native pack artifact) or the
+    pp run id (engineering stage).
+    """
+    from .schemas import DecisionRecord, MemoryRef
+
+    envelopes: list[dict] = []
+    artifacts: list[dict] = []
+    seen_envelope_tasks = {
+        str(e.get("_task_id")) for e in (state.envelopes or []) if e.get("_task_id")
+    }
+    for rec in (getattr(state, "attended_results", []) or []):
+        tid = str(rec.get("task_id"))
+        if tid in seen_envelope_tasks:
+            continue  # an in-graph / ingest envelope already represents this task
+        squad = str(rec.get("owner_squad") or "engineering")
+        ref_obj = rec.get("artifact_ref") if isinstance(rec.get("artifact_ref"), dict) else None
+        ref_key = str((ref_obj or {}).get("key") or rec.get("run_id") or tid)
+        kind = "attended_squad_artifact" if ref_obj else "attended_pp_run"
+        status = str(rec.get("final_status") or rec.get("status") or "complete")
+        detail = rec.get("summary") or rec.get("error") or ""
+        record = DecisionRecord(
+            workflow_id=state.workflow_id,
+            origin_squad=squad,
+            target_squad="hydra",
+            decision=(f"Attended {squad} task {tid} finished: {status}"),
+            rationale=(
+                f"Driven in-context by the attended host loop (run {rec.get('run_id')}). "
+                f"outcome={status}; artifact={ref_key}"
+                + (f"; detail={str(detail)[:300]}" if detail else "")
+            ),
+            artifacts=[MemoryRef(tier="episodic", key=ref_key, summary=kind)],
+            sealed=(status == "complete"),
+        )
+        env = record.model_dump(mode="json")
+        env["_task_id"] = tid
+        env["_attended"] = True
+        envelopes.append(env)
+        artifacts.append({
+            "kind": kind,
+            "ref": ref_key,
+            "task_id": tid,
+            "squad": squad,
+            "status": status,
+        })
+    return envelopes, artifacts
 
 
 def _resolve_pack_lead_agent(pack) -> str:
@@ -1541,13 +2131,10 @@ def _resolve_pack_lead_agent(pack) -> str:
     if getattr(pack, "entrypoint", None) == "claude-native":
         from .native_packs import native_pack
         return native_pack(pack.slug).qualified_lead_agent
-    agents = list(getattr(pack, "agents", []) or [])
-    for a in agents:
-        if getattr(a, "authority", "") == "gatekeeper":
-            return a.slug
-    if agents:
-        return agents[0].slug
-    return "general-purpose"
+    if getattr(pack, "entrypoint", None) == "claude-skill":
+        return _resolve_claude_skill_host_action(pack)["agent_type"]
+    spec = _pack_lead_agent_spec(pack)
+    return spec.slug if spec is not None else "general-purpose"
 
 
 def _resolve_pack_cwd(pack, project: Path) -> str:
@@ -1560,6 +2147,12 @@ def _resolve_pack_cwd(pack, project: Path) -> str:
     if getattr(pack, "entrypoint", None) == "claude-native":
         from .native_packs import native_pack_root
         return str(native_pack_root(pack.slug))
+    if getattr(pack, "entrypoint", None) == "claude-skill":
+        # E2-31: squads/<slug>/ is only Hydra's overlay -- the agents, skills and
+        # slash command live in the pack's own checkout.
+        checkout = _skill_pack_checkout(pack)
+        if checkout is not None:
+            return str(checkout)
     from .squad_loader import SQUAD_DIR_NAMES, USER_SQUAD_DIR
     for dir_name in SQUAD_DIR_NAMES:
         candidate = project / dir_name / pack.slug
@@ -1665,9 +2258,22 @@ def _cmd_attended_step(args) -> int:
             return 1
         state = HydraState.model_validate(snap.values)
 
+        # E2-32: no-approval workflows have no `approve` caller to leave the
+        # plan_only dispatch interrupt — run that same pass here, once.
+        if _run_first_step_dispatch_pass(sup, config, project, wf, snap, state):
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
+
+        # E2-23: pick the next attended task in task-list order.  The squad
+        # only decides WHICH cursor is opened (pp run vs squad stage) — it must
+        # not reorder the planner's dependency chain.
+        packs = _discover(project)
+        _sel_task, _sel_kind, _sel_pack = _next_attended_task(state, packs)
+
         # --- Engineering task (mcp entrypoint) ---
-        task = _next_engineering_task(state)
-        if task is not None:
+        if _sel_kind == "engineering":
+            task = _sel_task
             try:
                 project_path = _resolve_task_project_path(task, state, project)
             except MissingEngineeringTargetError as _missing_target_err:
@@ -1801,15 +2407,45 @@ def _cmd_attended_step(args) -> int:
             return 0
 
         # --- Non-engineering task (claude-skill / agent-impersonation) ---
-        packs = _discover(project)
-        ne_task, ne_pack = _next_nonengineering_attended_task(state, packs)
-        if ne_task is not None:
+        # E2-32: a stub squad has no host action to spawn — drive it in-process.
+        # Resolved against the E2-23 attended selection in TASK-LIST ORDER:
+        # whichever candidate appears first in state.tasks wins, so a stub
+        # never jumps the queue and is never skipped forever.
+        stub_task, stub_pack = _next_stub_attended_task(state, packs)
+        if stub_task is not None and _task_precedes(state, stub_task, _sel_task):
+            res = _drive_stub_task(sup, config, project, wf, state,
+                                   stub_task, stub_pack)
+            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            return 0
+
+        if _sel_kind == "squad":
+            ne_task, ne_pack = _sel_task, _sel_pack
             task_id = str(ne_task.task_id)
             request_text = ne_task.description or state.root_goal
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
-            lead_agent = _resolve_pack_lead_agent(ne_pack)
+            action_extras = None
+            if ne_pack.entrypoint == "claude-skill":
+                action_extras = _resolve_claude_skill_host_action(ne_pack)
+                lead_agent = action_extras.pop("agent_type")
+            else:
+                lead_agent = _resolve_pack_lead_agent(ne_pack)
+
+            # E2-28: upstream context as HANDLES only (never raw artifact text
+            # across a squad boundary) — completed tasks' envelope ids plus the
+            # workflow's episodic MemoryRef keys.
+            _done_ids = set(getattr(state, "attended_completed_task_ids", []) or [])
+            _upstream_refs: list[str] = []
+            for _t in getattr(state, "tasks", []):
+                if str(_t.task_id) not in _done_ids:
+                    continue
+                _rid = getattr(_t, "result_envelope_id", None) or getattr(_t, "envelope_id", None)
+                if _rid:
+                    _upstream_refs.append(f"envelope:{_rid} ({_t.owner_squad})")
+            _upstream_refs.extend(
+                f"episodic:{k}" for k in (getattr(state, "episodic_refs", []) or []))
 
             res = host_bridge.begin_squad_stage(
+                action_extras=action_extras,
                 workflow_id=wf,
                 task_id=task_id,
                 squad_slug=ne_pack.slug,
@@ -1818,6 +2454,16 @@ def _cmd_attended_step(args) -> int:
                 pack_cwd=pack_cwd,
                 request_text=request_text,
                 project_root=project,
+                goal=state.root_goal,
+                envelope_id=(str(ne_task.envelope_id)
+                             if getattr(ne_task, "envelope_id", None) else None),
+                upstream_refs=_upstream_refs,
+                budget_usd=state.budget.budget_usd,
+                budget_remaining_usd=state.budget.usd_remaining,
+                risk=("high" if getattr(state, "requires_human_approval", False)
+                      else "normal"),
+                priority=getattr(ne_task, "priority", None),
+                acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
             )
             emit(project, wf, "attended.step", {
                 "run_id": task_id,
@@ -1828,8 +2474,14 @@ def _cmd_attended_step(args) -> int:
             print(json.dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
-        # No pending tasks of any kind.
-        print(json.dumps({"ok": True, "status": "no_pending_task",
+        # No pending tasks of any kind. E2-30: this is not the end of the
+        # workflow — the attended results still have to go through
+        # synthesis/judge_synthesis/postcheck. Tell the host to call
+        # `hydra finalize` (status), keeping `no_pending_task` as a
+        # compatibility alias for hosts pinned to the old contract.
+        print(json.dumps({"ok": True, "status": "ready_to_finalize",
+                          "no_pending_task": True,
+                          "next_action": "hydra.workflow.finalize",
                           "workflow_id": wf}))
         return 0
     finally:
@@ -1892,10 +2544,13 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
                 res["budget_block"] = block
                 res["budget_downgrade"] = downgrade
                 res["spent_usd"] = state.budget.spent_usd
+                attended_results = _merge_attended_result(
+                    state.attended_results, _attended_result_record(state, res))
                 try:
                     sup.update_state(config, {
                         "attended_completed_task_ids": completed,
                         "attended_done_task_ids": done_ids,
+                        "attended_results": attended_results,
                         "open_pp_runs": open_runs,
                         "budget": state.budget.model_dump(mode="json"),
                         "budget_downgrade_active": bool(downgrade),
@@ -1949,7 +2604,10 @@ def _cmd_attended_submit(args) -> int:
         # On terminal: charge budget on the authoritative HydraState ledger and
         # record the task outcome into the checkpoint.
         # Rider (b): skip charge if already_charged=True (idempotency guard).
-        if res.get("status") in ("complete", "surfaced", "aborted"):
+        # E2-35: "complete_unpersisted" is terminal too — the pack agent ran and
+        # spent real money, so it must charge like any other terminal outcome.
+        if res.get("status") in ("complete", "complete_unpersisted",
+                                 "surfaced", "aborted"):
             if res.get("already_charged"):
                 # Idempotent re-submit: cursor was already charged on the first
                 # terminal submit.  Return the cached result without re-billing.
@@ -1978,7 +2636,13 @@ def _cmd_attended_submit(args) -> int:
             # the operator and telemetry.
             squad_slug = str(res.get("squad_slug") or "")
             artifact_text = str(res.get("artifact_text") or "")
-            if squad_slug and artifact_text:
+            # E2-35: host_bridge already persisted non-native squad artifacts
+            # (generic store + claude-skill shim) and recorded the outcome on
+            # the cursor. Only squads it left alone — the native packs — reach
+            # the native output-root writer here.
+            already_handled = (res.get("artifact_ref") is not None
+                               or res.get("artifact_persist_error") is not None)
+            if squad_slug and artifact_text and not already_handled:
                 try:
                     from .artifact_store import write_native_artifact
                     ref = write_native_artifact(
@@ -2035,10 +2699,16 @@ def _cmd_attended_submit(args) -> int:
                     res["budget_block"] = block
                     res["budget_downgrade"] = downgrade
                     res["spent_usd"] = state.budget.spent_usd
+                    # E2-30: persist the attended outcome so `hydra finalize`
+                    # can materialise it into a squad result envelope for
+                    # node_synthesis (the in-graph dispatch never ran here).
+                    attended_results = _merge_attended_result(
+                        state.attended_results, _attended_result_record(state, res))
                     try:
                         sup.update_state(config, {
                             "attended_completed_task_ids": completed,
                             "attended_done_task_ids": done_ids,
+                            "attended_results": attended_results,
                             "open_pp_runs": open_runs,
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),
@@ -2058,17 +2728,37 @@ def _cmd_attended_submit(args) -> int:
                             claim_ingested_ids,
                             dispatch_ingested_envelopes,
                             load_ingested_ids,
+                            normalize_for_ingest,
                             release_ingested_ids,
                         )
                         packs = discover_squads(project)
                         if hasattr(dispatcher, "set_squad_packs"):
                             dispatcher.set_squad_packs(packs)
                         outcomes: list[dict[str, object]] = []
+                        # E2-34: envelopes that never reached a squad because
+                        # they failed schema validation. A non-empty list flips
+                        # the top-level status to "envelopes_rejected" so the
+                        # delegation is never dropped inside a "complete".
+                        rejected: list[dict[str, object]] = []
                         processed = load_ingested_ids(project, wf)
                         for raw in emitted:
                             if not isinstance(raw, dict):
-                                outcomes.append({"status": "failed", "detail": "non-object envelope"})
+                                bad = {"status": "failed", "detail": "non-object envelope",
+                                       "errors": [{"field": "", "msg": "non-object envelope"}]}
+                                outcomes.append(bad)
+                                rejected.append(bad)
+                                emit(project, wf, "ingest.invalid_envelope",
+                                     {"envelope_id": None, "type": None,
+                                      "errors": bad["errors"]})
                                 continue
+                            # E2-34: normalize BEFORE reading the id. A pack may
+                            # omit `id` or use a non-UUID label; keying dedup on
+                            # the raw value would let such an envelope bypass
+                            # `processed` and dispatch twice.
+                            raw = normalize_for_ingest(
+                                raw,
+                                lambda event, payload: emit(project, wf, event, payload),
+                            )
                             envelope_id = raw.get("id")
                             if envelope_id is not None and str(envelope_id) in processed:
                                 outcomes.append({"envelope_id": str(envelope_id),
@@ -2083,7 +2773,12 @@ def _cmd_attended_submit(args) -> int:
                             )
                             item = outcome.items[-1] if outcome.items else None
                             if envelope_id is not None and item is not None:
-                                if item.status == "unknown_target":
+                                # A schema-rejected envelope never reached a
+                                # squad, so un-claim it: the host can re-submit
+                                # a corrected envelope under the same id without
+                                # being suppressed as a duplicate (E2-34).
+                                if (item.status == "unknown_target"
+                                        or (item.status == "failed" and item.errors)):
                                     release_ingested_ids(project, wf, [str(envelope_id)])
                                 else:
                                     processed.add(str(envelope_id))
@@ -2097,14 +2792,167 @@ def _cmd_attended_submit(args) -> int:
                             except Exception as exc:  # noqa: BLE001
                                 emit(project, wf, "attended.emitted_persist_failed",
                                      {"error": str(exc)})
-                            outcomes.extend(vars(item) for item in outcome.items)
+                            outcomes.extend(vars(it) for it in outcome.items)
+                            rejected.extend(vars(it) for it in outcome.rejected)
                         res["ingest"] = outcomes
+                        if rejected:
+                            # The engineering task itself stays attended-complete
+                            # (it is already in attended_done_task_ids); what is
+                            # NOT complete is the delegation it emitted. Surface
+                            # that as the top-level status and park it on the
+                            # cursor so `step`/finalize can render it.
+                            res["status"] = "envelopes_rejected"
+                            res["rejected_envelopes"] = rejected
+                            host_bridge.record_rejected_envelopes(cfile, rejected)
+                            emit(project, wf, "attended.envelopes_rejected", {
+                                "run_id": str(args.run_id),
+                                "rejected_count": len(rejected),
+                            })
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
                                               "status": res.get("status")})
         print(json.dumps({"ok": True, **res}, indent=2, default=str))
         return 0
+    finally:
+        _release_resume_lock(lock_fd, lock_path)
+
+
+def _cmd_finalize(args) -> int:
+    """``hydra finalize <workflow_id>`` — close an attended workflow properly.
+
+    E2-30: the attended loop (`hydra step` / `hydra submit-host-result`) marks
+    tasks attended-done but never re-enters the graph, so an interactive
+    workflow died at `phase="synthesis"` with no engine DECISION_RECORD, no
+    judge_synthesis verdict, no postcheck governance pass and no RA-8 episodic
+    row. This command is the missing leg: it materialises the attended results
+    into the state shape `node_synthesis` expects and resumes the graph so
+    `synthesis -> judge_synthesis -> postcheck` run over real squad output.
+
+    Contract:
+      * any task still pending -> ``{ok:false, status:"tasks_pending", pending}``
+      * already finalized      -> ``{ok:true, status:"already_finalized",
+                                     decision_record_id}`` (idempotent)
+      * otherwise              -> ``{ok:true, status:"finalized",
+                                     decision_record_id, phase, artifact_refs}``
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    wf = str(args.workflow_id)
+    if not _WORKFLOW_ID_RE.match(wf):
+        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+              file=sys.stderr)
+        return 1
+
+    lock_fd, lock_path = _acquire_resume_lock(project, wf)
+    if lock_fd is None:
+        print(json.dumps({"ok": False, "status": "resume_in_progress",
+                          "lock": str(lock_path)}))
+        return 0
+    try:
+        from .supervisor import build_supervisor, _PurePythonRunner
+        dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        if isinstance(sup, _PurePythonRunner):
+            print(json.dumps({
+                "ok": False,
+                "error": "langgraph unavailable — finalize requires the checkpointing supervisor",
+            }), file=sys.stderr)
+            return 1
+        config = {"configurable": {"thread_id": wf}}
+        snap = sup.get_state(config)
+        if snap is None or not snap.values:
+            print(json.dumps({"ok": False, "workflow_id": wf, "error": "not_found"}),
+                  file=sys.stderr)
+            return 1
+        try:
+            state = HydraState.model_validate(snap.values)
+        except Exception as e:  # noqa: BLE001
+            print(json.dumps({"ok": False, "workflow_id": wf,
+                              "error": f"checkpoint_invalid: {e}"}), file=sys.stderr)
+            return 1
+
+        # Idempotent: a second call never re-synthesizes (that would duplicate
+        # the episodic rows RA-8 writes inside node_synthesis).
+        if state.attended_finalized_record_id:
+            print(json.dumps({
+                "ok": True, "status": "already_finalized", "workflow_id": wf,
+                "decision_record_id": state.attended_finalized_record_id,
+                "phase": state.phase,
+            }, indent=2, default=str))
+            return 0
+
+        pending = _attended_pending_task_ids(state)
+        if pending:
+            print(json.dumps({
+                "ok": False, "status": "tasks_pending", "workflow_id": wf,
+                "pending": pending,
+                "detail": ("attended tasks still open — drive them with "
+                           "`hydra step` / `hydra submit-host-result` first"),
+            }, indent=2, default=str))
+            return 0
+
+        envelopes, artifacts = _materialize_attended_results(state)
+        patch: dict[str, object] = {
+            "phase": "synthesis",
+            "pending_hitl": None,
+            "hitl_return_node": None,
+        }
+        if envelopes:
+            patch["envelopes"] = envelopes
+        if artifacts:
+            patch["artifacts"] = artifacts
+        emit(project, wf, "finalize.materialized", {
+            "envelopes": len(envelopes), "artifacts": len(artifacts),
+            "attended_results": len(state.attended_results or []),
+        })
+        # as_node="judge_per_squad": its conditional edge routes to `synthesis`
+        # for a non-surfaced phase, so the graph re-enters exactly where the
+        # attended loop left off.
+        sup.update_state(config, patch, as_node="judge_per_squad")
+
+        # `synthesis` and `judge_synthesis` are interrupt_before nodes; drive
+        # the tail deterministically until the graph has no next task (END) or
+        # it parks on a HITL gate.
+        for _ in range(6):
+            cur = sup.get_state(config)
+            if not getattr(cur, "next", None):
+                break
+            sup.invoke(None, config=config)
+            after = sup.get_state(config)
+            if (after.values or {}).get("pending_hitl") and                     (after.values or {}).get("phase") == "surfaced":
+                break
+
+        final_snap = sup.get_state(config)
+        final_state = HydraState.model_validate(final_snap.values)
+        record = next(
+            (e for e in reversed(final_state.envelopes)
+             if e.get("type") == "DECISION_RECORD" and e.get("origin_squad") == "hydra"),
+            None,
+        )
+        record_id = str((record or {}).get("id") or "")
+        if record_id:
+            try:
+                sup.update_state(config, {"attended_finalized_record_id": record_id})
+            except Exception as e:  # noqa: BLE001
+                emit(project, wf, "finalize.persist_failed", {"error": str(e)})
+        emit(project, wf, "finalize.complete", {
+            "decision_record_id": record_id or None,
+            "phase": final_state.phase,
+        })
+        payload = {
+            "ok": bool(record_id),
+            "status": "finalized" if record_id else "no_decision_record",
+            "workflow_id": wf,
+            "decision_record_id": record_id or None,
+            "phase": final_state.phase,
+            "artifact_refs": [a.get("key") for a in ((record or {}).get("artifacts") or [])],
+            "dissent_count": len((record or {}).get("dissenting_opinions") or []),
+            "sealed": (record or {}).get("sealed"),
+            "pending_hitl": final_state.pending_hitl,
+            "trace": str(trace_path(project, wf)),
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        return 0 if record_id else 1
     finally:
         _release_resume_lock(lock_fd, lock_path)
 
@@ -2529,9 +3377,32 @@ def _cmd_reap(args) -> int:
             finally:
                 _release_resume_lock(lock_fd, lock_path)
 
+    # E2-17: a reaped workflow is terminal — close its pending rows in
+    # TheEights' shared ledger. One hitl.list for the whole sweep; fail-soft
+    # (an unreachable daemon leaves the rows and spools nothing to lose).
+    eights_hitl = {"resolved": 0, "failed": 0, "pending": 0}
+    if do_apply and reaped:
+        try:
+            from .eights.hitl_reconcile import resolve_for_workflow
+            attestor = _reconcile_attestor(project)
+            rows = attestor.hitl_list()
+            if rows is None:
+                eights_hitl["unavailable"] = True
+            else:
+                for wf in reaped:
+                    s = resolve_for_workflow(
+                        attestor, wf, rows=rows,
+                        note="workflow terminal: surfaced",
+                    )
+                    for k in ("resolved", "failed", "pending"):
+                        eights_hitl[k] += s.get(k, 0)
+        except Exception as exc:  # noqa: BLE001 — never fail a reap on this
+            eights_hitl["error"] = f"{type(exc).__name__}: {exc}"
+
     print(json.dumps({
         "mode": "apply" if do_apply else "dry-run",
         "older_than_hours": older_than_h,
+        "eights_hitl": eights_hitl,
         "scanned": len(thread_ids),
         "candidate_count": len(candidates),
         "candidates": candidates,
@@ -3002,6 +3873,29 @@ def _cmd_gateway_backup(args) -> int:
     return 0
 
 
+def _redact_inline_secrets(spec: dict) -> list[str]:
+    """Rewrite inline-secret-shaped env values in ``spec`` to ``${KEY}`` refs.
+
+    Mutates ``spec["env"]`` in place and returns the sorted list of env keys
+    that were rewritten. Detection is a shape check only
+    (``backends_env.looks_like_inline_secret``); the value is never printed,
+    logged, or returned.
+    """
+    from .backends_env import looks_like_inline_secret
+
+    if not isinstance(spec, dict):
+        return []
+    env = spec.get("env")
+    if not isinstance(env, dict):
+        return []
+    rewritten: list[str] = []
+    for key, value in list(env.items()):
+        if looks_like_inline_secret(value):
+            env[key] = "${" + str(key) + "}"
+            rewritten.append(str(key))
+    return sorted(rewritten)
+
+
 def _cmd_gateway_export_backends(args) -> int:
     """Export mcpServers block from ~/.claude.json to ~/.hydra/backends.json."""
     from .dispatcher import _load_user_scope_mcp, BACKEND_REGISTRY
@@ -3009,6 +3903,17 @@ def _cmd_gateway_export_backends(args) -> int:
     if not servers:
         print("No mcpServers found in ~/.claude.json")
         return 1
+    # E2-5: never copy inline secret material into backends.json. Any env value
+    # that looks like a 64-hex key is rewritten to a ${VAR} reference resolved
+    # at dispatch time from the launching environment. The value itself is
+    # neither printed nor retained.
+    for _name, _spec in servers.items():
+        _redacted = _redact_inline_secrets(_spec)
+        for _key in _redacted:
+            print(
+                f"  NOTE: {_name}.env.{_key} rewritten to ${{{_key}}} — "
+                f"export {_key} in the environment that launches Hydra."
+            )
     BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
     BACKEND_REGISTRY.write_text(
         json.dumps(servers, indent=2, default=str), encoding="utf-8"
@@ -3200,6 +4105,24 @@ def _interpolate(template: str, values: dict[str, str]) -> str:
     return result
 
 
+def _resolve_eights_spool_roots() -> tuple[Path, Path]:
+    """Resolve (spool_root, dead_letter_root), honouring the env overrides.
+
+    ``HYDRA_EIGHTS_SPOOL`` / ``HYDRA_EIGHTS_DEAD_LETTER`` let tests (and an
+    operator inspecting a copied spool) point the drain + doctor checks at a
+    scratch directory instead of ``~/.hydra/eights-pending``.
+    """
+    from .eights.pending_spool import DEFAULT_SPOOL_ROOT, DEFAULT_DEAD_LETTER_ROOT
+
+    spool_root = Path(
+        os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT
+    )
+    dead_root = Path(
+        os.environ.get("HYDRA_EIGHTS_DEAD_LETTER") or DEFAULT_DEAD_LETTER_ROOT
+    )
+    return spool_root, dead_root
+
+
 def _cmd_eights_drain(args) -> int:
     """Drain the eights-pending spool in a bounded batch.
 
@@ -3207,21 +4130,30 @@ def _cmd_eights_drain(args) -> int:
     via the live MCPStdioDispatcher.  Also removes stale .partial staging
     files older than 1 hour (these are crash residue from interrupted writes).
 
-    Prints JSON: {drained, failed, remaining, partial_removed, spool_root}.
+    Prints JSON: {drained, failed, skipped, dead_lettered, dead_letter_depth,
+    remaining, partial_removed, spool_root, dead_letter_root}.
     ``drained`` = successfully re-sent; ``failed`` = attempted but daemon
-    rejected; ``remaining`` = still on disk after this run.
+    rejected; ``skipped`` = corrupt / concurrently-removed / TTL-expired;
+    ``dead_lettered`` = moved to the dead-letter dir on THIS run;
+    ``dead_letter_depth`` = total entries sitting in the dead-letter dir.
+
+    E2-3: entries older than --max-age-hours are dead-lettered WITHOUT a
+    replay attempt.  That used to be invisible, so an eights outage longer
+    than the 24h default silently converted the whole backlog into
+    unreplayable dead letters.  A WARN now goes to stderr whenever an entry
+    is dead-lettered for age, and `--replay-dead-letter` re-queues them.
 
     If the eights daemon is not reachable the replay attempts all fail; spool
     entries remain in place for the next run (fail-soft, never destructive).
     """
     import time as _time
-    from .eights.pending_spool import PendingSpool, DEFAULT_SPOOL_ROOT
+    from .eights.pending_spool import PendingSpool
 
     limit = int(getattr(args, "limit", 500))
+    max_age_hours = float(getattr(args, "max_age_hours", 24.0))
+    replay_dead_letter = bool(getattr(args, "replay_dead_letter", False))
     project = Path(args.project) if args.project else Path.cwd()
-    spool_root = Path(
-        os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT
-    )
+    spool_root, dead_root = _resolve_eights_spool_roots()
 
     # Remove stale .partial files (crash residue from interrupted spool writes).
     partial_removed = 0
@@ -3235,9 +4167,21 @@ def _cmd_eights_drain(args) -> int:
             except OSError:
                 pass
 
-    spool = PendingSpool(root=spool_root)
+    spool = PendingSpool(root=spool_root, dead_letter_root=dead_root)
+
+    # E2-3: --replay-dead-letter moves dead letters back into the pending
+    # spool (attempts reset) and drains THAT pass with the age check off —
+    # otherwise every re-queued entry would immediately expire again.
+    requeued = 0
+    if replay_dead_letter:
+        requeued = spool.requeue_dead_letters(limit=limit)
+        max_age_hours = 0.0
+
     drained = 0
     failed = 0
+    skipped = 0
+    dead_lettered = 0
+    dead_lettered_expired = 0
     drain_error: str | None = None
 
     try:
@@ -3245,23 +4189,77 @@ def _cmd_eights_drain(args) -> int:
         from .eights.attestation import EightsAttestor
         dispatcher = MCPStdioDispatcher(project)
         attestor = EightsAttestor(dispatcher=dispatcher, spool=spool)
-        summary = attestor.replay_pending(max_replays=limit)
+        summary = attestor.replay_pending(
+            max_replays=limit, max_age_hours=max_age_hours
+        )
         drained = summary.get("sent", 0)
         failed = summary.get("failed", 0)
+        skipped = summary.get("skipped", 0)
+        dead_lettered = summary.get("dead_lettered", 0)
+        dead_lettered_expired = summary.get("dead_lettered_expired", 0)
     except Exception as exc:  # noqa: BLE001 — dispatcher not available → partial drain report
         drain_error = f"{type(exc).__name__}: {exc}"
 
     remaining = spool.count()
+    dead_letter_depth = spool.dead_letter_count()
     out: dict = {
         "drained": drained,
         "failed": failed,
+        "skipped": skipped,
+        "dead_lettered": dead_lettered,
+        "dead_letter_depth": dead_letter_depth,
         "remaining": remaining,
         "partial_removed": partial_removed,
         "spool_root": str(spool_root),
+        "dead_letter_root": str(dead_root),
     }
+    if replay_dead_letter:
+        out["requeued_from_dead_letter"] = requeued
     if drain_error is not None:
         out["error"] = drain_error
+
+    if dead_lettered_expired > 0:
+        print(
+            f"WARN: {dead_lettered_expired} spool entr"
+            f"{'y' if dead_lettered_expired == 1 else 'ies'} dead-lettered for "
+            f"age (older than --max-age-hours={max_age_hours}). They were NOT "
+            "replayed. Recover them with "
+            "`hydra eights-drain --replay-dead-letter`, or raise "
+            "--max-age-hours before the next drain.",
+            file=sys.stderr,
+        )
+
     print(json.dumps(out, indent=2))
+    return 0
+
+
+def _cmd_eights_hitl_reconcile(args) -> int:
+    """`hydra eights-hitl-reconcile [--apply] [--limit N]` (E2-17).
+
+    Lists TheEights' pending `hydra_gate` requests, matches each row's
+    workflow_id against Hydra's checkpoint store, and resolves the rows whose
+    workflow is terminal (done/surfaced) or unknown to Hydra. Rows for an
+    ACTIVE workflow are never touched — those are real gates awaiting a human.
+
+    Dry-run by default (mirrors `reap`); prints a JSON summary either way.
+    """
+    project = Path(args.project) if args.project else Path.cwd()
+    do_apply = bool(getattr(args, "apply", False))
+    limit = getattr(args, "limit", None)
+
+    from .eights.hitl_reconcile import reconcile
+    try:
+        attestor = _reconcile_attestor(project)
+        lookup = _make_phase_lookup(project)
+    except Exception as exc:  # noqa: BLE001 — report, never traceback
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
+              file=sys.stderr)
+        return 1
+
+    summary = reconcile(attestor, lookup, apply=do_apply,
+                        limit=int(limit) if limit is not None else None)
+    summary["mode"] = "apply" if do_apply else "dry-run"
+    print(json.dumps(summary, indent=2))
     return 0
 
 
@@ -3358,6 +4356,12 @@ def main(argv: list[str] | None = None) -> int:
     shr.add_argument("--result", required=True, metavar="FILE",
                      help="Path to a JSON file with the subagent's result object.")
     shr.add_argument("--verbose", action="store_true")
+
+    fin = sub.add_parser("finalize", help=(
+        "Attended mode: materialise the attended task results and resume the "
+        "graph through synthesis -> judge_synthesis -> postcheck (idempotent)."))
+    fin.add_argument("workflow_id")
+    fin.add_argument("--verbose", action="store_true")
 
     s = sub.add_parser("status")
     s.add_argument("workflow_id", nargs="?")
@@ -3468,7 +4472,8 @@ def main(argv: list[str] | None = None) -> int:
             "Drain the eights-pending spool in a bounded batch. "
             "Re-issues spooled calls to the eights daemon and removes stale "
             ".partial files older than 1 hour. "
-            "Prints JSON: {drained, failed, remaining}."
+            "Prints JSON: {drained, failed, skipped, dead_lettered, "
+            "dead_letter_depth, remaining}."
         ),
     )
     ed.add_argument(
@@ -3481,6 +4486,48 @@ def main(argv: list[str] | None = None) -> int:
             "(default 500). Remaining entries stay in the spool for the next "
             "call."
         ),
+    )
+    ed.add_argument(
+        "--max-age-hours",
+        dest="max_age_hours",
+        type=float,
+        default=24.0,
+        metavar="H",
+        help=(
+            "Dead-letter spool entries older than H hours WITHOUT attempting "
+            "a replay (default 24, kept for backwards compatibility; 0 "
+            "disables the age check entirely). Entries dead-lettered for age "
+            "emit a WARN on stderr — recover them with --replay-dead-letter."
+        ),
+    )
+    ed.add_argument(
+        "--replay-dead-letter",
+        dest="replay_dead_letter",
+        action="store_true",
+        help=(
+            "Move up to --limit entries from the dead-letter directory back "
+            "into the pending spool (attempts reset to 0) and drain them with "
+            "the age check disabled for that pass."
+        ),
+    )
+
+    # E2-17: HITL lifecycle reconciliation against TheEights' shared ledger.
+    ehr = sub.add_parser(
+        "eights-hitl-reconcile",
+        help=(
+            "Reconcile TheEights' pending HITL requests against Hydra "
+            "workflow state. Resolves rows whose workflow is terminal or "
+            "unknown; leaves active gates alone. Dry-run unless --apply. "
+            "Prints JSON: {pending, terminal, unknown, active, resolved}."
+        ),
+    )
+    ehr.add_argument(
+        "--apply", action="store_true",
+        help="Actually resolve the zombie rows (default: dry-run report only).",
+    )
+    ehr.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Examine at most N pending rows (default: all).",
     )
 
     # gateway management
@@ -3539,6 +4586,7 @@ def main(argv: list[str] | None = None) -> int:
         "plan": _cmd_plan,
         "step": _cmd_attended_step,
         "submit-host-result": _cmd_attended_submit,
+        "finalize": _cmd_finalize,
         "status": _cmd_status,
         "trace": _cmd_trace,
         "budget": _cmd_budget,
@@ -3553,6 +4601,7 @@ def main(argv: list[str] | None = None) -> int:
         "ingest": _cmd_ingest,
         "replay": _cmd_replay,
         "eights-drain": _cmd_eights_drain,
+        "eights-hitl-reconcile": _cmd_eights_hitl_reconcile,
         "gateway-backup": _cmd_gateway_backup,
         "gateway-export-backends": _cmd_gateway_export_backends,
         "gateway-migrate-hooks": _cmd_gateway_migrate_hooks,

@@ -41,6 +41,28 @@ from typing import Any, Callable, Iterable
 DEFAULT_SPOOL_ROOT = Path.home() / ".hydra" / "eights-pending"
 DEFAULT_DEAD_LETTER_ROOT = Path.home() / ".hydra" / "eights-pending-dead"
 
+# E2-26: the spool root is operator state. `HYDRA_EIGHTS_SPOOL` was already
+# honoured by the CLI (`hydra doctor`, `hydra eights-replay`) but NOT by the
+# `PendingSpool()` default used by `EightsAttestor`, so a test run wrote real
+# failure payloads into the operator's live `~/.hydra/eights-pending`. Both
+# roots now resolve through the environment at *construction* time (not
+# import time) so an in-test `monkeypatch.setenv` takes effect too.
+#
+#   HYDRA_EIGHTS_SPOOL       -> spool root       (pre-existing name)
+#   HYDRA_EIGHTS_DEAD_LETTER -> dead-letter root (added by E2-26)
+
+
+def resolve_spool_root() -> Path:
+    """Spool root: ``HYDRA_EIGHTS_SPOOL`` env override, else the default."""
+    return Path(os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT)
+
+
+def resolve_dead_letter_root() -> Path:
+    """Dead-letter root: ``HYDRA_EIGHTS_DEAD_LETTER`` override, else default."""
+    return Path(
+        os.environ.get("HYDRA_EIGHTS_DEAD_LETTER") or DEFAULT_DEAD_LETTER_ROOT
+    )
+
 
 @dataclass
 class SpooledCall:
@@ -101,11 +123,11 @@ class PendingSpool:
         *,
         dead_letter_root: Path | str | None = None,
     ) -> None:
-        self.root = Path(root) if root is not None else DEFAULT_SPOOL_ROOT
+        self.root = Path(root) if root is not None else resolve_spool_root()
         self.dead_letter_root = (
             Path(dead_letter_root)
             if dead_letter_root is not None
-            else DEFAULT_DEAD_LETTER_ROOT
+            else resolve_dead_letter_root()
         )
         # Lazy mkdir — the spool only materializes when something is spooled
         # so a clean install with healthy eights never creates the directory.
@@ -182,14 +204,34 @@ class PendingSpool:
         entries that exceed ``max_attempts`` are moved to the dead-letter
         directory instead of retrying forever.
 
-        Returns a summary dict: ``{"sent": N, "failed": M, "skipped": K}``.
+        Returns a summary dict::
+
+            {"sent": N, "failed": M, "skipped": K,
+             "dead_lettered": D, "dead_lettered_expired": E}
+
         ``skipped`` counts files that were corrupt or already deleted by
         a concurrent replay, plus entries dead-lettered without a replay
         attempt because they expired their TTL.
+
+        ``dead_lettered`` counts every entry moved to the dead-letter
+        directory during THIS run — both TTL expiries and entries that
+        exhausted ``max_attempts``. ``dead_lettered_expired`` is the TTL
+        subset, so an operator can tell "the backlog aged out" (fixable by
+        raising ``--max-age-hours`` / replaying the dead-letter dir) from
+        "the daemon keeps rejecting these". E2-3: these moves used to be
+        invisible — an outage longer than the TTL silently converted the
+        whole backlog into unreplayable dead letters.
         """
         sent = failed = skipped = 0
+        dead_lettered = dead_lettered_expired = 0
         if not self.root.is_dir():
-            return {"sent": sent, "failed": failed, "skipped": skipped}
+            return {
+                "sent": sent,
+                "failed": failed,
+                "skipped": skipped,
+                "dead_lettered": dead_lettered,
+                "dead_lettered_expired": dead_lettered_expired,
+            }
 
         replayed = 0
         for path in self._iter_pending_files():
@@ -212,6 +254,8 @@ class PendingSpool:
                     skipped += 1
                     continue
                 skipped += 1
+                dead_lettered += 1
+                dead_lettered_expired += 1
                 continue
             if max_replays is not None and replayed >= max_replays:
                 break
@@ -220,18 +264,66 @@ class PendingSpool:
                 result = send_fn(sc)
             except Exception:  # noqa: BLE001 — leave on disk for next replay
                 failed += 1
-                self._record_failure(path, sc, max_attempts=max_attempts)
+                if self._record_failure(path, sc, max_attempts=max_attempts):
+                    dead_lettered += 1
                 continue
             if not result:
                 failed += 1
-                self._record_failure(path, sc, max_attempts=max_attempts)
+                if self._record_failure(path, sc, max_attempts=max_attempts):
+                    dead_lettered += 1
                 continue
             try:
                 path.unlink()
                 sent += 1
             except FileNotFoundError:
                 skipped += 1
-        return {"sent": sent, "failed": failed, "skipped": skipped}
+        return {
+            "sent": sent,
+            "failed": failed,
+            "skipped": skipped,
+            "dead_lettered": dead_lettered,
+            "dead_lettered_expired": dead_lettered_expired,
+        }
+
+    def dead_letter_count(self) -> int:
+        """How many entries sit in the dead-letter dir. 0 when it doesn't exist."""
+        if not self.dead_letter_root.is_dir():
+            return 0
+        return sum(
+            1 for p in self.dead_letter_root.iterdir() if p.suffix == ".json"
+        )
+
+    def requeue_dead_letters(self, *, limit: int | None = None) -> int:
+        """Move up to ``limit`` dead-letter entries back into the pending spool.
+
+        ``attempts`` is reset to 0 on the way back so a re-queued entry gets a
+        full retry budget. Returns the number of entries actually re-queued.
+        Corrupt dead letters are left in place for inspection (fail-soft).
+        """
+        if not self.dead_letter_root.is_dir():
+            return 0
+        self.root.mkdir(parents=True, exist_ok=True)
+        requeued = 0
+        for path in sorted(
+            p for p in self.dead_letter_root.iterdir() if p.suffix == ".json"
+        ):
+            if limit is not None and requeued >= limit:
+                break
+            try:
+                sc = SpooledCall.from_json(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 — leave corrupt files for the operator
+                continue
+            sc.attempts = 0
+            target = self.root / path.name
+            if target.exists():
+                target = self.root / f"{sc.id}-{uuid.uuid4().hex}.json"
+            try:
+                self._write_call(path, sc)
+                os.replace(path, target)
+            except OSError:
+                continue
+            requeued += 1
+        return requeued
 
     # --- internals --------------------------------------------------------
 
@@ -241,13 +333,15 @@ class PendingSpool:
             return iter(())
         return iter(sorted(p for p in self.root.iterdir() if p.suffix == ".json"))
 
-    def _record_failure(self, path: Path, sc: SpooledCall, *, max_attempts: int) -> None:
+    def _record_failure(self, path: Path, sc: SpooledCall, *, max_attempts: int) -> bool:
+        """Persist the incremented attempt count. Returns True if dead-lettered."""
         sc.attempts += 1
         if sc.attempts > max_attempts:
             self._write_call(path, sc)
             self._dead_letter(path, sc)
-            return
+            return True
         self._write_call(path, sc)
+        return False
 
     def _write_call(self, path: Path, sc: SpooledCall) -> None:
         partial_path = path.with_suffix(f"{path.suffix}.partial")

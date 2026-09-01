@@ -36,9 +36,11 @@ the highest risk. We defend with two layers:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import UUID, uuid4
 
 from .governance import charge_and_gate, redact_for_squad_boundary
 from .schemas import HydraEnvelope, validate_envelope
@@ -72,6 +74,268 @@ def _redact_envelope_dict(env_dict: dict) -> dict:
     return redacted
 
 
+# ---------------------------------------------------------------------------
+# E2-34: pack-envelope normalization
+# ---------------------------------------------------------------------------
+# A claude-skill pack (e.g. RLM-Gaming's Director) hand-writes a DEV_TASK from
+# the prose contract, not from ``hydra_core.schemas.DevTask``. It emitted
+# {type, origin_squad, target_squad, workflow_id, repo, pp_team, title,
+# instructions, acceptance_criteria, budget_usd} — missing the REQUIRED
+# ``owner`` and ``branch``, so validation failed and the delegation was dropped
+# inside a top-level "complete" result (finding E2-34). We now fill safe
+# defaults before validation and fold pack-only keys into real schema fields so
+# nothing is silently lost.
+
+#: The ``DevTask.owner`` literal set, in tie-break priority order.
+DEV_TASK_OWNERS: tuple[str, ...] = ("frontend", "backend", "devops", "data", "fullstack")
+
+#: Keyword -> owner inference table. Matched case-insensitively on word
+#: boundaries against ``pp_team`` (weighted x2 — the most explicit signal),
+#: ``title``, and ``instructions``. Highest score wins; ties break in
+#: ``DEV_TASK_OWNERS`` order; no hit at all falls back to ``"fullstack"``.
+OWNER_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "frontend": ("ui", "ux", "html", "css", "frontend", "front-end", "react",
+                 "component", "stylesheet", "layout", "design-system", "widget"),
+    "backend": ("api", "db", "database", "backend", "back-end", "server",
+                "endpoint", "handler", "service", "sql", "rpc"),
+    "devops": ("deploy", "deployment", "ci", "cd", "pipeline", "docker",
+               "kubernetes", "infra", "infrastructure", "release", "runbook"),
+    "data": ("data", "etl", "elt", "dataset", "warehouse", "analytics",
+             "telemetry", "ingestion"),
+}
+
+_WORD_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_SLUG_STRIP_RE = re.compile(r"^-+|-+$")
+
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in _WORD_SPLIT_RE.split(str(text).lower()) if t]
+
+
+def infer_dev_task_owner(pp_team: str | None, title: str | None,
+                         instructions: str | None) -> str:
+    """Infer a ``DevTask.owner`` literal from the pack's free-text fields.
+
+    Deterministic: score each owner by keyword hits (``pp_team`` counts double),
+    take the highest score, break ties in ``DEV_TASK_OWNERS`` order, and fall
+    back to ``"fullstack"`` when nothing matches.
+    """
+    scores: dict[str, int] = {owner: 0 for owner in OWNER_KEYWORDS}
+    for text, weight in ((pp_team, 2), (title, 1), (instructions, 1)):
+        if not text:
+            continue
+        toks = set(_tokens(text))
+        # Hyphenated keywords ("front-end") are also compared against the raw
+        # lowercased text, since tokenizing splits them apart.
+        raw = str(text).lower()
+        for owner, words in OWNER_KEYWORDS.items():
+            for word in words:
+                if (word in toks) or ("-" in word and word in raw):
+                    scores[owner] += weight
+    best = max(scores.values())
+    if best == 0:
+        return "fullstack"
+    for owner in DEV_TASK_OWNERS:
+        if scores.get(owner) == best:
+            return owner
+    return "fullstack"  # pragma: no cover — unreachable; best came from scores
+
+
+def slugify(text: str, *, max_words: int = 6, max_len: int = 48) -> str:
+    """Lowercase hyphen-joined slug of at most ``max_words`` words."""
+    words = _tokens(text)[:max_words]
+    return _SLUG_STRIP_RE.sub("", "-".join(words)[:max_len])
+
+
+def default_dev_task_branch(workflow_id: Any, title: str | None,
+                            instructions: str | None) -> str:
+    """``hydra/<workflow-short8>/<slug>`` — the branch a pack omitted."""
+    wf_short = str(workflow_id or "unknown").replace("-", "")[:8] or "unknown"
+    slug = slugify(title or "") or slugify(instructions or "") or "dev-task"
+    return f"hydra/{wf_short}/{slug}"
+
+
+#: Keys packs commonly emit that are NOT ``DevTask`` fields. Pydantic ignores
+#: extras, so without this they would vanish. Each is folded into a real field.
+_DEV_TASK_PACK_ONLY_KEYS: tuple[str, ...] = ("title", "acceptance_criteria", "budget_usd")
+
+
+def _normalize_envelope_id(out: dict, defaulted: list[str]) -> None:
+    """Guarantee ``out["id"]`` is a UUID string, preserving a non-UUID original.
+
+    ``HydraEnvelope.id`` is a ``UUID``. A host-run pack labels its envelopes
+    however it likes — the observed case was ``"devtask-hydra-heads-166fc7ee"``,
+    which ``hydra.workflow.submit_envelopes`` accepted and the detached ingest
+    then rejected with "id Input should be a valid UUID", visible only in
+    ``ingest.log``. We mint a UUID4 and keep the original in ``external_id`` so
+    the pack's own reference still resolves.
+
+    A MISSING id is synthesized too: the dedup ledger keys on the id, so an
+    envelope without one would bypass ``processed`` entirely.
+    """
+    raw_id = out.get("id")
+    if raw_id is not None and str(raw_id).strip():
+        try:
+            UUID(str(raw_id))
+            return
+        except (ValueError, AttributeError, TypeError):
+            if not out.get("external_id"):
+                out["external_id"] = str(raw_id)
+                defaulted.append("external_id")
+    out["id"] = str(uuid4())
+    defaulted.append("id")
+
+
+def normalize_pack_envelope(env: dict) -> dict:
+    """Fill safe defaults on a pack-emitted envelope before schema validation.
+
+    ``id`` is normalized for EVERY envelope type (see ``_normalize_envelope_id``);
+    the remaining repairs apply to ``DEV_TASK``, the type packs hand-write most
+    often. The returned dict carries ``_normalized_fields`` — the list of fields
+    defaulted or folded — which the caller emits as
+    ``ingest.envelope_normalized``. Pydantic treats that key as an extra and
+    drops it at validation.
+
+    Never raises: a shape this cannot repair falls through to validation, which
+    then reports the real error.
+    """
+    if not isinstance(env, dict):
+        return env
+    out = dict(env)
+    defaulted: list[str] = []
+    _normalize_envelope_id(out, defaulted)
+    if out.get("type") != "DEV_TASK":
+        if defaulted:
+            out["_normalized_fields"] = defaulted
+        return out
+
+    title = out.get("title") if isinstance(out.get("title"), str) else None
+    instructions = out.get("instructions") if isinstance(out.get("instructions"), str) else None
+    pp_team = out.get("pp_team") if isinstance(out.get("pp_team"), str) else None
+
+    # --- owner -------------------------------------------------------------
+    if not out.get("owner"):
+        out["owner"] = infer_dev_task_owner(pp_team, title, instructions)
+        defaulted.append("owner")
+
+    # --- branch ------------------------------------------------------------
+    if not out.get("branch"):
+        out["branch"] = default_dev_task_branch(out.get("workflow_id"), title, instructions)
+        defaulted.append("branch")
+
+    # --- repo / target_repo_id ---------------------------------------------
+    repo = out.get("repo")
+    if isinstance(repo, str) and repo and not out.get("target_repo_id"):
+        try:
+            from .repo_registry import is_known_repo
+            if is_known_repo(repo):
+                out["target_repo_id"] = repo
+                defaulted.append("target_repo_id")
+        except Exception:  # noqa: BLE001 — registry trouble must not block ingest
+            pass
+    if not out.get("repo"):
+        # ``repo`` is required by the schema; fall back to the resolved repo id
+        # so a pack that only set target_repo_id still validates.
+        out["repo"] = str(out.get("target_repo_id") or ".")
+        defaulted.append("repo")
+
+    # --- fold pack-only keys into real fields so nothing is lost ------------
+    tail_lines: list[str] = []
+
+    acceptance = out.pop("acceptance_criteria", None)
+    if acceptance:
+        items = acceptance if isinstance(acceptance, list) else [acceptance]
+        existing = list(out.get("test_plan") or [])
+        for item in items:
+            text = str(item).strip()
+            if text and text not in existing:
+                existing.append(text)
+        out["test_plan"] = existing
+        defaulted.append("test_plan<-acceptance_criteria")
+
+    budget = out.pop("budget_usd", None)
+    if budget is not None:
+        constraints = dict(out.get("constraints") or {})
+        folded = False
+        if constraints.get("budget_usd") is None:
+            try:
+                constraints["budget_usd"] = float(budget)
+                out["constraints"] = constraints
+                defaulted.append("constraints.budget_usd<-budget_usd")
+                folded = True
+            except (TypeError, ValueError):
+                folded = False
+        if not folded:
+            tail_lines.append(f"budget_usd: {budget}")
+    if title:
+        out.pop("title", None)
+        tail_lines.insert(0, f"Title: {title}")
+
+    # Any remaining key that is neither a DevTask field nor an internal ingest
+    # marker is appended verbatim so the receiving squad still sees it.
+    from .schemas import DevTask as _DevTask
+    known = set(_DevTask.model_fields)
+    for key in sorted(k for k in list(out) if k not in known
+                      and not k.startswith("_") and k not in _DEV_TASK_PACK_ONLY_KEYS):
+        tail_lines.append(f"{key}: {out.pop(key)!r}")
+
+    if tail_lines:
+        tail = "\n".join(tail_lines)
+        base = out.get("instructions")
+        out["instructions"] = (
+            f"{base}\n\n[from originating pack]\n{tail}"
+            if isinstance(base, str) and base
+            else f"[from originating pack]\n{tail}"
+        )
+        defaulted.append("instructions<-pack_only_keys")
+
+    if defaulted:
+        out["_normalized_fields"] = defaulted
+    return out
+
+
+def normalize_for_ingest(env: dict,
+                         emit_fn: Callable[[str, dict], None] | None = None) -> dict:
+    """``normalize_pack_envelope`` + the ``ingest.envelope_normalized`` trace.
+
+    Returns the normalized dict with the ``_normalized_fields`` marker stripped,
+    so callers can hand it straight to ``validate_envelope`` or persist it.
+    Idempotent: normalizing an already-normalized envelope defaults nothing and
+    emits nothing, which is what lets the CLI normalize once for dedup and still
+    pass the dict through ``dispatch_ingested_envelopes``.
+    """
+    if not isinstance(env, dict):
+        return env
+    out = normalize_pack_envelope(env)
+    fields_defaulted = out.pop("_normalized_fields", None)
+    if fields_defaulted and emit_fn is not None:
+        try:
+            emit_fn("ingest.envelope_normalized", {
+                "envelope_id": str(out.get("id", "?")),
+                "external_id": out.get("external_id"),
+                "type": out.get("type"),
+                "fields_defaulted": list(fields_defaulted),
+            })
+        except Exception:  # noqa: BLE001 — tracing must never break ingest
+            pass
+    return out
+
+
+def validation_error_details(exc: Exception) -> list[dict[str, Any]]:
+    """Render a pydantic ValidationError as a JSON-safe field/message list."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            return [
+                {"field": ".".join(str(p) for p in e.get("loc", ())),
+                 "msg": str(e.get("msg", ""))}
+                for e in errors()
+            ]
+        except Exception:  # noqa: BLE001
+            pass
+    return [{"field": "", "msg": str(exc)}]
+
+
 @dataclass
 class IngestItemResult:
     envelope_id: str
@@ -80,6 +344,9 @@ class IngestItemResult:
     status: str          # done | failed | surfaced | running | skipped_duplicate | deferred_to_host | unknown_target
     run_id: str | None = None
     detail: str = ""
+    # E2-34: structured pydantic errors for a `failed` validation item, so the
+    # host sees WHICH fields were wrong instead of one flattened string.
+    errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +373,15 @@ class IngestOutcome:
             it.envelope_id for it in self.items
             if it.status not in ("skipped_duplicate", "unknown_target")
         ]
+
+    @property
+    def rejected(self) -> list[IngestItemResult]:
+        """Items that never reached a squad because they failed validation.
+
+        E2-34: the attended submit path turns a non-empty list into a top-level
+        ``status="envelopes_rejected"`` instead of reporting ``complete`` with
+        the failure buried in the ``ingest`` detail."""
+        return [it for it in self.items if it.status == "failed" and it.errors]
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -162,15 +438,28 @@ def dispatch_ingested_envelopes(
 
     for raw in raw_envelopes:
         # Normalise to a typed envelope (validate raw dicts; pass through
-        # already-typed envelopes).
+        # already-typed envelopes). E2-34: a hand-written pack envelope first
+        # goes through normalize_pack_envelope, which supplies the required
+        # fields the prose contract never documented (owner/branch) and folds
+        # pack-only keys into real schema fields.
+        normalized = normalize_for_ingest(raw, _emit) if isinstance(raw, dict) else raw
         try:
-            env = raw if isinstance(raw, HydraEnvelope) else validate_envelope(dict(raw))
+            env = (normalized if isinstance(normalized, HydraEnvelope)
+                   else validate_envelope(dict(normalized)))
         except Exception as exc:  # noqa: BLE001 — bad envelope is an item failure, not a crash
+            bad = normalized if isinstance(normalized, dict) else {}
+            errors = validation_error_details(exc)
             outcome.items.append(IngestItemResult(
-                envelope_id=str((raw or {}).get("id", "?")) if isinstance(raw, dict) else "?",
-                envelope_type=(raw or {}).get("type") if isinstance(raw, dict) else None,
+                envelope_id=str(bad.get("id", "?")),
+                envelope_type=bad.get("type"),
                 target=None, status="failed", detail=f"invalid envelope: {exc}",
+                errors=errors,
             ))
+            _emit("ingest.invalid_envelope", {
+                "envelope_id": str(bad.get("id", "?")),
+                "type": bad.get("type"),
+                "errors": errors,
+            })
             continue
 
         eid = str(env.id)
@@ -220,10 +509,15 @@ def dispatch_ingested_envelopes(
             safe_dict = _redact_envelope_dict(env.model_dump(mode="json"))
             safe_env = validate_envelope(safe_dict)
         except Exception as exc:  # noqa: BLE001
+            errors = validation_error_details(exc)
             outcome.items.append(IngestItemResult(
                 envelope_id=eid, envelope_type=etype, target=target,
                 status="failed", detail=f"redaction/validation failed: {exc}",
+                errors=errors,
             ))
+            _emit("ingest.invalid_envelope", {
+                "envelope_id": eid, "type": etype, "errors": errors,
+            })
             continue
 
         task = TaskState(

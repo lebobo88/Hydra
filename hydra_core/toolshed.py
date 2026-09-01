@@ -282,7 +282,7 @@ def _extract_tags(name: str, description: str) -> list[str]:
 # ---------- static catalogs for known servers ----------
 
 PP_HARNESS_TOOLS = [
-    "analyze_autogenesis", "agents_md_status", "apply_agents_md_patch",
+    "ack_run", "analyze_autogenesis", "agents_md_status", "apply_agents_md_patch",
     "apply_master_plan_patch", "archive_artifact", "archive_winner_and_losers",
     "artifact_validate", "audit_status", "borda_count", "browser_validation_finalize",
     "browser_validation_start", "budget_status", "completion_checklist",
@@ -420,6 +420,7 @@ XENIA_TICKETS_TOOLS = [
 HYDRA_CONTROL_TOOLS = [
     "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.plan",
     "hydra.workflow.step", "hydra.workflow.submit_host_result",
+    "hydra.workflow.finalize",
     "hydra.workflow.resume", "hydra.workflow.submit_envelopes",
     "hydra.cockpit.audit",
     # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
@@ -795,6 +796,11 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "required": ["goal"],
         },
         "hydra.workflow.step": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
+        },
+        "hydra.workflow.finalize": {
             "type": "object",
             "properties": {"workflow_id": {"type": "string"}},
             "required": ["workflow_id"],

@@ -48,6 +48,12 @@ class Constraints(BaseModel):
 class HydraEnvelope(BaseModel):
     """Base envelope shared by every cross-squad message."""
     id: UUID = Field(default_factory=uuid4)
+    # E2-34: the identifier the ORIGINATING system used, when it was not a
+    # UUID. A host-run pack may label its envelope "devtask-hydra-heads-166fc7ee";
+    # `hydra_core.ingest.normalize_pack_envelope` mints a real UUID for `id` and
+    # preserves the original here so the pack's own reference still resolves and
+    # the trace stays correlatable. None when the pack supplied a valid UUID.
+    external_id: Optional[str] = None
     type: str
     origin_squad: str
     target_squad: Optional[str] = None

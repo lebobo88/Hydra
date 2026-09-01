@@ -15,6 +15,10 @@ HYDRA_ROOT = Path(__file__).resolve().parents[1]
 
 class _StubDispatcher:
     """Minimal dispatcher protocol stand-in. Returns a fake result envelope."""
+    # E2-22: this suite exercises the in-graph mcp dispatch path with a
+    # scripted pp harness. Opt in explicitly — node_dispatch otherwise
+    # defers mcp packs to the attended host on a non-live dispatcher.
+    allow_offline_mcp_dispatch = True
     def call_mcp(self, server, tool, args, **_kw):
         return {"status": "done", "tool": tool, "result": {"ok": True}}
 

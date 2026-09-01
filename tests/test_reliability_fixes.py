@@ -1469,6 +1469,11 @@ class TestJudgePerSquadHaltsOnSurfaced:
         from hydra_core.supervisor import build_supervisor
 
         class _NullDisp:
+            # E2-22: node_dispatch defers mcp packs to the attended host on a
+            # non-live dispatcher, which would end the pass at dispatch. This
+            # test guards the judge->synthesis happy path, so opt back in.
+            allow_offline_mcp_dispatch = True
+
             def call_mcp(self, *_a, **_k):
                 return {"status": "done", "result": {}}
             def emit_claude_prompt(self, *_a, **_k):

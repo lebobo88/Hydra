@@ -278,6 +278,57 @@ def _detached_refusal(kind: str) -> dict[str, Any]:
     }
 
 
+def _normalize_and_validate_envelopes(
+    envelopes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """E2-34: repair + schema-check envelopes BEFORE the detached ingest starts.
+
+    Returns ``(normalized, rejected)``. ``normalized`` carries the defaults
+    ``hydra_core.ingest.normalize_pack_envelope`` supplies (a UUID ``id`` with
+    the pack's original preserved as ``external_id``, an inferred ``owner``, a
+    synthesized ``branch``, ...). ``rejected`` holds one entry per envelope that
+    still fails ``validate_envelope``, with structured per-field errors.
+
+    Fail-OPEN on an import error only: if ``hydra_core`` is not importable in
+    this process the envelopes pass through untouched and the detached child
+    validates them as it did before — degraded, never a hard block.
+    """
+    try:
+        from hydra_core.ingest import (  # noqa: PLC0415
+            normalize_for_ingest,
+            validation_error_details,
+        )
+        from hydra_core.schemas import validate_envelope  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — hydra_core not on path in some test envs
+        logger.warning("submit_envelopes: hydra_core unavailable; "
+                       "skipping synchronous validation")
+        return list(envelopes), []
+
+    normalized: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, env in enumerate(envelopes):
+        try:
+            out = normalize_for_ingest(dict(env))
+        except Exception as exc:  # noqa: BLE001 — a repair failure is a rejection
+            rejected.append({"index": index, "envelope_id": None,
+                             "type": (env or {}).get("type"),
+                             "errors": [{"field": "", "msg": str(exc)}]})
+            continue
+        try:
+            validate_envelope(out)
+        except Exception as exc:  # noqa: BLE001
+            rejected.append({
+                "index": index,
+                "envelope_id": str(out.get("id")) if out.get("id") else None,
+                "external_id": out.get("external_id"),
+                "type": out.get("type"),
+                "errors": validation_error_details(exc),
+            })
+            continue
+        normalized.append(out)
+    return normalized, rejected
+
+
 def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[str, Any]:
     # Detached gate: resume is automation-only. No fleet exemption — a resume
     # call carries no fleet goal string, so fleet detection is not applicable.
@@ -299,6 +350,11 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -369,6 +425,11 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -444,6 +505,11 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
     creationflags = 0
     start_new_session = False
@@ -478,6 +544,7 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 _PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
 _STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "900"))
 _SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "1800"))
+_FINALIZE_TIMEOUT_S = int(os.environ.get("HYDRA_FINALIZE_TIMEOUT_S", "600"))
 
 
 def _run_cli_json(cli_args: list[str], *, timeout_s: int,
@@ -488,6 +555,11 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
     cmd = [sys.executable, "-m", "hydra_core.cli", *cli_args]
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
+    # E2-36: force UTF-8 in the detached child so its stdout/stderr (and any
+    # CLI output it relays into the log) never depends on the Windows ANSI
+    # codepage. Without this a non-cp1252 byte kills the reader thread.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, validated tokens
             cmd, cwd=str(_HYDRA_ROOT), env=env,
@@ -498,7 +570,8 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             # (lseek on fd 0 → NtQueryInformationFile blocks forever). Mirrors
             # _launch_run, which already passes DEVNULL for the same reason.
             stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=timeout_s,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
         # MU8b: surface whatever partial output was buffered so callers can
@@ -515,6 +588,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             "plan": "HYDRA_PLAN_TIMEOUT_S",
             "step": "HYDRA_STEP_TIMEOUT_S",
             "submit": "HYDRA_SUBMIT_TIMEOUT_S",
+            "finalize": "HYDRA_FINALIZE_TIMEOUT_S",
         }
         _knob = _knob_map.get(err_label,
                                f"HYDRA_{err_label.upper()}_TIMEOUT_S")
@@ -617,6 +691,43 @@ def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
         ["submit-host-result", workflow_id, "--run-id", run_id,
          "--call-key", call_key, "--result", str(res_file)],
         timeout_s=_SUBMIT_TIMEOUT_S, err_label="submit", workflow_id=workflow_id)
+
+
+def _ensure_venom_registry() -> int:
+    """Populate the process-local Cerberus venom registry, returning its size.
+
+    E2-11: ``hydra.venom.cross_check`` runs ``require_cerberus_pass`` against
+    ``hydra_core.venom``'s process-local ``_REGISTRY``, which is only ever
+    filled by ``load_cerberus_venoms()`` scanning ``squads/*/cerberus.yaml``.
+    This server never called it, so every venom-class capability looked
+    unregistered and was waved through. Called once at startup and again,
+    lazily, from the handler as a guard (the MCP SDK may serve tools without
+    this module's ``main()`` having run).
+
+    Fail-soft: a load failure is logged and reported as an empty registry. The
+    handler translates "empty" into a fail-closed refusal, so a broken load can
+    never re-open the gate.
+    """
+    try:
+        from hydra_core.venom import load_cerberus_venoms, registered_venoms
+    except Exception as exc:  # noqa: BLE001 — never fatal at startup
+        logger.warning("venom registry unavailable: %s", exc)
+        return 0
+    try:
+        if not registered_venoms():
+            load_cerberus_venoms(_HYDRA_ROOT)
+    except Exception as exc:  # noqa: BLE001 — fail-soft; gate stays fail-closed
+        logger.warning("venom registry load failed from %s: %s", _HYDRA_ROOT, exc)
+    try:
+        return len(registered_venoms())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _run_finalize(workflow_id: str) -> dict[str, Any]:
+    """Materialise attended results and resume the graph through synthesis."""
+    return _run_cli_json(["finalize", workflow_id], timeout_s=_FINALIZE_TIMEOUT_S,
+                         err_label="finalize", workflow_id=workflow_id)
 
 
 def _tool_handlers() -> dict[str, Any]:
@@ -723,8 +834,24 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "error": "each envelope must be an object"}
         if len(envelopes) > 100:
             return {"ok": False, "error": "too many envelopes (max 100)"}
+        # E2-34: normalize + validate SYNCHRONOUSLY here. Before this, a
+        # malformed envelope (e.g. id="devtask-hydra-heads-166fc7ee", which is
+        # not a UUID) was accepted with {launched: true} and only rejected
+        # inside the detached child, visible nowhere but .hydra/<wf>/ingest.log.
+        # The batch is all-or-nothing: nothing is launched and nothing is
+        # claimed, so the host corrects and re-submits the whole list.
+        normalized, rejected = _normalize_and_validate_envelopes(envelopes)
+        if rejected:
+            return {
+                "ok": False,
+                "launched": False,
+                "status": "envelopes_rejected",
+                "rejected": rejected,
+                "error": (f"{len(rejected)} of {len(envelopes)} envelope(s) failed "
+                          "validation; nothing was dispatched"),
+            }
         try:
-            return _launch_ingest(workflow_id, envelopes)
+            return _launch_ingest(workflow_id, normalized)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("ingest launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
@@ -883,6 +1010,24 @@ def _tool_handlers() -> dict[str, Any]:
             logger.exception("attended submit failed")
             return {"ok": False, "error": f"submit_failed: {e}"}
 
+    def workflow_finalize(args: dict[str, Any]) -> dict[str, Any]:
+        """Close an attended workflow: synthesis -> judge_synthesis -> postcheck.
+
+        E2-30: the attended step/submit loop marks tasks done but never
+        re-enters the graph, so an interactive workflow otherwise ends with no
+        engine DECISION_RECORD, no postcheck and no episodic row. Call this
+        once `hydra.workflow.step` returns {status:"ready_to_finalize"}.
+        Idempotent: a second call returns {status:"already_finalized"}.
+        """
+        workflow_id = str(args.get("workflow_id") or "")
+        if not _WORKFLOW_ID_RE.match(workflow_id):
+            return {"ok": False, "error": "invalid_workflow_id"}
+        try:
+            return _run_finalize(workflow_id)
+        except Exception as e:  # noqa: BLE001 — surfaced, never silent
+            logger.exception("attended finalize failed")
+            return {"ok": False, "error": f"finalize_failed: {e}"}
+
     # ------------------------------------------------------------------
     # F32-H: four new governance-federation tools called by AgentSmith's
     # HydraBridge (hydra-bridge.ts:74,108,129,150). Argument shapes match
@@ -903,6 +1048,12 @@ def _tool_handlers() -> dict[str, Any]:
             from hydra_core.venom import require_cerberus_pass, VenomUnregistered
         except Exception as imp_exc:  # noqa: BLE001
             return {"ok": False, "rationale": f"venom module unavailable: {imp_exc}"}
+        # E2-11: an empty registry means no venom is known to this process, so
+        # "unregistered" carries no information. Fail closed rather than
+        # approving every venom-class capability.
+        if _ensure_venom_registry() == 0:
+            return {"ok": False,
+                    "rationale": "venom registry not loaded — failing closed"}
         try:
             verdict = require_cerberus_pass(
                 capability, context,
@@ -915,7 +1066,8 @@ def _tool_handlers() -> dict[str, Any]:
                 "rationale": "; ".join(verdict.refusal_reasons) or "cerberus refused",
             }
         except VenomUnregistered:
-            # Capability not in registry → not a known venom; treat as pass.
+            # Registry is non-empty (checked above) and the capability is absent
+            # from it → genuinely not a venom-class action; treat as pass.
             return {"ok": True, "rationale": "capability not in venom registry — not a venom-class action"}
         except Exception as exc:  # noqa: BLE001 — transport-shaped error → ok=false
             logger.exception("venom_cross_check: unexpected error")
@@ -1209,6 +1361,7 @@ def _tool_handlers() -> dict[str, Any]:
         "hydra.workflow.plan": workflow_plan,
         "hydra.workflow.step": workflow_step,
         "hydra.workflow.submit_host_result": workflow_submit_host_result,
+        "hydra.workflow.finalize": workflow_finalize,
         "hydra.workflow.resume": workflow_resume,
         "hydra.workflow.submit_envelopes": workflow_submit_envelopes,
         "hydra.workflow.budget": workflow_budget,
@@ -1352,6 +1505,26 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                            "description": "The host subagent's result object."},
             },
             "required": ["workflow_id", "run_id", "call_key", "result"],
+        },
+    },
+    "hydra.workflow.finalize": {
+        "description": (
+            "Attended execution: close the workflow through the ENGINE. Call it "
+            "once hydra.workflow.step returns {status:'ready_to_finalize'}. "
+            "Materialises every attended task result (engineering stages and "
+            "claude-skill/impersonation squad cursors) into squad DECISION_RECORD "
+            "envelopes + artifact rows, then resumes the graph so synthesis -> "
+            "judge_synthesis -> postcheck run over the real outputs: the engine "
+            "DECISION_RECORD is persisted to episodic memory (RA-8) and the phase "
+            "becomes terminal. Returns {ok:true, status:'finalized', "
+            "decision_record_id, phase, artifact_refs} or {ok:false, "
+            "status:'tasks_pending', pending:[task_id,...]} when the attended loop "
+            "is not done. Idempotent: a second call returns "
+            "{ok:true, status:'already_finalized', decision_record_id}."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workflow_id": {"type": "string"}},
+            "required": ["workflow_id"],
         },
     },
     "hydra.workflow.submit_envelopes": {
@@ -1720,5 +1893,15 @@ def _serve_bare() -> None:
 
 
 def main() -> None:
+    # E2-11: prime the Cerberus venom registry before serving any tool, so
+    # hydra.venom.cross_check gates against the same capability set that
+    # `hydra doctor` reports instead of an empty dict.
+    _venom_count = _ensure_venom_registry()
+    if _venom_count:
+        logger.info("Cerberus venom registry loaded: %d capabilities", _venom_count)
+    else:
+        logger.warning(
+            "Cerberus venom registry empty (root=%s) — hydra.venom.cross_check "
+            "will fail closed", _HYDRA_ROOT)
     if not _serve_with_mcp_sdk():
         _serve_bare()

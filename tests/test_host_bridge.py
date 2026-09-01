@@ -2421,3 +2421,289 @@ def test_recover_stalled_stage_already_merged_branch_reproduces_live_incident(tm
         "this is the exact data-loss shape from the live incident")
     assert (tmp_path / "important_fix.py").exists()
     assert (tmp_path / "old_feature.py").exists()
+
+
+# --------------------------------------------------------------------------- #
+# E2-28 — squad host_action prompt carries full Hydra context                  #
+# --------------------------------------------------------------------------- #
+
+def test_squad_stage_prompt_carries_hydra_context(tmp_path):
+    """The squad host_action prompt must be reproducible from the trace alone:
+    Hydra context block, root goal, task description and budget constraints."""
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-e228", task_id="task-11", squad_slug="executive",
+        entrypoint="agent-impersonation", lead_agent="executive-suite:boardroom",
+        pack_cwd=str(tmp_path), request_text="Decompose goal + budget split",
+        project_root=str(tmp_path),
+        goal="Build Hydra Pulse, a live workflow dashboard",
+        envelope_id="env-42",
+        upstream_refs=["envelope:env-1 (executive)", "episodic:wf-e228/plan"],
+        budget_usd=20.0, budget_remaining_usd=17.5,
+        risk="high", priority="P1",
+        acceptance_criteria=["A budget split per squad", "One page of rationale"],
+    )
+    prompt = res["host_action"]["prompt"]
+    assert prompt.startswith("## Hydra context")
+    assert "workflow_id: wf-e228" in prompt
+    assert "task_id: task-11" in prompt
+    assert "squad: executive" in prompt
+    assert "envelope_id: env-42" in prompt
+    assert "envelope:env-1 (executive)" in prompt
+    assert "episodic:wf-e228/plan" in prompt
+    assert "Build Hydra Pulse, a live workflow dashboard" in prompt
+    assert "Decompose goal + budget split" in prompt
+    assert "17.50 remaining of 20.00 total" in prompt
+    assert "risk: high" in prompt
+    assert "priority: P1" in prompt
+    assert "- A budget split per squad" in prompt
+    # The bare planner label stays available for hosts that want just the task.
+    assert res["host_action"]["task_description"] == "Decompose goal + budget split"
+
+
+def test_squad_stage_prompt_degrades_without_context(tmp_path):
+    """With no optional context the prompt still carries identity + the task,
+    and marks the missing fields explicitly rather than omitting them."""
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-bare", task_id="task-12", squad_slug="garland",
+        entrypoint="claude-skill", lead_agent="calliope",
+        pack_cwd=str(tmp_path), request_text="draft the brand brief",
+        project_root=str(tmp_path))
+    prompt = res["host_action"]["prompt"]
+    assert "workflow_id: wf-bare" in prompt
+    assert "envelope_id: (none)" in prompt
+    assert "upstream_refs: (none)" in prompt
+    assert "acceptance_criteria: (none)" in prompt
+    assert "budget_usd: unknown" in prompt
+    assert "draft the brand brief" in prompt
+    assert res["host_action"]["task_description"] == "draft the brand brief"
+
+
+def test_squad_prompt_builder_omits_raw_upstream_content():
+    """Hard rule 3: only handles cross a squad boundary, never blobs. The
+    builder has no parameter that could carry raw upstream artifact text."""
+    import inspect
+    params = set(inspect.signature(host_bridge._build_squad_prompt).parameters)
+    assert "upstream_refs" in params
+    assert not {"upstream_text", "upstream_content", "artifacts"} & params
+
+
+# --------------------------------------------------------------------------- #
+# E2-27: judge_model_id validation / normalization                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _clear_judge_pin_cache():
+    """The doctor probe is cached process-wide; keep tests independent."""
+    host_bridge._reset_judge_model_pin_cache()
+    yield
+    host_bridge._reset_judge_model_pin_cache()
+
+
+class _FakeDispatcherWithDoctor(FakeDispatcher):
+    """FakeDispatcher serving pp's doctor judge_capabilities map, and
+    enforcing pp's real record_verdict judge-model pin."""
+
+    def __init__(self, *, enforce_pin: bool = True, **kw):
+        super().__init__(**kw)
+        self._enforce_pin = enforce_pin
+        self.verdicts: list[dict] = []
+
+    def call_mcp(self, server, tool, args, squad_id=None):
+        if tool == "doctor":
+            self.calls.append((server, tool, dict(args), squad_id))
+            return {"status": "done", "result": {"judge_capabilities": {
+                "codex": {"critique_model": "gpt-5.4"},
+                "agy": {"critique_model": "gemini-3.1-pro-preview"},
+                "claude": {"critique_model": None},
+            }}}
+        if tool == "record_verdict":
+            self.calls.append((server, tool, dict(args), squad_id))
+            self.verdicts.append(dict(args))
+            if self._enforce_pin and args.get("judge_producer") == "codex" \
+                    and args.get("judge_model_id") not in {"gpt-5.4", "gpt-5.5"}:
+                return {"status": "failed", "error": (
+                    "judge_producer=codex must record judge_model_id in "
+                    "{gpt-5.4, gpt-5.5} because pp_codex.critique is pinned "
+                    "to those models (default or escalated)")}
+            return {"status": "done", "result": {"verdict_id": "v-1"}}
+        return super().call_mcp(server, tool, args, squad_id)
+
+
+def _drive_to_judge(disp, tmp_path):
+    res = _begin(disp, tmp_path)
+    cfile = res["cursor_path"]
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "model": "claude-opus-4-8"})
+    return cfile, res
+
+
+def test_judge_host_action_carries_allowed_model_ids(tmp_path):
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    _cfile, res = _drive_to_judge(disp, tmp_path)
+    allowed = res["host_action"]["allowed_judge_model_ids"]
+    assert allowed["codex"] == ["gpt-5.4", "gpt-5.5"]
+    assert allowed["agy"] == ["gemini-3.1-pro-preview"]
+    assert allowed["claude"] == []
+    # The instruction the host relays to the judge names the pinned ids.
+    assert "allowed_judge_model_ids" in res["host_action"]["instructions"]
+    assert "Never invent" in res["host_action"]["instructions"]
+    # doctor ran read-only under the engineering RBAC scope.
+    assert ("pp_harness", "doctor", {}, "engineering") in disp.calls
+
+
+def test_mislabeled_codex_model_id_is_normalized_not_fatal(tmp_path):
+    """E2-27: the live incident -- a judge reporting gpt-5.1-codex on a PASS.
+
+    The verdict must be recorded against pp's pinned id, the stage must
+    complete, and the judge's own claim must be preserved for audit.
+    """
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, _ = _drive_to_judge(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile,
+        call_key="judge-run-1-stage-1-att-1-0",
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.1-codex", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    assert res["final_status"] == "complete"
+    assert res["stage_outcome"] == "pass"
+    assert len(disp.verdicts) == 1
+    v = disp.verdicts[0]
+    assert v["judge_model_id"] == "gpt-5.4"
+    assert v["judge_producer"] == "codex"
+    assert v["score_json"]["judge_model_id_reported"] == "gpt-5.1-codex"
+
+
+def test_missing_model_id_normalizes_to_pin(tmp_path):
+    """A judge that reports no model id must not send a made-up default."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, _ = _drive_to_judge(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile,
+        call_key="judge-run-1-stage-1-att-1-0",
+        result={"outcome": "pass", "critique_md": "ok",
+                "judge_producer": "codex", "cost_usd": 0.05})
+    assert res["status"] == "complete"
+    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.4"
+    assert disp.verdicts[0]["score_json"]["judge_model_id_reported"] is None
+
+
+def test_escalated_codex_model_id_passes_through(tmp_path):
+    """gpt-5.5 is a legitimate pp escalation -- do NOT rewrite it to gpt-5.4."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, _ = _drive_to_judge(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile,
+        call_key="judge-run-1-stage-1-att-1-0",
+        result={"outcome": "pass", "critique_md": "ok",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.5", "cost_usd": 0.05})
+    assert res["status"] == "complete"
+    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.5"
+    assert "judge_model_id_reported" not in disp.verdicts[0]["score_json"]
+
+
+def test_same_vendor_claude_model_id_is_not_normalized(tmp_path):
+    """pp pins no Claude critique model -- the reported id must survive."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=False)
+    cfile, _ = _drive_to_judge(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile,
+        call_key="judge-run-1-stage-1-att-1-0",
+        result={"outcome": "pass", "critique_md": "ok",
+                "judge_producer": "claude-same-vendor-host",
+                "judge_model_id": "claude-haiku-4", "cost_usd": 0.02})
+    assert res["status"] == "complete"
+    assert disp.verdicts[0]["judge_model_id"] == "claude-haiku-4"
+    assert disp.verdicts[0]["judge_producer"] == "claude-same-vendor-host"
+
+
+def test_record_verdict_pin_error_is_retryable_cursor_stays_await_judge(tmp_path):
+    """E2-27 (3): a pp pin rejection must NOT surface a passing stage.
+
+    Simulated by emptying the pin map so host-side normalization is a no-op
+    and the mislabeled id reaches pp, exactly as it did before this fix.
+    """
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+    host_bridge._JUDGE_MODEL_PIN_CACHE = {"codex": (), "agy": (), "claude": ()}
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.1-codex", "cost_usd": 0.05})
+
+    assert res["ok"] is False
+    assert res["retryable"] is True
+    assert "must record judge_model_id" in res["error"]
+    assert "allowed_judge_model_ids" in res
+    # Cursor is NOT terminal and the same judge step is still pending.
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+    assert res["host_action"]["call_key"] == judge_key
+    assert disp.count("finalize_stage") == 0
+    assert disp.count("finalize_run") == 0
+    assert host_bridge.load_cursor(cfile)["state"] == "await_judge"
+
+    # A corrected resubmit under the SAME call_key completes the stage.
+    host_bridge._reset_judge_model_pin_cache()
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.4", "cost_usd": 0.05})
+    assert res2["status"] == "complete"
+    assert res2["final_status"] == "complete"
+    # Judge cost was accrued exactly once across both submits.
+    assert res2["cost_usd"] == pytest.approx(0.15)
+
+
+def test_unknown_judge_producer_is_retryable_without_advancing(tmp_path):
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "ok",
+                "judge_producer": "definitely-not-a-vendor",
+                "judge_model_id": "who-knows", "cost_usd": 0.05})
+
+    assert res["ok"] is False and res["retryable"] is True
+    assert "not a supported judge vendor" in res["error"]
+    assert sorted(res["allowed_judge_model_ids"]) == ["agy", "claude", "codex"]
+    assert res["state"] == "await_judge"
+    assert res["host_action"]["call_key"] == judge_key
+    # Nothing was written to the pp ledger and no judge cost was accrued.
+    assert disp.count("record_verdict") == 0
+    assert res["cost_usd"] == pytest.approx(0.10)   # generate only
+
+
+def test_unknown_judge_producer_correction_budget_is_bounded(tmp_path):
+    """A host that keeps re-reporting a bad producer must not livelock."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True,
+                                     enforce_pin=False)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+    bad = {"outcome": "pass", "critique_md": "ok",
+           "judge_producer": "definitely-not-a-vendor",
+           "judge_model_id": "who-knows", "cost_usd": 0.05}
+
+    for _ in range(host_bridge._MAX_JUDGE_MODEL_CORRECTIONS):
+        res = host_bridge.submit_host_result(
+            disp, cursor_file=cfile, call_key=judge_key, result=dict(bad))
+        assert res["ok"] is False
+
+    # Budget exhausted -- the stage proceeds instead of bouncing forever.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key, result=dict(bad))
+    assert res.get("retryable") is not True
+    assert res["state"] in host_bridge._TERMINAL
+    assert disp.count("record_verdict") == 1

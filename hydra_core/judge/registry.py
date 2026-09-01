@@ -688,6 +688,45 @@ _register(Rubric(
 ))
 
 
+# ---------- engineering / code ----------
+#
+# pair-programmer's registry (daemon/src/rubrics/registry.ts) ships NO rubric of
+# kind "code": its gates.ts::pickDefaultRubric returns null for the code_style /
+# lint_class gate types, which is why Hydra's engineering stages fell through to
+# the spec rubric `rfc-2119-normative`. This is the missing code-quality rubric,
+# registered locally so a code gate is judged on code criteria rather than on
+# RFC-2119 normative-language criteria (finding E2-25).
+
+_register(Rubric(
+    rubric_id="code-change-quality@1",
+    kind="code",
+    body_md=(
+        "# Code Change Quality (v1)\n"
+        "Judge a code diff on what the change actually does, not on prose style.\n"
+        "- **requirement_fidelity** (0-5): the change implements the stated "
+        "request — no more, no less; out-of-scope edits count against it.\n"
+        "- **correctness** (0-5): the logic is right for the stated inputs, "
+        "including boundary and error paths.\n"
+        "- **regression_safety** (0-5): existing behavior and public contracts "
+        "are preserved; nothing silently changes for existing callers.\n"
+        "- **test_evidence** (0-5): the change is covered by tests that would "
+        "fail without it, or the absence of tests is justified.\n"
+        "- **error_handling** (0-5): failures are surfaced, not swallowed; no "
+        "bare except that masks a real error.\n"
+        "- **readability** (0-5): names, structure, and comments explain the "
+        "non-obvious; no dead or duplicated code introduced.\n"
+        "- **security_hygiene** (0-5): no injected secrets, unvalidated input "
+        "paths, or new command/SQL/path-traversal surface.\n"
+        "Pass requires requirement_fidelity, correctness and regression_safety "
+        "all >=3, and no dimension at 0.\n"
+    ),
+    score_dimensions=(
+        "requirement_fidelity", "correctness", "regression_safety",
+        "test_evidence", "error_handling", "readability", "security_hygiene",
+    ),
+))
+
+
 def get_rubric(rubric_id: str) -> Rubric:
     if rubric_id not in _REGISTRY:
         raise KeyError(f"Unknown rubric: {rubric_id}. Known: {sorted(_REGISTRY)}")

@@ -96,7 +96,13 @@ def test_replay_drains_on_success_deletes_files(tmp_path: Path) -> None:
         return {"status": "done"}
 
     summary = spool.replay(send)
-    assert summary == {"sent": 2, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 2,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
     assert spool.count() == 0
     # Both calls reached the sender
     assert {a["slug"] for _, a in delivered} == {"a", "b"}
@@ -152,7 +158,13 @@ def test_replay_skips_corrupt_files_silently(tmp_path: Path) -> None:
 def test_replay_empty_spool_returns_zero_summary(tmp_path: Path) -> None:
     spool = PendingSpool(root=tmp_path)
     summary = spool.replay(lambda _call: {"status": "done"})
-    assert summary == {"sent": 0, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
 
 
 def test_replay_respects_max_replays(tmp_path: Path) -> None:
@@ -168,7 +180,13 @@ def test_replay_respects_max_replays(tmp_path: Path) -> None:
         return {"status": "done"}
 
     summary = spool.replay(send, max_replays=1)
-    assert summary == {"sent": 1, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 1,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
     assert len(delivered) == 1
     assert spool.count() == 2
 
@@ -188,9 +206,17 @@ def test_replay_dead_letters_expired_entries(tmp_path: Path) -> None:
     sent: list[str] = []
     summary = spool.replay(lambda call: sent.append(call.id) or {"status": "done"})
 
-    assert summary == {"sent": 0, "failed": 0, "skipped": 1}
+    # E2-3: the move is reported, not just counted as an opaque "skipped".
+    assert summary == {
+        "sent": 0,
+        "failed": 0,
+        "skipped": 1,
+        "dead_lettered": 1,
+        "dead_lettered_expired": 1,
+    }
     assert sent == []
     assert spool.count() == 0
+    assert spool.dead_letter_count() == 1
     assert (dead / "expired-entry.json").exists()
 
 
@@ -209,10 +235,90 @@ def test_replay_dead_letters_after_max_attempts(tmp_path: Path) -> None:
 
     summary = spool.replay(lambda _call: None, max_attempts=5)
 
-    assert summary == {"sent": 0, "failed": 1, "skipped": 0}
+    # E2-3: an attempts-exhausted move is dead_lettered but NOT expired.
+    assert summary == {
+        "sent": 0,
+        "failed": 1,
+        "skipped": 0,
+        "dead_lettered": 1,
+        "dead_lettered_expired": 0,
+    }
     assert spool.count() == 0
+    assert spool.dead_letter_count() == 1
     dead_payload = json.loads((dead / "too-many-attempts.json").read_text("utf-8"))
     assert dead_payload["attempts"] == 6
+
+
+def test_replay_reports_zero_dead_lettered_on_clean_drain(tmp_path: Path) -> None:
+    spool = PendingSpool(root=tmp_path / "pending", dead_letter_root=tmp_path / "dead")
+    spool.spool(tool="eights.evolution.propose", args={"slug": "a"})
+
+    summary = spool.replay(lambda _call: {"status": "done"})
+
+    assert summary["sent"] == 1
+    assert summary["dead_lettered"] == 0
+    assert summary["dead_lettered_expired"] == 0
+    assert spool.dead_letter_count() == 0
+
+
+def test_dead_letter_count_zero_when_dir_absent(tmp_path: Path) -> None:
+    spool = PendingSpool(
+        root=tmp_path / "pending", dead_letter_root=tmp_path / "never-created"
+    )
+    assert spool.dead_letter_count() == 0
+
+
+def test_max_age_hours_zero_disables_expiry(tmp_path: Path) -> None:
+    """E2-3: an operator can drain an aged backlog instead of losing it."""
+    dead = tmp_path / "dead"
+    spool = PendingSpool(root=tmp_path / "pending", dead_letter_root=dead)
+    _write_spooled_call(
+        spool.root / "old.json",
+        SpooledCall(
+            id="old",
+            tool="eights.evolution.propose",
+            args={"slug": "stale"},
+            spooled_at=(datetime.now(timezone.utc) - timedelta(hours=400)).isoformat(),
+        ),
+    )
+
+    summary = spool.replay(lambda _call: {"status": "done"}, max_age_hours=0)
+
+    assert summary["sent"] == 1
+    assert summary["dead_lettered"] == 0
+    assert spool.dead_letter_count() == 0
+
+
+def test_requeue_dead_letters_resets_attempts_and_moves_files(tmp_path: Path) -> None:
+    dead = tmp_path / "dead"
+    spool = PendingSpool(root=tmp_path / "pending", dead_letter_root=dead)
+    for idx in range(3):
+        _write_spooled_call(
+            dead / f"dl-{idx}.json",
+            SpooledCall(
+                id=f"dl-{idx}",
+                tool="eights.evolution.propose",
+                args={"slug": f"s{idx}"},
+                spooled_at=(
+                    datetime.now(timezone.utc) - timedelta(hours=99)
+                ).isoformat(),
+                attempts=6,
+            ),
+        )
+
+    requeued = spool.requeue_dead_letters(limit=2)
+
+    assert requeued == 2
+    assert spool.count() == 2
+    assert spool.dead_letter_count() == 1
+    assert all(call.attempts == 0 for call in spool.list_pending())
+
+
+def test_requeue_dead_letters_noop_when_dir_absent(tmp_path: Path) -> None:
+    spool = PendingSpool(
+        root=tmp_path / "pending", dead_letter_root=tmp_path / "never-created"
+    )
+    assert spool.requeue_dead_letters() == 0
 
 
 # ----- EightsAttestor integration tests -----
@@ -273,7 +379,13 @@ def test_attestor_replays_when_daemon_recovers(tmp_path: Path) -> None:
     up_dispatcher = _UpDispatcher()
     up = EightsAttestor(dispatcher=up_dispatcher, workflow_id="wf-B", spool=spool)
     summary = up.replay_pending()
-    assert summary == {"sent": 2, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 2,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
     assert spool.count() == 0
     delivered_tools = sorted(t for _, t, _ in up_dispatcher.calls)
     assert delivered_tools == [
@@ -289,7 +401,13 @@ def test_attestor_replay_noop_when_disabled(tmp_path: Path) -> None:
     spool.spool(tool="eights.evolution.propose", args={"slug": "x"})
     attestor = EightsAttestor(dispatcher=None, enabled=False, spool=spool)
     summary = attestor.replay_pending()
-    assert summary == {"sent": 0, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
     # Spool is preserved for when the daemon is later enabled
     assert spool.count() == 1
 
@@ -331,5 +449,11 @@ def test_attestor_replay_drops_advisory_constitution_entries(tmp_path: Path) -> 
         spool=spool,
     )
     summary = attestor.replay_pending()
-    assert summary == {"sent": 1, "failed": 0, "skipped": 0}
+    assert summary == {
+        "sent": 1,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+    }
     assert spool.count() == 0

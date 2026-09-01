@@ -37,11 +37,12 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import re as _re
 
 from . import telemetry as _telemetry
+from .proc import run_text
 from .squad_node import (
     Dispatcher,
     _augment_with_critique,
@@ -51,7 +52,10 @@ from .squad_node import (
     _pp_gate_type,
     _pp_inner,
     _pp_ok,
-    _rubric_md,
+    _default_rubric_id,
+    _resolve_rubric_id,
+    _resolve_skill_shim,
+    _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
 )
@@ -61,7 +65,13 @@ from .squad_node import (
 CURSOR_SCHEMA = 1
 
 # Terminal cursor states.
-_TERMINAL = {"complete", "surfaced", "aborted"}
+#
+# E2-35: ``complete_unpersisted`` is a terminal COMPLETE-shaped outcome whose
+# artifact could not be persisted anywhere. It is deliberately NOT spelled
+# "complete" so governance/synthesis cannot mistake an artifact-less squad
+# return for a durable one, and it is terminal so the driver stops rather than
+# re-spawning the pack agent.
+_TERMINAL = {"complete", "complete_unpersisted", "surfaced", "aborted"}
 
 _SQ = "engineering"
 
@@ -205,6 +215,150 @@ def _classify_infra_failure(exc: Exception | None) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# E2-27: judge_model_id validation / normalization                            #
+# --------------------------------------------------------------------------- #
+# pp's ``recordVerdict`` hard-pins the model id a judge may report for the
+# vendors whose critique CLI is itself pinned (codex, agy). A visible judge
+# subagent that reports the model it *thinks* it used (e.g. "gpt-5.1-codex")
+# rather than the id pp's critique tool actually served made record_verdict
+# throw a validation error; the bridge classified that as deterministic-fatal
+# and surfaced an otherwise-PASSING stage with the merge discarded (E2-27).
+#
+# The host now (a) tells the judge which ids are acceptable via the judge
+# host_action, (b) normalizes a mislabeled id to the producer's pinned
+# critique model before calling record_verdict (keeping the reported value in
+# ``score_json["judge_model_id_reported"]``), and (c) treats a pp pin error as
+# host-correctable rather than fatal.
+
+# Suffix the same-vendor Claude judge appends to its producer label (LV-3) so
+# pp's generator-identical producer+model check does not reject the verdict.
+# It is a LABEL, not a vendor: strip it before looking up model pins.
+_SAME_VENDOR_HOST_SUFFIX = "-same-vendor-host"
+
+# Static fallback for pp's pinned critique model ids, used when the
+# ``pp_harness.doctor`` probe is unavailable. Mirrors pp's DEFAULT_MODELS
+# (``codex_critique`` / ``codex_critique_escalated`` / ``agy_critique``).
+# ``claude`` is present with an EMPTY tuple on purpose: pp does not pin Claude
+# critique models, so any id is acceptable and no normalization applies -- but
+# "claude" must still be a KNOWN producer so the same-vendor judge is not
+# rejected as unsupported.
+_STATIC_JUDGE_MODEL_PINS: dict[str, tuple[str, ...]] = {
+    "codex": ("gpt-5.4", "gpt-5.5"),
+    "agy": ("gemini-3.1-pro-preview",),
+    "claude": (),
+}
+
+# Substring identifying pp's judge-model pin rejection on record_verdict.
+# Such a rejection is host-correctable (re-report the model id) rather than a
+# fatal defect in the artifact, so it must NOT surface a passing stage.
+_JUDGE_PIN_ERROR_MARKER = "must record judge_model_id"
+
+# Bound on how many times one judge call_key may be bounced back to the host
+# for a model-id/producer correction before the bridge stops asking and lets
+# the normal (pp-authoritative) path run. Without a bound a host that keeps
+# re-reporting the same unsupported producer would livelock the stage.
+_MAX_JUDGE_MODEL_CORRECTIONS = 2
+
+# Process-level cache of the doctor probe (fail-soft, refreshed on demand).
+_JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
+
+
+def _base_judge_vendor(producer: Any) -> str:
+    """Strip the LV-3 ``-same-vendor-host`` label suffix off a judge producer."""
+    p = str(producer or "")
+    if p.endswith(_SAME_VENDOR_HOST_SUFFIX):
+        return p[: -len(_SAME_VENDOR_HOST_SUFFIX)]
+    return p
+
+
+def allowed_judge_model_ids(dispatcher: Dispatcher | None,
+                            *, refresh: bool = False) -> dict[str, list[str]]:
+    """Return ``{judge_producer: [acceptable model ids]}``.
+
+    Sourced from ``pp_harness.doctor``'s ``judge_capabilities`` map (the
+    authority on what each vendor's critique tool is pinned to), UNIONED with
+    the static fallback above -- doctor reports only the DEFAULT critique
+    model, while pp additionally accepts codex's escalated id, so neither
+    source alone is complete.
+
+    Fail-soft in every direction: a missing dispatcher, an RBAC denial, a
+    transport error, or a malformed payload all fall back to the static map.
+    An empty list means "this producer is known but pp pins no model for it"
+    (claude), which disables normalization rather than rejecting the verdict.
+    """
+    global _JUDGE_MODEL_PIN_CACHE
+    if _JUDGE_MODEL_PIN_CACHE is not None and not refresh:
+        return {k: list(v) for k, v in _JUDGE_MODEL_PIN_CACHE.items()}
+    pins: dict[str, list[str]] = {
+        k: list(v) for k, v in _STATIC_JUDGE_MODEL_PINS.items()
+    }
+    if dispatcher is not None:
+        try:
+            caps = _pp_inner(_raise_on_error_payload(
+                dispatcher.call_mcp("pp_harness", "doctor", {}, squad_id=_SQ),
+                "doctor",
+            )).get("judge_capabilities")
+            if isinstance(caps, dict):
+                for vendor, summary in caps.items():
+                    if not isinstance(summary, dict):
+                        continue
+                    bucket = pins.setdefault(str(vendor), [])
+                    model = summary.get("critique_model")
+                    if model and str(model) not in bucket:
+                        # Front of the list: doctor's value is the vendor's
+                        # DEFAULT pin, which is what normalization targets.
+                        bucket.insert(0, str(model))
+        except Exception:  # noqa: BLE001 — never block a stage on a probe
+            pass
+    _JUDGE_MODEL_PIN_CACHE = {k: tuple(v) for k, v in pins.items()}
+    return {k: list(v) for k, v in pins.items()}
+
+
+def _reset_judge_model_pin_cache() -> None:
+    """Test hook: drop the cached doctor probe."""
+    global _JUDGE_MODEL_PIN_CACHE
+    _JUDGE_MODEL_PIN_CACHE = None
+
+
+def _is_judge_pin_error(exc: Exception | None) -> bool:
+    """True when a record_verdict failure is pp's judge-model pin rejection.
+
+    That rejection is a LABEL problem the host can correct by re-reporting the
+    model id -- it says nothing about the artifact -- so it must be routed to
+    the host-correctable path instead of ``_classify_infra_failure``'s
+    deterministic-fatal default (which matches on "validation").
+    """
+    if exc is None:
+        return False
+    if _JUDGE_PIN_ERROR_MARKER in str(exc).lower():
+        return True
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        return _JUDGE_PIN_ERROR_MARKER in str(payload.get("error", "")).lower()
+    return False
+
+
+def _judge_correction_budget_left(cursor: dict[str, Any],
+                                  call_key: str | None) -> bool:
+    """Whether this judge call_key may still be bounced back for a correction."""
+    counts = cursor.get("judge_model_corrections")
+    if not isinstance(counts, dict):
+        return True
+    return int(counts.get(str(call_key), 0)) < _MAX_JUDGE_MODEL_CORRECTIONS
+
+
+def _record_judge_correction(cursor: dict[str, Any],
+                             call_key: str | None) -> int:
+    counts = cursor.get("judge_model_corrections")
+    if not isinstance(counts, dict):
+        counts = {}
+        cursor["judge_model_corrections"] = counts
+    key = str(call_key)
+    counts[key] = int(counts.get(key, 0)) + 1
+    return counts[key]
+
+
+# --------------------------------------------------------------------------- #
 # Worktree isolation (write-safety)                                           #
 # --------------------------------------------------------------------------- #
 # In attended mode the host's visible `engineer` subagent writes code. The
@@ -256,8 +410,8 @@ def _baseline_timeout_s() -> int:
 def _git(args: list[str], cwd: str | Path, timeout: int | None = None) -> subprocess.CompletedProcess:
     if timeout is None:
         timeout = _git_timeout_s()
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, timeout=timeout, check=False)
+    return run_text(["git", *args], cwd=str(cwd), capture_output=True,
+                    timeout=timeout, check=False)
 
 
 def _git_repo_root(path: str | Path) -> str | None:
@@ -364,9 +518,9 @@ def _write_worktree_gitexcludes(worktree_path: str) -> None:
     already present in the file are not duplicated.  Fail-soft on any error.
     """
     try:
-        r = subprocess.run(
+        r = run_text(
             ["git", "-C", worktree_path, "rev-parse", "--git-path", "info/exclude"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, timeout=5, check=False,
         )
         if r.returncode != 0 or not r.stdout.strip():
             return
@@ -1347,14 +1501,13 @@ def _capture_baseline_failures(
         if not tests_dir.is_dir():
             continue
         try:
-            res = subprocess.run(
+            res = run_text(
                 [
                     _sys.executable, "-m", "pytest",
                     "tests/", "--no-header", "-q", "--tb=no",
                 ],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 check=False,
                 timeout=_baseline_timeout_s(),
             )
@@ -1466,8 +1619,22 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         if cursor.get("emitted_envelopes"):
             res["emitted_envelopes"] = cursor["emitted_envelopes"]
             res["emitted_envelope_count"] = len(cursor["emitted_envelopes"])
+        # E2-34: an emitted envelope that failed schema validation is
+        # outstanding work, not a completed stage. Report it on every read of
+        # a terminal cursor and override the reported status so the host
+        # cannot mistake the run for fully complete.
+        if cursor.get("rejected_envelopes"):
+            res["rejected_envelopes"] = cursor["rejected_envelopes"]
+            res["status"] = "envelopes_rejected"
         if cursor.get("artifact_text"):
             res["artifact_text"] = cursor["artifact_text"]
+        # E2-35: surface where (or whether) the squad artifact landed so the
+        # CLI does not re-attempt a native persist over a ref that already
+        # exists, and so an operator sees an unpersisted result as such.
+        for key in ("artifact_ref", "artifact_persisted_via",
+                    "artifact_persist_error", "artifact_persist_warning"):
+            if cursor.get(key) is not None:
+                res[key] = cursor[key]
     return res
 
 
@@ -1494,7 +1661,7 @@ def begin_stage(
     project_path: str,
     request_text: str,
     model_tier: str | None = None,
-    judge_rubric_id: str = "rfc-2119-normative",
+    judge_rubric_id: str | None = None,
     project_root: str | Path | None = None,
     task_id: str | None = None,
     isolate: bool = True,
@@ -1513,6 +1680,14 @@ def begin_stage(
     """
     # Browser isolation parity with the headless driver (PP-BV-ISO).
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
+    # E2-25: an attended stage is always kind="code", so its default rubric is
+    # the code rubric. It used to default to the SPEC rubric
+    # `rfc-2119-normative`, which pp's gates.ts maps only to gate_type="spec" —
+    # and whose body no registry served for the unversioned id, so every code
+    # stage was silently judged on a generic one-liner while the ledger recorded
+    # the spec rubric's name.
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(
+        _pp_gate_type("code", "code_style"))
     cm = dispatcher.call_mcp
 
     st = _raise_on_error_payload(
@@ -1732,16 +1907,32 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     except Exception:  # noqa: BLE001
         gate_dec = {}
     required_cross = bool(gate_dec.get("required_cross_vendor", True))
-    gate_rubric = str(gate_dec.get("rubric_id") or cursor["judge_rubric_id"])
+    # E2-25: pp and Hydra both key rubrics by an immutable `@N`; a bare base id
+    # resolves to the highest registered version before it reaches the judge or
+    # the ledger. An id nothing registers is traced, not silently accepted.
+    requested_rubric = str(gate_dec.get("rubric_id") or cursor["judge_rubric_id"])
+    gate_rubric = _resolve_rubric_id(
+        dispatcher, requested_rubric,
+        lambda base: _trace(cursor, "attended.rubric_unresolved", {
+            "stage_id": stage_id, "requested": base}))
     # producer is "claude": a sanctioned same-vendor Claude judge is allowed only
     # when cross-vendor is NOT required; otherwise the host must spawn the
     # cross-vendor judge (codex/agy critique).
     judge_agent = "judge-cross-vendor" if required_cross else "judge-same-vendor"
-    rubric_body = _rubric_md(gate_rubric)
+    rubric_body, rubric_fallback = _rubric_md_ex(gate_rubric, dispatcher)
+    if rubric_fallback:
+        # The judge is about to see the GENERIC rubric, not the named one. Say so
+        # here, in the host_action, and in the verdict metadata — the ledger must
+        # never carry a rubric id whose body was not the one applied.
+        _trace(cursor, "attended.rubric_fallback", {
+            "stage_id": stage_id, "requested": requested_rubric,
+            "effective": gate_rubric,
+        })
     judge_text = _judge_artifact_text(
         work_path, sorted(run_changed), gen_text)
 
     cursor["gate_rubric"] = gate_rubric
+    cursor["gate_rubric_fallback"] = rubric_fallback
     cursor["required_cross"] = required_cross
     cursor["state"] = "await_judge"
     # LV-8: scope the call_key with run_id + stage_id, not just the generate
@@ -1770,19 +1961,33 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # doesn't break retry-safety: the same judge call re-driven on the same
     # attempt still produces the same token.
     judge_call_key = f"judge-{run_id}-{stage_id}-{cursor['attempt_id']}-{gen_idx}"
+    # E2-27: hand the host the model ids pp will accept for each judge
+    # producer, so the judge subagent reports a pinned id instead of guessing
+    # one that record_verdict then rejects.
+    allowed_models = allowed_judge_model_ids(dispatcher)
     cursor["pending_action"] = {
         "call_key": judge_call_key,
         "agent_type": judge_agent,
         "rubric_id": gate_rubric,
+        "rubric_fallback": rubric_fallback,
         "required_cross_vendor": required_cross,
         "artifact_text": judge_text,
         "rubric_md": rubric_body,
         "cwd": work_path,
+        "allowed_judge_model_ids": allowed_models,
         "instructions": (
             f"Spawn the visible `{judge_agent}` subagent to judge the diff "
-            f"against rubric {gate_rubric}. Then call submit-host-result with "
+            f"against rubric {gate_rubric}"
+            + (" (NOTE: no registry served this rubric's body — `rubric_md` "
+               "below is the GENERIC fallback text, judge against that)"
+               if rubric_fallback else "")
+            + ". Then call submit-host-result with "
             "{call_key, result:{outcome:pass|revise|fail, critique_md, "
-            "judge_producer, judge_model_id, score_json, cost_usd}}."),
+            "judge_producer, judge_model_id, score_json, cost_usd}}. "
+            "Report judge_model_id exactly as the critique tool returned it; "
+            "if the tool named no model, use the pinned id for that producer "
+            f"from allowed_judge_model_ids ({allowed_models!r}). Never invent "
+            "a model id."),
     }
     _trace(cursor, "attended.attempt_recorded", {
         "stage_id": stage_id, "attempt_id": cursor["attempt_id"],
@@ -1795,7 +2000,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any],
                  *, cursor_file: "str | Path | None" = None,
-                 call_key: str | None = None) -> None:
+                 call_key: str | None = None) -> dict[str, Any] | None:
     """await_judge -> terminal (or back to await_generate for Reflexion x1).
 
     F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
@@ -1808,6 +2013,14 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     Fix-1b: idempotency markers (verdict_recorded_for / smoke_result_for) written
     mid-function so a retried submit after a timeout never double-records in the
     pp ledger or restarts the ~28-min smoke.
+    E2-27: an unsupported judge_producer, or a pp judge-model pin rejection on
+    record_verdict, is HOST-CORRECTABLE -- the cursor stays in ``await_judge``
+    with its pending_action (and call_key) untouched and this function returns
+    a ``{"ok": False, "retryable": True, ...}`` dict for the caller to relay,
+    instead of surfacing a passing stage.
+
+    Returns ``None`` on a normal transition, or the host-correctable error
+    dict described above.
     """
     cm = dispatcher.call_mcp
     producer = cursor["producer"]
@@ -1816,6 +2029,46 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     required_cross = bool(cursor.get("required_cross"))
     gen_idx = cursor.get("generate_index", 0)   # GAP-f: 0=first attempt, 1=retry
     work_path = cursor.get("work_path") or cursor["project_path"]
+
+    # E2-27: validate the judge's self-reported producer BEFORE anything is
+    # accrued or written. An unsupported producer means the host cannot build
+    # a valid record_verdict payload, and pp does not police non-{codex,agy}
+    # vendors -- so a bogus label would otherwise land a bogus vendor in the
+    # ledger. Bounce it back as host-correctable: the cursor is left exactly
+    # as it was (state "await_judge"/"stalled_infra", same pending_action,
+    # same call_key), so a corrected resubmit re-enters here cleanly.
+    allowed_models = allowed_judge_model_ids(dispatcher)
+    _reported_producer = str(result.get("judge_producer")
+                             or ("codex" if required_cross else "claude"))
+    _reported_vendor = _base_judge_vendor(_reported_producer)
+    if _reported_vendor not in allowed_models:
+        if _judge_correction_budget_left(cursor, call_key):
+            n = _record_judge_correction(cursor, call_key)
+            _trace(cursor, "attended.judge_producer_unsupported", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "judge_producer": _reported_producer,
+                "correction_attempt": n,
+                "allowed_judge_model_ids": allowed_models,
+            })
+            if cursor_file is not None:
+                save_cursor(cursor_file, cursor)
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": (
+                    f"judge_producer {_reported_producer!r} is not a supported "
+                    f"judge vendor; resubmit the SAME call_key with a "
+                    f"judge_producer in {sorted(allowed_models)} and a "
+                    f"judge_model_id from allowed_judge_model_ids"),
+                "allowed_judge_model_ids": allowed_models,
+            }
+        # Correction budget exhausted — stop bouncing and let the normal path
+        # run so the stage reaches a decision instead of livelocking.
+        _trace(cursor, "attended.judge_producer_unsupported_accepted", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "judge_producer": _reported_producer,
+            "reason": "correction budget exhausted; proceeding to pp",
+        })
 
     # W2-3: guard cost/token accrual against double-counting when a
     # transport-shaped record_verdict failure holds the cursor open
@@ -1868,6 +2121,36 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     score_json["_attended"] = True
     if degraded:
         score_json["_judge_degraded"] = True
+    # E2-25: the effective rubric travels with the verdict. `_rubric_fallback`
+    # marks a verdict whose named rubric body was NOT the one the judge applied,
+    # so an auditor reading the pp ledger can tell the two cases apart.
+    score_json["_rubric_id"] = gate_rubric
+    if cursor.get("gate_rubric_fallback"):
+        score_json["_rubric_fallback"] = True
+
+    # E2-27: normalize the reported judge_model_id against pp's pins BEFORE
+    # record_verdict. pp pins codex/agy critique models; a judge that names
+    # the model it believes it used ("gpt-5.1-codex") rather than the id the
+    # critique tool served made record_verdict throw, which used to discard a
+    # passing stage. Normalize to the vendor's pinned critique model and keep
+    # the judge's own claim in score_json for audit. Vendors pp does not pin
+    # (claude -> empty list) are passed through untouched.
+    _judge_vendor = _base_judge_vendor(judge_producer)
+    _reported_model = str(result.get("judge_model_id")
+                          or result.get("model") or "").strip()
+    judge_model_id = _reported_model or f"{judge_producer}-default"
+    _vendor_pins = allowed_models.get(_judge_vendor) or []
+    if _vendor_pins and judge_model_id not in _vendor_pins:
+        _pinned = _vendor_pins[0]
+        score_json["judge_model_id_reported"] = _reported_model or None
+        _trace(cursor, "attended.judge_model_id_normalized", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "judge_producer": judge_producer,
+            "reported": _reported_model or None,
+            "normalized_to": _pinned,
+            "allowed_judge_model_ids": _vendor_pins,
+        })
+        judge_model_id = _pinned
 
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
@@ -1907,8 +2190,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         _verdict_payload = {
             "attempt_id": attempt_id,
             "judge_producer": judge_producer,
-            "judge_model_id": str(result.get("judge_model_id")
-                                  or result.get("model") or f"{judge_producer}-default"),
+            "judge_model_id": judge_model_id,
             "outcome": outcome if outcome in {"pass", "revise", "fail"} else "revise",
             "critique_md": critique_md[:4000],
             "score_json": score_json,
@@ -1946,6 +2228,45 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             # row and no trace explaining why.
             _record_verdict_ok = False
             _record_verdict_exc = exc
+
+    # E2-27: pp's judge-model pin rejection is a LABEL problem, not an
+    # artifact defect. `_classify_infra_failure` calls it "deterministic"
+    # (its text matches the "validation" marker), which used to surface a
+    # PASSING stage and discard the merge. Route it to the host-correctable
+    # path instead: nothing about the cursor state or pending_action changes,
+    # so a resubmit under the SAME call_key with a corrected judge_model_id
+    # re-enters here and retries record_verdict (no verdict row was written,
+    # so `verdict_recorded_for` is unset and there is nothing to double-write).
+    if not _record_verdict_ok and _is_judge_pin_error(_record_verdict_exc):
+        _pin_reason = str(_record_verdict_exc)
+        if _judge_correction_budget_left(cursor, call_key):
+            n = _record_judge_correction(cursor, call_key)
+            _trace(cursor, "attended.judge_model_id_pin_rejected", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "attempt_id": attempt_id,
+                "judge_producer": judge_producer,
+                "judge_model_id": judge_model_id,
+                "correction_attempt": n,
+                "reason": _pin_reason,
+                "allowed_judge_model_ids": allowed_models,
+            })
+            if cursor_file is not None:
+                save_cursor(cursor_file, cursor)
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": (
+                    "pp rejected the judge model id: " + _pin_reason +
+                    " — resubmit the SAME call_key with a judge_model_id from "
+                    "allowed_judge_model_ids"),
+                "allowed_judge_model_ids": allowed_models,
+            }
+        _trace(cursor, "attended.judge_model_id_pin_unrecoverable", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "reason": _pin_reason,
+            "correction_budget": _MAX_JUDGE_MODEL_CORRECTIONS,
+        })
+
     if outcome == "pass" and not _record_verdict_ok:
         _rv_reason = str(_record_verdict_exc) if _record_verdict_exc is not None else "unknown error"
         _rv_kind = _classify_infra_failure(_record_verdict_exc)
@@ -1981,6 +2302,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     _trace(cursor, "attended.verdict", {
         "stage_id": cursor["stage_id"], "rubric_id": gate_rubric,
+        "rubric_fallback": bool(cursor.get("gate_rubric_fallback")),
         "attempt_id": attempt_id, "producer": producer,
         "judge_producer": judge_producer, "outcome": outcome,
         "cross_vendor": cross_vendor, "generate_index": gen_idx,
@@ -2100,11 +2422,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                     else:
                         import sys as _sys
                         try:
-                            _reruns = subprocess.run(
+                            _reruns = run_text(
                                 [_sys.executable, "-m", "pytest",
                                  "tests/", "--no-header", "-q", "--tb=no"],
                                 cwd=work_path,
-                                capture_output=True, text=True, check=False,
+                                capture_output=True, check=False,
                                 timeout=_baseline_timeout_s(),
                             )
                             _current_failing = _parse_failing_tests(
@@ -2300,6 +2622,67 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     })
 
 
+def _build_squad_prompt(
+    *,
+    workflow_id: str,
+    task_id: str,
+    squad_slug: str,
+    request_text: str,
+    goal: str | None = None,
+    envelope_id: str | None = None,
+    upstream_refs: Sequence[str] | None = None,
+    budget_usd: float | None = None,
+    budget_remaining_usd: float | None = None,
+    risk: str | None = None,
+    priority: str | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+) -> str:
+    """E2-28: build the non-engineering squad host_action prompt.
+
+    Mirrors the engineering path's ``## Hydra context`` block so a squad leg is
+    reproducible from the trace alone: workflow/task identity, the root goal,
+    the task description, and the governing constraints.
+
+    ``upstream_refs`` carries MemoryRef handles / envelope ids of prior completed
+    work ONLY — never raw upstream artifact content, which must not cross a squad
+    boundary un-redacted (AGENTS.md hard rule 3).
+    """
+    _none = "(none)"
+    refs = [str(r).strip() for r in (upstream_refs or []) if str(r).strip()]
+    crit = [str(c).strip() for c in (acceptance_criteria or []) if str(c).strip()]
+
+    if budget_usd is None and budget_remaining_usd is None:
+        budget_line = "unknown"
+    elif budget_usd is None:
+        budget_line = f"{budget_remaining_usd:.2f}"
+    elif budget_remaining_usd is None:
+        budget_line = f"of {budget_usd:.2f} total"
+    else:
+        budget_line = f"{budget_remaining_usd:.2f} remaining of {budget_usd:.2f} total"
+
+    lines = [
+        "## Hydra context",
+        f"workflow_id: {workflow_id}",
+        f"task_id: {task_id}",
+        f"squad: {squad_slug}",
+        f"envelope_id: {envelope_id or _none}",
+        f"upstream_refs: {', '.join(refs) if refs else _none}",
+        "",
+        "## Goal",
+        (goal or "").strip() or _none,
+        "",
+        "## Task",
+        (request_text or "").strip() or _none,
+        "",
+        "## Constraints",
+        (f"budget_usd: {budget_line}, risk: {risk or 'unknown'}, "
+         f"priority: {priority or 'unknown'}"),
+        "acceptance_criteria: " + (_none if not crit else ""),
+    ]
+    lines.extend(f"- {c}" for c in crit)
+    return "\n".join(lines)
+
+
 def begin_squad_stage(
     *,
     workflow_id: str,
@@ -2310,6 +2693,15 @@ def begin_squad_stage(
     pack_cwd: str,
     request_text: str,
     project_root: str | Path,
+    goal: str | None = None,
+    envelope_id: str | None = None,
+    upstream_refs: Sequence[str] | None = None,
+    budget_usd: float | None = None,
+    budget_remaining_usd: float | None = None,
+    risk: str | None = None,
+    priority: str | None = None,
+    acceptance_criteria: Sequence[str] | None = None,
+    action_extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -2321,8 +2713,26 @@ def begin_squad_stage(
 
     Returns an ``awaiting_host`` step result whose ``host_action`` tells the host
     to spawn the visible pack agent subagent in ``pack_cwd``.
+
+    E2-28: ``host_action.prompt`` is the full context-bearing prompt built by
+    ``_build_squad_prompt``; the bare planner task label stays available as
+    ``host_action.task_description``.
     """
     call_key = f"squad-{task_id}-0"
+    prompt = _build_squad_prompt(
+        workflow_id=workflow_id,
+        task_id=task_id,
+        squad_slug=squad_slug,
+        request_text=request_text,
+        goal=goal,
+        envelope_id=envelope_id,
+        upstream_refs=upstream_refs,
+        budget_usd=budget_usd,
+        budget_remaining_usd=budget_remaining_usd,
+        risk=risk,
+        priority=priority,
+        acceptance_criteria=acceptance_criteria,
+    )
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "kind": "squad",
@@ -2344,10 +2754,17 @@ def begin_squad_stage(
             "call_key": call_key,
             "agent_type": lead_agent,
             "cwd": pack_cwd,
-            "prompt": request_text,
+            "prompt": prompt,
+            "task_description": request_text,
             "instructions": "Run the pack agent and submit the artifact.",
         },
     }
+    # E2-31: claude-skill packs that are not plugin-loadable carry the pack's
+    # slash command + MCP tool scope so the host can drive them via
+    # general-purpose; `lead_agent_file` is informational.
+    if action_extras:
+        cursor["pending_action"].update(
+            {k: v for k, v in action_extras.items() if k != "agent_type"})
     cfile = cursor_path(project_root, workflow_id, task_id)
     save_cursor(cfile, cursor)
     _trace(cursor, "attended.squad_stage_started", {
@@ -2358,7 +2775,98 @@ def begin_squad_stage(
     return _step_result(cursor, cfile)
 
 
-def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
+def _has_native_pack(slug: str) -> bool:
+    """True when the squad owns a registered Claude Code plugin pack."""
+    if not slug:
+        return False
+    try:
+        from .native_packs import native_pack
+        native_pack(slug)
+        return True
+    except Exception:  # noqa: BLE001 — unregistered slug or registry error
+        return False
+
+
+def _persist_attended_squad_artifact(
+    dispatcher: Dispatcher,
+    cursor: dict[str, Any],
+    *,
+    cursor_file: str | Path,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Persist a non-native squad's attended artifact (E2-35).
+
+    The CLI persists native-pack results through the pack's declared output
+    root; a squad with no ``NATIVE_PACKS`` entry (customer-support via the
+    xenia shim, for instance) had NO persist path at all, so its result came
+    back ``complete`` with an ``artifact_persist_error`` and no ``artifact_ref``
+    and its work never reached memory or synthesis.
+
+    Ladder, both best-effort:
+
+    1. the generic attended store (``<project>/.hydra/<wf>/attended/artifacts``),
+       which needs no MCP round-trip and is therefore the reliable leg;
+    2. when the squad has a claude-skill shim, ``<prefix>.output.write`` as
+       well, so the pack's own on-disk store stays in sync.
+
+    Returns ``(artifact_ref | None, via | None, errors)``. The caller downgrades
+    the outcome to ``complete_unpersisted`` only when BOTH legs failed.
+    """
+    text = str(cursor.get("artifact_text") or "")
+    slug = str(cursor.get("squad_slug") or "")
+    wf = str(cursor.get("workflow_id") or "")
+    raw_task = str(cursor.get("task_id") or cursor.get("run_id") or "task")
+    task_id = "".join(c for c in raw_task if c.isalnum() or c in "-_") or "task"
+    errors: list[str] = []
+    via: list[str] = []
+    ref: dict[str, Any] | None = None
+
+    try:
+        from .artifact_store import write_attended_artifact
+        # `cursor["project_path"]` is the PACK cwd for squad cursors, not the
+        # Hydra project root, so derive the root from the cursor sidecar path
+        # (`<project>/.hydra/<wf>/attended/<run>.json`) instead.
+        project_root = Path(cursor_file).resolve().parents[3]
+        mref = write_attended_artifact(project_root, wf, f"{task_id}.md", text)
+        ref = mref.model_dump(mode="json")
+        via.append("generic")
+    except Exception as exc:  # noqa: BLE001 — fail-soft; the shim leg may still land
+        errors.append(f"generic store: {exc}")
+
+    shim = _resolve_skill_shim(slug) if slug else None
+    if shim:
+        tool = f"{shim['prefix']}.output.write"
+        try:
+            args: dict[str, Any] = {
+                shim["path_key"]: "attended",
+                "topic": f"attended {raw_task}"[:80],
+                "content": text,
+            }
+            if shim["server"] == "rlm_creative":
+                args.update({"domain": "creative", "scopes": ["team:garland-crew"]})
+            resp = dispatcher.call_mcp(shim["server"], tool, args, squad_id=slug)
+            _raise_on_error_payload(resp, tool)
+            via.append("shim")
+            rel = resp.get("relative") if isinstance(resp, dict) else None
+            if ref is None and rel:
+                from .schemas import MemoryRef
+                ref = MemoryRef(
+                    tier="episodic",
+                    key=f"{shim['prefix']}:output:{rel}",
+                    summary=str(rel),
+                ).model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001 — pack store is best-effort
+            errors.append(f"{tool}: {exc}")
+
+    return ref, ("+".join(via) or None), errors
+
+
+def _apply_squad_result(
+    dispatcher: Dispatcher,
+    cursor: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    cursor_file: str | Path,
+) -> None:
     """await_squad_agent → terminal.
 
     Accumulate spend from the host agent's result and mark the cursor complete.
@@ -2378,14 +2886,43 @@ def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
     # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
     emitted = result.get("emitted_envelopes", result.get("envelopes", []))
     cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
-    cursor["final_status"] = "complete"
-    cursor["state"] = "complete"
+
+    # E2-35: a squad with no native pack still gets its artifact persisted --
+    # generically, and (when it has one) through its claude-skill shim too.
+    # Native packs are left to the CLI's `write_native_artifact` path, which
+    # already returns a `<plugin>:output:...` ref for them.
+    slug = str(cursor.get("squad_slug") or "")
+    final_status = "complete"
+    if cursor["artifact_text"] and not _has_native_pack(slug):
+        ref, via, errors = _persist_attended_squad_artifact(
+            dispatcher, cursor, cursor_file=cursor_file)
+        if ref is not None:
+            cursor["artifact_ref"] = ref
+            cursor["artifact_persisted_via"] = via
+            _trace(cursor, "attended.skill_artifact_persisted", {
+                "squad": slug, "memory_ref": ref.get("key"), "via": via,
+            })
+            if errors:
+                # One leg landed; keep the other's failure visible without
+                # downgrading a result that IS durably persisted.
+                cursor["artifact_persist_warning"] = "; ".join(errors)
+        else:
+            final_status = "complete_unpersisted"
+            cursor["artifact_persist_error"] = (
+                "; ".join(errors) or "no attended artifact persist path succeeded")
+            _trace(cursor, "attended.skill_artifact_persist_failed", {
+                "squad": slug, "error": cursor["artifact_persist_error"],
+            })
+
+    cursor["final_status"] = final_status
+    cursor["state"] = final_status
     cursor["pending_action"] = None
     cursor["finalized"] = True
     _trace(cursor, "attended.squad_result_applied", {
         "task_id": cursor.get("task_id"),
         "squad_slug": cursor.get("squad_slug"),
         "cost_usd": cursor.get("cost_usd"),
+        "final_status": final_status,
         "emitted_envelope_count": len(cursor["emitted_envelopes"]),
     })
 
@@ -2802,11 +3339,21 @@ def submit_host_result(
         # submit_host_result carrying the same call_key/result re-enters
         # _apply_judge here and retries record_verdict via the
         # idempotency_token — exactly-once even across the re-drive.
-        _apply_judge(dispatcher, cursor, result,
-                     cursor_file=cursor_file, call_key=call_key)
+        # E2-27: a host-correctable judge label problem (unsupported producer,
+        # or pp's judge-model pin rejection) comes back as a retryable error
+        # dict. The cursor is unchanged and still holds this judge's
+        # pending_action/call_key, so the host corrects the label and
+        # resubmits under the SAME call_key rather than losing the stage.
+        _judge_err = _apply_judge(dispatcher, cursor, result,
+                                  cursor_file=cursor_file, call_key=call_key)
+        if _judge_err is not None:
+            save_cursor(cursor_file, cursor)
+            out = _step_result(cursor, cursor_file)
+            out.update(_judge_err)
+            return out
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
-        _apply_squad_result(cursor, result)
+        _apply_squad_result(dispatcher, cursor, result, cursor_file=cursor_file)
     else:  # pragma: no cover — defensive
         cursor["state"] = "aborted"
         cursor["final_status"] = "aborted"
@@ -2830,6 +3377,31 @@ def mark_charged(cursor_file: str | Path) -> None:
         if cursor.get("state") in _TERMINAL:
             cursor["charged"] = True
             save_cursor(cursor_file, cursor)
+    except Exception:  # noqa: BLE001 — never crash the caller on persist failure
+        pass
+
+
+def record_rejected_envelopes(cursor_file: str | Path,
+                              rejected: list[dict[str, Any]]) -> None:
+    """E2-34: park schema-rejected emitted envelopes on the terminal cursor.
+
+    The engineering task itself completed; what failed is the delegation it
+    emitted. Persisting the rejections here (rather than only returning them
+    once) means a later ``step`` / finalize read still sees the outstanding
+    work, so a dropped DEV_TASK cannot disappear between calls. Fail-soft: a
+    storage hiccup never blocks the calling workflow.
+    """
+    if not rejected:
+        return
+    try:
+        cursor = load_cursor(cursor_file)
+        cursor["rejected_envelopes"] = list(rejected)
+        save_cursor(cursor_file, cursor)
+        _trace(cursor, "attended.envelopes_rejected", {
+            "task_id": cursor.get("task_id"),
+            "squad_slug": cursor.get("squad_slug"),
+            "rejected_count": len(rejected),
+        })
     except Exception:  # noqa: BLE001 — never crash the caller on persist failure
         pass
 

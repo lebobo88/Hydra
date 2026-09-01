@@ -16,6 +16,14 @@
 #          stage is generating, so the deterministic codegen path is never blocked.
 #   EXEMPT the pair-programmer repo itself (working there with code is legal).
 #
+# LOCKSTEP WITH hydra-block-bash-writes.ps1 — the two guards must reach the same
+# verdict for the same file. Write/Edit payloads carry an already-absolute
+# file_path, so nothing to resolve here; the Bash hook receives a command string
+# and therefore additionally honours `cd` / `pushd` / `Set-Location` in that
+# command when resolving a RELATIVE destination (E2-18). Only the Bash hook
+# needs that code; this note exists so the pair stays in sync. The worktree-root
+# precedence block below is the other half of the lockstep.
+#
 # Kill-switch: set HYDRA_ENFORCE_ROUTING to anything but '1' to disable.
 
 $ErrorActionPreference = 'SilentlyContinue'

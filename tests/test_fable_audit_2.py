@@ -55,6 +55,11 @@ class _FakeDispatcher:
     run without errors.
     """
 
+    # E2-22: these tests exercise the in-graph mcp dispatch path with a
+    # scripted pp harness. Opt in explicitly — node_dispatch otherwise
+    # defers mcp packs to the attended host on a non-live dispatcher.
+    allow_offline_mcp_dispatch = True
+
     def __init__(
         self,
         *,
@@ -216,9 +221,15 @@ class TestSupervisorStatusCoercion:
             lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
         )
 
+        # E2-22: node_dispatch defers mcp packs to the attended host on a
+        # non-live dispatcher. This test's concern is the status coercion the
+        # in-graph path applies, so opt back into that path explicitly.
+        class _OfflineDispatcher:
+            allow_offline_mcp_dispatch = True
+
         runner = build_supervisor(
             project_root=HYDRA_ROOT,
-            dispatcher=object(),
+            dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
         )
         assert isinstance(runner, _PurePythonRunner)
@@ -704,10 +715,11 @@ class TestResolvePackLeadAgent:
         from hydra_core.squad_loader import discover_squads
 
         packs = discover_squads(HYDRA_ROOT)
-        # garland's first gatekeeper is brand-strategist (authority: gatekeeper)
+        # garland is claude-native, so the lead comes from NATIVE_PACKS, whose
+        # lead_agent must be the RLM-Creative plugin agent name (E2-29).
         garland = packs["garland"]
         lead = _resolve_pack_lead_agent(garland)
-        assert lead == "rlm-creative:brand-strategist"
+        assert lead == "rlm-creative:calliope"
 
     def test_fallback_to_general_purpose_when_no_agents(self):
         from hydra_core.cli import _resolve_pack_lead_agent
@@ -3156,3 +3168,97 @@ class TestF36ProceduralRiskRouting:
                 f"F36: risk class for '{kind}' must be one of {valid_classes}, "
                 f"got {risk!r}"
             )
+
+
+# ===========================================================================
+# E2-23 — _next_attended_task honours task-list order across squads
+# ===========================================================================
+
+class TestNextAttendedTaskOrder:
+    """The attended step must select the next task in planner order.
+
+    Before E2-23 the engineering leg was always drained first, so a campaign
+    wired executive -> garland -> engineering ran the engineer with neither
+    upstream envelope produced.
+    """
+
+    def _state(self, squads):
+        from hydra_core.state import HydraState, TaskState
+        state = HydraState(root_goal="campaign goal")
+        tasks = []
+        for squad in squads:
+            t = TaskState(owner_squad=squad, description=f"{squad} leg",  # type: ignore[call-arg]
+                          status="pending")
+            state.tasks.append(t)
+            tasks.append(t)
+        return state, tasks
+
+    def test_campaign_order_executive_garland_engineering(self):
+        from hydra_core.cli import _next_attended_task
+        from hydra_core.squad_loader import discover_squads
+
+        packs = discover_squads(HYDRA_ROOT)
+        state, (exec_t, garland_t, eng_t) = self._state(
+            ["executive", "garland", "engineering"])
+
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == exec_t.task_id
+        assert kind == "squad"
+        assert pack.slug == "executive"
+
+        state.attended_completed_task_ids.append(str(exec_t.task_id))
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == garland_t.task_id
+        assert kind == "squad"
+        assert pack.slug == "garland"
+
+        state.attended_completed_task_ids.append(str(garland_t.task_id))
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == eng_t.task_id
+        assert kind == "engineering"
+        assert pack is None
+
+        state.attended_completed_task_ids.append(str(eng_t.task_id))
+        assert _next_attended_task(state, packs) == (None, None, None)
+
+    def test_engineering_only_workflow_unchanged(self):
+        from hydra_core.cli import _next_attended_task
+        from hydra_core.squad_loader import discover_squads
+
+        packs = discover_squads(HYDRA_ROOT)
+        state, (eng_t,) = self._state(["engineering"])
+
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == eng_t.task_id
+        assert kind == "engineering"
+        assert pack is None
+
+    def test_engineering_first_when_listed_first(self):
+        from hydra_core.cli import _next_attended_task
+        from hydra_core.squad_loader import discover_squads
+
+        packs = discover_squads(HYDRA_ROOT)
+        state, (eng_t, sq_t) = self._state(
+            ["engineering", "customer-support"])
+
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == eng_t.task_id
+        assert kind == "engineering"
+
+        state.attended_completed_task_ids.append(str(eng_t.task_id))
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == sq_t.task_id
+        assert kind == "squad"
+        assert pack.slug == "customer-support"
+
+    def test_stub_squad_does_not_block_engineering_behind_it(self):
+        """A non-attended (stub) squad is skipped, not treated as pending."""
+        from hydra_core.cli import _next_attended_task
+        from hydra_core.squad_loader import discover_squads
+
+        packs = discover_squads(HYDRA_ROOT)
+        state, (_stub_t, eng_t) = self._state(["healthcare", "engineering"])
+
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task.task_id == eng_t.task_id
+        assert kind == "engineering"

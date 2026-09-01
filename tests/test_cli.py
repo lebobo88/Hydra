@@ -951,7 +951,13 @@ def test_attended_squad_path_completes_charges_once_no_redispatch(
     assert payload_step["state"] == "await_squad_agent", (
         f"expected await_squad_agent, got {payload_step['state']!r}"
     )
-    assert payload_step["host_action"]["agent_type"] == "brand-director"
+    # E2-31: a claude-skill pack never hands the host the bare squad.yaml slug.
+    # This fake pack has no resolvable checkout, so it degrades to the
+    # general-purpose host agent driving the pack's slash command + MCP shim.
+    _skill_action = payload_step["host_action"]
+    assert _skill_action["agent_type"] == "general-purpose"
+    assert _skill_action["skill"] == "/rlm-creative:creative-campaign"
+    assert _skill_action["tool_scope"] == "rlm"
 
     cfile = payload_step["cursor_path"]
     call_key = payload_step["host_action"]["call_key"]
@@ -1004,3 +1010,143 @@ def test_attended_squad_path_completes_charges_once_no_redispatch(
     assert p3.get("already_charged") is True, (
         "duplicate submit must report already_charged to prevent double-billing"
     )
+
+
+# --- eights-drain / dead-letter reporting (E2-3) -----------------------------
+#
+# Finding E2-3: `eights-drain` printed only {drained, failed, remaining,
+# partial_removed}, so a 24h+ eights outage moved the whole backlog into the
+# dead-letter dir with zero operator-visible signal. These tests pin the
+# reporting contract and the recovery path.
+
+class _StubEightsDispatcher:
+    """Stands in for MCPStdioDispatcher — every eights call succeeds."""
+
+    def __init__(self, *_a, **_kw):
+        self.calls = []
+
+    def call_mcp(self, server, tool, args, **_kw):
+        self.calls.append((server, tool, args))
+        return {"status": "done", "result": {"ok": True}}
+
+
+def _spool_env(monkeypatch, tmp_path):
+    """Point the drain + doctor spool checks at scratch dirs, never ~/.hydra."""
+    pending = tmp_path / "pending"
+    dead = tmp_path / "dead"
+    monkeypatch.setenv("HYDRA_EIGHTS_SPOOL", str(pending))
+    monkeypatch.setenv("HYDRA_EIGHTS_DEAD_LETTER", str(dead))
+    return pending, dead
+
+
+def _write_spooled(path, *, call_id, age_hours=0.0, attempts=0):
+    from datetime import datetime, timedelta, timezone
+
+    from hydra_core.eights.pending_spool import SpooledCall
+
+    call = SpooledCall(
+        id=call_id,
+        tool="eights.evolution.propose",
+        args={"slug": call_id},
+        spooled_at=(
+            datetime.now(timezone.utc) - timedelta(hours=age_hours)
+        ).isoformat(),
+        attempts=attempts,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(call.to_json(), encoding="utf-8")
+
+
+def test_eights_drain_reports_dead_lettered_and_warns_on_age(
+    tmp_path, monkeypatch, capsys
+):
+    pending, dead = _spool_env(monkeypatch, tmp_path)
+    _write_spooled(pending / "aged.json", call_id="aged", age_hours=72.0)
+    monkeypatch.setattr(
+        "hydra_core.dispatcher.MCPStdioDispatcher", _StubEightsDispatcher
+    )
+
+    rc = _run(["eights-drain"], project_root=tmp_path)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 0
+    assert payload["drained"] == 0
+    assert payload["skipped"] == 1
+    assert payload["dead_lettered"] == 1
+    assert payload["dead_letter_depth"] == 1
+    assert payload["remaining"] == 0
+    assert payload["dead_letter_root"] == str(dead)
+    # The operator MUST be told the backlog aged out, and how to recover it.
+    assert "WARN" in captured.err
+    assert "--replay-dead-letter" in captured.err
+
+
+def test_eights_drain_max_age_hours_zero_drains_aged_backlog(
+    tmp_path, monkeypatch, capsys
+):
+    pending, _dead = _spool_env(monkeypatch, tmp_path)
+    _write_spooled(pending / "aged.json", call_id="aged", age_hours=72.0)
+    monkeypatch.setattr(
+        "hydra_core.dispatcher.MCPStdioDispatcher", _StubEightsDispatcher
+    )
+
+    rc = _run(["eights-drain", "--max-age-hours", "0"], project_root=tmp_path)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert rc == 0
+    assert payload["drained"] == 1
+    assert payload["dead_lettered"] == 0
+    assert payload["dead_letter_depth"] == 0
+    assert "WARN" not in captured.err
+
+
+def test_eights_drain_replay_dead_letter_requeues_and_drains(
+    tmp_path, monkeypatch, capsys
+):
+    _pending, dead = _spool_env(monkeypatch, tmp_path)
+    for idx in range(3):
+        _write_spooled(
+            dead / f"dl-{idx}.json",
+            call_id=f"dl-{idx}",
+            age_hours=500.0,
+            attempts=6,
+        )
+    monkeypatch.setattr(
+        "hydra_core.dispatcher.MCPStdioDispatcher", _StubEightsDispatcher
+    )
+
+    rc = _run(
+        ["eights-drain", "--replay-dead-letter", "--limit", "2"],
+        project_root=tmp_path,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["requeued_from_dead_letter"] == 2
+    # Re-queued entries drain even though they are far older than the TTL.
+    assert payload["drained"] == 2
+    assert payload["dead_lettered"] == 0
+    assert payload["remaining"] == 0
+    assert payload["dead_letter_depth"] == 1
+
+
+def test_doctor_warns_on_eights_dead_letter_depth(tmp_path, monkeypatch, capsys):
+    _pending, dead = _spool_env(monkeypatch, tmp_path)
+    _write_spooled(dead / "dl-0.json", call_id="dl-0", age_hours=500.0)
+
+    _run(["doctor"], project_root=REPO_ROOT)
+    out = capsys.readouterr().out
+
+    assert "WARN: eights dead-letter depth=1" in out
+    assert "--replay-dead-letter" in out
+
+
+def test_doctor_reports_clean_eights_dead_letter_depth(tmp_path, monkeypatch, capsys):
+    _spool_env(monkeypatch, tmp_path)
+
+    _run(["doctor"], project_root=REPO_ROOT)
+    out = capsys.readouterr().out
+
+    assert "OK:   eights dead-letter  depth=0" in out

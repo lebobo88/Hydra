@@ -108,6 +108,12 @@ class _FakeStdioCtx:
 
 
 def _install_fake_mcp(monkeypatch, session: _FakeSession):
+    # E2-26: these tests drive `call_mcp` against an in-memory fake MCP SDK —
+    # `_FakeStdioCtx` forks nothing — so the `HYDRA_TEST_NO_DAEMONS` spawn
+    # guard installed by tests/conftest.py must be lifted here, or every
+    # transport assertion below would short-circuit to the disabled payload.
+    # They are NOT `live_daemon` tests: no real daemon is ever contacted.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     mcp = types.ModuleType("mcp")
     mcp.ClientSession = lambda read, write: session
     mcp.StdioServerParameters = lambda **kw: types.SimpleNamespace(**kw)
@@ -197,6 +203,9 @@ def test_wedged_teardown_hits_overall_deadline_backstop(monkeypatch, disp):
     client = types.ModuleType("mcp.client")
     stdio = types.ModuleType("mcp.client.stdio")
     stdio.stdio_client = lambda params: _HangingTeardownStdioCtx()
+    # E2-26: in-memory fake MCP SDK — nothing is forked. Lift the
+    # conftest spawn guard so `call_mcp` reaches the transport path.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", client)
     monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
@@ -235,6 +244,9 @@ def test_pp_harness_calls_reuse_one_pooled_session(monkeypatch, disp):
     client = types.ModuleType("mcp.client")
     stdio = types.ModuleType("mcp.client.stdio")
     stdio.stdio_client = lambda params: _CountingStdioCtx()
+    # E2-26: in-memory fake MCP SDK — nothing is forked. Lift the
+    # conftest spawn guard so `call_mcp` reaches the transport path.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", client)
     monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
@@ -273,6 +285,9 @@ def test_pooled_session_drop_hits_teardown_deadline(monkeypatch, disp):
     client = types.ModuleType("mcp.client")
     stdio = types.ModuleType("mcp.client.stdio")
     stdio.stdio_client = lambda params: _HangingTeardownStdioCtx()
+    # E2-26: in-memory fake MCP SDK — nothing is forked. Lift the
+    # conftest spawn guard so `call_mcp` reaches the transport path.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", client)
     monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
@@ -308,6 +323,9 @@ def test_eights_calls_reuse_one_pooled_session(monkeypatch, disp):
     client = types.ModuleType("mcp.client")
     stdio = types.ModuleType("mcp.client.stdio")
     stdio.stdio_client = lambda params: _CountingStdioCtx()
+    # E2-26: in-memory fake MCP SDK — nothing is forked. Lift the
+    # conftest spawn guard so `call_mcp` reaches the transport path.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", client)
     monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
@@ -342,6 +360,9 @@ def test_eights_concurrent_connect_is_single_flight(monkeypatch, disp):
     client = types.ModuleType("mcp.client")
     stdio = types.ModuleType("mcp.client.stdio")
     stdio.stdio_client = lambda params: _CountingStdioCtx()
+    # E2-26: in-memory fake MCP SDK — nothing is forked. Lift the
+    # conftest spawn guard so `call_mcp` reaches the transport path.
+    monkeypatch.delenv("HYDRA_TEST_NO_DAEMONS", raising=False)
     monkeypatch.setitem(sys.modules, "mcp", mcp)
     monkeypatch.setitem(sys.modules, "mcp.client", client)
     monkeypatch.setitem(sys.modules, "mcp.client.stdio", stdio)
