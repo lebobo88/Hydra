@@ -543,14 +543,53 @@ def _load_schema_cache(path: Path = GATEWAY_SCHEMA_CACHE) -> dict[str, dict[str,
     }
 
 
+_SCHEMA_SHAPE_KEYS = ("properties", "$ref", "anyOf", "oneOf", "allOf",
+                      "patternProperties")
+
+
+def _schema_is_informative(schema: Any) -> bool:
+    """True when ``schema`` actually declares an argument shape.
+
+    A bare ``{"type": "object"}`` — or the ``{"type":"object","properties":{},
+    "required":null}`` placeholder some backends emit before their tool
+    definitions are wired — carries no parameter information. Treating those
+    as "present" lets a placeholder clobber a real schema, which is how
+    ``pp_codex``/``pp_agy`` ``critique``/``generate`` reached hosts with no
+    discoverable ``cwd`` argument (E2-39).
+    """
+    if not isinstance(schema, dict) or not schema:
+        return False
+    return any(schema.get(key) for key in _SCHEMA_SHAPE_KEYS)
+
+
+def _resolve_tool_schema(cached: Any, seeded: Any) -> dict[str, Any]:
+    """Pick the advertised schema for one tool.
+
+    The backend-published (cached) schema wins whenever it declares real
+    parameters. A placeholder never overwrites an informative hand-seeded
+    schema; when neither declares parameters the cached value is still
+    preferred so genuinely parameterless tools keep their published shape.
+    """
+    if _schema_is_informative(cached):
+        return cached
+    if _schema_is_informative(seeded):
+        return seeded
+    if isinstance(cached, dict) and cached:
+        return cached
+    if isinstance(seeded, dict) and seeded:
+        return seeded
+    return {"type": "object"}
+
+
 def _apply_schema_cache_to_shed(shed: Any,
                                 schema_cache: dict[str, dict[str, Any]]) -> None:
     """Overlay warmed schemas onto the ToolShed catalog entries in place, so
     the progressive-disclosure meta-tools (``gateway.describe`` /
     ``gateway.navigate``) resolve the same real schemas the gateway advertises.
-    Cache wins over hand-seeded ``input_schema``; absent a cache entry the
-    hand-seed (or empty) schema is left untouched. Catalog and ``_by_key``
-    share entry objects, so a single mutation updates both views."""
+    An informative cache entry wins over a hand-seeded ``input_schema``; a
+    placeholder cache entry does not (see ``_resolve_tool_schema``). Catalog
+    and ``_by_key`` share entry objects, so a single mutation updates both
+    views."""
     if not schema_cache:
         return
     for server_name, entries in shed._catalog.items():
@@ -559,8 +598,9 @@ def _apply_schema_cache_to_shed(shed: Any,
             continue
         for entry in entries:
             cached = cached_for_server.get(entry.name)
-            if cached:
-                entry.input_schema = cached
+            if cached is None:
+                continue
+            entry.input_schema = _resolve_tool_schema(cached, entry.input_schema)
 
 
 _COERCE_SENTINEL = object()
@@ -718,6 +758,8 @@ def _build_static_tool_list(
     ``schema_cache`` (real schemas fetched offline by ``refresh_schemas``)
     → ``entry.input_schema`` (hand-seeded ``SCHEMA_OVERRIDES``) →
     ``{"type":"object"}`` (last-resort when a backend was never refreshed).
+    A cache entry that declares no parameters is treated as a placeholder and
+    yields to an informative hand-seed rather than overwriting it (E2-39).
     A bare ``{"type":"object"}`` strips param types and makes nested
     objects / numeric args mangle on the proxy hop, so a real schema here
     is what keeps writes like ``eights.memory.add`` and numeric params like
@@ -736,9 +778,8 @@ def _build_static_tool_list(
             continue
         cached_for_server = schema_cache.get(server_name, {})
         for entry in shed._catalog.get(server_name, []):
-            schema = (cached_for_server.get(entry.name)
-                      or entry.input_schema
-                      or {"type": "object"})
+            schema = _resolve_tool_schema(cached_for_server.get(entry.name),
+                                          entry.input_schema)
             tools.append({
                 "name": f"{server_name}__{entry.name}",
                 "description": f"[{server_name}] {entry.description}",
