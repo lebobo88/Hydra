@@ -41,6 +41,28 @@ from typing import Any, Callable, Iterable
 DEFAULT_SPOOL_ROOT = Path.home() / ".hydra" / "eights-pending"
 DEFAULT_DEAD_LETTER_ROOT = Path.home() / ".hydra" / "eights-pending-dead"
 
+# E2-26: the spool root is operator state. `HYDRA_EIGHTS_SPOOL` was already
+# honoured by the CLI (`hydra doctor`, `hydra eights-replay`) but NOT by the
+# `PendingSpool()` default used by `EightsAttestor`, so a test run wrote real
+# failure payloads into the operator's live `~/.hydra/eights-pending`. Both
+# roots now resolve through the environment at *construction* time (not
+# import time) so an in-test `monkeypatch.setenv` takes effect too.
+#
+#   HYDRA_EIGHTS_SPOOL       -> spool root       (pre-existing name)
+#   HYDRA_EIGHTS_DEAD_LETTER -> dead-letter root (added by E2-26)
+
+
+def resolve_spool_root() -> Path:
+    """Spool root: ``HYDRA_EIGHTS_SPOOL`` env override, else the default."""
+    return Path(os.environ.get("HYDRA_EIGHTS_SPOOL") or DEFAULT_SPOOL_ROOT)
+
+
+def resolve_dead_letter_root() -> Path:
+    """Dead-letter root: ``HYDRA_EIGHTS_DEAD_LETTER`` override, else default."""
+    return Path(
+        os.environ.get("HYDRA_EIGHTS_DEAD_LETTER") or DEFAULT_DEAD_LETTER_ROOT
+    )
+
 
 @dataclass
 class SpooledCall:
@@ -101,11 +123,11 @@ class PendingSpool:
         *,
         dead_letter_root: Path | str | None = None,
     ) -> None:
-        self.root = Path(root) if root is not None else DEFAULT_SPOOL_ROOT
+        self.root = Path(root) if root is not None else resolve_spool_root()
         self.dead_letter_root = (
             Path(dead_letter_root)
             if dead_letter_root is not None
-            else DEFAULT_DEAD_LETTER_ROOT
+            else resolve_dead_letter_root()
         )
         # Lazy mkdir — the spool only materializes when something is spooled
         # so a clean install with healthy eights never creates the directory.

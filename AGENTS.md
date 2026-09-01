@@ -57,6 +57,7 @@ and approval-gated execution, with server-side WS-AUTH capability enforcement on
 - Type-annotate everything in `hydra_core/`.
 - Keep `hydra_core/` runtime-agnostic — dispatchers are injected, no provider SDK imports.
 - Tests under `tests/` use `pytest`. Avoid network or LLM calls in unit tests.
+- **hermetic suite** (E2-26): `tests/conftest.py` redirects every Hydra state path (`HYDRA_HOME`, `HYDRA_EPISODIC_DB`, `HYDRA_CHECKPOINT_DB`, `HYDRA_BACKENDS`, `HYDRA_EIGHTS_SPOOL`, `HYDRA_EIGHTS_DEAD_LETTER`) into `.tmp-pytest/hydra-home/` and sets `HYDRA_TEST_NO_DAEMONS=1`, which makes `MCPStdioDispatcher.call_mcp` refuse to fork a stdio daemon. Never write a test that needs the operator's real `~/.hydra`; a test that genuinely needs a daemon carries `@pytest.mark.live_daemon` and runs only under `pytest -m live_daemon`.
 - **no-premature-done**: do not declare a task done until `pytest` (the full relevant suite, not just the new test) passes and the build is clean. A frozen contract in a sibling module can break silently if only the new test is checked.
 
 ## Security

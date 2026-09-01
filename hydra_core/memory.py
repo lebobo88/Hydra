@@ -11,6 +11,7 @@ authority for resolving handles back to content.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,8 +25,16 @@ from .eights.classifier import classify
 from .schemas import MemoryRef
 
 
-DEFAULT_DIR = Path.home() / ".hydra"
-EPISODIC_DB = DEFAULT_DIR / "episodic.db"
+# E2-26: both are resolved at import time (the public helpers below bind
+# ``EPISODIC_DB`` as a default argument), so the env overrides must be set
+# before ``hydra_core.memory`` is first imported. The pytest conftest sets
+# them at conftest-import time, which is strictly earlier than any test
+# module import.
+#
+#   HYDRA_HOME        -> the Hydra state directory (default ``~/.hydra``)
+#   HYDRA_EPISODIC_DB -> the episodic SQLite file (added by E2-26)
+DEFAULT_DIR = Path(os.environ.get("HYDRA_HOME") or (Path.home() / ".hydra"))
+EPISODIC_DB = Path(os.environ.get("HYDRA_EPISODIC_DB") or (DEFAULT_DIR / "episodic.db"))
 
 
 # --------- episodic ---------
