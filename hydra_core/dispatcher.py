@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .backends_env import expand_spec_env
 from .proc import run_text
 
 logger = logging.getLogger(__name__)
@@ -633,6 +634,9 @@ class MCPStdioDispatcher:
                 ),
             }
 
+        # E2-5: resolve ${VAR} / ${VAR:-default} references so a secret can live
+        # in the launching environment instead of inline in backends.json.
+        spec = expand_spec_env(spec, server=server)
         params = StdioServerParameters(
             command=spec["command"],
             args=list(spec.get("args", [])),
@@ -899,6 +903,8 @@ class MCPStdioDispatcher:
             if spec is None:
                 raise KeyError(server)
 
+            # E2-5: same ${VAR} expansion as the one-shot path above.
+            spec = expand_spec_env(spec, server=server)
             params = StdioServerParameters(
                 command=spec["command"],
                 args=list(spec.get("args", [])),

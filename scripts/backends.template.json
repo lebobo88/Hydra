@@ -143,7 +143,8 @@
     "cwd": "{{HYDRA_ROOT}}",
     "env": {
       "PYTHONPATH": "{{HYDRA_ROOT}}",
-      "HYDRA_XENIA_ROOT": "{{AIAPP_BASE}}/Xenia"
+      "HYDRA_XENIA_ROOT": "{{AIAPP_BASE}}/Xenia",
+      "HYDRA_OPERATOR_KEY": "${HYDRA_OPERATOR_KEY}"
     }
   },
   "marketbliss": {
@@ -169,7 +170,8 @@
     "cwd": "{{HYDRA_ROOT}}",
     "env": {
       "PYTHONPATH": "{{HYDRA_ROOT}}",
-      "HYDRA_ROOT": "{{HYDRA_ROOT}}"
+      "HYDRA_ROOT": "{{HYDRA_ROOT}}",
+      "HYDRA_OPERATOR_KEY": "${HYDRA_OPERATOR_KEY}"
     }
   },
   "blender": {

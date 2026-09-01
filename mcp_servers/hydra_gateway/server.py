@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 
+from hydra_core.backends_env import expand_spec_env  # noqa: E402
 from hydra_core.dispatcher import BACKEND_REGISTRY, _load_backend_registry, _strip_comments  # noqa: E402
 from hydra_core.toolshed import build_default_shed, ProgressiveDisclosureTree  # noqa: E402
 from hydra_core.squad_loader import discover_squads  # noqa: E402
@@ -158,7 +159,9 @@ class AsyncBackendPool:
         except ImportError:
             return None
 
-        spec = self._specs[server]
+        # E2-5: resolve ${VAR} / ${VAR:-default} references so a secret can live
+        # in the launching environment instead of inline in backends.json.
+        spec = expand_spec_env(self._specs[server], server=server)
         params = StdioServerParameters(
             command=spec["command"],
             args=list(spec.get("args", [])),
