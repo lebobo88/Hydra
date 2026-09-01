@@ -972,17 +972,17 @@ def _drive_generate(
     return gen, "codex"
 
 
-def _rubric_md(rubric_id: str) -> str:
+def _rubric_md_ex(rubric_id: str, dispatcher: Any = None) -> tuple[str, bool]:
+    """``(body_md, fallback)`` for the judge. ``fallback=True`` means no registry
+    served the named rubric and the judge is getting the generic text instead —
+    the caller MUST surface that rather than ledger the id as applied (E2-25)."""
+    from .judge.rubric_resolution import rubric_body
+    return rubric_body(rubric_id, dispatcher, squad_id="engineering")
+
+
+def _rubric_md(rubric_id: str, dispatcher: Any = None) -> str:
     """Resolve a rubric body for the judge; degrade to a minimal rubric."""
-    try:
-        from .judge.registry import get_rubric
-        return get_rubric(rubric_id).body_md
-    except Exception:  # noqa: BLE001 — never block the loop on a registry miss
-        return (
-            "Evaluate the change for correctness, adherence to the stated request, "
-            "and absence of regressions. Output outcome (pass/revise/fail), a "
-            "critique, and per-dimension scores."
-        )
+    return _rubric_md_ex(rubric_id, dispatcher)[0]
 
 
 # pp's gate_eligible_judges accepts a STRICT gate_type enum; start_stage accepts
@@ -1002,6 +1002,20 @@ def _pp_gate_type(kind: str, gate_type: str | None = None) -> str:
     if gate_type in _PP_GATE_TYPES:
         return gate_type  # already a valid pp gate type
     return _PP_GATE_TYPE_BY_KIND.get(kind, "code_style")
+
+
+def _default_rubric_id(gate_type: str | None) -> str:
+    """Gate-typed default rubric BASE id (E2-25). See judge/rubric_resolution."""
+    from .judge.rubric_resolution import default_rubric_id
+    return default_rubric_id(gate_type)
+
+
+def _resolve_rubric_id(dispatcher: Any, rubric_id: str,
+                       on_unresolved: Any = None) -> str:
+    """Turn a base rubric id into its highest registered ``@N`` (E2-25)."""
+    from .judge.rubric_resolution import resolve_rubric_id
+    return resolve_rubric_id(dispatcher, rubric_id, squad_id="engineering",
+                             on_unresolved=on_unresolved)
 
 
 def _judge_artifact_text(
@@ -1109,7 +1123,7 @@ def _drive_pp_stage_loop(
     project_path: str,
     request_text: str,
     model_tier: str | None = None,
-    judge_rubric_id: str = "rfc-2119-normative",
+    judge_rubric_id: str | None = None,
     workflow_id: str | None = None,
     invoke_mode: str | None = None,
     # MU16: optional budget state for pre-operation gates (fleet or global).
@@ -1144,6 +1158,11 @@ def _drive_pp_stage_loop(
     F18: ``invoke_mode="pp_best_of"`` implies N=3 when HYDRA_BEST_OF_N is unset.
     An explicit HYDRA_BEST_OF_N always wins over the invoke_mode default.
     """
+    # E2-25: this stage is always kind="code", so its default rubric is the code
+    # rubric, NOT the spec rubric `rfc-2119-normative` that used to be hardcoded
+    # here (pp's gates.ts maps only gate_type="spec" to that one).
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(
+        _pp_gate_type("code", "code_style"))
     # F18: explicit env wins; invoke_mode="pp_best_of" implies N=3 as fallback.
     _effective_n = _best_of_n() or (3 if invoke_mode == "pp_best_of" else None)
     if _effective_n:
@@ -1202,7 +1221,10 @@ def _drive_pp_stage_loop(
         attempt_id: str | None = None
         outcome: str | None = None
         critique_md = ""
-        rubric_body = _rubric_md(judge_rubric_id)
+        # Preload; the per-attempt gate decision below re-resolves and overwrites
+        # both of these before the judge ever sees them.
+        rubric_body, rubric_fallback = _rubric_md_ex(
+            _resolve_rubric_id(dispatcher, judge_rubric_id), dispatcher)
         gen_failed = False
 
         # Reflexion ×1 → at most two attempts.
@@ -1333,8 +1355,19 @@ def _drive_pp_stage_loop(
             except Exception:  # noqa: BLE001 — never block the loop on a policy miss
                 gate_dec = {}
             required_cross = bool(gate_dec.get("required_cross_vendor", True))
-            gate_rubric = str(gate_dec.get("rubric_id") or judge_rubric_id)
-            rubric_body = _rubric_md(gate_rubric)
+            # E2-25: pp's registries key rubrics by an immutable `@N`; request the
+            # resolved version and say so when no registry served the body.
+            _requested_rubric = str(gate_dec.get("rubric_id") or judge_rubric_id)
+            gate_rubric = _resolve_rubric_id(
+                dispatcher, _requested_rubric,
+                lambda base: _trace("engineering.rubric_unresolved",
+                                    {"stage_id": stage_id, "requested": base}))
+            rubric_body, rubric_fallback = _rubric_md_ex(gate_rubric, dispatcher)
+            if rubric_fallback:
+                _trace("engineering.rubric_fallback", {
+                    "stage_id": stage_id, "requested": _requested_rubric,
+                    "effective": gate_rubric,
+                })
 
             # The judge reads the REAL diff (verbatim code), not just the
             # generator's prose summary — a condensed summary causes false gate
@@ -1383,6 +1416,10 @@ def _drive_pp_stage_loop(
                 "cross_vendor" if required_cross else "same_vendor")
             if degraded:
                 score_json["_judge_degraded"] = True
+            # E2-25: never ledger a rubric id whose body the judge never saw.
+            score_json["_rubric_id"] = gate_rubric
+            if rubric_fallback:
+                score_json["_rubric_fallback"] = True
 
             # F26+M8: capture record_verdict success; failure on pass → downgrade.
             _rv_ok = True
@@ -1611,7 +1648,7 @@ def _rank_key(outcome: str, score: dict[str, Any], smoke_status: str) -> float:
 def _drive_best_of_loop(
     dispatcher: Dispatcher, *, run_id: str, project_path: str, request_text: str,
     n: int, model_tier: str | None = None,
-    judge_rubric_id: str = "rfc-2119-normative", workflow_id: str | None = None,
+    judge_rubric_id: str | None = None, workflow_id: str | None = None,
     # MU16: optional budget state + repo_id for pre-candidate gates.
     # None = no gate (unit tests / callers that don't thread state).
     state: "HydraState | None" = None,
@@ -1627,6 +1664,9 @@ def _drive_best_of_loop(
     (the caller then falls back to the single-candidate path). Fail-soft: any
     exception finalizes the run aborted (lock released)."""
     sq = "engineering"
+    # E2-25: code stage → code rubric default (not the spec rubric).
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(
+        _pp_gate_type("code", "code_style"))
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
     cm = dispatcher.call_mcp
     out: dict[str, Any] = {
@@ -1785,8 +1825,18 @@ def _drive_best_of_loop(
             except Exception:  # noqa: BLE001
                 gate = {}
             required_cross = bool(gate.get("required_cross_vendor", True))
-            gate_rubric = str(gate.get("rubric_id") or judge_rubric_id)
-            rubric_body = _rubric_md(gate_rubric)
+            # E2-25: versioned id + explicit fallback, same as the single path.
+            _requested_rubric = str(gate.get("rubric_id") or judge_rubric_id)
+            gate_rubric = _resolve_rubric_id(
+                dispatcher, _requested_rubric,
+                lambda base: _trace("engineering.rubric_unresolved",
+                                    {"candidate": ci_idx, "requested": base}))
+            rubric_body, rubric_fallback = _rubric_md_ex(gate_rubric, dispatcher)
+            if rubric_fallback:
+                _trace("engineering.rubric_fallback", {
+                    "candidate": ci_idx, "requested": _requested_rubric,
+                    "effective": gate_rubric,
+                })
             judge_text = _judge_artifact_text(wt, sorted(run_changed), gen_text)
             # (A) Give the judge the candidate's real execution outcome.
             judge_text = judge_text + "\n\n" + _execution_evidence_md(
@@ -1819,6 +1869,10 @@ def _drive_best_of_loop(
             score["_judge_tier"] = "cross_vendor" if required_cross else "same_vendor"
             if required_cross and not cross_vendor:
                 score["_judge_degraded"] = True
+            # E2-25: never ledger a rubric id whose body the judge never saw.
+            score["_rubric_id"] = gate_rubric
+            if rubric_fallback:
+                score["_rubric_fallback"] = True
             # F26+M8: capture record_verdict success; failure on pass → downgrade.
             _bo_rv_ok = True
             if att_id:

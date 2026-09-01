@@ -51,7 +51,9 @@ from .squad_node import (
     _pp_gate_type,
     _pp_inner,
     _pp_ok,
-    _rubric_md,
+    _default_rubric_id,
+    _resolve_rubric_id,
+    _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
 )
@@ -1494,7 +1496,7 @@ def begin_stage(
     project_path: str,
     request_text: str,
     model_tier: str | None = None,
-    judge_rubric_id: str = "rfc-2119-normative",
+    judge_rubric_id: str | None = None,
     project_root: str | Path | None = None,
     task_id: str | None = None,
     isolate: bool = True,
@@ -1513,6 +1515,14 @@ def begin_stage(
     """
     # Browser isolation parity with the headless driver (PP-BV-ISO).
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
+    # E2-25: an attended stage is always kind="code", so its default rubric is
+    # the code rubric. It used to default to the SPEC rubric
+    # `rfc-2119-normative`, which pp's gates.ts maps only to gate_type="spec" —
+    # and whose body no registry served for the unversioned id, so every code
+    # stage was silently judged on a generic one-liner while the ledger recorded
+    # the spec rubric's name.
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(
+        _pp_gate_type("code", "code_style"))
     cm = dispatcher.call_mcp
 
     st = _raise_on_error_payload(
@@ -1732,16 +1742,32 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     except Exception:  # noqa: BLE001
         gate_dec = {}
     required_cross = bool(gate_dec.get("required_cross_vendor", True))
-    gate_rubric = str(gate_dec.get("rubric_id") or cursor["judge_rubric_id"])
+    # E2-25: pp and Hydra both key rubrics by an immutable `@N`; a bare base id
+    # resolves to the highest registered version before it reaches the judge or
+    # the ledger. An id nothing registers is traced, not silently accepted.
+    requested_rubric = str(gate_dec.get("rubric_id") or cursor["judge_rubric_id"])
+    gate_rubric = _resolve_rubric_id(
+        dispatcher, requested_rubric,
+        lambda base: _trace(cursor, "attended.rubric_unresolved", {
+            "stage_id": stage_id, "requested": base}))
     # producer is "claude": a sanctioned same-vendor Claude judge is allowed only
     # when cross-vendor is NOT required; otherwise the host must spawn the
     # cross-vendor judge (codex/agy critique).
     judge_agent = "judge-cross-vendor" if required_cross else "judge-same-vendor"
-    rubric_body = _rubric_md(gate_rubric)
+    rubric_body, rubric_fallback = _rubric_md_ex(gate_rubric, dispatcher)
+    if rubric_fallback:
+        # The judge is about to see the GENERIC rubric, not the named one. Say so
+        # here, in the host_action, and in the verdict metadata — the ledger must
+        # never carry a rubric id whose body was not the one applied.
+        _trace(cursor, "attended.rubric_fallback", {
+            "stage_id": stage_id, "requested": requested_rubric,
+            "effective": gate_rubric,
+        })
     judge_text = _judge_artifact_text(
         work_path, sorted(run_changed), gen_text)
 
     cursor["gate_rubric"] = gate_rubric
+    cursor["gate_rubric_fallback"] = rubric_fallback
     cursor["required_cross"] = required_cross
     cursor["state"] = "await_judge"
     # LV-8: scope the call_key with run_id + stage_id, not just the generate
@@ -1774,13 +1800,18 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         "call_key": judge_call_key,
         "agent_type": judge_agent,
         "rubric_id": gate_rubric,
+        "rubric_fallback": rubric_fallback,
         "required_cross_vendor": required_cross,
         "artifact_text": judge_text,
         "rubric_md": rubric_body,
         "cwd": work_path,
         "instructions": (
             f"Spawn the visible `{judge_agent}` subagent to judge the diff "
-            f"against rubric {gate_rubric}. Then call submit-host-result with "
+            f"against rubric {gate_rubric}"
+            + (" (NOTE: no registry served this rubric's body — `rubric_md` "
+               "below is the GENERIC fallback text, judge against that)"
+               if rubric_fallback else "")
+            + ". Then call submit-host-result with "
             "{call_key, result:{outcome:pass|revise|fail, critique_md, "
             "judge_producer, judge_model_id, score_json, cost_usd}}."),
     }
@@ -1868,6 +1899,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     score_json["_attended"] = True
     if degraded:
         score_json["_judge_degraded"] = True
+    # E2-25: the effective rubric travels with the verdict. `_rubric_fallback`
+    # marks a verdict whose named rubric body was NOT the one the judge applied,
+    # so an auditor reading the pp ledger can tell the two cases apart.
+    score_json["_rubric_id"] = gate_rubric
+    if cursor.get("gate_rubric_fallback"):
+        score_json["_rubric_fallback"] = True
 
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
@@ -1981,6 +2018,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     _trace(cursor, "attended.verdict", {
         "stage_id": cursor["stage_id"], "rubric_id": gate_rubric,
+        "rubric_fallback": bool(cursor.get("gate_rubric_fallback")),
         "attempt_id": attempt_id, "producer": producer,
         "judge_producer": judge_producer, "outcome": outcome,
         "cross_vendor": cross_vendor, "generate_index": gen_idx,
