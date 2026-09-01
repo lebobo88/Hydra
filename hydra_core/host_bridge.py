@@ -54,6 +54,7 @@ from .squad_node import (
     _pp_ok,
     _default_rubric_id,
     _resolve_rubric_id,
+    _resolve_skill_shim,
     _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
@@ -64,7 +65,13 @@ from .squad_node import (
 CURSOR_SCHEMA = 1
 
 # Terminal cursor states.
-_TERMINAL = {"complete", "surfaced", "aborted"}
+#
+# E2-35: ``complete_unpersisted`` is a terminal COMPLETE-shaped outcome whose
+# artifact could not be persisted anywhere. It is deliberately NOT spelled
+# "complete" so governance/synthesis cannot mistake an artifact-less squad
+# return for a durable one, and it is terminal so the driver stops rather than
+# re-spawning the pack agent.
+_TERMINAL = {"complete", "complete_unpersisted", "surfaced", "aborted"}
 
 _SQ = "engineering"
 
@@ -1621,6 +1628,13 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
             res["status"] = "envelopes_rejected"
         if cursor.get("artifact_text"):
             res["artifact_text"] = cursor["artifact_text"]
+        # E2-35: surface where (or whether) the squad artifact landed so the
+        # CLI does not re-attempt a native persist over a ref that already
+        # exists, and so an operator sees an unpersisted result as such.
+        for key in ("artifact_ref", "artifact_persisted_via",
+                    "artifact_persist_error", "artifact_persist_warning"):
+            if cursor.get(key) is not None:
+                res[key] = cursor[key]
     return res
 
 
@@ -2761,7 +2775,98 @@ def begin_squad_stage(
     return _step_result(cursor, cfile)
 
 
-def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
+def _has_native_pack(slug: str) -> bool:
+    """True when the squad owns a registered Claude Code plugin pack."""
+    if not slug:
+        return False
+    try:
+        from .native_packs import native_pack
+        native_pack(slug)
+        return True
+    except Exception:  # noqa: BLE001 — unregistered slug or registry error
+        return False
+
+
+def _persist_attended_squad_artifact(
+    dispatcher: Dispatcher,
+    cursor: dict[str, Any],
+    *,
+    cursor_file: str | Path,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Persist a non-native squad's attended artifact (E2-35).
+
+    The CLI persists native-pack results through the pack's declared output
+    root; a squad with no ``NATIVE_PACKS`` entry (customer-support via the
+    xenia shim, for instance) had NO persist path at all, so its result came
+    back ``complete`` with an ``artifact_persist_error`` and no ``artifact_ref``
+    and its work never reached memory or synthesis.
+
+    Ladder, both best-effort:
+
+    1. the generic attended store (``<project>/.hydra/<wf>/attended/artifacts``),
+       which needs no MCP round-trip and is therefore the reliable leg;
+    2. when the squad has a claude-skill shim, ``<prefix>.output.write`` as
+       well, so the pack's own on-disk store stays in sync.
+
+    Returns ``(artifact_ref | None, via | None, errors)``. The caller downgrades
+    the outcome to ``complete_unpersisted`` only when BOTH legs failed.
+    """
+    text = str(cursor.get("artifact_text") or "")
+    slug = str(cursor.get("squad_slug") or "")
+    wf = str(cursor.get("workflow_id") or "")
+    raw_task = str(cursor.get("task_id") or cursor.get("run_id") or "task")
+    task_id = "".join(c for c in raw_task if c.isalnum() or c in "-_") or "task"
+    errors: list[str] = []
+    via: list[str] = []
+    ref: dict[str, Any] | None = None
+
+    try:
+        from .artifact_store import write_attended_artifact
+        # `cursor["project_path"]` is the PACK cwd for squad cursors, not the
+        # Hydra project root, so derive the root from the cursor sidecar path
+        # (`<project>/.hydra/<wf>/attended/<run>.json`) instead.
+        project_root = Path(cursor_file).resolve().parents[3]
+        mref = write_attended_artifact(project_root, wf, f"{task_id}.md", text)
+        ref = mref.model_dump(mode="json")
+        via.append("generic")
+    except Exception as exc:  # noqa: BLE001 — fail-soft; the shim leg may still land
+        errors.append(f"generic store: {exc}")
+
+    shim = _resolve_skill_shim(slug) if slug else None
+    if shim:
+        tool = f"{shim['prefix']}.output.write"
+        try:
+            args: dict[str, Any] = {
+                shim["path_key"]: "attended",
+                "topic": f"attended {raw_task}"[:80],
+                "content": text,
+            }
+            if shim["server"] == "rlm_creative":
+                args.update({"domain": "creative", "scopes": ["team:garland-crew"]})
+            resp = dispatcher.call_mcp(shim["server"], tool, args, squad_id=slug)
+            _raise_on_error_payload(resp, tool)
+            via.append("shim")
+            rel = resp.get("relative") if isinstance(resp, dict) else None
+            if ref is None and rel:
+                from .schemas import MemoryRef
+                ref = MemoryRef(
+                    tier="episodic",
+                    key=f"{shim['prefix']}:output:{rel}",
+                    summary=str(rel),
+                ).model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001 — pack store is best-effort
+            errors.append(f"{tool}: {exc}")
+
+    return ref, ("+".join(via) or None), errors
+
+
+def _apply_squad_result(
+    dispatcher: Dispatcher,
+    cursor: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    cursor_file: str | Path,
+) -> None:
     """await_squad_agent → terminal.
 
     Accumulate spend from the host agent's result and mark the cursor complete.
@@ -2781,14 +2886,43 @@ def _apply_squad_result(cursor: dict[str, Any], result: dict[str, Any]) -> None:
     # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
     emitted = result.get("emitted_envelopes", result.get("envelopes", []))
     cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
-    cursor["final_status"] = "complete"
-    cursor["state"] = "complete"
+
+    # E2-35: a squad with no native pack still gets its artifact persisted --
+    # generically, and (when it has one) through its claude-skill shim too.
+    # Native packs are left to the CLI's `write_native_artifact` path, which
+    # already returns a `<plugin>:output:...` ref for them.
+    slug = str(cursor.get("squad_slug") or "")
+    final_status = "complete"
+    if cursor["artifact_text"] and not _has_native_pack(slug):
+        ref, via, errors = _persist_attended_squad_artifact(
+            dispatcher, cursor, cursor_file=cursor_file)
+        if ref is not None:
+            cursor["artifact_ref"] = ref
+            cursor["artifact_persisted_via"] = via
+            _trace(cursor, "attended.skill_artifact_persisted", {
+                "squad": slug, "memory_ref": ref.get("key"), "via": via,
+            })
+            if errors:
+                # One leg landed; keep the other's failure visible without
+                # downgrading a result that IS durably persisted.
+                cursor["artifact_persist_warning"] = "; ".join(errors)
+        else:
+            final_status = "complete_unpersisted"
+            cursor["artifact_persist_error"] = (
+                "; ".join(errors) or "no attended artifact persist path succeeded")
+            _trace(cursor, "attended.skill_artifact_persist_failed", {
+                "squad": slug, "error": cursor["artifact_persist_error"],
+            })
+
+    cursor["final_status"] = final_status
+    cursor["state"] = final_status
     cursor["pending_action"] = None
     cursor["finalized"] = True
     _trace(cursor, "attended.squad_result_applied", {
         "task_id": cursor.get("task_id"),
         "squad_slug": cursor.get("squad_slug"),
         "cost_usd": cursor.get("cost_usd"),
+        "final_status": final_status,
         "emitted_envelope_count": len(cursor["emitted_envelopes"]),
     })
 
@@ -3219,7 +3353,7 @@ def submit_host_result(
             return out
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
-        _apply_squad_result(cursor, result)
+        _apply_squad_result(dispatcher, cursor, result, cursor_file=cursor_file)
     else:  # pragma: no cover — defensive
         cursor["state"] = "aborted"
         cursor["final_status"] = "aborted"

@@ -2572,7 +2572,10 @@ def _cmd_attended_submit(args) -> int:
         # On terminal: charge budget on the authoritative HydraState ledger and
         # record the task outcome into the checkpoint.
         # Rider (b): skip charge if already_charged=True (idempotency guard).
-        if res.get("status") in ("complete", "surfaced", "aborted"):
+        # E2-35: "complete_unpersisted" is terminal too — the pack agent ran and
+        # spent real money, so it must charge like any other terminal outcome.
+        if res.get("status") in ("complete", "complete_unpersisted",
+                                 "surfaced", "aborted"):
             if res.get("already_charged"):
                 # Idempotent re-submit: cursor was already charged on the first
                 # terminal submit.  Return the cached result without re-billing.
@@ -2601,7 +2604,13 @@ def _cmd_attended_submit(args) -> int:
             # the operator and telemetry.
             squad_slug = str(res.get("squad_slug") or "")
             artifact_text = str(res.get("artifact_text") or "")
-            if squad_slug and artifact_text:
+            # E2-35: host_bridge already persisted non-native squad artifacts
+            # (generic store + claude-skill shim) and recorded the outcome on
+            # the cursor. Only squads it left alone — the native packs — reach
+            # the native output-root writer here.
+            already_handled = (res.get("artifact_ref") is not None
+                               or res.get("artifact_persist_error") is not None)
+            if squad_slug and artifact_text and not already_handled:
                 try:
                     from .artifact_store import write_native_artifact
                     ref = write_native_artifact(
