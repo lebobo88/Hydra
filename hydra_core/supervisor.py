@@ -2170,9 +2170,26 @@ def build_supervisor(
             # it to the host strands the task as deferred_to_host instead of
             # surfacing the honest stub signal. Only agent-impersonation and
             # claude-skill (which genuinely need a host executor) are deferred.
+            # E2-22: the mirror case. An attended `hydra approve` pass re-enters
+            # this node with a NON-live dispatcher (cli's `_NullDispatcher`).
+            # Letting the mcp engineering pack through there scaffolded a
+            # skeleton pp "run" from the stub response, emitted a placeholder
+            # DECISION_RECORD, and let the NoOp judge score it (`_skeleton:true`
+            # verdicts + a Reflexion retry) for work the host had not driven
+            # yet. Defer it exactly like the native packs; the attended host
+            # drives the real stage loop through host_bridge afterwards.
+            # Offline callers that genuinely want the in-graph mcp path (unit
+            # tests with a scripted pp dispatcher) opt in explicitly by setting
+            # `allow_offline_mcp_dispatch = True` on their dispatcher.
+            _live_dispatch = getattr(dispatcher, "live_execution", False)
+            _offline_mcp_ok = getattr(
+                dispatcher, "allow_offline_mcp_dispatch", False) is True
             if (pack.entrypoint == "claude-native"
-                    or (getattr(dispatcher, "live_execution", False)
-                        and pack.entrypoint not in ("mcp", "stub"))):
+                    or (_live_dispatch
+                        and pack.entrypoint not in ("mcp", "stub"))
+                    or (not _live_dispatch
+                        and pack.entrypoint == "mcp"
+                        and not _offline_mcp_ok)):
                 emit_trace(judge_trace_root, state.workflow_id, "dispatch.deferred_to_host", {
                     "squad": pack.slug,
                     "entrypoint": pack.entrypoint,
@@ -2475,7 +2492,13 @@ def build_supervisor(
             "artifacts": artifacts,
             "verdicts": bon_verdicts,
             "tasks": _forwarded_tasks,
-            "phase": "judge_per_squad",
+            # E2-22: this key pre-declares the node the graph is about to
+            # enter. When every task was parked for the attended host there is
+            # no next node — after_dispatch ends the pass — so hold the honest
+            # "executing" instead of claiming a judge pass that will not run.
+            "phase": ("executing"
+                      if _all_tasks_deferred_to_host(state, packs)
+                      else "judge_per_squad"),
         }
 
     def _reflexion_retry(
@@ -3444,7 +3467,16 @@ def build_supervisor(
         """
         if state.hitl_return_node == "dispatch":
             return "hitl_gate_dispatch"
-        return "halt" if state.phase == "surfaced" else "judge_per_squad"
+        if state.phase == "surfaced":
+            return "halt"
+        # E2-22: dispatch parked EVERY task awaiting the attended host — there
+        # is nothing to judge and nothing to synthesize. Stop here (phase stays
+        # "executing") so the trace does not record verdicts and a synthesis
+        # for work that has not run. The host drives the real stages next and
+        # re-enters via the continuation transport.
+        if _all_tasks_deferred_to_host(state, packs):
+            return "await_host"
+        return "judge_per_squad"
 
     def after_judge_per_squad(state: HydraState) -> str:
         """F9: when judge_per_squad surfaced a resumable HITL gate, route to
@@ -3507,6 +3539,10 @@ def build_supervisor(
         "judge_per_squad": "judge_per_squad",
         "hitl_gate_dispatch": "hitl_gate_dispatch",
         "halt": "postcheck",
+        # E2-22: every task deferred to the attended host — end the graph pass
+        # here rather than judging/synthesizing work that never ran. Note this
+        # goes to END, not postcheck: postcheck would stamp phase="done".
+        "await_host": END,
     })
     # F9: hitl_gate_dispatch → dispatch (re-entry after operator approval).
     graph.add_edge("hitl_gate_dispatch", "dispatch")
@@ -3556,6 +3592,30 @@ def build_supervisor(
     return graph.compile(
         checkpointer=checkpointer,
         interrupt_before=interrupts,
+    )
+
+
+def _all_tasks_deferred_to_host(state: HydraState, packs: dict) -> bool:
+    """True when dispatch parked every task, engineering included, for the host.
+
+    E2-22. Two deliberate narrowings:
+
+    ALL, not ANY. On the live/detached path dispatch defers the non-mcp packs
+    and still runs engineering in-graph; that mixed pass must keep judging and
+    synthesizing the leg it actually executed.
+
+    At least one mcp pack. This finding is about the engineering leg being
+    parked, so the hold applies only to a pass that deferred one. A workflow
+    with no mcp squad at all keeps its existing routing — whether an all-native
+    pass should synthesize placeholder output is a separate question this fix
+    does not answer.
+    """
+    tasks = list(getattr(state, "tasks", []) or [])
+    if not tasks or not all(t.status == "deferred_to_host" for t in tasks):
+        return False
+    return any(
+        getattr(packs.get(t.owner_squad), "entrypoint", None) == "mcp"
+        for t in tasks
     )
 
 
@@ -3613,5 +3673,10 @@ class _PurePythonRunner:
                     else:
                         setattr(s, k, v)
             if s.phase in ("done", "surfaced"):
+                return s
+            # E2-22: mirror the compiled graph's "await_host" edge — a dispatch
+            # pass that parked every task for the attended host stops here
+            # instead of falling through to judge/synthesis/postcheck.
+            if name == "dispatch" and _all_tasks_deferred_to_host(s, self.packs):
                 return s
         return s

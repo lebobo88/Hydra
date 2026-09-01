@@ -55,6 +55,11 @@ class _FakeDispatcher:
     run without errors.
     """
 
+    # E2-22: these tests exercise the in-graph mcp dispatch path with a
+    # scripted pp harness. Opt in explicitly — node_dispatch otherwise
+    # defers mcp packs to the attended host on a non-live dispatcher.
+    allow_offline_mcp_dispatch = True
+
     def __init__(
         self,
         *,
@@ -216,9 +221,15 @@ class TestSupervisorStatusCoercion:
             lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
         )
 
+        # E2-22: node_dispatch defers mcp packs to the attended host on a
+        # non-live dispatcher. This test's concern is the status coercion the
+        # in-graph path applies, so opt back into that path explicitly.
+        class _OfflineDispatcher:
+            allow_offline_mcp_dispatch = True
+
         runner = build_supervisor(
             project_root=HYDRA_ROOT,
-            dispatcher=object(),
+            dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
         )
         assert isinstance(runner, _PurePythonRunner)

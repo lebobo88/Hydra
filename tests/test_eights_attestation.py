@@ -26,6 +26,10 @@ class _NullDispatcher:
 
 class _RecordingDispatcher:
     """Logs every eights MCP call; can replay scripted responses by tool name."""
+    # E2-22: this suite exercises the in-graph mcp dispatch path with a
+    # scripted pp harness. Opt in explicitly — node_dispatch otherwise
+    # defers mcp packs to the attended host on a non-live dispatcher.
+    allow_offline_mcp_dispatch = True
     def __init__(self, scripted: dict[str, dict] | None = None):
         self.calls: list[dict] = []
         self.scripted = scripted or {}
