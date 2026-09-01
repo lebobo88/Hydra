@@ -2687,6 +2687,7 @@ def begin_squad_stage(
     risk: str | None = None,
     priority: str | None = None,
     acceptance_criteria: Sequence[str] | None = None,
+    action_extras: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -2744,6 +2745,12 @@ def begin_squad_stage(
             "instructions": "Run the pack agent and submit the artifact.",
         },
     }
+    # E2-31: claude-skill packs that are not plugin-loadable carry the pack's
+    # slash command + MCP tool scope so the host can drive them via
+    # general-purpose; `lead_agent_file` is informational.
+    if action_extras:
+        cursor["pending_action"].update(
+            {k: v for k, v in action_extras.items() if k != "agent_type"})
     cfile = cursor_path(project_root, workflow_id, task_id)
     save_cursor(cfile, cursor)
     _trace(cursor, "attended.squad_stage_started", {

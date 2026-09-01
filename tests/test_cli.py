@@ -951,7 +951,13 @@ def test_attended_squad_path_completes_charges_once_no_redispatch(
     assert payload_step["state"] == "await_squad_agent", (
         f"expected await_squad_agent, got {payload_step['state']!r}"
     )
-    assert payload_step["host_action"]["agent_type"] == "brand-director"
+    # E2-31: a claude-skill pack never hands the host the bare squad.yaml slug.
+    # This fake pack has no resolvable checkout, so it degrades to the
+    # general-purpose host agent driving the pack's slash command + MCP shim.
+    _skill_action = payload_step["host_action"]
+    assert _skill_action["agent_type"] == "general-purpose"
+    assert _skill_action["skill"] == "/rlm-creative:creative-campaign"
+    assert _skill_action["tool_scope"] == "rlm"
 
     cfile = payload_step["cursor_path"]
     call_key = payload_step["host_action"]["call_key"]
