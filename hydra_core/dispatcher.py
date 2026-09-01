@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .proc import run_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -456,8 +458,8 @@ class MCPStdioDispatcher:
         if venom_block is not None:
             return venom_block
         try:
-            res = subprocess.run(
-                cmd, env=env, capture_output=True, text=True, timeout=300,
+            res = run_text(
+                cmd, env=env, capture_output=True, timeout=300,
             )
             return {
                 "returncode": res.returncode,

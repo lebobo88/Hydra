@@ -42,6 +42,7 @@ from typing import Any, Optional
 import re as _re
 
 from . import telemetry as _telemetry
+from .proc import run_text
 from .squad_node import (
     Dispatcher,
     _augment_with_critique,
@@ -256,8 +257,8 @@ def _baseline_timeout_s() -> int:
 def _git(args: list[str], cwd: str | Path, timeout: int | None = None) -> subprocess.CompletedProcess:
     if timeout is None:
         timeout = _git_timeout_s()
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, timeout=timeout, check=False)
+    return run_text(["git", *args], cwd=str(cwd), capture_output=True,
+                    timeout=timeout, check=False)
 
 
 def _git_repo_root(path: str | Path) -> str | None:
@@ -364,9 +365,9 @@ def _write_worktree_gitexcludes(worktree_path: str) -> None:
     already present in the file are not duplicated.  Fail-soft on any error.
     """
     try:
-        r = subprocess.run(
+        r = run_text(
             ["git", "-C", worktree_path, "rev-parse", "--git-path", "info/exclude"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, timeout=5, check=False,
         )
         if r.returncode != 0 or not r.stdout.strip():
             return
@@ -1347,14 +1348,13 @@ def _capture_baseline_failures(
         if not tests_dir.is_dir():
             continue
         try:
-            res = subprocess.run(
+            res = run_text(
                 [
                     _sys.executable, "-m", "pytest",
                     "tests/", "--no-header", "-q", "--tb=no",
                 ],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 check=False,
                 timeout=_baseline_timeout_s(),
             )
@@ -2100,11 +2100,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                     else:
                         import sys as _sys
                         try:
-                            _reruns = subprocess.run(
+                            _reruns = run_text(
                                 [_sys.executable, "-m", "pytest",
                                  "tests/", "--no-header", "-q", "--tb=no"],
                                 cwd=work_path,
-                                capture_output=True, text=True, check=False,
+                                capture_output=True, check=False,
                                 timeout=_baseline_timeout_s(),
                             )
                             _current_failing = _parse_failing_tests(

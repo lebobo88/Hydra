@@ -33,6 +33,7 @@ from pathlib import Path
 _log = logging.getLogger("hydra.engineering")
 
 from .iolaus import post_dispatch, pre_dispatch
+from .proc import run_text
 from .schemas import (
     DecisionRecord,
     Handoff,
@@ -229,9 +230,9 @@ def _worktree_dirty_set(project_path: str | None) -> set[str]:
     if not (root / ".git").exists() and not (root.parent / ".git").exists():
         return set()
     try:
-        res = subprocess.run(
+        res = run_text(
             ["git", "status", "--porcelain"],
-            cwd=root, capture_output=True, text=True, check=False,
+            cwd=root, capture_output=True, check=False,
         )
     except Exception:  # noqa: BLE001 — never crash on a git hiccup
         return set()
@@ -365,10 +366,9 @@ def _resolve_worktree_main_root(project_path: Path) -> "Path | None":
     Fail-soft: any exception → ``None``. Callers treat None as "not a worktree".
     """
     try:
-        proc = subprocess.run(
+        proc = run_text(
             ["git", "-C", str(project_path), "rev-parse", "--git-common-dir"],
             capture_output=True,
-            text=True,
             timeout=5,
             check=False,
         )
@@ -668,9 +668,9 @@ def _run_smoke(
     _use_shell = os.name == "nt" and cmd[0].lower() in ("npm", "npx", "yarn", "pnpm")
     _timeout = _smoke_timeout_s()
     try:
-        res = subprocess.run(
+        res = run_text(
             cmd if not _use_shell else " ".join(cmd),
-            cwd=smoke_cwd, capture_output=True, text=True,
+            cwd=smoke_cwd, capture_output=True,
             check=False, timeout=_timeout, shell=_use_shell,
         )
     except subprocess.TimeoutExpired as exc:
@@ -850,8 +850,8 @@ def _run_claude_cli(
     else:
         cmd += ["--permission-mode", "acceptEdits"]
     try:
-        res = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout_s,
+        res = run_text(
+            cmd, cwd=cwd, capture_output=True, timeout=timeout_s,
             env=sub_env,
         )
         return _parse_claude_cli_result(res.stdout, res.stderr, res.returncode, mdl)
@@ -1021,9 +1021,9 @@ def _judge_artifact_text(
     budget = max_chars  # bound INTERMEDIATE accumulation, not just the final slice
     # Modified tracked files → a real unified diff.
     try:
-        res = subprocess.run(
+        res = run_text(
             ["git", "-C", project_path, "diff", "--", *changed_paths],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, timeout=30,
         )
         diff = (res.stdout or "").strip()[:budget]
         if diff:
@@ -1033,10 +1033,10 @@ def _judge_artifact_text(
         pass
     # New/untracked files → include their content (git diff omits them).
     try:
-        u = subprocess.run(
+        u = run_text(
             ["git", "-C", project_path, "ls-files", "--others",
              "--exclude-standard", "--", *changed_paths],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, timeout=15,
         )
         for rel in (u.stdout or "").splitlines():
             if budget <= 0:
@@ -3113,11 +3113,10 @@ def harvest_pp_run_artifacts(
         return None
 
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_text(
             ["git", *args],
             cwd=root,
             capture_output=True,
-            text=True,
             check=False,
         )
 
