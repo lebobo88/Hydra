@@ -619,6 +619,37 @@ def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
         timeout_s=_SUBMIT_TIMEOUT_S, err_label="submit", workflow_id=workflow_id)
 
 
+def _ensure_venom_registry() -> int:
+    """Populate the process-local Cerberus venom registry, returning its size.
+
+    E2-11: ``hydra.venom.cross_check`` runs ``require_cerberus_pass`` against
+    ``hydra_core.venom``'s process-local ``_REGISTRY``, which is only ever
+    filled by ``load_cerberus_venoms()`` scanning ``squads/*/cerberus.yaml``.
+    This server never called it, so every venom-class capability looked
+    unregistered and was waved through. Called once at startup and again,
+    lazily, from the handler as a guard (the MCP SDK may serve tools without
+    this module's ``main()`` having run).
+
+    Fail-soft: a load failure is logged and reported as an empty registry. The
+    handler translates "empty" into a fail-closed refusal, so a broken load can
+    never re-open the gate.
+    """
+    try:
+        from hydra_core.venom import load_cerberus_venoms, registered_venoms
+    except Exception as exc:  # noqa: BLE001 — never fatal at startup
+        logger.warning("venom registry unavailable: %s", exc)
+        return 0
+    try:
+        if not registered_venoms():
+            load_cerberus_venoms(_HYDRA_ROOT)
+    except Exception as exc:  # noqa: BLE001 — fail-soft; gate stays fail-closed
+        logger.warning("venom registry load failed from %s: %s", _HYDRA_ROOT, exc)
+    try:
+        return len(registered_venoms())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _tool_handlers() -> dict[str, Any]:
     def ping(args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -903,6 +934,12 @@ def _tool_handlers() -> dict[str, Any]:
             from hydra_core.venom import require_cerberus_pass, VenomUnregistered
         except Exception as imp_exc:  # noqa: BLE001
             return {"ok": False, "rationale": f"venom module unavailable: {imp_exc}"}
+        # E2-11: an empty registry means no venom is known to this process, so
+        # "unregistered" carries no information. Fail closed rather than
+        # approving every venom-class capability.
+        if _ensure_venom_registry() == 0:
+            return {"ok": False,
+                    "rationale": "venom registry not loaded — failing closed"}
         try:
             verdict = require_cerberus_pass(
                 capability, context,
@@ -915,7 +952,8 @@ def _tool_handlers() -> dict[str, Any]:
                 "rationale": "; ".join(verdict.refusal_reasons) or "cerberus refused",
             }
         except VenomUnregistered:
-            # Capability not in registry → not a known venom; treat as pass.
+            # Registry is non-empty (checked above) and the capability is absent
+            # from it → genuinely not a venom-class action; treat as pass.
             return {"ok": True, "rationale": "capability not in venom registry — not a venom-class action"}
         except Exception as exc:  # noqa: BLE001 — transport-shaped error → ok=false
             logger.exception("venom_cross_check: unexpected error")
@@ -1720,5 +1758,15 @@ def _serve_bare() -> None:
 
 
 def main() -> None:
+    # E2-11: prime the Cerberus venom registry before serving any tool, so
+    # hydra.venom.cross_check gates against the same capability set that
+    # `hydra doctor` reports instead of an empty dict.
+    _venom_count = _ensure_venom_registry()
+    if _venom_count:
+        logger.info("Cerberus venom registry loaded: %d capabilities", _venom_count)
+    else:
+        logger.warning(
+            "Cerberus venom registry empty (root=%s) — hydra.venom.cross_check "
+            "will fail closed", _HYDRA_ROOT)
     if not _serve_with_mcp_sdk():
         _serve_bare()
