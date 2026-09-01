@@ -146,9 +146,12 @@ def test_attended_step_drives_stub_squad_in_process(tmp_path, monkeypatch, capsy
                  if "[STUB]" in str(e.get("decision") or "")]
     assert len(stub_envs) == 1, sup.values["envelopes"]
 
-    # the loop then continues: nothing left to drive
+    # the loop then continues: nothing left to drive. E2-30 renamed this
+    # terminal status to `ready_to_finalize` (the attended results still owe
+    # synthesis/postcheck) and kept `no_pending_task` as a boolean alias.
     nxt = _step(tmp_path, wf_id, capsys)
-    assert nxt["status"] == "no_pending_task", nxt
+    assert nxt["status"] == "ready_to_finalize", nxt
+    assert nxt["no_pending_task"] is True, nxt
 
 
 def test_stub_task_is_not_marked_done_so_governance_still_surfaces(
