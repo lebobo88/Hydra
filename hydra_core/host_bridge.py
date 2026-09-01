@@ -1468,6 +1468,13 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         if cursor.get("emitted_envelopes"):
             res["emitted_envelopes"] = cursor["emitted_envelopes"]
             res["emitted_envelope_count"] = len(cursor["emitted_envelopes"])
+        # E2-34: an emitted envelope that failed schema validation is
+        # outstanding work, not a completed stage. Report it on every read of
+        # a terminal cursor and override the reported status so the host
+        # cannot mistake the run for fully complete.
+        if cursor.get("rejected_envelopes"):
+            res["rejected_envelopes"] = cursor["rejected_envelopes"]
+            res["status"] = "envelopes_rejected"
         if cursor.get("artifact_text"):
             res["artifact_text"] = cursor["artifact_text"]
     return res
@@ -2956,6 +2963,31 @@ def mark_charged(cursor_file: str | Path) -> None:
         if cursor.get("state") in _TERMINAL:
             cursor["charged"] = True
             save_cursor(cursor_file, cursor)
+    except Exception:  # noqa: BLE001 — never crash the caller on persist failure
+        pass
+
+
+def record_rejected_envelopes(cursor_file: str | Path,
+                              rejected: list[dict[str, Any]]) -> None:
+    """E2-34: park schema-rejected emitted envelopes on the terminal cursor.
+
+    The engineering task itself completed; what failed is the delegation it
+    emitted. Persisting the rejections here (rather than only returning them
+    once) means a later ``step`` / finalize read still sees the outstanding
+    work, so a dropped DEV_TASK cannot disappear between calls. Fail-soft: a
+    storage hiccup never blocks the calling workflow.
+    """
+    if not rejected:
+        return
+    try:
+        cursor = load_cursor(cursor_file)
+        cursor["rejected_envelopes"] = list(rejected)
+        save_cursor(cursor_file, cursor)
+        _trace(cursor, "attended.envelopes_rejected", {
+            "task_id": cursor.get("task_id"),
+            "squad_slug": cursor.get("squad_slug"),
+            "rejected_count": len(rejected),
+        })
     except Exception:  # noqa: BLE001 — never crash the caller on persist failure
         pass
 

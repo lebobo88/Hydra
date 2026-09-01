@@ -278,6 +278,57 @@ def _detached_refusal(kind: str) -> dict[str, Any]:
     }
 
 
+def _normalize_and_validate_envelopes(
+    envelopes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """E2-34: repair + schema-check envelopes BEFORE the detached ingest starts.
+
+    Returns ``(normalized, rejected)``. ``normalized`` carries the defaults
+    ``hydra_core.ingest.normalize_pack_envelope`` supplies (a UUID ``id`` with
+    the pack's original preserved as ``external_id``, an inferred ``owner``, a
+    synthesized ``branch``, ...). ``rejected`` holds one entry per envelope that
+    still fails ``validate_envelope``, with structured per-field errors.
+
+    Fail-OPEN on an import error only: if ``hydra_core`` is not importable in
+    this process the envelopes pass through untouched and the detached child
+    validates them as it did before — degraded, never a hard block.
+    """
+    try:
+        from hydra_core.ingest import (  # noqa: PLC0415
+            normalize_for_ingest,
+            validation_error_details,
+        )
+        from hydra_core.schemas import validate_envelope  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — hydra_core not on path in some test envs
+        logger.warning("submit_envelopes: hydra_core unavailable; "
+                       "skipping synchronous validation")
+        return list(envelopes), []
+
+    normalized: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for index, env in enumerate(envelopes):
+        try:
+            out = normalize_for_ingest(dict(env))
+        except Exception as exc:  # noqa: BLE001 — a repair failure is a rejection
+            rejected.append({"index": index, "envelope_id": None,
+                             "type": (env or {}).get("type"),
+                             "errors": [{"field": "", "msg": str(exc)}]})
+            continue
+        try:
+            validate_envelope(out)
+        except Exception as exc:  # noqa: BLE001
+            rejected.append({
+                "index": index,
+                "envelope_id": str(out.get("id")) if out.get("id") else None,
+                "external_id": out.get("external_id"),
+                "type": out.get("type"),
+                "errors": validation_error_details(exc),
+            })
+            continue
+        normalized.append(out)
+    return normalized, rejected
+
+
 def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[str, Any]:
     # Detached gate: resume is automation-only. No fleet exemption — a resume
     # call carries no fleet goal string, so fleet detection is not applicable.
@@ -775,8 +826,24 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "error": "each envelope must be an object"}
         if len(envelopes) > 100:
             return {"ok": False, "error": "too many envelopes (max 100)"}
+        # E2-34: normalize + validate SYNCHRONOUSLY here. Before this, a
+        # malformed envelope (e.g. id="devtask-hydra-heads-166fc7ee", which is
+        # not a UUID) was accepted with {launched: true} and only rejected
+        # inside the detached child, visible nowhere but .hydra/<wf>/ingest.log.
+        # The batch is all-or-nothing: nothing is launched and nothing is
+        # claimed, so the host corrects and re-submits the whole list.
+        normalized, rejected = _normalize_and_validate_envelopes(envelopes)
+        if rejected:
+            return {
+                "ok": False,
+                "launched": False,
+                "status": "envelopes_rejected",
+                "rejected": rejected,
+                "error": (f"{len(rejected)} of {len(envelopes)} envelope(s) failed "
+                          "validation; nothing was dispatched"),
+            }
         try:
-            return _launch_ingest(workflow_id, envelopes)
+            return _launch_ingest(workflow_id, normalized)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("ingest launch failed")
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
