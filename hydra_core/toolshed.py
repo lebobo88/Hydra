@@ -990,6 +990,140 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             },
         },
     },
+    # E2-39: the cross-vendor judge/generator tools take a REQUIRED `cwd`.
+    # Without a hand-seed the gateway advertised them parameterless whenever
+    # ~/.hydra/gateway_schemas.json was missing or held a placeholder, so hosts
+    # could not discover `cwd` and the first live call failed zod validation.
+    "pp_codex": {
+        "generate": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Absolute working directory for the sub-CLI. REQUIRED.",
+                },
+                "model": {"type": "string"},
+                "sandbox": {
+                    "type": "string",
+                    "enum": ["read-only", "workspace-write", "danger-full-access"],
+                },
+                "output_schema": {
+                    "description": "Optional JSON schema the output must conform to.",
+                },
+                "timeout_ms": {"type": "number"},
+            "untrusted_inputs": {
+                "type": "array",
+                "description": (
+                    "Untrusted evidence to fence off from the instruction "
+                    "channel. Each item is {label, text}."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["label", "text"],
+                    "additionalProperties": False,
+                },
+            },
+            "skip_recap": {"type": "boolean"},
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["minimal", "low", "medium", "high", "xhigh"],
+                },
+            },
+            "required": ["prompt", "cwd"],
+            "additionalProperties": False,
+        },
+        "critique": {
+            "type": "object",
+            "properties": {
+            "artifact_text": {
+                "type": "string",
+                "description": "The artifact (diff, spec, code) under review.",
+            },
+            "rubric_md": {
+                "type": "string",
+                "description": "Markdown rubric body the judge scores against.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Absolute working directory for the sub-CLI. REQUIRED.",
+            },
+            "model": {"type": "string"},
+            "output_schema": {
+                "description": "Optional JSON schema the verdict must conform to.",
+            },
+            "timeout_ms": {"type": "number"},
+                "escalate": {"type": "boolean"},
+            },
+            "required": ["artifact_text", "rubric_md", "cwd"],
+            "additionalProperties": False,
+        },
+    },
+    "pp_agy": {
+        "generate": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Absolute working directory for the sub-CLI. REQUIRED.",
+                },
+                "model": {"type": "string"},
+                "output_schema": {
+                    "description": "Optional JSON schema the output must conform to.",
+                },
+                "timeout_ms": {"type": "number"},
+            "untrusted_inputs": {
+                "type": "array",
+                "description": (
+                    "Untrusted evidence to fence off from the instruction "
+                    "channel. Each item is {label, text}."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["label", "text"],
+                    "additionalProperties": False,
+                },
+            },
+            "skip_recap": {"type": "boolean"},
+                "fresh_session": {"type": "boolean"},
+            },
+            "required": ["prompt", "cwd"],
+            "additionalProperties": False,
+        },
+        "critique": {
+            "type": "object",
+            "properties": {
+            "artifact_text": {
+                "type": "string",
+                "description": "The artifact (diff, spec, code) under review.",
+            },
+            "rubric_md": {
+                "type": "string",
+                "description": "Markdown rubric body the judge scores against.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Absolute working directory for the sub-CLI. REQUIRED.",
+            },
+            "model": {"type": "string"},
+            "output_schema": {
+                "description": "Optional JSON schema the verdict must conform to.",
+            },
+            "timeout_ms": {"type": "number"},
+            },
+            "required": ["artifact_text", "rubric_md", "cwd"],
+            "additionalProperties": False,
+        },
+    },
 }
 
 
@@ -1015,8 +1149,10 @@ def build_default_shed(dispatcher: Any = None) -> ToolShed:
                                  schemas=SCHEMA_OVERRIDES.get("hydra_control"))
     shed.register_static_catalog("xenia", XENIA_TOOLS)
     shed.register_static_catalog("senate", SENATE_TOOLS)
-    shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS)
-    shed.register_static_catalog("pp_agy", PP_AGY_TOOLS)
+    shed.register_static_catalog("pp_codex", PP_CODEX_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("pp_codex"))
+    shed.register_static_catalog("pp_agy", PP_AGY_TOOLS,
+                                 schemas=SCHEMA_OVERRIDES.get("pp_agy"))
     shed.register_static_catalog("xenia_kb", XENIA_KB_TOOLS)
     shed.register_static_catalog("xenia_tickets", XENIA_TICKETS_TOOLS)
     # Optional / 3rd-party backends — present in backends.template.json and
