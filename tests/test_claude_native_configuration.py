@@ -137,10 +137,10 @@ def test_plugin_and_project_contexts_have_documented_activation_boundary() -> No
     manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.1.6"
+    assert manifest["version"] == "0.1.7"
     assert manifest["author"]["name"] == "rob"
     assert "hooks" not in manifest
-    assert len(manifest["agents"]) == 9
+    assert len(manifest["agents"]) == 11
     assert "### Activation contexts" in readme
     assert "consumer projects" in readme
 
@@ -179,3 +179,12 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
     for skill in expected:
         body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
         assert "disable-model-invocation: true" in body
+
+
+def test_hydra_persona_agent_adds_voice_without_duplicating_the_contract() -> None:
+    hydra = (PLUGIN_ROOT / "agents" / "hydra.md").read_text(encoding="utf-8")
+
+    assert "Hard Rule" not in hydra
+    assert "/pp:" not in hydra
+    # No routing table (the squad registry table lives in AGENTS.md, not here).
+    assert "| Slug | Source pack | Entrypoint |" not in hydra

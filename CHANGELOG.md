@@ -8,6 +8,19 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Added — Hydra's own register (plugin 0.1.7)
+
+- New primary agents `plugins/hydra/agents/hydra.md` (cathedral register) and
+  `plugins/hydra/agents/hydra-plaza.md` (plaza register) give Hydra an
+  operator-configurable voice grounded in the manifesto's gestalt/register
+  distinction, instead of relying solely on `CLAUDE.md` plus hook
+  re-injection. `plugins/hydra/settings.json` (`{"agent": "hydra:hydra"}`)
+  makes `hydra:hydra` the default primary agent; operators can switch to the
+  stripped-voice `hydra:hydra-plaza` register with `claude --agent
+  hydra:hydra-plaza`. Both agents defer to `AGENTS.md`/`CLAUDE.md`/
+  `.claude/rules/*` for the governing contract and add voice only — no
+  duplicated Hard Rules, no routing table, no `/pp:*` references.
+
 ### Changed — canonical plugin namespace (plugin 0.1.6)
 
 - Moved Hydra agents, skills, and portable hooks into `plugins/hydra/`.
