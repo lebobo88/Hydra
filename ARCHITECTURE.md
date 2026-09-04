@@ -257,6 +257,70 @@ are always attended, and detached launch is automation-only behind
 to auto-wire `drive_pp_loop` and the `MCPCritiqueClient`; the engine itself is
 mode-agnostic.
 
+### 6c-bis. Cross-vendor judge selection for an engineering stage
+
+`hydra_core/judge_vendor.py::_judge_vendor_chain` is the single authority for
+which vendor judges a stage's diff. It is shared by both lanes — the headless
+drive loop (`squad_node._drive_pp_stage_loop`) and the attended host-bridge
+(`host_bridge`) — so the two cannot drift. Its rule: `generator=codex` maps to
+`agy`, `generator=agy` maps to `codex`, and for a `claude` generator the
+tiebreak is gate-type driven. The generator's own vendor can never appear in the
+returned chain — three guard sites enforce it (primary selection, the
+`preferred_producers` append loop, and the defensive other-lane append loop) —
+because a same-vendor judge records `cross_vendor=0` and trips the F31
+downgrade.
+
+The **gate type** is derived from the dispatched envelope by
+`squad_node._gate_type_for_envelope`:
+
+| Envelope type | Gate type |
+|---|---|
+| `PRD` | `spec` |
+| `ARCH_RFC` | `design` |
+| `DEV_TASK` / `HANDOFF` | `code_style` |
+| anything else | `code_style` (default) |
+
+The gate type is resolved **once per stage** and reused for both
+`gate_eligible_judges` and vendor selection, so the two cannot disagree. In the
+attended lane `host_bridge.begin_stage` persists it as `cursor['gate_type']` and
+`_apply_generate` reads that persisted value.
+
+For a `claude` generator the tiebreak (`_CODEX_PREFERRED_GATE_TYPES` /
+`_AGY_PREFERRED_GATE_TYPES`) **deliberately diverges** from pair-programmer's own
+mapping, by operator decision (not drift):
+
+| Gate type | pair-programmer prefers | Hydra picks |
+|---|---|---|
+| `security` | agy | **codex** |
+| `spec` | agy | **codex** |
+| `contract` | codex | codex *(unchanged)* |
+| `design` | codex | **agy** |
+| other | — | pp's `preferred_producers` order |
+
+Only `security`/`spec` and `design` differ; `contract -> codex` is identical in
+both systems. This is a considered override — a future reader comparing the two
+repos should not "fix" it.
+
+**Repo targeting.** The envelope's `target_repo_id` wins when present; otherwise
+`squad_node._via_mcp` falls back to the workflow's already-resolved
+`state.target_repo_id` (allow-list validated at intake in `supervisor.py` via
+`_is_known_repo`, unknown ids routed to HITL). This matters because only
+`DevTask` and `CSuiteDecisionPacket` define `target_repo_id` — `PRD` and
+`ARCH_RFC` do not — so before this fallback existed those envelopes reached
+engineering via ingest `execute_squad` and then failed the WS1-E guard, making
+the `design -> agy` route unreachable. The WS1-E guard still fires when *neither*
+source resolves: engineering never silently falls back to the Hydra cwd.
+
+**Failover is engine-side only.** On `{judge_tool_failed: true}`,
+`host_bridge._apply_judge` advances the vendor chain, re-issues the same
+`call_key` to the next vendor, and traces `attended.judge_vendor_failover` (or
+`..._exhausted`, surfacing the stage). The judge subagent must never substitute a
+vendor itself, since a blind agent-side fallback can land a same-vendor judge.
+
+Finally, `hydra_core/judge/router.py`'s post-synthesis gate is intentionally
+hardcoded codex-only and exempt from the `preferred_judge_vendors` policy knob
+that drives the rest of vendor preference.
+
 ### 6d. RBAC enforcement
 
 Each squad's `squad.yaml#tools` block declares which tools and MCP
