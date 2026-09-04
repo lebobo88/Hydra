@@ -27,6 +27,11 @@ class JudgePolicy:
     # policy configured). For cross_vendor the judge MUST differ from the
     # generator; this set additionally constrains which differing pairs are valid.
     vendor_pairs: frozenset = field(default_factory=frozenset)
+    # B5: default `JudgeRoute.preferred_judge_vendors` ordering for
+    # `router.route_judge` when a caller doesn't pass its own list. Ordered,
+    # first entry wins ties. router.py:175's post-synthesis gate is
+    # intentionally excluded from this policy knob (hardcoded ["codex"]).
+    preferred_judge_vendors: tuple[str, ...] = ("codex", "agy")
 
     def squad_enabled(self, squad: str | None) -> bool:
         """True when the squad opts in to real cross-vendor judging.
@@ -95,5 +100,9 @@ def load_policy(project_root: Path | None = None) -> JudgePolicy:
             (str(p[0]), str(p[1]))
             for p in (merged.get("vendor_pairs") or [])
             if isinstance(p, (list, tuple)) and len(p) == 2
+        ),
+        preferred_judge_vendors=tuple(
+            str(v) for v in (merged.get("preferred_judge_vendors")
+                              or ["codex", "agy"])
         ),
     )
