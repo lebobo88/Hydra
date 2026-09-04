@@ -43,8 +43,6 @@ import re as _re
 
 from . import telemetry as _telemetry
 from .judge_vendor import (
-    _SECURITY_SPEC_GATE_TYPES,
-    _CONTRACT_ARCH_GATE_TYPES,
     _base_judge_vendor,
     _judge_vendor_chain,
 )
@@ -1749,6 +1747,12 @@ def begin_stage(
     task_id: str | None = None,
     isolate: bool = True,
     hydra_context_block: str | None = None,
+    # B9: the real pp gate_type for this stage's triggering envelope (see
+    # squad_node._gate_type_for_envelope / _ENVELOPE_TYPE_TO_KIND). The
+    # caller passes the actual envelope type (PRD/ARCH_RFC/DEV_TASK/HANDOFF)
+    # it resolved for this task, or None when no better signal exists — this
+    # falls through to the documented code_style DEFAULT via `_pp_gate_type`.
+    gate_type: str | None = None,
 ) -> dict[str, Any]:
     """Open an attended code stage and pause for the first host action (the
     ``engineer`` generation). ``run_id`` must already exist (the caller runs
@@ -1763,14 +1767,17 @@ def begin_stage(
     """
     # Browser isolation parity with the headless driver (PP-BV-ISO).
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
-    # E2-25: an attended stage is always kind="code", so its default rubric is
-    # the code rubric. It used to default to the SPEC rubric
-    # `rfc-2119-normative`, which pp's gates.ts maps only to gate_type="spec" —
-    # and whose body no registry served for the unversioned id, so every code
-    # stage was silently judged on a generic one-liner while the ledger recorded
-    # the spec rubric's name.
-    judge_rubric_id = judge_rubric_id or _default_rubric_id(
-        _pp_gate_type("code", "code_style"))
+    # B9: resolve the real gate_type ONCE here and persist it on the cursor
+    # (below) so the later submit-host-result step reads the SAME value
+    # instead of re-deriving (and potentially drifting from) a second
+    # hardcoded literal. E2-25: still defaults to the code rubric (NOT the
+    # spec rubric `rfc-2119-normative`, which pp's gates.ts maps only to
+    # gate_type="spec") when the caller carries no better signal — it used to
+    # default to that spec rubric unconditionally, and whose body no registry
+    # served for the unversioned id, so every code stage was silently judged
+    # on a generic one-liner while the ledger recorded the spec rubric's name.
+    gate_type = _pp_gate_type("code", gate_type)
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     cm = dispatcher.call_mcp
 
     st = _raise_on_error_payload(
@@ -1826,6 +1833,10 @@ def begin_stage(
         "hydra_context_block": hydra_context_block or "",
         "model_tier": model_tier,
         "judge_rubric_id": judge_rubric_id,
+        # B9: persisted so the later submit-host-result step (a separate host
+        # round-trip, possibly a fresh process) uses the SAME gate_type this
+        # stage opened with instead of re-deriving it.
+        "gate_type": gate_type,
         "state": "await_generate",
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
         "baseline_failures": baseline_failures,
@@ -1977,7 +1988,10 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     # Judge routing — honour pp's gate_eligible_judges (cross- vs same-vendor)
     # exactly like the headless loop, so the host spawns the right judge agent.
-    gate_type_used = _pp_gate_type("code", "code_style")
+    # B9: reuse the SAME gate_type this stage opened with (persisted on the
+    # cursor by begin_stage) rather than re-deriving a hardcoded literal here
+    # — the two must never drift from each other.
+    gate_type_used = cursor.get("gate_type") or _pp_gate_type("code", "code_style")
     gate_dec: dict[str, Any] = {}
     try:
         gate_dec = _pp_inner(_raise_on_error_payload(

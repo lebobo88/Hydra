@@ -18,14 +18,31 @@ from typing import Any, Sequence
 # consumers can distinguish it from a genuine cross-vendor result.
 _SAME_VENDOR_HOST_SUFFIX = "-same-vendor-host"
 
-# pp gate types (from pp's strict gate_type enum, see squad_node._PP_GATE_TYPES)
-# that count as "security/spec" vs "contract/architecture" for the
-# claude-generator tiebreak below. pp's own enum has no separate
-# "architecture" value -- an architecture gate is represented as gate_type
-# "design" (see squad_node._PP_GATE_TYPE_BY_KIND's "architecture" -> "design"
-# mapping).
-_SECURITY_SPEC_GATE_TYPES = frozenset({"security", "spec"})
-_CONTRACT_ARCH_GATE_TYPES = frozenset({"contract", "design"})
+# B9 PART 2 — OPERATOR DECISION, INTENTIONAL DIVERGENCE FROM pp.
+#
+# pp's own authoritative mapping (`.claude/agents/judge-cross-vendor.md`
+# "Cross-vendor mapping") prefers agy for security/spec gates and codex for
+# contract/architecture gates. The Hydra operator has deliberately chosen the
+# OPPOSITE tiebreak for a claude generator here -- this is NOT accidental
+# drift from pp's spec, it is a considered override:
+#
+#     gate_type   pp's own preference   Hydra's claude-generator tiebreak
+#     ---------   -------------------   ----------------------------------
+#     security    agy                   codex
+#     spec        agy                   codex
+#     contract    codex                 codex   (unchanged)
+#     design      codex                 agy     (Hydra's architecture gate;
+#                                                 pp has no separate
+#                                                 "architecture" enum value --
+#                                                 see squad_node
+#                                                 ._PP_GATE_TYPE_BY_KIND's
+#                                                 "architecture" -> "design")
+#     other       n/a                   pp's own preferred_producers order,
+#                 (code_style, docs_polish, lint_class, unknown/None)
+#
+# See `_judge_vendor_chain`'s docstring below for the full mapping table.
+_CODEX_PREFERRED_GATE_TYPES = frozenset({"security", "spec", "contract"})
+_AGY_PREFERRED_GATE_TYPES = frozenset({"design"})
 
 
 def _base_judge_vendor(producer: Any) -> str:
@@ -38,13 +55,29 @@ def _base_judge_vendor(producer: Any) -> str:
 
 def _judge_vendor_chain(generator_producer: Any, gate_type: str | None,
                         pp_preferred_producers: Sequence[Any] | None) -> list[str]:
-    """Ordered cross-vendor judge producers to try, per pp's authoritative
+    """Ordered cross-vendor judge producers to try.
+
+    ``generator=codex``/``generator=agy`` follow pp's own authoritative
     mapping (``.claude/agents/judge-cross-vendor.md`` "Cross-vendor mapping"):
+    the OTHER vendor always judges. For ``generator=claude`` the tiebreak
+    between agy and codex is gate-type-driven -- and here Hydra INTENTIONALLY
+    DIVERGES from pp's own mapping by explicit operator decision (B9 PART 2),
+    not accidental drift:
 
         generator=codex  -> agy
         generator=agy    -> codex
-        generator=claude -> EITHER, preferring agy for security/spec gates
-                             and codex for contract/architecture gates
+        generator=claude -> gate_type security/spec/contract -> codex
+                             gate_type design                 -> agy
+                             anything else (code_style, docs_polish,
+                             lint_class, unknown/None) -> pp's own
+                             preferred_producers order, then the defensive
+                             other-lane append
+
+    pp's OWN preference (for reference, NOT followed here for claude
+    generators) is agy for security/spec and codex for contract/architecture
+    -- exactly inverted. See the module-level comment above
+    ``_CODEX_PREFERRED_GATE_TYPES`` / ``_AGY_PREFERRED_GATE_TYPES`` for the
+    full table and rationale.
 
     B2: pp's ``gate_eligible_judges`` returns ``preferred_producers`` in pool
     order (``[codex, agy, claude]`` filtered to other vendors), so naively
@@ -65,10 +98,12 @@ def _judge_vendor_chain(generator_producer: Any, gate_type: str | None,
         # claude (or any other same-side generator): EITHER vendor is valid;
         # break the tie on the gate's shape, defaulting to pp's own ordering
         # when the gate type carries no security/spec/contract/design signal.
-        if gate_type in _SECURITY_SPEC_GATE_TYPES:
-            primary = "agy"
-        elif gate_type in _CONTRACT_ARCH_GATE_TYPES:
+        # B9 PART 2: this INVERTS pp's own mapping by operator decision --
+        # see the module-level comment and this function's docstring.
+        if gate_type in _CODEX_PREFERRED_GATE_TYPES:
             primary = "codex"
+        elif gate_type in _AGY_PREFERRED_GATE_TYPES:
+            primary = "agy"
         else:
             # pp's own first cross-vendor pick -- but a malformed/legacy
             # response could (in principle) still list the generator's own

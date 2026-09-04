@@ -79,11 +79,11 @@ def _smoke_passes(monkeypatch):
                         lambda *a, **k: ("pass", "fake smoke pass"))
 
 
-def _begin(disp, tmp_path):
+def _begin(disp, tmp_path, gate_type=None):
     return host_bridge.begin_stage(
         disp, workflow_id="wf-1", run_id="run-1",
         project_path=str(tmp_path), request_text="implement the thing",
-        project_root=str(tmp_path))
+        project_root=str(tmp_path), gate_type=gate_type)
 
 
 def test_begin_pauses_for_engineer(tmp_path):
@@ -2539,8 +2539,8 @@ class _FakeDispatcherWithDoctor(FakeDispatcher):
         return super().call_mcp(server, tool, args, squad_id)
 
 
-def _drive_to_judge(disp, tmp_path):
-    res = _begin(disp, tmp_path)
+def _drive_to_judge(disp, tmp_path, gate_type=None):
+    res = _begin(disp, tmp_path, gate_type=gate_type)
     cfile = res["cursor_path"]
     res = host_bridge.submit_host_result(
         disp, cursor_file=cfile, call_key="generate-0",
@@ -2736,20 +2736,23 @@ def test_judge_vendor_chain_agy_generator_prefers_codex():
     assert chain[0] == "codex"
 
 
-def test_judge_vendor_chain_claude_generator_security_spec_prefers_agy():
-    """Naive 'first of preferred_producers' always yields codex (pool order
-    [codex, agy, claude]) -- this must NOT happen for a security/spec gate."""
-    chain = host_bridge._judge_vendor_chain("claude", "security", ["codex", "agy"])
-    assert chain[0] == "agy"
-    chain = host_bridge._judge_vendor_chain("claude", "spec", ["codex", "agy"])
-    assert chain[0] == "agy"
-
-
-def test_judge_vendor_chain_claude_generator_contract_design_prefers_codex():
-    chain = host_bridge._judge_vendor_chain("claude", "contract", ["codex", "agy"])
+def test_judge_vendor_chain_claude_generator_security_spec_contract_prefers_codex():
+    """B9 PART 2 — Hydra's operator-decided tiebreak INVERTS pp's own mapping
+    (pp prefers agy for security/spec): security/spec/contract all route a
+    claude generator to codex."""
+    chain = host_bridge._judge_vendor_chain("claude", "security", ["agy", "codex"])
     assert chain[0] == "codex"
+    chain = host_bridge._judge_vendor_chain("claude", "spec", ["agy", "codex"])
+    assert chain[0] == "codex"
+    chain = host_bridge._judge_vendor_chain("claude", "contract", ["agy", "codex"])
+    assert chain[0] == "codex"
+
+
+def test_judge_vendor_chain_claude_generator_design_prefers_agy():
+    """B9 PART 2 — the design (architecture) gate is the one case Hydra routes
+    to agy for a claude generator, INVERTING pp's own codex preference."""
     chain = host_bridge._judge_vendor_chain("claude", "design", ["codex", "agy"])
-    assert chain[0] == "codex"
+    assert chain[0] == "agy"
 
 
 def test_judge_vendor_chain_claude_generator_default_defers_to_pp_order():
@@ -2894,3 +2897,80 @@ def test_judge_vendor_chain_excludes_generator_vendor_even_when_pp_pref_includes
     chain = host_bridge._judge_vendor_chain("claude", "code_style", ["claude", "codex", "agy"])
     assert "claude" not in chain
     assert chain[0] == "codex"
+
+
+def test_judge_vendor_chain_never_leaks_generator_vendor_for_every_gate_type():
+    """B9: exhaustive guard -- for EVERY pp gate_type and EVERY generator
+    vendor, the generator's own vendor must never appear anywhere in the
+    returned chain. A previous round's judge caught exactly this leak."""
+    from hydra_core.squad_node import _PP_GATE_TYPES
+
+    for gate_type in sorted(_PP_GATE_TYPES) + [None, "unknown_gate_type"]:
+        for generator in ("codex", "agy", "claude"):
+            chain = host_bridge._judge_vendor_chain(
+                generator, gate_type, ["codex", "agy", "claude"])
+            assert generator not in chain, (
+                f"generator={generator!r} gate_type={gate_type!r} chain={chain!r}"
+            )
+            assert chain, f"empty chain for generator={generator!r} gate_type={gate_type!r}"
+
+
+# ─── B9: real gate_type reaches _judge_vendor_chain end-to-end ──────────────
+#
+# The bug this closes: gate_type_used was hardcoded to _pp_gate_type("code",
+# "code_style") at every call site, so gate_type NEVER carried real signal
+# into _judge_vendor_chain and the security/spec/contract/design tiebreak
+# branches were unreachable dead code. These tests drive the real host_bridge
+# entry points (begin_stage -> submit_host_result) and assert the actual
+# gate_type argument _judge_vendor_chain receives, proving the plumbing (not
+# just the pure function) is fixed.
+
+def test_begin_stage_gate_type_reaches_judge_vendor_chain_design(tmp_path):
+    """A stage opened with gate_type='design' (e.g. an ARCH_RFC-triggered
+    attended task) must select an agy primary judge for the claude generator
+    -- the old hardcoded code_style default would have selected codex via
+    pp's own preferred_producers order instead."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path, gate_type="design")
+    # B9 site 1 (host_bridge.begin_stage): the resolved gate_type is
+    # persisted on the cursor.
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "design"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "model": "claude-opus-4-8"})
+    # B9 site 2 (the submit-host-result judge-routing step): the SAME
+    # gate_type reaches gate_eligible_judges and _judge_vendor_chain.
+    gate_call = next(a for (s, t, a, _sq) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "design"
+    assert res["host_action"]["judge_producer"] == "agy"
+
+
+def test_begin_stage_gate_type_reaches_judge_vendor_chain_security(tmp_path):
+    """gate_type='security' (e.g. a PRD-triggered attended task) must select
+    codex for the claude generator -- Hydra's operator-decided inversion of
+    pp's own agy-for-security preference."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path, gate_type="security")
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "security"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "model": "claude-opus-4-8"})
+    gate_call = next(a for (s, t, a, _sq) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "security"
+    assert res["host_action"]["judge_producer"] == "codex"
+
+
+def test_begin_stage_no_gate_type_falls_back_to_code_style_default(tmp_path):
+    """No gate_type signal (the planner-dispatched default case) must still
+    fall through to the documented code_style DEFAULT, unchanged from before
+    this fix."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "code_style"
