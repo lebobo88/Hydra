@@ -3157,6 +3157,22 @@ def _via_mcp(
     # who can swap those dirs already owns the host — no further mitigation needed.
     target_repo_id = getattr(inbound, "target_repo_id", None)
     target_repo_subpath = getattr(inbound, "target_repo_subpath", None)
+    _repo_target_source: str | None = "envelope" if target_repo_id else None
+    # B10: when the envelope itself carries no target_repo_id, fall back to
+    # the workflow's already-resolved target (state.target_repo_id /
+    # state.target_repo_subpath). Only PRD/DEV_TASK/CSuiteDecisionPacket-style
+    # envelopes with an explicit target_repo_id skip this fallback — PRD and
+    # ARCH_RFC schemas have no target_repo_id field at all, so without this
+    # fallback they could never reach engineering dispatch even when the
+    # workflow was planned with an explicit --repo <id>. The envelope value
+    # always wins when present; this is strictly a fallback, and it is
+    # resolved through the SAME resolve_repo_project_path call (and the same
+    # failure handling below) as an envelope-level target, so an invalid
+    # workflow-level id fails exactly the same way.
+    if not target_repo_id and pack.slug == "engineering" and state.target_repo_id:
+        target_repo_id = state.target_repo_id
+        target_repo_subpath = state.target_repo_subpath
+        _repo_target_source = "workflow"
     if target_repo_id and pack.slug == "engineering":
         from hydra_core.repo_registry import resolve_repo_project_path
         try:
@@ -3169,9 +3185,24 @@ def _via_mcp(
                 rationale=(
                     "repo-targeting rejected "
                     f"target_repo_id={target_repo_id!r} "
-                    f"target_repo_subpath={target_repo_subpath!r}: {e}"
+                    f"target_repo_subpath={target_repo_subpath!r} "
+                    f"(source={_repo_target_source}): {e}"
                 ),
             )
+        # Breadcrumb: record which source (envelope vs workflow) supplied the
+        # resolved target, so a future ledger reader can tell them apart.
+        try:
+            from . import telemetry as _tel
+            _tel.emit(
+                Path(project_path), state.workflow_id, "repo_target_resolved",
+                {
+                    "target_repo_id": target_repo_id,
+                    "target_repo_subpath": target_repo_subpath,
+                    "source": _repo_target_source,
+                },
+            )
+        except Exception:  # noqa: BLE001 — never abort dispatch on a trace write
+            pass
     elif pack.slug == "engineering":
         # WS1-E: the engineering squad must never silently fall back to the
         # Hydra cwd. squad.yaml's `invoke.project_path` is a non-engineering

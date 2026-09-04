@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins" / "hydra"
@@ -181,10 +182,31 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
         assert "disable-model-invocation: true" in body
 
 
-def test_hydra_persona_agent_adds_voice_without_duplicating_the_contract() -> None:
-    hydra = (PLUGIN_ROOT / "agents" / "hydra.md").read_text(encoding="utf-8")
+@pytest.mark.parametrize("agent_filename", ["hydra.md", "hydra-plaza.md"])
+def test_hydra_persona_agent_adds_voice_without_duplicating_the_contract(
+    agent_filename: str,
+) -> None:
+    body = (PLUGIN_ROOT / "agents" / agent_filename).read_text(encoding="utf-8")
 
-    assert "Hard Rule" not in hydra
-    assert "/pp:" not in hydra
+    assert "Hard Rule" not in body
+    assert "/pp:" not in body
     # No routing table (the squad registry table lives in AGENTS.md, not here).
-    assert "| Slug | Source pack | Entrypoint |" not in hydra
+    assert "| Slug | Source pack | Entrypoint |" not in body
+
+    # Frontmatter must omit tools:/model:/permissionMode: -- each omission is
+    # deliberate: `["*"]` is not a documented file form; a `model:` would
+    # force that model on every session in every project with the plugin
+    # enabled, overriding the operator's --model; permissionMode is ignored
+    # for plugin agents.
+    frontmatter = body.split("---\n", 2)[1]
+    assert "tools:" not in frontmatter
+    assert "model:" not in frontmatter
+    assert "permissionMode:" not in frontmatter
+
+
+def test_plugin_settings_scope_agent_to_plugin_namespace() -> None:
+    settings = json.loads((PLUGIN_ROOT / "settings.json").read_text(encoding="utf-8"))
+
+    # Scoped ("hydra:hydra"), not a bare "hydra" -- a bare name would not
+    # resolve for a plugin agent.
+    assert settings == {"agent": "hydra:hydra"}
