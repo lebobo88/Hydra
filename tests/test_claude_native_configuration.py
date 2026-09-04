@@ -173,9 +173,25 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
     }
     actual = {path.parent.name for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")}
     assert expected <= actual
-    assert not any(
-        any((ROOT / ".claude" / directory).iterdir())
-        for directory in ("agents", "commands", "skills", "hooks")
+
+    # Git does not track empty directories, so a fresh checkout of `.claude/`
+    # legitimately has NO `agents`/`commands`/`skills`/`hooks` directory at
+    # all after 41993f2 moved these operator artifacts into the plugin
+    # (plugins/hydra/). Absence satisfies the invariant at least as strongly
+    # as emptiness does -- do not "restore" these as empty dirs / .gitkeep,
+    # that would silently reintroduce the project-scope duplicates this
+    # assertion exists to forbid.
+    offenders: dict[str, list[str]] = {}
+    for directory in ("agents", "commands", "skills", "hooks"):
+        path = ROOT / ".claude" / directory
+        if not path.exists():
+            continue
+        entries = sorted(entry.name for entry in path.iterdir())
+        if entries:
+            offenders[directory] = entries
+    assert not offenders, (
+        "Project-scope .claude/ directories must not duplicate the plugin "
+        f"namespace, but found entries: {offenders}"
     )
     for skill in expected:
         body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
