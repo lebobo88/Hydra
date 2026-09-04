@@ -17,6 +17,8 @@ scaffolds) and its integration into ``_via_mcp``:
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -383,23 +385,27 @@ def test_drive_generate_prefers_host_engineer_and_codex_is_cross_vendor(monkeypa
 def test_drive_generate_falls_back_to_codex_when_no_host(monkeypatch) -> None:
     monkeypatch.setattr("hydra_core.squad_node._run_smoke",
                         lambda *_a, **_k: ("pass", "stub smoke pass"))
-    # F31: require cross-vendor so same-vendor codex→codex is flagged degraded.
+    # B4: require cross-vendor. codex generated → the authoritative
+    # cross-vendor mapping (`_judge_vendor_chain`) now picks agy as a
+    # GENUINE cross-vendor judge (not a same-vendor codex self-judge
+    # fallback, which was the only option before agy was wired in).
     resp = _happy_responses("pass")
     resp[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
         "required_cross_vendor": True, "rubric_id": "rfc-2119-normative"}}
+    resp[("pp_agy", "critique")] = {"status": "done", "result": {"parsed": {
+        "outcome": "pass", "critique_md": "c" * 90, "score": {"correctness": 9}}}}
     disp = _ScriptedDispatcher(resp)  # no run_host_agent
 
-    # Note: F31 fires (required_cross=True, codex judge = same-vendor → degraded)
-    # so the verdict is downgraded from pass→revise. The test verifies the FIRST
-    # record_verdict call carries the degraded marker, which is the key assertion.
     _drive_pp_stage_loop(
         disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
 
-    # No host → codex generated → same-vendor codex judge, marked degraded.
+    # No host → codex generated → genuine cross-vendor agy judge, not degraded.
     assert any(True for (s, t, _a) in disp.calls if (s, t) == ("pp_codex", "generate"))
+    assert any(True for (s, t, _a) in disp.calls if (s, t) == ("pp_agy", "critique"))
+    assert not any(True for (s, t, _a) in disp.calls if (s, t) == ("pp_codex", "critique"))
     rv = next(a for (s, t, a) in disp.calls if t == "record_verdict")
-    assert rv["score_json"].get("_cross_vendor") is False
-    assert rv["score_json"].get("_judge_degraded") is True
+    assert rv["score_json"].get("_cross_vendor") is True
+    assert not rv["score_json"].get("_judge_degraded")
 
 
 def test_cost_accumulated_even_when_generate_fails() -> None:
@@ -650,6 +656,185 @@ def test_judge_artifact_text_falls_back_to_summary() -> None:
     # Non-repo path → git diff fails → falls back to the summary.
     out = _judge_artifact_text("/nonexistent", ["foo.py"], "the summary")
     assert out == "the summary"
+
+
+# ─── B7: diff-truncation marker on _judge_artifact_text ────────────────────
+
+def _judge_git(root, *args):
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+
+
+def _judge_init_repo_with_modified_file(root, name="big.py", lines=4000):
+    """A committed repo with ONE file whose working-tree edit produces a
+    multi-KB unified diff (well over any small max_chars test cap)."""
+    (root / name).write_text("x = 1\n", encoding="utf-8")
+    _judge_git(root, "init", "-q")
+    _judge_git(root, "add", "-A")
+    _judge_git(root, "commit", "-q", "-m", "init")
+    (root / name).write_text("x = 1\n" + ("y = 2\n" * lines), encoding="utf-8")
+
+
+def test_judge_artifact_text_under_cap_has_no_truncation_marker(tmp_path) -> None:
+    """(a) A diff comfortably under max_chars is returned verbatim — no
+    truncation marker, and it contains the real diff content."""
+    _judge_init_repo_with_modified_file(tmp_path, lines=5)
+    out = _judge_artifact_text(str(tmp_path), ["big.py"], "summary",
+                               max_chars=40000)
+    assert "TRUNCATED BY THE HARNESS" not in out
+    assert "y = 2" in out
+    assert "summary" in out
+
+
+def test_judge_artifact_text_over_cap_marker_has_correct_n_m_k(tmp_path) -> None:
+    """(b) A diff over max_chars gets the explicit truncation marker with
+    correct N (shown), M (total), and K (files omitted entirely) numbers."""
+    # Three modified files, each producing a large diff chunk; a small
+    # max_chars only leaves room for a prefix of the first file's diff, so
+    # the other two are omitted ENTIRELY (K == 2).
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text("x = 1\n", encoding="utf-8")
+    _judge_git(tmp_path, "init", "-q")
+    _judge_git(tmp_path, "add", "-A")
+    _judge_git(tmp_path, "commit", "-q", "-m", "init")
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text(
+            "x = 1\n" + ("y = 2\n" * 2000), encoding="utf-8")
+
+    out = _judge_artifact_text(
+        str(tmp_path), ["a.py", "b.py", "c.py"], "summary", max_chars=3000)
+
+    assert "[!] DIFF TRUNCATED BY THE HARNESS" in out
+    m = re.search(
+        r"showing (\d+) of (\d+) characters; (\d+) file\(s\) omitted entirely",
+        out)
+    assert m, out[-400:]
+    shown, total, omitted = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    assert 0 < shown < total  # genuinely a partial view
+    assert omitted == 2  # only the first file's diff fit in the budget
+    assert "UNVERIFIED" in out
+
+
+def test_judge_artifact_text_truncated_never_exceeds_max_chars(tmp_path) -> None:
+    """(c) The returned string never exceeds max_chars INCLUDING the marker,
+    across several cap sizes small enough to force truncation."""
+    _judge_init_repo_with_modified_file(tmp_path, lines=4000)
+    for cap in (500, 1500, 3000, 10000):
+        out = _judge_artifact_text(str(tmp_path), ["big.py"], "summary",
+                                   max_chars=cap)
+        assert len(out) <= cap, (cap, len(out))
+
+
+# ─── D1: the marker itself must never be silently truncated ────────────────
+
+def test_judge_artifact_text_marker_boundary_caps_stay_intact(tmp_path) -> None:
+    """A marker cut mid-string is exactly the invisible-truncation failure
+    B7 exists to eliminate. Across caps at and around the marker's own
+    length (both the full N/M/K marker and the fixed-length minimal
+    fallback), the result must ALWAYS (len(out) <= cap) and must contain a
+    COMPLETE, parseable notice whenever the cap is large enough to hold one
+    — never a mangled fragment of either marker. Only below the minimal
+    marker's own length is a notice legitimately impossible; that is
+    asserted explicitly rather than silently ignored."""
+    from hydra_core.squad_node import (
+        _DIFF_TRUNCATION_MARKER_MINIMAL,
+        _DIFF_TRUNCATION_MARKER_TEMPLATE,
+    )
+    _judge_init_repo_with_modified_file(tmp_path, lines=4000)
+
+    minimal_len = len(_DIFF_TRUNCATION_MARKER_MINIMAL)
+    # Worst-case full-marker length for a single-file diff (K in {0,1}).
+    full_len = len(_DIFF_TRUNCATION_MARKER_TEMPLATE.format(
+        shown=99999, total=99999, omitted=1))
+
+    caps = sorted({
+        0, 1, 50,
+        minimal_len - 1, minimal_len, minimal_len + 1,
+        full_len - 1, full_len, full_len + 1,
+    })
+    # A genuinely INTACT full marker must parse back its own N/M/K numbers.
+    full_marker_re = re.compile(
+        r"\[!\] DIFF TRUNCATED BY THE HARNESS - showing (\d+) of (\d+) "
+        r"characters; (\d+) file\(s\) omitted entirely")
+
+    for cap in caps:
+        if cap < 0:
+            continue
+        out = _judge_artifact_text(str(tmp_path), ["big.py"], "summary",
+                                   max_chars=cap)
+        assert len(out) <= cap, (cap, len(out))
+
+        has_full = bool(full_marker_re.search(out))
+        has_minimal = _DIFF_TRUNCATION_MARKER_MINIMAL in out
+        # A "mangled fragment" would be a prefix of either marker that is
+        # NOT the complete marker string — assert that never happens by
+        # checking neither marker's literal opening tag appears without
+        # the marker being intact.
+        fragment_of_full = ("DIFF TRUNCATED BY THE HARNESS" in out
+                            and not has_full)
+        fragment_of_minimal = ("[!] TRUNCATED BY THE HARNESS" in out
+                               and not has_minimal and not has_full)
+        assert not fragment_of_full, (cap, out[-250:])
+        assert not fragment_of_minimal, (cap, out[-250:])
+
+        if cap >= full_len:
+            assert has_full, (cap, out[-250:])
+        elif cap >= minimal_len:
+            assert has_minimal, (cap, out[-250:])
+        else:
+            # Documented degenerate case: the cap is smaller than even the
+            # fixed-length minimal notice, so NO visible truncation warning
+            # can fit without breaking the max_chars contract. Truncation
+            # is genuinely invisible here — the caller's cap wins.
+            assert not has_full and not has_minimal
+
+
+# ─── D2: quoted/non-ASCII diff headers must not corrupt file attribution ──
+
+def test_judge_artifact_text_quoted_header_path_splits_and_counts_correctly(
+    tmp_path,
+) -> None:
+    """git quotes+octal-escapes a diff header path once it contains a
+    non-ASCII byte (core.quotepath defaults to true), e.g.
+    ``diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"``. Before the D2
+    fix that header didn't match the plain ``a/... b/...`` regex, so the
+    quoted file's diff silently merged into the PRECEDING file's chunk —
+    corrupting the K (files-omitted) count the truncation marker reports.
+    """
+    _judge_git(tmp_path, "init", "-q")
+    plain = tmp_path / "a_plain.py"
+    quoted = tmp_path / "café.py"
+    plain.write_text("x = 1\n", encoding="utf-8")
+    quoted.write_text("x = 1\n", encoding="utf-8")
+    _judge_git(tmp_path, "add", "-A")
+    _judge_git(tmp_path, "commit", "-q", "-m", "init")
+    plain.write_text("x = 1\n" + ("y = 2\n" * 1500), encoding="utf-8")
+    quoted.write_text("x = 1\n" + ("z = 3\n" * 1500), encoding="utf-8")
+
+    # Confirm this environment's git actually quotes the non-ASCII path
+    # (otherwise the test would trivially pass for the wrong reason).
+    raw = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--", "a_plain.py", "café.py"],
+        capture_output=True, text=True,
+    ).stdout
+    assert '"a/caf' in raw or '"b/caf' in raw, raw[:200]
+
+    from hydra_core.squad_node import _split_diff_into_file_chunks
+    chunks = _split_diff_into_file_chunks(raw)
+    paths = [p for p, _chunk in chunks]
+    assert "café.py" in paths  # correctly split into its OWN chunk
+    assert len(chunks) == 2  # NOT merged into the preceding file's chunk
+
+    # And end-to-end: a small cap should correctly report exactly ONE file
+    # omitted entirely (whichever diff chunk didn't fit), not zero (which
+    # is what the pre-fix merge bug would silently produce).
+    out = _judge_artifact_text(
+        str(tmp_path), ["a_plain.py", "café.py"], "summary", max_chars=1500)
+    m = re.search(r"(\d+) file\(s\) omitted entirely", out)
+    assert m, out[-300:]
+    assert int(m.group(1)) == 1
 
 
 def test_judge_defaults_cross_vendor_codex_when_gate_unavailable(monkeypatch) -> None:
@@ -983,3 +1168,248 @@ def test_via_mcp_without_hydra_context_block_prompt_unchanged(monkeypatch) -> No
     assert "## Hydra context" not in gen_prompt, (
         "generate prompt must not contain a Hydra context header when block is absent"
     )
+
+
+# --------------------------------------------------------------------------- #
+# B9: real gate_type threading (headless single-candidate + best-of + _via_mcp)
+# --------------------------------------------------------------------------- #
+#
+# Before this fix every headless call site hardcoded
+# gate_type_used = _pp_gate_type("code", "code_style"), so the security/spec/
+# contract/design tiebreak branches in _judge_vendor_chain were unreachable
+# dead code. These tests drive the real functions (not just the pure
+# _judge_vendor_chain helper) and assert the real gate_type argument reaches
+# gate_eligible_judges / _judge_vendor_chain.
+
+def test_gate_type_for_envelope_maps_hydra_envelope_types() -> None:
+    from hydra_core.squad_node import _gate_type_for_envelope
+
+    assert _gate_type_for_envelope("PRD") == "spec"
+    assert _gate_type_for_envelope("ARCH_RFC") == "design"
+    assert _gate_type_for_envelope("DEV_TASK") == "code_style"
+    assert _gate_type_for_envelope("HANDOFF") == "code_style"
+    # Unrecognized/missing type (e.g. the planner's C_SUITE_DECISION_PACKET
+    # dispatch envelope) falls through to the documented code_style DEFAULT.
+    assert _gate_type_for_envelope("C_SUITE_DECISION_PACKET") == "code_style"
+    assert _gate_type_for_envelope(None) == "code_style"
+
+
+def test_drive_pp_stage_loop_single_candidate_threads_gate_type(monkeypatch) -> None:
+    """squad_node call site (single-candidate path): the caller-supplied
+    gate_type must be the SAME value sent to gate_eligible_judges."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing",
+        gate_type="security")
+    assert out["final_status"] == "complete"
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "security"
+
+
+def test_drive_pp_stage_loop_default_gate_type_is_code_style() -> None:
+    """No gate_type supplied -- falls through to the documented DEFAULT,
+    unchanged from before this fix."""
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "code_style"
+
+
+def _best_of_responses_b9(n_candidates: int = 1) -> dict:
+    cands = [
+        {"candidate_index": i, "attempt_slot_id": f"slot{i}",
+         "worktree_path": f"/tmp/b9c{i}", "worktree_mode": "copy"}
+        for i in range(1, n_candidates + 1)
+    ]
+    return {
+        ("pp_harness", "start_best_of_stage"): {"status": "done", "result": {
+            "stage_id": "st_b9", "candidates": cands}},
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
+        ("pp_codex", "generate"): {"status": "done", "result": {
+            "text": "edited foo.py", "model": "codex-1",
+            "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": "x"}},
+        ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_b9"}},
+        ("pp_codex", "critique"): {"status": "done", "result": {"parsed": {
+            "outcome": "pass", "critique_md": "ok", "score": {}}}},
+        ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
+        ("pp_harness", "record_smoke_status"): {"status": "done", "result": {}},
+        ("pp_harness", "get_stage_finalize_readiness"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {"status": "done", "result": {
+            "effective_status": "complete", "status": "complete"}},
+        ("pp_harness", "borda_count"): {"status": "done", "result": {"winner": "att_b9"}},
+        ("pp_harness", "archive_winner_and_losers"): {"status": "done", "result": {
+            "merge_status": "merged", "winner_diff_path": "w.diff"}},
+        ("pp_harness", "teardown_candidates"): {"status": "done", "result": {
+            "teardown_status": "ok"}},
+    }
+
+
+class _B9BoDispatcher:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[tuple] = []
+
+    def call_mcp(self, server, tool, args, *, squad_id=None):
+        self.calls.append((server, tool, dict(args)))
+        return self.responses.get((server, tool), {"status": "done", "result": {}})
+
+    def emit_claude_prompt(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def invoke_claude_skill(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def spawn_subprocess(self, *a, **k): raise NotImplementedError  # pragma: no cover
+
+
+def test_drive_best_of_loop_threads_gate_type(monkeypatch) -> None:
+    """squad_node call site (best-of path): the caller-supplied gate_type
+    must reach BOTH start_best_of_stage and gate_eligible_judges/
+    _judge_vendor_chain -- not the old hardcoded code_style literal."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _B9BoDispatcher(_best_of_responses_b9(n_candidates=1))
+    out = _drive_best_of_loop(
+        disp, run_id="run_b9", project_path="/tmp/proj", request_text="do it",
+        n=1, gate_type="contract")
+    assert out is not None
+    open_call = next(a for (s, t, a) in disp.calls if t == "start_best_of_stage")
+    assert open_call["gate_type"] == "contract"
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "contract"
+
+
+def test_via_mcp_threads_real_gate_type_from_dev_task(monkeypatch) -> None:
+    """_via_mcp call site: a DEV_TASK-typed inbound envelope must resolve to
+    gate_type='code_style' and that exact value must reach
+    _drive_pp_stage_loop (proving the end-to-end envelope -> kind ->
+    gate_type derivation, not just the pure mapping function)."""
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    _via_mcp(state, pack, _inbound(state), disp)
+
+    assert captured.get("gate_type") == "code_style"
+
+
+def test_via_mcp_threads_real_gate_type_from_prd_envelope(monkeypatch) -> None:
+    """A PRD-typed inbound envelope (squad.yaml accepts PRD/ARCH_RFC/DEV_TASK/
+    HANDOFF) must resolve to gate_type='spec' and that exact value must reach
+    _drive_pp_stage_loop."""
+    from uuid import uuid4
+
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    class _FakePRDEnvelope:
+        """Minimal stand-in carrying only what _via_mcp reads via getattr --
+        the real PRD schema has no target_repo_id field, so a genuine PRD
+        instance can never resolve a dispatch target; this fake proves the
+        gate_type derivation without fighting that unrelated constraint."""
+        type = "PRD"
+
+        def __init__(self, workflow_id):
+            self.id = uuid4()
+            self.workflow_id = workflow_id
+            self.origin_squad = "hydra"
+            self.model_tier = None
+            self.target_repo_id = "hydra"
+            self.target_repo_subpath = None
+            self.instructions = "write the PRD"
+            self.summary = None
+            self.objective = None
+            self.pp_team = None
+            self.pp_profile = None
+
+        def model_dump(self, mode="json"):
+            return {"type": self.type}
+
+    inbound = _FakePRDEnvelope(state.workflow_id)
+    _via_mcp(state, pack, inbound, disp)
+
+    assert captured.get("gate_type") == "spec"
+
+
+def test_via_mcp_threads_real_gate_type_from_arch_rfc_envelope(monkeypatch) -> None:
+    """An ARCH_RFC-typed inbound envelope must resolve to gate_type='design'
+    and that exact value must reach _drive_pp_stage_loop."""
+    from uuid import uuid4
+
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    class _FakeArchRFCEnvelope:
+        type = "ARCH_RFC"
+
+        def __init__(self, workflow_id):
+            self.id = uuid4()
+            self.workflow_id = workflow_id
+            self.origin_squad = "hydra"
+            self.model_tier = None
+            self.target_repo_id = "hydra"
+            self.target_repo_subpath = None
+            self.instructions = "review the architecture"
+            self.summary = None
+            self.objective = None
+            self.pp_team = None
+            self.pp_profile = None
+
+        def model_dump(self, mode="json"):
+            return {"type": self.type}
+
+    inbound = _FakeArchRFCEnvelope(state.workflow_id)
+    _via_mcp(state, pack, inbound, disp)
+
+    assert captured.get("gate_type") == "design"

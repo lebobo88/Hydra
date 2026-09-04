@@ -433,7 +433,8 @@ class TestPpBestOfImpliesN3:
 
         def _fake_best_of(dispatcher, *, run_id, project_path, request_text,
                           n, model_tier=None, judge_rubric_id=None, workflow_id=None,
-                          state=None, repo_id=None):  # MU16: budget-gate kwargs
+                          state=None, repo_id=None,  # MU16: budget-gate kwargs
+                          gate_type=None):  # B9: real gate_type threading
             n_received.append(n)
             return {
                 "final_status": "complete", "stage_outcome": outcome,

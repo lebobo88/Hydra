@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hydra_core.proc import no_window_creationflags
+
 # ---------------------------------------------------------------------------
 # Allow-list: repo_id -> directory NAME (or forward-slash-separated relative
 # path) under the shared base dir. Keys are lower-case normalised identifiers.
@@ -141,6 +143,7 @@ def _get_base() -> Path:
                 text=True, encoding="utf-8", errors="replace",
                 timeout=5,
                 check=False,
+                creationflags=no_window_creationflags(),
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 raw = proc.stdout.strip()
@@ -301,6 +304,7 @@ def resolve_repo_path(repo_id: str) -> Path:
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
             check=False,
+            creationflags=no_window_creationflags(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         raise ValueError(
@@ -482,6 +486,7 @@ def register_repo(repo_id: str, path: str, *, force: bool = False,
                 ["git", "init", str(target)],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, check=False,
+                creationflags=no_window_creationflags(),
             )
             if proc.returncode != 0:
                 raise ValueError(f"git init failed for {target}: {proc.stderr.strip()}")

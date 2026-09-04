@@ -21,7 +21,7 @@ from hydra_core.repo_registry import (
     resolve_repo_path,
     resolve_repo_project_path,
 )
-from hydra_core.schemas import CSuiteDecisionPacket
+from hydra_core.schemas import ArchRFC, CSuiteDecisionPacket, PRD
 from hydra_core.squad_loader import SquadPack
 from hydra_core.squad_node import _via_mcp
 from hydra_core.state import HydraState
@@ -1095,6 +1095,192 @@ def test_preseeded_target_repo_ids_win_over_conflicting_goal_repos_flag() -> Non
     assert task_repo_ids == {"hydra", "pair-programmer"}, (
         f"pre-seeded target_repo_ids must win; got {task_repo_ids}"
     )
+
+
+# ---------------------------------------------------------------------------
+# B10 — _via_mcp falls back to state.target_repo_id when the envelope itself
+# carries none, resolved through the SAME resolve_repo_project_path call and
+# the SAME failure handling as an envelope-level target.
+# ---------------------------------------------------------------------------
+
+
+def test_via_mcp_envelope_target_wins_over_workflow_target() -> None:
+    """(a) envelope-level target_repo_id must win when both envelope AND
+    workflow (state) carry one."""
+    state = HydraState(root_goal="Fix something", target_repo_id="pair-programmer")
+    pack = _make_engineering_pack()
+    inbound = CSuiteDecisionPacket(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        origin="BOARDROOM",
+        objective="Fix something",
+        target_repo_id="hydra",
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
+    expected_path = str(resolve_repo_path("hydra"))
+    assert captured[0]["project_path"] == expected_path, (
+        "envelope-level target_repo_id='hydra' must win over "
+        f"workflow-level 'pair-programmer'; got {captured[0]['project_path']!r}"
+    )
+
+
+def test_via_mcp_arch_rfc_falls_back_to_workflow_target_repo_id() -> None:
+    """(b) ARCH_RFC has no target_repo_id field at all -- _via_mcp must fall
+    back to state.target_repo_id so the dispatch reaches engineering instead
+    of dying at the WS1-E guard."""
+    state = HydraState(root_goal="Design something", target_repo_id="hydra")
+    pack = _make_engineering_pack()
+    inbound = ArchRFC(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        risk_assessment="low",
+        rollout_plan="staged",
+    )
+    assert getattr(inbound, "target_repo_id", None) is None, (
+        "ArchRFC must not carry a target_repo_id field (that's the whole point)"
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
+    expected_path = str(resolve_repo_path("hydra"))
+    assert captured[0]["project_path"] == expected_path
+
+
+def test_via_mcp_prd_falls_back_to_workflow_target_repo_id() -> None:
+    """(b) PRD has no target_repo_id field either -- same fallback."""
+    state = HydraState(root_goal="Spec something", target_repo_id="hydra")
+    pack = _make_engineering_pack()
+    inbound = PRD(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        source_goal_id=uuid.uuid4(),
+        summary="a spec",
+    )
+    assert getattr(inbound, "target_repo_id", None) is None, (
+        "PRD must not carry a target_repo_id field (that's the whole point)"
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
+    expected_path = str(resolve_repo_path("hydra"))
+    assert captured[0]["project_path"] == expected_path
+
+
+def test_via_mcp_no_envelope_and_no_workflow_target_still_fails_closed() -> None:
+    """(c) neither the envelope nor the workflow carries a target -- the WS1-E
+    guard must still fire; no silent cwd fallback."""
+    state = HydraState(root_goal="Fix something else")  # no target_repo_id
+    pack = _make_engineering_pack()
+    inbound = CSuiteDecisionPacket(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        origin="BOARDROOM",
+        objective="Fix something else",
+        # no target_repo_id
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status == "failed"
+    assert "target" in result.rationale.lower()
+    assert not captured, "no pp run should ever be started without a resolved target"
+
+
+def test_via_mcp_invalid_workflow_target_fails_same_as_invalid_envelope_target() -> None:
+    """(d) an invalid workflow-level id must fail exactly like an invalid
+    envelope-level id does -- same resolve_repo_project_path call, same
+    exception handling, same 'repo-targeting rejected' message shape."""
+    state = HydraState(root_goal="Fix something", target_repo_id="totally-bogus-repo-id")
+    pack = _make_engineering_pack()
+    inbound = ArchRFC(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        risk_assessment="low",
+        rollout_plan="staged",
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status == "failed"
+    assert "repo-targeting rejected" in result.rationale
+    assert "totally-bogus-repo-id" in result.rationale
+    assert not captured
+
+
+def test_via_mcp_arch_rfc_workflow_target_end_to_end_gate_type_design() -> None:
+    """(e) The most important assertion in this file: an ARCH_RFC submitted
+    into a workflow planned with a workflow-level target_repo_id must (1)
+    actually dispatch (not die at WS1-E) and (2) map to gate_type == 'design'
+    via _gate_type_for_envelope. This is the first configuration in which the
+    design -> agy route has any reachable caller at all (B9's gate-mapping
+    table only had unreachable callers for ARCH_RFC before B10)."""
+    from hydra_core.squad_node import _gate_type_for_envelope
+
+    state = HydraState(root_goal="Design something", target_repo_id="hydra")
+    pack = _make_engineering_pack()
+    inbound = ArchRFC(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        risk_assessment="low",
+        rollout_plan="staged",
+    )
+    dispatcher, captured = _make_stub_dispatcher()
+
+    result = _via_mcp(state, pack, inbound, dispatcher)
+
+    assert result.status != "failed", f"_via_mcp failed unexpectedly: {result.rationale}"
+    assert captured, "ARCH_RFC + workflow-level target must reach pp start_run"
+    assert _gate_type_for_envelope(inbound.type) == "design", (
+        "ARCH_RFC must map to gate_type='design' (the design -> agy route)"
+    )
+
+
+def test_via_mcp_records_repo_target_source_breadcrumb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The breadcrumb (state.target_repo_source-adjacent telemetry) must record
+    which source (envelope vs workflow) supplied the resolved target, per the
+    task's 'record which source' requirement."""
+    emitted: list[tuple[str, dict]] = []
+
+    def _fake_emit(project_root, workflow_id, kind, payload):  # noqa: ANN001
+        emitted.append((kind, payload))
+
+    monkeypatch.setattr("hydra_core.telemetry.emit", _fake_emit)
+
+    state = HydraState(root_goal="Design something", target_repo_id="hydra")
+    pack = _make_engineering_pack()
+    inbound = ArchRFC(
+        workflow_id=state.workflow_id,
+        origin_squad="hydra",
+        target_squad="engineering",
+        risk_assessment="low",
+        rollout_plan="staged",
+    )
+    dispatcher, _captured = _make_stub_dispatcher()
+
+    _via_mcp(state, pack, inbound, dispatcher)
+
+    breadcrumbs = [p for k, p in emitted if k == "repo_target_resolved"]
+    assert breadcrumbs, "expected a repo_target_resolved telemetry breadcrumb"
+    assert breadcrumbs[0]["source"] == "workflow"
+    assert breadcrumbs[0]["target_repo_id"] == "hydra"
 
 
 def test_parse_repo_arg_short_typo_raises_valueerror() -> None:

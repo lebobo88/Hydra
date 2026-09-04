@@ -42,6 +42,10 @@ from typing import Any, Optional, Sequence
 import re as _re
 
 from . import telemetry as _telemetry
+from .judge_vendor import (
+    _base_judge_vendor,
+    _judge_vendor_chain,
+)
 from .proc import run_text
 from .squad_node import (
     Dispatcher,
@@ -235,16 +239,22 @@ def _classify_infra_failure(exc: Exception | None) -> str:
 # It is a LABEL, not a vendor: strip it before looking up model pins.
 _SAME_VENDOR_HOST_SUFFIX = "-same-vendor-host"
 
-# Static fallback for pp's pinned critique model ids, used when the
-# ``pp_harness.doctor`` probe is unavailable. Mirrors pp's DEFAULT_MODELS
-# (``codex_critique`` / ``codex_critique_escalated`` / ``agy_critique``).
+# Static fallback for pp's pinned critique model ids, used ONLY when the
+# ``pp_harness.doctor`` probe is unavailable (B1: doctor's live
+# ``judge_capabilities`` is otherwise always authoritative -- see
+# ``allowed_judge_model_ids`` below). Mirrors pp's current
+# ``JUDGE_MODEL_POLICY`` (daemon/src/config.ts): codex default/escalated
+# ``gpt-5.6-terra`` / ``gpt-5.6-sol``; agy default/escalated
+# ``gemini-3.8-flash-medium`` / ``gemini-3.1-pro-high``. Keep these in sync
+# with pp's ``JUDGE_MODEL_POLICY`` when pp repins -- a stale id here is only a
+# fallback-of-last-resort, but a stale one is still wrong.
 # ``claude`` is present with an EMPTY tuple on purpose: pp does not pin Claude
 # critique models, so any id is acceptable and no normalization applies -- but
 # "claude" must still be a KNOWN producer so the same-vendor judge is not
 # rejected as unsupported.
 _STATIC_JUDGE_MODEL_PINS: dict[str, tuple[str, ...]] = {
-    "codex": ("gpt-5.4", "gpt-5.5"),
-    "agy": ("gemini-3.1-pro-preview",),
+    "codex": ("gpt-5.6-terra", "gpt-5.6-sol"),
+    "agy": ("gemini-3.8-flash-medium", "gemini-3.1-pro-high"),
     "claude": (),
 }
 
@@ -263,23 +273,78 @@ _MAX_JUDGE_MODEL_CORRECTIONS = 2
 _JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
 
 
-def _base_judge_vendor(producer: Any) -> str:
-    """Strip the LV-3 ``-same-vendor-host`` label suffix off a judge producer."""
-    p = str(producer or "")
-    if p.endswith(_SAME_VENDOR_HOST_SUFFIX):
-        return p[: -len(_SAME_VENDOR_HOST_SUFFIX)]
-    return p
+def _judge_pending_action(*, call_key: str, judge_agent: str, gate_rubric: str,
+                          rubric_fallback: bool, required_cross: bool,
+                          judge_text: str, rubric_body: str, work_path: Any,
+                          allowed_models: dict[str, list[str]],
+                          judge_producer: str,
+                          failover_note: str = "") -> dict[str, Any]:
+    """Build the judge host_action, including B2's selected ``judge_producer``
+    (from the authoritative cross-vendor mapping, not pp's raw pool order) and
+    that vendor's ``preferred_models``. Shared by the initial judge dispatch
+    and by ``_apply_judge``'s engine-side ``judge_tool_failed`` failover so
+    both paths hand the host an identically-shaped instruction.
+    """
+    preferred_models = allowed_models.get(judge_producer, [])
+    return {
+        "call_key": call_key,
+        "agent_type": judge_agent,
+        "rubric_id": gate_rubric,
+        "rubric_fallback": rubric_fallback,
+        "required_cross_vendor": required_cross,
+        "artifact_text": judge_text,
+        "rubric_md": rubric_body,
+        "cwd": work_path,
+        "allowed_judge_model_ids": allowed_models,
+        # B2: the producer the host MUST use, per pp's authoritative
+        # cross-vendor mapping -- not merely a hint among several.
+        "judge_producer": judge_producer,
+        "preferred_models": preferred_models,
+        "instructions": (
+            f"Spawn the visible `{judge_agent}` subagent to judge the diff "
+            f"against rubric {gate_rubric}"
+            + (" (NOTE: no registry served this rubric's body — `rubric_md` "
+               "below is the GENERIC fallback text, judge against that)"
+               if rubric_fallback else "")
+            + f". Use judge_producer={judge_producer!r} "
+            f"(preferred_models={preferred_models!r}) per pp's cross-vendor "
+            "mapping in judge-cross-vendor.md -- do not substitute a "
+            "different vendor unless this host_action tells you to fail "
+            "over. If the chosen vendor's CLI is not configured, return "
+            "{judge_tool_failed: true, reason, vendor, model: null} and "
+            "STOP; do NOT silently fall back to another vendor yourself. "
+            + (failover_note + " " if failover_note else "")
+            + "Then call submit-host-result with "
+            "{call_key, result:{outcome:pass|revise|fail, critique_md, "
+            "judge_producer, judge_model_id, score_json, cost_usd}}. "
+            "Report judge_model_id exactly as the critique tool returned it; "
+            "if the tool named no model, use the pinned id for that producer "
+            f"from allowed_judge_model_ids ({allowed_models!r}). Never invent "
+            "a model id."),
+    }
 
 
 def allowed_judge_model_ids(dispatcher: Dispatcher | None,
                             *, refresh: bool = False) -> dict[str, list[str]]:
-    """Return ``{judge_producer: [acceptable model ids]}``.
+    """Return ``{judge_producer: [acceptable model ids]}``, default id first.
 
-    Sourced from ``pp_harness.doctor``'s ``judge_capabilities`` map (the
-    authority on what each vendor's critique tool is pinned to), UNIONED with
-    the static fallback above -- doctor reports only the DEFAULT critique
-    model, while pp additionally accepts codex's escalated id, so neither
-    source alone is complete.
+    B1: sourced from ``pp_harness.doctor``'s ``judge_capabilities`` map --
+    pp added ``allowed_critique_models`` and ``escalated_critique_model``
+    fields specifically so downstream callers stop hard-coding stale static
+    pins (see the comment above ``describeJudgeCapabilities`` in pp's
+    ``gates.ts``). When doctor reports a vendor, its full allow-list (default
+    id first, then escalated, then any remaining allow-listed ids) WINS
+    outright for that vendor -- it does not merely get merged in front of the
+    static fallback. The static map above is used only when doctor is
+    unreachable or reports nothing for a vendor.
+    #
+    # This also fixes the model-id-index-0 bug: the previous implementation
+    # inserted only doctor's DEFAULT ``critique_model`` at the front of the
+    # (stale) static bucket and never consulted ``escalated_critique_model``
+    # or ``allowed_critique_models`` at all, so a judge legitimately
+    # reporting the escalated id (e.g. codex's ``gpt-5.6-sol``) would not be
+    # found in the bucket and got silently rewritten down to the default
+    # (``gpt-5.6-terra``) by the normalization step in ``_apply_judge``.
 
     Fail-soft in every direction: a missing dispatcher, an RBAC denial, a
     transport error, or a malformed payload all fall back to the static map.
@@ -302,12 +367,28 @@ def allowed_judge_model_ids(dispatcher: Dispatcher | None,
                 for vendor, summary in caps.items():
                     if not isinstance(summary, dict):
                         continue
-                    bucket = pins.setdefault(str(vendor), [])
-                    model = summary.get("critique_model")
-                    if model and str(model) not in bucket:
-                        # Front of the list: doctor's value is the vendor's
-                        # DEFAULT pin, which is what normalization targets.
-                        bucket.insert(0, str(model))
+                    doctor_ids: list[str] = []
+                    default_model = (summary.get("critique_model")
+                                     or summary.get("default_critique_model"))
+                    if default_model:
+                        doctor_ids.append(str(default_model))
+                    escalated_model = summary.get("escalated_critique_model")
+                    if escalated_model and str(escalated_model) not in doctor_ids:
+                        doctor_ids.append(str(escalated_model))
+                    allow_list = summary.get("allowed_critique_models")
+                    if isinstance(allow_list, list):
+                        for m in allow_list:
+                            if m and str(m) not in doctor_ids:
+                                doctor_ids.append(str(m))
+                    if doctor_ids:
+                        # Doctor is authoritative for this vendor: replace the
+                        # static fallback entirely rather than merging, so a
+                        # stale static id can never linger in the bucket.
+                        pins[str(vendor)] = doctor_ids
+                    elif str(vendor) not in pins:
+                        # A vendor doctor knows about but pins nothing for
+                        # (e.g. claude) -- record it as known with no pin.
+                        pins[str(vendor)] = []
         except Exception:  # noqa: BLE001 — never block a stage on a probe
             pass
     _JUDGE_MODEL_PIN_CACHE = {k: tuple(v) for k, v in pins.items()}
@@ -1666,6 +1747,12 @@ def begin_stage(
     task_id: str | None = None,
     isolate: bool = True,
     hydra_context_block: str | None = None,
+    # B9: the real pp gate_type for this stage's triggering envelope (see
+    # squad_node._gate_type_for_envelope / _ENVELOPE_TYPE_TO_KIND). The
+    # caller passes the actual envelope type (PRD/ARCH_RFC/DEV_TASK/HANDOFF)
+    # it resolved for this task, or None when no better signal exists — this
+    # falls through to the documented code_style DEFAULT via `_pp_gate_type`.
+    gate_type: str | None = None,
 ) -> dict[str, Any]:
     """Open an attended code stage and pause for the first host action (the
     ``engineer`` generation). ``run_id`` must already exist (the caller runs
@@ -1680,14 +1767,17 @@ def begin_stage(
     """
     # Browser isolation parity with the headless driver (PP-BV-ISO).
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
-    # E2-25: an attended stage is always kind="code", so its default rubric is
-    # the code rubric. It used to default to the SPEC rubric
-    # `rfc-2119-normative`, which pp's gates.ts maps only to gate_type="spec" —
-    # and whose body no registry served for the unversioned id, so every code
-    # stage was silently judged on a generic one-liner while the ledger recorded
-    # the spec rubric's name.
-    judge_rubric_id = judge_rubric_id or _default_rubric_id(
-        _pp_gate_type("code", "code_style"))
+    # B9: resolve the real gate_type ONCE here and persist it on the cursor
+    # (below) so the later submit-host-result step reads the SAME value
+    # instead of re-deriving (and potentially drifting from) a second
+    # hardcoded literal. E2-25: still defaults to the code rubric (NOT the
+    # spec rubric `rfc-2119-normative`, which pp's gates.ts maps only to
+    # gate_type="spec") when the caller carries no better signal — it used to
+    # default to that spec rubric unconditionally, and whose body no registry
+    # served for the unversioned id, so every code stage was silently judged
+    # on a generic one-liner while the ledger recorded the spec rubric's name.
+    gate_type = _pp_gate_type("code", gate_type)
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     cm = dispatcher.call_mcp
 
     st = _raise_on_error_payload(
@@ -1743,6 +1833,10 @@ def begin_stage(
         "hydra_context_block": hydra_context_block or "",
         "model_tier": model_tier,
         "judge_rubric_id": judge_rubric_id,
+        # B9: persisted so the later submit-host-result step (a separate host
+        # round-trip, possibly a fresh process) uses the SAME gate_type this
+        # stage opened with instead of re-deriving it.
+        "gate_type": gate_type,
         "state": "await_generate",
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
         "baseline_failures": baseline_failures,
@@ -1894,11 +1988,15 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 
     # Judge routing — honour pp's gate_eligible_judges (cross- vs same-vendor)
     # exactly like the headless loop, so the host spawns the right judge agent.
+    # B9: reuse the SAME gate_type this stage opened with (persisted on the
+    # cursor by begin_stage) rather than re-deriving a hardcoded literal here
+    # — the two must never drift from each other.
+    gate_type_used = cursor.get("gate_type") or _pp_gate_type("code", "code_style")
     gate_dec: dict[str, Any] = {}
     try:
         gate_dec = _pp_inner(_raise_on_error_payload(
             cm("pp_harness", "gate_eligible_judges", {
-                "gate_type": _pp_gate_type("code", "code_style"),
+                "gate_type": gate_type_used,
                 "generator_producer": producer,
                 "prompt_keywords": cursor["request_text"][:1000],
             }, squad_id=_SQ),
@@ -1907,6 +2005,13 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     except Exception:  # noqa: BLE001
         gate_dec = {}
     required_cross = bool(gate_dec.get("required_cross_vendor", True))
+    # B2: pull pp's own closing (cross-vendor) lane so its preferred_producers
+    # feed the vendor-selection mapping below instead of being discarded.
+    allowed_judges_list = gate_dec.get("allowed_judges") or []
+    _closing_lane = next(
+        (j for j in allowed_judges_list if isinstance(j, dict) and j.get("closing")),
+        None) or {}
+    _pp_preferred_producers = _closing_lane.get("preferred_producers") or []
     # E2-25: pp and Hydra both key rubrics by an immutable `@N`; a bare base id
     # resolves to the highest registered version before it reaches the judge or
     # the ledger. An id nothing registers is traced, not silently accepted.
@@ -1919,6 +2024,17 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # when cross-vendor is NOT required; otherwise the host must spawn the
     # cross-vendor judge (codex/agy critique).
     judge_agent = "judge-cross-vendor" if required_cross else "judge-same-vendor"
+    # B2: select the judge PRODUCER, not just the agent type. For a
+    # cross-vendor gate the mapping is authoritative (judge-cross-vendor.md);
+    # for a same-vendor gate the judge is the generator's own vendor by
+    # definition. The chain's remaining entries are engine-side failover
+    # targets for `judge_tool_failed` (see `_apply_judge`).
+    if required_cross:
+        judge_vendor_chain = _judge_vendor_chain(
+            producer, gate_type_used, _pp_preferred_producers)
+    else:
+        judge_vendor_chain = [_base_judge_vendor(producer)]
+    judge_producer_selected = judge_vendor_chain[0]
     rubric_body, rubric_fallback = _rubric_md_ex(gate_rubric, dispatcher)
     if rubric_fallback:
         # The judge is about to see the GENERIC rubric, not the named one. Say so
@@ -1934,6 +2050,12 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["gate_rubric"] = gate_rubric
     cursor["gate_rubric_fallback"] = rubric_fallback
     cursor["required_cross"] = required_cross
+    # B2: the engine-owned vendor failover chain + cursor into it. Failover on
+    # `judge_tool_failed` NEVER happens agent-side (pp's judge-cross-vendor
+    # spec forbids it -- it can land a same-vendor judge and trip F31); it is
+    # driven from here, in `_apply_judge`.
+    cursor["judge_vendor_chain"] = judge_vendor_chain
+    cursor["judge_vendor_chain_idx"] = 0
     cursor["state"] = "await_judge"
     # LV-8: scope the call_key with run_id + stage_id, not just the generate
     # index. This value round-trips verbatim as pp's record_verdict
@@ -1965,30 +2087,12 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # producer, so the judge subagent reports a pinned id instead of guessing
     # one that record_verdict then rejects.
     allowed_models = allowed_judge_model_ids(dispatcher)
-    cursor["pending_action"] = {
-        "call_key": judge_call_key,
-        "agent_type": judge_agent,
-        "rubric_id": gate_rubric,
-        "rubric_fallback": rubric_fallback,
-        "required_cross_vendor": required_cross,
-        "artifact_text": judge_text,
-        "rubric_md": rubric_body,
-        "cwd": work_path,
-        "allowed_judge_model_ids": allowed_models,
-        "instructions": (
-            f"Spawn the visible `{judge_agent}` subagent to judge the diff "
-            f"against rubric {gate_rubric}"
-            + (" (NOTE: no registry served this rubric's body — `rubric_md` "
-               "below is the GENERIC fallback text, judge against that)"
-               if rubric_fallback else "")
-            + ". Then call submit-host-result with "
-            "{call_key, result:{outcome:pass|revise|fail, critique_md, "
-            "judge_producer, judge_model_id, score_json, cost_usd}}. "
-            "Report judge_model_id exactly as the critique tool returned it; "
-            "if the tool named no model, use the pinned id for that producer "
-            f"from allowed_judge_model_ids ({allowed_models!r}). Never invent "
-            "a model id."),
-    }
+    cursor["pending_action"] = _judge_pending_action(
+        call_key=judge_call_key, judge_agent=judge_agent, gate_rubric=gate_rubric,
+        rubric_fallback=rubric_fallback, required_cross=required_cross,
+        judge_text=judge_text, rubric_body=rubric_body, work_path=work_path,
+        allowed_models=allowed_models, judge_producer=judge_producer_selected,
+    )
     _trace(cursor, "attended.attempt_recorded", {
         "stage_id": stage_id, "attempt_id": cursor["attempt_id"],
         "producer": producer, "judge_agent": judge_agent,
@@ -2019,9 +2123,74 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     a ``{"ok": False, "retryable": True, ...}`` dict for the caller to relay,
     instead of surfacing a passing stage.
 
+    B2: a judge that could not reach its assigned vendor's CLI reports
+    ``{judge_tool_failed: true, reason, vendor, model: null}`` per
+    judge-cross-vendor.md and MUST NOT silently fall back to a different
+    vendor itself (that can land a same-vendor judge and trip F31's
+    degraded-downgrade undetected). Failover instead happens HERE, engine
+    side: the next entry in ``cursor["judge_vendor_chain"]`` is selected and
+    the SAME pending_action/call_key is reissued pointing at it.
+
     Returns ``None`` on a normal transition, or the host-correctable error
     dict described above.
     """
+    # B2: engine-side judge-vendor failover. Checked before anything else is
+    # accrued/recorded -- a failed judge tool call produced no verdict, so
+    # nothing needs to be undone, only the pending_action needs to move on to
+    # the next vendor in the chain.
+    if result.get("judge_tool_failed"):
+        chain = list(cursor.get("judge_vendor_chain") or [])
+        idx = int(cursor.get("judge_vendor_chain_idx") or 0)
+        stage_id = cursor.get("stage_id")
+        failed_vendor = chain[idx] if idx < len(chain) else result.get("vendor")
+        next_idx = idx + 1
+        if next_idx < len(chain):
+            next_vendor = chain[next_idx]
+            cursor["judge_vendor_chain_idx"] = next_idx
+            pending = dict(cursor.get("pending_action") or {})
+            allowed_models = allowed_judge_model_ids(dispatcher)
+            pending["judge_producer"] = next_vendor
+            pending["preferred_models"] = allowed_models.get(next_vendor, [])
+            pending["allowed_judge_model_ids"] = allowed_models
+            pending["instructions"] = (
+                f"FAILOVER: judge_producer {failed_vendor!r} reported "
+                f"judge_tool_failed ({result.get('reason')!r}). Spawn the "
+                f"visible judge subagent AGAIN for the SAME call_key, this "
+                f"time with judge_producer={next_vendor!r} "
+                f"(preferred_models={allowed_models.get(next_vendor, [])!r}). "
+                "Then call submit-host-result with "
+                "{call_key, result:{outcome:pass|revise|fail, critique_md, "
+                "judge_producer, judge_model_id, score_json, cost_usd}}."
+            )
+            cursor["pending_action"] = pending
+            _trace(cursor, "attended.judge_vendor_failover", {
+                "stage_id": stage_id, "call_key": call_key,
+                "from_producer": failed_vendor, "to_producer": next_vendor,
+                "reason": result.get("reason"),
+            })
+            if cursor_file is not None:
+                save_cursor(cursor_file, cursor)
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": (
+                    f"judge vendor {failed_vendor!r} reported judge_tool_failed "
+                    f"({result.get('reason')!r}); resubmit the SAME call_key "
+                    f"with judge_producer={next_vendor!r}"),
+                "judge_producer": next_vendor,
+            }
+        # No further vendors to try — this is a genuine infra failure, not a
+        # code defect, so it must surface immediately rather than loop.
+        cursor["error"] = (
+            f"all judge vendors exhausted after judge_tool_failed from "
+            f"{failed_vendor!r}: {result.get('reason')}")
+        _trace(cursor, "attended.judge_vendor_failover_exhausted", {
+            "stage_id": stage_id, "call_key": call_key,
+            "chain": chain, "reason": result.get("reason"),
+        })
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        return None
+
     cm = dispatcher.call_mcp
     producer = cursor["producer"]
     attempt_id = cursor.get("attempt_id")

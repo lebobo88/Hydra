@@ -51,6 +51,8 @@ sys.path.insert(0, str(_HERE.parents[2]))
 
 _HYDRA_ROOT = Path(os.environ.get("HYDRA_ROOT") or _HERE.parents[2])
 
+from hydra_core.proc import no_window_creationflags  # noqa: E402 — needs sys.path.insert above
+
 _RESUME_ACTIONS = ("approve", "reject", "modify-budget", "force-dispatch",
                    "change-squads", "recover-stalled-stage")
 
@@ -362,6 +364,7 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
         start_new_session = True
@@ -437,6 +440,7 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
         start_new_session = True
@@ -517,6 +521,7 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
         start_new_session = True
@@ -572,6 +577,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             stdin=subprocess.DEVNULL,
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout_s,
+            creationflags=no_window_creationflags(),
         )
     except subprocess.TimeoutExpired as exc:
         # MU8b: surface whatever partial output was buffered so callers can

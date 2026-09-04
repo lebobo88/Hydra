@@ -91,6 +91,22 @@ Adding a head to the pantheon is a *constitution-class change* — it's not
 fungible. Edits to `heads.yaml` are reviewable; introducing a new mythic
 name reviewable by the user.
 
+## Hydra's own register
+
+Hydra's own voice — not a head's — now ships as a real host persona instead
+of only living in `CLAUDE.md` and hook re-injection:
+
+- `plugins/hydra/agents/hydra.md` — cathedral register, priest-architect,
+  the default (`plugins/hydra/settings.json` sets `{"agent": "hydra:hydra"}`).
+- `plugins/hydra/agents/hydra-plaza.md` — plaza register, same contract,
+  stripped of ceremony; switch with `claude --agent hydra:hydra-plaza`.
+
+Both defer to `AGENTS.md`/`CLAUDE.md`/`.claude/rules/*` for the governing
+contract and add voice only. This adds no head to the pantheon — the
+manifesto is explicit that Hydra is the body, not a head — so the
+"adding a head is a constitution-class change" rule above does not apply
+here.
+
 ## What Hydra is and is not
 
 | Hydra is | Hydra is not |

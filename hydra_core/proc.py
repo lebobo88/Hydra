@@ -19,7 +19,22 @@ import os
 import subprocess
 from typing import Any
 
-__all__ = ["run_text"]
+__all__ = ["run_text", "no_window_creationflags"]
+
+
+def no_window_creationflags() -> int:
+    """``CREATE_NO_WINDOW`` on Windows, ``0`` elsewhere.
+
+    Prevents a console-subsystem child (git, python, node, a CLI tool) from
+    allocating a visible console window when the parent process has none of
+    its own — e.g. an MCP stdio server launched by the host, or an already
+    detached child. Uses ``getattr(..., 0)`` so this is a no-op on any
+    platform or Python build lacking the constant (never hard-code
+    ``0x08000000``).
+    """
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def run_text(cmd: Any, **kwargs: Any) -> "subprocess.CompletedProcess[str]":
@@ -30,6 +45,8 @@ def run_text(cmd: Any, **kwargs: Any) -> "subprocess.CompletedProcess[str]":
     ``PYTHONIOENCODING=utf-8`` into the child environment so a Python child
     *encodes* its own output as UTF-8 too.  When ``env`` is not supplied it is
     derived from ``os.environ`` (equivalent to the inherited environment).
+    Also ORs in :func:`no_window_creationflags` so the child never flashes a
+    console window on Windows.
     """
     env = kwargs.pop("env", None)
     child_env = dict(os.environ if env is None else env)
@@ -37,11 +54,13 @@ def run_text(cmd: Any, **kwargs: Any) -> "subprocess.CompletedProcess[str]":
     kwargs.pop("text", None)
     kwargs.pop("encoding", None)
     kwargs.pop("errors", None)
+    creationflags = kwargs.pop("creationflags", 0) | no_window_creationflags()
     return subprocess.run(
         cmd,
         env=child_env,
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=creationflags,
         **kwargs,
     )

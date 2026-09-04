@@ -79,11 +79,11 @@ def _smoke_passes(monkeypatch):
                         lambda *a, **k: ("pass", "fake smoke pass"))
 
 
-def _begin(disp, tmp_path):
+def _begin(disp, tmp_path, gate_type=None):
     return host_bridge.begin_stage(
         disp, workflow_id="wf-1", run_id="run-1",
         project_path=str(tmp_path), request_text="implement the thing",
-        project_root=str(tmp_path))
+        project_root=str(tmp_path), gate_type=gate_type)
 
 
 def test_begin_pauses_for_engineer(tmp_path):
@@ -2513,25 +2513,34 @@ class _FakeDispatcherWithDoctor(FakeDispatcher):
         if tool == "doctor":
             self.calls.append((server, tool, dict(args), squad_id))
             return {"status": "done", "result": {"judge_capabilities": {
-                "codex": {"critique_model": "gpt-5.4"},
-                "agy": {"critique_model": "gemini-3.1-pro-preview"},
+                "codex": {"critique_model": "gpt-5.6-terra",
+                          "escalated_critique_model": "gpt-5.6-sol",
+                          "allowed_critique_models": [
+                              "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]},
+                "agy": {"critique_model": "gemini-3.8-flash-medium",
+                        "escalated_critique_model": "gemini-3.1-pro-high",
+                        "allowed_critique_models": [
+                            "gemini-3.8-flash-high", "gemini-3.8-flash-medium",
+                            "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+                            "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+                            "gemini-3.1-pro-high", "gemini-3.1-pro-low"]},
                 "claude": {"critique_model": None},
             }}}
         if tool == "record_verdict":
             self.calls.append((server, tool, dict(args), squad_id))
             self.verdicts.append(dict(args))
             if self._enforce_pin and args.get("judge_producer") == "codex" \
-                    and args.get("judge_model_id") not in {"gpt-5.4", "gpt-5.5"}:
+                    and args.get("judge_model_id") not in {"gpt-5.6-terra", "gpt-5.6-sol"}:
                 return {"status": "failed", "error": (
                     "judge_producer=codex must record judge_model_id in "
-                    "{gpt-5.4, gpt-5.5} because pp_codex.critique is pinned "
+                    "{gpt-5.6-terra, gpt-5.6-sol} because pp_codex.critique is pinned "
                     "to those models (default or escalated)")}
             return {"status": "done", "result": {"verdict_id": "v-1"}}
         return super().call_mcp(server, tool, args, squad_id)
 
 
-def _drive_to_judge(disp, tmp_path):
-    res = _begin(disp, tmp_path)
+def _drive_to_judge(disp, tmp_path, gate_type=None):
+    res = _begin(disp, tmp_path, gate_type=gate_type)
     cfile = res["cursor_path"]
     res = host_bridge.submit_host_result(
         disp, cursor_file=cfile, call_key="generate-0",
@@ -2544,8 +2553,8 @@ def test_judge_host_action_carries_allowed_model_ids(tmp_path):
     disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
     _cfile, res = _drive_to_judge(disp, tmp_path)
     allowed = res["host_action"]["allowed_judge_model_ids"]
-    assert allowed["codex"] == ["gpt-5.4", "gpt-5.5"]
-    assert allowed["agy"] == ["gemini-3.1-pro-preview"]
+    assert allowed["codex"] == ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+    assert allowed["agy"][:2] == ["gemini-3.8-flash-medium", "gemini-3.1-pro-high"]
     assert allowed["claude"] == []
     # The instruction the host relays to the judge names the pinned ids.
     assert "allowed_judge_model_ids" in res["host_action"]["instructions"]
@@ -2574,7 +2583,7 @@ def test_mislabeled_codex_model_id_is_normalized_not_fatal(tmp_path):
     assert res["stage_outcome"] == "pass"
     assert len(disp.verdicts) == 1
     v = disp.verdicts[0]
-    assert v["judge_model_id"] == "gpt-5.4"
+    assert v["judge_model_id"] == "gpt-5.6-terra"
     assert v["judge_producer"] == "codex"
     assert v["score_json"]["judge_model_id_reported"] == "gpt-5.1-codex"
 
@@ -2589,12 +2598,12 @@ def test_missing_model_id_normalizes_to_pin(tmp_path):
         result={"outcome": "pass", "critique_md": "ok",
                 "judge_producer": "codex", "cost_usd": 0.05})
     assert res["status"] == "complete"
-    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.4"
+    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.6-terra"
     assert disp.verdicts[0]["score_json"]["judge_model_id_reported"] is None
 
 
 def test_escalated_codex_model_id_passes_through(tmp_path):
-    """gpt-5.5 is a legitimate pp escalation -- do NOT rewrite it to gpt-5.4."""
+    """gpt-5.6-sol is a legitimate pp escalation -- do NOT rewrite it to gpt-5.6-terra."""
     disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
     cfile, _ = _drive_to_judge(disp, tmp_path)
     res = host_bridge.submit_host_result(
@@ -2602,9 +2611,9 @@ def test_escalated_codex_model_id_passes_through(tmp_path):
         call_key="judge-run-1-stage-1-att-1-0",
         result={"outcome": "pass", "critique_md": "ok",
                 "judge_producer": "codex",
-                "judge_model_id": "gpt-5.5", "cost_usd": 0.05})
+                "judge_model_id": "gpt-5.6-sol", "cost_usd": 0.05})
     assert res["status"] == "complete"
-    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.5"
+    assert disp.verdicts[0]["judge_model_id"] == "gpt-5.6-sol"
     assert "judge_model_id_reported" not in disp.verdicts[0]["score_json"]
 
 
@@ -2658,7 +2667,7 @@ def test_record_verdict_pin_error_is_retryable_cursor_stays_await_judge(tmp_path
         disp, cursor_file=cfile, call_key=judge_key,
         result={"outcome": "pass", "critique_md": "looks good",
                 "judge_producer": "codex",
-                "judge_model_id": "gpt-5.4", "cost_usd": 0.05})
+                "judge_model_id": "gpt-5.6-terra", "cost_usd": 0.05})
     assert res2["status"] == "complete"
     assert res2["final_status"] == "complete"
     # Judge cost was accrued exactly once across both submits.
@@ -2707,3 +2716,261 @@ def test_unknown_judge_producer_correction_budget_is_bounded(tmp_path):
     assert res.get("retryable") is not True
     assert res["state"] in host_bridge._TERMINAL
     assert disp.count("record_verdict") == 1
+
+
+# ─── B2: cross-vendor judge PRODUCER selection + engine-side failover ────────
+#
+# pp's gate_eligible_judges returns preferred_producers in raw pool order
+# ([codex, agy, claude] filtered to other vendors), which is NOT the same as
+# the authoritative generator->judge mapping in pp's judge-cross-vendor.md.
+# _judge_vendor_chain implements that mapping directly so a claude generator
+# is not always routed to codex.
+
+def test_judge_vendor_chain_codex_generator_prefers_agy():
+    chain = host_bridge._judge_vendor_chain("codex", "code_style", ["agy", "claude"])
+    assert chain[0] == "agy"
+
+
+def test_judge_vendor_chain_agy_generator_prefers_codex():
+    chain = host_bridge._judge_vendor_chain("agy", "code_style", ["codex", "claude"])
+    assert chain[0] == "codex"
+
+
+def test_judge_vendor_chain_claude_generator_security_spec_contract_prefers_codex():
+    """B9 PART 2 — Hydra's operator-decided tiebreak INVERTS pp's own mapping
+    (pp prefers agy for security/spec): security/spec/contract all route a
+    claude generator to codex."""
+    chain = host_bridge._judge_vendor_chain("claude", "security", ["agy", "codex"])
+    assert chain[0] == "codex"
+    chain = host_bridge._judge_vendor_chain("claude", "spec", ["agy", "codex"])
+    assert chain[0] == "codex"
+    chain = host_bridge._judge_vendor_chain("claude", "contract", ["agy", "codex"])
+    assert chain[0] == "codex"
+
+
+def test_judge_vendor_chain_claude_generator_design_prefers_agy():
+    """B9 PART 2 — the design (architecture) gate is the one case Hydra routes
+    to agy for a claude generator, INVERTING pp's own codex preference."""
+    chain = host_bridge._judge_vendor_chain("claude", "design", ["codex", "agy"])
+    assert chain[0] == "agy"
+
+
+def test_judge_vendor_chain_claude_generator_default_defers_to_pp_order():
+    """No security/spec/contract/design signal -- pp's own preferred order wins
+    (still not hard-coded, and still a real vendor pp actually offered)."""
+    chain = host_bridge._judge_vendor_chain("claude", "code_style", ["agy", "codex"])
+    assert chain[0] == "agy"
+
+
+def test_judge_vendor_chain_always_offers_both_cross_vendors_as_fallback():
+    """Even with an empty/short preferred_producers hint (e.g. the legacy
+    FakeDispatcher's gate_eligible_judges stub), the chain still offers the
+    other cross-vendor lane so engine-side failover always has somewhere to
+    go."""
+    chain = host_bridge._judge_vendor_chain("claude", "code_style", [])
+    assert set(chain) == {"codex", "agy"}
+
+
+class _FakeDispatcherWithAllowedJudges(FakeDispatcher):
+    """FakeDispatcher whose gate_eligible_judges response carries a real
+    `allowed_judges` closing lane, like pp's actual response shape."""
+
+    def __init__(self, *, preferred_producers, **kw):
+        super().__init__(**kw)
+        self._preferred_producers = preferred_producers
+
+    def call_mcp(self, server, tool, args, squad_id=None):
+        if tool == "gate_eligible_judges":
+            self.calls.append((server, tool, dict(args), squad_id))
+            return {"status": "done", "result": {
+                "required_cross_vendor": self._required_cross,
+                "rubric_id": "rfc-2119-normative",
+                "allowed_judges": [{
+                    "agent": "judge-cross-vendor", "tier": "cross_vendor",
+                    "preferred_producers": self._preferred_producers,
+                    "preferred_models": [],
+                    "closing": True,
+                }],
+            }}
+        return super().call_mcp(server, tool, args, squad_id)
+
+
+def test_judge_host_action_carries_selected_judge_producer(tmp_path):
+    """The host_action must name the SELECTED producer (from the mapping),
+    not just leave the host to infer it from the agent type."""
+    disp = _FakeDispatcherWithAllowedJudges(
+        required_cross_vendor=True, preferred_producers=["codex", "agy"])
+    res = _begin(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10, "model": "claude-opus-4-8"})
+    host_action = res["host_action"]
+    # generator is "claude" (the attended engineer); gate_type is code_style
+    # (no security/spec/contract/design signal) so pp's own preferred order
+    # (codex first here) is honored.
+    assert host_action["judge_producer"] == "codex"
+    assert "preferred_models" in host_action
+    assert "judge_producer=" in host_action["instructions"]
+
+
+def test_judge_vendor_failover_on_judge_tool_failed(tmp_path):
+    """A judge that cannot reach its assigned vendor's CLI must NOT silently
+    substitute another vendor itself -- the engine reissues the SAME call_key
+    pointed at the next chain entry, and traces attended.judge_vendor_failover."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+    first_producer = judge_res["host_action"]["judge_producer"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"judge_tool_failed": True,
+                "reason": f"{first_producer} CLI not configured",
+                "vendor": first_producer, "model": None})
+
+    assert res["ok"] is False
+    assert res["retryable"] is True
+    next_producer = res["judge_producer"]
+    assert next_producer != first_producer
+    assert res["state"] == "await_judge"
+    assert res["host_action"]["call_key"] == judge_key
+    assert res["host_action"]["judge_producer"] == next_producer
+    # Nothing was recorded to the pp ledger for the failed attempt.
+    assert disp.count("record_verdict") == 0
+
+    # The corrected resubmit (now against the failed-over vendor) completes
+    # the stage normally.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": next_producer,
+                "judge_model_id": (host_bridge.allowed_judge_model_ids(disp)
+                                    .get(next_producer) or [None])[0],
+                "cost_usd": 0.05})
+    assert res2["status"] == "complete"
+    assert disp.count("record_verdict") == 1
+
+
+def test_judge_vendor_failover_exhausted_surfaces_stage(tmp_path):
+    """When every vendor in the chain has failed, the stage surfaces instead
+    of looping forever."""
+    disp = _FakeDispatcherWithDoctor(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    chain = host_bridge.load_cursor(cfile)["judge_vendor_chain"]
+    assert len(chain) >= 2
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"judge_tool_failed": True, "reason": "vendor A down",
+                "vendor": chain[0], "model": None})
+    assert res["ok"] is False and res["retryable"] is True
+
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=res["host_action"]["call_key"],
+        result={"judge_tool_failed": True, "reason": "vendor B down too",
+                "vendor": res["judge_producer"], "model": None})
+
+    assert res2["status"] == "surfaced"
+    assert res2["state"] in host_bridge._TERMINAL
+    assert disp.count("record_verdict") == 0
+
+
+def test_judge_vendor_chain_excludes_generator_vendor_even_when_pp_pref_includes_it():
+    """Regression: pp's real response never lists the generator's own vendor in
+    preferred_producers (gates.ts:499 filters it), but this function must not
+    trust that -- a malformed/legacy response listing it must never let a
+    same-vendor lane into the failover chain (that would trip F31 on failover)."""
+    chain = host_bridge._judge_vendor_chain("codex", "code_style", ["codex", "agy"])
+    assert "codex" not in chain
+    assert chain == ["agy"]
+
+    chain = host_bridge._judge_vendor_chain("agy", "code_style", ["agy", "codex"])
+    assert "agy" not in chain
+    assert chain == ["codex"]
+
+    # claude generator, no security/spec/contract/design signal: the
+    # malformed pp_pref lists "claude" itself first -- primary must still
+    # be guarded to a real cross-vendor pick, and "claude" must never appear
+    # anywhere in the chain.
+    chain = host_bridge._judge_vendor_chain("claude", "code_style", ["claude", "codex", "agy"])
+    assert "claude" not in chain
+    assert chain[0] == "codex"
+
+
+def test_judge_vendor_chain_never_leaks_generator_vendor_for_every_gate_type():
+    """B9: exhaustive guard -- for EVERY pp gate_type and EVERY generator
+    vendor, the generator's own vendor must never appear anywhere in the
+    returned chain. A previous round's judge caught exactly this leak."""
+    from hydra_core.squad_node import _PP_GATE_TYPES
+
+    for gate_type in sorted(_PP_GATE_TYPES) + [None, "unknown_gate_type"]:
+        for generator in ("codex", "agy", "claude"):
+            chain = host_bridge._judge_vendor_chain(
+                generator, gate_type, ["codex", "agy", "claude"])
+            assert generator not in chain, (
+                f"generator={generator!r} gate_type={gate_type!r} chain={chain!r}"
+            )
+            assert chain, f"empty chain for generator={generator!r} gate_type={gate_type!r}"
+
+
+# ─── B9: real gate_type reaches _judge_vendor_chain end-to-end ──────────────
+#
+# The bug this closes: gate_type_used was hardcoded to _pp_gate_type("code",
+# "code_style") at every call site, so gate_type NEVER carried real signal
+# into _judge_vendor_chain and the security/spec/contract/design tiebreak
+# branches were unreachable dead code. These tests drive the real host_bridge
+# entry points (begin_stage -> submit_host_result) and assert the actual
+# gate_type argument _judge_vendor_chain receives, proving the plumbing (not
+# just the pure function) is fixed.
+
+def test_begin_stage_gate_type_reaches_judge_vendor_chain_design(tmp_path):
+    """A stage opened with gate_type='design' (e.g. an ARCH_RFC-triggered
+    attended task) must select an agy primary judge for the claude generator
+    -- the old hardcoded code_style default would have selected codex via
+    pp's own preferred_producers order instead."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path, gate_type="design")
+    # B9 site 1 (host_bridge.begin_stage): the resolved gate_type is
+    # persisted on the cursor.
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "design"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "model": "claude-opus-4-8"})
+    # B9 site 2 (the submit-host-result judge-routing step): the SAME
+    # gate_type reaches gate_eligible_judges and _judge_vendor_chain.
+    gate_call = next(a for (s, t, a, _sq) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "design"
+    assert res["host_action"]["judge_producer"] == "agy"
+
+
+def test_begin_stage_gate_type_reaches_judge_vendor_chain_security(tmp_path):
+    """gate_type='security' (e.g. a PRD-triggered attended task) must select
+    codex for the claude generator -- Hydra's operator-decided inversion of
+    pp's own agy-for-security preference."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path, gate_type="security")
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "security"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "model": "claude-opus-4-8"})
+    gate_call = next(a for (s, t, a, _sq) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "security"
+    assert res["host_action"]["judge_producer"] == "codex"
+
+
+def test_begin_stage_no_gate_type_falls_back_to_code_style_default(tmp_path):
+    """No gate_type signal (the planner-dispatched default case) must still
+    fall through to the documented code_style DEFAULT, unchanged from before
+    this fix."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin(disp, tmp_path)
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["gate_type"] == "code_style"

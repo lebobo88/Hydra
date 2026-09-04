@@ -1340,6 +1340,10 @@ def build_supervisor(
             origin_squad=origin,
             profile=profile,
             is_post_synthesis=is_post_synthesis,
+            # B5: policy-driven vendor ordering, not router.py's own hardcoded
+            # default (`judge_policy` is already loaded above from
+            # policy.yaml / the project's .hydra/judge_policy.yaml override).
+            preferred_judge_vendors=list(judge_policy.preferred_judge_vendors),
         )
         if route.tier == "skip" or not route.rubric_ids:
             emit_trace(judge_trace_root, state.workflow_id, "judge.skipped", {

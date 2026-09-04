@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugins" / "hydra"
@@ -137,10 +138,10 @@ def test_plugin_and_project_contexts_have_documented_activation_boundary() -> No
     manifest = json.loads((PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.1.6"
+    assert manifest["version"] == "0.1.7"
     assert manifest["author"]["name"] == "rob"
     assert "hooks" not in manifest
-    assert len(manifest["agents"]) == 9
+    assert len(manifest["agents"]) == 11
     assert "### Activation contexts" in readme
     assert "consumer projects" in readme
 
@@ -172,10 +173,56 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
     }
     actual = {path.parent.name for path in (PLUGIN_ROOT / "skills").glob("*/SKILL.md")}
     assert expected <= actual
-    assert not any(
-        any((ROOT / ".claude" / directory).iterdir())
-        for directory in ("agents", "commands", "skills", "hooks")
+
+    # Git does not track empty directories, so a fresh checkout of `.claude/`
+    # legitimately has NO `agents`/`commands`/`skills`/`hooks` directory at
+    # all after 41993f2 moved these operator artifacts into the plugin
+    # (plugins/hydra/). Absence satisfies the invariant at least as strongly
+    # as emptiness does -- do not "restore" these as empty dirs / .gitkeep,
+    # that would silently reintroduce the project-scope duplicates this
+    # assertion exists to forbid.
+    offenders: dict[str, list[str]] = {}
+    for directory in ("agents", "commands", "skills", "hooks"):
+        path = ROOT / ".claude" / directory
+        if not path.exists():
+            continue
+        entries = sorted(entry.name for entry in path.iterdir())
+        if entries:
+            offenders[directory] = entries
+    assert not offenders, (
+        "Project-scope .claude/ directories must not duplicate the plugin "
+        f"namespace, but found entries: {offenders}"
     )
     for skill in expected:
         body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
         assert "disable-model-invocation: true" in body
+
+
+@pytest.mark.parametrize("agent_filename", ["hydra.md", "hydra-plaza.md"])
+def test_hydra_persona_agent_adds_voice_without_duplicating_the_contract(
+    agent_filename: str,
+) -> None:
+    body = (PLUGIN_ROOT / "agents" / agent_filename).read_text(encoding="utf-8")
+
+    assert "Hard Rule" not in body
+    assert "/pp:" not in body
+    # No routing table (the squad registry table lives in AGENTS.md, not here).
+    assert "| Slug | Source pack | Entrypoint |" not in body
+
+    # Frontmatter must omit tools:/model:/permissionMode: -- each omission is
+    # deliberate: `["*"]` is not a documented file form; a `model:` would
+    # force that model on every session in every project with the plugin
+    # enabled, overriding the operator's --model; permissionMode is ignored
+    # for plugin agents.
+    frontmatter = body.split("---\n", 2)[1]
+    assert "tools:" not in frontmatter
+    assert "model:" not in frontmatter
+    assert "permissionMode:" not in frontmatter
+
+
+def test_plugin_settings_scope_agent_to_plugin_namespace() -> None:
+    settings = json.loads((PLUGIN_ROOT / "settings.json").read_text(encoding="utf-8"))
+
+    # Scoped ("hydra:hydra"), not a bare "hydra" -- a bare name would not
+    # resolve for a plugin agent.
+    assert settings == {"agent": "hydra:hydra"}
