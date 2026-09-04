@@ -3,12 +3,14 @@
 # Override per-project by placing a `.hydra/judge_policy.yaml` at the workflow
 # project root. Unknown keys are ignored; missing keys fall back to these defaults.
 
-# REFERENCE ONLY — NOT parsed by load_policy(). The authoritative tier-by-type
-# logic lives in router.py (`_BASE_TIER_BY_TYPE` + the `_has_passing_pp_verdict`
-# short-circuit that implements the `skip_if_pp_judged` semantic). This block is
-# kept as documentation of intent; editing it changes nothing. `skip_if_pp_judged`
-# is NOT a valid JudgeTier literal (cross_vendor|same_vendor|skip) — do not feed
-# it to JudgeRoute.tier.
+# `default_tier_by_envelope` (below) is REFERENCE ONLY — NOT parsed by
+# load_policy(). The authoritative tier-by-type logic lives in router.py
+# (`_BASE_TIER_BY_TYPE` + the `_has_passing_pp_verdict` short-circuit that
+# implements the `skip_if_pp_judged` semantic). This block is kept as
+# documentation of intent; editing it changes nothing. `skip_if_pp_judged`
+# is NOT a valid JudgeTier literal (cross_vendor|same_vendor|skip) — do not
+# feed it to JudgeRoute.tier. Every OTHER top-level key in this file (below
+# this block) IS parsed by `load_policy()` — see `policy.py:81`.
 default_tier_by_envelope:
   C_SUITE_DECISION_PACKET: cross_vendor
   CREATIVE_BRIEF: same_vendor
@@ -43,6 +45,14 @@ vendor_pairs:
   - [claude, codex]
   - [claude, agy]
   - [codex, codex]   # same-vendor degraded fallback (no host Claude producer)
+
+# B5: default ordering for `JudgeRoute.preferred_judge_vendors` when a caller
+# of `router.route_judge` doesn't pass its own list (parsed by load_policy()).
+# NOTE: router.py's post-synthesis gate (line ~175) is hardcoded to
+# ["codex"] deliberately and does NOT read this key.
+preferred_judge_vendors:
+  - codex
+  - agy
 
 # Per-workflow tripwire. When the running judge cost exceeds this, the
 # dispatcher downgrades cross_vendor → single_vendor (Phase-2 hook).

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -33,6 +34,7 @@ from pathlib import Path
 _log = logging.getLogger("hydra.engineering")
 
 from .iolaus import post_dispatch, pre_dispatch
+from .judge_vendor import _judge_vendor_chain
 from .proc import run_text
 from .schemas import (
     DecisionRecord,
@@ -1018,33 +1020,71 @@ def _resolve_rubric_id(dispatcher: Any, rubric_id: str,
                              on_unresolved=on_unresolved)
 
 
+# B7: a real 36,295-char diff (run_THLiv-q5AnGD) was silently truncated to a
+# ~38% prefix with no marker — the judge scored missing test evidence at the
+# floor for tests that DID exist, and (the dangerous inverse) a defect past
+# the cutoff would be invisible while the judge believes it saw everything.
+# Default raised 14000 -> 40000; truncation now always leaves an explicit,
+# unmissable marker with real N/M/K numbers.
+_DIFF_TRUNCATION_MARKER_TEMPLATE = (
+    "\n\n[!] DIFF TRUNCATED BY THE HARNESS - showing {shown} of {total} "
+    "characters; {omitted} file(s) omitted entirely. Evidence is "
+    "INCOMPLETE: score any dimension you cannot see as UNVERIFIED, never as "
+    "passing."
+)
+
+# D1: fixed-length fallback used ONLY when `max_chars` is too small to fit
+# the full N/M/K marker above. No interpolated numbers -> constant, known
+# length -> can ALWAYS be reserved/fit exactly, never sliced. Truncation
+# must stay visible even when the cap can't afford the real numbers; losing
+# the digits is acceptable, losing the WARNING is not.
+_DIFF_TRUNCATION_MARKER_MINIMAL = (
+    "\n\n[!] TRUNCATED BY THE HARNESS - details omitted (cap too small); "
+    "evidence INCOMPLETE, do not score unseen content as passing."
+)
+
+
 def _judge_artifact_text(
     project_path: str, changed_paths: list[str], gen_text: str,
-    max_chars: int = 14000,
+    max_chars: int = 40000,
 ) -> str:
     """Build the judge's artifact text: the generator summary PLUS the real
     verbatim code — the unified diff of MODIFIED tracked files AND the full
     content of NEW/untracked files (``git diff`` omits untracked, so a judge that
     saw only the diff would miss brand-new files entirely). This gives the judge
     real code instead of a prose summary, which causes false gate FAILs. Falls
-    back to the summary alone when nothing is readable. All read-only."""
+    back to the summary alone when nothing is readable. All read-only.
+
+    B7: builds the FULL (untruncated) body first, tracking each file's exact
+    character span within it, so truncation can report precisely how much was
+    cut (N of M characters) and how many changed files never made it into the
+    judge's view at all (K omitted entirely) instead of silently slicing a
+    bare string. The returned string never exceeds ``max_chars`` INCLUDING the
+    truncation marker.
+    """
     summary = (gen_text or "").strip()
     if not changed_paths:
         return summary or "(no diff summary returned)"
-    parts: list[str] = []
-    budget = max_chars  # bound INTERMEDIATE accumulation, not just the final slice
-    # Modified tracked files → a real unified diff.
+
+    # (file_path_or_None, chunk_text) — one entry per modified-file diff chunk
+    # plus one entry per new/untracked file, in the order they get
+    # concatenated. file_path is used only to attribute a truncation cut.
+    file_sections: list[tuple[str | None, str]] = []
+
+    # Modified tracked files → a real unified diff, split per file so a
+    # truncation boundary can be attributed to specific files.
     try:
         res = run_text(
             ["git", "-C", project_path, "diff", "--", *changed_paths],
             capture_output=True, timeout=30,
         )
-        diff = (res.stdout or "").strip()[:budget]
-        if diff:
-            parts.append("UNIFIED DIFF (modified):\n" + diff)
-            budget -= len(diff)
+        full_diff = (res.stdout or "").strip()
+        if full_diff:
+            file_sections.extend(_split_diff_into_file_chunks(full_diff))
     except Exception:  # noqa: BLE001 — never block the loop on a git hiccup
         pass
+    has_diff = bool(file_sections)
+
     # New/untracked files → include their content (git diff omits them).
     try:
         u = run_text(
@@ -1053,25 +1093,188 @@ def _judge_artifact_text(
             capture_output=True, timeout=15,
         )
         for rel in (u.stdout or "").splitlines():
-            if budget <= 0:
-                break
             rel = rel.strip()
             if not rel:
                 continue
             try:
                 with open(os.path.join(project_path, rel), "r",
                           encoding="utf-8", errors="replace") as fh:
-                    body = fh.read(min(8000, budget))
-                parts.append(f"NEW FILE {rel}:\n{body}")
-                budget -= len(body)
+                    body = fh.read()
+                file_sections.append((rel, f"NEW FILE {rel}:\n{body}"))
             except Exception:  # noqa: BLE001 — unreadable/binary new file; skip
                 pass
     except Exception:  # noqa: BLE001
         pass
-    if not parts:
+
+    if not file_sections:
         return summary or "(no diff summary returned)"
+
+    # Build the full body while recording each file's [start, end) span, so
+    # a later cut at any offset can be mapped straight back to "which files
+    # got zero bytes" without re-deriving the concatenation logic.
     head = (summary + "\n\n") if summary else ""
-    return (head + "\n\n".join(parts))[:max_chars]
+    pieces: list[str] = [head]
+    spans: list[tuple[str | None, int, int]] = []  # (path, start, end)
+    cursor = len(head)
+    if has_diff:
+        pieces.append("UNIFIED DIFF (modified):\n")
+        cursor += len(pieces[-1])
+    first = True
+    for path, chunk in file_sections:
+        sep = "" if first else "\n\n"
+        first = False
+        pieces.append(sep + chunk)
+        start = cursor + len(sep)
+        end = start + len(chunk)
+        spans.append((path, start, end))
+        cursor = end
+    full_body = "".join(pieces)
+    total_chars = len(full_body)
+
+    if total_chars <= max_chars:
+        return full_body
+
+    # Truncation bites. D1: reserve room for the marker BEFORE slicing the
+    # body, and NEVER slice the marker itself afterward -- a marker cut
+    # mid-string is a mangled fragment, which is exactly the
+    # invisible/misleading-truncation failure mode B7 exists to eliminate.
+    #
+    # Reserve using the worst-case digit-length for "shown"/"omitted" (both
+    # bounded above by the untruncated totals -- shown <= total_chars and
+    # omitted <= len(spans), so neither can ever need MORE digits than this
+    # upper-bound render) so the FINAL marker, built after the real cut is
+    # known, can never end up longer than what was reserved here.
+    worst_marker = _DIFF_TRUNCATION_MARKER_TEMPLATE.format(
+        shown=total_chars, total=total_chars, omitted=len(spans))
+
+    if len(worst_marker) <= max_chars:
+        budget_for_body = max_chars - len(worst_marker)
+        truncated_body = full_body[:budget_for_body]
+        # A file whose span starts at or beyond the cutoff contributed ZERO
+        # characters to `truncated_body` — that's "omitted entirely" (as
+        # opposed to merely truncated mid-file, which we do not separately
+        # count since the marker already flags the whole artifact as
+        # incomplete).
+        omitted_files = sum(1 for _path, start, _end in spans
+                            if start >= budget_for_body)
+        marker = _DIFF_TRUNCATION_MARKER_TEMPLATE.format(
+            shown=len(truncated_body), total=total_chars, omitted=omitted_files)
+        # `marker` is provably <= `worst_marker` in length (see above), so
+        # `truncated_body + marker` is provably <= max_chars. No trailing
+        # slice — slicing here is exactly what would re-mangle the marker.
+        return truncated_body + marker
+
+    # max_chars can't fit the full N/M/K marker. Fall back to the fixed,
+    # numberless minimal notice — still an intact, parseable warning, just
+    # without the exact counts.
+    if len(_DIFF_TRUNCATION_MARKER_MINIMAL) <= max_chars:
+        budget_for_body = max_chars - len(_DIFF_TRUNCATION_MARKER_MINIMAL)
+        truncated_body = full_body[:budget_for_body]
+        return truncated_body + _DIFF_TRUNCATION_MARKER_MINIMAL
+
+    # max_chars is smaller than even the fixed minimal notice -- there is
+    # NO room for any visible truncation warning without breaking the
+    # caller's max_chars contract. This is a pathological/degenerate input
+    # (max_chars is always tens of thousands of characters in production);
+    # the only remaining honest behavior is a bare, unmarked slice rather
+    # than raising or silently exceeding the cap. Documented explicitly:
+    # in this branch ONLY, truncation is NOT visible in the returned text.
+    return full_body[:max_chars]
+
+
+# D2: git quotes+C-escapes a diff header path whenever it contains a byte
+# git considers "special" (by default: any non-ASCII byte, since
+# core.quotepath defaults to true; also quotes, backslashes, and control
+# characters regardless of core.quotepath) — e.g.
+# ``diff --git "a/caf\303\251.py" "b/caf\303\251.py"``. A plain space does
+# NOT trigger quoting, so the unquoted form below still needs to tolerate
+# spaces inside the path.
+_DIFF_HEADER_QUOTED_RE = re.compile(
+    r'^diff --git "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)"$')
+_DIFF_HEADER_UNQUOTED_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+
+# Simple (non-octal) C-style escapes git's quote_path() may emit.
+_GIT_QUOTE_SIMPLE_ESCAPES = {
+    "\\": 0x5C, '"': 0x22, "n": 0x0A, "t": 0x09, "r": 0x0D,
+    "a": 0x07, "b": 0x08, "f": 0x0C, "v": 0x0B,
+}
+
+
+def _unquote_git_path(raw: str) -> str:
+    """Reverse git's C-style path quoting (``\\NNN`` octal-byte and simple
+    ``\\n``/``\\t``/``\\"``/... escapes) back to the real path. Octal escapes
+    encode raw UTF-8 BYTES (not codepoints), so this collects a byte buffer
+    and decodes it as UTF-8 once at the end rather than treating each octal
+    escape as an independent character."""
+    out = bytearray()
+    i = 0
+    n = len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt in _GIT_QUOTE_SIMPLE_ESCAPES:
+                out.append(_GIT_QUOTE_SIMPLE_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt in "01234567":
+                j = i + 1
+                digits = ""
+                while j < n and len(digits) < 3 and raw[j] in "01234567":
+                    digits += raw[j]
+                    j += 1
+                out.append(int(digits, 8) & 0xFF)
+                i = j
+                continue
+            # Unknown escape — keep the escaped char literally rather than
+            # dropping data.
+            out.extend(nxt.encode("utf-8", errors="replace"))
+            i += 2
+            continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_header_b_path(line: str) -> str | None:
+    """Extract the post-image (``b/...``) path from a ``diff --git`` header
+    line, in EITHER git's quoted or unquoted form. Returns ``None`` when the
+    line is not a ``diff --git`` header at all."""
+    line = line.rstrip("\n")
+    m = _DIFF_HEADER_QUOTED_RE.match(line)
+    if m:
+        b_token = _unquote_git_path(m.group(2))
+    else:
+        m2 = _DIFF_HEADER_UNQUOTED_RE.match(line)
+        if not m2:
+            return None
+        b_token = m2.group(2)
+    return b_token[2:] if b_token.startswith("b/") else b_token
+
+
+def _split_diff_into_file_chunks(diff_text: str) -> list[tuple[str | None, str]]:
+    """Split a ``git diff`` unified-diff blob into ``(file_path, chunk_text)``
+    pieces on each ``diff --git ...`` header (quoted or unquoted), so B7's
+    truncation accounting can attribute a cut to specific files instead of
+    reporting an opaque byte count."""
+    if not diff_text:
+        return []
+    lines = diff_text.splitlines(keepends=True)
+    chunks: list[tuple[str | None, str]] = []
+    cur_path: str | None = None
+    cur_lines: list[str] = []
+    for line in lines:
+        b_path = _diff_header_b_path(line)
+        if b_path is not None:
+            if cur_lines:
+                chunks.append((cur_path, "".join(cur_lines).rstrip("\n")))
+            cur_path = b_path
+            cur_lines = [line]
+        else:
+            cur_lines.append(line)
+    if cur_lines:
+        chunks.append((cur_path, "".join(cur_lines).rstrip("\n")))
+    return chunks
 
 
 def _execution_evidence_md(
@@ -1349,18 +1552,28 @@ def _drive_pp_stage_loop(
             # vendor. gate_eligible_judges decides cross- vs same-vendor for this
             # gate (pp: "Driver MUST call this before invoking any judge"); we
             # follow it. Default when the gate tool is unavailable (no daemon /
-            # scripted): prefer cross-vendor. agy is enabled by default (opt-out
-            # via PP_DISABLE_AGY=1); codex is used here as the cross-vendor judge.
+            # scripted): prefer cross-vendor. B4: the actual cross-vendor
+            # producer (codex or agy) is picked below via the shared
+            # `_judge_vendor_chain` mapping, not hardcoded to codex.
+            gate_type_used = _pp_gate_type("code", "code_style")
             gate_dec: dict[str, Any] = {}
             try:
                 gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
-                    "gate_type": _pp_gate_type("code", "code_style"),
+                    "gate_type": gate_type_used,
                     "generator_producer": producer,
                     "prompt_keywords": request_text[:1000],
                 }, squad_id=sq))
             except Exception:  # noqa: BLE001 — never block the loop on a policy miss
                 gate_dec = {}
             required_cross = bool(gate_dec.get("required_cross_vendor", True))
+            # B4: pull pp's own closing (cross-vendor) lane so its
+            # preferred_producers feed the vendor-selection mapping below
+            # instead of being discarded (mirrors host_bridge.py).
+            _allowed_judges_list = gate_dec.get("allowed_judges") or []
+            _closing_lane = next(
+                (j for j in _allowed_judges_list
+                 if isinstance(j, dict) and j.get("closing")), None) or {}
+            _pp_preferred_producers = _closing_lane.get("preferred_producers") or []
             # E2-25: pp's registries key rubrics by an immutable `@N`; request the
             # resolved version and say so when no registry served the body.
             _requested_rubric = str(gate_dec.get("rubric_id") or judge_rubric_id)
@@ -1383,28 +1596,46 @@ def _drive_pp_stage_loop(
 
             # Vendor selection follows the gate decision:
             #   same-vendor + Claude producer -> a Claude critique (different
-            #     model) judges it — codex is NOT spent (the common path; keeps
-            #     scarce codex quota for the gates that truly need cross-vendor).
-            #   else -> codex critique (a genuine CROSS-vendor judge when the
-            #     producer is Claude; a SAME-vendor degraded judge only on the
-            #     true-headless codex-generated path).
+            #     model) judges it — the cross-vendor CLI is NOT spent (the
+            #     common path; keeps scarce codex/agy quota for the gates that
+            #     truly need cross-vendor).
+            #   else -> a genuine cross-vendor critique, vendor chosen by
+            #     `_judge_vendor_chain` (codex/agy per pp's authoritative
+            #     mapping; a SAME-vendor degraded judge only when the chosen
+            #     vendor equals the generator's own, e.g. no cross-vendor CLI
+            #     is configured).
             use_claude_judge = (not required_cross) and producer == "claude"
             if use_claude_judge:
                 ci = _claude_critique(judge_text, rubric_body, project_path)
                 judge_producer = "claude"
             else:
-                ci = _pp_inner(cm("pp_codex", "critique", {
+                # Mirrors host_bridge.py: the cross-vendor mapping only
+                # applies when cross-vendor was actually REQUIRED. Otherwise
+                # (e.g. a non-Claude producer on a same-vendor-eligible gate)
+                # the producer's own vendor self-judges — no reason to spend
+                # a second vendor's quota when the gate didn't ask for one.
+                if required_cross:
+                    judge_vendor_chain = _judge_vendor_chain(
+                        producer, gate_type_used, _pp_preferred_producers)
+                else:
+                    judge_vendor_chain = [producer]
+                judge_producer = judge_vendor_chain[0]
+                _critique_server = ("pp_agy" if judge_producer == "agy"
+                                    else "pp_codex")
+                ci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text,
                     "rubric_md": rubric_body,
                     "cwd": project_path,
                     "timeout_ms": _judge_timeout_ms(),
                 }, squad_id=sq))
-                judge_producer = "codex"
+                # judge_producer already holds the vendor actually dispatched
+                # to (the `_judge_vendor_chain[0]` pick above); report that.
             # cross_vendor := the judge vendor differs from the producer vendor.
             cross_vendor = judge_producer != producer
-            # _judge_degraded: cross-vendor was REQUIRED but unattainable — only
-            # when codex generated AND must self-judge (agy unavailable, PP_DISABLE_AGY=1).
-            # A gate-sanctioned same-vendor Claude judge is NOT degraded.
+            # _judge_degraded: cross-vendor was REQUIRED but unattainable —
+            # only when the selected cross-vendor CLI is unavailable and the
+            # generator ends up self-judging. A gate-sanctioned same-vendor
+            # Claude judge is NOT degraded.
             degraded = required_cross and not cross_vendor
 
             # F6: critique cost counts toward the run's budget charge too.
@@ -1833,16 +2064,24 @@ def _drive_best_of_loop(
             except Exception:  # noqa: BLE001
                 pass
             # Judge per pp's routing (identical policy to the single path).
+            gate_type_used = _pp_gate_type("code", "code_style")
             gate: dict[str, Any] = {}
             try:
                 gate = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
-                    "gate_type": _pp_gate_type("code", "code_style"),
+                    "gate_type": gate_type_used,
                     "generator_producer": producer,
                     "prompt_keywords": request_text[:1000],
                 }, squad_id=sq))
             except Exception:  # noqa: BLE001
                 gate = {}
             required_cross = bool(gate.get("required_cross_vendor", True))
+            # B4: pull pp's own closing (cross-vendor) lane so its
+            # preferred_producers feed the vendor-selection mapping below.
+            _allowed_judges_list = gate.get("allowed_judges") or []
+            _closing_lane = next(
+                (j for j in _allowed_judges_list
+                 if isinstance(j, dict) and j.get("closing")), None) or {}
+            _pp_preferred_producers = _closing_lane.get("preferred_producers") or []
             # E2-25: versioned id + explicit fallback, same as the single path.
             _requested_rubric = str(gate.get("rubric_id") or judge_rubric_id)
             gate_rubric = _resolve_rubric_id(
@@ -1865,12 +2104,21 @@ def _drive_best_of_loop(
                 jci = _claude_critique(judge_text, rubric_body, wt)
                 jp = "claude"
             else:
+                # Mirrors the single-candidate path above and host_bridge.py:
+                # the cross-vendor mapping only applies when actually
+                # REQUIRED; otherwise the producer's own vendor self-judges.
+                if required_cross:
+                    judge_vendor_chain = _judge_vendor_chain(
+                        producer, gate_type_used, _pp_preferred_producers)
+                else:
+                    judge_vendor_chain = [producer]
+                jp = judge_vendor_chain[0]
+                _critique_server = "pp_agy" if jp == "agy" else "pp_codex"
                 _trace("judge.start", {"candidate": ci_idx, "n": n,
-                                       "vendor": "codex"})
-                jci = _pp_inner(cm("pp_codex", "critique", {
+                                       "vendor": jp})
+                jci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
                     "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
-                jp = "codex"
             out["cost_usd"] += float(jci.get("cost_usd") or 0.0)
             out["tokens_in"] += int(jci.get("tokens_in") or 0)
             out["tokens_out"] += int(jci.get("tokens_out") or 0)

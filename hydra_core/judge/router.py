@@ -17,9 +17,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Optional
 
 from .schemas import JudgeTier
+
+
+@lru_cache(maxsize=1)
+def _default_preferred_judge_vendors() -> tuple[str, ...]:
+    """Packaged-default vendor ordering (no project override), cached.
+
+    Lazy/local import avoids a hard import-time dependency between the two
+    judge submodules; `policy.py` never imports `router.py`, so this is not
+    circular, just deferred so `route_judge` callers who always pass their
+    own `preferred_judge_vendors` never pay the yaml-load cost.
+    """
+    from .policy import load_policy
+    return load_policy().preferred_judge_vendors
 
 
 # Base policy by envelope type. Anything not in this map defaults to same_vendor.
@@ -162,11 +176,19 @@ def route_judge(
     origin_squad: Optional[str] = None,
     profile: Optional[str] = None,
     is_post_synthesis: bool = False,
+    preferred_judge_vendors: Optional[list[str]] = None,
 ) -> JudgeRoute:
     """Decide tier + rubrics for the given envelope.
 
     Post-synthesis pass is forced cross_vendor with the synthesis-coherence
     rubric, regardless of envelope type.
+
+    B5: ``preferred_judge_vendors`` drives the non-post-synthesis vendor
+    ordering below (was hardcoded ``["codex"]``). Callers should pass
+    ``JudgePolicy.preferred_judge_vendors`` (see ``policy.py`` /
+    ``policy.yaml``); when omitted this falls back to the packaged default
+    loaded from ``policy.yaml`` via ``load_policy()``. Does NOT affect the
+    post-synthesis gate below, which stays intentionally codex-only.
     """
     if is_post_synthesis:
         return JudgeRoute(
@@ -246,12 +268,16 @@ def route_judge(
         tier = "cross_vendor"
 
     # Vendor selection: agy (Antigravity CLI) is enabled by default and opt-out
-    # via PP_DISABLE_AGY=1. Codex is the primary MCP-wired judge; agy is the
-    # secondary. For a cross_vendor gate the GENERATOR must differ from the judge
-    # vendor for the guarantee to hold; that distinctness is enforced downstream
-    # by the vendor-pair rule (judge.policy). For same_vendor the judge is the
-    # same vendor at same-or-higher tier (also enforced downstream).
-    preferred = ["codex"]
+    # via PP_DISABLE_AGY=1. For a cross_vendor gate the GENERATOR must differ
+    # from the judge vendor for the guarantee to hold; that distinctness is
+    # enforced downstream by the vendor-pair rule (judge.policy). For
+    # same_vendor the judge is the same vendor at same-or-higher tier (also
+    # enforced downstream). B5: the ordering itself is policy-driven, not
+    # hardcoded — see `JudgePolicy.preferred_judge_vendors` / policy.yaml.
+    if preferred_judge_vendors:
+        preferred = list(preferred_judge_vendors)
+    else:
+        preferred = list(_default_preferred_judge_vendors())
     return JudgeRoute(
         tier=tier,
         rubric_ids=rubrics,
