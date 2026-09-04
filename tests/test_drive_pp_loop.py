@@ -1168,3 +1168,248 @@ def test_via_mcp_without_hydra_context_block_prompt_unchanged(monkeypatch) -> No
     assert "## Hydra context" not in gen_prompt, (
         "generate prompt must not contain a Hydra context header when block is absent"
     )
+
+
+# --------------------------------------------------------------------------- #
+# B9: real gate_type threading (headless single-candidate + best-of + _via_mcp)
+# --------------------------------------------------------------------------- #
+#
+# Before this fix every headless call site hardcoded
+# gate_type_used = _pp_gate_type("code", "code_style"), so the security/spec/
+# contract/design tiebreak branches in _judge_vendor_chain were unreachable
+# dead code. These tests drive the real functions (not just the pure
+# _judge_vendor_chain helper) and assert the real gate_type argument reaches
+# gate_eligible_judges / _judge_vendor_chain.
+
+def test_gate_type_for_envelope_maps_hydra_envelope_types() -> None:
+    from hydra_core.squad_node import _gate_type_for_envelope
+
+    assert _gate_type_for_envelope("PRD") == "spec"
+    assert _gate_type_for_envelope("ARCH_RFC") == "design"
+    assert _gate_type_for_envelope("DEV_TASK") == "code_style"
+    assert _gate_type_for_envelope("HANDOFF") == "code_style"
+    # Unrecognized/missing type (e.g. the planner's C_SUITE_DECISION_PACKET
+    # dispatch envelope) falls through to the documented code_style DEFAULT.
+    assert _gate_type_for_envelope("C_SUITE_DECISION_PACKET") == "code_style"
+    assert _gate_type_for_envelope(None) == "code_style"
+
+
+def test_drive_pp_stage_loop_single_candidate_threads_gate_type(monkeypatch) -> None:
+    """squad_node call site (single-candidate path): the caller-supplied
+    gate_type must be the SAME value sent to gate_eligible_judges."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing",
+        gate_type="security")
+    assert out["final_status"] == "complete"
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "security"
+
+
+def test_drive_pp_stage_loop_default_gate_type_is_code_style() -> None:
+    """No gate_type supplied -- falls through to the documented DEFAULT,
+    unchanged from before this fix."""
+    disp = _ScriptedDispatcher(_happy_responses("pass"))
+    _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do it")
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "code_style"
+
+
+def _best_of_responses_b9(n_candidates: int = 1) -> dict:
+    cands = [
+        {"candidate_index": i, "attempt_slot_id": f"slot{i}",
+         "worktree_path": f"/tmp/b9c{i}", "worktree_mode": "copy"}
+        for i in range(1, n_candidates + 1)
+    ]
+    return {
+        ("pp_harness", "start_best_of_stage"): {"status": "done", "result": {
+            "stage_id": "st_b9", "candidates": cands}},
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
+        ("pp_codex", "generate"): {"status": "done", "result": {
+            "text": "edited foo.py", "model": "codex-1",
+            "tokens_in": 5, "tokens_out": 7, "cost_usd": 0.02}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": "x"}},
+        ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_b9"}},
+        ("pp_codex", "critique"): {"status": "done", "result": {"parsed": {
+            "outcome": "pass", "critique_md": "ok", "score": {}}}},
+        ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
+        ("pp_harness", "record_smoke_status"): {"status": "done", "result": {}},
+        ("pp_harness", "get_stage_finalize_readiness"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {"status": "done", "result": {
+            "effective_status": "complete", "status": "complete"}},
+        ("pp_harness", "borda_count"): {"status": "done", "result": {"winner": "att_b9"}},
+        ("pp_harness", "archive_winner_and_losers"): {"status": "done", "result": {
+            "merge_status": "merged", "winner_diff_path": "w.diff"}},
+        ("pp_harness", "teardown_candidates"): {"status": "done", "result": {
+            "teardown_status": "ok"}},
+    }
+
+
+class _B9BoDispatcher:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[tuple] = []
+
+    def call_mcp(self, server, tool, args, *, squad_id=None):
+        self.calls.append((server, tool, dict(args)))
+        return self.responses.get((server, tool), {"status": "done", "result": {}})
+
+    def emit_claude_prompt(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def invoke_claude_skill(self, *a, **k): raise NotImplementedError  # pragma: no cover
+    def spawn_subprocess(self, *a, **k): raise NotImplementedError  # pragma: no cover
+
+
+def test_drive_best_of_loop_threads_gate_type(monkeypatch) -> None:
+    """squad_node call site (best-of path): the caller-supplied gate_type
+    must reach BOTH start_best_of_stage and gate_eligible_judges/
+    _judge_vendor_chain -- not the old hardcoded code_style literal."""
+    from hydra_core.squad_node import _drive_best_of_loop
+
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _B9BoDispatcher(_best_of_responses_b9(n_candidates=1))
+    out = _drive_best_of_loop(
+        disp, run_id="run_b9", project_path="/tmp/proj", request_text="do it",
+        n=1, gate_type="contract")
+    assert out is not None
+    open_call = next(a for (s, t, a) in disp.calls if t == "start_best_of_stage")
+    assert open_call["gate_type"] == "contract"
+    gate_call = next(a for (s, t, a) in disp.calls if t == "gate_eligible_judges")
+    assert gate_call["gate_type"] == "contract"
+
+
+def test_via_mcp_threads_real_gate_type_from_dev_task(monkeypatch) -> None:
+    """_via_mcp call site: a DEV_TASK-typed inbound envelope must resolve to
+    gate_type='code_style' and that exact value must reach
+    _drive_pp_stage_loop (proving the end-to-end envelope -> kind ->
+    gate_type derivation, not just the pure mapping function)."""
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    _via_mcp(state, pack, _inbound(state), disp)
+
+    assert captured.get("gate_type") == "code_style"
+
+
+def test_via_mcp_threads_real_gate_type_from_prd_envelope(monkeypatch) -> None:
+    """A PRD-typed inbound envelope (squad.yaml accepts PRD/ARCH_RFC/DEV_TASK/
+    HANDOFF) must resolve to gate_type='spec' and that exact value must reach
+    _drive_pp_stage_loop."""
+    from uuid import uuid4
+
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    class _FakePRDEnvelope:
+        """Minimal stand-in carrying only what _via_mcp reads via getattr --
+        the real PRD schema has no target_repo_id field, so a genuine PRD
+        instance can never resolve a dispatch target; this fake proves the
+        gate_type derivation without fighting that unrelated constraint."""
+        type = "PRD"
+
+        def __init__(self, workflow_id):
+            self.id = uuid4()
+            self.workflow_id = workflow_id
+            self.origin_squad = "hydra"
+            self.model_tier = None
+            self.target_repo_id = "hydra"
+            self.target_repo_subpath = None
+            self.instructions = "write the PRD"
+            self.summary = None
+            self.objective = None
+            self.pp_team = None
+            self.pp_profile = None
+
+        def model_dump(self, mode="json"):
+            return {"type": self.type}
+
+    inbound = _FakePRDEnvelope(state.workflow_id)
+    _via_mcp(state, pack, inbound, disp)
+
+    assert captured.get("gate_type") == "spec"
+
+
+def test_via_mcp_threads_real_gate_type_from_arch_rfc_envelope(monkeypatch) -> None:
+    """An ARCH_RFC-typed inbound envelope must resolve to gate_type='design'
+    and that exact value must reach _drive_pp_stage_loop."""
+    from uuid import uuid4
+
+    captured: dict = {}
+
+    def _fake_loop(_dispatcher, **kwargs):
+        captured.update(kwargs)
+        return {
+            "final_status": "complete", "stage_outcome": "pass",
+            "verdict_outcome": "pass", "attempt_id": "att_x", "critique": "",
+            "error": None, "finalized": True, "wrote_changes": False,
+            "smoke_status": "pass", "smoke_reason": "", "harvest_sha": None,
+            "harvest_error": None, "changed_paths": [],
+        }
+
+    monkeypatch.setattr("hydra_core.squad_node._drive_pp_stage_loop", _fake_loop)
+    monkeypatch.setattr("hydra_core.squad_node.harvest_pp_run_artifacts",
+                        lambda **_k: None)
+    state = HydraState(root_goal="t")
+    pack = _eng_pack()
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+
+    class _FakeArchRFCEnvelope:
+        type = "ARCH_RFC"
+
+        def __init__(self, workflow_id):
+            self.id = uuid4()
+            self.workflow_id = workflow_id
+            self.origin_squad = "hydra"
+            self.model_tier = None
+            self.target_repo_id = "hydra"
+            self.target_repo_subpath = None
+            self.instructions = "review the architecture"
+            self.summary = None
+            self.objective = None
+            self.pp_team = None
+            self.pp_profile = None
+
+        def model_dump(self, mode="json"):
+            return {"type": self.type}
+
+    inbound = _FakeArchRFCEnvelope(state.workflow_id)
+    _via_mcp(state, pack, inbound, disp)
+
+    assert captured.get("gate_type") == "design"

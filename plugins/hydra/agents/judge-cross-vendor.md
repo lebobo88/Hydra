@@ -25,9 +25,27 @@ do not assume a passing implementation.
 
 Given: `artifact_text` (the engineer's diff + summary), `rubric_md`, `attempt_id`, `generator_producer`, `judge_producer`, `preferred_models`.
 
-The host (`host_bridge._judge_vendor_chain`) has ALREADY selected `judge_producer`
-per pp's authoritative cross-vendor mapping (never the same vendor as
-`generator_producer`). Do not re-derive or second-guess it.
+The host (`host_bridge._judge_vendor_chain`, implemented in
+`hydra_core/judge_vendor.py`) has ALREADY selected `judge_producer` — never
+the same vendor as `generator_producer`. Do not re-derive or second-guess it.
+
+**Hydra's mapping intentionally diverges from pp's own.** For a
+`codex`/`agy` generator the other vendor always judges, same as pp. For a
+`claude` generator, pp's own authoritative mapping (see the sibling repo's
+`.claude/agents/judge-cross-vendor.md` "Cross-vendor mapping") prefers agy
+for security/spec gates and codex for contract/architecture gates — Hydra's
+operator has deliberately chosen the OPPOSITE tiebreak (B9 PART 2), NOT an
+accidental drift:
+
+| gate_type | pp's own preference | Hydra's claude-generator tiebreak |
+|---|---|---|
+| security | agy | **codex** |
+| spec | agy | **codex** |
+| contract | codex | codex (unchanged) |
+| design (architecture) | codex | **agy** |
+| other (code_style, docs_polish, lint_class, unknown) | pp's own `preferred_producers` order | pp's own `preferred_producers` order (unchanged) |
+
+The generator's own vendor is never selected as judge in any case.
 
 1. **Pre-flight tool check.** Confirm your granted tools include the critique
    tool for `judge_producer`: `mcp__pp_codex__critique` (or

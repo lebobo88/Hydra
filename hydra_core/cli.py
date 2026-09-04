@@ -1743,6 +1743,29 @@ def _next_attended_task(state: HydraState, packs: dict):
     return None, None, None
 
 
+def _attended_task_gate_type(task, state: HydraState) -> str | None:
+    """B9: best-effort real pp gate_type for an attended engineering
+    ``TaskState``, derived from the actual Hydra envelope that triggered it
+    (PRD/ARCH_RFC/DEV_TASK/HANDOFF via ``squad_node._gate_type_for_envelope``)
+    rather than a hardcoded literal.
+
+    ``TaskState`` itself carries no envelope type, only ``envelope_id``; the
+    triggering envelope's raw dict (with its real ``type``) lives in
+    ``state.envelopes``. Returns ``None`` (falls through to host_bridge's
+    documented code_style DEFAULT) when the task has no envelope_id or no
+    matching envelope is found — e.g. a planner-synthesised default task with
+    no originating PRD/ARCH_RFC/DEV_TASK envelope.
+    """
+    eid = str(getattr(task, "envelope_id", "") or "")
+    if not eid:
+        return None
+    for env in getattr(state, "envelopes", None) or []:
+        if isinstance(env, dict) and str(env.get("id") or "") == eid:
+            from .squad_node import _gate_type_for_envelope
+            return _gate_type_for_envelope(env.get("type"))
+    return None
+
+
 def _pack_lead_agent_spec(pack):
     """The pack's lead AgentSpec: first gatekeeper, else first agent, else None."""
     agents = list(getattr(pack, "agents", []) or [])
@@ -2376,7 +2399,10 @@ def _cmd_attended_step(args) -> int:
                 project_path=project_path, request_text=request_text,
                 model_tier=getattr(task, "model_tier", None),
                 project_root=project, task_id=str(task.task_id),
-                hydra_context_block=_hydra_context_block)
+                hydra_context_block=_hydra_context_block,
+                # B9: real gate_type derived from the task's triggering
+                # envelope, not a hardcoded literal.
+                gate_type=_attended_task_gate_type(task, state))
 
             try:
                 # Only open_pp_runs (replace channel) is persisted — NOT `tasks`

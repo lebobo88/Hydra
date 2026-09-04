@@ -1006,6 +1006,34 @@ def _pp_gate_type(kind: str, gate_type: str | None = None) -> str:
     return _PP_GATE_TYPE_BY_KIND.get(kind, "code_style")
 
 
+# B9: the real signal for "what kind of gate is this stage" is the typed
+# Hydra envelope that reached the engineering squad (squad.yaml `accepts`:
+# PRD/ARCH_RFC/DEV_TASK/HANDOFF), NOT a hardcoded "code" literal. Map the
+# envelope's `type` to the nearest ``_PP_GATE_TYPE_BY_KIND`` key so
+# ``_gate_type_for_envelope`` below can resolve a real gate_type end-to-end
+# (envelope -> kind -> pp gate_type) instead of always falling through to the
+# code_style default.
+_ENVELOPE_TYPE_TO_KIND = {
+    "PRD": "spec",
+    "ARCH_RFC": "design",
+    "DEV_TASK": "code",
+    "HANDOFF": "code",
+}
+
+
+def _gate_type_for_envelope(envelope_type: Any) -> str:
+    """Resolve the real pp gate_type for a Hydra envelope's ``type`` (B9).
+
+    PRD -> spec, ARCH_RFC -> design, DEV_TASK/HANDOFF -> code_style, anything
+    else (e.g. the planner's C_SUITE_DECISION_PACKET dispatch envelope, or a
+    missing/unrecognized type) falls back to the documented code_style
+    DEFAULT via ``_pp_gate_type``'s own fallback -- same as before this fix,
+    just no longer a hardcode for the cases that DO carry real signal.
+    """
+    kind = _ENVELOPE_TYPE_TO_KIND.get(str(envelope_type or ""), "code")
+    return _pp_gate_type(kind)
+
+
 def _default_rubric_id(gate_type: str | None) -> str:
     """Gate-typed default rubric BASE id (E2-25). See judge/rubric_resolution."""
     from .judge.rubric_resolution import default_rubric_id
@@ -1333,6 +1361,10 @@ def _drive_pp_stage_loop(
     # None = no gate (unit tests / callers that don't thread state).
     state: "HydraState | None" = None,
     repo_id: str | None = None,
+    # B9: the real pp gate_type for this stage (see `_gate_type_for_envelope`),
+    # threaded by the caller from the actual dispatched envelope's type. None
+    # falls through to the documented code_style DEFAULT via `_pp_gate_type`.
+    gate_type: str | None = None,
 ) -> dict[str, Any]:
     """Drive a pp `code` stage to a finalized run, headless (no Claude driver).
 
@@ -1361,11 +1393,14 @@ def _drive_pp_stage_loop(
     F18: ``invoke_mode="pp_best_of"`` implies N=3 when HYDRA_BEST_OF_N is unset.
     An explicit HYDRA_BEST_OF_N always wins over the invoke_mode default.
     """
-    # E2-25: this stage is always kind="code", so its default rubric is the code
-    # rubric, NOT the spec rubric `rfc-2119-normative` that used to be hardcoded
-    # here (pp's gates.ts maps only gate_type="spec" to that one).
-    judge_rubric_id = judge_rubric_id or _default_rubric_id(
-        _pp_gate_type("code", "code_style"))
+    # B9: resolve the real pp gate_type ONCE for this stage; used for both the
+    # rubric default below and every gate_eligible_judges / _judge_vendor_chain
+    # call downstream (including the best-of delegate) so they cannot drift
+    # from each other. E2-25: still defaults to the code rubric (NOT the spec
+    # rubric `rfc-2119-normative`, which pp's gates.ts maps only to
+    # gate_type="spec") when the caller carries no better signal.
+    gate_type = _pp_gate_type("code", gate_type)
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     # F18: explicit env wins; invoke_mode="pp_best_of" implies N=3 as fallback.
     _effective_n = _best_of_n() or (3 if invoke_mode == "pp_best_of" else None)
     if _effective_n:
@@ -1373,7 +1408,7 @@ def _drive_pp_stage_loop(
             dispatcher, run_id=run_id, project_path=project_path,
             request_text=request_text, n=_effective_n, model_tier=model_tier,
             judge_rubric_id=judge_rubric_id, workflow_id=workflow_id,
-            state=state, repo_id=repo_id)
+            state=state, repo_id=repo_id, gate_type=gate_type)
         if _bo is not None:
             return _bo
         _log.warning("best-of-N could not open; falling back to single-candidate "
@@ -1554,8 +1589,10 @@ def _drive_pp_stage_loop(
             # follow it. Default when the gate tool is unavailable (no daemon /
             # scripted): prefer cross-vendor. B4: the actual cross-vendor
             # producer (codex or agy) is picked below via the shared
-            # `_judge_vendor_chain` mapping, not hardcoded to codex.
-            gate_type_used = _pp_gate_type("code", "code_style")
+            # `_judge_vendor_chain` mapping, not hardcoded to codex. B9: reuse
+            # the stage's real gate_type (resolved once above) rather than
+            # re-deriving a hardcoded literal here.
+            gate_type_used = gate_type
             gate_dec: dict[str, Any] = {}
             try:
                 gate_dec = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
@@ -1896,6 +1933,10 @@ def _drive_best_of_loop(
     # None = no gate (unit tests / callers that don't thread state).
     state: "HydraState | None" = None,
     repo_id: str | None = None,
+    # B9: the real pp gate_type for this stage, threaded from the caller
+    # (`_drive_pp_stage_loop`, already resolved via `_pp_gate_type`). None
+    # falls through to the documented code_style DEFAULT.
+    gate_type: str | None = None,
 ) -> dict[str, Any] | None:
     """Real best-of-N for the headless engineering stage (opt-in HYDRA_BEST_OF_N).
 
@@ -1907,9 +1948,10 @@ def _drive_best_of_loop(
     (the caller then falls back to the single-candidate path). Fail-soft: any
     exception finalizes the run aborted (lock released)."""
     sq = "engineering"
-    # E2-25: code stage → code rubric default (not the spec rubric).
-    judge_rubric_id = judge_rubric_id or _default_rubric_id(
-        _pp_gate_type("code", "code_style"))
+    # B9: resolve once; E2-25 default (code stage → code rubric, not spec)
+    # unchanged when the caller carries no better signal.
+    gate_type = _pp_gate_type("code", gate_type)
+    judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     os.environ.setdefault("PP_BROWSER_ENGINE", "playwright")
     cm = dispatcher.call_mcp
     out: dict[str, Any] = {
@@ -1943,7 +1985,7 @@ def _drive_best_of_loop(
     try:
         bo = _pp_inner(cm("pp_harness", "start_best_of_stage", {
             "run_id": run_id, "kind": "code",
-            "gate_type": _pp_gate_type("code", "code_style"), "n": n,
+            "gate_type": gate_type, "n": n,
         }, squad_id=sq))
     except Exception as e:  # noqa: BLE001
         _log.warning("start_best_of_stage raised (run=%s): %r", run_id, e)
@@ -2064,7 +2106,8 @@ def _drive_best_of_loop(
             except Exception:  # noqa: BLE001
                 pass
             # Judge per pp's routing (identical policy to the single path).
-            gate_type_used = _pp_gate_type("code", "code_style")
+            # B9: reuse the stage's real gate_type (resolved once above).
+            gate_type_used = gate_type
             gate: dict[str, Any] = {}
             try:
                 gate = _pp_inner(cm("pp_harness", "gate_eligible_judges", {
@@ -3311,6 +3354,9 @@ def _via_mcp(
             invoke_mode=mode,
             state=state,
             repo_id=target_repo_id,
+            # B9: real gate_type derived from the dispatched envelope's type
+            # (PRD/ARCH_RFC/DEV_TASK/HANDOFF), not a hardcoded literal.
+            gate_type=_gate_type_for_envelope(_hctx_type),
         )
         # The loop already finalized the run (complete/surfaced/aborted) → the
         # project lock is released. Drop the ledger entry so node_postcheck's
