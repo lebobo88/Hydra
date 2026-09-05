@@ -212,6 +212,8 @@ def test_hydra_persona_agent_adds_voice_without_duplicating_the_contract(
     # em dash, no "load-bearing".
     assert "\u2014" not in body  # the em dash, U+2014
     assert "load-bearing" not in body.lower()
+    # Blocks the figurative wording the cross-vendor judge flagged.
+    assert "drift" not in body.lower()
 
     # Frontmatter must omit tools:/model:/permissionMode: -- each omission is
     # deliberate: `["*"]` is not a documented file form; a `model:` would
