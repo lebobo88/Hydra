@@ -1717,17 +1717,43 @@ class TestRiderBRecoverySafeOrdering:
         )
         # Match the real invocation ("charge_and_gate(state, ..." or
         # "charge_and_gate(\n    state, ..."), not a bare "charge_and_gate(...)"
-        # mentioned in a nearby comment.
-        m = re.search(r"charge_and_gate\(\s*state\b", src[idx_mark:])
+        # mentioned in a nearby comment, and not the
+        # "from .governance import charge_and_gate" statement.
+        #
+        # IMPORTANT: search the WHOLE function source, not just the slice
+        # after idx_mark. Scoping the search to src[idx_mark:] made
+        # idx_charge = idx_mark + m.start() unconditionally >= idx_mark,
+        # so the later `assert idx_mark < idx_charge` ordering check could
+        # never fail even if the real call were moved before mark_charged.
+        # Searching the full source lets a reversed ordering actually
+        # produce idx_charge < idx_mark, so the ordering assertion below is
+        # the one that fires (not this "call must exist" assertion).
+        call_re = re.compile(r"charge_and_gate\(\s*state\b")
+        idx_charge = None
+        m = None
+        for cand in call_re.finditer(src):
+            # Skip mentions inside a comment (e.g. the ordering explainer
+            # comment block: "#   2. charge_and_gate(...)"). A commented
+            # mention never matches `charge_and_gate\(\s*state\b` anyway
+            # (comments here use "charge_and_gate(...)", not "(...state"),
+            # but guard explicitly so this stays true if the comment wording
+            # changes again.
+            line_start = src.rfind("\n", 0, cand.start()) + 1
+            line = src[line_start:cand.start()]
+            if line.lstrip().startswith("#"):
+                continue
+            m = cand
+            idx_charge = cand.start()
+            break
         assert m is not None, (
             "a charge_and_gate(state, ...) call must appear in "
-            "_cmd_attended_submit after mark_charged(cfile)"
+            "_cmd_attended_submit (excluding the import statement and any "
+            "comment mentions)"
         )
-        idx_charge = idx_mark + m.start()
         call_snippet = src[idx_charge:idx_charge + 200]
         assert "source=cost_source" in call_snippet, (
-            "the post-mark_charged charge_and_gate(...) call must forward "
-            f"source=cost_source; got: {call_snippet!r}"
+            "the charge_and_gate(...) call must forward source=cost_source; "
+            f"got: {call_snippet!r}"
         )
         assert idx_mark < idx_charge, (
             f"Rider (b) recovery-safe ordering: mark_charged call (pos {idx_mark}) must "
