@@ -1671,6 +1671,18 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         "cost_usd": float(cursor.get("cost_usd") or 0.0),
         "tokens_in": int(cursor.get("tokens_in") or 0),
         "tokens_out": int(cursor.get("tokens_out") or 0),
+        # B8: cost provenance for the stage as a whole — the CLI's
+        # charge_and_gate call reads "cost_source" to tag the ledger entry so
+        # an unreporting host counts as estimated/unmeasured, never free.
+        # Defaults to "measured" (pre-existing behaviour) when the stage never
+        # ran any accrual (e.g. still awaiting the host).
+        "cost_source": cursor.get("cost_source") or "measured",
+        "unmeasured_count": int(cursor.get("unmeasured_count") or 0),
+        # Fix (mixed-provenance estimated_usd): the per-component estimated
+        # dollars accrued across this stage's calls, so a charging site can
+        # credit budget.estimated_usd with only this figure instead of
+        # inferring it from the collapsed "cost_source" label.
+        "estimated_cost_usd": float(cursor.get("estimated_cost_usd") or 0.0),
     }
     if status == "awaiting_host":
         res["host_action"] = _host_action(cursor)
@@ -1728,6 +1740,81 @@ def _trace(cursor: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
                         {"run_id": cursor.get("run_id"), **payload})
     except Exception:  # noqa: BLE001 — never crash the driver on a trace write
         pass
+
+
+# B8: priority order used to resolve one stage's overall cost provenance
+# across its several accrual calls (generate, judge, squad-result) —
+# "estimated" wins over "measured" wins over "unmeasured", because a single
+# estimated call anywhere in the stage means the stage's total cost_usd is no
+# longer purely measured money, and a single measured call means the stage is
+# not wholly unmeasured.
+_SOURCE_RANK = {"unmeasured": 0, "measured": 1, "estimated": 2}
+
+
+def _merge_cost_source(cursor: dict[str, Any], new_source: str) -> None:
+    current = cursor.get("cost_source")
+    if current is None or _SOURCE_RANK[new_source] > _SOURCE_RANK[current]:
+        cursor["cost_source"] = new_source
+
+
+def _priced_cost(
+    cursor: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    label: str,
+    model_hint: str | None = None,
+) -> tuple[float, str]:
+    """B8: resolve a host result's dollar cost + provenance ``source``.
+
+    Returns ``(cost_usd, source)`` where ``source`` is one of
+    ``"measured"`` (the host reported ``cost_usd`` directly — the pre-existing
+    behaviour, unchanged), ``"estimated"`` (the host reported no cost but DID
+    report ``tokens_in``/``tokens_out`` and a ``model``, so
+    ``hydra_core.pricing.price_call`` prices it), or ``"unmeasured"`` (neither
+    a cost nor usable tokens+model were reported — this call contributes
+    $0.0 and a trace event is emitted; it never blocks the stage).
+
+    Also folds the resolved source into ``cursor["cost_source"]`` — priority
+    estimated > measured > unmeasured across the whole stage's accrual calls
+    (generate + judge + squad-result) — and bumps ``cursor["unmeasured_count"]``
+    on an unmeasured call so a caller charging the STAGE's total cost once
+    (``_cmd_attended_submit`` / recover-stalled-stage) can pick the right
+    ``source`` for ``charge_and_gate``.
+
+    Fix (mixed-provenance ``estimated_usd``): a stage can mix a measured call
+    (e.g. generate) with an estimated call (e.g. judge). ``cost_source``
+    necessarily collapses to a single winning label for the whole stage
+    (see ``_merge_cost_source``), so it cannot tell the charging site how much
+    of the stage's *total* was actually estimated money. This function
+    separately accumulates ``cursor["estimated_cost_usd"]`` by ONLY the
+    dollar amount resolved on this call's estimated branch, so a caller can
+    credit ``budget.estimated_usd`` with just that figure instead of the
+    whole (mixed) stage total.
+    """
+    reported = result.get("cost_usd")
+    if reported is not None:
+        _merge_cost_source(cursor, "measured")
+        return float(reported), "measured"
+
+    tokens_in = int(result.get("tokens_in") or 0)
+    tokens_out = int(result.get("tokens_out") or 0)
+    model = str(result.get("model") or model_hint or cursor.get("model_tier") or "")
+    if (tokens_in or tokens_out) and model:
+        from .pricing import price_call
+        priced = price_call(model, tokens_in, tokens_out)
+        if priced is not None:
+            _merge_cost_source(cursor, "estimated")
+            cursor["estimated_cost_usd"] = (
+                float(cursor.get("estimated_cost_usd") or 0.0) + priced
+            )
+            return priced, "estimated"
+
+    _merge_cost_source(cursor, "unmeasured")
+    cursor["unmeasured_count"] = int(cursor.get("unmeasured_count") or 0) + 1
+    _trace(cursor, "attended.cost_unmeasured", {
+        "stage_id": cursor.get("stage_id"), "call": label, "model": model or None,
+    })
+    return 0.0, "unmeasured"
 
 
 # --------------------------------------------------------------------------- #
@@ -1891,7 +1978,11 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     producer = cursor["producer"]
 
     gen_text = str(result.get("text") or "")
-    cursor["cost_usd"] = float(cursor["cost_usd"]) + float(result.get("cost_usd") or 0.0)
+    # B8: a host result that omits cost_usd is no longer free — if it reports
+    # tokens+model, price it (source="estimated"); otherwise it is
+    # source="unmeasured" ($0.0, logged, non-blocking).
+    _gen_cost, _gen_source = _priced_cost(cursor, result, label="generate")
+    cursor["cost_usd"] = float(cursor["cost_usd"]) + _gen_cost
     cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
     cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
 
@@ -1930,7 +2021,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
                     "agent_type": "engineer",   # F29
                     "tokens_in": int(result.get("tokens_in") or 0),
                     "tokens_out": int(result.get("tokens_out") or 0),
-                    "cost_usd": float(result.get("cost_usd") or 0.0),
+                    "cost_usd": _gen_cost,
                     "status": "error", "retry_index": gen_idx,
                     "notes": {"candidate_index": 1},
                 }, squad_id=_SQ),
@@ -1972,7 +2063,7 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
                 "tokens_in": int(result.get("tokens_in") or 0),
                 "tokens_out": int(result.get("tokens_out") or 0),
-                "cost_usd": float(result.get("cost_usd") or 0.0),
+                "cost_usd": _gen_cost,
                 "status": "ok", "retry_index": gen_idx,
                 "notes": {"candidate_index": 1},
             }, squad_id=_SQ),
@@ -2260,7 +2351,15 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                             "judge_cost_applied_for double-counting guard "
                             "cannot protect this accrual on a re-drive"),
             })
-        cursor["cost_usd"] = float(cursor["cost_usd"]) + float(result.get("cost_usd") or 0.0)
+        # B8: same treat-missing-cost-as-priceable-or-unmeasured policy as the
+        # generate accrual above; hint the judge's own model field
+        # (judge_model_id) since a judge result's model lives there, not in
+        # the generic "model" key.
+        _judge_cost, _judge_cost_source = _priced_cost(
+            cursor, result, label="judge",
+            model_hint=str(result.get("judge_model_id") or "") or None,
+        )
+        cursor["cost_usd"] = float(cursor["cost_usd"]) + _judge_cost
         cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
         cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
         if call_key is not None:
@@ -3043,8 +3142,10 @@ def _apply_squad_result(
     (``_cmd_attended_submit``) charges the returned cost_usd through the
     authoritative HydraState budget path after this returns.
     """
-    cursor["cost_usd"] = (float(cursor.get("cost_usd") or 0.0)
-                          + float(result.get("cost_usd") or 0.0))
+    # B8: same treat-missing-cost-as-priceable-or-unmeasured policy as the
+    # engineering generate/judge accruals above.
+    _squad_cost, _squad_cost_source = _priced_cost(cursor, result, label="squad_result")
+    cursor["cost_usd"] = float(cursor.get("cost_usd") or 0.0) + _squad_cost
     cursor["tokens_in"] = (int(cursor.get("tokens_in") or 0)
                            + int(result.get("tokens_in") or 0))
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)

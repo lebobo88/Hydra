@@ -27,6 +27,16 @@ class BudgetLedger(BaseModel):
     spent_usd: float = 0.0
     spent_tokens: int = 0
 
+    # B8: companion counters for cost provenance. ``estimated_usd`` is the
+    # portion of ``spent_usd`` that came from ``pricing.price_call`` rather
+    # than a directly reported ``cost_usd`` (source="estimated" in
+    # ``record_cost``) — a companion, never a substitute: ``spent_usd``
+    # keeps its existing meaning and the 0.8/1.0 tripwires read it unchanged.
+    # ``unmeasured_stages`` counts stages that reported neither a cost nor
+    # usable tokens (source="unmeasured") — logged, never blocking.
+    estimated_usd: float = 0.0
+    unmeasured_stages: int = 0
+
     # WS8 SLICE 4 — per-repo fleet budget isolation.
     # repo_budgets: equal-split allocation per fleet repo (set by allocate_repos).
     # repo_spend:   accumulated spend per fleet repo (updated by charge_and_gate_repo).

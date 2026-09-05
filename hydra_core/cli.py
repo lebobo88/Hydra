@@ -2556,7 +2556,24 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
                 state = HydraState.model_validate(snap.values)
                 cost = float(res.get("cost_usd") or 0.0)
                 toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
-                block, downgrade = charge_and_gate(state, cost, toks)
+                # B8: host_bridge tags the stage's cost provenance in
+                # "cost_source" ("measured"/"estimated"/"unmeasured") — an
+                # unreporting host no longer charges as free.
+                cost_source = str(res.get("cost_source") or "measured")
+                # Fix (mixed-provenance estimated_usd): "cost_source" is a
+                # single collapsed label for the whole (possibly mixed)
+                # stage, so it cannot be used to size the estimated_usd
+                # credit for a stage that mixed a measured and an estimated
+                # component. Pass the per-component figure host_bridge
+                # tracked separately instead.
+                estimated_component = float(res.get("estimated_cost_usd") or 0.0)
+                block, downgrade = charge_and_gate(
+                    state, cost, toks, source=cost_source,
+                    estimated_usd=estimated_component,
+                )
+                if cost_source == "unmeasured":
+                    emit(project, wf, "attended.cost_unmeasured",
+                         {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
                 tid = res.get("task_id")
                 completed = list(state.attended_completed_task_ids)
                 if tid is not None and str(tid) not in completed:
@@ -2691,7 +2708,20 @@ def _cmd_attended_submit(args) -> int:
                     state = HydraState.model_validate(snap.values)
                     cost = float(res.get("cost_usd") or 0.0)
                     toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
-                    block, downgrade = charge_and_gate(state, cost, toks)
+                    # B8: see the recover-stalled-stage twin above — an
+                    # unreporting host is estimated/unmeasured, never free.
+                    cost_source = str(res.get("cost_source") or "measured")
+                    # Fix (mixed-provenance estimated_usd): see the twin
+                    # comment above — credit only the per-component estimated
+                    # figure, not the whole (possibly mixed) stage total.
+                    estimated_component = float(res.get("estimated_cost_usd") or 0.0)
+                    block, downgrade = charge_and_gate(
+                        state, cost, toks, source=cost_source,
+                        estimated_usd=estimated_component,
+                    )
+                    if cost_source == "unmeasured":
+                        emit(project, wf, "attended.cost_unmeasured",
+                             {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
                     # F34: budget_charge to eights (fail-soft; never blocks local work).
                     try:
                         from .eights.attestation import EightsAttestor as _EightsAttestor

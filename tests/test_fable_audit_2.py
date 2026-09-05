@@ -1703,14 +1703,57 @@ class TestRiderBRecoverySafeOrdering:
         src = inspect.getsource(cli_mod._cmd_attended_submit)
         # Match the actual CALL sites, not the import at the top of the function.
         # mark_charged call: "mark_charged(cfile)"
-        # charge_and_gate call: "charge_and_gate(state, cost, toks)"
+        # charge_and_gate call: the "charge_and_gate(" invocation that follows
+        # mark_charged, keyed on "source=cost_source" appearing in the same
+        # call (not just the import statement further up).
+        # (B8: the source= kwarg was added so an unreporting host prices as
+        # estimated/unmeasured rather than free. Mixed-provenance fix: the
+        # call now also forwards estimated_usd=; the call site's SHAPE
+        # changed, but the ordering this test pins is unchanged.)
+        import re
         idx_mark = src.find("mark_charged(cfile)")
-        idx_charge = src.find("charge_and_gate(state, cost, toks)")
         assert idx_mark != -1, (
             "mark_charged(cfile) call must appear in _cmd_attended_submit"
         )
-        assert idx_charge != -1, (
-            "charge_and_gate(state, cost, toks) call must appear in _cmd_attended_submit"
+        # Match the real invocation ("charge_and_gate(state, ..." or
+        # "charge_and_gate(\n    state, ..."), not a bare "charge_and_gate(...)"
+        # mentioned in a nearby comment, and not the
+        # "from .governance import charge_and_gate" statement.
+        #
+        # IMPORTANT: search the WHOLE function source, not just the slice
+        # after idx_mark. Scoping the search to src[idx_mark:] made
+        # idx_charge = idx_mark + m.start() unconditionally >= idx_mark,
+        # so the later `assert idx_mark < idx_charge` ordering check could
+        # never fail even if the real call were moved before mark_charged.
+        # Searching the full source lets a reversed ordering actually
+        # produce idx_charge < idx_mark, so the ordering assertion below is
+        # the one that fires (not this "call must exist" assertion).
+        call_re = re.compile(r"charge_and_gate\(\s*state\b")
+        idx_charge = None
+        m = None
+        for cand in call_re.finditer(src):
+            # Skip mentions inside a comment (e.g. the ordering explainer
+            # comment block: "#   2. charge_and_gate(...)"). A commented
+            # mention never matches `charge_and_gate\(\s*state\b` anyway
+            # (comments here use "charge_and_gate(...)", not "(...state"),
+            # but guard explicitly so this stays true if the comment wording
+            # changes again.
+            line_start = src.rfind("\n", 0, cand.start()) + 1
+            line = src[line_start:cand.start()]
+            if line.lstrip().startswith("#"):
+                continue
+            m = cand
+            idx_charge = cand.start()
+            break
+        assert m is not None, (
+            "a charge_and_gate(state, ...) call must appear in "
+            "_cmd_attended_submit (excluding the import statement and any "
+            "comment mentions)"
+        )
+        call_snippet = src[idx_charge:idx_charge + 200]
+        assert "source=cost_source" in call_snippet, (
+            "the charge_and_gate(...) call must forward source=cost_source; "
+            f"got: {call_snippet!r}"
         )
         assert idx_mark < idx_charge, (
             f"Rider (b) recovery-safe ordering: mark_charged call (pos {idx_mark}) must "
