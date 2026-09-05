@@ -939,7 +939,7 @@ def test_attended_squad_path_completes_charges_once_no_redispatch(
     monkeypatch.setattr("hydra_core.squad_loader.discover_squads",
                         lambda *a, **k: {"garland": _FakePack()})
     monkeypatch.setattr("hydra_core.governance.charge_and_gate",
-                        lambda state, cost, toks: (False, False))
+                        lambda state, cost, toks, **_kw: (False, False))
 
     # --- step 1: attended step → squad cursor ---
     rc_step = cli._cmd_attended_step(

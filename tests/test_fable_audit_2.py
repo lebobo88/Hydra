@@ -1703,14 +1703,31 @@ class TestRiderBRecoverySafeOrdering:
         src = inspect.getsource(cli_mod._cmd_attended_submit)
         # Match the actual CALL sites, not the import at the top of the function.
         # mark_charged call: "mark_charged(cfile)"
-        # charge_and_gate call: "charge_and_gate(state, cost, toks)"
+        # charge_and_gate call: the "charge_and_gate(" invocation that follows
+        # mark_charged, keyed on "source=cost_source" appearing in the same
+        # call (not just the import statement further up).
+        # (B8: the source= kwarg was added so an unreporting host prices as
+        # estimated/unmeasured rather than free. Mixed-provenance fix: the
+        # call now also forwards estimated_usd=; the call site's SHAPE
+        # changed, but the ordering this test pins is unchanged.)
+        import re
         idx_mark = src.find("mark_charged(cfile)")
-        idx_charge = src.find("charge_and_gate(state, cost, toks)")
         assert idx_mark != -1, (
             "mark_charged(cfile) call must appear in _cmd_attended_submit"
         )
-        assert idx_charge != -1, (
-            "charge_and_gate(state, cost, toks) call must appear in _cmd_attended_submit"
+        # Match the real invocation ("charge_and_gate(state, ..." or
+        # "charge_and_gate(\n    state, ..."), not a bare "charge_and_gate(...)"
+        # mentioned in a nearby comment.
+        m = re.search(r"charge_and_gate\(\s*state\b", src[idx_mark:])
+        assert m is not None, (
+            "a charge_and_gate(state, ...) call must appear in "
+            "_cmd_attended_submit after mark_charged(cfile)"
+        )
+        idx_charge = idx_mark + m.start()
+        call_snippet = src[idx_charge:idx_charge + 200]
+        assert "source=cost_source" in call_snippet, (
+            "the post-mark_charged charge_and_gate(...) call must forward "
+            f"source=cost_source; got: {call_snippet!r}"
         )
         assert idx_mark < idx_charge, (
             f"Rider (b) recovery-safe ordering: mark_charged call (pos {idx_mark}) must "

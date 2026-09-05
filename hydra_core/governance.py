@@ -24,9 +24,46 @@ from .state import HydraState
 
 # --------- budget ---------
 
-def record_cost(state: HydraState, usd: float, tokens: int) -> None:
+def record_cost(
+    state: HydraState,
+    usd: float,
+    tokens: int,
+    source: str = "measured",
+    estimated_usd: float | None = None,
+) -> None:
+    """Charge ``usd``/``tokens`` onto the budget ledger.
+
+    ``source`` is one of ``"measured"`` (a directly reported cost — the
+    default, so every pre-existing caller keeps its current behaviour),
+    ``"estimated"`` (priced via ``hydra_core.pricing`` from tokens+model
+    because the host did not report a cost), or ``"unmeasured"`` (neither a
+    cost nor usable tokens were available; ``usd`` is expected to be 0.0).
+
+    B8: measured AND estimated spend BOTH accumulate into ``spent_usd`` so the
+    0.8/1.0 budget tripwires stay authoritative over estimated money too —
+    that is the point of the estimate. ``estimated_usd`` is a companion
+    counter that additionally tracks only the estimated portion; it never
+    changes what ``spent_usd`` means. ``unmeasured_stages`` counts stages
+    that could not be priced at all.
+
+    Fix (mixed-provenance): ``usd`` may be a stage TOTAL that mixes a
+    measured component with an estimated component (``source`` necessarily
+    collapses to one label for the whole stage — see
+    ``host_bridge._merge_cost_source``). The optional ``estimated_usd``
+    keyword lets a caller pass the exact estimated-only dollar figure it
+    tracked per-component, so this credits ``budget.estimated_usd`` with
+    that precise amount instead of inferring it (wrongly, for a mixed stage)
+    from the collapsed ``source`` label. When omitted, behaviour is
+    unchanged from before this fix.
+    """
     state.budget.spent_usd += usd
     state.budget.spent_tokens += tokens
+    if estimated_usd is not None:
+        state.budget.estimated_usd += estimated_usd
+    elif source == "estimated":
+        state.budget.estimated_usd += usd
+    if source == "unmeasured":
+        state.budget.unmeasured_stages += 1
 
 
 def should_downgrade_model(state: HydraState, threshold: float = 0.8) -> bool:
@@ -43,6 +80,8 @@ def charge_and_gate(
     state: HydraState,
     cost_usd: float,
     cost_tokens: int,
+    source: str = "measured",
+    estimated_usd: float | None = None,
 ) -> tuple[bool, bool]:
     """Record cost then evaluate both budget gates in one call.
 
@@ -53,8 +92,13 @@ def charge_and_gate(
     Callers at every execute_squad site use this so the logic is not
     duplicated across best-of-N, single-shot dispatch, and reflexion.
     Sequential (non-fleet) path only — do NOT replace with charge_and_gate_repo.
+
+    ``source`` (B8) is forwarded to ``record_cost`` unchanged; it defaults to
+    ``"measured"`` so every pre-existing caller keeps its current behaviour.
+    ``estimated_usd`` (mixed-provenance fix) is likewise forwarded unchanged;
+    when omitted, behaviour is unchanged from before this fix.
     """
-    record_cost(state, cost_usd, cost_tokens)
+    record_cost(state, cost_usd, cost_tokens, source=source, estimated_usd=estimated_usd)
     block = should_block_for_budget(state)
     downgrade = should_downgrade_model(state)
     return block, downgrade
@@ -65,6 +109,7 @@ def charge_and_gate_repo(
     repo_id: str | None,
     cost_usd: float,
     cost_tokens: int,
+    source: str = "measured",
 ) -> tuple[bool, bool, bool]:
     """WS8 SLICE 4 — per-repo fleet budget isolation.
 
@@ -87,7 +132,7 @@ def charge_and_gate_repo(
       extension is addable without schema changes.  Per-repo over must NEVER be
       wired into the fleet-WIDE cancel_event — that would break isolation.
     """
-    record_cost(state, cost_usd, cost_tokens)
+    record_cost(state, cost_usd, cost_tokens, source=source)
 
     # Per-repo spend tracking.
     # If repo_id is None OR the repo has no per-repo allocation (not a fleet
