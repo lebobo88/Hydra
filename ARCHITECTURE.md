@@ -301,6 +301,38 @@ Only `security`/`spec` and `design` differ; `contract -> codex` is identical in
 both systems. This is a considered override — a future reader comparing the two
 repos should not "fix" it.
 
+### 6c-ter. Attended cost provenance (B8) — estimate, never block
+
+An attended host result (the `result` dict a caller hands to
+`submit_host_result`) can omit `cost_usd`. Previously this silently charged the
+stage $0.0 — a CFO tripwire reading a run's real spend as free money.
+`host_bridge._priced_cost` now resolves, per accrual call (generate / judge /
+squad-result):
+
+- **measured** — the host reported `cost_usd` directly (unchanged behaviour).
+- **estimated** — no `cost_usd`, but `tokens_in`/`tokens_out` and a `model` id
+  were reported; `hydra_core/pricing.py::price_call` prices the call from a
+  built-in rate table (overridable at `<HYDRA_HOME>/pricing.json`).
+- **unmeasured** — neither a cost nor a priceable model+tokens; contributes
+  $0.0 and emits an `attended.cost_unmeasured` trace event. This is a log, not
+  a gate: no HITL, no block, and the stage still finalizes normally.
+
+The stage's overall `cost_source` (surfaced in `_step_result` and read by
+`cli.py`'s `charge_and_gate` call) picks the highest-priority source seen
+across the stage's accrual calls — `estimated` > `measured` > `unmeasured`.
+`governance.record_cost(state, usd, tokens, source=...)` folds measured AND
+estimated dollars into `budget.spent_usd` (so the 80%/100% tripwires see
+estimated money too — that is the point) while `budget.estimated_usd` tracks
+only the estimated portion as a companion counter, and `budget.unmeasured_stages`
+counts stages priced at $0.0 for lack of any usable signal.
+
+**Host-side companion:** `hydra_core/transcript_cost.py::summarize_transcript_cost`
+sums a subagent transcript's per-turn `message.usage` (JSONL,
+`input_tokens`/`output_tokens`/`cache_creation_input_tokens`/
+`cache_read_input_tokens` + `message.model`) and prices it through
+`pricing.price_call`, so a host driving the attended loop can report a real
+`cost_usd` instead of relying on the engine's estimate.
+
 **Repo targeting.** The envelope's `target_repo_id` wins when present; otherwise
 `squad_node._via_mcp` falls back to the workflow's already-resolved
 `state.target_repo_id` (allow-list validated at intake in `supervisor.py` via
