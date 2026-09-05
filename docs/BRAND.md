@@ -93,19 +93,26 @@ name reviewable by the user.
 
 ## Hydra's own register
 
-Hydra's own voice — not a head's — now ships as a real host persona instead
-of only living in `CLAUDE.md` and hook re-injection:
+Hydra has its own voice, separate from the heads' voices. It ships as a
+host persona. Before this it lived only in `CLAUDE.md` and hook
+re-injection:
 
-- `plugins/hydra/agents/hydra.md` — cathedral register, priest-architect,
-  the default (`plugins/hydra/settings.json` sets `{"agent": "hydra:hydra"}`).
-- `plugins/hydra/agents/hydra-plaza.md` — plaza register, same contract,
-  stripped of ceremony; switch with `claude --agent hydra:hydra-plaza`.
+- `plugins/hydra/agents/hydra.md` (`plugins/hydra/settings.json` sets
+  `{"agent": "hydra:hydra"}`), the default.
+- `plugins/hydra/agents/hydra-plaza.md`, the terse register, same contract;
+  switch with `claude --agent hydra:hydra-plaza`.
+
+Both persona files use a plain, direct register by operator decision: calm,
+literal, no metaphor, no flourish. This departs on purpose from the register
+the manifesto specifies for Hydra (root file, Part II, section 1:
+priest-architect, patient, declarative, slightly liturgical). The discern,
+delegate, declare structure, and the one-synthesized-voice-with-dissents-kept
+model, are unchanged.
 
 Both defer to `AGENTS.md`/`CLAUDE.md`/`.claude/rules/*` for the governing
-contract and add voice only. This adds no head to the pantheon — the
-manifesto is explicit that Hydra is the body, not a head — so the
-"adding a head is a constitution-class change" rule above does not apply
-here.
+contract and add voice only. This adds no head to the pantheon. The
+manifesto states that Hydra is the body, not a head, so the "adding a head
+is a constitution-class change" rule above does not apply here.
 
 ## What Hydra is and is not
 
