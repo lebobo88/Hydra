@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .eights import Cell
 
@@ -225,7 +225,8 @@ class HITLRequest(HydraEnvelope):
                     "campaign_signoff", "schema_conflict", "loop_ceiling",
                     "constitution_breach", "reflexion_override",
                     "acceptance_criteria", "lock_release_pending",
-                    "mcp_disconnect", "over_budget", "envelope_ceiling"]
+                    "mcp_disconnect", "over_budget", "envelope_ceiling",
+                    "plan_approval"]
     # `reflexion_override`: emitted by `node_judge_per_squad` when an envelope's
     # `revise` verdict cannot be retried because the Reflexion ×1 ceiling is
     # exhausted. Operator approval raises `state.reflexion_override_granted_until`
@@ -256,6 +257,122 @@ class Handoff(HydraEnvelope):
     granted_memory_scopes: list[str] = Field(default_factory=list)
     payload_envelope_id: UUID  # the actual artifact being handed off
     expires_at: Optional[datetime] = None
+
+
+# ---------- planning ----------
+
+class PlanStep(BaseModel):
+    """One decomposed unit of work inside a `Plan`.
+
+    `step_id` is a readable slug (e.g. "wire-auth-middleware"), NOT a UUID —
+    steps must stay stable across plan revisions so markdown diffs between
+    `plan_revision`s line up on the same identifiers.
+    """
+    step_id: str
+    target_squad: str
+    envelope_type: str
+    description: str
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)  # other step_ids
+    priority: Literal["P0", "P1", "P2", "P3"] = "P2"
+    model_tier: Optional[str] = None
+    target_repo_id: Optional[str] = None
+    target_repo_subpath: Optional[str] = None
+    estimated_budget_usd: Optional[float] = None
+    taxonomy_section: Optional[str] = None
+    rationale: Optional[str] = None
+
+    @field_validator("envelope_type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        # NOTE: SCHEMA_REGISTRY is defined further down in this module.
+        # Pydantic validators run at CALL time (not import time), so this
+        # module-level name resolves fine by the time any PlanStep is
+        # constructed. Do NOT snapshot the registry into a frozenset here —
+        # "JUDGE_VERDICT" is registered lazily via `_register_judge_verdict`
+        # after package init, and a snapshot taken now would miss it.
+        if v not in SCHEMA_REGISTRY:
+            raise ValueError(
+                f"Unknown envelope_type: {v!r}. Known: {list(SCHEMA_REGISTRY)}"
+            )
+        return v
+
+
+class Plan(HydraEnvelope):
+    """A decomposition of a goal into dependency-ordered `PlanStep`s.
+
+    Cyclic or dangling dependencies are rejected at construction time — a
+    cyclic plan cannot enter the system, because `validate_envelope` is
+    nothing more than a registry lookup + `model_validate`.
+    """
+    type: Literal["PLAN"] = "PLAN"
+    rigor: Literal["trivial", "standard", "major"]
+    goal_restatement: str
+    # REQUIRED: TheEights' `extractSummary` probes `objective|summary|
+    # description|goal` in that order when minting a semantic memory row.
+    # A Plan without `summary` gets no semantic memory row at all.
+    summary: str
+    steps: list[PlanStep] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    artifact_path: Optional[str] = None
+    plan_revision: int = 1
+    supersedes: Optional[UUID] = None
+    authored_by: list[str] = Field(default_factory=list)
+    dissents: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_dag(self) -> "Plan":
+        seen: set[str] = set()
+        for step in self.steps:
+            if step.step_id in seen:
+                raise ValueError(
+                    f"Duplicate step_id in Plan: {step.step_id!r}"
+                )
+            seen.add(step.step_id)
+
+        known_ids = seen
+        for step in self.steps:
+            if step.step_id in step.depends_on:
+                raise ValueError(
+                    f"Step {step.step_id!r} depends on itself"
+                )
+            for dep in step.depends_on:
+                if dep not in known_ids:
+                    raise ValueError(
+                        f"Step {step.step_id!r} depends on unknown step_id "
+                        f"{dep!r} (dangling dependency)"
+                    )
+
+        # Kahn's algorithm: repeatedly drain nodes with in-degree 0. Any node
+        # left over once the queue is exhausted is part of a cycle.
+        in_degree: dict[str, int] = {step.step_id: 0 for step in self.steps}
+        dependents: dict[str, list[str]] = {step.step_id: [] for step in self.steps}
+        for step in self.steps:
+            for dep in step.depends_on:
+                in_degree[step.step_id] += 1
+                dependents[dep].append(step.step_id)
+
+        queue = [sid for sid, deg in in_degree.items() if deg == 0]
+        drained: set[str] = set()
+        while queue:
+            sid = queue.pop()
+            drained.add(sid)
+            for nxt in dependents[sid]:
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    queue.append(nxt)
+
+        remaining = known_ids - drained
+        if remaining:
+            # Removing this validator (or the Kahn drain above) makes a
+            # cyclic Plan, e.g. steps a->b->a, construct without error —
+            # that is exactly the property this test proves.
+            raise ValueError(
+                f"Cyclic dependency detected among steps: {sorted(remaining)}"
+            )
+        return self
 
 
 # ---------- customer-support squad (Xenia) ----------
@@ -370,6 +487,7 @@ AnyEnvelope = (
     CSuiteDecisionPacket | PRD | ArchRFC | DevTask
     | CreativeBrief | ShotList | AssetJob
     | HITLRequest | DecisionRecord | Handoff
+    | Plan
     | SupportTicket | PortableContext | VocReport
 )
 
@@ -385,6 +503,7 @@ SCHEMA_REGISTRY: dict[str, type[HydraEnvelope]] = {
     "HITL_REQUEST": HITLRequest,
     "DECISION_RECORD": DecisionRecord,
     "HANDOFF": Handoff,
+    "PLAN": Plan,
     "SUPPORT_TICKET": SupportTicket,
     "PORTABLE_CONTEXT": PortableContext,
     "VOC_REPORT": VocReport,

@@ -50,6 +50,7 @@ _BASE_TIER_BY_TYPE: dict[str, JudgeTier] = {
     "HITL_REQUEST": "cross_vendor",
     "DECISION_RECORD": "same_vendor",
     "HANDOFF": "same_vendor",
+    "PLAN": "cross_vendor",
 }
 
 
@@ -215,6 +216,8 @@ def route_judge(
         rubrics.append("board-decision-quality@1")
     elif etype in ("CREATIVE_BRIEF", "SHOT_LIST"):
         rubrics.extend(["brand-consistency@1", "audience-fit@1"])
+    elif etype == "PLAN":
+        rubrics.append("plan-decomposition-quality@1")
 
     # Squad-boundary rubrics. Healthcare + legal-compliance always escalate
     # to cross_vendor (privacy/compliance posture). Other stub squads bind
