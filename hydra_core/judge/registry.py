@@ -727,6 +727,54 @@ _register(Rubric(
 ))
 
 
+# ---------- planning ----------
+
+_register(Rubric(
+    rubric_id="plan-decomposition-quality@1",
+    kind="governance",
+    body_md=(
+        "# Plan Decomposition Quality (v1)\n"
+        "Judge a `PLAN` envelope on whether it decomposes the stated goal into "
+        "a sound, dependency-correct, testable set of steps.\n"
+        "- **goal_fidelity** (0-5): the plan's `goal_restatement` and `steps` "
+        "actually address the operator's stated goal — no drift, no scope "
+        "invention.\n"
+        "- **decomposition_soundness** (0-5): each step is a coherent, "
+        "right-sized unit of work; the whole covers the goal without gaps or "
+        "needless overlap.\n"
+        "- **dependency_correctness** (0-5): `depends_on` edges reflect real "
+        "ordering constraints; the DAG is acyclic and non-dangling (enforced "
+        "structurally by `Plan`'s validator, but a judge should still flag "
+        "dependency edges that are structurally valid yet logically wrong).\n"
+        "- **acceptance_testability** (0-5): each step's `acceptance_criteria` "
+        "is concrete enough to verify pass/fail without further interpretation.\n"
+        "- **envelope_typing** (0-5): each step's `envelope_type` and "
+        "`target_squad` match the kind of work described.\n"
+        "- **risk_surfacing** (0-5): `risks`, `non_goals`, and "
+        "`open_questions` are populated where the plan has real uncertainty; "
+        "silence on an obvious risk counts against this dimension.\n"
+        "- **ceiling_respect** (0-5): the plan's scope and step count are "
+        "proportionate to `rigor` (trivial/standard/major) and do not invite "
+        "loop-ceiling or envelope-ceiling exhaustion.\n"
+        "- **cell_coverage** (0-5, ADVISORY): whether the plan's steps map "
+        "sensibly onto TheEights' eight-cell vocabulary (vision/context/"
+        "triggers/influence/risk/focus/constraints/delight). When the cell "
+        "classifier (`eights.cells.classify`) is unavailable — e.g. under "
+        "`HYDRA_TEST_NO_DAEMONS=1`, where MCP calls refuse — this dimension "
+        "MUST be scored as skip/advisory and MUST NOT fail the rubric. It "
+        "exists to enrich judgment when the classifier is reachable, not to "
+        "gate it.\n"
+        "Pass requires goal_fidelity, decomposition_soundness and "
+        "dependency_correctness all >=3, and no non-advisory dimension at 0.\n"
+    ),
+    score_dimensions=(
+        "goal_fidelity", "decomposition_soundness", "dependency_correctness",
+        "acceptance_testability", "envelope_typing", "risk_surfacing",
+        "ceiling_respect", "cell_coverage",
+    ),
+))
+
+
 def get_rubric(rubric_id: str) -> Rubric:
     if rubric_id not in _REGISTRY:
         raise KeyError(f"Unknown rubric: {rubric_id}. Known: {sorted(_REGISTRY)}")

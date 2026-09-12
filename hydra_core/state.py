@@ -167,6 +167,13 @@ class TaskState(BaseModel):
     # default / auto-detect.  Preserved across planner rebuilds and retries.
     pp_team: Optional[str] = None
     pp_profile: Optional[str] = None
+    # P0 planning substrate: task_ids this task depends on, and the Plan
+    # step / revision it was materialized from (None = task predates
+    # planning, or was created outside a Plan). Purely additive — nothing
+    # yet reads these fields to gate dispatch ordering.
+    depends_on: list[str] = Field(default_factory=list)
+    plan_step_id: Optional[str] = None
+    plan_revision: int = 0
 
 
 class HydraState(BaseModel):
@@ -336,6 +343,21 @@ class HydraState(BaseModel):
     # finalize returns {status:"already_finalized"} with this id instead of
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
+
+    # P0 planning substrate (purely additive — nothing reads these yet).
+    # Plain replace-by-default fields, no reducers: a planning re-run
+    # REPLACES the prior plan snapshot rather than accumulating history.
+    plan_status: Literal[
+        "none", "skipped", "authoring", "drafted", "judged",
+        "approved", "rejected", "bypassed",
+    ] = "none"
+    plan_rigor: Optional[str] = None
+    plan_rigor_source: Optional[str] = None
+    plan_envelope_id: Optional[UUID] = None
+    plan_ref: Optional[dict[str, Any]] = None
+    plan_revision: int = 0
+    plan_approved_at: Optional[datetime] = None
+    plan_artifact_location: Optional[str] = None
 
     def bump_iteration(self) -> None:
         self.iteration_count += 1
