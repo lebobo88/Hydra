@@ -169,8 +169,13 @@ class TaskState(BaseModel):
     pp_profile: Optional[str] = None
     # P0 planning substrate: task_ids this task depends on, and the Plan
     # step / revision it was materialized from (None = task predates
-    # planning, or was created outside a Plan). Purely additive — nothing
-    # yet reads these fields to gate dispatch ordering.
+    # planning, or was created outside a Plan). P1 (plan_deps_satisfied,
+    # below) reads ``depends_on`` to gate attended task selection, and it
+    # does so UNCONDITIONALLY -- not only while a plan barrier is active
+    # (see the call site in cli.py for why). This is a no-op for existing
+    # workflows only because nothing in the codebase populates
+    # ``depends_on`` yet; the moment a planner starts setting it, dependency
+    # ordering takes effect.
     depends_on: list[str] = Field(default_factory=list)
     plan_step_id: Optional[str] = None
     plan_revision: int = 0
@@ -344,9 +349,13 @@ class HydraState(BaseModel):
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
 
-    # P0 planning substrate (purely additive — nothing reads these yet).
-    # Plain replace-by-default fields, no reducers: a planning re-run
-    # REPLACES the prior plan snapshot rather than accumulating history.
+    # P0 planning substrate. Plain replace-by-default fields, no reducers: a
+    # planning re-run REPLACES the prior plan snapshot rather than
+    # accumulating history. P1 (plan_barrier_active, below) now reads
+    # ``plan_status`` to gate dispatch while a plan is
+    # authoring/drafted/judged/rejected; it is a no-op for existing
+    # workflows only because nothing yet drives ``plan_status`` away from
+    # its default "none".
     plan_status: Literal[
         "none", "skipped", "authoring", "drafted", "judged",
         "approved", "rejected", "bypassed",

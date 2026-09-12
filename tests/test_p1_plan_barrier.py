@@ -258,16 +258,129 @@ def test_first_step_dispatch_pass_runs_under_barrier_with_pending_engineering(mo
 
 
 def test_first_step_dispatch_pass_reverted_guard_fails(monkeypatch):
-    """Proves the guard is load-bearing: reverting to the OLD condition
-    (suppress whenever an engineering task is pending, barrier or not) would
-    make the pass never run here -- exactly the deadlock this fixes."""
+    """Proves the guard is load-bearing by actually invoking
+    ``_run_first_step_dispatch_pass`` -- not just re-checking the predicates
+    it consults.
+
+    The fixed condition is::
+
+        _next_engineering_task(state) is not None and not plan_barrier_active(state)
+
+    Folding ``not plan_barrier_active(state)`` to ``not False`` collapses it
+    back to the OLD, unguarded condition::
+
+        _next_engineering_task(state) is not None
+
+    which is exactly the pre-fix deadlock: an engineering task pending under
+    an active barrier would suppress the bootstrap pass forever, so the
+    planning task's own ``dispatch.deferred_to_host`` marking never happens.
+    Patching ``plan_barrier_active`` (as imported into ``hydra_core.cli``) to
+    always return False reproduces that old condition byte-for-byte, so this
+    test calls the real function twice against the same barrier-active,
+    pending-engineering state: once with the fix live (expect it to run),
+    once with the old condition simulated (expect it to be suppressed).
+    """
+    ran = {"called": False}
+
+    class _FakeSup:
+        def invoke(self, *_a, **_k):
+            ran["called"] = True
+
     state = HydraState(root_goal="x", plan_status="authoring")
     state.tasks.append(TaskState(owner_squad="engineering", description="e"))
-    old_guard_would_suppress = _next_engineering_task(state) is not None
-    assert old_guard_would_suppress, (
+    snap = _FakeSnap(("dispatch",))
+    assert _next_engineering_task(state) is not None, (
         "sanity check: an engineering task must be pending for this test to "
         "mean anything"
     )
-    # The new guard additionally requires `not plan_barrier_active(state)`
-    # before suppressing -- under an active barrier it must NOT suppress.
-    assert plan_barrier_active(state) is True
+    assert plan_barrier_active(state) is True, (
+        "sanity check: the barrier must be active for this test to mean "
+        "anything"
+    )
+
+    # With the fix live: the barrier being active means the pending
+    # engineering task must NOT suppress the pass.
+    result = _run_first_step_dispatch_pass(
+        _FakeSup(), {}, HYDRA_ROOT, "wf", snap, state)
+    assert result is True
+    assert ran["called"] is True
+
+    # Simulate the reverted (pre-fix) guard: force plan_barrier_active to
+    # always read False inside hydra_core.cli. The condition then reduces to
+    # the old unconditional `_next_engineering_task(state) is not None`,
+    # which suppresses the pass -- reproducing the deadlock this fix closes.
+    monkeypatch.setattr("hydra_core.cli.plan_barrier_active", lambda _s: False)
+    ran["called"] = False
+    reverted_result = _run_first_step_dispatch_pass(
+        _FakeSup(), {}, HYDRA_ROOT, "wf", snap, state)
+    assert reverted_result is False
+    assert ran["called"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 9 — pre-upgrade-checkpoint compatibility: no ``plan_status`` attribute at all
+# --------------------------------------------------------------------------- #
+
+def test_plan_barrier_active_false_when_plan_status_attribute_absent():
+    """A checkpoint written before P1 shipped carries no ``plan_status``
+    field at all (not even the default "none") once deserialized into
+    whatever plain object a legacy caller hands in. ``plan_barrier_active``
+    must treat "attribute absent" the same as "none" -- i.e. inactive --
+    rather than raising or defaulting to active."""
+
+    class _NoPlanStatus:
+        """Deliberately carries no ``plan_status`` attribute."""
+
+    assert plan_barrier_active(_NoPlanStatus()) is False
+
+
+# --------------------------------------------------------------------------- #
+# 10 — depends_on is enforced even with plan_status == "none" (no active plan)
+# --------------------------------------------------------------------------- #
+
+def test_depends_on_is_enforced_even_without_a_plan():
+    """P1's dependency gating (``plan_deps_satisfied``, and its unconditional
+    call site in ``_next_attended_task``) is deliberately NOT gated behind
+    ``plan_barrier_active``. This pins that as intended behavior: a task
+    carrying ``depends_on`` is held back even when ``plan_status == "none"``
+    (the default -- no plan barrier active at all), because approval moves a
+    plan to "approved", which is not a barrier state, and dependency
+    ordering must still hold post-approval."""
+    state = HydraState(root_goal="x")  # plan_status defaults to "none"
+    assert plan_barrier_active(state) is False
+
+    upstream = TaskState(owner_squad="engineering", description="upstream")
+    dependent = TaskState(owner_squad="engineering", description="dependent",
+                          depends_on=[str(upstream.task_id)])
+    state.tasks.extend([upstream, dependent])
+
+    # The dependent is not yet satisfied -- selection must skip it and pick
+    # the upstream task instead, even though no plan barrier is active.
+    assert not plan_deps_satisfied(state, dependent)
+    task, kind, pack = _next_attended_task(state, {})
+    assert task is not None and task.description == "upstream"
+
+    # Once the upstream task is genuinely done, the dependent is released.
+    state.attended_done_task_ids = [str(upstream.task_id)]
+    assert plan_deps_satisfied(state, dependent)
+
+
+# --------------------------------------------------------------------------- #
+# 11 — stale plan_revision is skipped even with plan_status == "none"
+# --------------------------------------------------------------------------- #
+
+def test_stale_plan_revision_skipped_without_a_plan():
+    """Companion to test_stale_plan_revision_skipped_by_selectors: pins,
+    explicitly and by name, that the stale-plan_revision skip in
+    ``_next_attended_task`` fires with the default ``plan_status == "none"``
+    -- no plan barrier active -- so a reader cannot mistake it for a
+    barrier-only guard."""
+    state = HydraState(root_goal="x", plan_revision=2)
+    assert plan_barrier_active(state) is False
+
+    stale = TaskState(owner_squad="engineering", description="stale",
+                      plan_revision=1)
+    state.tasks.append(stale)
+
+    task, kind, pack = _next_attended_task(state, {})
+    assert task is None

@@ -1748,6 +1748,14 @@ def _next_attended_task(state: HydraState, packs: dict):
             continue
         if barrier and t.owner_squad != "planning":
             continue
+        # Deliberately unconditional (NOT `if barrier and not
+        # plan_deps_satisfied(...)`): approval sets plan_status="approved",
+        # which is intentionally not a barrier state, so a barrier-conditional
+        # check would stop honoring an approved plan's step dependencies the
+        # instant the plan was approved -- destroying the DAG ordering this
+        # feature exists to provide. Do not "fix" this into a barrier-gated
+        # check; empty `depends_on` (today's default for every task) always
+        # satisfies, so this stays a no-op until a planner populates it.
         if not plan_deps_satisfied(state, t):
             continue
         if t.owner_squad == "engineering":
