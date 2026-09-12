@@ -645,6 +645,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
 
 def _run_plan(goal: str, *, squad: str | None, budget: float | None,
               workflow_id: str | None, risk: str | None = None,
+              rigor: str | None = None,
               repo: str | None = None, repos: str | None = None,
               repo_subpath: str | None = None) -> dict[str, Any]:
     """Run `hydra plan` SYNCHRONOUSLY and return the planner state IN-BAND.
@@ -665,6 +666,8 @@ def _run_plan(goal: str, *, squad: str | None, budget: float | None,
         cli_args.extend(["--budget", str(budget)])
     if risk is not None:
         cli_args.extend(["--risk", risk])
+    if rigor is not None:
+        cli_args.extend(["--rigor", rigor])
     if repo:
         cli_args.extend(["--repo", repo])
     if repos:
@@ -863,6 +866,8 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
 
     _RISK_VALUES = frozenset({"low", "medium", "high"})
+    # P3: operator override of node_planner's computed plan_rigor (plan-only).
+    _RIGOR_VALUES = frozenset({"trivial", "standard", "major"})
     # Repo/repos/subpath: loose transport-level shape only (comma/dash/underscore
     # tokens). The allow-list check happens once, at Hydra intake, regardless of
     # whether the id arrived via goal text or this structured param (WS1-B) —
@@ -963,12 +968,18 @@ def _tool_handlers() -> dict[str, Any]:
         risk = str(risk) if risk not in (None, "") else None
         if risk is not None and risk not in _RISK_VALUES:
             return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
+        # P3: rigor param — operator override of the computed plan_rigor (optional).
+        rigor = args.get("rigor")
+        rigor = str(rigor) if rigor not in (None, "") else None
+        if rigor is not None and rigor not in _RIGOR_VALUES:
+            return {"ok": False,
+                    "error": f"invalid_rigor (must be trivial|standard|major, got {rigor!r})"}
         _repo_err, _repo_params = _extract_repo_params(args)
         if _repo_err is not None:
             return _repo_err
         try:
             return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id,
-                             risk=risk, **_repo_params)
+                             risk=risk, rigor=rigor, **_repo_params)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("plan failed")
             return {"ok": False, "error": f"plan_failed: {e}"}
@@ -1459,6 +1470,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "description": "Pre-allocated workflow id (optional)."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
                          "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
+                "rigor": {"type": "string", "enum": ["trivial", "standard", "major"],
+                          "description": ("Operator override of node_planner's computed plan_rigor, "
+                                         "forwarded as --rigor to the CLI (optional). Wins over the "
+                                         "computed value; a downgrade from the computed value is "
+                                         "recorded as a hitl_history event.")},
                 "repo": {"type": "string",
                          "description": ("Single allow-listed repo id for engineering targeting "
                                         "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "

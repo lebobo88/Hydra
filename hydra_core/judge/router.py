@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Optional
 
+from ..escalation import _ESCALATION_PATTERNS, goal_escalates
 from .schemas import JudgeTier
 
 
@@ -54,22 +55,19 @@ _BASE_TIER_BY_TYPE: dict[str, JudgeTier] = {
 }
 
 
-# Regex escalation: any match upgrades same_vendor → cross_vendor.
-_ESCALATION_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"\bcapital[_ ]allocation\b",
-        r"\bmerger\b",
-        r"\bacquisition\b",
-        r"\bcrisis\b",
-        r"\bblack[_ ]swan\b",
-        r"\bphi\b",
-        r"\bhipaa\b",
-        r"\bgdpr\b",
-        r"\bconstitution\b",
-        r"\bproduction\s+deploy",
-        r"\b(?:auth|cred|secret|token)\b",
-    ]
-]
+# _ESCALATION_PATTERNS and goal_escalates() now live in `..escalation` (see
+# import above) so `hydra_core.plan_triage` can use them without pulling in
+# this package's eager dispatcher/MCP imports. Re-imported here so existing
+# callers of `router._ESCALATION_PATTERNS` keep working unchanged: `pat in
+# _ESCALATION_PATTERNS` below is a plain global lookup in *this* module's
+# namespace, so patching `router._ESCALATION_PATTERNS` still changes
+# `route_judge`'s behavior. `router.goal_escalates`, however, is a bare
+# re-export of the same function object as `escalation.goal_escalates` --
+# it closes over `escalation.py`'s own module global, not this one's, so
+# patching `router._ESCALATION_PATTERNS` would NOT affect a call through
+# `router.goal_escalates`. Nothing in the repo does that today; if it ever
+# needs to, patch `escalation._ESCALATION_PATTERNS` instead, or give this
+# module a router-local adapter that reads its own binding.
 
 
 # Topic-specific rubric additions for executive envelopes.
