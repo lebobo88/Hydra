@@ -189,9 +189,129 @@ function _bwEffCwdAt([int]$atIndex) {
     return $eff
 }
 
+# --- SHELL-AWARE ARGUMENT RECONSTRUCTION (security hardening, 2026-09) -------
+# ROOT CAUSE this closes: every regex above that captured a destination with a
+# character class like `[^\s''";|&<>]+` EXCLUDES quote characters, so it stops
+# dead at the first quote boundary. A destination written as adjacent quoted
+# fragments — e.g. `'/protected/hydra_core/sup'"ervisor.py"` — is ONE shell
+# argument (the shell concatenates adjacent quoted/unquoted runs with no
+# separating whitespace) but the regex only ever captured `/protected/hydra_
+# core/sup`, silently losing the `ervisor.py` suffix. Test-BlockedDest then
+# saw a value with no blocked extension and returned "not blocked" — a false
+# negative proven against the hook as it existed at 29dbe89, for EVERY
+# destination-extracting branch (redirect, tee, cp/mv, Path.write_text,
+# Set-Content/Out-File, heredoc) plus python open()'s argument parsing.
+#
+# The fix is a real (small) shell-argument reader used by EVERY branch below
+# instead of ad-hoc per-branch capture groups: Read-ShellArgument walks the
+# command text char-by-char, tracks single-quote / double-quote / backslash-
+# escape state, and treats unquoted whitespace as the only separator — so a
+# single-quoted prefix immediately followed by a double-quoted suffix (or any
+# other quote-adjacency shape) reconstructs into ONE fully-unquoted argument.
+# Get-ShellArgsInRange repeats it to collect every argument of an invocation
+# (needed for cp/mv's "last argument is the destination" and for Set-Content/
+# Out-File's positional-or-flag scan). Read-PyStringLiteral does the analogous
+# job one layer down, for adjacent Python string literals inside a
+# `python -c "..."` one-liner (implicit literal concatenation), which is what
+# let a fragmented open()/Path()/shutil argument dodge the old single-quote-
+# pair regexes entirely (the regex just failed to match, so the call wasn't
+# recognised as a write idiom at all).
+function Read-ShellArgument {
+    # Reconstructs ONE shell argument starting at/after $start, concatenating
+    # adjacent quoted and unquoted runs. Returns $null Value when the cursor
+    # (after skipping whitespace) lands on a separator or end-of-string, so
+    # callers can detect "no more arguments" without an out-of-band sentinel.
+    param([string]$s, [int]$start)
+    $n = $s.Length
+    $i = [Math]::Max(0, $start)
+    while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
+    $beginIdx = $i
+    if ($i -ge $n -or $s[$i] -match '[;|&<>\r\n]') {
+        return [pscustomobject]@{ Value = $null; Start = $beginIdx; End = $i }
+    }
+    $sb = New-Object System.Text.StringBuilder
+    while ($i -lt $n) {
+        $c = $s[$i]
+        if ($c -eq "'") {
+            $i++
+            while ($i -lt $n -and $s[$i] -ne "'") { [void]$sb.Append($s[$i]); $i++ }
+            if ($i -lt $n) { $i++ }
+            continue
+        }
+        if ($c -eq '"') {
+            $i++
+            while ($i -lt $n -and $s[$i] -ne '"') {
+                if ($s[$i] -eq '\' -and ($i + 1) -lt $n -and
+                    ($s[$i + 1] -eq '"' -or $s[$i + 1] -eq '\')) {
+                    [void]$sb.Append($s[$i + 1]); $i += 2; continue
+                }
+                [void]$sb.Append($s[$i]); $i++
+            }
+            if ($i -lt $n) { $i++ }
+            continue
+        }
+        if ($c -match '[ \t;|&<>\r\n]') { break }
+        if ($c -eq '\' -and ($i + 1) -lt $n) {
+            [void]$sb.Append($s[$i + 1]); $i += 2; continue
+        }
+        [void]$sb.Append($c); $i++
+    }
+    return [pscustomobject]@{ Value = $sb.ToString(); Start = $beginIdx; End = $i }
+}
+
+function Get-ShellArgsInRange {
+    # Collects every reconstructed argument from $startIdx up to (not past) a
+    # statement separator (unquoted ; | & < >), a newline, or $endIdx.
+    param([string]$s, [int]$startIdx, [int]$endIdx)
+    $result = New-Object System.Collections.Generic.List[object]
+    $i = $startIdx
+    while ($i -lt $endIdx) {
+        $tok = Read-ShellArgument $s $i
+        if ($null -eq $tok.Value) { break }
+        if ($tok.End -ge $endIdx) {
+            # Argument may extend past the caller's nominal end (e.g. end of
+            # the whole command) — still valid, just clamp the loop.
+            [void]$result.Add($tok)
+            break
+        }
+        [void]$result.Add($tok)
+        if ($tok.End -le $i) { break }   # safety against zero-length loops
+        $i = $tok.End
+    }
+    return $result
+}
+
+function Read-PyStringLiteral {
+    # Reconstructs one or more ADJACENT Python string literals (implicit
+    # literal concatenation, e.g. 'sup' 'ervisor.py' -> 'supervisor.py') into
+    # one value, so a python -c one-liner can't dodge detection by splitting
+    # an open()/Path()/shutil argument across literals.
+    param([string]$s, [int]$start)
+    $n = $s.Length
+    $i = [Math]::Max(0, $start)
+    $sb = New-Object System.Text.StringBuilder
+    $any = $false
+    while ($true) {
+        while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
+        if ($i -ge $n -or ($s[$i] -ne "'" -and $s[$i] -ne '"')) { break }
+        $q = $s[$i]; $i++
+        while ($i -lt $n -and $s[$i] -ne $q) {
+            if ($s[$i] -eq '\' -and ($i + 1) -lt $n) { [void]$sb.Append($s[$i + 1]); $i += 2; continue }
+            [void]$sb.Append($s[$i]); $i++
+        }
+        if ($i -lt $n) { $i++ }
+        $any = $true
+    }
+    if (-not $any) { return $null }
+    return [pscustomobject]@{ Value = $sb.ToString(); Start = $start; End = $i }
+}
+
 function Test-BlockedDest {
     param([string]$dest, [int]$atIndex = [int]::MaxValue)
     if (-not $dest) { return $false }
+    # $dest arrives already fully unquoted/reconstructed from Read-ShellArgument
+    # or Read-PyStringLiteral; Trim() here is a harmless no-op safety net for
+    # any caller that still passes a raw single-quote-wrapped literal.
     $raw = $dest.Trim('"''').Replace('/', '\')
     $norm = $raw.ToLowerInvariant()
 
@@ -216,6 +336,15 @@ function Test-BlockedDest {
         foreach ($frag in $allowDirFragments) {
             if ($absNorm.Contains($frag)) { return $false }
         }
+        # docs/plans carve-out (P2 plan artifact writer, hydra_core.artifact_
+        # store.write_repo_artifact allow-lists docs/plans for .html alongside
+        # the already-globally-allowed .md/.json/.txt). Segment-bounded
+        # (trailing \) so 'docs\plansomething\' cannot slip through, and only
+        # for the exact .html suffix — no other blocked extension is exempted.
+        if ($absNorm -match '\.html$') {
+            $_bwPlansFrag = "$_bwProjRootNorm\docs\plans\"
+            if ($absNorm -eq $_bwPlansFrag.TrimEnd('\') -or $absNorm.StartsWith($_bwPlansFrag)) { return $false }
+        }
     }
     return [bool]($norm -match $blockExtPat)
 }
@@ -225,12 +354,15 @@ $reason  = ''
 
 # 1. Output redirection: > or >> followed by a filename
 #    e.g.  echo "..." > foo.py    cat src.txt >> dest.ts
+#    Destination is reconstructed via Read-ShellArgument (not a truncating
+#    capture group) so a fragment-concatenated path can't dodge detection.
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '>{1,2}\s*[''"]?([^\s''";|&<>]+)')
+    $hits = [regex]::Matches($cmd, '>{1,2}\s*')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
+        $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
             $matched = $true
-            $reason = "output redirection to '$($hit.Groups[1].Value)'"
+            $reason = "output redirection to '$($tok.Value)'"
             break
         }
     }
@@ -239,27 +371,31 @@ if (-not $matched) {
 # 2. tee [flags] filename
 #    e.g.  cmd | tee output.py    cmd | tee -a file.ts
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '\btee\s+(?:-[ai]\s+)*[''"]?([^\s''";|&<>\-][^\s''";|&<>]*)')
+    $hits = [regex]::Matches($cmd, '\btee\s+(?:-[ai]\s+)*')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
+        $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
             $matched = $true
-            $reason = "tee to '$($hit.Groups[1].Value)'"
+            $reason = "tee to '$($tok.Value)'"
             break
         }
     }
 }
 
-# 3. cp / mv / copy / move — heuristic: last space-delimited token before end or
-#    shell separator is the destination.
+# 3. cp / mv / copy / move — the LAST reconstructed argument of the invocation
+#    (up to the next statement separator) is the destination.
 #    e.g.  cp template.py src/newfile.py    mv old.js new.ts
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd,
-        '\b(?:cp|mv|copy|move)\b\s+\S.*?\s+([''"]?[^\s''";|&<>]+[''"]?)(?=\s*(?:$|[;&|]))')
+    $hits = [regex]::Matches($cmd, '\b(?:cp|mv|copy|move)\b')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
-            $matched = $true
-            $reason = "cp/mv/copy/move to '$($hit.Groups[1].Value)'"
-            break
+        $argsList = Get-ShellArgsInRange $cmd ($hit.Index + $hit.Length) $cmd.Length
+        if ($argsList.Count -ge 2) {
+            $destTok = $argsList[$argsList.Count - 1]
+            if (Test-BlockedDest $destTok.Value $destTok.Start) {
+                $matched = $true
+                $reason = "cp/mv/copy/move to '$($destTok.Value)'"
+                break
+            }
         }
     }
 }
@@ -274,13 +410,27 @@ if (-not $matched) {
 #              python -c "open('bar.ts','wb').write(b'...')"
 #              python -c "open('q.py','a+').write('...')"
 if (-not $matched) {
-    # Capture: open( '<path>' , '<mode-with-w/a/x>' )
-    # First arg: any quoted string. Second arg: quoted string that contains w, a, or x.
-    $openMatches = [regex]::Matches($cmd,
-        "\bopen\s*\(\s*[`"'][^`"']*[`"']\s*,\s*[`"']([^`"']*[wax][^`"']*)[`"']")
-    if ($openMatches.Count -gt 0) {
-        $matched = $true
-        $reason  = "python -c with open() in write/append/exclusive mode ('$($openMatches[0].Groups[1].Value)')"
+    # Locate `open(` then reconstruct arg1 (path, may be fragmented across
+    # adjacent literals) and arg2 (mode) via Read-PyStringLiteral rather than a
+    # single quote-pair regex — the old regex demanded arg1 be EXACTLY one
+    # quoted literal immediately followed by a comma, so splitting the path
+    # across two literals (`'sup' 'ervisor.py'`) made the whole pattern fail to
+    # match, silently un-detecting the write regardless of mode.
+    $openHits = [regex]::Matches($cmd, '\bopen\s*\(\s*')
+    foreach ($oh in $openHits) {
+        $arg1 = Read-PyStringLiteral $cmd ($oh.Index + $oh.Length)
+        if (-not $arg1) { continue }
+        $j = $arg1.End
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }
+        $j++
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        $arg2 = Read-PyStringLiteral $cmd $j
+        if ($arg2 -and ($arg2.Value -match '[wax]')) {
+            $matched = $true
+            $reason  = "python -c with open() in write/append/exclusive mode ('$($arg2.Value)') targeting '$($arg1.Value)'"
+            break
+        }
     }
 }
 #    4b. pathlib.Path(...).write_text / write_bytes — scan directly for the
@@ -289,32 +439,84 @@ if (-not $matched) {
 #        (which would stop a [^;|&\n]* lookahead before reaching the call).
 #        e.g.  python -c "from pathlib import Path; Path('x.py').write_text('...')"
 if (-not $matched) {
-    $plMatches = [regex]::Matches($cmd,
-        "\bPath\s*\(\s*[`"']([^`"']+)[`"']\s*\)\s*\.\s*write_(?:text|bytes)\b")
-    foreach ($pm in $plMatches) {
-        if (Test-BlockedDest $pm.Groups[1].Value $pm.Index) {
+    $plHits = [regex]::Matches($cmd, '\bPath\s*\(\s*')
+    foreach ($ph in $plHits) {
+        $arg = Read-PyStringLiteral $cmd ($ph.Index + $ph.Length)
+        if (-not $arg) { continue }
+        $j = $arg.End
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        if ($j -ge $cmd.Length -or $cmd[$j] -ne ')') { continue }
+        $j++
+        if ($cmd.Substring($j) -notmatch '^\s*\.\s*write_(?:text|bytes)\b') { continue }
+        if (Test-BlockedDest $arg.Value $arg.Start) {
             $matched = $true
-            $reason = "pathlib.Path.write_text/write_bytes to '$($pm.Groups[1].Value)'"
+            $reason = "pathlib.Path.write_text/write_bytes to '$($arg.Value)'"
             break
         }
     }
 }
-#    4c. shutil.copy*/move with a blocked-extension filename in the command
+#    4c. shutil.copy*/move with a blocked-extension destination.
 #        e.g.  python -c "import shutil; shutil.copy('tmpl.py','src/real.py')"
+#        Primary check reconstructs the destination argument (fragment-
+#        concatenation-proof); the original whole-command heuristic is kept as
+#        a fallback so an unusual call shape that the arg reader can't line up
+#        still degrades to the old (broader, presence-only) behaviour rather
+#        than going undetected.
 if (-not $matched) {
-    if (($cmd -match 'python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\b') -and
-        ($cmd -match $blockExtPat)) {
-        $matched = $true
-        $reason  = 'python -c shutil write to engine source'
+    $shHits = [regex]::Matches($cmd, '\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\s*\(\s*')
+    foreach ($sh in $shHits) {
+        $a1 = Read-PyStringLiteral $cmd ($sh.Index + $sh.Length)
+        if (-not $a1) { continue }
+        $j = $a1.End
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }
+        $j++
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        $a2 = Read-PyStringLiteral $cmd $j
+        if ($a2 -and (Test-BlockedDest $a2.Value $a2.Start)) {
+            $matched = $true
+            $reason = "python -c shutil write to '$($a2.Value)'"
+            break
+        }
+    }
+    if (-not $matched) {
+        if (($cmd -match 'python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\b') -and
+            ($cmd -match $blockExtPat)) {
+            $matched = $true
+            $reason  = 'python -c shutil write to engine source'
+        }
     }
 }
 
-# 5. sed -i (in-place file edit) — block only when a blocked extension also
-#    appears in the command (best-effort: target filename may not be parseable).
+# 5. sed -i (in-place file edit). Primary check reconstructs sed's own
+#    arguments and tests each non-flag token as a possible destination — this
+#    catches a fragmented filename (e.g. 'file.'"py") that would no longer
+#    appear as a contiguous blocked extension in the raw command text. The
+#    original whole-command heuristic (blocked extension appears anywhere +
+#    -i flag present) is kept as an OR, not a replacement, so nothing that
+#    used to block stops blocking.
 if (-not $matched) {
-    if (($cmd -match '\bsed\s+[^;|&\n]*-i') -and ($cmd -match $blockExtPat)) {
-        $matched = $true
-        $reason  = 'sed -i (in-place edit of engine source)'
+    $sedHits = [regex]::Matches($cmd, '\bsed\b')
+    foreach ($sh in $sedHits) {
+        $argsList = Get-ShellArgsInRange $cmd ($sh.Index + $sh.Length) $cmd.Length
+        $hasInPlace = $false
+        foreach ($t in $argsList) { if ($t.Value -match '^-[a-zA-Z]*i') { $hasInPlace = $true; break } }
+        if ($hasInPlace) {
+            foreach ($t in $argsList) {
+                if ($t.Value -notmatch '^-' -and (Test-BlockedDest $t.Value $t.Start)) {
+                    $matched = $true
+                    $reason = "sed -i (in-place edit) targets '$($t.Value)'"
+                    break
+                }
+            }
+        }
+        if ($matched) { break }
+    }
+    if (-not $matched) {
+        if (($cmd -match '\bsed\s+[^;|&\n]*-i') -and ($cmd -match $blockExtPat)) {
+            $matched = $true
+            $reason  = 'sed -i (in-place edit of engine source)'
+        }
     }
 }
 
@@ -327,24 +529,23 @@ if (-not $matched) {
 #          Get-Template | Out-File -FilePath src/index.ts  → blocked
 #          Set-Content foo.py 'content'              → blocked (positional)
 if (-not $matched) {
-    $scMatches = [regex]::Matches($cmd, '\b(?:Set-Content|Out-File)\b([^;|&\n]*)')
+    $scMatches = [regex]::Matches($cmd, '\b(?:Set-Content|Out-File)\b')
     foreach ($m in $scMatches) {
-        $invocation = $m.Groups[1].Value
-        $tokens = ($invocation -split '\s+') | Where-Object { $_ -ne '' }
+        $argsList = Get-ShellArgsInRange $cmd ($m.Index + $m.Length) $cmd.Length
         $nextIsPathValue = $false
-        foreach ($tok in $tokens) {
+        foreach ($tok in $argsList) {
             if ($nextIsPathValue) {
-                if (Test-BlockedDest $tok $m.Index) {
+                if (Test-BlockedDest $tok.Value $tok.Start) {
                     $matched = $true
-                    $reason = "Set-Content/Out-File to '$tok'"
+                    $reason = "Set-Content/Out-File to '$($tok.Value)'"
                     break
                 }
                 $nextIsPathValue = $false
-            } elseif ($tok -match '^-(?:Path|FilePath|LiteralPath)(?::|$)') {
+            } elseif ($tok.Value -match '^-(?:Path|FilePath|LiteralPath)(?::(.*))?$') {
                 # Flag with inline value (-Path:foo.py) or flag expecting next token
-                $inline = ($tok -replace '^-(?:Path|FilePath|LiteralPath):', '')
-                if ($inline -and ($inline -ne $tok)) {
-                    if (Test-BlockedDest $inline $m.Index) {
+                $inline = $Matches[1]
+                if ($inline) {
+                    if (Test-BlockedDest $inline $tok.Start) {
                         $matched = $true
                         $reason = "Set-Content/Out-File to '$inline'"
                         break
@@ -352,11 +553,11 @@ if (-not $matched) {
                 } else {
                     $nextIsPathValue = $true
                 }
-            } elseif ($tok -notmatch '^-') {
+            } elseif ($tok.Value -notmatch '^-') {
                 # Positional argument (not a flag name or flag value)
-                if (Test-BlockedDest $tok $m.Index) {
+                if (Test-BlockedDest $tok.Value $tok.Start) {
                     $matched = $true
-                    $reason = "Set-Content/Out-File to '$tok'"
+                    $reason = "Set-Content/Out-File to '$($tok.Value)'"
                     break
                 }
             }
@@ -368,11 +569,12 @@ if (-not $matched) {
 # 7a. Shell heredoc redirected into a blocked-extension file
 #     e.g.  cat <<'EOF' > src/index.ts ... EOF
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*[''"]?([^\s''";|&<>]+)')
+    $hits = [regex]::Matches($cmd, '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*')
     foreach ($hit in $hits) {
-        if (Test-BlockedDest $hit.Groups[1].Value $hit.Index) {
+        $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
             $matched = $true
-            $reason = "heredoc into '$($hit.Groups[1].Value)'"
+            $reason = "heredoc into '$($tok.Value)'"
             break
         }
     }
