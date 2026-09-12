@@ -44,7 +44,7 @@ _WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 warnings.filterwarnings("ignore", category=UserWarning, module=r"langchain_core.*")
 
 from .squad_loader import discover_squads
-from .state import HydraState
+from .state import HydraState, plan_barrier_active, plan_deps_satisfied
 from .telemetry import emit, trace_path
 
 # ---------------------------------------------------------------------------
@@ -1728,10 +1728,35 @@ def _next_attended_task(state: HydraState, packs: dict):
     ``attended_completed_task_ids`` are skipped, and non-engineering tasks
     whose squad is unknown or headless-dispatchable are passed over (they are
     not host-attended) so engineering behind them is still reachable.
+
+    P1: the squad only decides WHICH cursor is opened — it must not reorder
+    the planner's dependency chain. Order still comes from the planner's
+    ``state.tasks`` list; two gates now additionally hold a candidate back
+    without reordering anything: while a plan barrier is active
+    (``plan_barrier_active``) only a ``planning``-owned task is selectable,
+    and independently of the barrier, a task whose ``depends_on`` is not yet
+    satisfied (``plan_deps_satisfied``) is skipped so a later, ready task can
+    be picked instead. Both are no-ops while ``plan_status == "none"`` and no
+    task carries ``depends_on``.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    barrier = plan_barrier_active(state)
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
+            continue
+        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
+            continue
+        if barrier and t.owner_squad != "planning":
+            continue
+        # Deliberately unconditional (NOT `if barrier and not
+        # plan_deps_satisfied(...)`): approval sets plan_status="approved",
+        # which is intentionally not a barrier state, so a barrier-conditional
+        # check would stop honoring an approved plan's step dependencies the
+        # instant the plan was approved -- destroying the DAG ordering this
+        # feature exists to provide. Do not "fix" this into a barrier-gated
+        # check; empty `depends_on` (today's default for every task) always
+        # satisfies, so this stays a no-op until a planner populates it.
+        if not plan_deps_satisfied(state, t):
             continue
         if t.owner_squad == "engineering":
             return t, "engineering", None
@@ -1885,10 +1910,22 @@ def _next_stub_attended_task(state: HydraState, packs: dict):
     ``_next_nonengineering_attended_task`` both skipped stub tasks, so an
     attended workflow whose only task was a stub squad reported
     ``no_pending_task`` forever and never advanced.
+
+    P1: while a plan barrier is active, a stub task cannot jump ahead of the
+    planning task — this selector is consulted BEFORE ``_next_attended_task``
+    in ``_cmd_attended_step``, so without this guard a pre-seeded stub task
+    ordered ahead of the planning task would be driven regardless of
+    ``plan_status``. A stale-revision stub task (superseded by a replan) is
+    also skipped. Both are no-ops while ``plan_status == "none"``.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
+    barrier = plan_barrier_active(state)
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
+            continue
+        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
+            continue
+        if barrier and t.owner_squad != "planning":
             continue
         pack = packs.get(t.owner_squad)
         if pack is not None and getattr(pack, "entrypoint", None) == "stub":
@@ -2013,7 +2050,15 @@ def _run_first_step_dispatch_pass(sup, config: dict, project: Path, wf: str,
         return False
     if not (getattr(snap, "next", ()) or ()):
         return False
-    if _next_engineering_task(state) is not None:
+    # P1: under an active plan barrier, a pending engineering task must NOT
+    # suppress this bootstrap pass — the planning task needs its
+    # dispatch.deferred_to_host marking, and _next_engineering_task knows
+    # nothing about plan_status, so without this the workflow would hang
+    # waiting on an engineering task the barrier is holding back anyway.
+    # Deliberately NOT added to _next_engineering_task itself: this guard is
+    # local to the bootstrap-pass suppressor, and filtering inside that
+    # predicate would change its meaning for every other caller.
+    if _next_engineering_task(state) is not None and not plan_barrier_active(state):
         return False
     emit(project, wf, "attended.no_approval_dispatch_pass", {
         "interrupted_before": list(getattr(snap, "next", ()) or ()),
@@ -2078,6 +2123,12 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
     ``attended_completed_task_ids`` (the same signal `_next_engineering_task`
     and `_next_nonengineering_attended_task` honour), OR when the in-graph
     dispatch already carried it to a terminal status.
+
+    P1: a task whose ``plan_revision`` is stale (superseded by a replan) is
+    excluded too. ``state.tasks`` is append-only, so without this a
+    superseded plan's step tasks would sit "pending" forever and block
+    finalize (``tasks_pending``) even though no selector will ever dispatch
+    them again. No-op while nothing sets a non-zero ``plan_revision``.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
     pending: list[str] = []
@@ -2086,6 +2137,8 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
         if tid in done:
             continue
         if t.status in ("done", "failed", "cancelled"):
+            continue
+        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
             continue
         pending.append(tid)
     return pending
@@ -2498,6 +2551,34 @@ def _cmd_attended_step(args) -> int:
                 "state": res.get("state"),
             })
             print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            return 0
+
+        # P1: awaiting_plan_approval — a plan-gate HITL is open. Distinct from
+        # ready_to_finalize so the host waits on /hydra:approve instead of
+        # calling finalize against an unapproved plan. No-op unless something
+        # files a pending_hitl with gate_node == "plan_gate".
+        _pending_hitl = getattr(state, "pending_hitl", None)
+        if isinstance(_pending_hitl, dict) and _pending_hitl.get("gate_node") == "plan_gate":
+            print(json.dumps({"ok": True, "status": "awaiting_plan_approval",
+                              "pending_hitl": _pending_hitl,
+                              "workflow_id": wf}, indent=2, default=str))
+            return 0
+
+        # P1: blocked_on_failed_dependency — at least one not-done task has
+        # unsatisfied dependencies and nothing else is selectable. Without
+        # this distinct terminal, the host would see ready_to_finalize, call
+        # finalize, get tasks_pending back, and silently drop half a plan.
+        # No-op unless a task carries a depends_on that never resolves.
+        _blocked_deps = [
+            str(t.task_id) for t in getattr(state, "tasks", [])
+            if getattr(t, "status", None) not in ("done", "failed", "cancelled")
+            and str(t.task_id) not in set(getattr(state, "attended_completed_task_ids", []) or [])
+            and not plan_deps_satisfied(state, t)
+        ]
+        if _blocked_deps:
+            print(json.dumps({"ok": True, "status": "blocked_on_failed_dependency",
+                              "blocked_task_ids": _blocked_deps,
+                              "workflow_id": wf}, indent=2, default=str))
             return 0
 
         # No pending tasks of any kind. E2-30: this is not the end of the

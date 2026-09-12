@@ -169,8 +169,13 @@ class TaskState(BaseModel):
     pp_profile: Optional[str] = None
     # P0 planning substrate: task_ids this task depends on, and the Plan
     # step / revision it was materialized from (None = task predates
-    # planning, or was created outside a Plan). Purely additive — nothing
-    # yet reads these fields to gate dispatch ordering.
+    # planning, or was created outside a Plan). P1 (plan_deps_satisfied,
+    # below) reads ``depends_on`` to gate attended task selection, and it
+    # does so UNCONDITIONALLY -- not only while a plan barrier is active
+    # (see the call site in cli.py for why). This is a no-op for existing
+    # workflows only because nothing in the codebase populates
+    # ``depends_on`` yet; the moment a planner starts setting it, dependency
+    # ordering takes effect.
     depends_on: list[str] = Field(default_factory=list)
     plan_step_id: Optional[str] = None
     plan_revision: int = 0
@@ -344,9 +349,13 @@ class HydraState(BaseModel):
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
 
-    # P0 planning substrate (purely additive — nothing reads these yet).
-    # Plain replace-by-default fields, no reducers: a planning re-run
-    # REPLACES the prior plan snapshot rather than accumulating history.
+    # P0 planning substrate. Plain replace-by-default fields, no reducers: a
+    # planning re-run REPLACES the prior plan snapshot rather than
+    # accumulating history. P1 (plan_barrier_active, below) now reads
+    # ``plan_status`` to gate dispatch while a plan is
+    # authoring/drafted/judged/rejected; it is a no-op for existing
+    # workflows only because nothing yet drives ``plan_status`` away from
+    # its default "none".
     plan_status: Literal[
         "none", "skipped", "authoring", "drafted", "judged",
         "approved", "rejected", "bypassed",
@@ -379,6 +388,52 @@ class HydraState(BaseModel):
             if key.startswith("mcp_failure:") and count >= self.mcp_failure_ceiling:
                 return True, key.split(":", 1)[1]
         return False, None
+
+
+# P1 plan-barrier predicates. Both are NO-OPs today: nothing ever sets
+# plan_status away from its default "none", so plan_barrier_active is always
+# False and plan_deps_satisfied is only consulted behind that gate (except
+# where a caller applies it unconditionally, per its own docstring). Defined
+# ONCE here and imported everywhere else — a divergent second definition is
+# the documented trap from the worktree-relocation incident.
+_PLAN_BARRIER_STATES = frozenset({"authoring", "drafted", "judged", "rejected"})
+
+
+def plan_barrier_active(state) -> bool:
+    """True while a plan is mid-authoring/judging/rejected and dispatch should
+    hold non-planning work. ``getattr`` with a "none" default so a checkpoint
+    written before this field existed is never blocked."""
+    return str(getattr(state, "plan_status", "none") or "none") in _PLAN_BARRIER_STATES
+
+
+def plan_deps_satisfied(state, task) -> bool:
+    """True when every task_id in ``task.depends_on`` has been driven to a
+    genuinely-done outcome.
+
+    Empty ``depends_on`` is always satisfied. A dependency is satisfied when
+    its id appears in ``state.attended_done_task_ids`` (attended cursors that
+    finalized with final_status="complete" — see HydraState.attended_done_task_ids)
+    or when the corresponding TaskState has ``status == "done"`` (in-graph
+    dispatch path). Deliberately NOT attended_completed_task_ids: that list
+    also includes "surfaced" and "aborted" outcomes, and releasing a dependent
+    onto a surfaced upstream is the E2-23 bug in a new costume.
+    """
+    deps = list(getattr(task, "depends_on", None) or [])
+    if not deps:
+        return True
+    done_ids = set(getattr(state, "attended_done_task_ids", None) or [])
+    status_by_id = {
+        str(t.task_id): getattr(t, "status", None)
+        for t in getattr(state, "tasks", None) or []
+    }
+    for dep in deps:
+        dep = str(dep)
+        if dep in done_ids:
+            continue
+        if status_by_id.get(dep) == "done":
+            continue
+        return False
+    return True
 
 
 def make_checkpoint_serde() -> Any:
