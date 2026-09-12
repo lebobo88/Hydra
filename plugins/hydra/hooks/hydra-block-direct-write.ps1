@@ -22,7 +22,11 @@
 # and therefore additionally honours `cd` / `pushd` / `Set-Location` in that
 # command when resolving a RELATIVE destination (E2-18). Only the Bash hook
 # needs that code; this note exists so the pair stays in sync. The worktree-root
-# precedence block below is the other half of the lockstep.
+# precedence block below is the other half of the lockstep. The Bash hook also
+# fails closed on a write destination it cannot resolve statically (a shell
+# `$(...)`/backtick/`$VAR`/`${VAR}` expansion) — this hook has no shell to
+# parse and receives an already-resolved file_path, so it needs no equivalent
+# rule; it is a Bash-only concern and does not affect lockstep for Write/Edit.
 #
 # Kill-switch: set HYDRA_ENFORCE_ROUTING to anything but '1' to disable.
 

@@ -388,3 +388,347 @@ def test_both_hooks_document_the_docs_plans_carveout():
     direct_hook = (HOOKS_DIR / DIRECT_HOOK).read_text(encoding="utf-8")
     assert "docs\\plans\\" in bash_hook or "docs/plans" in bash_hook.lower() or "docs\\plans" in bash_hook
     assert "docs\\plans\\" in direct_hook or "docs/plans" in direct_hook.lower() or "docs\\plans" in direct_hook
+
+
+# ---------------------------------------------------------------------------
+# Revision (2026-09): five residual bypasses confirmed by cross-vendor judge,
+# all PRE-EXISTING (the plain hook at 29dbe89 also scored 0 on every one of
+# them) and NOT regressed by the quote-fragmentation fix above:
+#   - `$(...)` command substitution forming the blocked extension
+#   - a backtick command substitution forming the blocked extension
+#   - `"$VAR"` / `"${VAR}"` naming a literal engine-source path
+#   - a backslash-newline line continuation splitting the extension
+# A shell expansion cannot be resolved without running a shell, which this
+# hook must never do, so it FAILS CLOSED: any reconstructed write destination
+# containing an unresolvable `$(...)`, backtick, `$VAR`, or `${VAR}` in
+# unquoted/double-quoted context now blocks with its own distinct message,
+# regardless of extension or worktree membership. Line-continuation, unlike
+# expansion, IS statically resolvable, so it is normalised (resolved) up
+# front instead of being treated as unresolvable.
+# ---------------------------------------------------------------------------
+
+UNRESOLVABLE_MARKER = "UNRESOLVABLE"
+
+
+class TestExpansionFailsClosed:
+    """Requirement (b): a shell expansion in the reconstructed destination
+    blocks unconditionally, with a message distinguishable from the ordinary
+    'targets engine source' refusal."""
+
+    def test_command_substitution_forming_extension(self, project_dir: Path):
+        result = _run_bash_hook(
+            'echo x > "hydra_core/supervisor.$(printf py)"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_backtick_substitution_forming_extension(self, project_dir: Path):
+        result = _run_bash_hook(
+            'echo x > "hydra_core/supervisor.`printf py`"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_double_quoted_variable_destination(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; echo x > "$D"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_double_quoted_braced_variable_destination(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; echo x > "${{D}}"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_message_distinguishable_from_extension_block_message(self, project_dir: Path):
+        """The unresolvable-destination refusal must not read identically to
+        the ordinary 'targets engine source' refusal, so an operator can tell
+        the two apart in a transcript."""
+        expansion_result = _run_bash_hook(
+            f'D={BLOCKED_REL}; echo x > "$D"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        extension_result = _run_bash_hook(
+            f"echo a >> {BLOCKED_REL}",
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert expansion_result.returncode == 2
+        assert extension_result.returncode == 2
+        assert expansion_result.stderr != extension_result.stderr
+        assert "targets engine source" in extension_result.stderr
+        assert "targets engine source" not in expansion_result.stderr
+
+    def test_expansion_in_cp_destination_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; cp template.txt "$D"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_in_sed_destination_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; sed -i "s/a/b/" "$D"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_in_set_content_destination_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; Set-Content -Path "$D" -Value x',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_in_heredoc_destination_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; cat <<EOF > "$D"\nbody\nEOF',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_blocks_even_inside_worktree_root(self, project_dir: Path):
+        """An agent has no legitimate need to name a write destination
+        through a variable, even inside its own allow-listed worktree — it
+        can always write a literal path. Placing the (fake) worktree root at
+        project_dir itself and using HYDRA_WORKTREE_ROOT to point at it must
+        NOT exempt an expansion-bearing destination."""
+        env_extra = {"HYDRA_WORKTREE_ROOT": str(project_dir)}
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": f'D={BLOCKED_REL}; echo x > "$D"'},
+            "cwd": str(project_dir),
+        }
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.update(env_extra)
+        result = subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(HOOKS_DIR / BASH_HOOK)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestLineContinuationResolved:
+    """Requirement (a): a backslash-newline continuation is statically
+    resolvable, so it is joined up front and the resulting write is
+    evaluated normally (blocked when the joined destination is blocked)."""
+
+    def test_backslash_newline_splits_extension(self, project_dir: Path):
+        # Built from explicit character codes, not a "\\\n" string literal:
+        # a transport step (shell quoting, an editor, a copy/paste) can
+        # silently flatten "\n" into the two characters backslash+'n', which
+        # would make this test pass for the WRONG reason (some other branch
+        # blocking a payload that no longer contains a real newline at all —
+        # exactly the "proves the property, not the instance" trap). Assert
+        # the payload itself carries a real LF before trusting the result.
+        cmd = "echo x > hydra_core/supervisor." + chr(92) + chr(10) + "py"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_backslash_crlf_newline_splits_extension(self, project_dir: Path):
+        cmd = "echo x > hydra_core/supervisor." + chr(92) + chr(13) + chr(10) + "py"
+        assert chr(13) in cmd and chr(10) in cmd, "payload lost its real CRLF before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestAnsiCQuotingRegression:
+    """ANSI-C `$'...'` quoting was already blocked by 373f0cc (the leading
+    `$` before the quoted run is itself an unquoted expansion marker under
+    Read-ShellArgument, so it now also trips the fail-closed expansion rule
+    above). Locked in here as a regression guard."""
+
+    def test_ansi_c_hex_escape_regression(self, project_dir: Path):
+        result = _run_bash_hook(
+            r"echo x > $'hydra_core/supervisor\x2epy'",
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_ansi_c_octal_escape_regression(self, project_dir: Path):
+        result = _run_bash_hook(
+            r"echo x > $'hydra_core/supervisor\056py'",
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_adjacent_fragment_split_still_blocked(self, project_dir: Path):
+        """373f0cc's own fix, re-asserted here so this revision cannot
+        silently regress it."""
+        result = _run_bash_hook(
+            "echo x > 'hydra_core/superviso'\"r.py\"",
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestExpansionFalsePositives:
+    """A literal `$` has no shell meaning inside single quotes, and a
+    backslash-escaped `\\$` inside double quotes is also literal — neither
+    may be treated as an expansion."""
+
+    def test_single_quoted_dollar_is_literal(self, project_dir: Path):
+        result = _run_bash_hook(
+            "echo x > '$HOME/notes.md'",
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_escaped_dollar_in_double_quotes_is_literal(self, project_dir: Path):
+        result = _run_bash_hook(
+            'echo x > "notes\\$HOME.md"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_elsewhere_in_command_does_not_block(self, project_dir: Path):
+        """The rule applies to the reconstructed DESTINATION only — an
+        expansion in, say, a grep pattern must not block anything."""
+        result = _run_bash_hook(
+            'grep -n "$pattern" README.md',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_in_commit_message_does_not_block(self, project_dir: Path):
+        """An expansion in a commit message (not a write destination) must
+        not block."""
+        result = _run_bash_hook(
+            'git commit -m "built from $BRANCH"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_expansion_in_inplace_edit_program_argument_does_not_block(self, project_dir: Path):
+        """An expansion in the *program* argument of an in-place edit (the
+        sed script, not the destination file) must not block."""
+        (project_dir / "README.md").write_text("x", encoding="utf-8")
+        result = _run_bash_hook(
+            'sed -i "s/$OLD/new/" README.md',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestSetContentValuePayloadNotTreatedAsDestination:
+    """Found while implementing the fail-closed expansion rule above:
+    Set-Content/Out-File's own positional-argument scan (added earlier to
+    catch a filename in `Set-Content foo.py 'content'`) was also applying to
+    -Value's PAYLOAD once -Path had already been given by name, so an
+    entirely ordinary `Set-Content -Path notes.md -Value "$USER"` was
+    misread as an unresolvable destination. The destination slot is now
+    resolved once (named flag, inline flag, or first positional) and the
+    expansion fail-close only applies to that one slot."""
+
+    def test_named_path_with_variable_value_not_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            'Set-Content -Path notes.md -Value "$USER"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_positional_path_with_variable_content_not_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            'Set-Content notes.md "$USER"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_named_path_expansion_destination_still_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; Set-Content -Path "$D" -Value x',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_positional_expansion_destination_still_blocks(self, project_dir: Path):
+        result = _run_bash_hook(
+            f'D={BLOCKED_REL}; Set-Content "$D" "content"',
+            cwd=project_dir, project_dir=project_dir,
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPropertyNotInstance:
+    """Prove the fixes are load-bearing: patch them out and confirm the
+    corresponding test regresses to allow (rc=0)."""
+
+    def test_removing_expansion_check_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        needle = (
+            "    if ($hasExpansion) {\n"
+            "        $script:bwUnresolvedReason = 'expansion'\n"
+            "        return $true\n"
+            "    }\n"
+        )
+        assert needle in hook_text, "expansion-check block not found; test is stale"
+        patched = hook_text.replace(needle, "    if ($false -and $hasExpansion) {\n        return $true\n    }\n")
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(patched, encoding="utf-8")
+
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": f'D={BLOCKED_REL}; echo x > "$D"'},
+            "cwd": str(project_dir),
+        }
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        result = subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(patched_hook)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        # WITHOUT the fix, the variable destination silently resolves to a
+        # relative path with no blocked extension text and is allowed.
+        assert result.returncode == 0, (
+            f"property check failed: removing the expansion guard should have "
+            f"allowed this write, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_continuation_normalisation_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        needle = "$cmd = $cmd -replace '\\\\\\r?\\n', ''"
+        assert needle in hook_text, "continuation-normalisation line not found; test is stale"
+        patched = hook_text.replace(needle, "# disabled for property test")
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(patched, encoding="utf-8")
+
+        cmd = "echo x > hydra_core/supervisor.\\\npy"
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(project_dir)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        result = subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(patched_hook)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"property check failed: removing continuation normalisation should "
+            f"have allowed this write, but rc={result.returncode} stderr={result.stderr}"
+        )

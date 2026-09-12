@@ -31,13 +31,28 @@
 # which keeps the resolution inside the project root: fail CLOSED.
 #
 # RESIDUAL LIMITS — this is a guardrail, not a sandbox:
-#   - Obfuscated writes (variable indirection, eval, base64 payloads,
-#     pipes to write-capable sub-processes) can evade detection.
+#   - Obfuscated writes (eval, base64 payloads, pipes to write-capable
+#     sub-processes) can still evade detection.
 #   - Multi-line commands joined on one line may confuse some regex patterns.
-#   - The hook sees raw command TEXT only; it cannot resolve shell variables or
-#     evaluate expressions, so e.g. `> "$DEST"` where $DEST=foo.py is missed.
 #   - For a genuine isolation boundary, use OS-level sandboxing (containers,
 #     seccomp, etc.); this hook is an LLM-routing guardrail only.
+#
+# FAIL-CLOSED ON UNRESOLVABLE DESTINATIONS (security hardening, 2026-09) —
+# the hook does NOT run a shell and cannot know what `$(...)`, a backtick
+# command, `$VAR`, or `${VAR}` expands to. Rather than let an unresolvable
+# write destination fall through to "no blocked extension found, allow" (a
+# hole: `D=hydra_core/supervisor.py; echo x > "$D"` previously scored 0),
+# any write-detecting branch whose reconstructed destination contains a
+# shell expansion in unquoted or double-quoted context BLOCKS unconditionally
+# — including inside an allow-listed worktree — with its own distinct
+# message. An agent operating under HYDRA_ENFORCE_ROUTING=1 has no legitimate
+# need to express a write destination through a variable or a command
+# substitution; it can always write a literal path, and engine source must
+# go through /hydra:run regardless. Cost: an agent that legitimately wants
+# to write through `"$VAR"` must inline the literal path instead — a one-line
+# fix, not a workflow blocker. A backslash-newline line continuation is
+# resolved (joined) up front, since that IS statically resolvable and is not
+# an expansion.
 #
 # ALLOW exceptions (mirrors hydra-block-direct-write.ps1):
 #   - Writes into harness / worktree / vcs / build dirs are allowed (that is
@@ -85,6 +100,17 @@ if ($json.tool_name -ne 'Bash') { exit 0 }
 
 $cmd = "$($json.tool_input.command)"
 if (-not $cmd) { exit 0 }
+
+# --- Line-continuation normalisation (security hardening, 2026-09) ----------
+# A backslash immediately followed by a newline (LF or CRLF) is removed along
+# with the newline, joining the two halves into one token, exactly as a shell
+# does before it tokenizes. Done ONCE here so every branch below (and every
+# regex/argument reader) sees the already-joined command; without this,
+# `> hydra_core/supervisor.\` + newline + `py` split a blocked extension
+# across lines and evaded every branch (measured 0 against the guard at
+# 29dbe89). This is statically resolvable — unlike variable/command
+# substitution below — so it is resolved, not blocked.
+$cmd = $cmd -replace '\\\r?\n', ''
 
 # --- Blocked engine-source extension pattern (same as hydra-block-direct-write.ps1) ---
 $blockExtPat = '\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|rb|php|swift|m|mm|vue|svelte|html|htm|css|scss|sass|less|sql|sh|bash|lua|gd|glsl|hlsl|shader|dart|scala|clj|ex|exs)(?=[''"\s;|&<>]|$)'
@@ -221,15 +247,25 @@ function Read-ShellArgument {
     # adjacent quoted and unquoted runs. Returns $null Value when the cursor
     # (after skipping whitespace) lands on a separator or end-of-string, so
     # callers can detect "no more arguments" without an out-of-band sentinel.
+    #
+    # Also tracks HasExpansion: whether an unescaped `$` or backtick appeared
+    # in UNQUOTED or DOUBLE-QUOTED state — the two contexts where a real shell
+    # would actually expand it (`$(...)`, `${...}`, `$VAR`, or a backtick
+    # command substitution). Inside SINGLE quotes `$`/backtick are always
+    # literal and never set this flag. A backslash-escaped `\$` or `` \` ``
+    # inside double quotes is also literal (per POSIX quoting rules) and does
+    # not set the flag — this mirrors the same escape set already honoured
+    # for `\"`/`\\` in that branch.
     param([string]$s, [int]$start)
     $n = $s.Length
     $i = [Math]::Max(0, $start)
     while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
     $beginIdx = $i
     if ($i -ge $n -or $s[$i] -match '[;|&<>\r\n]') {
-        return [pscustomobject]@{ Value = $null; Start = $beginIdx; End = $i }
+        return [pscustomobject]@{ Value = $null; Start = $beginIdx; End = $i; HasExpansion = $false }
     }
     $sb = New-Object System.Text.StringBuilder
+    $hasExpansion = $false
     while ($i -lt $n) {
         $c = $s[$i]
         if ($c -eq "'") {
@@ -242,9 +278,11 @@ function Read-ShellArgument {
             $i++
             while ($i -lt $n -and $s[$i] -ne '"') {
                 if ($s[$i] -eq '\' -and ($i + 1) -lt $n -and
-                    ($s[$i + 1] -eq '"' -or $s[$i + 1] -eq '\')) {
+                    ($s[$i + 1] -eq '"' -or $s[$i + 1] -eq '\' -or
+                     $s[$i + 1] -eq '$' -or $s[$i + 1] -eq '`')) {
                     [void]$sb.Append($s[$i + 1]); $i += 2; continue
                 }
+                if ($s[$i] -eq '$' -or $s[$i] -eq '`') { $hasExpansion = $true }
                 [void]$sb.Append($s[$i]); $i++
             }
             if ($i -lt $n) { $i++ }
@@ -254,9 +292,10 @@ function Read-ShellArgument {
         if ($c -eq '\' -and ($i + 1) -lt $n) {
             [void]$sb.Append($s[$i + 1]); $i += 2; continue
         }
+        if ($c -eq '$' -or $c -eq '`') { $hasExpansion = $true }
         [void]$sb.Append($c); $i++
     }
-    return [pscustomobject]@{ Value = $sb.ToString(); Start = $beginIdx; End = $i }
+    return [pscustomobject]@{ Value = $sb.ToString(); Start = $beginIdx; End = $i; HasExpansion = $hasExpansion }
 }
 
 function Get-ShellArgsInRange {
@@ -306,9 +345,24 @@ function Read-PyStringLiteral {
     return [pscustomobject]@{ Value = $sb.ToString(); Start = $start; End = $i }
 }
 
+# Set by Test-BlockedDest on its most recent call so the final reporting block
+# can tell an "unresolvable destination" block apart from an ordinary
+# "blocked extension" block and print a distinguishable operator message.
+$script:bwUnresolvedReason = $null
+
 function Test-BlockedDest {
-    param([string]$dest, [int]$atIndex = [int]::MaxValue)
+    param([string]$dest, [int]$atIndex = [int]::MaxValue, [bool]$hasExpansion = $false)
+    $script:bwUnresolvedReason = $null
     if (-not $dest) { return $false }
+    # FAIL CLOSED on an unresolvable destination: a shell expansion in the
+    # reconstructed argument means this hook cannot statically know the real
+    # destination, so it cannot be waved through even when everything else
+    # about it (worktree membership, allow-listed dir, extension) looks fine.
+    # See the FAIL-CLOSED header comment at the top of this file.
+    if ($hasExpansion) {
+        $script:bwUnresolvedReason = 'expansion'
+        return $true
+    }
     # $dest arrives already fully unquoted/reconstructed from Read-ShellArgument
     # or Read-PyStringLiteral; Trim() here is a harmless no-op safety net for
     # any caller that still passes a raw single-quote-wrapped literal.
@@ -360,7 +414,7 @@ if (-not $matched) {
     $hits = [regex]::Matches($cmd, '>{1,2}\s*')
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
-        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
             $matched = $true
             $reason = "output redirection to '$($tok.Value)'"
             break
@@ -374,7 +428,7 @@ if (-not $matched) {
     $hits = [regex]::Matches($cmd, '\btee\s+(?:-[ai]\s+)*')
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
-        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
             $matched = $true
             $reason = "tee to '$($tok.Value)'"
             break
@@ -391,7 +445,7 @@ if (-not $matched) {
         $argsList = Get-ShellArgsInRange $cmd ($hit.Index + $hit.Length) $cmd.Length
         if ($argsList.Count -ge 2) {
             $destTok = $argsList[$argsList.Count - 1]
-            if (Test-BlockedDest $destTok.Value $destTok.Start) {
+            if (Test-BlockedDest $destTok.Value $destTok.Start $destTok.HasExpansion) {
                 $matched = $true
                 $reason = "cp/mv/copy/move to '$($destTok.Value)'"
                 break
@@ -502,8 +556,22 @@ if (-not $matched) {
         $hasInPlace = $false
         foreach ($t in $argsList) { if ($t.Value -match '^-[a-zA-Z]*i') { $hasInPlace = $true; break } }
         if ($hasInPlace) {
-            foreach ($t in $argsList) {
-                if ($t.Value -notmatch '^-' -and (Test-BlockedDest $t.Value $t.Start)) {
+            # The FAIL-CLOSED expansion check applies only to the LAST
+            # non-flag token — sed's actual file destination — not to every
+            # non-flag token. sed's own SCRIPT argument (e.g. "s/$OLD/new/")
+            # is also a non-flag token and legitimately contains `$VAR`
+            # without naming a write destination at all; treating it as an
+            # unresolvable destination was a false positive this revision
+            # must not introduce. Every non-flag token still gets the plain
+            # extension check (unchanged, catches a fragmented filename in
+            # any position), only the expansion fail-close is last-token-only.
+            $nonFlagToks = New-Object System.Collections.Generic.List[object]
+            foreach ($t in $argsList) { if ($t.Value -notmatch '^-') { [void]$nonFlagToks.Add($t) } }
+            for ($ti = 0; $ti -lt $nonFlagToks.Count; $ti++) {
+                $t = $nonFlagToks[$ti]
+                $isLast = ($ti -eq ($nonFlagToks.Count - 1))
+                $expFlag = $isLast -and $t.HasExpansion
+                if (Test-BlockedDest $t.Value $t.Start $expFlag) {
                     $matched = $true
                     $reason = "sed -i (in-place edit) targets '$($t.Value)'"
                     break
@@ -533,14 +601,29 @@ if (-not $matched) {
     foreach ($m in $scMatches) {
         $argsList = Get-ShellArgsInRange $cmd ($m.Index + $m.Length) $cmd.Length
         $nextIsPathValue = $false
+        # FAIL-CLOSED scope guard: -Value's payload is ALSO a bare positional
+        # token once -Path is given by name, and Set-Content/Out-File's own
+        # positional binding order is Path THEN Value — so only the ONE
+        # destination slot (the named -Path/-FilePath/-LiteralPath value, its
+        # inline form, or else the first positional token when no such named
+        # flag is used) is a plausible destination. Without this, a
+        # completely ordinary `Set-Content -Path notes.md -Value "$USER"`
+        # was flagged as an unresolvable destination because of `-Value`'s
+        # own payload, not the actual (literal, fine) destination. The plain
+        # extension check still runs against every non-flag token as before
+        # (unchanged, catches a fragmented filename in any position); only
+        # the expansion fail-close is scoped to the genuine destination slot,
+        # tracked here as $pathResolved once that slot has been filled.
+        $pathResolved = $false
         foreach ($tok in $argsList) {
             if ($nextIsPathValue) {
-                if (Test-BlockedDest $tok.Value $tok.Start) {
+                if (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion) {
                     $matched = $true
                     $reason = "Set-Content/Out-File to '$($tok.Value)'"
                     break
                 }
                 $nextIsPathValue = $false
+                $pathResolved = $true
             } elseif ($tok.Value -match '^-(?:Path|FilePath|LiteralPath)(?::(.*))?$') {
                 # Flag with inline value (-Path:foo.py) or flag expecting next token
                 $inline = $Matches[1]
@@ -550,16 +633,19 @@ if (-not $matched) {
                         $reason = "Set-Content/Out-File to '$inline'"
                         break
                     }
+                    $pathResolved = $true
                 } else {
                     $nextIsPathValue = $true
                 }
             } elseif ($tok.Value -notmatch '^-') {
                 # Positional argument (not a flag name or flag value)
-                if (Test-BlockedDest $tok.Value $tok.Start) {
+                $expFlag = (-not $pathResolved) -and $tok.HasExpansion
+                if (Test-BlockedDest $tok.Value $tok.Start $expFlag) {
                     $matched = $true
                     $reason = "Set-Content/Out-File to '$($tok.Value)'"
                     break
                 }
+                $pathResolved = $true
             }
         }
         if ($matched) { break }
@@ -572,7 +658,7 @@ if (-not $matched) {
     $hits = [regex]::Matches($cmd, '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*')
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
-        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start)) {
+        if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
             $matched = $true
             $reason = "heredoc into '$($tok.Value)'"
             break
@@ -592,10 +678,22 @@ if (-not $matched) {
 }
 
 if ($matched) {
-    [Console]::Error.WriteLine("[hydra] BLOCKED: Bash write idiom ($reason) targets engine source.")
-    [Console]::Error.WriteLine("[hydra] Engineering code MUST go through the pair-programmer harness, not a Bash write.")
-    [Console]::Error.WriteLine("[hydra] Route it: /hydra:run `"<goal>`" (or submit a DEV_TASK via the ingest bridge).")
-    [Console]::Error.WriteLine("[hydra] Design docs (.md) are allowed. Kill-switch: set HYDRA_ENFORCE_ROUTING != 1.")
+    if ($script:bwUnresolvedReason -eq 'expansion') {
+        # Distinct from the "targets engine source" refusal below so an
+        # operator can tell the two apart in a transcript: this path never
+        # learned the extension, because the destination itself could not be
+        # resolved statically (it names a variable or a command
+        # substitution rather than a literal path).
+        [Console]::Error.WriteLine("[hydra] BLOCKED: Bash write idiom ($reason) has an UNRESOLVABLE destination.")
+        [Console]::Error.WriteLine("[hydra] The destination contains a shell expansion (`$(...), a backtick command, `$VAR, or `${VAR}) that this guard cannot statically resolve, so it cannot verify the write is safe.")
+        [Console]::Error.WriteLine("[hydra] Write a literal path instead. Engineering code must still go through the pair-programmer harness, not a Bash write.")
+        [Console]::Error.WriteLine("[hydra] Route it: /hydra:run `"<goal>`" (or submit a DEV_TASK via the ingest bridge). Kill-switch: set HYDRA_ENFORCE_ROUTING != 1.")
+    } else {
+        [Console]::Error.WriteLine("[hydra] BLOCKED: Bash write idiom ($reason) targets engine source.")
+        [Console]::Error.WriteLine("[hydra] Engineering code MUST go through the pair-programmer harness, not a Bash write.")
+        [Console]::Error.WriteLine("[hydra] Route it: /hydra:run `"<goal>`" (or submit a DEV_TASK via the ingest bridge).")
+        [Console]::Error.WriteLine("[hydra] Design docs (.md) are allowed. Kill-switch: set HYDRA_ENFORCE_ROUTING != 1.")
+    }
     exit 2
 }
 
