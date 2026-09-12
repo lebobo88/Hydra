@@ -773,6 +773,16 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                     "enum": ["low", "medium", "high"],
                     "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
                 },
+                "rigor": {
+                    "type": "string",
+                    "enum": ["trivial", "standard", "major"],
+                    "description": (
+                        "Operator override of node_planner's computed plan_rigor, "
+                        "forwarded as --rigor to the CLI (optional). Wins over the "
+                        "computed value; a downgrade from the computed value is "
+                        "recorded as a hitl_history event."
+                    ),
+                },
                 "repo": {
                     "type": "string",
                     "description": (

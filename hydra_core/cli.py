@@ -599,10 +599,11 @@ def _cmd_run(args) -> int:
     # slash commands advertise it but the CLI run parser never accepted it).
     if getattr(args, "budget", None) is not None:
         initial.budget.budget_usd = float(args.budget)
-    # --risk: recorded for audit / downstream gating. There is no dedicated
-    # HydraState risk field yet, so we surface it on the start event rather than
-    # silently dropping the operator's intent.
+    # --risk: recorded on the start event for audit AND (P3) pre-seeded onto
+    # HydraState.risk_tolerance, where node_planner's plan-rigor triage reads it.
     _risk = getattr(args, "risk", None)
+    if _risk:
+        initial.risk_tolerance = _risk
     critique_client = None
     if args.live:
         from .dispatcher import MCPStdioDispatcher
@@ -731,6 +732,14 @@ def _cmd_plan(args) -> int:
         initial.selected_squads = [s.strip() for s in args.squad.split(",") if s.strip()]
     if getattr(args, "budget", None) is not None:
         initial.budget.budget_usd = float(args.budget)
+    if getattr(args, "risk", None):
+        initial.risk_tolerance = args.risk
+    # --rigor: operator override of node_planner's computed plan_rigor, pre-
+    # seeded onto state the way --squad pre-seeds selected_squads. node_planner
+    # still computes the auto-triage value (to detect + record a downgrade)
+    # but the override wins and plan_rigor_source becomes "operator_flag".
+    if getattr(args, "rigor", None):
+        initial.plan_rigor_override = args.rigor
 
     # Planning never dispatches, so a NullDispatcher is correct and cheap — it
     # lacks the `live_execution` marker, so drive_pp_loop is never auto-enabled.
@@ -4477,6 +4486,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="Pre-allocate the workflow id (threads plan->step->resume).")
     pl.add_argument("--risk", choices=["low", "medium", "high"], default=None,
                     help="Operator risk tolerance hint (recorded on the plan event).")
+    pl.add_argument("--rigor", choices=["trivial", "standard", "major"], default=None,
+                    help="Operator override of the computed plan_rigor. Wins over "
+                         "node_planner's triage; a downgrade from the computed value "
+                         "is recorded as a hitl_history event.")
 
     stp = sub.add_parser("step", help=(
         "Attended mode: open the next engineering stage and pause for a visible "

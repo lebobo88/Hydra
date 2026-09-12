@@ -34,6 +34,7 @@ from .judge import dispatch_judge, dispatch_judge_with_fallback, route_judge, lo
 from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
+from .plan_triage import triage_plan
 from .router import RoutingDecision, classify_intent, compute_tool_scope
 from .telemetry import emit as emit_trace
 from .venom import load_cerberus_venoms
@@ -1219,6 +1220,44 @@ def build_supervisor(
         if needs_ac_hitl:
             state.requires_human_approval = True
 
+        # -----------------------------------------------------------------------
+        # P3: plan-rigor triage. RECORDING ONLY -- this run seeds no planning
+        # task, sets no plan_status, and does not touch requires_human_approval
+        # or the reason precedence above (those change in a later phase).
+        # Placed HERE: after selected_squads/full_tasks are final, and after the
+        # WS1-E missing-engineering-target surface has already returned above
+        # (a surfaced planner must not pay for triage).
+        # -----------------------------------------------------------------------
+        _repo_count = len(state.target_repo_ids) if state.target_repo_ids else 1
+        _computed_rigor, _rigor_reason = triage_plan(
+            goal=state.root_goal,
+            selected_squads=state.selected_squads,
+            task_priorities=[t.priority for t in full_tasks],
+            budget_usd=state.budget.budget_usd,
+            risk_tolerance=state.risk_tolerance,
+            packs=packs,
+            repo_count=_repo_count,
+        )
+        _rigor_rank = {"trivial": 0, "standard": 1, "major": 2}
+        _override = state.plan_rigor_override
+        _new_hitl_history: list[dict[str, Any]] = []
+        if _override is not None:
+            plan_rigor = _override
+            plan_rigor_source = "operator_flag"
+            if _rigor_rank[_override] < _rigor_rank[_computed_rigor]:
+                # A downgrade is a governance decision, not a preference --
+                # recorded verbatim (both values) rather than silently applied.
+                _new_hitl_history.append({
+                    "event": "plan_rigor_override_downgrade",
+                    "workflow_id": str(state.workflow_id),
+                    "computed_rigor": _computed_rigor,
+                    "computed_reason": _rigor_reason,
+                    "override_rigor": _override,
+                })
+        else:
+            plan_rigor = _computed_rigor
+            plan_rigor_source = "triage"
+
         out: dict = {
             # APPEND REDUCER: emit only synthesised_tasks (not existing_tasks).
             # Pre-seeded tasks are already in state.tasks; re-emitting them
@@ -1227,7 +1266,11 @@ def build_supervisor(
             "envelopes": new_envelopes,
             "requires_human_approval": state.requires_human_approval,
             "phase": "approval" if state.requires_human_approval else "dispatch",
+            "plan_rigor": plan_rigor,
+            "plan_rigor_source": plan_rigor_source,
         }
+        if _new_hitl_history:
+            out["hitl_history"] = _new_hitl_history
 
         if state.requires_human_approval:
             # C2 (mesh-console-unification): the graph interrupts BEFORE the

@@ -206,6 +206,14 @@ class HydraState(BaseModel):
     # "goal_text_inferred" (MU5 conservative cue-based inference), or None
     # when no target has resolved.
     target_repo_source: Optional[str] = None
+    # P3 plan-triage substrate: the operator's `--risk`/`risk=` hint (CLI
+    # `hydra run --risk` / `hydra plan --risk`, or the hydra.workflow.plan
+    # / hydra.workflow.launch MCP `risk` param). Previously recorded only on
+    # the workflow_start/workflow_plan trace event with a comment noting
+    # "there is no dedicated HydraState risk field yet" (see cli.py); this is
+    # that field. Defaults to "medium" so a workflow with no operator hint
+    # triages the same as before this field existed.
+    risk_tolerance: Literal["low", "medium", "high"] = "medium"
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",
@@ -362,6 +370,14 @@ class HydraState(BaseModel):
     ] = "none"
     plan_rigor: Optional[str] = None
     plan_rigor_source: Optional[str] = None
+    # P3: operator override input (pre-seeded the way --squad pre-seeds
+    # selected_squads, via `hydra plan --rigor` / hydra.workflow.plan
+    # rigor=). node_planner reads this once to set plan_rigor/plan_rigor_source
+    # ("operator_flag") instead of the computed triage value, and records a
+    # hitl_history downgrade event when the override is stricter-to-looser
+    # than the computed rigor. Left populated afterwards (an input value, not
+    # a derived one) so replay reproduces the same override.
+    plan_rigor_override: Optional[Literal["trivial", "standard", "major"]] = None
     plan_envelope_id: Optional[UUID] = None
     plan_ref: Optional[dict[str, Any]] = None
     plan_revision: int = 0
