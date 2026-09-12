@@ -45,7 +45,7 @@ from uuid import UUID, uuid4
 from .governance import charge_and_gate, redact_for_squad_boundary
 from .schemas import HydraEnvelope, validate_envelope
 from .squad_node import execute_squad
-from .state import HydraState, TaskState
+from .state import HydraState, TaskState, plan_barrier_active
 # Reuse the in-graph routing + cost helpers so ingest and node_dispatch stay in
 # lockstep. supervisor's langgraph import is guarded (pure-python fallback), so
 # importing these module-level helpers is safe even without langgraph.
@@ -464,6 +464,25 @@ def dispatch_ingested_envelopes(
 
         eid = str(env.id)
         etype = getattr(env, "type", None)
+
+        # P1: while a plan barrier is active, every non-PLAN envelope is HELD
+        # rather than dispatched — this function calls execute_squad directly,
+        # bypassing node_dispatch's barrier check entirely, so it is a real
+        # bypass if left unguarded. Held items are visible in the result (not
+        # silently dropped) so the host can re-ingest them once the plan
+        # clears. No filesystem/lock/checkpoint I/O added — plan_barrier_active
+        # only reads state.plan_status. No-op while plan_status == "none".
+        if etype != "PLAN" and plan_barrier_active(state):
+            outcome.items.append(IngestItemResult(
+                envelope_id=eid, envelope_type=etype, target=None,
+                status="deferred_to_host",
+                detail=f"plan_barrier_active (plan_status={state.plan_status!r}); "
+                       "held pending plan resolution, re-ingest after the barrier clears",
+            ))
+            _emit("ingest.held_for_plan_barrier", {
+                "envelope_id": eid, "type": etype, "plan_status": state.plan_status,
+            })
+            continue
 
         if eid in seen_existing:
             outcome.items.append(IngestItemResult(

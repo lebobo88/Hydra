@@ -381,6 +381,52 @@ class HydraState(BaseModel):
         return False, None
 
 
+# P1 plan-barrier predicates. Both are NO-OPs today: nothing ever sets
+# plan_status away from its default "none", so plan_barrier_active is always
+# False and plan_deps_satisfied is only consulted behind that gate (except
+# where a caller applies it unconditionally, per its own docstring). Defined
+# ONCE here and imported everywhere else — a divergent second definition is
+# the documented trap from the worktree-relocation incident.
+_PLAN_BARRIER_STATES = frozenset({"authoring", "drafted", "judged", "rejected"})
+
+
+def plan_barrier_active(state) -> bool:
+    """True while a plan is mid-authoring/judging/rejected and dispatch should
+    hold non-planning work. ``getattr`` with a "none" default so a checkpoint
+    written before this field existed is never blocked."""
+    return str(getattr(state, "plan_status", "none") or "none") in _PLAN_BARRIER_STATES
+
+
+def plan_deps_satisfied(state, task) -> bool:
+    """True when every task_id in ``task.depends_on`` has been driven to a
+    genuinely-done outcome.
+
+    Empty ``depends_on`` is always satisfied. A dependency is satisfied when
+    its id appears in ``state.attended_done_task_ids`` (attended cursors that
+    finalized with final_status="complete" — see HydraState.attended_done_task_ids)
+    or when the corresponding TaskState has ``status == "done"`` (in-graph
+    dispatch path). Deliberately NOT attended_completed_task_ids: that list
+    also includes "surfaced" and "aborted" outcomes, and releasing a dependent
+    onto a surfaced upstream is the E2-23 bug in a new costume.
+    """
+    deps = list(getattr(task, "depends_on", None) or [])
+    if not deps:
+        return True
+    done_ids = set(getattr(state, "attended_done_task_ids", None) or [])
+    status_by_id = {
+        str(t.task_id): getattr(t, "status", None)
+        for t in getattr(state, "tasks", None) or []
+    }
+    for dep in deps:
+        dep = str(dep)
+        if dep in done_ids:
+            continue
+        if status_by_id.get(dep) == "done":
+            continue
+        return False
+    return True
+
+
 def make_checkpoint_serde() -> Any:
     """Return a JsonPlusSerializer with hydra_core.state types registered.
 

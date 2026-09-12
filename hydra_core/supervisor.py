@@ -48,7 +48,14 @@ from .schemas import (
 from .squad_loader import SquadPack, discover_squads
 from .fleet import dispatch_fleet
 from .squad_node import Dispatcher, SquadResult, execute_squad
-from .state import BudgetLedger, HydraState, TaskState, make_checkpoint_serde
+from .state import (
+    BudgetLedger,
+    HydraState,
+    TaskState,
+    make_checkpoint_serde,
+    plan_barrier_active,
+    plan_deps_satisfied,
+)
 
 
 # --- LangGraph is an optional runtime dependency. If missing we still expose
@@ -1852,6 +1859,8 @@ def build_supervisor(
             state.fleet_parallel
             and len(_fleet_candidate_tasks) >= 2
             and len(_distinct_non_none_repo_ids) >= 2
+            # P1: never race a parallel fleet against an active plan barrier.
+            and not plan_barrier_active(state)
         )
 
         if _use_fleet:
@@ -2157,8 +2166,19 @@ def build_supervisor(
         # loop are collected here and forwarded to their target squad in a single
         # sweep after the loop. Each entry: (envelope_obj, producer_slug, target_slug).
         _forward_queue: list[tuple[Any, str, str]] = []
+        # P1 plan-barrier: while a plan is mid-authoring/judging/rejected,
+        # only the planning task itself may dispatch. No-op today (nothing
+        # ever sets plan_status away from "none").
+        _barrier_active = plan_barrier_active(state)
         for task in _dispatch_tasks:
             if task.status != "pending":
+                continue
+            if _barrier_active and task.owner_squad != "planning":
+                continue
+            # P1: a stale-revision task (superseded by a replan) never
+            # dispatches. tasks is append-only, so a superseded plan's step
+            # tasks would otherwise execute after a replan.
+            if getattr(task, "plan_revision", 0) and task.plan_revision != state.plan_revision:
                 continue
             pack = packs.get(task.owner_squad)
             if pack is None:
