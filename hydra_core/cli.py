@@ -625,6 +625,12 @@ def _cmd_run(args) -> int:
         dispatcher=dispatcher,
         critique_client=critique_client,
         force_pure_python=getattr(args, "no_checkpoint", False),
+        # P5a: `--live` is the detached path (hydra.workflow.launch detaches
+        # exactly this); `--no-checkpoint` is the pure-python runner. Neither
+        # has an attended host cursor for the claude-native planning squad to
+        # defer to, so both must force plan_rigor to "trivial" or a plan-phase
+        # run would seed a planning task and park forever.
+        force_trivial_plan_rigor=bool(args.live) or bool(getattr(args, "no_checkpoint", False)),
     )
     emit(project, workflow_id, "workflow_start",
          {"goal": _goal, "budget_usd": initial.budget.budget_usd, "risk": _risk})
