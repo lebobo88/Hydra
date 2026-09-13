@@ -1188,3 +1188,672 @@ class TestFourthRevisionPropertyNotInstance:
             f"property check failed: removing the destination check should have "
             f"refused open('notes.md','w') again, but rc={result.returncode} stderr={result.stderr}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fifth revision (2026-09): INVENTORY EXTENSION. The destination parser
+# (Read-ShellArgument / Get-ShellArgsInRange / Read-PyDestExpr /
+# Test-BlockedDest) is unchanged; these idioms were simply never recognised
+# as write idioms at all, so their destination was never examined. Measured
+# 0 (undetected) both on this branch before this revision and on main
+# (29dbe89) — pre-existing gaps, not regressions.
+#
+#   dd if=/dev/zero of=hydra_core/supervisor.py
+#   install /dev/null hydra_core/supervisor.py
+#   truncate -s 0 hydra_core/supervisor.py
+#   ln -sf a hydra_core/supervisor.py
+#   python -c "import os; os.replace('a','hydra_core/supervisor.py')"
+#   python -c "import os; os.rename('a','hydra_core/supervisor.py')"
+#   python -c "from pathlib import Path; Path('hydra_core/supervisor.py').open('w')"
+#
+# `install` is the CRITICAL false-positive trap: it is overwhelmingly a
+# package-manager verb, not coreutils. Test-IsCommandWord is the load-bearing
+# discriminator — `install` (and `dd`/`truncate`/`ln`) counts as this hook's
+# own write idiom ONLY in command-word position (start of command, or
+# immediately after `;`/`&`/`|`/newline/`sudo`/`env`/`nice`), never as a
+# subcommand argument of another program.
+# ---------------------------------------------------------------------------
+
+
+def _dd_cmd(dest_expr: str) -> str:
+    return f"dd if=/dev/zero of={dest_expr}"
+
+
+def _truncate_cmd(dest_expr: str) -> str:
+    return f"truncate -s 0 {dest_expr}"
+
+
+def _ln_cmd(dest_expr: str) -> str:
+    return f"ln -sf a {dest_expr}"
+
+
+def _install_cmd(dest_expr: str) -> str:
+    return f"install /dev/null {dest_expr}"
+
+
+class TestDdOfWrite:
+    def test_blocked_shapes(self, project_dir: Path):
+        for name, expr in _shapes_for(BLOCKED_REL, 10, "hydra core/supervisor.py").items():
+            if name == "quoted_with_space":
+                (project_dir / "hydra core").mkdir(exist_ok=True)
+            result = _run_bash_hook(_dd_cmd(expr), cwd=project_dir, project_dir=project_dir)
+            assert result.returncode == 2, f"{name}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    def test_unresolvable_destination_blocked(self, project_dir: Path):
+        result = _run_bash_hook(_dd_cmd("$D"), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(_dd_cmd(PLANS_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            _dd_cmd("docs/plansomething/x.html"), cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_no_of_argument_allowed(self, project_dir: Path):
+        """`dd` with no `of=` writes stdout, not a file — not a write idiom."""
+        result = _run_bash_hook("dd if=/dev/zero bs=1 count=1", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestTruncateWrite:
+    def test_blocked_shapes(self, project_dir: Path):
+        for name, expr in _shapes_for(BLOCKED_REL, 10, "hydra core/supervisor.py").items():
+            if name == "quoted_with_space":
+                (project_dir / "hydra core").mkdir(exist_ok=True)
+            result = _run_bash_hook(_truncate_cmd(expr), cwd=project_dir, project_dir=project_dir)
+            assert result.returncode == 2, f"{name}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    def test_unresolvable_destination_blocked(self, project_dir: Path):
+        result = _run_bash_hook(_truncate_cmd("$D"), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(_truncate_cmd(PLANS_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            _truncate_cmd("docs/plansomething/x.html"), cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_size_flag_value_not_mistaken_for_path(self, project_dir: Path):
+        """`-s 10`: the size value is NOT a path and must not be examined
+        (and there is no other operand here at all, so nothing to block)."""
+        result = _run_bash_hook("truncate -s 10", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_reference_file_is_read_not_write(self, project_dir: Path):
+        """`-r RFILE` is READ (to copy its size), never written — even when
+        RFILE is itself a protected path — and the real write target (the
+        trailing operand) is what gets examined."""
+        result = _run_bash_hook(
+            f"truncate -r {BLOCKED_REL} notes.txt", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestLnWrite:
+    def test_blocked_shapes(self, project_dir: Path):
+        for name, expr in _shapes_for(BLOCKED_REL, 10, "hydra core/supervisor.py").items():
+            if name == "quoted_with_space":
+                (project_dir / "hydra core").mkdir(exist_ok=True)
+            result = _run_bash_hook(_ln_cmd(expr), cwd=project_dir, project_dir=project_dir)
+            assert result.returncode == 2, f"{name}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    def test_unresolvable_destination_blocked(self, project_dir: Path):
+        result = _run_bash_hook(_ln_cmd("$D"), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(_ln_cmd(PLANS_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            _ln_cmd("docs/plansomething/x.html"), cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_target_protected_but_linkname_not_allowed(self, project_dir: Path):
+        """Reading a protected path (as the link TARGET) is not a write —
+        only the link NAME (the destination) is examined. Confirms the
+        implementation reads the LAST operand as the destination, not the
+        first."""
+        result = _run_bash_hook(f"ln -s {BLOCKED_REL} mylink", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestInstallWrite:
+    def test_blocked_shapes(self, project_dir: Path):
+        for name, expr in _shapes_for(BLOCKED_REL, 10, "hydra core/supervisor.py").items():
+            if name == "quoted_with_space":
+                (project_dir / "hydra core").mkdir(exist_ok=True)
+            result = _run_bash_hook(_install_cmd(expr), cwd=project_dir, project_dir=project_dir)
+            assert result.returncode == 2, f"{name}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    def test_unresolvable_destination_blocked(self, project_dir: Path):
+        result = _run_bash_hook(_install_cmd("$D"), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(_install_cmd(PLANS_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            _install_cmd("docs/plansomething/x.html"), cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "npm install",
+            "npm install express",
+            "npm i",
+            "pnpm install",
+            "yarn install",
+            "bun install",
+            "pip install requests",
+            "pip3 install -r requirements.txt",
+            "python -m pip install -e .",
+            "apt install foo",
+            "apt-get install foo",
+            "dnf install foo",
+            "yum install foo",
+            "brew install foo",
+            "cargo install ripgrep",
+            "go install ./...",
+            "gem install bundler",
+            "composer install",
+            "choco install foo",
+            "winget install foo",
+            # slash/dot/scope/at package names must not be mistaken for paths
+            "pip install ruamel.yaml",
+            "npm install @scope/pkg",
+            "go install example.com/cmd/tool@latest",
+        ],
+    )
+    def test_package_manager_install_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPyOsReplaceRename:
+    @pytest.mark.parametrize("fn", ["replace", "rename"])
+    def test_blocked(self, project_dir: Path, fn: str):
+        cmd = f"python -c \"import os; os.{fn}('a','{BLOCKED_REL}')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize("fn", ["replace", "rename"])
+    def test_unresolvable_blocked(self, project_dir: Path, fn: str):
+        cmd = f"python -c \"import os; D='{BLOCKED_REL}'; os.{fn}('a', D)\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    @pytest.mark.parametrize("fn", ["replace", "rename"])
+    def test_docs_plans_allowed(self, project_dir: Path, fn: str):
+        cmd = f"python -c \"import os; os.{fn}('a','{PLANS_REL}')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPyOsSymlinkLink:
+    @pytest.mark.parametrize("fn", ["symlink", "link"])
+    def test_blocked(self, project_dir: Path, fn: str):
+        cmd = f"python -c \"import os; os.{fn}('a','{BLOCKED_REL}')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize("fn", ["symlink", "link"])
+    def test_target_protected_but_dst_not_allowed(self, project_dir: Path, fn: str):
+        """The first argument (the existing file being linked TO) is only
+        read; only the second argument (the new link) is a write."""
+        cmd = f"python -c \"import os; os.{fn}('{BLOCKED_REL}','newlink')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize("fn", ["symlink", "link"])
+    def test_docs_plans_allowed(self, project_dir: Path, fn: str):
+        cmd = f"python -c \"import os; os.{fn}('a','{PLANS_REL}')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPyOsTruncate:
+    def test_blocked(self, project_dir: Path):
+        cmd = f"python -c \"import os; os.truncate('{BLOCKED_REL}', 0)\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_unresolvable_blocked(self, project_dir: Path):
+        cmd = f"python -c \"import os; D='{BLOCKED_REL}'; os.truncate(D, 0)\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        cmd = f"python -c \"import os; os.truncate('{PLANS_REL}', 0)\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPathOpenWriteMode:
+    def test_positional_write_mode_blocked(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('" + BLOCKED_REL + "').open('w')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_keyword_mode_blocked(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('" + BLOCKED_REL + "').open(mode='w')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_read_mode_allowed(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('" + BLOCKED_REL + "').open('r')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_no_args_defaults_to_read_allowed(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('" + BLOCKED_REL + "').open()\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plans_allowed(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('" + PLANS_REL + "').open('w')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestIoCodecsOpen:
+    @pytest.mark.parametrize("prefix", ["io", "codecs"])
+    def test_write_mode_blocked(self, project_dir: Path, prefix: str):
+        cmd = f"python -c \"import {prefix}; {prefix}.open('{BLOCKED_REL}','w')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize("prefix", ["io", "codecs"])
+    def test_read_mode_allowed(self, project_dir: Path, prefix: str):
+        cmd = f"python -c \"import {prefix}; {prefix}.open('{BLOCKED_REL}','r')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize("prefix", ["io", "codecs"])
+    def test_docs_plans_allowed(self, project_dir: Path, prefix: str):
+        cmd = f"python -c \"import {prefix}; {prefix}.open('{PLANS_REL}','w')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestFifthRevisionPropertyNotInstance:
+    """Prove each new idiom's detection is load-bearing: patch out exactly
+    that one branch in a temporary copy of the hook and confirm the
+    corresponding bypass returns (rc=0), following the same pattern as the
+    third/fourth revisions' test_removing_* tests."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_dd_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $ddHits = [regex]::Matches($cmd, '\\bdd\\b')",
+            "if ($false) {\n    $ddHits = [regex]::Matches($cmd, '\\bdd\\b')",
+        )
+        result = self._run(patched_hook, _dd_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing dd detection should have allowed "
+            f"the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_truncate_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $truncHits = [regex]::Matches($cmd, '\\btruncate\\b')",
+            "if ($false) {\n    $truncHits = [regex]::Matches($cmd, '\\btruncate\\b')",
+        )
+        result = self._run(patched_hook, _truncate_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing truncate detection should have "
+            f"allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_ln_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $lnHits = [regex]::Matches($cmd, '\\bln\\b')",
+            "if ($false) {\n    $lnHits = [regex]::Matches($cmd, '\\bln\\b')",
+        )
+        result = self._run(patched_hook, _ln_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing ln detection should have allowed "
+            f"the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_install_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $instHits = [regex]::Matches($cmd, '\\binstall\\b')",
+            "if ($false) {\n    $instHits = [regex]::Matches($cmd, '\\binstall\\b')",
+        )
+        result = self._run(patched_hook, _install_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing install detection should have "
+            f"allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_install_command_word_guard_breaks_npm_install(self, project_dir: Path, tmp_path: Path):
+        """The false-positive trap: without Test-IsCommandWord gating the
+        `install` branch, an npm invocation shaped like `npm install <pkg>
+        <path>` would also be examined by the coreutils `install SOURCE...
+        DEST` logic (its LAST operand tested as a destination) — prove the
+        guard is why it currently isn't.
+
+        Needs >=2 operands after the word `install`: the coreutils branch's
+        last-operand-is-destination check only fires when
+        `operands.Count -ge 2` (single-operand installs like plain `npm
+        install <path>` never reach that check regardless of the guard, so
+        they would not distinguish this property)."""
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "    foreach ($ih in $instHits) {\n"
+            "        if (-not (Test-IsCommandWord $cmd $ih.Index)) { continue }\n",
+            "    foreach ($ih in $instHits) {\n",
+        )
+        cmd = f"npm install /dev/null {BLOCKED_REL}"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, (
+            f"property check failed: removing Test-IsCommandWord gating should "
+            f"have made `{cmd}` examine its last operand as a destination and "
+            f"block it, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_os_replace_rename_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $osrHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*')",
+            "if ($false) {\n    $osrHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*')",
+        )
+        cmd = f"python -c \"import os; os.replace('a','{BLOCKED_REL}')\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing os.replace/os.rename detection "
+            f"should have allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_os_symlink_link_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $oslHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*')",
+            "if ($false) {\n    $oslHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*')",
+        )
+        cmd = f"python -c \"import os; os.symlink('a','{BLOCKED_REL}')\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing os.symlink/os.link detection "
+            f"should have allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_os_truncate_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "if (-not $matched) {\n    $otHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*')",
+            "if ($false) {\n    $otHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*')",
+        )
+        cmd = f"python -c \"import os; os.truncate('{BLOCKED_REL}', 0)\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing os.truncate detection should "
+            f"have allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_path_open_mode_check_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "            if ($modeVal -and ($modeVal -match '[wax]')) {\n"
+            "                if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {\n"
+            "                    $matched = $true\n"
+            "                    $reason = \"pathlib.Path.open('$modeVal') targets '$($arg.Value)'\"\n"
+            "                    break\n"
+            "                }\n"
+            "            }",
+            "            if ($false) {\n"
+            "                if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {\n"
+            "                    $matched = $true\n"
+            "                    $reason = \"pathlib.Path.open('$modeVal') targets '$($arg.Value)'\"\n"
+            "                    break\n"
+            "                }\n"
+            "            }",
+        )
+        cmd = "python -c \"from pathlib import Path; Path('" + BLOCKED_REL + "').open('w')\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing the Path.open mode check should "
+            f"have allowed the bypass, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    # NOTE: there is deliberately no test_removing_io_codecs_open_extension_*
+    # property test here. An earlier revision matched io.open(/codecs.open(
+    # via an explicit `io\s*\.\s*open|codecs\s*\.\s*open` alternation; a
+    # property test proved that alternation redundant, not load-bearing:
+    # the char before `open` in `io.open(` / `codecs.open(` is `.`, a
+    # non-word character, so the bare `\bopen\s*\(` word-boundary match
+    # already matches it — reverting to the bare regex does NOT reopen the
+    # bypass. The alternation was removed as dead code; TestIoCodecsOpen
+    # above is the real regression guard for io.open()/codecs.open() write
+    # detection.
+
+# ---------------------------------------------------------------------------
+# Sixth revision (2026-09): `-t DIR` / `--target-directory=DIR` destinations.
+#
+# PROVEN gap: `cp`/`mv` had no `-t` handling at all, and `ln`/`install` parsed
+# `-t DIR` / `--target-directory=DIR` but checked the DIRECTORY path itself -
+# a directory like `hydra_core` carries no blocked extension, so the write
+# sailed through. The actual file written is DIR joined with the BASENAME of
+# each source (`cp supervisor.py -t hydra_core` writes
+# `hydra_core/supervisor.py`), which IS protected. Fixed by synthesising that
+# joined path and running it through the same `Test-BlockedDest` every other
+# branch already uses - no new parsing, no new refusal reason.
+#
+# THE TRAP: `-t` means something else entirely for tar (list), sort (field
+# separator), docker/ssh (tty), systemctl (unit type), timeout (duration),
+# etc. Only `cp`/`mv`/`install`/`ln`, and only in COMMAND-WORD position
+# (Test-IsCommandWord), may interpret `-t` as target-directory.
+# ---------------------------------------------------------------------------
+
+
+class TestCpMvTargetDirectory:
+    def test_cp_dash_t_separated_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "cp supervisor.py -t hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_cp_target_directory_equals_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "cp supervisor.py --target-directory=hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_mv_dash_t_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "mv supervisor.py -t hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_cp_dash_t_docs_allowed(self, project_dir: Path):
+        # cp notes.md -t docs resolves to docs/notes.md, an allowed
+        # extension, so allowed.
+        result = _run_bash_hook("cp notes.md -t docs", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_cp_dash_t_docs_plans_html_allowed(self, project_dir: Path):
+        # The docs/plans carve-out is scoped to .html, not to cp/mv
+        # generally - cp report.html -t docs/plans resolves to the
+        # carved-out docs/plans/report.html and is allowed.
+        result = _run_bash_hook(
+            "cp report.html -t docs/plans", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_cp_dash_t_docs_plansomething_blocked(self, project_dir: Path):
+        # Segment-bounded: docs/plansomething must NOT match the docs/plans
+        # carve-out, even reached via -t.
+        result = _run_bash_hook(
+            "cp supervisor.py -t docs/plansomething", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_mv_dash_t_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "mv supervisor.py -t docs/plansomething", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_positional_control_still_blocked(self, project_dir: Path):
+        # Control: the already-correct positional form must stay blocked.
+        result = _run_bash_hook(
+            "cp a.txt hydra_core/supervisor.py", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestInstallTargetDirectory:
+    def test_install_dash_t_separated_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "install supervisor.py -t hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_install_target_directory_equals_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "install supervisor.py --target-directory=hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_install_dev_null_dash_t_allowed(self, project_dir: Path):
+        # install /dev/null -t hydra_core resolves to hydra_core/null - no
+        # blocked extension, so ALLOWED. Deliberate: the guard is
+        # extension-based, not path-based.
+        result = _run_bash_hook(
+            "install /dev/null -t hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_install_dash_t_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "install supervisor.py -t docs/plansomething", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestLnTargetDirectory:
+    def test_ln_dash_t_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "ln -t hydra_core supervisor.py", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_ln_dash_t_docs_plansomething_blocked(self, project_dir: Path):
+        result = _run_bash_hook(
+            "ln -t docs/plansomething supervisor.py", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestDashTFalsePositiveTrap:
+    # -t is a common flag meaning something entirely different for these
+    # commands - none of them is cp/mv/install/ln, so this hook must never
+    # touch them regardless of the -t target-directory handling added above.
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "tar -tf archive.tar",
+            "sort -t, -k2 data.csv",
+            "docker run -t image",
+            "ssh -t host cmd",
+            "systemctl list-units -t service",
+            "timeout -t 5 cmd",
+        ],
+    )
+    def test_non_copy_commands_dash_t_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd}: rc={result.returncode} stderr={result.stderr}"
+
+
+class TestSixthRevisionPropertyNotInstance:
+    # Prove the -t/--target-directory= handling is load-bearing: patch it
+    # out in a temporary copy of the hook and confirm the bypass returns
+    # (rc=0), following the same pattern as the fourth/fifth revisions.
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_cp_mv_target_directory_handling_allows_the_bypass(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "        if (Test-IsCommandWord $cmd $hit.Index) {\n",
+            "        if ($false) {\n",
+        )
+        result = self._run(
+            patched_hook, "cp supervisor.py -t hydra_core", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, (
+            f"property check failed: removing the cp/mv -t target-directory "
+            f"handling should have allowed the bypass, but "
+            f"rc={result.returncode} stderr={result.stderr}"
+        )

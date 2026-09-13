@@ -9,6 +9,8 @@
 #   - Output redirection (> or >>) targeting a blocked-extension file
 #   - tee command with a blocked-extension destination
 #   - cp / mv / copy / move whose resolved destination has a blocked extension
+#     (including `-t DIR` / `--target-directory=DIR`, whose real write target
+#     is DIR joined with each source's basename, never DIR itself)
 #   - python -c ... open(..., write/append/exclusive mode) — one-liner writing
 #   - python -c ... pathlib.Path(...).write_text/write_bytes(...)
 #   - python -c ... shutil.copy*/move with a blocked-extension destination
@@ -17,6 +19,19 @@
 #     flag values AND positional arguments (fixes first-token-is-flag false neg)
 #   - Shell heredoc (<<WORD) redirected into a blocked-extension file
 #   - PowerShell here-string (@'...'@ or @"..."@) piped to Set-Content/Out-File
+#   - dd if=... of=<dest>                       (destination = the of= operand)
+#   - truncate [-s SIZE] FILE...                (every non-option operand)
+#   - ln [-s] TARGET LINKNAME / TARGET... DIR    (destination = the link/dir,
+#     never the target — with `-t DIR` / `--target-directory=DIR`, every
+#     operand is a TARGET being read and the real write is DIR joined with
+#     each operand's basename)
+#   - install SOURCE... DEST / -t DIR           (coreutils file-copy form only
+#     — see Test-IsCommandWord: never a package-manager `install` subcommand)
+#   - python -c ... os.replace(src, dst) / os.rename(src, dst)
+#   - python -c ... os.symlink(src, dst) / os.link(src, dst)
+#   - python -c ... os.truncate(path, size)
+#   - python -c ... Path(...).open(mode) — including mode='w' as a keyword
+#   - python -c ... io.open(...) / codecs.open(...) — same shape as open()
 #
 # EFFECTIVE-CWD RULE (E2-18) — a relative destination is resolved against the
 # cwd the command has actually reached, not blindly against the payload's
@@ -393,6 +408,78 @@ function Get-ShellArgsInRange {
     return $result
 }
 
+function Get-ShellBasename {
+    # Returns the final path segment of a (POSIX- or Windows-style) path
+    # string. Used to synthesise the real write destination of a `-t DIR` /
+    # `--target-directory=DIR` invocation: cp/mv/install/ln write DIR joined
+    # with each source's basename, never DIR in isolation, so
+    # `cp supervisor.py -t hydra_core` must be checked as
+    # `hydra_core/supervisor.py`, not as `hydra_core`.
+    param([string]$p)
+    $trimmed = $p.TrimEnd('/', '\')
+    if (-not $trimmed) { return $p }
+    $idx = $trimmed.LastIndexOfAny([char[]]('/', '\'))
+    if ($idx -ge 0) { return $trimmed.Substring($idx + 1) }
+    return $trimmed
+}
+
+function Test-IsCommandWord {
+    # INVENTORY EXTENSION (2026-09) — the false-positive discriminator for
+    # dd/truncate/ln/install: a word like "install" only counts as ITS OWN
+    # command when it sits in a command-word position (start of string, or
+    # immediately after a statement separator `;`/`&`/`|`/newline, or
+    # immediately after the literal word `sudo`/`env`/`nice`) — NOT when it is
+    # a subcommand argument of another program (`npm install`, `pip install`,
+    # `apt-get install`, `cargo install`, ...). A package name is not a path,
+    # and `install`/`dd`/`ln`/`truncate` appearing as someone else's argument
+    # must never be treated as this hook's own write idiom.
+    param([string]$s, [int]$wordStart)
+    $i = $wordStart - 1
+    while ($i -ge 0 -and $s[$i] -match '[ \t]') { $i-- }
+    if ($i -lt 0) { return $true }
+    $c = $s[$i]
+    if ($c -eq ';' -or $c -eq '&' -or $c -eq '|' -or $c -eq "`n" -or $c -eq "`r") { return $true }
+    $j = $i
+    while ($j -ge 0 -and $s[$j] -notmatch '[\s;&|]') { $j-- }
+    $prevWord = $s.Substring($j + 1, $i - $j)
+    return $prevWord -in @('sudo', 'env', 'nice')
+}
+
+function Get-BalancedParenText {
+    # Given the index of an OPENING '(' character, returns the text strictly
+    # between it and its matching ')' (quote-aware, so a ')' or '(' inside a
+    # string literal doesn't unbalance the count), plus the index just past
+    # the matching ')'. Used to read a call's full argument list (e.g.
+    # Path(...).open(mode='w')) so a keyword argument can be found anywhere
+    # inside it, not just in the first positional slot.
+    param([string]$s, [int]$openParenIdx)
+    $n = $s.Length
+    $i = $openParenIdx
+    if ($i -ge $n -or $s[$i] -ne '(') { return $null }
+    $depth = 0
+    $start = $i + 1
+    while ($i -lt $n) {
+        $c = $s[$i]
+        if ($c -eq "'" -or $c -eq '"') {
+            $q = $c; $i++
+            while ($i -lt $n -and $s[$i] -ne $q) {
+                if ($s[$i] -eq '\' -and ($i + 1) -lt $n) { $i += 2; continue }
+                $i++
+            }
+            if ($i -lt $n) { $i++ }
+            continue
+        }
+        if ($c -eq '(') { $depth++; $i++; continue }
+        if ($c -eq ')') {
+            $depth--
+            if ($depth -eq 0) { return [pscustomobject]@{ Text = $s.Substring($start, $i - $start); End = $i + 1 } }
+            $i++; continue
+        }
+        $i++
+    }
+    return $null
+}
+
 function Read-PyStringLiteral {
     # Reconstructs one or more ADJACENT Python string literals (implicit
     # literal concatenation, e.g. 'sup' 'ervisor.py' -> 'supervisor.py') into
@@ -659,12 +746,59 @@ if (-not $matched) {
 }
 
 # 3. cp / mv / copy / move — the LAST reconstructed argument of the invocation
-#    (up to the next statement separator) is the destination.
+#    (up to the next statement separator) is the destination, UNLESS `-t DIR`
+#    / `--target-directory=DIR` is present. `-t` is only recognised as
+#    target-directory when `cp`/`mv`/`copy`/`move` is the COMMAND WORD itself
+#    (see Test-IsCommandWord) — `-t` means something else entirely for tar
+#    (list), sort (field separator), docker/ssh (tty), systemctl (unit type),
+#    timeout (duration), etc., and those commands never even reach this
+#    branch. With `-t`/`--target-directory=` present, EVERY other operand is a
+#    SOURCE (none is a destination) and the real write target is DIR joined
+#    with each source's basename — `cp a.py -t dir` writes `dir/a.py`, never
+#    `dir` itself.
 #    e.g.  cp template.py src/newfile.py    mv old.js new.ts
+#          cp supervisor.py -t hydra_core   (writes hydra_core/supervisor.py)
 if (-not $matched) {
     $hits = [regex]::Matches($cmd, '\b(?:cp|mv|copy|move)\b')
     foreach ($hit in $hits) {
         $argsList = Get-ShellArgsInRange $cmd ($hit.Index + $hit.Length) $cmd.Length
+        $targetDirTok = $null
+        $operands = New-Object System.Collections.Generic.List[object]
+        $awaitingTargetDir = $false
+        if (Test-IsCommandWord $cmd $hit.Index) {
+            foreach ($t in $argsList) {
+                if ($awaitingTargetDir) {
+                    $targetDirTok = [pscustomobject]@{ Value = $t.Value; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                    $awaitingTargetDir = $false
+                    continue
+                }
+                if ($t.Value -match '^-t(.*)$') {
+                    if ($Matches[1]) {
+                        $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                    } else { $awaitingTargetDir = $true }
+                    continue
+                }
+                if ($t.Value -match '^--target-directory=(.*)$') {
+                    $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                    continue
+                }
+                if ($t.Value -match '^-') { continue }
+                [void]$operands.Add($t)
+            }
+        }
+        if ($targetDirTok) {
+            foreach ($src in $operands) {
+                $joined = "$($targetDirTok.Value)/$(Get-ShellBasename $src.Value)"
+                $expFlag = $targetDirTok.HasExpansion -or $src.HasExpansion
+                if (Test-BlockedDest $joined $targetDirTok.Start $expFlag) {
+                    $matched = $true
+                    $reason = "cp/mv/copy/move to '$joined'"
+                    break
+                }
+            }
+            if ($matched) { break }
+            continue
+        }
         if ($argsList.Count -ge 2) {
             $destTok = $argsList[$argsList.Count - 1]
             if (Test-BlockedDest $destTok.Value $destTok.Start $destTok.HasExpansion) {
@@ -699,6 +833,14 @@ if (-not $matched) {
     # by setting Resolvable=$false, which is passed through as
     # Test-BlockedDest's $hasExpansion — the open() branch was the one place
     # still failing OPEN on that shape while every other branch fails closed.
+    #        `io.open(...)` and `codecs.open(...)` need no alternation of
+    #        their own: the char immediately before `open` in both is `.`, a
+    #        non-word character, so the bare `\bopen\s*\(` word-boundary
+    #        match already fires on `io.open(` and `codecs.open(` exactly as
+    #        it does on unqualified `open(`. An earlier revision added an
+    #        explicit `io\s*\.\s*open|codecs\s*\.\s*open` alternation here;
+    #        it was dead code (removed 2026-09) — TestIoCodecsOpen below
+    #        still proves the behavior holds without it.
     $openHits = [regex]::Matches($cmd, '\bopen\s*\(\s*')
     foreach ($oh in $openHits) {
         $arg1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
@@ -717,11 +859,17 @@ if (-not $matched) {
         }
     }
 }
-#    4b. pathlib.Path(...).write_text / write_bytes — scan directly for the
-#        method call pattern and test the captured filename.  Does not rely on
-#        the -c prefix so it works even when the Python code contains semicolons
-#        (which would stop a [^;|&\n]* lookahead before reaching the call).
+#    4b. pathlib.Path(...).write_text / write_bytes / open(mode) — scan
+#        directly for the method call pattern and test the captured filename.
+#        Does not rely on the -c prefix so it works even when the Python code
+#        contains semicolons (which would stop a [^;|&\n]* lookahead before
+#        reaching the call).
 #        e.g.  python -c "from pathlib import Path; Path('x.py').write_text('...')"
+#              python -c "from pathlib import Path; Path('x.py').open('w')"
+#              python -c "from pathlib import Path; Path('x.py').open(mode='w')"
+#        `.open()` with no args (or a bare 'r') defaults to read mode and is
+#        NOT a write — matches the same write-mode convention as every other
+#        branch (a mode containing w/a/x is a write; bare 'r' is not).
 if (-not $matched) {
     $plHits = [regex]::Matches($cmd, '\bPath\s*\(\s*')
     foreach ($ph in $plHits) {
@@ -731,11 +879,39 @@ if (-not $matched) {
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
         if ($j -ge $cmd.Length -or $cmd[$j] -ne ')') { continue }
         $j++
-        if ($cmd.Substring($j) -notmatch '^\s*\.\s*write_(?:text|bytes)\b') { continue }
-        if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {
-            $matched = $true
-            $reason = "pathlib.Path.write_text/write_bytes to '$($arg.Value)'"
-            break
+        $rest = $cmd.Substring($j)
+        if ($rest -match '^\s*\.\s*write_(?:text|bytes)\b') {
+            if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {
+                $matched = $true
+                $reason = "pathlib.Path.write_text/write_bytes to '$($arg.Value)'"
+                break
+            }
+            continue
+        }
+        $openM = [regex]::Match($rest, '^\s*\.\s*open\s*\(')
+        if ($openM.Success) {
+            $openParenIdx = $j + $openM.Length - 1
+            $bal = Get-BalancedParenText $cmd $openParenIdx
+            $modeVal = $null
+            if ($bal -and $bal.Text.Trim()) {
+                $posLit = Read-PyStringLiteral $bal.Text 0
+                if ($posLit) {
+                    $modeVal = $posLit.Value
+                } else {
+                    $kwm = [regex]::Match($bal.Text, "mode\s*=\s*")
+                    if ($kwm.Success) {
+                        $kwLit = Read-PyStringLiteral $bal.Text ($kwm.Index + $kwm.Length)
+                        if ($kwLit) { $modeVal = $kwLit.Value }
+                    }
+                }
+            }
+            if ($modeVal -and ($modeVal -match '[wax]')) {
+                if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {
+                    $matched = $true
+                    $reason = "pathlib.Path.open('$modeVal') targets '$($arg.Value)'"
+                    break
+                }
+            }
         }
     }
 }
@@ -904,6 +1080,251 @@ if (-not $matched) {
         ($cmd -match $blockExtPat)) {
         $matched = $true
         $reason = 'PowerShell here-string write to engine source'
+    }
+}
+
+# --- INVENTORY EXTENSION (2026-09): write idioms the parser never even
+# looked at, so their destination was never examined at all. The destination
+# PARSER (Read-ShellArgument / Get-ShellArgsInRange / Read-PyDestExpr /
+# Test-BlockedDest) is unchanged and reused as-is by every branch below —
+# this closes coverage GAPS in which write idioms are recognised, not
+# resolution gaps. See Test-IsCommandWord above: `dd`/`truncate`/`ln`/
+# `install` are treated as THIS hook's write idiom only in command-word
+# position, never as a subcommand argument of another program (`npm
+# install`, `pip install`, `apt-get install`, `cargo install`, ...) — a
+# package name is not a path.
+
+# 8. dd if=... of=DEST — the destination is the `of=` operand. `dd` without
+#    `of=` writes stdout and is not a file write, so no `of=` -> no match.
+#    e.g.  dd if=/dev/zero of=hydra_core/supervisor.py
+if (-not $matched) {
+    $ddHits = [regex]::Matches($cmd, '\bdd\b')
+    foreach ($dh in $ddHits) {
+        if (-not (Test-IsCommandWord $cmd $dh.Index)) { continue }
+        $argsList = Get-ShellArgsInRange $cmd ($dh.Index + $dh.Length) $cmd.Length
+        foreach ($t in $argsList) {
+            if ($t.Value -match '^of=(.*)$') {
+                if (Test-BlockedDest $Matches[1] $t.Start $t.HasExpansion) {
+                    $matched = $true
+                    $reason = "dd of= write to '$($Matches[1])'"
+                }
+                break
+            }
+        }
+        if ($matched) { break }
+    }
+}
+
+# 9. truncate [opts] FILE... — every non-option operand is a file it WRITES
+#    (truncates to a given size). `-s`/`--size` takes a value that is NOT a
+#    path; `-r`/`--reference` takes a reference file it READS, not writes —
+#    both flags' values (attached or as the next token) are consumed and
+#    skipped, never tested as a destination.
+#    e.g.  truncate -s 0 hydra_core/supervisor.py
+if (-not $matched) {
+    $truncHits = [regex]::Matches($cmd, '\btruncate\b')
+    foreach ($th in $truncHits) {
+        if (-not (Test-IsCommandWord $cmd $th.Index)) { continue }
+        $argsList = Get-ShellArgsInRange $cmd ($th.Index + $th.Length) $cmd.Length
+        $skipNext = $false
+        foreach ($t in $argsList) {
+            if ($skipNext) { $skipNext = $false; continue }
+            if ($t.Value -match '^-s(.*)$') { if (-not $Matches[1]) { $skipNext = $true }; continue }
+            if ($t.Value -match '^--size(?:=.*)?$') { if ($t.Value -eq '--size') { $skipNext = $true }; continue }
+            if ($t.Value -match '^-r(.*)$') { if (-not $Matches[1]) { $skipNext = $true }; continue }
+            if ($t.Value -match '^--reference(?:=.*)?$') { if ($t.Value -eq '--reference') { $skipNext = $true }; continue }
+            if ($t.Value -match '^-') { continue }
+            if (Test-BlockedDest $t.Value $t.Start $t.HasExpansion) {
+                $matched = $true
+                $reason = "truncate write to '$($t.Value)'"
+                break
+            }
+        }
+        if ($matched) { break }
+    }
+}
+
+# 10. ln [opts] TARGET LINKNAME  /  ln [opts] TARGET... DIRECTORY — the
+#     destination is the LINK (or the directory the links land in), never the
+#     TARGET being linked to: reading a protected path is not a write. The
+#     last operand is the destination unless `-t DIR` / `--target-directory=
+#     DIR` names it explicitly. Every other leading-dash token (-s, -f, -n,
+#     -v, -b, ...) is a value-less flag and is skipped.
+#     e.g.  ln -sf a hydra_core/supervisor.py        (creates the link there)
+#           ln -s hydra_core/supervisor.py mylink    (only READS the target — allowed)
+if (-not $matched) {
+    $lnHits = [regex]::Matches($cmd, '\bln\b')
+    foreach ($lh in $lnHits) {
+        if (-not (Test-IsCommandWord $cmd $lh.Index)) { continue }
+        $argsList = Get-ShellArgsInRange $cmd ($lh.Index + $lh.Length) $cmd.Length
+        $targetDirTok = $null
+        $operands = New-Object System.Collections.Generic.List[object]
+        $awaitingTargetDir = $false
+        foreach ($t in $argsList) {
+            if ($awaitingTargetDir) {
+                $targetDirTok = [pscustomobject]@{ Value = $t.Value; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                $awaitingTargetDir = $false
+                continue
+            }
+            if ($t.Value -match '^-t(.*)$') {
+                if ($Matches[1]) {
+                    $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                } else { $awaitingTargetDir = $true }
+                continue
+            }
+            if ($t.Value -match '^--target-directory=(.*)$') {
+                $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                continue
+            }
+            if ($t.Value -match '^-') { continue }
+            [void]$operands.Add($t)
+        }
+        if ($targetDirTok) {
+            # Every operand is a TARGET being linked TO (read, not written);
+            # the real write is DIR joined with each operand's basename —
+            # `ln -t hydra_core supervisor.py` writes `hydra_core/supervisor.py`.
+            foreach ($src in $operands) {
+                $joined = "$($targetDirTok.Value)/$(Get-ShellBasename $src.Value)"
+                $expFlag = $targetDirTok.HasExpansion -or $src.HasExpansion
+                if (Test-BlockedDest $joined $targetDirTok.Start $expFlag) {
+                    $matched = $true
+                    $reason = "ln creates link at '$joined'"
+                    break
+                }
+            }
+        } elseif ($operands.Count -ge 2) {
+            $destTok = $operands[$operands.Count - 1]
+            if (Test-BlockedDest $destTok.Value $destTok.Start $destTok.HasExpansion) {
+                $matched = $true
+                $reason = "ln creates link at '$($destTok.Value)'"
+            }
+        }
+        if ($matched) { break }
+    }
+}
+
+# 11. install [opts] SOURCE... DEST — the coreutils file-copying form writes
+#     its last operand, or the `-t DIR` / `--target-directory=DIR` directory.
+#     `-m`/`-o`/`-g` (mode/owner/group) take a value that is NOT a path and is
+#     consumed and skipped, attached or as the next token, short or long form.
+#     `install` is OVERWHELMINGLY a package-manager verb (npm/pip/apt/cargo/
+#     go/gem/composer/choco/winget/brew install ...) — Test-IsCommandWord is
+#     the load-bearing guard here: it fires only when `install` is the
+#     command word itself, never a subcommand argument of another program, so
+#     `npm install express`, `pip install ruamel.yaml`, `go install
+#     example.com/cmd/tool@latest`, etc. are never even considered.
+#     e.g.  install /dev/null hydra_core/supervisor.py
+if (-not $matched) {
+    $instHits = [regex]::Matches($cmd, '\binstall\b')
+    foreach ($ih in $instHits) {
+        if (-not (Test-IsCommandWord $cmd $ih.Index)) { continue }
+        $argsList = Get-ShellArgsInRange $cmd ($ih.Index + $ih.Length) $cmd.Length
+        $targetDirTok = $null
+        $operands = New-Object System.Collections.Generic.List[object]
+        $skipNext = $false
+        $awaitingTargetDir = $false
+        foreach ($t in $argsList) {
+            if ($awaitingTargetDir) {
+                $targetDirTok = [pscustomobject]@{ Value = $t.Value; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                $awaitingTargetDir = $false
+                continue
+            }
+            if ($skipNext) { $skipNext = $false; continue }
+            if ($t.Value -match '^-t(.*)$') {
+                if ($Matches[1]) {
+                    $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                } else { $awaitingTargetDir = $true }
+                continue
+            }
+            if ($t.Value -match '^--target-directory=(.*)$') {
+                $targetDirTok = [pscustomobject]@{ Value = $Matches[1]; Start = $t.Start; HasExpansion = $t.HasExpansion }
+                continue
+            }
+            if ($t.Value -match '^-[mog](.*)$') { if (-not $Matches[1]) { $skipNext = $true }; continue }
+            if ($t.Value -match '^--(?:mode|owner|group)(?:=.*)?$') {
+                if ($t.Value -notmatch '=') { $skipNext = $true }
+                continue
+            }
+            if ($t.Value -match '^-') { continue }
+            [void]$operands.Add($t)
+        }
+        if ($targetDirTok) {
+            # Every operand is a SOURCE being installed (read); the real write
+            # is DIR joined with each source's basename — `install a.py -t
+            # hydra_core` writes `hydra_core/a.py`, never `hydra_core` itself.
+            foreach ($src in $operands) {
+                $joined = "$($targetDirTok.Value)/$(Get-ShellBasename $src.Value)"
+                $expFlag = $targetDirTok.HasExpansion -or $src.HasExpansion
+                if (Test-BlockedDest $joined $targetDirTok.Start $expFlag) {
+                    $matched = $true
+                    $reason = "install write to '$joined'"
+                    break
+                }
+            }
+        } elseif ($operands.Count -ge 2) {
+            $destTok = $operands[$operands.Count - 1]
+            if (Test-BlockedDest $destTok.Value $destTok.Start $destTok.HasExpansion) {
+                $matched = $true
+                $reason = "install write to '$($destTok.Value)'"
+            }
+        }
+        if ($matched) { break }
+    }
+}
+
+# 12. python -c os.replace(src, dst) / os.rename(src, dst) — destination is
+#     the SECOND argument; the first (src) is only read.
+if (-not $matched) {
+    $osrHits = [regex]::Matches($cmd, '\bos\s*\.\s*(?:replace|rename)\s*\(\s*')
+    foreach ($oh in $osrHits) {
+        $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
+        if (-not $a1) { continue }
+        $j = $a1.End
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }
+        $j++
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        $a2 = Read-PyDestExpr $cmd $j
+        if ($a2 -and (Test-BlockedDest $a2.Value $a2.Start (-not $a2.Resolvable))) {
+            $matched = $true
+            $reason = "python os.replace/os.rename to '$($a2.Value)'"
+            break
+        }
+    }
+}
+
+# 13. python -c os.symlink(src, dst) / os.link(src, dst) — destination is the
+#     SECOND argument (the new link); the first (src/target) is only read.
+if (-not $matched) {
+    $oslHits = [regex]::Matches($cmd, '\bos\s*\.\s*(?:symlink|link)\s*\(\s*')
+    foreach ($oh in $oslHits) {
+        $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
+        if (-not $a1) { continue }
+        $j = $a1.End
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }
+        $j++
+        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
+        $a2 = Read-PyDestExpr $cmd $j
+        if ($a2 -and (Test-BlockedDest $a2.Value $a2.Start (-not $a2.Resolvable))) {
+            $matched = $true
+            $reason = "python os.symlink/os.link to '$($a2.Value)'"
+            break
+        }
+    }
+}
+
+# 14. python -c os.truncate(path, size) — destination is the FIRST argument.
+if (-not $matched) {
+    $otHits = [regex]::Matches($cmd, '\bos\s*\.\s*truncate\s*\(\s*')
+    foreach ($oh in $otHits) {
+        $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
+        if (-not $a1) { continue }
+        if (Test-BlockedDest $a1.Value $a1.Start (-not $a1.Resolvable)) {
+            $matched = $true
+            $reason = "python os.truncate targets '$($a1.Value)'"
+            break
+        }
     }
 }
 
