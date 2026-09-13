@@ -343,6 +343,82 @@ function _bwEffCwdAt([int]$atIndex) {
 # let a fragmented open()/Path()/shutil argument dodge the old single-quote-
 # pair regexes entirely (the regex just failed to match, so the call wasn't
 # recognised as a write idiom at all).
+
+# --- QUOTE-AWARE STATEMENT BOUNDARIES (security hardening, 2026-09, revision) ---
+# ROOT CAUSE this closes: Test-IsCommandWord's backward boundary scan (below)
+# and the two brace-group predicates inspected raw characters with no idea
+# whether a `;`/`&`/`|`/newline/`(`/`)`/`{`/`}` sat inside a quoted string.
+# `echo '{ install x hydra_core/supervisor.py; }'` — an ordinary quoted
+# literal, not a grouping attempt — read the quoted `{`/`}`/`;` as real shell
+# syntax and treated `install` as a command-position word: a FALSE POSITIVE
+# introduced by the grouping commit, for both braces and parens, in both
+# quote styles.
+#
+# Get-UnquotedMask reuses the exact same single-quote / double-quote /
+# backslash-escape state machine Read-ShellArgument and Remove-LineContinuations
+# already implement (this is the file's third such tracker's worth of logic,
+# so it is written ONCE here and shared rather than re-derived) — a forward
+# scan over the whole command that marks, for every index, whether that
+# character sits in real (unquoted, unescaped) shell syntax. Test-IsUnquotedAt
+# is the point lookup callers use. The rule is applied uniformly to EVERY
+# statement-boundary character, not only the new grouping ones — so a quoted
+# `;` or `|` (e.g. inside an echoed string or a commit message) is also, and
+# was already incorrectly, not a real separator; that pre-existing gap is
+# fixed as a side effect of fixing the grouping regression.
+function Get-UnquotedMask {
+    param([string]$s)
+    if (-not $script:_bwQuoteMaskCache) { $script:_bwQuoteMaskCache = @{} }
+    if ($script:_bwQuoteMaskCache.ContainsKey($s)) { return $script:_bwQuoteMaskCache[$s] }
+    $n = $s.Length
+    $mask = New-Object 'bool[]' $n
+    $inSingle = $false
+    $inDouble = $false
+    $i = 0
+    while ($i -lt $n) {
+        $c = $s[$i]
+        if ($inSingle) {
+            $mask[$i] = $false
+            if ($c -eq "'") { $inSingle = $false }
+            $i++
+            continue
+        }
+        if ($c -eq '\') {
+            # Outside quotes a backslash escapes ANY next character; inside
+            # double quotes only the POSIX set ("\$`) is a real escape and any
+            # other backslash is just a literal backslash — mirroring
+            # Read-ShellArgument's own escape handling exactly so this mask
+            # agrees with how the destination reader already treats the text.
+            if ($inDouble -and (($i + 1) -ge $n -or
+                    -not ($s[$i + 1] -eq '"' -or $s[$i + 1] -eq '\' -or
+                          $s[$i + 1] -eq '$' -or $s[$i + 1] -eq '`'))) {
+                $mask[$i] = $false
+                $i++
+                continue
+            }
+            $mask[$i] = $false
+            $i++
+            if ($i -lt $n) { $mask[$i] = $false; $i++ }
+            continue
+        }
+        if ($c -eq "'" -and -not $inDouble) { $inSingle = $true; $mask[$i] = $false; $i++; continue }
+        if ($c -eq '"') { $inDouble = -not $inDouble; $mask[$i] = $false; $i++; continue }
+        $mask[$i] = (-not $inDouble)
+        $i++
+    }
+    $script:_bwQuoteMaskCache[$s] = $mask
+    return $mask
+}
+
+function Test-IsUnquotedAt {
+    # True when $s[$idx] sits in real (unquoted, unescaped) shell syntax —
+    # i.e. it is eligible to be interpreted as a statement-boundary character
+    # at all. Out-of-range indices are treated as unquoted (they carry no
+    # quote text to be inside of).
+    param([string]$s, [int]$idx)
+    if ($idx -lt 0 -or $idx -ge $s.Length) { return $true }
+    return (Get-UnquotedMask $s)[$idx]
+}
+
 function Test-IsGroupCloseBrace {
     # A bare `}` closes a shell brace group ONLY per shell grammar: it must be
     # preceded by whitespace, `;`, or a newline (a brace group is written
@@ -358,6 +434,7 @@ function Test-IsGroupCloseBrace {
     # the destination silently stopped being recognised as unresolvable.
     param([string]$s, [int]$idx)
     if ($idx -le 0 -or $idx -ge $s.Length -or $s[$idx] -ne '}') { return $false }
+    if (-not (Test-IsUnquotedAt $s $idx)) { return $false }
     $prev = $s[$idx - 1]
     return ($prev -eq ' ' -or $prev -eq "`t" -or $prev -eq ';' -or $prev -eq "`n" -or $prev -eq "`r")
 }
@@ -372,6 +449,7 @@ function Test-IsGroupOpenBrace {
     # treated as a statement boundary.
     param([string]$s, [int]$idx)
     if ($idx -lt 0 -or $idx -ge $s.Length -or $s[$idx] -ne '{') { return $false }
+    if (-not (Test-IsUnquotedAt $s $idx)) { return $false }
     $nextIdx = $idx + 1
     if ($nextIdx -ge $s.Length) { return $false }
     $next = $s[$nextIdx]
@@ -556,13 +634,23 @@ function Test-IsCommandWord {
     # negative across all four discriminated idioms (install/dd/truncate/ln),
     # including nested groups and grouping combined with a wrapper prefix
     # (`( sudo install ... )`).
+    #
+    # QUOTE-AWARE (revision, 2026-09): every character in this boundary set —
+    # not just the brace-group delimiters, which already route through
+    # Test-IsGroupOpenBrace/CloseBrace — is a real statement boundary ONLY in
+    # UNQUOTED shell syntax (Test-IsUnquotedAt). A bare `(`/`)`/`;`/`&`/`|`/
+    # newline inside a single- or double-quoted literal (e.g. the `(`/`)` in
+    # `echo '( install x <path> )'`, or a quoted `;`/`|` in an echoed string
+    # or commit message) is ordinary literal text, not shell grammar, and
+    # must not end or begin a statement.
     $runStart = 0
     $k = $boundary - 1
     while ($k -ge 0) {
         $ck = $s[$k]
-        if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq "`n" -or $ck -eq "`r" -or
-            $ck -eq '(' -or $ck -eq ')' -or
-            (Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }
+        if ((Test-IsUnquotedAt $s $k) -and (
+                $ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq "`n" -or $ck -eq "`r" -or
+                $ck -eq '(' -or $ck -eq ')')) { $runStart = $k + 1; break }
+        if ((Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }
         $k--
     }
 

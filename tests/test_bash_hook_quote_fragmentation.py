@@ -2106,14 +2106,15 @@ class TestEighthRevisionPropertyNotInstance:
         self, project_dir: Path, tmp_path: Path
     ):
         needle = (
-            "if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\" -or\n"
-            "            $ck -eq '(' -or $ck -eq ')' -or\n"
-            "            (Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }"
+            "        if ((Test-IsUnquotedAt $s $k) -and (\n"
+            "                $ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\" -or\n"
+            "                $ck -eq '(' -or $ck -eq ')')) { $runStart = $k + 1; break }\n"
+            "        if ((Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }"
         )
         patched_hook = self._patched_hook(
             tmp_path,
             needle,
-            "if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\") { $runStart = $k + 1; break }",
+            "        if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\") { $runStart = $k + 1; break }",
         )
         result = self._run(
             patched_hook, f"( install a {BLOCKED_REL} )", cwd=project_dir, project_dir=project_dir
@@ -2190,6 +2191,133 @@ class TestBraceGroupQualificationPropertyNotInstance:
             f"property check failed: removing the brace-group qualification "
             f"should have reopened the xargs -I{{}} placeholder bypass, but "
             f"rc={result.returncode} stderr={result.stderr}"
+        )
+
+
+class TestQuoteAwareGroupingFalsePositives:
+    """TENTH REVISION (2026-09) — the grouping-delimiter boundary added in the
+    eighth revision inspected raw `(`/`)`/`{`/`}`/`;`/`|` characters with no
+    idea whether they sat inside a quoted string. An ordinary quoted literal
+    that merely CONTAINS grouping-shaped or separator-shaped text — a
+    commit message, an echoed string — was misread as real shell grouping
+    and the word inside it scored as a command position. All five shapes
+    below are NEW false positives this branch introduced (measured 0 on
+    `main@29dbe89`, 2 on the pre-fix revision of this branch), affecting both
+    braces and parentheses in both quote styles. The fix makes the boundary
+    scan and the two brace-group predicates quote-aware, reusing the same
+    single/double/escape quote tracker `Read-ShellArgument` already
+    implements (`Test-IsUnquotedAt` / `Get-UnquotedMask`) rather than adding
+    a second, independent notion of "am I inside quotes"."""
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"echo '{{ install x {BLOCKED_REL}; }}'",
+            f'echo "{{ install x {BLOCKED_REL}; }}"',
+            f"echo '( install x {BLOCKED_REL} )'",
+            f'echo "( install x {BLOCKED_REL} )"',
+            f"git commit -m 'fix {{ install x {BLOCKED_REL}; }}'",
+            f'git commit -m "fix {{ install x {BLOCKED_REL}; }}"',
+        ],
+    )
+    def test_quoted_grouping_text_stays_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # A quoted `;` or `|` was already misread as a real statement
+            # separator BEFORE the grouping commit — the same
+            # Test-IsUnquotedAt fix corrects this pre-existing gap as a side
+            # effect, since the rule is now applied uniformly to every
+            # boundary character rather than only the new grouping ones.
+            f"echo 'a; install x {BLOCKED_REL}'",
+            f"echo 'a| install x {BLOCKED_REL}'",
+            f"git commit -m 'note: a; install x {BLOCKED_REL}'",
+            f"git commit -m 'note: a| install x {BLOCKED_REL}'",
+        ],
+    )
+    def test_quoted_separator_stays_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"( install a {BLOCKED_REL} )",
+            f"{{ install a {BLOCKED_REL}; }}",
+            f"(install a {BLOCKED_REL})",
+            f"( ( install a {BLOCKED_REL} ) )",
+            f"true && ( install a {BLOCKED_REL} )",
+            f"true && {{ install a {BLOCKED_REL}; }}",
+            f"( dd if=/dev/zero of={BLOCKED_REL} )",
+            f"{{ truncate -s 0 {BLOCKED_REL}; }}",
+            f"( ln -sf a {BLOCKED_REL} )",
+            f"( sudo install a {BLOCKED_REL} )",
+            f"{{ env FOO=1 install a {BLOCKED_REL}; }}",
+        ],
+    )
+    def test_real_grouping_still_blocked(self, project_dir: Path, cmd: str):
+        """Quote-awareness must not weaken the eighth revision's grouping
+        detection: every shape it closed (plus the `&&`-brace variant) must
+        still block."""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"{cmd!r}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+
+class TestTenthRevisionPropertyNotInstance:
+    """Prove the quote-awareness added to the boundary scan is load-bearing:
+    patch out exactly that addition in a temporary copy of the hook (falling
+    back to the eighth revision's unqualified boundary scan) and confirm
+    `echo '{ install x <protected>; }'` returns to exit 2 — the false
+    positive this revision fixes."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_quote_awareness_reintroduces_the_false_positive(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        # This exact line appears once in each of Test-IsGroupOpenBrace and
+        # Test-IsGroupCloseBrace (verified byte-identical in both). `str.replace`
+        # removes it from BOTH, which is what is actually load-bearing for
+        # `echo '{ install x <protected>; }'`: the backward scan meets the
+        # quoted `{` before it ever reaches the quoted `;`, so it is the brace
+        # predicates' own quote check — not the raw `;`/`(`/`)` check also
+        # added this revision — that must be patched out to reproduce the
+        # pre-fix false positive.
+        needle = "    if (-not (Test-IsUnquotedAt $s $idx)) { return $false }"
+        assert (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8").count(needle) == 2, (
+            "expected exactly two occurrences (one per brace predicate); test is stale"
+        )
+        patched_hook = self._patched_hook(tmp_path, needle, "")
+        cmd = f"echo '{{ install x {BLOCKED_REL}; }}'"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, (
+            f"property check failed: removing the quote-awareness from the "
+            f"brace-group predicates should have reintroduced the false "
+            f"positive, but rc={result.returncode} stderr={result.stderr}"
         )
 
 
