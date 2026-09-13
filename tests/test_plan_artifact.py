@@ -428,16 +428,14 @@ def test_write_repo_artifact_rejects_symlinked_subtree_pointing_outside_allowed_
 # --------------------------------------------------------------------------- #
 
 
-def test_write_repo_artifact_allowed_root_non_string_entry_current_behavior(tmp_path):
-    # Not one of this revision's two fixes (relative-validation and
-    # refusal-test hardening) -- documented here as a measured pre-existing
-    # gap for a follow-up. A non-string allowed_roots entry is NOT refused
-    # with ArtifactStoreError: it crashes with a raw TypeError out of the
-    # `root / allowed` join, before any of the allowed_roots guards run.
-    # allowed_roots is caller-controlled but every call site in this
-    # codebase today passes a literal tuple of strings.
-    with pytest.raises(TypeError):
+def test_write_repo_artifact_allowed_root_non_string_entry_is_refused(tmp_path):
+    # A non-string allowed_roots entry (an int, a Path, None, ...) is now
+    # validated -- and refused with ArtifactStoreError -- before the
+    # `root / allowed` join that used to crash with a raw TypeError.
+    target = tmp_path / "docs" / "plans" / "x.html"
+    with pytest.raises(ArtifactStoreError):
         write_repo_artifact(tmp_path, "docs/plans/x.html", "no", allowed_roots=(123,))
+    assert not target.exists()
 
 
 def test_write_repo_artifact_allowed_root_very_long_entry_is_refused(tmp_path):
@@ -509,6 +507,82 @@ def test_write_repo_artifact_case_different_relative_spelling_measured_behavior(
     written = list((tmp_path / "docs").rglob("x.html"))
     assert len(written) == 1
     assert written[0].read_text(encoding="utf-8") == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# write_repo_artifact -- the error contract is now TOTAL: every malformed    #
+# input raises exactly ArtifactStoreError, never OSError/ValueError/         #
+# TypeError/FileNotFoundError/anything else, and none of them touch disk    #
+# --------------------------------------------------------------------------- #
+
+_MALFORMED_WRITE_REPO_ARTIFACT_CASES = [
+    ("control-nul", {"relative": "docs/plans/x\x00.html"}),
+    ("control-newline", {"relative": "docs/plans/x\n.html"}),
+    ("control-cr", {"relative": "docs/plans/x\r.html"}),
+    ("control-tab", {"relative": "docs/plans/x\t.html"}),
+    ("control-c1", {"relative": "docs/plans/x\x85.html"}),
+    ("empty-relative", {"relative": ""}),
+    ("whitespace-only-relative", {"relative": "   "}),
+    ("non-string-relative", {"relative": 123}),
+    ("absolute-posix", {"relative": "/etc/plans/x.html"}),
+    ("absolute-drive", {"relative": "C:\\Windows\\x.html"}),
+    ("drive-relative", {"relative": "C:x.html"}),
+    ("unc", {"relative": "\\\\server\\share\\x.html"}),
+    ("extended-length", {"relative": "\\\\?\\C:\\x.html"}),
+    ("upward-traversal", {"relative": "../../escape.html"}),
+    ("over-long-relative", {"relative": "docs/plans/" + "a" * 2000 + ".html"}),
+    (
+        "over-long-single-component",
+        {"relative": "docs/plans/" + "a" * 300 + ".html"},
+    ),
+    ("allowed-roots-non-string-entry", {"allowed_roots": (123,)}),
+    ("allowed-roots-path-entry", {"allowed_roots": (Path("docs/plans"),)}),
+    ("allowed-roots-none", {"allowed_roots": None}),
+    ("allowed-roots-bare-string", {"allowed_roots": "docs/plans"}),
+    ("allowed-roots-is-repo-root", {"allowed_roots": (".",)}),
+    ("blocked-suffix", {"relative": "docs/plans/x.png"}),
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [kwargs for _, kwargs in _MALFORMED_WRITE_REPO_ARTIFACT_CASES],
+    ids=[case_id for case_id, _ in _MALFORMED_WRITE_REPO_ARTIFACT_CASES],
+)
+def test_write_repo_artifact_error_contract_is_total(tmp_path, kwargs):
+    # The exception type is asserted EXACTLY as ArtifactStoreError -- not any
+    # of its plausible platform-level substitutes -- for every malformed
+    # input this writer must refuse. Type() equality (not isinstance) also
+    # guards against a bare `except OSError: raise ArtifactStoreError(...)`
+    # accidentally catching something that happens to subclass OSError but
+    # was never meant to be swallowed here; ArtifactStoreError itself
+    # subclasses ValueError, so isinstance alone would not distinguish it
+    # from a plain ValueError escaping some other code path.
+    before = set(tmp_path.rglob("*"))
+    call_kwargs = {"relative": "docs/plans/x.html", "content": "no"}
+    call_kwargs.update(kwargs)
+    with pytest.raises(ArtifactStoreError) as excinfo:
+        write_repo_artifact(tmp_path, **call_kwargs)
+    assert type(excinfo.value) is ArtifactStoreError
+    after = set(tmp_path.rglob("*"))
+    assert after == before, "no file or directory may be created on refusal"
+
+
+def test_write_repo_artifact_still_succeeds_default_subtree_multi_suffix(tmp_path):
+    write_repo_artifact(tmp_path, "docs/plans/plan.html", "<h1>hi</h1>")
+    write_repo_artifact(tmp_path, "docs/plans/plan.json", "{}")
+    write_repo_artifact(tmp_path, "docs/plans/plan.txt", "note")
+    assert (tmp_path / "docs" / "plans" / "plan.html").read_text(encoding="utf-8") == "<h1>hi</h1>"
+    assert (tmp_path / "docs" / "plans" / "plan.json").read_text(encoding="utf-8") == "{}"
+    assert (tmp_path / "docs" / "plans" / "plan.txt").read_text(encoding="utf-8") == "note"
+
+
+def test_write_repo_artifact_still_succeeds_explicit_different_subtree(tmp_path):
+    ref = write_repo_artifact(
+        tmp_path, "hydra_core/note.txt", "hi", allowed_roots=("hydra_core",)
+    )
+    assert (tmp_path / "hydra_core" / "note.txt").read_text(encoding="utf-8") == "hi"
+    assert ref.tier == "episodic"
 
 
 # --------------------------------------------------------------------------- #

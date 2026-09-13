@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ntpath
+import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from .native_packs import native_pack, native_pack_root
@@ -22,6 +24,17 @@ class ArtifactStoreError(ValueError):
 _CONTROL_CHARS = frozenset(chr(c) for c in range(0x00, 0x20)) | frozenset(
     chr(c) for c in range(0x7F, 0xA0)
 )
+
+# Explicit, conservative bounds on `relative`, checked before any Path is
+# constructed. Without these, whether an over-long name is refused depends
+# entirely on the platform's own path-length ceiling (Windows MAX_PATH is
+# ~260 characters and raises a raw FileNotFoundError deep in the write call);
+# on a filesystem with a longer limit -- or a differently-configured Windows
+# host with long-path support enabled -- the same write would silently
+# succeed. Pinning our own, smaller bound makes the refusal this module's
+# decision rather than an accident of the host filesystem.
+_MAX_RELATIVE_LENGTH = 1024
+_MAX_COMPONENT_LENGTH = 255  # the conventional single-component limit (NTFS, ext4, APFS)
 
 
 def _validate_relative(relative: object) -> str:
@@ -53,7 +66,50 @@ def _validate_relative(relative: object) -> str:
         raise ArtifactStoreError(
             f"relative {relative!r} must be repo-relative, not absolute"
         )
+    if len(relative) > _MAX_RELATIVE_LENGTH:
+        raise ArtifactStoreError(
+            f"relative path exceeds {_MAX_RELATIVE_LENGTH} characters "
+            f"({len(relative)})"
+        )
+    for component in re.split(r"[\\/]+", relative):
+        if len(component) > _MAX_COMPONENT_LENGTH:
+            raise ArtifactStoreError(
+                f"relative path component {component!r} exceeds "
+                f"{_MAX_COMPONENT_LENGTH} characters ({len(component)})"
+            )
     return relative
+
+
+def _validate_allowed_roots(allowed_roots: object) -> tuple[str, ...]:
+    """Syntactically validate ``allowed_roots`` *before* any ``Path`` is built.
+
+    ``root / allowed`` -- the very first thing the old code did with each
+    entry -- crashes with a raw ``TypeError`` for a non-string entry (an
+    ``int``, ``None``, or a ``pathlib.Path``), pre-empting every downstream
+    guard. A ``Path`` entry is an especially easy mistake: it is an
+    idiomatic, non-hostile way to spell a path in Python, and it deserves a
+    clear ``ArtifactStoreError`` naming the expected type, not a crash.
+    ``allowed_roots`` is documented as strings; this module does not accept
+    a ``Path`` here (unlike accepting one would, silently, for every future
+    caller) -- it is refused with a message that says so explicitly.
+
+    A bare string is also refused: ``allowed_roots="docs/plans"`` looks like
+    a single-entry shorthand but iterates character-by-character, which is
+    never what a caller intends.
+    """
+    if isinstance(allowed_roots, str) or not isinstance(allowed_roots, Iterable):
+        raise ArtifactStoreError(
+            "allowed_roots must be a non-string iterable of strings, got "
+            f"{allowed_roots!r} of type {type(allowed_roots).__name__}"
+        )
+    materialized = tuple(allowed_roots)
+    for entry in materialized:
+        if not isinstance(entry, str):
+            raise ArtifactStoreError(
+                "allowed_roots entries must be strings, got "
+                f"{entry!r} of type {type(entry).__name__}"
+            )
+    return materialized
 
 
 def write_native_artifact(slug: str, relative: str, content: str) -> MemoryRef:
@@ -160,10 +216,20 @@ def write_repo_artifact(
 
     ``relative`` is repo-relative and control-character-free: it is
     validated syntactically (non-empty, not whitespace-only, no absolute
-    spelling, no C0/C1 control character) before any path is constructed or
-    any filesystem call is made -- see :func:`_validate_relative`.
+    spelling, no C0/C1 control character, within the length bounds) before
+    any path is constructed or any filesystem call is made -- see
+    :func:`_validate_relative`. ``allowed_roots`` is validated the same way,
+    before it is ever joined onto a path -- see :func:`_validate_allowed_roots`.
+
+    Every remaining filesystem operation (directory creation, the write
+    itself) is wrapped so that whatever the underlying OS does -- a
+    too-long full path, a permissions error, any other ``OSError`` -- is
+    re-raised as :class:`ArtifactStoreError` with the original chained as
+    the cause. The contract is total: a caller of this writer sees exactly
+    one exception type for every rejection, never a platform-specific one.
     """
     _validate_relative(relative)
+    allowed_roots = _validate_allowed_roots(allowed_roots)
     root = Path(repo_root).resolve()
     candidate = (root / relative).resolve()
     if not candidate.is_relative_to(root):
@@ -217,7 +283,20 @@ def write_repo_artifact(
     if candidate.suffix.lower() not in allowed_suffixes:
         raise ArtifactStoreError("repo artifact suffix not in allow-list")
 
-    candidate.parent.mkdir(parents=True, exist_ok=True)
-    candidate.write_text(content, encoding="utf-8")
+    # Every guard above is this module's own opinion, checked before any
+    # filesystem call. What remains -- directory creation and the write --
+    # is still at the mercy of the OS (a too-long full path even after the
+    # relative-length bound above, since repo_root itself can be long; a
+    # permissions error; a full disk). Whatever OSError the platform raises
+    # here is re-raised as ArtifactStoreError so the writer's error contract
+    # stays total regardless of platform, with the original exception
+    # chained as the cause and the target path named in the message.
+    try:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactStoreError(
+            f"failed to write repo artifact at {candidate}: {exc}"
+        ) from exc
     rel = candidate.relative_to(root).as_posix()
     return MemoryRef(tier="episodic", key=f"repo:artifact:{rel}", summary=rel)
