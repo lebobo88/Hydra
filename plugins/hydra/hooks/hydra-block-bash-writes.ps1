@@ -1119,6 +1119,42 @@ function Test-BlockedDest {
     return [bool]($norm -match $blockExtPat)
 }
 
+# Several branches below (python -c shutil, sed -i, PowerShell here-string)
+# keep a WHOLE-COMMAND regex heuristic as a fallback OR alongside their
+# primary destination-token parse: "a blocked extension appears anywhere in
+# the raw text + the write idiom's own marker (shutil.copy, -i, Set-Content)
+# is present". That raw-text scan never consulted Test-BlockedDest, so it
+# never saw the docs/plans .html carve-out either — a properly-formed,
+# carve-out-eligible destination (docs/plans/x.html) still tripped it purely
+# because ".html" appears in the command text, disagreeing with every branch
+# that actually resolves its destination through Test-BlockedDest.
+#
+# This helper does NOT re-derive the carve-out itself (a first attempt did,
+# by pattern-matching '\docs\plans\' onto the raw text, and that only ever
+# recognised an ABSOLUTE destination — a relative `docs/plans/p.html`, which
+# every OTHER branch resolves correctly by joining it against the command's
+# cwd, still tripped this fallback). It instead reuses Test-BlockedDest —
+# the SAME resolution (cwd-join for a relative path, worktree-root check,
+# allow-dir fragments, then the docs/plans carve-out) every structured branch
+# already applies — passing the match's own index so `cd`-tracking
+# (_bwEffCwdAt) still applies. That keeps exactly one notion of "where does
+# this destination resolve to and is it carved out" in this file.
+function Test-CmdHasBlockedExtOutsidePlansCarveout {
+    param([string]$cmdText)
+    $extMatches = [regex]::Matches($cmdText, $blockExtPat)
+    foreach ($em in $extMatches) {
+        # Walk back to the start of the unbroken path/word token (stop at
+        # whitespace/quotes/shell metacharacters) — the same boundary
+        # Read-ShellArgument itself treats as an argument edge — so
+        # Test-BlockedDest sees the whole path, not just the extension.
+        $j = $em.Index
+        while ($j -gt 0 -and $cmdText[$j - 1] -notmatch '[\s;|&<>''"]') { $j-- }
+        $pathish = $cmdText.Substring($j, $em.Index - $j) + $em.Value
+        if (Test-BlockedDest $pathish $em.Index $false) { return $true }
+    }
+    return $false
+}
+
 $matched = $false
 $reason  = ''
 
@@ -1372,7 +1408,7 @@ if (-not $matched) {
     }
     if (-not $matched) {
         if (($cmd -match 'python[0-9.]*\s[^;|&\n]*-c\s[^;|&\n]*\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\b') -and
-            ($cmd -match $blockExtPat)) {
+            (Test-CmdHasBlockedExtOutsidePlansCarveout $cmd)) {
             $matched = $true
             $reason  = 'python -c shutil write to engine source'
         }
@@ -1418,7 +1454,7 @@ if (-not $matched) {
         if ($matched) { break }
     }
     if (-not $matched) {
-        if (($cmd -match '\bsed\s+[^;|&\n]*-i') -and ($cmd -match $blockExtPat)) {
+        if (($cmd -match '\bsed\s+[^;|&\n]*-i') -and (Test-CmdHasBlockedExtOutsidePlansCarveout $cmd)) {
             $matched = $true
             $reason  = 'sed -i (in-place edit of engine source)'
         }
@@ -1508,7 +1544,7 @@ if (-not $matched) {
 if (-not $matched) {
     if (($cmd -match "@'|@`"") -and
         ($cmd -match '\b(?:Set-Content|Out-File)\b') -and
-        ($cmd -match $blockExtPat)) {
+        (Test-CmdHasBlockedExtOutsidePlansCarveout $cmd)) {
         $matched = $true
         $reason = 'PowerShell here-string write to engine source'
     }
