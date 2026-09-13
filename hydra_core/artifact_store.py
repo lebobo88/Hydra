@@ -1,6 +1,7 @@
 """Safe local persistence for native Claude Code squad artifacts."""
 from __future__ import annotations
 
+import ntpath
 from pathlib import Path
 
 from .native_packs import native_pack, native_pack_root
@@ -98,12 +99,16 @@ def write_repo_artifact(
     that would turn this into exactly the code-modification primitive this
     module exists to avoid.
 
-    Guards, in order: the resolved candidate path must stay under
+    Guards, in order: every ``allowed_roots`` entry must be repo-relative
+    (never absolute -- POSIX-absolute, Windows drive-absolute, drive-relative
+    root, or UNC -- since an absolute entry makes "relative to repo_root"
+    ambiguous) and must resolve strictly *inside* ``repo_root`` -- not to
+    ``repo_root`` itself, which would erase the subtree boundary this
+    function exists to enforce; the resolved candidate path must stay under
     ``repo_root``; it must additionally resolve under at least one of
-    ``allowed_roots`` (each interpreted relative to ``repo_root``); and its
-    suffix must be one of ``allowed_suffixes``. Any violation raises
-    :class:`ArtifactStoreError`, matching the style of the other two writers
-    in this module.
+    ``allowed_roots``; and its suffix must be one of ``allowed_suffixes``.
+    Any violation raises :class:`ArtifactStoreError`, matching the style of
+    the other two writers in this module.
 
     Text-only, like the other two writers here (``content: str``, no binary
     path) -- an image referenced by a rendered plan is written by the
@@ -116,6 +121,17 @@ def write_repo_artifact(
 
     allowed_root_paths = [(root / allowed).resolve() for allowed in allowed_roots]
     for allowed, allowed_path in zip(allowed_roots, allowed_root_paths):
+        # allowed_roots is documented as repo-relative. An absolute entry
+        # (POSIX-absolute "/x", Windows drive-absolute "C:\x", a
+        # drive-relative root "\x", a bare drive-relative "C:foo", or a UNC
+        # "\\server\share") makes "relative to repo_root" ambiguous and is
+        # exactly how an intended subtree (e.g. the absolute spelling of
+        # docs/plans) can slip past the containment check below by already
+        # being an absolute path the join+resolve leaves untouched.
+        if allowed and (ntpath.splitdrive(allowed)[0] or allowed[0] in ("/", "\\")):
+            raise ArtifactStoreError(
+                f"allowed_roots entry {allowed!r} must be repo-relative, not absolute"
+            )
         # allowed_roots is caller-controlled (a hardcoded default everywhere
         # today, but the parameter is public). Resolving "<allowed>" relative
         # to root and never checking the RESULT is still under root means an
@@ -123,9 +139,21 @@ def write_repo_artifact(
         # the allow-list into free rein over the parent tree for anything with
         # an allowed suffix. Every configured root must itself live under
         # repo_root before it can allow-list a destination path.
-        if not (allowed_path == root or allowed_path.is_relative_to(root)):
+        if not allowed_path.is_relative_to(root):
             raise ArtifactStoreError(
                 f"allowed_roots entry {allowed!r} resolves outside repo_root"
+            )
+        # An allowed_roots entry that resolves to repo_root ITSELF (".", "",
+        # "./", "docs/..", or any other spelling that normalises to the
+        # root) is the containment check's own trivial case: repo_root is
+        # always "relative to" repo_root, so `allowed_path == root` used to
+        # be accepted here -- which erases the subtree boundary this
+        # function exists to create and, combined with ".html" being an
+        # allowed suffix, reaches straight into the repo's source tree. A
+        # proper subtree boundary must be a strict subset of repo_root.
+        if allowed_path == root:
+            raise ArtifactStoreError(
+                f"allowed_roots entry {allowed!r} resolves to repo_root itself"
             )
     if not any(
         candidate.is_relative_to(allowed_root)

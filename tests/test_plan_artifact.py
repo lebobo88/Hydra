@@ -119,6 +119,202 @@ def test_write_repo_artifact_rejects_allowed_root_escaping_repo_root(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# write_repo_artifact -- allowed_roots must be a real, repo-relative subtree #
+# boundary, not the repo root itself under another spelling                  #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "bad_root",
+    [".", "", "./", "docs/.."],
+    ids=["dot", "empty", "dot-slash", "dotdot-cancel"],
+)
+def test_write_repo_artifact_rejects_allowed_root_that_is_repo_root_itself(tmp_path, bad_root):
+    # Every spelling here normalises to repo_root itself. Accepting any of
+    # them as an "allowed subtree" erases the boundary the function exists
+    # to enforce -- and .html being an allowed suffix makes that reachable
+    # straight into a source directory.
+    target = tmp_path / "hydra_core" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            tmp_path,
+            "hydra_core/x.html",
+            "no",
+            allowed_roots=(bad_root,),
+        )
+    assert not target.exists()
+
+
+def test_write_repo_artifact_rejects_absolute_repo_root_as_allowed_root(tmp_path):
+    target = tmp_path / "hydra_core" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            tmp_path,
+            "hydra_core/x.html",
+            "no",
+            allowed_roots=(str(tmp_path),),
+        )
+    assert not target.exists()
+
+
+def test_write_repo_artifact_rejects_absolute_form_of_intended_subtree(tmp_path):
+    # The absolute spelling of the DEFAULT allowed subtree must still be
+    # refused -- allowed_roots is documented as repo-relative, and accepting
+    # an absolute form makes the parameter ambiguous.
+    target = tmp_path / "docs" / "plans" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            tmp_path,
+            "docs/plans/x.html",
+            "no",
+            allowed_roots=(str(tmp_path / "docs" / "plans"),),
+        )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "absolute_entry",
+    [
+        "/etc",
+        "C:\\Windows",
+        "\\etc",
+        "\\\\server\\share",
+    ],
+    ids=["posix-absolute", "windows-drive-absolute", "drive-relative-root", "unc"],
+)
+def test_write_repo_artifact_rejects_absolute_allowed_root_spellings(tmp_path, absolute_entry):
+    target = tmp_path / "hydra_core" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            tmp_path,
+            "hydra_core/x.html",
+            "no",
+            allowed_roots=(absolute_entry,),
+        )
+    assert not target.exists()
+
+
+def test_write_repo_artifact_rejects_symlinked_allowed_root_pointing_at_repo_root(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    link = repo_root / "linkroot"
+    try:
+        os.symlink(str(repo_root), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlinks in this environment: {exc}")
+    target = repo_root / "linkroot" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            repo_root,
+            "linkroot/x.html",
+            "no",
+            allowed_roots=("linkroot",),
+        )
+    assert not target.exists()
+
+
+def test_write_repo_artifact_rejects_symlinked_allowed_root_pointing_outside_repo_root(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = repo_root / "linkoutside"
+    try:
+        os.symlink(str(outside), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlinks in this environment: {exc}")
+    target = repo_root / "linkoutside" / "x.html"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            repo_root,
+            "linkoutside/x.html",
+            "no",
+            allowed_roots=("linkoutside",),
+        )
+    assert not target.exists()
+
+
+def test_write_repo_artifact_still_allows_explicit_different_relative_subtree(tmp_path):
+    # The enforced invariant is that a proper subtree boundary must exist --
+    # not which subtree a caller names. A deliberately parameterised,
+    # different relative subtree must keep working.
+    ref = write_repo_artifact(
+        tmp_path, "hydra_core/note.txt", "hi", allowed_roots=("hydra_core",)
+    )
+    assert (tmp_path / "hydra_core" / "note.txt").read_text(encoding="utf-8") == "hi"
+    assert ref.tier == "episodic"
+
+
+def test_write_repo_artifact_default_root_still_writes_plan_json_and_asset(tmp_path):
+    write_repo_artifact(tmp_path, "docs/plans/plan-x.html", "<h1>hi</h1>")
+    write_repo_artifact(tmp_path, "docs/plans/plan-x.json", "{}")
+    write_repo_artifact(tmp_path, "docs/plans/plan-x.txt", "note")
+    assert (tmp_path / "docs" / "plans" / "plan-x.html").exists()
+    assert (tmp_path / "docs" / "plans" / "plan-x.json").exists()
+    assert (tmp_path / "docs" / "plans" / "plan-x.txt").exists()
+
+
+def test_write_repo_artifact_root_rejection_is_load_bearing():
+    # Property, not instance: removing exactly the new root-rejection lines
+    # must bring back the defect (allowed_roots=(".",) writing outside the
+    # intended subtree straight into a source directory). Patch a temp copy
+    # of the module source with that one guard commented out and confirm the
+    # old, unsafe behaviour returns.
+    import importlib.util
+    import sys
+    import tempfile
+
+    src_path = Path(__file__).resolve().parents[1] / "hydra_core" / "artifact_store.py"
+    source = src_path.read_text(encoding="utf-8")
+
+    marker_start = "        if allowed_path == root:\n"
+    marker_body = (
+        "            raise ArtifactStoreError(\n"
+        "                f\"allowed_roots entry {allowed!r} resolves to repo_root itself\"\n"
+        "            )\n"
+    )
+    guard_block = marker_start + marker_body
+    assert guard_block in source, "expected root-rejection guard block not found verbatim"
+    patched_source = source.replace(guard_block, "")
+    assert patched_source != source
+
+    # The module uses package-relative imports (`from .native_packs import
+    # ...`); loading a standalone copy from an arbitrary temp path can't
+    # resolve those without a package context, so rewrite them to the
+    # absolute equivalents -- hydra_core is already importable in this test
+    # environment -- rather than changing anything about the guard logic
+    # under test.
+    patched_source = patched_source.replace(
+        "from .native_packs import native_pack, native_pack_root",
+        "from hydra_core.native_packs import native_pack, native_pack_root",
+    ).replace(
+        "from .schemas import MemoryRef",
+        "from hydra_core.schemas import MemoryRef",
+    )
+
+    with tempfile.TemporaryDirectory() as mod_dir:
+        mod_path = Path(mod_dir) / "artifact_store_unsafe.py"
+        mod_path.write_text(patched_source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("artifact_store_unsafe_probe", mod_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+            with tempfile.TemporaryDirectory() as repo_dir:
+                repo_root = Path(repo_dir)
+                (repo_root / "hydra_core").mkdir()
+                ref = module.write_repo_artifact(
+                    repo_root,
+                    "hydra_core/x.html",
+                    "no",
+                    allowed_roots=(".",),
+                )
+                assert (repo_root / "hydra_core" / "x.html").exists()
+        finally:
+            sys.modules.pop(spec.name, None)
+
+
+# --------------------------------------------------------------------------- #
 # PlanFigure — relative-path-only guard                                      #
 # --------------------------------------------------------------------------- #
 
