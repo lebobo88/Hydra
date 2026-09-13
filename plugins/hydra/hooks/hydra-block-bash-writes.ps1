@@ -343,6 +343,41 @@ function _bwEffCwdAt([int]$atIndex) {
 # let a fragmented open()/Path()/shutil argument dodge the old single-quote-
 # pair regexes entirely (the regex just failed to match, so the call wasn't
 # recognised as a write idiom at all).
+function Test-IsGroupCloseBrace {
+    # A bare `}` closes a shell brace group ONLY per shell grammar: it must be
+    # preceded by whitespace, `;`, or a newline (a brace group is written
+    # `{ cmd; }` or `{ cmd\n}` — the `}` is itself a reserved word and needs
+    # that separation to be recognised as one, per POSIX shell grammar). Glued
+    # directly onto other text — e.g. the `}` in an xargs `-I{}` replacement
+    # placeholder — it is NOT a group-closer and must not be treated as a
+    # statement boundary. Unqualified, treating every `}` as a boundary
+    # reopened the xargs `-I{}` placeholder bypass (2026-09 security
+    # regression): the destination `{}` in `xargs -I{} sh -c 'echo x > {}'`
+    # got split at the bare brace, so the placeholder text read back as `{`
+    # instead of `{}` and no longer matched the tracked placeholder list —
+    # the destination silently stopped being recognised as unresolvable.
+    param([string]$s, [int]$idx)
+    if ($idx -le 0 -or $idx -ge $s.Length -or $s[$idx] -ne '}') { return $false }
+    $prev = $s[$idx - 1]
+    return ($prev -eq ' ' -or $prev -eq "`t" -or $prev -eq ';' -or $prev -eq "`n" -or $prev -eq "`r")
+}
+
+function Test-IsGroupOpenBrace {
+    # The opening counterpart of Test-IsGroupCloseBrace: a bare `{` opens a
+    # shell brace group ONLY when followed by whitespace or a newline (a
+    # brace group is written `{ cmd; }` — the `{` needs that separation to be
+    # recognised as the reserved word, per POSIX shell grammar). Glued
+    # directly onto non-whitespace — e.g. the `{` in an xargs `-I{}`
+    # replacement placeholder — it is not a group-opener and must not be
+    # treated as a statement boundary.
+    param([string]$s, [int]$idx)
+    if ($idx -lt 0 -or $idx -ge $s.Length -or $s[$idx] -ne '{') { return $false }
+    $nextIdx = $idx + 1
+    if ($nextIdx -ge $s.Length) { return $false }
+    $next = $s[$nextIdx]
+    return ($next -eq ' ' -or $next -eq "`t" -or $next -eq "`n" -or $next -eq "`r")
+}
+
 function Read-ShellArgument {
     # Reconstructs ONE shell argument starting at/after $start, concatenating
     # adjacent quoted and unquoted runs. Returns $null Value when the cursor
@@ -362,7 +397,16 @@ function Read-ShellArgument {
     $i = [Math]::Max(0, $start)
     while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
     $beginIdx = $i
-    if ($i -ge $n -or $s[$i] -match '[;|&<>\r\n]') {
+    # A bare (unquoted) `)` closes the enclosing subshell — the same
+    # statement-boundary role as `;`/`|`/`&` — so it ends the argument list
+    # here too, not just in Test-IsCommandWord's boundary scan. Without this,
+    # `install a hydra_core/supervisor.py )` read the closing `)` as a
+    # phantom extra operand, which then displaced the real destination as
+    # the "last operand" and hid it from Test-BlockedDest. A bare `}` plays
+    # the same role for a brace GROUP, but only when it is actually a
+    # group-closer per shell grammar (Test-IsGroupCloseBrace) — an
+    # unqualified `}` boundary reopened the xargs `-I{}` placeholder bypass.
+    if ($i -ge $n -or $s[$i] -match '[;|&<>\r\n]' -or $s[$i] -eq ')' -or (Test-IsGroupCloseBrace $s $i)) {
         return [pscustomobject]@{ Value = $null; Start = $beginIdx; End = $i; HasExpansion = $false }
     }
     $sb = New-Object System.Text.StringBuilder
@@ -389,7 +433,13 @@ function Read-ShellArgument {
             if ($i -lt $n) { $i++ }
             continue
         }
-        if ($c -match '[ \t;|&<>\r\n]') { break }
+        # Same boundary set as above, applied mid-token: a `)` glued directly
+        # onto the end of a word (no space, e.g. `supervisor.py)`) must not
+        # be swallowed into the destination text — it would hide the real
+        # extension from the blocked-extension check. A `}` does the same
+        # ONLY when it is a genuine brace-group closer (Test-IsGroupCloseBrace)
+        # — `-I{}` must stay intact as a single placeholder token.
+        if ($c -match '[ \t;|&<>\r\n]' -or $c -eq ')' -or (Test-IsGroupCloseBrace $s $i)) { break }
         if ($c -eq '\' -and ($i + 1) -lt $n) {
             [void]$sb.Append($s[$i + 1]); $i += 2; continue
         }
@@ -460,6 +510,15 @@ function Test-IsCommandWord {
     # false block.
     param([string]$s, [int]$wordStart)
 
+    # A word immediately preceded by `.` is an attribute access (e.g. the
+    # `copy` in `shutil.copy(...)`, or `move` in `os.path.move`) and is NEVER
+    # a command word, independent of the prefix-chain walk below — this is
+    # what keeps a Python one-liner's `shutil.copy`/`shutil.move` branch
+    # authoritative instead of being reinterpreted through the shell
+    # `cp/mv/copy/move` idiom (which produced the wrong refusal reason and
+    # the wrong destination for `shutil.copy('t.md', os.path.join(...))`).
+    if ($wordStart -gt 0 -and $s[$wordStart - 1] -eq '.') { return $false }
+
     $wrappers = @('sudo', 'env', 'nice', 'command', 'exec', 'time', 'nohup', 'stdbuf', 'ionice', 'setsid')
     $valueOpts = @{
         'sudo'   = @('-u', '-g', '-p', '-C')
@@ -476,12 +535,34 @@ function Test-IsCommandWord {
     if ($boundary -gt 0 -and $s[$boundary - 1] -eq '\') { $boundary-- }
 
     # Find the start of the statement this word lives in: the character just
-    # after the nearest `;`/`&`/`|`/newline before $boundary, or 0.
+    # after the nearest `;`/`&`/`|`/newline/grouping-delimiter before
+    # $boundary, or 0. Shell grouping delimiters `(`/`)` (subshell) each
+    # begin or end a statement just as `;` does, unconditionally — a
+    # subshell paren is always a boundary, no qualification needed. A `{`/`}`
+    # (brace group) plays the same role but ONLY as an actual brace-group
+    # token per shell grammar: `{` must be followed by whitespace/newline to
+    # OPEN a group (Test-IsGroupOpenBrace) and `}` must be preceded by
+    # whitespace, `;`, or newline to CLOSE one (Test-IsGroupCloseBrace) — a
+    # brace glued directly onto adjacent text (e.g. an xargs `-I{}`
+    # placeholder) is not a group delimiter at all. Treating every `{`/`}` as
+    # an unconditional boundary here previously reopened the xargs `-I{}`
+    # placeholder bypass (see Test-IsGroupCloseBrace) as a side effect of
+    # this same prefix-chain fix. So a word immediately after a real opening
+    # `(`/`{` — allowing for whitespace, since the scan below steps over
+    # intervening spaces without stopping — is in command-word position.
+    # Without this, `( install a <path> )` scored the bare `(` itself as the
+    # "command" (a non-wrapper word), which made the discriminator conclude
+    # `install` was `(`'s argument rather than the command — a false
+    # negative across all four discriminated idioms (install/dd/truncate/ln),
+    # including nested groups and grouping combined with a wrapper prefix
+    # (`( sudo install ... )`).
     $runStart = 0
     $k = $boundary - 1
     while ($k -ge 0) {
         $ck = $s[$k]
-        if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq "`n" -or $ck -eq "`r") { $runStart = $k + 1; break }
+        if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq "`n" -or $ck -eq "`r" -or
+            $ck -eq '(' -or $ck -eq ')' -or
+            (Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }
         $k--
     }
 
@@ -831,7 +912,20 @@ if (-not $matched) {
         $targetDirTok = $null
         $operands = New-Object System.Collections.Generic.List[object]
         $awaitingTargetDir = $false
-        if (Test-IsCommandWord $cmd $hit.Index) {
+        # $isCmdWord gates BOTH the operand/-t population below AND the
+        # plain-last-operand fallback further down — not just the former.
+        # Ungated, the fallback used $argsList (built purely from the regex
+        # hit's position, regardless of whether cp/mv/copy/move was really
+        # the command word) as if it always were, so `shutil.copy('t.md',
+        # os.path.join(...))` — where `copy` is a Python attribute access,
+        # not a shell command (see the `.`-preceded rule in
+        # Test-IsCommandWord) — still ran its last reconstructed "argument"
+        # through Test-BlockedDest and blocked with the wrong reason
+        # ("cp/mv/copy/move to '...'" instead of the shutil branch's
+        # UNRESOLVABLE-destination refusal) and, in general, the wrong
+        # destination.
+        $isCmdWord = Test-IsCommandWord $cmd $hit.Index
+        if ($isCmdWord) {
             foreach ($t in $argsList) {
                 if ($awaitingTargetDir) {
                     $targetDirTok = [pscustomobject]@{ Value = $t.Value; Start = $t.Start; HasExpansion = $t.HasExpansion }
@@ -865,7 +959,7 @@ if (-not $matched) {
             if ($matched) { break }
             continue
         }
-        if ($argsList.Count -ge 2) {
+        if ($isCmdWord -and $argsList.Count -ge 2) {
             $destTok = $argsList[$argsList.Count - 1]
             if (Test-BlockedDest $destTok.Value $destTok.Start $destTok.HasExpansion) {
                 $matched = $true

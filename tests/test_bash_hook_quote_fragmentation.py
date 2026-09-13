@@ -1828,6 +1828,21 @@ class TestSixthRevisionPropertyNotInstance:
     # Prove the -t/--target-directory= handling is load-bearing: patch it
     # out in a temporary copy of the hook and confirm the bypass returns
     # (rc=0), following the same pattern as the fourth/fifth revisions.
+    #
+    # NEEDLE REFRESHED (2026-09, ninth revision) — the previous needle
+    # ("if (Test-IsCommandWord $cmd $hit.Index) {") disabled the WHOLE
+    # command-word gate (now stored in $isCmdWord and reused by the
+    # last-operand fallback below it), not specifically the `-t` synthesis
+    # this test names. That text no longer exists verbatim after the
+    # `$isCmdWord` refactor (see the dot-preceded-attribute / misattributed-
+    # shutil-refusal fix), so the staleness assertion in `_patched_hook`
+    # correctly failed loudly instead of silently patching nothing. The
+    # needle now disables ONLY the `-t` flag recognition (the `^-t(.*)$`
+    # match), which is what actually turns `-t hydra_core` from a
+    # target-directory marker into an ordinary skipped flag token — so
+    # `cp supervisor.py -t hydra_core` falls through to the plain
+    # last-operand fallback, sees `hydra_core` (no extension) as the
+    # "destination", and is waved through.
 
     def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
         hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
@@ -1857,8 +1872,8 @@ class TestSixthRevisionPropertyNotInstance:
     ):
         patched_hook = self._patched_hook(
             tmp_path,
-            "        if (Test-IsCommandWord $cmd $hit.Index) {\n",
-            "        if ($false) {\n",
+            "                if ($t.Value -match '^-t(.*)$') {\n",
+            "                if ($false) {\n",
         )
         result = self._run(
             patched_hook, "cp supervisor.py -t hydra_core", cwd=project_dir, project_dir=project_dir
@@ -2009,3 +2024,214 @@ class TestSeventhRevisionPropertyNotInstance:
             f"table should have allowed the bypass, but "
             f"rc={result.returncode} stderr={result.stderr}"
         )
+
+
+class TestGroupingDelimiterBoundaryShapes:
+    """EIGHTH REVISION (2026-09) — `Test-IsCommandWord` treated only
+    `;`/`&`/`|`/CR/LF as statement boundaries. Shell grouping delimiters
+    `(`/`)` (subshell) and `{`/`}` (brace group) were NOT boundaries, so the
+    bare delimiter itself became the run's first "non-wrapper word", and the
+    discriminator concluded the discriminated word was an argument to `(`
+    rather than the command in its own right. All eight shapes below
+    measured exit 0 (falsely allowed) on both this branch and
+    `main@29dbe89`, pre-dating this branch, and affect all four
+    discriminated idioms (`install`/`dd`/`truncate`/`ln`).
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"( install a {BLOCKED_REL} )",
+            f"{{ install a {BLOCKED_REL}; }}",
+            f"(install a {BLOCKED_REL})",
+            f"( ( install a {BLOCKED_REL} ) )",
+            f"true && ( install a {BLOCKED_REL} )",
+            f"( dd if=/dev/zero of={BLOCKED_REL} )",
+            f"{{ truncate -s 0 {BLOCKED_REL}; }}",
+            f"( ln -sf a {BLOCKED_REL} )",
+            # grouping combined with a wrapper prefix
+            f"( sudo install a {BLOCKED_REL} )",
+            f"{{ env FOO=1 install a {BLOCKED_REL}; }}",
+        ],
+    )
+    def test_grouping_forms_blocked(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"{cmd!r}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "( npm install express )",
+            "{ npm install express; }",
+            f"( echo install {BLOCKED_REL} )",
+            "( grep -n install README.md )",
+            "pip install -t vendor requests",
+        ],
+    )
+    def test_must_stay_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+
+class TestEighthRevisionPropertyNotInstance:
+    """Prove the grouping-delimiter boundary addition is load-bearing: patch
+    out exactly that change in a temporary copy of the hook and confirm
+    `( install a <protected> )` returns to exit 0 — the pre-fix false
+    negative."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_grouping_delimiter_boundary_allows_the_bypass(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        needle = (
+            "if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\" -or\n"
+            "            $ck -eq '(' -or $ck -eq ')' -or\n"
+            "            (Test-IsGroupOpenBrace $s $k) -or (Test-IsGroupCloseBrace $s $k)) { $runStart = $k + 1; break }"
+        )
+        patched_hook = self._patched_hook(
+            tmp_path,
+            needle,
+            "if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq \"`n\" -or $ck -eq \"`r\") { $runStart = $k + 1; break }",
+        )
+        result = self._run(
+            patched_hook, f"( install a {BLOCKED_REL} )", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, (
+            f"property check failed: removing the grouping-delimiter boundary "
+            f"should have allowed the bypass, but "
+            f"rc={result.returncode} stderr={result.stderr}"
+        )
+
+
+class TestBraceGroupQualificationPropertyNotInstance:
+    """NINTH REVISION (2026-09) — the eighth revision's grouping-delimiter
+    boundary treated EVERY bare `{`/`}` as a statement boundary, unqualified.
+    That reopened the xargs `-I{}` replacement-placeholder bypass (see
+    `TestXargsPlaceholderDestination`): the destination text `{}` in
+    `xargs -I{} sh -c 'echo x > {}'` got split at the bare `}` inside
+    `Read-ShellArgument`, so the reconstructed destination came back as `{`
+    instead of `{}` and no longer matched the tracked placeholder list — the
+    hook silently stopped recognising the destination as unresolvable and
+    let the write through.
+
+    The fix qualifies `{`/`}` as statement boundaries ONLY when they are an
+    actual brace-GROUP token per shell grammar (`Test-IsGroupOpenBrace` /
+    `Test-IsGroupCloseBrace`: a `{` must be followed by whitespace/newline to
+    open a group, a `}` must be preceded by whitespace, `;`, or newline to
+    close one) — `-I{}` is `{` immediately followed by `}` and satisfies
+    neither, so it is left alone as ordinary text.
+
+    This proves the qualification is load-bearing on the SAME
+    `Read-ShellArgument` mid-token break where the bypass actually lives:
+    patch out just the `Test-IsGroupCloseBrace` guard there (falling back to
+    an unqualified `}` boundary, matching the eighth revision's bug) and
+    confirm the xargs default-placeholder bypass returns to exit 0.
+    """
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_brace_group_qualification_reopens_xargs_bypass(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        needle = (
+            "if ($c -match '[ \\t;|&<>\\r\\n]' -or $c -eq ')' -or (Test-IsGroupCloseBrace $s $i)) { break }"
+        )
+        patched_hook = self._patched_hook(
+            tmp_path,
+            needle,
+            "if ($c -match '[ \\t;|&<>)}\\r\\n]') { break }",
+        )
+        cmd = "printf " + BLOCKED_REL + " | xargs -I{} sh -c 'echo x > {}'"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing the brace-group qualification "
+            f"should have reopened the xargs -I{{}} placeholder bypass, but "
+            f"rc={result.returncode} stderr={result.stderr}"
+        )
+
+
+class TestDotPrecededAttributeNotCommandWord:
+    """A word immediately preceded by `.` is an attribute access (e.g. the
+    `copy` in `shutil.copy(...)`) and must NEVER be treated as a shell
+    command word — independent of the grouping-delimiter fix above. Without
+    this, `shutil.copy('t.md', os.path.join('hydra_core', 'supervisor.py'))`
+    matched the shell `cp/mv/copy/move` idiom (because `copy` sat right after
+    a `Read-ShellArgument`-visible `)`/`}` boundary once those became
+    boundaries), which blocked with the WRONG reason ('cp/mv/copy/move to
+    ...') and the wrong destination instead of the shutil branch's own
+    UNRESOLVABLE-destination refusal. This keeps the Python `shutil.*`
+    branches (see `TestPyDestExprUnresolvable`) authoritative for Python
+    one-liners."""
+
+    def test_shutil_copy_allowed_destination_stays_allowed(self, project_dir: Path):
+        cmd = "python -c \"import shutil; shutil.copy('a.md','b.md')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_shutil_move_allowed_destination_stays_allowed(self, project_dir: Path):
+        cmd = "python -c \"import shutil; shutil.move('a.md','b.md')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_shutil_os_path_join_destination_blocked_with_unresolvable_reason(
+        self, project_dir: Path
+    ):
+        cmd = (
+            "python -c \"import shutil, os; "
+            "shutil.copy('t.md', os.path.join('hydra_core', 'supervisor.py'))\""
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr, (
+            f"expected the shutil branch's UNRESOLVABLE-destination refusal, "
+            f"not a misattributed cp/mv/copy/move refusal: stderr={result.stderr}"
+        )
+        assert "cp/mv/copy/move" not in result.stderr, (
+            f"'copy' in 'shutil.copy(' was misread as a shell command word: "
+            f"stderr={result.stderr}"
+        )
+
+
