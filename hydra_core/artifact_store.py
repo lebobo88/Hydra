@@ -36,6 +36,19 @@ _CONTROL_CHARS = frozenset(chr(c) for c in range(0x00, 0x20)) | frozenset(
 _MAX_RELATIVE_LENGTH = 1024
 _MAX_COMPONENT_LENGTH = 255  # the conventional single-component limit (NTFS, ext4, APFS)
 
+# Windows reserves these names for device I/O regardless of extension or
+# case -- "CON.html" is just as reserved as "CON". A component landing on
+# one of these can fail deep inside a Windows filesystem call in a way this
+# module does not control (and, worse, only after mkdir(parents=True) has
+# already created the leading directories of the path -- leaving a real
+# directory behind on a call this module is supposed to have refused
+# outright). Checked here, syntactically, before that can happen.
+_RESERVED_WINDOWS_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
 
 def _validate_relative(relative: object) -> str:
     """Syntactically validate a repo-relative path *before* any path
@@ -72,10 +85,29 @@ def _validate_relative(relative: object) -> str:
             f"({len(relative)})"
         )
     for component in re.split(r"[\\/]+", relative):
+        if not component:
+            continue
         if len(component) > _MAX_COMPONENT_LENGTH:
             raise ArtifactStoreError(
                 f"relative path component {component!r} exceeds "
                 f"{_MAX_COMPONENT_LENGTH} characters ({len(component)})"
+            )
+        # Windows silently strips a trailing dot or space from a component
+        # when it reaches the filesystem, so "x." and "x" (or "x " and "x")
+        # address the same file -- a caller who wrote "x." and expected a
+        # literal name would be surprised, and worse, this makes the
+        # component boundary itself platform-dependent rather than this
+        # module's own decision.
+        if component != component.rstrip(" ."):
+            raise ArtifactStoreError(
+                f"relative path component {component!r} has a trailing dot "
+                "or space"
+            )
+        base_name = component.split(".", 1)[0].upper()
+        if base_name in _RESERVED_WINDOWS_NAMES:
+            raise ArtifactStoreError(
+                f"relative path component {component!r} is a reserved "
+                "Windows device name"
             )
     return relative
 
@@ -110,6 +142,157 @@ def _validate_allowed_roots(allowed_roots: object) -> tuple[str, ...]:
                 f"{entry!r} of type {type(entry).__name__}"
             )
     return materialized
+
+
+def _validate_content(content: object) -> str:
+    """Require ``content`` to be a ``str``.
+
+    Both sibling writers in this module (:func:`write_native_artifact`,
+    :func:`write_attended_artifact`) are text-only by design, and so is this
+    one: there is no binary path here. Silently accepting ``bytes`` and
+    encoding it would be a second, undocumented content contract living
+    alongside the documented one; refusing it outright keeps the contract
+    single. Without this check, a non-``str`` (``None``, ``bytes``, an
+    ``int``) reaches ``Path.write_text`` and fails there with a raw
+    ``TypeError`` instead of this module's own error type.
+    """
+    if not isinstance(content, str):
+        raise ArtifactStoreError(
+            f"content must be a string, got {type(content).__name__}"
+        )
+    return content
+
+
+def _validate_allowed_suffixes(allowed_suffixes: object) -> frozenset[str]:
+    """Syntactically validate ``allowed_suffixes`` *before* it ever gates a
+    write.
+
+    A bare string here is not merely a type error -- it is a WIDENING.
+    ``candidate.suffix.lower() not in allowed_suffixes`` performs *substring*
+    matching against a ``str``, so a caller passing ``".html"`` (instead of
+    the intended ``{".html"}``) makes ``".htm"`` pass too, since ``".htm"``
+    is a literal prefix -- and therefore a substring -- of ``".html"``. That
+    is a suffix allow-list bypass, for exactly the reason a bare-string
+    ``allowed_roots`` is refused above. A non-string, non-iterable value
+    (``None``, an ``int``) fails with a raw ``TypeError`` at the same
+    membership test if left unguarded.
+
+    Every entry must additionally be a ``str`` that begins with a dot --
+    ``"html"`` without the leading dot can never match ``Path.suffix``
+    (which always includes the dot), so accepting it would silently produce
+    an allow-list that rejects everything a caller intended it to allow.
+    Case is normalised once, here, to lower-case -- the one place this
+    module's opinion about case lives -- rather than re-normalising on
+    every comparison at the write site.
+
+    An *empty* collection is not itself malformed: it is accepted here and
+    left to the ordinary suffix check in :func:`write_repo_artifact` to
+    refuse every write, the same way any other allow-list that matches
+    nothing would.
+    """
+    if isinstance(allowed_suffixes, str) or not isinstance(allowed_suffixes, Iterable):
+        raise ArtifactStoreError(
+            "allowed_suffixes must be a non-string iterable of strings, got "
+            f"{allowed_suffixes!r} of type {type(allowed_suffixes).__name__}"
+        )
+    materialized = tuple(allowed_suffixes)
+    for entry in materialized:
+        if not isinstance(entry, str) or not entry.startswith("."):
+            raise ArtifactStoreError(
+                "allowed_suffixes entries must be strings starting with "
+                f"'.', got {entry!r} of type {type(entry).__name__}"
+            )
+    return frozenset(entry.lower() for entry in materialized)
+
+
+def _validate_repo_root(repo_root: object) -> Path:
+    """Validate ``repo_root`` and resolve it to the real directory it must
+    already be.
+
+    ``Path(repo_root)`` is where a hostile or merely broken ``__fspath__``
+    (or a non-string, non-path-like value such as an ``int``) used to
+    surface as a raw ``TypeError``/``RuntimeError`` straight out of the
+    interpreter; it is caught here and converted like any other malformed
+    input this module refuses.
+
+    ``repo_root`` must additionally already exist and be a directory. A
+    writer whose entire premise is "write inside this repo" must not
+    invent the repo -- yet without this check, a nonexistent ``repo_root``
+    was silently created (along with the rest of the path) by the
+    ``mkdir(parents=True)`` in the write itself. The real caller resolves
+    ``repo_root`` through the repo registry, which already guarantees both
+    existence and directory-ness, so this costs a legitimate caller
+    nothing.
+
+    ``Path.resolve()`` follows symlinks, so a symlinked ``repo_root`` is
+    followed to its real target, and that target -- not the symlink -- is
+    what every containment check downstream is measured against. Refusing
+    a symlinked ``repo_root`` instead would just relocate this same
+    resolution decision to the caller without adding any safety: the
+    target directory is still required to exist and still becomes the
+    containment boundary either way, and resolving here keeps that
+    boundary consistent with how ``allowed_roots`` entries and the write
+    candidate itself are already resolved a few lines below.
+    """
+    try:
+        candidate_root = Path(repo_root)
+    except Exception as exc:
+        raise ArtifactStoreError(
+            f"repo_root is not a valid path: {exc!r}"
+        ) from exc
+    try:
+        resolved = candidate_root.resolve()
+    except OSError as exc:
+        raise ArtifactStoreError(
+            f"repo_root {repo_root!r} could not be resolved: {exc}"
+        ) from exc
+    if not resolved.is_dir():
+        raise ArtifactStoreError(
+            f"repo_root {repo_root!r} does not exist or is not a directory"
+        )
+    return resolved
+
+
+def _validate_write_repo_artifact_params(
+    repo_root: object,
+    relative: object,
+    content: object,
+    allowed_roots: object,
+    allowed_suffixes: object,
+) -> tuple[Path, str, str, tuple[str, ...], frozenset[str]]:
+    """The single validation pass for every :func:`write_repo_artifact`
+    parameter, run before any ``Path`` is built for containment purposes and
+    before any filesystem call the write itself would make.
+
+    Five rounds of review found the same class of defect in
+    ``write_repo_artifact`` five times over: one parameter, used before it
+    was validated, so a malformed value escaped as a platform or
+    interpreter exception (``TypeError``, ``RuntimeError``, a raw
+    ``OSError``) instead of this module's own :class:`ArtifactStoreError`.
+    Each round patched the parameter that had just been reported --
+    ``allowed_suffixes=None``, a bare-string ``allowed_suffixes`` that
+    *widened* the allow-list rather than merely mistyping it, a non-``str``
+    ``content``, a hostile ``repo_root.__fspath__``, and a nonexistent
+    ``repo_root`` that got silently created. That is how a sixth instance
+    would keep happening; a seventh after that. This function replaces the
+    per-parameter patches with one front door that validates all five --
+    ``repo_root``, ``relative``, ``content``, ``allowed_roots``,
+    ``allowed_suffixes`` -- so the rest of ``write_repo_artifact`` can
+    assume every input is already well-formed.
+
+    The four checks that need no filesystem access (``relative``,
+    ``content``, ``allowed_roots``, ``allowed_suffixes``) run first, as pure
+    string/collection operations; ``repo_root`` is validated last because
+    confirming it exists is itself a filesystem call (a stat, not a write) --
+    still strictly before ``write_repo_artifact`` constructs the write
+    candidate or touches the disk for real.
+    """
+    relative = _validate_relative(relative)
+    content = _validate_content(content)
+    allowed_roots = _validate_allowed_roots(allowed_roots)
+    allowed_suffixes = _validate_allowed_suffixes(allowed_suffixes)
+    root = _validate_repo_root(repo_root)
+    return root, relative, content, allowed_roots, allowed_suffixes
 
 
 def write_native_artifact(slug: str, relative: str, content: str) -> MemoryRef:
@@ -214,23 +397,38 @@ def write_repo_artifact(
     path) -- an image referenced by a rendered plan is written by the
     renderer's caller through its own path, never through this store.
 
-    ``relative`` is repo-relative and control-character-free: it is
-    validated syntactically (non-empty, not whitespace-only, no absolute
-    spelling, no C0/C1 control character, within the length bounds) before
-    any path is constructed or any filesystem call is made -- see
-    :func:`_validate_relative`. ``allowed_roots`` is validated the same way,
-    before it is ever joined onto a path -- see :func:`_validate_allowed_roots`.
+    Every parameter -- ``repo_root``, ``relative``, ``content``,
+    ``allowed_roots``, ``allowed_suffixes`` -- is validated in one pass, by
+    :func:`_validate_write_repo_artifact_params`, before this function
+    constructs the write candidate or makes any filesystem call: ``relative``
+    must be repo-relative and control-character-free (see
+    :func:`_validate_relative`); ``content`` must be a ``str`` (see
+    :func:`_validate_content`); ``allowed_roots`` must be a non-string
+    iterable of repo-relative strings (see :func:`_validate_allowed_roots`);
+    ``allowed_suffixes`` must be a non-string iterable of dot-prefixed
+    strings, never a bare string -- membership on a bare string is substring
+    matching, so ``".html"`` would silently also accept ``".htm"`` (see
+    :func:`_validate_allowed_suffixes`); and ``repo_root`` must already exist
+    as a directory (see :func:`_validate_repo_root`) -- this writer's premise
+    is "write inside this repo", and it must never invent the repo it is
+    supposed to be bounded by. Every rejection from this pass -- and every
+    guard below it -- raises :class:`ArtifactStoreError`, never a
+    platform-specific or interpreter-level exception, and leaves no file or
+    directory behind.
 
-    Every remaining filesystem operation (directory creation, the write
-    itself) is wrapped so that whatever the underlying OS does -- a
-    too-long full path, a permissions error, any other ``OSError`` -- is
-    re-raised as :class:`ArtifactStoreError` with the original chained as
-    the cause. The contract is total: a caller of this writer sees exactly
-    one exception type for every rejection, never a platform-specific one.
+    What remains after that pass -- directory creation and the write itself
+    -- is still at the mercy of the OS (a too-long full path even after the
+    relative-length bound above, since ``repo_root`` itself can be long; a
+    permissions error; a full disk). That narrow filesystem wrap is kept
+    deliberately narrow: it catches only the two calls that can still fail
+    for a reason outside this module's own opinion, so a programming error
+    elsewhere in this function is never disguised as a rejected write.
     """
-    _validate_relative(relative)
-    allowed_roots = _validate_allowed_roots(allowed_roots)
-    root = Path(repo_root).resolve()
+    root, relative, content, allowed_roots, allowed_suffixes = (
+        _validate_write_repo_artifact_params(
+            repo_root, relative, content, allowed_roots, allowed_suffixes
+        )
+    )
     candidate = (root / relative).resolve()
     if not candidate.is_relative_to(root):
         raise ArtifactStoreError("artifact path escapes repo root")

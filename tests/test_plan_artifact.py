@@ -510,12 +510,56 @@ def test_write_repo_artifact_case_different_relative_spelling_measured_behavior(
 
 
 # --------------------------------------------------------------------------- #
-# write_repo_artifact -- the error contract is now TOTAL: every malformed    #
-# input raises exactly ArtifactStoreError, never OSError/ValueError/         #
-# TypeError/FileNotFoundError/anything else, and none of them touch disk    #
+# write_repo_artifact -- the error contract is now TOTAL across ALL FIVE     #
+# parameters (repo_root, relative, content, allowed_roots, allowed_suffixes):#
+# every malformed input raises exactly ArtifactStoreError, never OSError/    #
+# ValueError/TypeError/RuntimeError/anything else, and none of them touch    #
+# disk. One table, not five scattered cases -- see the P2 validation-pass    #
+# restructure in hydra_core/artifact_store.py for why.                       #
 # --------------------------------------------------------------------------- #
 
+
+class _HostileFspath:
+    """An object whose __fspath__ raises -- the exact shape of the fifth
+    measured defect: Path(repo_root) used to let this escape as a raw
+    RuntimeError instead of ArtifactStoreError."""
+
+    def __fspath__(self):
+        raise RuntimeError("hostile __fspath__")
+
+    def __repr__(self):
+        return "_HostileFspath()"
+
+
+class _DeferredRepoRoot:
+    """A repo_root value that can only be built once this test's tmp_path is
+    known (a nonexistent path, or a path that is a file rather than a
+    directory) -- resolved in the test body, not at parametrize-collection
+    time."""
+
+    def __init__(self, builder):
+        self._builder = builder
+
+    def build(self, tmp_path):
+        return self._builder(tmp_path)
+
+
+def _make_nonexistent_repo_root(tmp_path):
+    return tmp_path / "ghost_repo"
+
+
+def _make_file_repo_root(tmp_path):
+    f = tmp_path / "not_a_directory.txt"
+    f.write_text("x", encoding="utf-8")
+    return f
+
+
+_REPO_ROOT_NONEXISTENT = _DeferredRepoRoot(_make_nonexistent_repo_root)
+_REPO_ROOT_IS_FILE = _DeferredRepoRoot(_make_file_repo_root)
+
+
 _MALFORMED_WRITE_REPO_ARTIFACT_CASES = [
+    # -- relative -------------------------------------------------------- #
     ("control-nul", {"relative": "docs/plans/x\x00.html"}),
     ("control-newline", {"relative": "docs/plans/x\n.html"}),
     ("control-cr", {"relative": "docs/plans/x\r.html"}),
@@ -524,6 +568,8 @@ _MALFORMED_WRITE_REPO_ARTIFACT_CASES = [
     ("empty-relative", {"relative": ""}),
     ("whitespace-only-relative", {"relative": "   "}),
     ("non-string-relative", {"relative": 123}),
+    ("path-relative", {"relative": Path("docs/plans/x.html")}),
+    ("bytes-relative", {"relative": b"docs/plans/x.html"}),
     ("absolute-posix", {"relative": "/etc/plans/x.html"}),
     ("absolute-drive", {"relative": "C:\\Windows\\x.html"}),
     ("drive-relative", {"relative": "C:x.html"}),
@@ -535,12 +581,38 @@ _MALFORMED_WRITE_REPO_ARTIFACT_CASES = [
         "over-long-single-component",
         {"relative": "docs/plans/" + "a" * 300 + ".html"},
     ),
+    ("reserved-device-name-component", {"relative": "docs/plans/CON.html"}),
+    ("trailing-dot-component", {"relative": "docs/plans/x.html."}),
+    ("trailing-space-component", {"relative": "docs/plans/x.html "}),
+    ("blocked-suffix", {"relative": "docs/plans/x.png"}),
+    # -- allowed_roots ----------------------------------------------------- #
     ("allowed-roots-non-string-entry", {"allowed_roots": (123,)}),
     ("allowed-roots-path-entry", {"allowed_roots": (Path("docs/plans"),)}),
+    ("allowed-roots-bytes-entry", {"allowed_roots": (b"docs/plans",)}),
+    (
+        "allowed-roots-generator-entry",
+        {"allowed_roots": ((x for x in ["docs/plans"]),)},
+    ),
     ("allowed-roots-none", {"allowed_roots": None}),
     ("allowed-roots-bare-string", {"allowed_roots": "docs/plans"}),
     ("allowed-roots-is-repo-root", {"allowed_roots": (".",)}),
-    ("blocked-suffix", {"relative": "docs/plans/x.png"}),
+    ("allowed-roots-absolute-entry", {"allowed_roots": ("/etc",)}),
+    ("allowed-roots-escaping-entry", {"allowed_roots": ("..",)}),
+    # -- allowed_suffixes ---------------------------------------------------#
+    ("allowed-suffixes-none", {"allowed_suffixes": None}),
+    ("allowed-suffixes-bare-string", {"allowed_suffixes": ".html"}),
+    ("allowed-suffixes-non-string-entry", {"allowed_suffixes": (123,)}),
+    ("allowed-suffixes-missing-dot", {"allowed_suffixes": ("html",)}),
+    ("allowed-suffixes-empty", {"allowed_suffixes": frozenset()}),
+    # -- content --------------------------------------------------------- #
+    ("content-none", {"content": None}),
+    ("content-bytes", {"content": b"x"}),
+    ("content-int", {"content": 123}),
+    # -- repo_root --------------------------------------------------------- #
+    ("repo-root-nonexistent", {"repo_root": _REPO_ROOT_NONEXISTENT}),
+    ("repo-root-is-file", {"repo_root": _REPO_ROOT_IS_FILE}),
+    ("repo-root-hostile-fspath", {"repo_root": _HostileFspath()}),
+    ("repo-root-non-string-non-path", {"repo_root": 12345}),
 ]
 
 
@@ -552,37 +624,161 @@ _MALFORMED_WRITE_REPO_ARTIFACT_CASES = [
 def test_write_repo_artifact_error_contract_is_total(tmp_path, kwargs):
     # The exception type is asserted EXACTLY as ArtifactStoreError -- not any
     # of its plausible platform-level substitutes -- for every malformed
-    # input this writer must refuse. Type() equality (not isinstance) also
-    # guards against a bare `except OSError: raise ArtifactStoreError(...)`
-    # accidentally catching something that happens to subclass OSError but
-    # was never meant to be swallowed here; ArtifactStoreError itself
-    # subclasses ValueError, so isinstance alone would not distinguish it
-    # from a plain ValueError escaping some other code path.
-    before = set(tmp_path.rglob("*"))
-    call_kwargs = {"relative": "docs/plans/x.html", "content": "no"}
+    # input across all five parameters this writer must refuse. Type()
+    # equality (not isinstance) also guards against a bare
+    # `except OSError: raise ArtifactStoreError(...)` accidentally catching
+    # something that happens to subclass OSError but was never meant to be
+    # swallowed here; ArtifactStoreError itself subclasses ValueError, so
+    # isinstance alone would not distinguish it from a plain ValueError
+    # escaping some other code path.
+    call_kwargs = {
+        "repo_root": tmp_path,
+        "relative": "docs/plans/x.html",
+        "content": "no",
+    }
     call_kwargs.update(kwargs)
+    if isinstance(call_kwargs["repo_root"], _DeferredRepoRoot):
+        call_kwargs["repo_root"] = call_kwargs["repo_root"].build(tmp_path)
+    before = set(tmp_path.rglob("*"))
     with pytest.raises(ArtifactStoreError) as excinfo:
-        write_repo_artifact(tmp_path, **call_kwargs)
+        write_repo_artifact(**call_kwargs)
     assert type(excinfo.value) is ArtifactStoreError
     after = set(tmp_path.rglob("*"))
     assert after == before, "no file or directory may be created on refusal"
 
 
-def test_write_repo_artifact_still_succeeds_default_subtree_multi_suffix(tmp_path):
-    write_repo_artifact(tmp_path, "docs/plans/plan.html", "<h1>hi</h1>")
-    write_repo_artifact(tmp_path, "docs/plans/plan.json", "{}")
-    write_repo_artifact(tmp_path, "docs/plans/plan.txt", "note")
-    assert (tmp_path / "docs" / "plans" / "plan.html").read_text(encoding="utf-8") == "<h1>hi</h1>"
-    assert (tmp_path / "docs" / "plans" / "plan.json").read_text(encoding="utf-8") == "{}"
-    assert (tmp_path / "docs" / "plans" / "plan.txt").read_text(encoding="utf-8") == "note"
+# --------------------------------------------------------------------------- #
+# write_repo_artifact -- the validation pass must not become an over-broad   #
+# rejection: every one of these must still succeed                          #
+# --------------------------------------------------------------------------- #
+
+_GOOD_WRITE_REPO_ARTIFACT_CASES = [
+    (
+        "default-subtree-html",
+        {"relative": "docs/plans/plan.html", "content": "<h1>hi</h1>"},
+    ),
+    ("default-subtree-json", {"relative": "docs/plans/plan.json", "content": "{}"}),
+    ("default-subtree-txt", {"relative": "docs/plans/plan.txt", "content": "note"}),
+    (
+        "explicit-different-subtree",
+        {
+            "relative": "hydra_core/note.txt",
+            "content": "hi",
+            "allowed_roots": ("hydra_core",),
+        },
+    ),
+    (
+        "explicit-frozenset-suffixes",
+        {
+            "relative": "docs/plans/plan.html",
+            "content": "<h1>hi</h1>",
+            "allowed_suffixes": frozenset({".html", ".json"}),
+        },
+    ),
+]
 
 
-def test_write_repo_artifact_still_succeeds_explicit_different_subtree(tmp_path):
-    ref = write_repo_artifact(
-        tmp_path, "hydra_core/note.txt", "hi", allowed_roots=("hydra_core",)
-    )
-    assert (tmp_path / "hydra_core" / "note.txt").read_text(encoding="utf-8") == "hi"
+@pytest.mark.parametrize(
+    "kwargs",
+    [kwargs for _, kwargs in _GOOD_WRITE_REPO_ARTIFACT_CASES],
+    ids=[case_id for case_id, _ in _GOOD_WRITE_REPO_ARTIFACT_CASES],
+)
+def test_write_repo_artifact_still_succeeds(tmp_path, kwargs):
+    call_kwargs = {"repo_root": tmp_path}
+    call_kwargs.update(kwargs)
+    ref = write_repo_artifact(**call_kwargs)
     assert ref.tier == "episodic"
+    target = tmp_path / Path(call_kwargs["relative"])
+    assert target.read_text(encoding="utf-8") == call_kwargs["content"]
+
+
+# --------------------------------------------------------------------------- #
+# Property, not instance: removing exactly one guard must bring back the     #
+# specific old defect that guard exists to close.                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_write_repo_artifact_repo_root_existence_guard_is_load_bearing():
+    # Patch a temp copy of the module with ONLY the repo_root existence
+    # check removed, and confirm the old bug returns: a nonexistent
+    # repo_root gets silently created by the write it should have refused.
+    import importlib.util
+    import sys
+    import tempfile
+
+    src_path = Path(__file__).resolve().parents[1] / "hydra_core" / "artifact_store.py"
+    source = src_path.read_text(encoding="utf-8")
+
+    marker = (
+        "    if not resolved.is_dir():\n"
+        "        raise ArtifactStoreError(\n"
+        "            f\"repo_root {repo_root!r} does not exist or is not a directory\"\n"
+        "        )\n"
+    )
+    assert marker in source, "expected repo_root existence guard not found verbatim"
+    patched_source = source.replace(marker, "")
+    assert patched_source != source
+
+    # Package-relative imports can't resolve from a standalone temp-path
+    # module; rewrite to the absolute equivalents (hydra_core is already
+    # importable here) rather than changing anything about the guard logic
+    # under test -- the same technique already used by
+    # test_write_repo_artifact_root_rejection_is_load_bearing above.
+    patched_source = patched_source.replace(
+        "from .native_packs import native_pack, native_pack_root",
+        "from hydra_core.native_packs import native_pack, native_pack_root",
+    ).replace(
+        "from .schemas import MemoryRef",
+        "from hydra_core.schemas import MemoryRef",
+    )
+
+    with tempfile.TemporaryDirectory() as mod_dir:
+        mod_path = Path(mod_dir) / "artifact_store_unsafe_root.py"
+        mod_path.write_text(patched_source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "artifact_store_unsafe_root_probe", mod_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        try:
+            spec.loader.exec_module(module)
+            with tempfile.TemporaryDirectory() as base_dir:
+                ghost = Path(base_dir) / "ghost_repo"
+                assert not ghost.exists()
+                module.write_repo_artifact(ghost, "docs/plans/x.html", "no")
+                assert ghost.is_dir(), "old bug: the phantom repo_root got created"
+                assert (ghost / "docs" / "plans" / "x.html").exists()
+        finally:
+            sys.modules.pop(spec.name, None)
+
+
+def test_write_repo_artifact_allowed_suffixes_string_would_widen_if_unguarded():
+    # Two-directions fallback for the bare-string allowed_suffixes guard,
+    # per the review request: source-patching out ONLY the string-refusal
+    # check does not reproduce the old widening on its own, because this
+    # module's per-entry check (every entry must be a str starting with
+    # ".") independently blocks it too -- tuple(".html") iterates to the
+    # characters '.', 'h', 't', 'm', 'l', and 'h' does not start with '.'.
+    # That second, independent guard is deliberate defense-in-depth, not an
+    # accident that makes this test impossible; demonstrating the removed
+    # guard's necessity is done from both directions instead:
+    #
+    # Direction 1: the raw mechanism the guard exists to close. Membership
+    # on a bare string is substring matching, so an unguarded ".html"
+    # allow-list would silently also accept ".htm".
+    assert ".htm" in ".html"
+
+
+def test_write_repo_artifact_rejects_bare_string_allowed_suffixes_widening(tmp_path):
+    # Direction 2: with the guard in place, the bare string is refused
+    # outright -- it never reaches the membership test above, so a ".htm"
+    # file can never ride in on a ".html" allow-list's coattails.
+    target = tmp_path / "docs" / "plans" / "x.htm"
+    with pytest.raises(ArtifactStoreError):
+        write_repo_artifact(
+            tmp_path, "docs/plans/x.htm", "no", allowed_suffixes=".html"
+        )
+    assert not target.exists()
 
 
 # --------------------------------------------------------------------------- #
