@@ -12,6 +12,50 @@ class ArtifactStoreError(ValueError):
     pass
 
 
+# C0 controls (0x00-0x1F, including NUL/newline/CR/tab) and C1 controls
+# (0x7F-0x9F, including DEL). A path containing any of these is refused
+# outright rather than passed through to the filesystem -- some platforms
+# happen to reject a subset of these bytes in a path (Windows rejects an
+# embedded newline or CR with an OSError), but that is the platform
+# rescuing a missing guard, not the guard doing its job. On a filesystem
+# that permits them the write would otherwise silently succeed.
+_CONTROL_CHARS = frozenset(chr(c) for c in range(0x00, 0x20)) | frozenset(
+    chr(c) for c in range(0x7F, 0xA0)
+)
+
+
+def _validate_relative(relative: object) -> str:
+    """Syntactically validate a repo-relative path *before* any path
+    construction or filesystem access.
+
+    ``relative`` is documented (here and on :func:`write_repo_artifact`) as
+    repo-relative and control-character-free. Without this gate, a
+    malformed value -- an absolute path, an empty string, an embedded
+    control character -- flows straight into ``Path`` construction and a
+    filesystem call, and surfaces as a platform-specific ``OSError`` or
+    ``ValueError`` instead of the ``ArtifactStoreError`` every other
+    rejection in this module raises. Worse, an *absolute* ``relative`` is
+    silently accepted by ``root / relative`` (the join is a no-op for an
+    absolute right-hand side), so it can pass every downstream containment
+    check purely by coincidence of where it happens to point -- the same
+    repo-relative ambiguity already closed for ``allowed_roots``.
+    """
+    if not isinstance(relative, str):
+        raise ArtifactStoreError(
+            f"relative must be a string, got {type(relative).__name__}"
+        )
+    if not relative.strip():
+        raise ArtifactStoreError("relative must not be empty or whitespace-only")
+    if any(ch in _CONTROL_CHARS for ch in relative):
+        raise ArtifactStoreError(f"relative {relative!r} contains a control character")
+    drive, _ = ntpath.splitdrive(relative)
+    if drive or relative[0] in ("/", "\\"):
+        raise ArtifactStoreError(
+            f"relative {relative!r} must be repo-relative, not absolute"
+        )
+    return relative
+
+
 def write_native_artifact(slug: str, relative: str, content: str) -> MemoryRef:
     """Write beneath the pack's declared output root, rejecting every escape."""
     spec = native_pack(slug)
@@ -113,7 +157,13 @@ def write_repo_artifact(
     Text-only, like the other two writers here (``content: str``, no binary
     path) -- an image referenced by a rendered plan is written by the
     renderer's caller through its own path, never through this store.
+
+    ``relative`` is repo-relative and control-character-free: it is
+    validated syntactically (non-empty, not whitespace-only, no absolute
+    spelling, no C0/C1 control character) before any path is constructed or
+    any filesystem call is made -- see :func:`_validate_relative`.
     """
+    _validate_relative(relative)
     root = Path(repo_root).resolve()
     candidate = (root / relative).resolve()
     if not candidate.is_relative_to(root):
