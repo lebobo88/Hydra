@@ -21,6 +21,20 @@ from typing import Any, Callable, Optional
 from .squad_loader import SquadPack
 
 
+# Reserved meta-squad slugs: packs that exist to gate/frame OTHER squads'
+# work rather than to receive routed goals themselves. They must never be
+# reachable through automatic selection (keyword/industry match, LLM
+# fallback) OR through explicit force-selection (--squad flag, goal-text
+# --squad extraction, pre-seeded `selected_squads`). Both containment sites
+# import this set: classify_intent (below) for automatic/LLM selection, and
+# hydra_core.supervisor's force-select handling for explicit selection.
+#
+# "planning" is the first entry: it decomposes and gates the plan a routed
+# goal produces, so routing a goal TO it as if it were an ordinary domain
+# squad would be a category error, and P5's planning-task seeding is the
+# only sanctioned way it ever runs.
+RESERVED_META_SQUADS: frozenset[str] = frozenset({"planning"})
+
 # Keyword fingerprints per domain. Hand-tuned, not learned. Add as you scaffold.
 _KEYWORDS: dict[str, tuple[str, ...]] = {
     "engineering": (
@@ -179,15 +193,21 @@ def classify_intent(
     # Explicit operator selection (--squad / pre-seeded selected_squads) bypasses
     # this filter; that path lives in supervisor.node_intake, which emits a trace
     # event when a stub is explicitly selected but still proceeds.
+    #
+    # Reserved meta-squads (RESERVED_META_SQUADS) are folded into the same
+    # exclusion set, but — unlike stubs — they are NEVER reachable even via
+    # explicit operator force-selection; supervisor.node_intake enforces that
+    # half separately (there is no bypass for a reserved slug).
     _stub_slugs: frozenset[str] = frozenset(
         slug for slug, pack in packs.items() if pack.entrypoint == "stub"
     )
+    _excluded_slugs: frozenset[str] = _stub_slugs | (RESERVED_META_SQUADS & set(packs))
 
     # Deterministic keyword pass
     for slug, kws in _KEYWORDS.items():
         if slug not in packs:
             continue
-        if slug in _stub_slugs:  # MU9a: skip non-executable stubs
+        if slug in _excluded_slugs:  # MU9a + reserved meta-squads
             continue
         hits = sum(1 for k in kws if re.search(rf"\b{re.escape(k)}\b", text_l))
         if hits:
@@ -195,7 +215,7 @@ def classify_intent(
 
     # Industry-tag boost
     for slug, pack in packs.items():
-        if slug in _stub_slugs:  # MU9a: skip non-executable stubs
+        if slug in _excluded_slugs:  # MU9a + reserved meta-squads
             continue
         overlap = set(industries) & set(pack.industries)
         if overlap:
@@ -220,7 +240,7 @@ def classify_intent(
         try:
             squads = classify_callable(text, packs) or []
             # MU9a: filter stubs and unknown slugs from LLM-returned list
-            squads = [s for s in squads if s in packs and s not in _stub_slugs]
+            squads = [s for s in squads if s in packs and s not in _excluded_slugs]
             if squads:
                 return RoutingDecision(
                     squads=squads,
@@ -231,8 +251,8 @@ def classify_intent(
         except Exception as e:
             # MU9a: prefer non-stub for the error-path default
             _err_default = next(
-                (s for s in ("executive",) if s in packs and s not in _stub_slugs),
-                next((s for s in packs if s not in _stub_slugs), ""),
+                (s for s in ("executive",) if s in packs and s not in _excluded_slugs),
+                next((s for s in packs if s not in _excluded_slugs), ""),
             ) or next(iter(packs), "")
             return RoutingDecision(
                 squads=[_err_default] if _err_default else [],
@@ -244,8 +264,8 @@ def classify_intent(
     # Last resort: send to executive for human-triage.
     # MU9a: prefer a non-stub default; fall back to any pack only if no non-stubs exist.
     default = next(
-        (s for s in ("executive",) if s in packs and s not in _stub_slugs),
-        next((s for s in packs if s not in _stub_slugs), ""),
+        (s for s in ("executive",) if s in packs and s not in _excluded_slugs),
+        next((s for s in packs if s not in _excluded_slugs), ""),
     ) or next(iter(packs), "")
     return RoutingDecision(
         squads=[default] if default else [],
