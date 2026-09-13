@@ -648,6 +648,132 @@ def test_write_repo_artifact_error_contract_is_total(tmp_path, kwargs):
 
 
 # --------------------------------------------------------------------------- #
+# write_repo_artifact -- THREE Path.resolve() calls sit outside a filesystem  #
+# error conversion: repo_root's own resolve (inside _validate_repo_root),     #
+# the candidate path's resolve, and each allowed_roots entry's resolve. A     #
+# cross-vendor judge demonstrated a raw exception escaping through the       #
+# candidate-path resolve by injecting a failure into Path.resolve; a second   #
+# review pass, injecting a failure at each successive resolve() call in      #
+# ordinal order (1st, 2nd, 3rd), found the repo_root resolve (ordinal #1)     #
+# was only caught as `except OSError`, not the broader `except Exception`     #
+# the other two use -- so a non-OSError injected there still escaped raw.    #
+# Measured against a real filesystem, none of the three is reachable through  #
+# caller-supplied input on a normal filesystem (a real symlink loop does not  #
+# raise -- see the dedicated symlink-loop test below), so these three tests   #
+# inject the failure directly via monkeypatch rather than trying to          #
+# construct a triggering input. Each test targets exactly one of the three   #
+# sites (by comparing `self` against the one Path value that call resolves), #
+# so a future reordering of the function's resolve calls makes the matching  #
+# test fail loudly rather than silently exercise the wrong site.            #
+# --------------------------------------------------------------------------- #
+
+
+def test_write_repo_artifact_repo_root_resolve_failure_is_wrapped(tmp_path, monkeypatch):
+    # Targets ONLY the `candidate_root.resolve()` call inside
+    # _validate_repo_root (resolve ordinal #1): fake_resolve raises when
+    # `self` is exactly the unresolved repo_root path and defers to the
+    # real resolve() everywhere else -- including the candidate-path and
+    # allowed_roots resolves that happen afterward -- so this case is
+    # genuinely distinct from the two below. This is the site that was
+    # previously caught only by `except OSError`, so a non-OSError
+    # (RuntimeError) is used here specifically to prove the widened
+    # `except Exception` now catches it too.
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    real_resolve = Path.resolve
+    target = tmp_path
+
+    def fake_resolve(self, *args, **kwargs):
+        if self == target:
+            raise RuntimeError("injected repo_root resolve failure")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises(ArtifactStoreError) as excinfo:
+        write_repo_artifact(tmp_path, "docs/plans/x.html", "content")
+    assert type(excinfo.value) is ArtifactStoreError
+    assert "could not be resolved" in str(excinfo.value)
+    after = set(tmp_path.rglob("*"))
+    assert after == before, "no file or directory may be created on refusal"
+
+
+def test_write_repo_artifact_candidate_resolve_failure_is_wrapped(tmp_path, monkeypatch):
+    # Targets ONLY the `(root / relative).resolve()` call (resolve ordinal
+    # #2): fake_resolve raises when `self` is exactly the unresolved
+    # candidate path (tmp_path/"docs/plans/x.html") and defers to the real
+    # resolve() everywhere else -- including the repo_root resolve inside
+    # _validate_repo_root (ordinal #1) and the allowed_roots resolve a few
+    # lines later (ordinal #3) -- so this case is genuinely distinct from
+    # both.
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    real_resolve = Path.resolve
+    target = tmp_path / "docs" / "plans" / "x.html"
+
+    def fake_resolve(self, *args, **kwargs):
+        if self == target:
+            raise RuntimeError("injected candidate resolve failure")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises(ArtifactStoreError) as excinfo:
+        write_repo_artifact(tmp_path, "docs/plans/x.html", "content")
+    assert type(excinfo.value) is ArtifactStoreError
+    assert "docs/plans/x.html" in str(excinfo.value)
+    after = set(tmp_path.rglob("*"))
+    assert after == before, "no file or directory may be created on refusal"
+
+
+def test_write_repo_artifact_allowed_root_resolve_failure_is_wrapped(tmp_path, monkeypatch):
+    # Targets ONLY the `(root / allowed).resolve()` call inside the
+    # allowed_roots loop (resolve ordinal #3): fake_resolve raises when
+    # `self` is exactly the unresolved default allowed root
+    # (tmp_path/"docs/plans") and defers to the real resolve() everywhere
+    # else -- including the repo_root resolve (ordinal #1) and the
+    # candidate path resolve (ordinal #2, which has an extra "x.html"
+    # component and so is never equal to this target) -- so this case
+    # exercises a genuinely different call than either of the two above.
+    (tmp_path / "docs" / "plans").mkdir(parents=True)
+    real_resolve = Path.resolve
+    allowed_target = tmp_path / "docs" / "plans"
+
+    def fake_resolve(self, *args, **kwargs):
+        if self == allowed_target:
+            raise RuntimeError("injected allowed_roots resolve failure")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises(ArtifactStoreError) as excinfo:
+        write_repo_artifact(tmp_path, "docs/plans/x.html", "content")
+    assert type(excinfo.value) is ArtifactStoreError
+    assert "docs/plans" in str(excinfo.value)
+    after = set(tmp_path.rglob("*"))
+    assert after == before, "no file or directory may be created on refusal"
+
+
+def test_write_repo_artifact_real_symlink_loop_unchanged(tmp_path):
+    # This is the case a reader will assume motivated the two wraps above --
+    # and it did not. A real symlink loop under docs/plans does NOT make
+    # resolve() raise: with strict=False (the default) it returns a path
+    # rather than raising, so the contract here is still enforced entirely
+    # by the existing containment check (candidate.is_relative_to(root)),
+    # not by the new wraps. This pins that measured behavior so a future
+    # reader does not go looking for a bug in the wraps that cannot occur
+    # through this path.
+    plans = tmp_path / "docs" / "plans"
+    plans.mkdir(parents=True)
+    loop = plans / "loop"
+    try:
+        loop.symlink_to(loop)
+    except OSError:
+        pytest.skip("platform/user cannot create symlinks")
+    with pytest.raises(ArtifactStoreError) as excinfo:
+        write_repo_artifact(tmp_path, "docs/plans/loop/x.html", "content")
+    assert type(excinfo.value) is ArtifactStoreError
+
+
+# --------------------------------------------------------------------------- #
 # write_repo_artifact -- the validation pass must not become an over-broad   #
 # rejection: every one of these must still succeed                          #
 # --------------------------------------------------------------------------- #
