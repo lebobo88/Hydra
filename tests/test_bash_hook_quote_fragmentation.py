@@ -912,8 +912,8 @@ class TestThirdRevisionPropertyNotInstance:
     def test_removing_clobber_operator_support_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "$hits = [regex]::Matches($cmd, '>{1,2}\\|?\\s*')",
-            "$hits = [regex]::Matches($cmd, '>{1,2}\\s*')",
+            "$hits = Get-HeredocOnlyRegexMatches $cmd '>{1,2}\\|?\\s*'",
+            "$hits = Get-HeredocOnlyRegexMatches $cmd '>{1,2}\\s*'",
         )
         result = self._run(
             patched_hook, f"echo x {_CLOBBER_OP} {BLOCKED_REL}", cwd=project_dir, project_dir=project_dir
@@ -1539,8 +1539,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_dd_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $ddHits = [regex]::Matches($cmd, '\\bdd\\b')",
-            "if ($false) {\n    $ddHits = [regex]::Matches($cmd, '\\bdd\\b')",
+            "if (-not $matched) {\n    $ddHits = Get-HeredocOnlyRegexMatches $cmd '\\bdd\\b'",
+            "if ($false) {\n    $ddHits = Get-HeredocOnlyRegexMatches $cmd '\\bdd\\b'",
         )
         result = self._run(patched_hook, _dd_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
         assert result.returncode == 0, (
@@ -1551,8 +1551,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_truncate_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $truncHits = [regex]::Matches($cmd, '\\btruncate\\b')",
-            "if ($false) {\n    $truncHits = [regex]::Matches($cmd, '\\btruncate\\b')",
+            "if (-not $matched) {\n    $truncHits = Get-HeredocOnlyRegexMatches $cmd '\\btruncate\\b'",
+            "if ($false) {\n    $truncHits = Get-HeredocOnlyRegexMatches $cmd '\\btruncate\\b'",
         )
         result = self._run(patched_hook, _truncate_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
         assert result.returncode == 0, (
@@ -1563,8 +1563,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_ln_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $lnHits = [regex]::Matches($cmd, '\\bln\\b')",
-            "if ($false) {\n    $lnHits = [regex]::Matches($cmd, '\\bln\\b')",
+            "if (-not $matched) {\n    $lnHits = Get-HeredocOnlyRegexMatches $cmd '\\bln\\b'",
+            "if ($false) {\n    $lnHits = Get-HeredocOnlyRegexMatches $cmd '\\bln\\b'",
         )
         result = self._run(patched_hook, _ln_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
         assert result.returncode == 0, (
@@ -1575,8 +1575,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_install_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $instHits = [regex]::Matches($cmd, '\\binstall\\b')",
-            "if ($false) {\n    $instHits = [regex]::Matches($cmd, '\\binstall\\b')",
+            "if (-not $matched) {\n    $instHits = Get-HeredocOnlyRegexMatches $cmd '\\binstall\\b'",
+            "if ($false) {\n    $instHits = Get-HeredocOnlyRegexMatches $cmd '\\binstall\\b'",
         )
         result = self._run(patched_hook, _install_cmd(BLOCKED_REL), cwd=project_dir, project_dir=project_dir)
         assert result.returncode == 0, (
@@ -1613,8 +1613,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_os_replace_rename_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $osrHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*')",
-            "if ($false) {\n    $osrHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*')",
+            "if (-not $matched) {\n    $osrHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*'",
+            "if ($false) {\n    $osrHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*(?:replace|rename)\\s*\\(\\s*'",
         )
         cmd = f"python -c \"import os; os.replace('a','{BLOCKED_REL}')\""
         result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
@@ -1626,8 +1626,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_os_symlink_link_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $oslHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*')",
-            "if ($false) {\n    $oslHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*')",
+            "if (-not $matched) {\n    $oslHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*'",
+            "if ($false) {\n    $oslHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*(?:symlink|link)\\s*\\(\\s*'",
         )
         cmd = f"python -c \"import os; os.symlink('a','{BLOCKED_REL}')\""
         result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
@@ -1639,8 +1639,8 @@ class TestFifthRevisionPropertyNotInstance:
     def test_removing_os_truncate_detection_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         patched_hook = self._patched_hook(
             tmp_path,
-            "if (-not $matched) {\n    $otHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*')",
-            "if ($false) {\n    $otHits = [regex]::Matches($cmd, '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*')",
+            "if (-not $matched) {\n    $otHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*'",
+            "if ($false) {\n    $otHits = Get-HeredocOnlyRegexMatches $cmd '\\bos\\s*\\.\\s*truncate\\s*\\(\\s*'",
         )
         cmd = f"python -c \"import os; os.truncate('{BLOCKED_REL}', 0)\""
         result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
@@ -2359,6 +2359,151 @@ class TestDotPrecededAttributeNotCommandWord:
         )
         assert "cp/mv/copy/move" not in result.stderr, (
             f"'copy' in 'shutil.copy(' was misread as a shell command word: "
+            f"stderr={result.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ELEVENTH REVISION (2026-09) — heredoc-body false positive.
+#
+# Every write-idiom regex-hit scan above operated on the WHOLE $cmd string
+# with no notion of a heredoc BODY: text a shell hands to the reader program
+# verbatim (`cat <<'EOF'` ... the lines up to the terminator `EOF`), never
+# shell syntax at all. A heredoc body that happens to contain a discriminated
+# write-idiom shape — even a bare `install x hydra_core/supervisor.py` with
+# NO quoting or grouping whatsoever — was read as if it were a real command:
+# measured 2 (BLOCKED) on this branch at a1284c8 for all three bracket/plain
+# shapes below, 0 on main@29dbe89. The plain-install shape (no grouping at
+# all) proves the cause is the write-idiom inventory scanning heredoc bodies,
+# not the grouping work from earlier revisions.
+#
+# The fix extends the SAME quote/escape mask this file already built
+# (Get-QuoteOnlyMask / Get-UnquotedMask) with a heredoc-body state
+# (Get-HeredocOnlyMask / Set-HeredocBodyMask) and excludes heredoc-body
+# positions from every write-idiom regex-hit filter
+# (Get-HeredocOnlyRegexMatches) — NOT from Test-IsUnquotedAt itself, because
+# an earlier attempt at this fix folded heredoc exclusion into the same
+# quote-based filter used everywhere and broke two real, already-tested
+# cases: a `python -c "open(...)"` one-liner (trigger text legitimately
+# inside the double-quoted `-c "..."` argument) and the xargs placeholder
+# tests' `sh -c 'echo x > {}'` (the `>` legitimately inside a single-quoted
+# nested-shell script). The heredoc DESTINATION check (`cat <<EOF > dest`,
+# tested separately below) is untouched — only the BODY is treated as data.
+# ---------------------------------------------------------------------------
+
+
+class TestHeredocBodyExclusion:
+    def test_bracket_install_in_body_single_quoted_delim_allowed(self, project_dir: Path):
+        cmd = "cat <<'EOF'\n{ install x " + BLOCKED_REL + "; }\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_bracket_install_in_body_unquoted_delim_allowed(self, project_dir: Path):
+        cmd = "cat <<EOF\n{ install x " + BLOCKED_REL + "; }\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_plain_install_in_body_no_grouping_allowed(self, project_dir: Path):
+        """The shape that proves the bug is in the write-idiom inventory, not
+        the grouping work: no quoting, no braces, no parens at all."""
+        cmd = "cat <<'EOF'\ninstall x " + BLOCKED_REL + "\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_plain_path_in_body_already_allowed(self, project_dir: Path):
+        """Baseline: a heredoc body naming the protected path with no write
+        idiom at all was already allowed before this revision."""
+        cmd = "cat <<'EOF'\n" + BLOCKED_REL + "\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_double_quoted_delimiter_body_allowed(self, project_dir: Path):
+        cmd = 'cat <<"EOF"\ninstall x ' + BLOCKED_REL + "\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_dash_form_tab_indented_terminator_body_allowed(self, project_dir: Path):
+        """`<<-WORD` permits leading tabs on the delimiter line (and, by
+        common shell convention, on body lines too); the body content itself
+        must still be excluded."""
+        cmd = "cat <<-'EOF' > docs/notes.md\n\tinstall x " + BLOCKED_REL + "\n\tEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_two_heredocs_in_one_command_both_bodies_excluded(self, project_dir: Path):
+        """A write-idiom shape inside the body of the SECOND heredoc must
+        also be excluded, and the first heredoc's body/terminator must not
+        confuse detection of the second."""
+        cmd = (
+            "cat <<'A' >> docs/notes.md\nfirst\nA\n"
+            "cat <<'B' >> docs/notes2.md\nsecond install x " + BLOCKED_REL + "\nB"
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_heredoc_destination_still_blocked(self, project_dir: Path):
+        """The heredoc's own DESTINATION (on the opener line, `> dest`) is a
+        real write target and must stay blocked — only the BODY is data."""
+        cmd = "cat <<'EOF' > " + BLOCKED_REL + "\nx\nEOF"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_real_world_docs_write_with_install_instructions_allowed(self, project_dir: Path):
+        """The real-world case this fix exists for: a heredoc writes
+        DOCUMENTATION to an allowed extension, and that documentation's body
+        happens to mention an install command naming a protected path."""
+        cmd = (
+            "cat <<'EOF' > docs/notes.md\n"
+            "Setup: { install x " + BLOCKED_REL + "; }\n"
+            "EOF"
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestEleventhRevisionPropertyNotInstance:
+    """Prove the heredoc-body exclusion is load-bearing: patch out exactly
+    the line that marks body characters in Get-HeredocOnlyMask's output
+    (falling back to an always-empty heredoc mask, i.e. no heredoc awareness
+    at all) and confirm the plain-install-in-heredoc-body false positive
+    returns (exit 2)."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_heredoc_body_marking_reintroduces_the_false_positive(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        needle = "        for ($k = $bodyStart; $k -lt $bodyEnd; $k++) { $bodyMask[$k] = $true }"
+        assert (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8").count(needle) == 1, (
+            "expected exactly one occurrence; test is stale"
+        )
+        patched_hook = self._patched_hook(tmp_path, needle, "")
+        cmd = "cat <<'EOF'\ninstall x " + BLOCKED_REL + "\nEOF"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, (
+            f"property check failed: removing the heredoc-body marking should "
+            f"have reintroduced the false positive, but rc={result.returncode} "
             f"stderr={result.stderr}"
         )
 

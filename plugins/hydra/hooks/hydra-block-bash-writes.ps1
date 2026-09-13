@@ -365,7 +365,18 @@ function _bwEffCwdAt([int]$atIndex) {
 # `;` or `|` (e.g. inside an echoed string or a commit message) is also, and
 # was already incorrectly, not a real separator; that pre-existing gap is
 # fixed as a side effect of fixing the grouping regression.
-function Get-UnquotedMask {
+function Get-QuoteOnlyMask {
+    # Pure quote/escape state — no heredoc knowledge. This is the original
+    # single-quote / double-quote / backslash-escape tracker; kept as its own
+    # function (rather than folded straight into Get-UnquotedMask) because
+    # Get-HeredocOnlyMask below needs it to decide whether a `<<` sits in real
+    # (unquoted) shell syntax BEFORE heredoc bodies can even be located, and
+    # every write-idiom regex-hit filter (Get-HeredocOnlyRegexMatches) needs
+    # "am I in a heredoc body" WITHOUT also excluding quoted text — a write
+    # idiom's trigger text legitimately lives inside a quoted string in real,
+    # already-tested shapes (a python one-liner's `open(`/`Path(`/
+    # `shutil.copy(` inside the double-quoted `-c "..."` argument that
+    # carries it; a nested `sh -c '...'` script's real `>` operator).
     param([string]$s)
     if (-not $script:_bwQuoteMaskCache) { $script:_bwQuoteMaskCache = @{} }
     if ($script:_bwQuoteMaskCache.ContainsKey($s)) { return $script:_bwQuoteMaskCache[$s] }
@@ -409,6 +420,137 @@ function Get-UnquotedMask {
     return $mask
 }
 
+function Get-HeredocOnlyMask {
+    # bool[] where TRUE means "this character sits inside a heredoc BODY"
+    # (never a quote judgment — see Get-QuoteOnlyMask's comment for why the
+    # two are kept separate). Built by walking Get-QuoteOnlyMask's output to
+    # find real (unquoted) `<<` heredoc openers and marking each body span;
+    # see Set-HeredocBodyMask for the shape-detection rules this shares with
+    # Get-UnquotedMask.
+    param([string]$s)
+    if (-not $script:_bwHeredocMaskCache) { $script:_bwHeredocMaskCache = @{} }
+    if ($script:_bwHeredocMaskCache.ContainsKey($s)) { return $script:_bwHeredocMaskCache[$s] }
+    $quoteMask = Get-QuoteOnlyMask $s
+    $n = $s.Length
+    $heredocMask = New-Object 'bool[]' $n
+    Set-HeredocBodyMask $s $quoteMask $heredocMask
+    $script:_bwHeredocMaskCache[$s] = $heredocMask
+    return $heredocMask
+}
+
+function Get-UnquotedMask {
+    # Combined mask: TRUE only where a character is both outside any quote
+    # AND outside any heredoc body — the "real, live shell syntax" test used
+    # by the command-word boundary scan (Test-IsCommandWord) and the two
+    # brace-group predicates. NOT used for the write-idiom regex-hit filter
+    # (see Get-HeredocOnlyRegexMatches, which excludes heredoc bodies only —
+    # quoted text must stay eligible there).
+    param([string]$s)
+    if (-not $script:_bwCombinedMaskCache) { $script:_bwCombinedMaskCache = @{} }
+    if ($script:_bwCombinedMaskCache.ContainsKey($s)) { return $script:_bwCombinedMaskCache[$s] }
+    $q = Get-QuoteOnlyMask $s
+    $h = Get-HeredocOnlyMask $s
+    $n = $s.Length
+    $mask = New-Object 'bool[]' $n
+    for ($i = 0; $i -lt $n; $i++) { $mask[$i] = $q[$i] -and (-not $h[$i]) }
+    $script:_bwCombinedMaskCache[$s] = $mask
+    return $mask
+}
+
+# --- HEREDOC-BODY MASK STATE (security hardening, 2026-09, fourth revision) --
+# ROOT CAUSE this closes: every write-idiom scan below (`[regex]::Matches($cmd,
+# ...)` for cp/mv/tee/redirect/install/dd/truncate/ln/python-open/Set-Content/
+# etc.) inspects the WHOLE command string with no idea that a heredoc's BODY
+# (`cat <<'EOF'` ... the lines up to the terminator `EOF`) is DATA the shell
+# hands to the reader program verbatim, not shell syntax at all. A heredoc
+# body that happens to contain a discriminated write-idiom shape — even a bare
+# `install x hydra_core/supervisor.py` with no quoting or grouping whatsoever
+# — was read as if it were a real command, a proven FALSE POSITIVE (measured
+# 2 on this branch, 0 on main@29dbe89, for a plain-install body with no
+# grouping at all — so the cause is the write-idiom inventory scanning heredoc
+# bodies, not the grouping work in earlier revisions). This is data, not code:
+# a genuine bypass would need the reconstructed *destination* to name a
+# protected path, and the heredoc's own destination (the `> dest` on the
+# opener line, matched by the existing branch below) is UNTOUCHED by this —
+# only the interior text of the body is excluded.
+#
+# Set-HeredocBodyMask extends the SAME mask Get-UnquotedMask already builds
+# for quote state — heredoc-body characters are marked exactly like quoted
+# characters (mask entry = $false, "not real unquoted shell syntax") rather
+# than introducing a fourth, independent notion of position; every caller
+# that already excludes quoted spans via Test-IsUnquotedAt (the command-word
+# boundary scan, the brace-group predicates, and — with this revision — every
+# write-idiom regex-hit filter) transparently also excludes heredoc bodies.
+#
+# A heredoc opens at `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`, or `<<\WORD`
+# in UNQUOTED context (checked against the mask as already built from real
+# quotes, so a `<<` appearing inside a quoted string is not a heredoc at
+# all). The `-` form permits leading tabs on the delimiter line; a quoted or
+# backslash-escaped delimiter does not change body detection here (it only
+# changes whether the shell would expand `$…`/backticks INSIDE the body,
+# which this hook never interprets for either quoting style). The body runs
+# from the end of the opener's own line to the line whose entire (optionally
+# tab-stripped) content equals the delimiter. The scan advances past each
+# body it finds before searching for the next `<<`, so `<<`-shaped text
+# INSIDE a body (literal heredoc-body text, not a nested heredoc) is never
+# mistaken for a new heredoc open — this is what makes two heredocs in one
+# command, and a heredoc whose body happens to mention `<<`, both behave.
+function Set-HeredocBodyMask {
+    # $quoteMask decides whether a `<<` found in $s is real (unquoted) shell
+    # syntax at all; $bodyMask is the OUTPUT — every body-interior index found
+    # is set to $true in it. Kept as two separate arrays (rather than mutating
+    # one mask in place) so callers can ask "is this a heredoc body?" without
+    # that answer being entangled with "is this quoted?" (see Get-QuoteOnlyMask).
+    param([string]$s, [bool[]]$quoteMask, [bool[]]$bodyMask)
+    $n = $s.Length
+    $i = 0
+    while ($true) {
+        $idx = $s.IndexOf('<<', $i)
+        if ($idx -lt 0) { break }
+        if ($idx -ge $n -or -not $quoteMask[$idx]) { $i = $idx + 2; continue }
+        $j = $idx + 2
+        $dashForm = $false
+        if ($j -lt $n -and $s[$j] -eq '-') { $dashForm = $true; $j++ }
+        while ($j -lt $n -and ($s[$j] -eq ' ' -or $s[$j] -eq "`t")) { $j++ }
+        $delim = $null
+        if ($j -lt $n -and $s[$j] -eq '\') {
+            $j++
+            $wordStart = $j
+            while ($j -lt $n -and $s[$j] -match '[A-Za-z0-9_]') { $j++ }
+            if ($j -gt $wordStart) { $delim = $s.Substring($wordStart, $j - $wordStart) }
+        } elseif ($j -lt $n -and ($s[$j] -eq "'" -or $s[$j] -eq '"')) {
+            $q = $s[$j]; $j++
+            $wordStart = $j
+            while ($j -lt $n -and $s[$j] -ne $q) { $j++ }
+            $delim = $s.Substring($wordStart, $j - $wordStart)
+            if ($j -lt $n) { $j++ }
+        } else {
+            $wordStart = $j
+            while ($j -lt $n -and $s[$j] -match '[A-Za-z0-9_]') { $j++ }
+            if ($j -gt $wordStart) { $delim = $s.Substring($wordStart, $j - $wordStart) }
+        }
+        if (-not $delim) { $i = $idx + 2; continue }
+        # Body starts on the line AFTER the opener's own line.
+        $openerLineEnd = $s.IndexOf("`n", $j)
+        if ($openerLineEnd -lt 0) { $i = $idx + 2; continue }
+        $bodyStart = $openerLineEnd + 1
+        $lineStart = $bodyStart
+        $bodyEnd = $n
+        $terminatorFound = $false
+        while ($lineStart -le $n) {
+            $nl = $s.IndexOf("`n", $lineStart)
+            $lineStop = $(if ($nl -lt 0) { $n } else { $nl })
+            $lineText = $s.Substring($lineStart, $lineStop - $lineStart).TrimEnd("`r")
+            $checkText = $(if ($dashForm) { $lineText.TrimStart("`t") } else { $lineText })
+            if ($checkText -eq $delim) { $bodyEnd = $lineStart; $terminatorFound = $true; break }
+            if ($nl -lt 0) { break }
+            $lineStart = $nl + 1
+        }
+        for ($k = $bodyStart; $k -lt $bodyEnd; $k++) { $bodyMask[$k] = $true }
+        $i = $(if ($terminatorFound) { $bodyEnd } else { $n })
+    }
+}
+
 function Test-IsUnquotedAt {
     # True when $s[$idx] sits in real (unquoted, unescaped) shell syntax —
     # i.e. it is eligible to be interpreted as a statement-boundary character
@@ -417,6 +559,47 @@ function Test-IsUnquotedAt {
     param([string]$s, [int]$idx)
     if ($idx -lt 0 -or $idx -ge $s.Length) { return $true }
     return (Get-UnquotedMask $s)[$idx]
+}
+
+function Test-IsInHeredocBody {
+    # True when $s[$idx] sits inside a heredoc BODY — regardless of quote
+    # state. Used by Get-HeredocOnlyRegexMatches to exclude heredoc-body text
+    # from every write-idiom branch's regex-hit scan WITHOUT also excluding
+    # quoted text (see that function's comment for why quoted text must stay
+    # eligible). Out-of-range indices are never inside a body.
+    param([string]$s, [int]$idx)
+    if ($idx -lt 0 -or $idx -ge $s.Length) { return $false }
+    return (Get-HeredocOnlyMask $s)[$idx]
+}
+
+function Get-HeredocOnlyRegexMatches {
+    # EVERY write-idiom branch below locates its trigger keyword/operator via
+    # `[regex]::Matches($cmd, ...)` over the WHOLE command string. Wrapping
+    # that call here discards any hit whose START position sits inside a
+    # heredoc BODY (Test-IsInHeredocBody) — heredoc-body text is DATA the
+    # shell hands to the reader program verbatim, never shell or python
+    # syntax, regardless of which branch is looking at it.
+    #
+    # This deliberately excludes ONLY heredoc bodies, never quoted text: a
+    # write-idiom keyword/operator legitimately appears inside a quoted
+    # string in (at least) two real, already-tested shapes — a python
+    # one-liner's `open(`/`Path(`/`shutil.copy(`/etc. living inside the
+    # double-quoted `-c "..."` argument that carries it, and a nested shell
+    # invocation's real operator living inside a quoted `sh -c '...'`/
+    # `bash -c "..."` script (e.g. `xargs -I{} sh -c 'echo x > {}'`, where the
+    # `>` is single-quoted but is genuinely executed by the inner shell).
+    # Excluding quoted spans here — as an earlier revision of this fix did —
+    # silently un-detects both: a proven regression (`python -c "open(...)"`
+    # writes going undetected, and the xargs placeholder tests' `sh -c` `>`
+    # no longer being seen at all). Quote-awareness for the discriminated
+    # command-word idioms (dd/truncate/ln/install) is instead handled where
+    # it already lived, inside Test-IsCommandWord's own boundary scan.
+    param([string]$s, [string]$pattern)
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($m in [regex]::Matches($s, $pattern)) {
+        if (-not (Test-IsInHeredocBody $s $m.Index)) { [void]$result.Add($m) }
+    }
+    return $result
 }
 
 function Test-IsGroupCloseBrace {
@@ -955,7 +1138,7 @@ $reason  = ''
 #    whitespace before `|` already ends the destination read there, and the
 #    `\|?` here only ever consumes a `|` glued directly onto the `>`.
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '>{1,2}\|?\s*')
+    $hits = Get-HeredocOnlyRegexMatches $cmd '>{1,2}\|?\s*'
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
         if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
@@ -969,7 +1152,7 @@ if (-not $matched) {
 # 2. tee [flags] filename
 #    e.g.  cmd | tee output.py    cmd | tee -a file.ts
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '\btee\s+(?:-[ai]\s+)*')
+    $hits = Get-HeredocOnlyRegexMatches $cmd '\btee\s+(?:-[ai]\s+)*'
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
         if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
@@ -994,7 +1177,7 @@ if (-not $matched) {
 #    e.g.  cp template.py src/newfile.py    mv old.js new.ts
 #          cp supervisor.py -t hydra_core   (writes hydra_core/supervisor.py)
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '\b(?:cp|mv|copy|move)\b')
+    $hits = Get-HeredocOnlyRegexMatches $cmd '\b(?:cp|mv|copy|move)\b'
     foreach ($hit in $hits) {
         $argsList = Get-ShellArgsInRange $cmd ($hit.Index + $hit.Length) $cmd.Length
         $targetDirTok = $null
@@ -1089,7 +1272,7 @@ if (-not $matched) {
     #        explicit `io\s*\.\s*open|codecs\s*\.\s*open` alternation here;
     #        it was dead code (removed 2026-09) — TestIoCodecsOpen below
     #        still proves the behavior holds without it.
-    $openHits = [regex]::Matches($cmd, '\bopen\s*\(\s*')
+    $openHits = Get-HeredocOnlyRegexMatches $cmd '\bopen\s*\(\s*'
     foreach ($oh in $openHits) {
         $arg1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
         if (-not $arg1) { continue }
@@ -1119,7 +1302,7 @@ if (-not $matched) {
 #        NOT a write — matches the same write-mode convention as every other
 #        branch (a mode containing w/a/x is a write; bare 'r' is not).
 if (-not $matched) {
-    $plHits = [regex]::Matches($cmd, '\bPath\s*\(\s*')
+    $plHits = Get-HeredocOnlyRegexMatches $cmd '\bPath\s*\(\s*'
     foreach ($ph in $plHits) {
         $arg = Read-PyDestExpr $cmd ($ph.Index + $ph.Length)
         if (-not $arg) { continue }
@@ -1171,7 +1354,7 @@ if (-not $matched) {
 #        still degrades to the old (broader, presence-only) behaviour rather
 #        than going undetected.
 if (-not $matched) {
-    $shHits = [regex]::Matches($cmd, '\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\s*\(\s*')
+    $shHits = Get-HeredocOnlyRegexMatches $cmd '\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\s*\(\s*'
     foreach ($sh in $shHits) {
         $a1 = Read-PyDestExpr $cmd ($sh.Index + $sh.Length)
         if (-not $a1) { continue }
@@ -1204,7 +1387,7 @@ if (-not $matched) {
 #    -i flag present) is kept as an OR, not a replacement, so nothing that
 #    used to block stops blocking.
 if (-not $matched) {
-    $sedHits = [regex]::Matches($cmd, '\bsed\b')
+    $sedHits = Get-HeredocOnlyRegexMatches $cmd '\bsed\b'
     foreach ($sh in $sedHits) {
         $argsList = Get-ShellArgsInRange $cmd ($sh.Index + $sh.Length) $cmd.Length
         $hasInPlace = $false
@@ -1251,7 +1434,7 @@ if (-not $matched) {
 #          Get-Template | Out-File -FilePath src/index.ts  → blocked
 #          Set-Content foo.py 'content'              → blocked (positional)
 if (-not $matched) {
-    $scMatches = [regex]::Matches($cmd, '\b(?:Set-Content|Out-File)\b')
+    $scMatches = Get-HeredocOnlyRegexMatches $cmd '\b(?:Set-Content|Out-File)\b'
     foreach ($m in $scMatches) {
         $argsList = Get-ShellArgsInRange $cmd ($m.Index + $m.Length) $cmd.Length
         $nextIsPathValue = $false
@@ -1309,7 +1492,7 @@ if (-not $matched) {
 # 7a. Shell heredoc redirected into a blocked-extension file
 #     e.g.  cat <<'EOF' > src/index.ts ... EOF
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*')
+    $hits = Get-HeredocOnlyRegexMatches $cmd '<<[''"]?\w+[''"]?[^;|&\n]*?>{1,2}\s*'
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
         if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {
@@ -1346,7 +1529,7 @@ if (-not $matched) {
 #    `of=` writes stdout and is not a file write, so no `of=` -> no match.
 #    e.g.  dd if=/dev/zero of=hydra_core/supervisor.py
 if (-not $matched) {
-    $ddHits = [regex]::Matches($cmd, '\bdd\b')
+    $ddHits = Get-HeredocOnlyRegexMatches $cmd '\bdd\b'
     foreach ($dh in $ddHits) {
         if (-not (Test-IsCommandWord $cmd $dh.Index)) { continue }
         $argsList = Get-ShellArgsInRange $cmd ($dh.Index + $dh.Length) $cmd.Length
@@ -1370,7 +1553,7 @@ if (-not $matched) {
 #    skipped, never tested as a destination.
 #    e.g.  truncate -s 0 hydra_core/supervisor.py
 if (-not $matched) {
-    $truncHits = [regex]::Matches($cmd, '\btruncate\b')
+    $truncHits = Get-HeredocOnlyRegexMatches $cmd '\btruncate\b'
     foreach ($th in $truncHits) {
         if (-not (Test-IsCommandWord $cmd $th.Index)) { continue }
         $argsList = Get-ShellArgsInRange $cmd ($th.Index + $th.Length) $cmd.Length
@@ -1401,7 +1584,7 @@ if (-not $matched) {
 #     e.g.  ln -sf a hydra_core/supervisor.py        (creates the link there)
 #           ln -s hydra_core/supervisor.py mylink    (only READS the target — allowed)
 if (-not $matched) {
-    $lnHits = [regex]::Matches($cmd, '\bln\b')
+    $lnHits = Get-HeredocOnlyRegexMatches $cmd '\bln\b'
     foreach ($lh in $lnHits) {
         if (-not (Test-IsCommandWord $cmd $lh.Index)) { continue }
         $argsList = Get-ShellArgsInRange $cmd ($lh.Index + $lh.Length) $cmd.Length
@@ -1463,7 +1646,7 @@ if (-not $matched) {
 #     example.com/cmd/tool@latest`, etc. are never even considered.
 #     e.g.  install /dev/null hydra_core/supervisor.py
 if (-not $matched) {
-    $instHits = [regex]::Matches($cmd, '\binstall\b')
+    $instHits = Get-HeredocOnlyRegexMatches $cmd '\binstall\b'
     foreach ($ih in $instHits) {
         if (-not (Test-IsCommandWord $cmd $ih.Index)) { continue }
         $argsList = Get-ShellArgsInRange $cmd ($ih.Index + $ih.Length) $cmd.Length
@@ -1523,7 +1706,7 @@ if (-not $matched) {
 # 12. python -c os.replace(src, dst) / os.rename(src, dst) — destination is
 #     the SECOND argument; the first (src) is only read.
 if (-not $matched) {
-    $osrHits = [regex]::Matches($cmd, '\bos\s*\.\s*(?:replace|rename)\s*\(\s*')
+    $osrHits = Get-HeredocOnlyRegexMatches $cmd '\bos\s*\.\s*(?:replace|rename)\s*\(\s*'
     foreach ($oh in $osrHits) {
         $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
         if (-not $a1) { continue }
@@ -1544,7 +1727,7 @@ if (-not $matched) {
 # 13. python -c os.symlink(src, dst) / os.link(src, dst) — destination is the
 #     SECOND argument (the new link); the first (src/target) is only read.
 if (-not $matched) {
-    $oslHits = [regex]::Matches($cmd, '\bos\s*\.\s*(?:symlink|link)\s*\(\s*')
+    $oslHits = Get-HeredocOnlyRegexMatches $cmd '\bos\s*\.\s*(?:symlink|link)\s*\(\s*'
     foreach ($oh in $oslHits) {
         $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
         if (-not $a1) { continue }
@@ -1564,7 +1747,7 @@ if (-not $matched) {
 
 # 14. python -c os.truncate(path, size) — destination is the FIRST argument.
 if (-not $matched) {
-    $otHits = [regex]::Matches($cmd, '\bos\s*\.\s*truncate\s*\(\s*')
+    $otHits = Get-HeredocOnlyRegexMatches $cmd '\bos\s*\.\s*truncate\s*\(\s*'
     foreach ($oh in $otHits) {
         $a1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
         if (-not $a1) { continue }
