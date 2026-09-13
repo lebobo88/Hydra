@@ -143,3 +143,7 @@ def _hermetic_hydra_env(request, monkeypatch):
     monkeypatch.delenv("HYDRA_CLAUDE_ENGINEER", raising=False)
     monkeypatch.delenv("HYDRA_DISABLE_CLAUDE_ENGINEER", raising=False)
     monkeypatch.delenv("HYDRA_BEST_OF_N", raising=False)
+    # P5a: HYDRA_PLAN_PHASE ships default-off; pin it off for the whole suite
+    # so no existing test's precedence/routing assertions shift underfoot.
+    # Plan-phase tests opt in explicitly via monkeypatch.setenv in-test.
+    monkeypatch.delenv("HYDRA_PLAN_PHASE", raising=False)

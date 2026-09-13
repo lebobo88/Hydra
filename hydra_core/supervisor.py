@@ -72,6 +72,18 @@ except ImportError:                                                        # pra
     _HAS_LANGGRAPH = False
 
 
+def _plan_phase_enabled() -> bool:
+    """HYDRA_PLAN_PHASE feature flag. Default OFF.
+
+    P5a (graph topology + planner seeding for the planning phase) ships behind
+    this flag so every existing workflow/checkpoint is unaffected until P5b
+    (ingest PLAN materialisation, CLI --rigor/--modify-plan surfaces, flag
+    default flip) lands. ``tests/conftest.py`` pins this env var off for the
+    whole suite; plan-phase tests opt in explicitly via monkeypatch.
+    """
+    return os.environ.get("HYDRA_PLAN_PHASE") == "1"
+
+
 # RC1 — delegation routing: which squad consumes each emitted envelope type
 # when the producing orchestrator (e.g. rlm-gaming) does not name an explicit
 # target_squad. DEV_TASK/PRD/ARCH_RFC -> engineering (pair-programmer);
@@ -228,10 +240,24 @@ def build_supervisor(
     profile: Optional[str] = None,
     force_pure_python: bool = False,
     plan_only: bool = False,
+    force_trivial_plan_rigor: bool = False,
 ):
     """Build a compiled supervisor. Returns the compiled graph if LangGraph is
     installed; otherwise returns a callable that runs the graph step-by-step
     in pure Python (suitable for headless tests).
+
+    `force_trivial_plan_rigor` forces `node_planner`'s HYDRA_PLAN_PHASE rigor
+    result to "trivial" regardless of triage/override, so no planning task is
+    ever seeded. The planning squad is claude-native (see
+    squads/planning/squad.yaml) and therefore attended-only -- it
+    unconditionally defers to a host cursor that does not exist on the
+    detached (`hydra run --live`, i.e. `hydra.workflow.launch`) path, so a
+    detached run that seeded one would park forever. `cli.py`'s `hydra run`
+    passes this for BOTH `--live` (detached) and `--no-checkpoint` (the
+    pure-python runner, which also has no interrupt/host-bridge semantics) --
+    it is deliberately an explicit caller signal, not implied by
+    `force_pure_python` alone, since other pure-python callers (tests
+    included) use that runner without implying "no host is available".
 
     `plan_only` adds ``"dispatch"`` to the graph's ``interrupt_before`` set so a
     run halts after ``planner`` (before any squad executes). It is the engine
@@ -1200,55 +1226,14 @@ def build_supervisor(
                 and any(g.hitl_required for g in squad_pack.gates)
             )
 
-        # (a) requires_human_approval: any high-risk task anywhere in full_tasks.
-        high_risk = any(_task_is_high_risk(t) for t in full_tasks)
-        # E2-32: an UNFUNDED workflow (budget_usd == 0) is not a risk signal.
-        # `is_over_budget()` is `spent >= budget`, which is trivially True for
-        # budget_usd == 0.0 at spent 0.0 -- so the identical goal/squad/risk
-        # required approval at --budget 0 and did not at --budget 0.1. Budget
-        # exhaustion is the dispatch-time gate (`budget.pre_dispatch_block` in
-        # node_dispatch, which fires on the same `spent >= budget` predicate
-        # and includes the zero-budget case); the approval gate stays purely
-        # risk-driven. A funded workflow that is genuinely over budget before
-        # dispatch still requires approval, exactly as before.
-        budget_exhausted = state.budget.budget_usd > 0 and state.is_over_budget()
-        state.requires_human_approval = high_risk or budget_exhausted
-
-        # squad_gate_high_risk: True when any task's squad has an explicit
-        # hitl_required gate (independent of task priority).  This is the
-        # "frozen contract" discriminator: reason="high_risk" is the canonical
-        # value keyed by the mesh console, and it must be preserved whenever a
-        # squad-level HITL gate would have fired regardless of AC.
-        # P0/P1 priority alone does NOT set this flag — those tasks qualify the
-        # AC gate as "high-risk qualifying" but do not set the frozen-contract
-        # squad-gate reason.
-        def _squad_has_hitl_gate(t: "TaskState") -> bool:
-            sp = packs.get(t.owner_squad)
-            return (
-                sp is not None
-                and sp.entrypoint != "stub"
-                and any(g.hitl_required for g in sp.gates)
-            )
-
-        squad_gate_high_risk = any(_squad_has_hitl_gate(t) for t in full_tasks)
-
-        # (b) AC gate: any HIGH-RISK task (qualifying) is MISSING valid criteria.
-        needs_ac_hitl = any(
-            _task_is_high_risk(t) and not _task_has_valid_criteria(t)
-            for t in full_tasks
-        )
-
-        # Merge: AC gate folds into a single pause.
-        if needs_ac_hitl:
-            state.requires_human_approval = True
-
         # -----------------------------------------------------------------------
-        # P3: plan-rigor triage. RECORDING ONLY -- this run seeds no planning
-        # task, sets no plan_status, and does not touch requires_human_approval
-        # or the reason precedence above (those change in a later phase).
-        # Placed HERE: after selected_squads/full_tasks are final, and after the
-        # WS1-E missing-engineering-target surface has already returned above
-        # (a surfaced planner must not pay for triage).
+        # P3/P5a: plan-rigor triage. Moved AHEAD of the high_risk/AC gates below
+        # so (i) a P5a-seeded planning task can join full_tasks before those
+        # gates evaluate it, and (ii) the HYDRA_PLAN_PHASE stand-down further
+        # down has plan_rigor in hand. Placed HERE: after selected_squads/
+        # full_tasks are final, and after the WS1-E missing-engineering-target
+        # surface has already returned above (a surfaced planner must not pay
+        # for triage).
         # -----------------------------------------------------------------------
         _repo_count = len(state.target_repo_ids) if state.target_repo_ids else 1
         _computed_rigor, _rigor_reason = triage_plan(
@@ -1280,6 +1265,110 @@ def build_supervisor(
             plan_rigor = _computed_rigor
             plan_rigor_source = "triage"
 
+        _plan_phase_on = _plan_phase_enabled()
+        if _plan_phase_on and force_trivial_plan_rigor and plan_rigor != "trivial":
+            # See build_supervisor's docstring: `force_trivial_plan_rigor` is
+            # an explicit caller signal (cli.py sets it for `--no-checkpoint`
+            # AND for the detached `hydra run --live` path) that there is no
+            # attended host cursor for the claude-native planning squad to
+            # defer to -- seeding a planning task would park the run forever.
+            # Deliberately NOT keyed off `force_pure_python` alone: plenty of
+            # callers (tests included) use the pure-python runner without
+            # implying "no host", and this must stay an explicit opt-in.
+            # Forced AFTER the override/downgrade bookkeeping above so a
+            # would-be downgrade is still recorded honestly. Gated on the
+            # flag itself: when HYDRA_PLAN_PHASE is off, plan_rigor is a
+            # RECORDING-ONLY telemetry value (nothing reads it to seed
+            # anything), so it must not be silently rewritten for callers that
+            # inspect it independent of the plan phase (e.g. plan_triage tests
+            # exercising node_planner via the pure-python fallback).
+            plan_rigor = "trivial"
+            plan_rigor_source = "forced_trivial_no_host"
+
+        # -----------------------------------------------------------------------
+        # P5a: HYDRA_PLAN_PHASE seeding. Default OFF (see _plan_phase_enabled).
+        # When on and the workflow is not trivial-rigor, seed exactly ONE
+        # planning task (owner_squad="planning") at priority P2 -- never P0/P1,
+        # because a P0/P1 task trips _task_is_high_risk by itself, which would
+        # re-introduce the sight-unseen high_risk approval this phase exists to
+        # replace. Planning is claude-native (squads/planning/squad.yaml) so
+        # this task always defers to the attended host cursor; it never
+        # fabricates a plan in-graph. full_tasks is refreshed immediately so
+        # the gates below (and any later consumer of full_tasks) see it.
+        # -----------------------------------------------------------------------
+        _plan_gate_active = _plan_phase_on and plan_rigor != "trivial"
+        if _plan_gate_active and "planning" not in pre_seeded_squads:
+            synthesised_tasks.append(TaskState(
+                owner_squad="planning",
+                description=f"Author a {plan_rigor}-rigor plan for: {state.root_goal}",
+                priority="P2",
+            ))
+            full_tasks = existing_tasks + synthesised_tasks
+
+        # (a) requires_human_approval: any high-risk task anywhere in full_tasks.
+        high_risk = any(_task_is_high_risk(t) for t in full_tasks)
+        # E2-32: an UNFUNDED workflow (budget_usd == 0) is not a risk signal.
+        # `is_over_budget()` is `spent >= budget`, which is trivially True for
+        # budget_usd == 0.0 at spent 0.0 -- so the identical goal/squad/risk
+        # required approval at --budget 0 and did not at --budget 0.1. Budget
+        # exhaustion is the dispatch-time gate (`budget.pre_dispatch_block` in
+        # node_dispatch, which fires on the same `spent >= budget` predicate
+        # and includes the zero-budget case); the approval gate stays purely
+        # risk-driven. A funded workflow that is genuinely over budget before
+        # dispatch still requires approval, exactly as before.
+        budget_exhausted = state.budget.budget_usd > 0 and state.is_over_budget()
+        # P5a: while the plan gate is active (flag on, non-trivial rigor),
+        # high_risk stands down here -- plan_gate (fed by node_plan_judge /
+        # node_plan_gate) becomes the single informed approval instead of a
+        # sight-unseen approve/reject of a squad list. budget_exhausted is
+        # DELIBERATELY excluded from the stand-down (see the E2-32 note
+        # above): an unfunded workflow is not a risk signal, but a funded
+        # over-budget one still requires approval, and it must still surface
+        # HERE (reason="over_budget", gate_node="approval") rather than
+        # falling through to node_dispatch's pre_dispatch_block
+        # (reason="over_budget", gate_node="dispatch") -- same reason string,
+        # different gate and different consumer semantics. Precedence for
+        # trivial rigor, for legacy checkpoints, and whenever the flag is off
+        # is byte-for-byte unchanged: _plan_gate_active is False in all three
+        # cases, so this collapses to the original `high_risk or
+        # budget_exhausted`.
+        if _plan_gate_active:
+            state.requires_human_approval = budget_exhausted
+        else:
+            state.requires_human_approval = high_risk or budget_exhausted
+
+        # squad_gate_high_risk: True when any task's squad has an explicit
+        # hitl_required gate (independent of task priority).  This is the
+        # "frozen contract" discriminator: reason="high_risk" is the canonical
+        # value keyed by the mesh console, and it must be preserved whenever a
+        # squad-level HITL gate would have fired regardless of AC.
+        # P0/P1 priority alone does NOT set this flag — those tasks qualify the
+        # AC gate as "high-risk qualifying" but do not set the frozen-contract
+        # squad-gate reason.
+        def _squad_has_hitl_gate(t: "TaskState") -> bool:
+            sp = packs.get(t.owner_squad)
+            return (
+                sp is not None
+                and sp.entrypoint != "stub"
+                and any(g.hitl_required for g in sp.gates)
+            )
+
+        squad_gate_high_risk = any(_squad_has_hitl_gate(t) for t in full_tasks)
+
+        # (b) AC gate: any HIGH-RISK task (qualifying) is MISSING valid criteria.
+        needs_ac_hitl = any(
+            _task_is_high_risk(t) and not _task_has_valid_criteria(t)
+            for t in full_tasks
+        )
+
+        # Merge: AC gate folds into a single pause. P5a: stands down alongside
+        # high_risk when the plan gate is active -- acceptance-criteria
+        # soundness is the plan judge/gate's job now, not a sight-unseen
+        # approval here. Unchanged (folds in unconditionally) whenever the
+        # plan gate is inactive, matching the pre-P5a behaviour exactly.
+        if needs_ac_hitl and not _plan_gate_active:
+            state.requires_human_approval = True
+
         out: dict = {
             # APPEND REDUCER: emit only synthesised_tasks (not existing_tasks).
             # Pre-seeded tasks are already in state.tasks; re-emitting them
@@ -1293,6 +1382,14 @@ def build_supervisor(
         }
         if _new_hitl_history:
             out["hitl_history"] = _new_hitl_history
+        if _plan_gate_active:
+            # Explicit write, not an omission: plan_barrier_active reads
+            # plan_status on every dispatch pass, and an omitted key on a
+            # LangGraph patch RETAINS the prior channel value rather than
+            # clearing it -- a stale value here would wedge or falsely
+            # un-wedge the barrier (see the LangGraph LastValue-clear note in
+            # hydra_core/state.py's plan_barrier_active docstring history).
+            out["plan_status"] = "authoring"
 
         if state.requires_human_approval:
             # C2 (mesh-console-unification): the graph interrupts BEFORE the
@@ -1302,6 +1399,23 @@ def build_supervisor(
             # request was only rendered inside node_approval — i.e. AFTER the
             # operator had already resumed — so the approval gate was
             # invisible to both /hydra:status state and the mesh HITL Center.
+            if _plan_gate_active:
+                # P5a: high_risk and needs_ac_hitl both stood down above, so
+                # the only possible driver left is budget_exhausted.
+                hitl = HITLRequest(
+                    workflow_id=state.workflow_id,
+                    origin_squad="hydra",
+                    target_squad="human",
+                    reason="over_budget",
+                    summary=(
+                        f"Budget exhausted before dispatch: "
+                        f"${state.budget.spent_usd:.4f} of "
+                        f"${state.budget.budget_usd:.2f} spent. "
+                        f"Goal: {state.root_goal!r}"
+                    ),
+                    options=["approve_override", "reject", "modify-budget"],
+                    default_option="reject",
+                )
             #
             # REASON PRECEDENCE (WS9 regression fix):
             # The canonical `reason` field is a FROZEN CONTRACT keyed by
@@ -1316,7 +1430,7 @@ def build_supervisor(
             # Missing-criteria information is always surfaced in the summary
             # regardless of which reason wins, so the operator is never blind
             # to missing AC even when `reason="high_risk"`.
-            if needs_ac_hitl and not squad_gate_high_risk:
+            elif needs_ac_hitl and not squad_gate_high_risk:
                 # Pure AC gate: a major (P0/P1) task on a squad without a
                 # hitl_required gate is missing acceptance criteria.
                 # No frozen-contract reason to preserve — use the WS9 reason.
@@ -2586,18 +2700,36 @@ def build_supervisor(
                     "hitl_return_node": "dispatch",
                 }
 
+        # P5a: this key pre-declares the node the graph is about to enter, the
+        # same discipline E2-22 established for the deferred-to-host case
+        # below. `state.plan_status`/`plan_barrier_active` reflect the value
+        # going INTO this dispatch pass (this node never writes plan_status),
+        # so these checks are safe to run against `state` directly.
+        if state.plan_status == "drafted":
+            # after_dispatch routes this straight to plan_judge.
+            _dispatch_phase = "planning"
+        elif _plan_authoring_parked(state):
+            # The plan barrier held every non-planning task this pass (the
+            # plan is still authoring/awaiting the plan_gate decision/sent
+            # back for rework) -- after_dispatch routes to await_host. Report
+            # "planning" rather than the E2-22 "executing" default so a
+            # status read mid-pass does not claim work that never ran.
+            _dispatch_phase = "planning"
+        elif _all_tasks_deferred_to_host(state, packs):
+            # E2-22: this key pre-declares the node the graph is about to
+            # enter. When every task was parked for the attended host there is
+            # no next node — after_dispatch ends the pass — so hold the honest
+            # "executing" instead of claiming a judge pass that will not run.
+            _dispatch_phase = "executing"
+        else:
+            _dispatch_phase = "judge_per_squad"
+
         return {
             "envelopes": new_decisions,
             "artifacts": artifacts,
             "verdicts": bon_verdicts,
             "tasks": _forwarded_tasks,
-            # E2-22: this key pre-declares the node the graph is about to
-            # enter. When every task was parked for the attended host there is
-            # no next node — after_dispatch ends the pass — so hold the honest
-            # "executing" instead of claiming a judge pass that will not run.
-            "phase": ("executing"
-                      if _all_tasks_deferred_to_host(state, packs)
-                      else "judge_per_squad"),
+            "phase": _dispatch_phase,
         }
 
     def _reflexion_retry(
@@ -3557,6 +3689,134 @@ def build_supervisor(
         """
         return {"hitl_return_node": None, "phase": "judge_per_squad"}
 
+    # ----- P5a: plan judge + plan gate (plan_approval HITL) -----
+
+    def node_plan_judge(state: HydraState) -> dict[str, Any]:
+        """Judges the drafted plan and files the `plan_approval` HITL gate.
+
+        Runs BEFORE the `plan_gate` interrupt — the same pre-interrupt filing
+        discipline `node_planner` uses for `approval` (see its comment): a
+        gate built inside the interrupted node is invisible to
+        `/hydra:status` and to TheEights' hitl_queue until AFTER the operator
+        has already resumed.
+
+        Routes its verdict through the critique client the graph already
+        injects (`MCPCritiqueClient` when live, `NoOpCritiqueClient` under a
+        null dispatcher) via `dispatch_judge` directly — not a host judge
+        agent, because this is a graph node, not an attended stage.
+
+        Sums the plan's `PlanStep.estimated_budget_usd` values into
+        `plan_detail` and flags `over_plan_budget` when that sum exceeds the
+        budget remaining before dispatch, so the operator sees the number
+        driving the gate rather than having to reconstruct it.
+        """
+        plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
+        plan_steps = plan_ref.get("steps") or []
+        estimated_total = 0.0
+        for step in plan_steps:
+            v = step.get("estimated_budget_usd") if isinstance(step, dict) else None
+            if isinstance(v, (int, float)):
+                estimated_total += float(v)
+        remaining_budget = max(0.0, state.budget.budget_usd - state.budget.spent_usd)
+        over_plan_budget = estimated_total > remaining_budget
+
+        # A PLAN-shaped envelope for the judge to inspect. Prefer the real
+        # plan_ref (set once the ingest PLAN branch materialises it — P5b);
+        # fall back to a minimal stand-in so the judge always has something
+        # concrete to score rather than crashing the gate on an empty plan.
+        plan_envelope: dict[str, Any] = dict(plan_ref) if plan_ref else {
+            "id": str(state.plan_envelope_id or uuid4()),
+            "type": "PLAN",
+            "workflow_id": str(state.workflow_id),
+            "origin_squad": "planning",
+            "target_squad": "hydra",
+            "rigor": state.plan_rigor or "standard",
+            "goal_restatement": state.root_goal,
+            "summary": state.root_goal,
+            "steps": plan_steps,
+        }
+
+        use_client = critique_client if critique_client is not None else NoOpCritiqueClient()
+        try:
+            judge_vendor = (list(judge_policy.preferred_judge_vendors) or ["codex"])[0]
+            verdict = dispatch_judge(
+                envelope=plan_envelope,
+                rubric_id="plan-decomposition-quality@1",
+                judge_vendor=judge_vendor,
+                workflow_id=state.workflow_id,
+                generator_vendor="claude",
+                client=use_client,
+            )
+            verdict_dict = verdict.model_dump(mode="json")
+        except Exception as e:  # noqa: BLE001 — a judge outage must not wedge the plan gate
+            emit_trace(judge_trace_root, state.workflow_id, "plan_judge.error", {
+                "error": str(e),
+            })
+            verdict_dict = {
+                "outcome": "skip",
+                "critique_md": f"[plan_judge error] {e}",
+                "rubric_id": "plan-decomposition-quality@1",
+            }
+
+        plan_detail: dict[str, Any] = {
+            "estimated_total_budget_usd": estimated_total,
+            "remaining_budget_usd": remaining_budget,
+            "over_plan_budget": over_plan_budget,
+            "verdict_outcome": verdict_dict.get("outcome"),
+            "step_count": len(plan_steps),
+        }
+
+        summary = (
+            f"Review plan (rigor={state.plan_rigor}) for goal: {state.root_goal!r} — "
+            f"estimated step budget ${estimated_total:.2f} of ${remaining_budget:.2f} "
+            f"remaining."
+        )
+        if over_plan_budget:
+            summary += " ESTIMATED PLAN COST EXCEEDS REMAINING BUDGET."
+
+        hitl = HITLRequest(
+            workflow_id=state.workflow_id,
+            origin_squad="hydra",
+            target_squad="human",
+            reason="plan_approval",
+            summary=summary,
+            options=["approve", "reject", "modify-budget"],
+            default_option="reject",
+        )
+        hitl_dict = hitl.model_dump(mode="json")
+        hitl_dict["gate_node"] = "plan_gate"  # C2-style dedupe key half
+        hitl_dict["plan_detail"] = plan_detail
+        eights.hitl_request(hitl_dict, gate_node="plan_gate")
+
+        return {
+            "phase": "approval",
+            "plan_status": "judged",
+            "pending_hitl": hitl_dict,
+            "verdicts": [verdict_dict],
+        }
+
+    def node_plan_gate(state: HydraState) -> dict[str, Any]:
+        """Post-resume bookkeeping for the `plan_approval` HITL gate.
+
+        Runs only AFTER the operator resumes past the `plan_gate` interrupt —
+        the gate itself is rendered+filed by `node_plan_judge` above. Mirrors
+        `node_approval`'s clobber guard: only clear a gate this node owns, so
+        a different gate that landed via replay/update_state between the
+        operator's clear and this continuation is never silently discarded.
+        """
+        cur = state.pending_hitl
+        if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
+            return {"phase": "approval"}
+        return {
+            "pending_hitl": None,
+            # Explicit write, not an omission — see node_planner's P5a
+            # seeding comment on why an omitted plan_status key here would
+            # RETAIN "judged" on the checkpoint channel instead of releasing
+            # the barrier.
+            "plan_status": "approved",
+            "phase": "dispatch",
+        }
+
     # ----- routing edges -----
 
     def after_intake(state: HydraState) -> str:
@@ -3578,6 +3838,19 @@ def build_supervisor(
             return "hitl_gate_dispatch"
         if state.phase == "surfaced":
             return "halt"
+        # P5a: the plan was drafted this pass — judge it before anything else
+        # can dispatch. Checked BEFORE _plan_authoring_parked so the two
+        # branches stay mutually exclusive (see _plan_authoring_parked's
+        # docstring).
+        if state.plan_status == "drafted":
+            return "plan_judge"
+        # P5a: the plan barrier held every non-planning task (still
+        # authoring, awaiting the plan_gate decision, or sent back for
+        # rework) — there is nothing to judge and nothing to synthesize yet.
+        # The host drives the planning squad's stage next and re-enters via
+        # the continuation transport, same as the E2-22 case below.
+        if _plan_authoring_parked(state):
+            return "await_host"
         # E2-22: dispatch parked EVERY task awaiting the attended host — there
         # is nothing to judge and nothing to synthesize. Stop here (phase stays
         # "executing") so the trace does not record verdicts and a synthesis
@@ -3612,6 +3885,12 @@ def build_supervisor(
                 ("planner", node_planner),
                 ("approval", node_approval),
                 ("dispatch", node_dispatch),
+                # P5a: unreachable on this runner today (force_pure_python
+                # forces plan_rigor to "trivial", above) — kept in the list
+                # for parity with the compiled graph. See invoke()'s skip
+                # conditions.
+                ("plan_judge", node_plan_judge),
+                ("plan_gate", node_plan_gate),
                 ("judge_per_squad", node_judge_per_squad),
                 ("synthesis", node_synthesis),
                 ("judge_synthesis", node_judge_synthesis),
@@ -3627,6 +3906,9 @@ def build_supervisor(
     # F9: dedicated interrupt nodes for resumable HITL gates.
     graph.add_node("hitl_gate_dispatch", hitl_gate_dispatch)
     graph.add_node("hitl_gate_judge", hitl_gate_judge)
+    # P5a: plan judge + plan gate (plan_approval HITL).
+    graph.add_node("plan_judge", node_plan_judge)
+    graph.add_node("plan_gate", node_plan_gate)
     graph.add_node("judge_per_squad", node_judge_per_squad)
     graph.add_node("synthesis", node_synthesis)
     graph.add_node("judge_synthesis", node_judge_synthesis)
@@ -3648,13 +3930,21 @@ def build_supervisor(
         "judge_per_squad": "judge_per_squad",
         "hitl_gate_dispatch": "hitl_gate_dispatch",
         "halt": "postcheck",
-        # E2-22: every task deferred to the attended host — end the graph pass
-        # here rather than judging/synthesizing work that never ran. Note this
+        # P5a: the plan was drafted this pass — judge it.
+        "plan_judge": "plan_judge",
+        # E2-22 / P5a: every task deferred to the attended host, OR the plan
+        # barrier held everything non-planning — end the graph pass here
+        # rather than judging/synthesizing work that never ran. Note this
         # goes to END, not postcheck: postcheck would stamp phase="done".
         "await_host": END,
     })
     # F9: hitl_gate_dispatch → dispatch (re-entry after operator approval).
     graph.add_edge("hitl_gate_dispatch", "dispatch")
+    # P5a: plan_judge always hands off to the plan_gate interrupt point;
+    # plan_gate re-enters dispatch once the operator resumes (mirrors
+    # hitl_gate_dispatch → dispatch).
+    graph.add_edge("plan_judge", "plan_gate")
+    graph.add_edge("plan_gate", "dispatch")
     # F9: conditional edge from judge_per_squad — resumable gates route to
     # hitl_gate_judge; reflexion/policy surfaces still halt at postcheck.
     graph.add_conditional_edges("judge_per_squad", after_judge_per_squad, {
@@ -3691,6 +3981,10 @@ def build_supervisor(
         "hitl_gate_judge",
         "synthesis",
         "judge_synthesis",
+        # P5a: the plan_approval HITL gate. Filed pre-interrupt by
+        # node_plan_judge (mirroring node_planner's "approval" discipline);
+        # this node is where the pause actually happens.
+        "plan_gate",
     ]
     if plan_only:
         # Attended (host-bridged) planning surface: halt after planner, before
@@ -3724,6 +4018,34 @@ def _all_tasks_deferred_to_host(state: HydraState, packs: dict) -> bool:
         return False
     return any(
         getattr(packs.get(t.owner_squad), "entrypoint", None) == "mcp"
+        for t in tasks
+    )
+
+
+def _plan_authoring_parked(state: HydraState) -> bool:
+    """True when the plan barrier held every non-planning task this pass.
+
+    P5a. ``plan_barrier_active`` covers "authoring", "drafted", "judged", and
+    "rejected" (see the ``_PLAN_BARRIER_STATES`` docstring in state.py).
+    ``plan_status == "drafted"`` has its OWN ``after_dispatch`` branch (routes
+    to ``plan_judge``) and must never also match here — checked first so the
+    two branches stay mutually exclusive. That leaves "authoring" (the plan
+    is not yet drafted), "judged" (awaiting the operator's ``plan_gate``
+    decision), and "rejected" (sent back for rework): in all three the
+    barrier is active and every non-planning task is deliberately held at
+    "pending"/"blocked", so ``after_dispatch`` must report the honest
+    "held for the plan" outcome instead of falling through to
+    ``_all_tasks_deferred_to_host``'s narrower (mcp-pack-only) check, which
+    would otherwise under-report the phase as "executing" for an all-native
+    or mixed-but-not-yet-dispatched task set.
+    """
+    if not plan_barrier_active(state) or state.plan_status == "drafted":
+        return False
+    tasks = list(getattr(state, "tasks", []) or [])
+    if not tasks:
+        return False
+    return all(
+        t.owner_squad == "planning" or t.status in ("pending", "blocked")
         for t in tasks
     )
 
@@ -3771,6 +4093,18 @@ class _PurePythonRunner:
             # can reach later nodes.
             if name == "approval" and not s.requires_human_approval:
                 continue
+            # P5a: mirror the compiled graph's conditional routing for the
+            # plan_judge/plan_gate pair — plan_judge only runs once the plan
+            # is "drafted" (after_dispatch's third branch); plan_gate only
+            # runs immediately after plan_judge set plan_status="judged".
+            # force_pure_python forces plan_rigor to "trivial" (see
+            # build_supervisor), so plan_status never reaches "drafted" on
+            # this runner today — this skip exists so the runner stays
+            # correct if that forcing is ever relaxed for a hermetic test.
+            if name == "plan_judge" and s.plan_status != "drafted":
+                continue
+            if name == "plan_gate" and s.plan_status != "judged":
+                continue
             patch = fn(s) or {}
             for k, v in patch.items():
                 if hasattr(s, k):
@@ -3786,6 +4120,12 @@ class _PurePythonRunner:
             # E2-22: mirror the compiled graph's "await_host" edge — a dispatch
             # pass that parked every task for the attended host stops here
             # instead of falling through to judge/synthesis/postcheck.
-            if name == "dispatch" and _all_tasks_deferred_to_host(s, self.packs):
-                return s
+            if name == "dispatch":
+                # P5a: plan_status=="drafted" falls through to plan_judge
+                # instead of stopping (mirrors after_dispatch's precedence:
+                # the "drafted" branch is checked BEFORE _plan_authoring_parked).
+                if s.plan_status != "drafted" and _plan_authoring_parked(s):
+                    return s
+                if _all_tasks_deferred_to_host(s, self.packs):
+                    return s
         return s
