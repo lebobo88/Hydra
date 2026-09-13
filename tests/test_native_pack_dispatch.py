@@ -109,5 +109,10 @@ def test_active_source_packs_are_host_attended_native_plugins() -> None:
         "executive", "garland", "legal-compliance", "rlm-gaming",
         "marketing-strategy", "marketing-creative", "marketing-research",
         "marketing-production", "marketing-ops",
+        # P4 planning-phase: the planning squad is claude-native for the same
+        # reason as the packs above -- node_dispatch must defer it to the
+        # attended host unconditionally rather than risk a legacy in-graph
+        # path fabricating a plan (see squads/planning/squad.yaml).
+        "planning",
     }
     assert {slug for slug, pack in packs.items() if pack.entrypoint == "claude-native"} == expected

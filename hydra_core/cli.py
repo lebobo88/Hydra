@@ -2162,6 +2162,15 @@ def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[d
     attended result, one squad-origin DECISION_RECORD envelope plus one
     artifact row keyed by the persisted MemoryRef (native pack artifact) or the
     pp run id (engineering stage).
+
+    A task whose `owner_squad` is a RESERVED_META_SQUAD (e.g. "planning") still
+    gets its DECISION_RECORD envelope here like any other squad — this
+    function does not special-case it. `node_synthesis`'s `origin_squad`
+    grouping loop is the one place that excludes RESERVED_META_SQUADS from
+    becoming a squad "voice" (the plan is the frame of the record, not a
+    voice within it); that single filter covers an envelope regardless of
+    which of the two emission points produced it (an ordinary in-graph
+    dispatch envelope, or this function).
     """
     from .schemas import DecisionRecord, MemoryRef
 

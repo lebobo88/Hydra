@@ -35,7 +35,7 @@ from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
 from .plan_triage import triage_plan
-from .router import RoutingDecision, classify_intent, compute_tool_scope
+from .router import RESERVED_META_SQUADS, RoutingDecision, classify_intent, compute_tool_scope
 from .telemetry import emit as emit_trace
 from .venom import load_cerberus_venoms
 from .schemas import (
@@ -823,8 +823,18 @@ def build_supervisor(
                     _squad_tokens = [
                         t.strip().lower() for t in _squad_raw.split(",") if t.strip()
                     ]
-                    _squad_unknown = [t for t in _squad_tokens if t not in packs]
-                    _squad_valid = [t for t in _squad_tokens if t in packs]
+                    # RESERVED_META_SQUADS (e.g. "planning") are treated the same
+                    # as an unknown slug here: they exist in `packs` but must never
+                    # be reachable via force-selection, so they are rejected with
+                    # the same explicit error rather than silently dropped later.
+                    _squad_unknown = [
+                        t for t in _squad_tokens
+                        if t not in packs or t in RESERVED_META_SQUADS
+                    ]
+                    _squad_valid = [
+                        t for t in _squad_tokens
+                        if t in packs and t not in RESERVED_META_SQUADS
+                    ]
                     if _squad_unknown:
                         # Unknown slug at tail position: error like unknown --repo.
                         state.phase = "surfaced"
@@ -880,8 +890,20 @@ def build_supervisor(
         # --squad) wins over the intent router: validate slugs against discovered
         # packs and skip classification. Unknown slugs are dropped with a trace
         # event; if nothing valid survives, fall back to the router.
-        forced = [s for s in state.selected_squads if s in packs]
-        unknown = [s for s in state.selected_squads if s not in packs]
+        # RESERVED_META_SQUADS (e.g. "planning") are rejected here exactly like
+        # an unknown slug: covers CLI `hydra run --squad planning`, a resumed
+        # workflow with `selected_squads` pre-seeded to a reserved slug, and any
+        # other path that lands a slug in state.selected_squads before this
+        # point. Unlike a stub (which an operator may knowingly force-select,
+        # below), a reserved meta-squad has NO explicit-selection bypass.
+        forced = [
+            s for s in state.selected_squads
+            if s in packs and s not in RESERVED_META_SQUADS
+        ]
+        unknown = [
+            s for s in state.selected_squads
+            if s not in packs or s in RESERVED_META_SQUADS
+        ]
         if unknown:
             emit_trace(
                 judge_trace_root,
@@ -3027,13 +3049,23 @@ def build_supervisor(
             crown_label_for_squad(s) for s in state.selected_squads
         ) or "(no heads convened)"
 
-        # Group envelopes by origin_squad (skip Hydra's own routing slips).
+        # Group envelopes by origin_squad (skip Hydra's own routing slips, and
+        # any RESERVED_META_SQUADS origin such as "planning"). A plan is the
+        # FRAME a decision record is read within, not one of the voices
+        # contributing to it — surfacing it as a squad voice here would be a
+        # category error symmetric with routing a goal TO it (see
+        # RESERVED_META_SQUADS in hydra_core/router.py). This filter covers
+        # BOTH emission points that can put a "planning"-origin envelope into
+        # state.envelopes: an ordinary in-graph dispatch envelope, and the
+        # DECISION_RECORD `_materialize_attended_results` (hydra_core/cli.py)
+        # synthesizes for an attended planning task — both are read through
+        # this same `state.envelopes` grouping loop.
         # Redact at synthesis boundary — envelopes from different squads are
         # merged here, so cross-squad text must be sanitized.
         squad_to_envs: dict[str, list[dict]] = {}
         for env in state.envelopes:
             origin = env.get("origin_squad") or "hydra"
-            if origin == "hydra":
+            if origin == "hydra" or origin in RESERVED_META_SQUADS:
                 continue
             try:
                 redacted = _validate_and_redact_envelope(

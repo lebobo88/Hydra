@@ -141,7 +141,8 @@ def test_plugin_and_project_contexts_have_documented_activation_boundary() -> No
     assert manifest["version"] == "0.1.7"
     assert manifest["author"]["name"] == "rob"
     assert "hooks" not in manifest
-    assert len(manifest["agents"]) == 11
+    # 3 planning agents (plan-author, plan-critic, plan-scribe) were added in the planning phase
+    assert len(manifest["agents"]) == 14
     assert "### Activation contexts" in readme
     assert "consumer projects" in readme
 

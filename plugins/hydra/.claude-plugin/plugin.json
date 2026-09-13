@@ -16,6 +16,9 @@
     "./agents/hydra-synthesizer.md",
     "./agents/engineer.md",
     "./agents/judge-cross-vendor.md",
-    "./agents/judge-same-vendor.md"
+    "./agents/judge-same-vendor.md",
+    "./agents/plan-author.md",
+    "./agents/plan-critic.md",
+    "./agents/plan-scribe.md"
   ]
 }
