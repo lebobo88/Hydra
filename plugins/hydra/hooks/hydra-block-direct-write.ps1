@@ -22,7 +22,11 @@
 # and therefore additionally honours `cd` / `pushd` / `Set-Location` in that
 # command when resolving a RELATIVE destination (E2-18). Only the Bash hook
 # needs that code; this note exists so the pair stays in sync. The worktree-root
-# precedence block below is the other half of the lockstep.
+# precedence block below is the other half of the lockstep. The Bash hook also
+# fails closed on a write destination it cannot resolve statically (a shell
+# `$(...)`/backtick/`$VAR`/`${VAR}` expansion) — this hook has no shell to
+# parse and receives an already-resolved file_path, so it needs no equivalent
+# rule; it is a Bash-only concern and does not affect lockstep for Write/Edit.
 #
 # Kill-switch: set HYDRA_ENFORCE_ROUTING to anything but '1' to disable.
 
@@ -166,6 +170,20 @@ $allowExt = @(
 $ext = [System.IO.Path]::GetExtension($norm)
 if (-not $ext) { exit 0 }                       # extensionless (LICENSE, etc.)
 if ($allowExt -contains $ext) { exit 0 }
+
+# --- docs/plans carve-out (P2 plan artifact writer, security hardening 2026-09) --
+# hydra_core.artifact_store.write_repo_artifact allow-lists docs/plans for
+# {.md,.json,.txt,.html}; .md/.json/.txt already pass the generic allowExt
+# check above, but .html is otherwise a blocked engine-source extension, so it
+# needs an explicit, narrowly-scoped carve-out here. Segment-bounded (leading
+# AND trailing \) so a sibling directory merely beginning with "plans" (e.g.
+# docs\plansomething\) cannot slip through, and gated on $_arUnderProjRoot so
+# this is not a global .html allowance — it stays inside the exact contract
+# LOCKSTEP-mirrored in hydra-block-bash-writes.ps1's Test-BlockedDest.
+if ($ext -eq '.html' -and $_arUnderProjRoot) {
+    $_arPlansFrag = "$_arProjRootNorm\docs\plans\"
+    if ($norm -eq $_arPlansFrag.TrimEnd('\') -or $norm.StartsWith($_arPlansFrag)) { exit 0 }
+}
 
 # --- Block engine-source extensions ------------------------------------------
 $blockExt = @(
