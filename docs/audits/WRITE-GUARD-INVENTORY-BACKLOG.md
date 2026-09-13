@@ -169,3 +169,33 @@ commands, not two openers on one line. It passes and it does cover something rea
 Rename it to say what it covers, and add a genuine same-line case alongside the
 fix above. A test whose name overclaims is a small lie that a future reader will
 believe.
+
+## Pre-existing false positive: a quoted redirect anywhere in the command
+
+**Measured 2026-09-13, pre-existing, tracked, not fixed.**
+
+A redirect operator and a protected path inside a *quoted string* are still read
+as a real write, so a commit message or an echoed string that quotes a write
+idiom is refused:
+
+    git commit -m 'fix: echo x > <protected>'     ORIG 2, now 2
+    echo 'echo x > <protected>'                   ORIG 2, now 2
+
+Not a regression — identical on `main@29dbe89` — and it is why the commits in this
+work were made with `git commit -F <file>` rather than `-m`.
+
+Worth contrasting with what *is* now fixed: `git commit -m 'fix: install x
+<protected>'` is allowed (0), because the quote-aware work covers the write-idiom
+scan for the newer idioms. The gap is specific to the redirect-operator scan,
+which still matches the whole command string without consulting the quote mask.
+
+**The fix is now cheap and obvious, which was not true before.** The mask added
+for boundaries and heredoc bodies already reports whether a given index is
+unquoted. Apply it to the redirect, tee and copy operator scans as well, so an
+operator inside a quoted run is literal text. That would remove the last member
+of this family and let `git commit -m` quote a write idiom freely.
+
+Left undone only because it was found while sanity-checking the landed guard, on
+the eleventh review pass, and the workaround (`-F`) is trivial. It is the single
+highest-value item on this page: small, well-understood, and it removes a friction
+that every future agent in this repo would otherwise hit.
