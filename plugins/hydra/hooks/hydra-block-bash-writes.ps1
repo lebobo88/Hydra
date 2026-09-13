@@ -36,6 +36,14 @@
 #   - Multi-line commands joined on one line may confuse some regex patterns.
 #   - For a genuine isolation boundary, use OS-level sandboxing (containers,
 #     seccomp, etc.); this hook is an LLM-routing guardrail only.
+#   - RUNTIME INDIRECTION IS AN UNBOUNDED CLASS, not something this file
+#     closes. This revision fails closed on ONE reachable, concrete shape —
+#     an xargs replacement-string placeholder (`{}` / a custom `-I<replstr>`)
+#     standing in for a destination — but a destination can equally be
+#     constructed inside `sh -c` from a variable, decoded from base64, read
+#     from a file, or built by a `python -c` one-liner, and no static
+#     path-scanning PreToolUse hook can resolve those. Do not read the
+#     placeholder fix as closing indirect execution in general.
 #
 # FAIL-CLOSED ON UNRESOLVABLE DESTINATIONS (security hardening, 2026-09) —
 # the hook does NOT run a shell and cannot know what `$(...)`, a backtick
@@ -110,7 +118,72 @@ if (-not $cmd) { exit 0 }
 # across lines and evaded every branch (measured 0 against the guard at
 # 29dbe89). This is statically resolvable — unlike variable/command
 # substitution below — so it is resolved, not blocked.
-$cmd = $cmd -replace '\\\r?\n', ''
+#
+# QUOTE-AWARE (revision, 2026-09): a shell only splices a backslash-newline in
+# UNQUOTED and DOUBLE-QUOTED context. Inside SINGLE quotes, a backslash and a
+# newline are both literal characters and a real shell writes them literally.
+# An earlier version of this normalisation used a blind `-replace` over the
+# WHOLE command string, which spliced a backslash-newline even inside single
+# quotes — so `'docs/plan\<LF>s/x.html'` (to the shell: a path literally
+# containing a backslash and a newline, NOT `docs/plans/x.html`) was rewritten
+# into the clean carve-out path, recognised as `docs/plans/*.html`, and
+# ALLOWED — a FALSE ALLOW, not a missed block. Remove-LineContinuations walks
+# the same single/double/escape quote-state machine Read-ShellArgument already
+# implements and splices ONLY where a shell actually would.
+function Remove-LineContinuations {
+    param([string]$s)
+    $n = $s.Length
+    $sb = New-Object System.Text.StringBuilder
+    $inSingle = $false
+    $inDouble = $false
+    $i = 0
+    while ($i -lt $n) {
+        $c = $s[$i]
+        if ($inSingle) {
+            [void]$sb.Append($c)
+            if ($c -eq "'") { $inSingle = $false }
+            $i++
+            continue
+        }
+        if ($c -eq '\') {
+            # Backslash-newline (LF or CRLF): splice, but only outside single
+            # quotes (unquoted or double-quoted — the two contexts where a
+            # real shell performs this splice).
+            if (($i + 1) -lt $n -and $s[$i + 1] -eq "`n") { $i += 2; continue }
+            if (($i + 2) -lt $n -and $s[$i + 1] -eq "`r" -and $s[$i + 2] -eq "`n") { $i += 3; continue }
+            # Not a line continuation: keep the backslash and whatever it
+            # escapes verbatim (e.g. `\"` inside double quotes must not end
+            # the quoted run).
+            [void]$sb.Append($c)
+            $i++
+            if ($i -lt $n) { [void]$sb.Append($s[$i]); $i++ }
+            continue
+        }
+        if ($c -eq "'" -and -not $inDouble) { $inSingle = $true; [void]$sb.Append($c); $i++; continue }
+        if ($c -eq '"') { $inDouble = -not $inDouble; [void]$sb.Append($c); $i++; continue }
+        [void]$sb.Append($c)
+        $i++
+    }
+    return $sb.ToString()
+}
+$cmd = Remove-LineContinuations $cmd
+
+# --- xargs -I replacement-string placeholders (security hardening, 2026-09) ---
+# `xargs -I{} sh -c 'echo x > {}'` (or any other `-I<replstr>`) substitutes
+# the literal replstr token with a line read from STDIN at RUNTIME — this
+# hook only ever sees the literal placeholder text (e.g. `{}`) in the static
+# command string, never the real destination. That is the identical
+# "cannot know the real destination" situation as a `$VAR` or `$(...)`
+# expansion (see the FAIL-CLOSED header comment above) and is treated through
+# the SAME mechanism and the SAME distinguishable 'expansion' refusal reason,
+# not a separate code path. `{}` is xargs's own default replstr; the regex
+# below also captures a custom `-I<replstr>` (named or numbered) so
+# `xargs -IFILE ... FILE` and similar spellings are covered too.
+$_bwPlaceholders = New-Object System.Collections.Generic.List[string]
+[void]$_bwPlaceholders.Add('{}')
+foreach ($_xm in [regex]::Matches($cmd, '\bxargs\b[^;|&\n]*?-I\s*(\S+)')) {
+    if ($_xm.Groups[1].Success) { [void]$_bwPlaceholders.Add($_xm.Groups[1].Value) }
+}
 
 # --- Blocked engine-source extension pattern (same as hydra-block-direct-write.ps1) ---
 $blockExtPat = '\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|c|cc|cpp|cxx|h|hpp|cs|rb|php|swift|m|mm|vue|svelte|html|htm|css|scss|sass|less|sql|sh|bash|lua|gd|glsl|hlsl|shader|dart|scala|clj|ex|exs)(?=[''"\s;|&<>]|$)'
@@ -367,6 +440,15 @@ function Test-BlockedDest {
     # or Read-PyStringLiteral; Trim() here is a harmless no-op safety net for
     # any caller that still passes a raw single-quote-wrapped literal.
     $raw = $dest.Trim('"''').Replace('/', '\')
+    # FAIL CLOSED on an xargs replacement-string placeholder for the same
+    # reason as an unresolvable expansion above: the real destination arrives
+    # from stdin at runtime and this hook cannot know it statically. Reuses
+    # the identical mechanism/reason so the reporting block below prints the
+    # same distinguishable "UNRESOLVABLE destination" message.
+    if ($_bwPlaceholders -contains $raw) {
+        $script:bwUnresolvedReason = 'expansion'
+        return $true
+    }
     $norm = $raw.ToLowerInvariant()
 
     $_effCwd = _bwEffCwdAt $atIndex
@@ -410,8 +492,19 @@ $reason  = ''
 #    e.g.  echo "..." > foo.py    cat src.txt >> dest.ts
 #    Destination is reconstructed via Read-ShellArgument (not a truncating
 #    capture group) so a fragment-concatenated path can't dodge detection.
+#    `>|` (the noclobber-override clobber operator, e.g. `echo x >|file.py`
+#    or `echo x >| file.py`) previously matched the bare `>` with zero
+#    whitespace, leaving the reader positioned on `|`, which reads as a
+#    statement separator and yields no argument at all — the destination was
+#    never examined (measured 0). The operator pattern now accepts an
+#    optional `|` immediately after the `>`/`>>` and before the optional
+#    whitespace, so both the spaced and unspaced forms resolve to the same
+#    reconstructed destination as plain `>`. A genuine pipe after a normal
+#    redirect (`echo x > a.txt | grep y`) is unaffected: the required
+#    whitespace before `|` already ends the destination read there, and the
+#    `\|?` here only ever consumes a `|` glued directly onto the `>`.
 if (-not $matched) {
-    $hits = [regex]::Matches($cmd, '>{1,2}\s*')
+    $hits = [regex]::Matches($cmd, '>{1,2}\|?\s*')
     foreach ($hit in $hits) {
         $tok = Read-ShellArgument $cmd ($hit.Index + $hit.Length)
         if ($tok.Value -and (Test-BlockedDest $tok.Value $tok.Start $tok.HasExpansion)) {

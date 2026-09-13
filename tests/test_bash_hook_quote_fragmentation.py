@@ -707,8 +707,8 @@ class TestPropertyNotInstance:
 
     def test_removing_continuation_normalisation_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
         hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
-        needle = "$cmd = $cmd -replace '\\\\\\r?\\n', ''"
-        assert needle in hook_text, "continuation-normalisation line not found; test is stale"
+        needle = "$cmd = Remove-LineContinuations $cmd"
+        assert needle in hook_text, "continuation-normalisation call not found; test is stale"
         patched = hook_text.replace(needle, "# disabled for property test")
         patched_hook = tmp_path / BASH_HOOK
         patched_hook.write_text(patched, encoding="utf-8")
@@ -731,4 +731,228 @@ class TestPropertyNotInstance:
         assert result.returncode == 0, (
             f"property check failed: removing continuation normalisation should "
             f"have allowed this write, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Third revision (2026-09): three further bypasses confirmed by cross-vendor
+# judge and reproduced by execution against 830a090, none a regression of the
+# preceding revision (all measured 0 there too):
+#   - the noclobber-override clobber operator, spaced and unspaced
+#   - a placeholder destination whose real value only exists at runtime, on
+#     stdin (xargs -I<replstr>)
+#   - the line-continuation splice added in 830a090 spliced a backslash-
+#     newline even INSIDE single quotes, where a shell never would, forging
+#     the docs/plans carve-out for a path a shell would not actually write
+#     there (a FALSE ALLOW, not a missed block)
+# ---------------------------------------------------------------------------
+
+_CLOBBER_OP = ">" + "|"
+
+
+class TestClobberOperator:
+    """The clobber-override redirect operator overrides `noclobber`; the
+    guard's redirect-operator pattern matched only the bare `>` (zero
+    whitespace before the following `|`), leaving the argument reader
+    positioned on the `|` separator, which reads as end-of-argument — the
+    destination was never examined."""
+
+    def test_spaced_protected_blocked(self, project_dir: Path):
+        result = _run_bash_hook(f"echo x {_CLOBBER_OP} {BLOCKED_REL}", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_unspaced_protected_blocked(self, project_dir: Path):
+        result = _run_bash_hook(f"echo x {_CLOBBER_OP}{BLOCKED_REL}", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_spaced_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(f"echo x {_CLOBBER_OP} {PLANS_REL}", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_unspaced_docs_plans_allowed(self, project_dir: Path):
+        result = _run_bash_hook(f"echo x {_CLOBBER_OP}{PLANS_REL}", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_genuine_pipe_after_plain_redirect_unaffected(self, project_dir: Path):
+        """A plain redirect followed by a real pipe (space-separated) — the
+        file must still be the destination and the piped command must never
+        be mistaken for one."""
+        result = _run_bash_hook("echo x > a.txt | grep y", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestXargsPlaceholderDestination:
+    """`xargs -I<replstr> ... <replstr> ...` substitutes the literal replstr
+    with a line read from stdin at RUNTIME; the guard only ever sees the
+    literal placeholder text in the static command string, never the real
+    destination — the identical situation as an unresolvable variable or
+    command-substitution expansion, and it fails closed through that same
+    mechanism."""
+
+    def test_default_placeholder_blocked(self, project_dir: Path):
+        cmd = "printf " + BLOCKED_REL + " | xargs -I{} sh -c 'echo x > {}'"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_named_replstr_placeholder_blocked(self, project_dir: Path):
+        """A custom `-I` replacement string (not the default placeholder)."""
+        cmd = "printf " + BLOCKED_REL + " | xargs -IFILE sh -c 'echo x > FILE'"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_spaced_named_replstr_placeholder_blocked(self, project_dir: Path):
+        """`-I <replstr>` with a space before the replstr token."""
+        cmd = "printf " + BLOCKED_REL + " | xargs -I FILE sh -c 'echo x > FILE'"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+
+class TestQuoteAwareLineContinuationSplice:
+    """830a090's line-continuation normalisation spliced a backslash-newline
+    unconditionally, INCLUDING inside single quotes, where a shell never
+    splices — both the backslash and the newline are literal characters
+    there. A single-quoted path split across a backslash-newline is, to a
+    real shell, a path literally CONTAINING a backslash and a newline (not
+    the clean joined path), but the old blind splice rewrote it into the
+    clean carve-out path and ALLOWED it: a FALSE ALLOW, not a missed block.
+    Every payload here is built from explicit character codes and asserted
+    on before being sent, per the project's own documented gotcha about
+    flattened continuation payloads."""
+
+    def test_single_quoted_continuation_does_not_forge_the_carveout(self, project_dir: Path):
+        cmd = "echo x > 'docs/plan" + chr(92) + chr(10) + "s/x.html'"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, (
+            f"single-quoted backslash-newline must NOT splice into the docs/plans "
+            f"carve-out; rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_single_quoted_continuation_crlf_does_not_forge_the_carveout(self, project_dir: Path):
+        cmd = "echo x > 'docs/plan" + chr(92) + chr(13) + chr(10) + "s/x.html'"
+        assert chr(13) in cmd and chr(10) in cmd, "payload lost its real CRLF before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_double_quoted_continuation_still_blocks_protected(self, project_dir: Path):
+        cmd = 'echo x > "hydra_core/supervi' + chr(92) + chr(10) + 'sor.py"'
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_unquoted_continuation_still_blocks_protected(self, project_dir: Path):
+        cmd = "echo x > hydra_core/supervi" + chr(92) + chr(10) + "sor.py"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_double_quoted_continuation_docs_plans_still_allowed(self, project_dir: Path):
+        """A GENUINE double-quoted continuation (splice IS correct here)
+        must still resolve to the clean carve-out path and be allowed."""
+        cmd = 'echo x > "docs/plan' + chr(92) + chr(10) + 's/x.html"'
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_unquoted_continuation_docs_plans_still_allowed(self, project_dir: Path):
+        cmd = "echo x > docs/plan" + chr(92) + chr(10) + "s/x.html"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_docs_plans_x_html_plain_still_allowed(self, project_dir: Path):
+        result = _run_bash_hook(f"echo x > {PLANS_REL}", cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_single_quoted_continuation_inside_otherwise_allowed_path_stays_blocked(self, project_dir: Path):
+        """A single-quoted backslash-newline splitting the `docs` SEGMENT
+        itself (distinct from the `plan[s]` split above — a different point
+        in the path) must not become allowed by splicing: without the
+        splice, the literal path's second component is `<newline>cs`, not
+        `docs`, so it never lands under the docs/plans prefix and the
+        (otherwise carve-out-eligible) `.html` extension is generically
+        blocked."""
+        cmd = "echo x > 'do" + chr(92) + chr(10) + "cs/plans/x.html'"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestThirdRevisionPropertyNotInstance:
+    """Prove each of the three fixes above is load-bearing: patch out exactly
+    that one change in a temporary copy of the hook and confirm the
+    corresponding bypass returns (rc=0)."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_clobber_operator_support_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "$hits = [regex]::Matches($cmd, '>{1,2}\\|?\\s*')",
+            "$hits = [regex]::Matches($cmd, '>{1,2}\\s*')",
+        )
+        result = self._run(
+            patched_hook, f"echo x {_CLOBBER_OP} {BLOCKED_REL}", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, (
+            f"property check failed: removing clobber-operator support should "
+            f"have allowed this write, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_placeholder_check_allows_the_bypass(self, project_dir: Path, tmp_path: Path):
+        needle = (
+            "    if ($_bwPlaceholders -contains $raw) {\n"
+            "        $script:bwUnresolvedReason = 'expansion'\n"
+            "        return $true\n"
+            "    }\n"
+        )
+        patched_hook = self._patched_hook(tmp_path, needle, "")
+        cmd = "printf " + BLOCKED_REL + " | xargs -I{} sh -c 'echo x > {}'"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: removing the placeholder check should have "
+            f"allowed this write, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_reverting_to_blind_splice_forges_the_carveout(self, project_dir: Path, tmp_path: Path):
+        """Reverting ONLY the quote-awareness (call the old blind
+        whole-command regex instead of the new quote-tracking function,
+        leaving everything else — including the function definition —
+        untouched) must bring back the FALSE ALLOW."""
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "$cmd = Remove-LineContinuations $cmd",
+            "$cmd = $cmd -replace '\\\\\\r?\\n', ''",
+        )
+        cmd = "echo x > 'docs/plan" + chr(92) + chr(10) + "s/x.html'"
+        assert chr(10) in cmd, "payload lost its real newline before reaching the hook"
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: reverting to the blind splice should have "
+            f"forged the docs/plans carve-out (rc=0), but rc={result.returncode} "
+            f"stderr={result.stderr}"
         )
