@@ -956,3 +956,235 @@ class TestThirdRevisionPropertyNotInstance:
             f"forged the docs/plans carve-out (rc=0), but rc={result.returncode} "
             f"stderr={result.stderr}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fourth revision (2026-09): two further pre-existing defects in the
+# `python -c` branches, both measured identically on 29dbe89 (the bypass) and
+# on every revision through c634849 (both defects) — neither a regression of
+# the preceding revisions:
+#
+#   Fix A (bypass, want BLOCK): Read-PyStringLiteral only folds ADJACENT
+#   literals; its callers then require a `,`/`)` immediately after, so
+#   `'hydra_core/' + 'supervisor.py'` (Python `+` concatenation) made the
+#   whole destination-detection branch stop parsing and the write went
+#   unexamined, for all three python -c branches (open/Path/shutil).
+#   Read-PyDestExpr now reads a whole destination EXPRESSION — literals
+#   joined by any mix of adjacency and `+` — and fails closed (through the
+#   SAME unresolvable-destination mechanism as a shell $VAR/$(...) expansion)
+#   the moment any operand isn't a plain literal.
+#
+#   Fix B (false positive, want ALLOW): the open() write-mode branch treated
+#   ANY write-mode open() as a hit without ever testing its destination
+#   against Test-BlockedDest, so open('notes.md','w') and
+#   open('docs/plans/p.html','w') — the latter directly contradicting the
+#   docs/plans carve-out — both refused. The destination is now routed
+#   through the same Test-BlockedDest check the Path/shutil branches use.
+# ---------------------------------------------------------------------------
+
+PLANS_ASSETS_REL = "docs/plans/assets/a.txt"
+
+
+class TestPyDestExprConcatenation:
+    """`+`-joined (and mixed adjacent/`+`) Python string-literal destinations
+    must resolve exactly as a single literal would, across all three
+    python -c branches."""
+
+    def test_open_plus_concatenation_blocked(self, project_dir: Path):
+        cmd = "python -c \"open('hydra_core/' + 'supervisor.py', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_pathlib_plus_concatenation_blocked(self, project_dir: Path):
+        cmd = "python -c \"from pathlib import Path; Path('hydra_core/' + 'supervisor.py').write_text('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_shutil_plus_concatenation_blocked(self, project_dir: Path):
+        cmd = "python -c \"import shutil; shutil.copy('a.txt', 'hydra_core/' + 'supervisor.py')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_three_operand_plus_chain_blocked(self, project_dir: Path):
+        cmd = "python -c \"open('hydra_core/' + 'supervisor' + '.py', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_mixed_adjacent_and_plus_chain_blocked(self, project_dir: Path):
+        """Adjacency AND `+` combined in one destination expression:
+        `'hydra_core/''supervisor' + '.py'` — the first two literals are
+        adjacent (implicit concatenation), then `+` joins the third."""
+        cmd = "python -c \"open('hydra_core/''supervisor' + '.py', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_plus_whitespace_variations_blocked(self, project_dir: Path):
+        cmd = "python -c \"open('hydra_core/'   +   'supervisor.py', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestPyDestExprUnresolvable:
+    """An operand of the destination expression that isn't a plain string
+    literal (a bare name, a call such as os.path.join(...), or an f-string
+    with a `{...}` placeholder) must fail closed as UNRESOLVABLE, the same
+    mechanism as a shell $VAR/$(...) expansion — not fall through un-detected
+    the way the `+`-bypass did."""
+
+    def test_open_bare_name_destination_blocked(self, project_dir: Path):
+        cmd = "python -c \"D='hydra_core/supervisor.py'; open(D, 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_pathlib_os_path_join_destination_blocked(self, project_dir: Path):
+        cmd = (
+            "python -c \"from pathlib import Path; import os; "
+            "Path(os.path.join('hydra_core', 'supervisor.py')).write_text('x')\""
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_shutil_os_path_join_destination_blocked(self, project_dir: Path):
+        cmd = (
+            "python -c \"import shutil, os; "
+            "shutil.copy('t.md', os.path.join('hydra_core', 'supervisor.py'))\""
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_open_fstring_placeholder_destination_blocked(self, project_dir: Path):
+        cmd = "python -c \"x='supervisor'; open(f'hydra_core/{x}.py', 'w').write('y')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+    def test_pathlib_fstring_placeholder_destination_blocked(self, project_dir: Path):
+        cmd = (
+            "python -c \"from pathlib import Path; x='supervisor'; "
+            "Path(f'hydra_core/{x}.py').write_text('y')\""
+        )
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"rc={result.returncode} stderr={result.stderr}"
+        assert UNRESOLVABLE_MARKER in result.stderr
+
+
+class TestPyOpenDestinationChecked:
+    """Fix B: open()'s destination must be routed through the same
+    Test-BlockedDest check Path/shutil already use, not treated as a hit on
+    write-mode alone."""
+
+    def test_open_notes_md_allowed(self, project_dir: Path):
+        cmd = "python -c \"open('notes.md', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_open_docs_plans_html_allowed(self, project_dir: Path):
+        cmd = "python -c \"open('docs/plans/p.html', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_open_docs_plans_assets_allowed(self, project_dir: Path):
+        cmd = f"python -c \"open('{PLANS_ASSETS_REL}', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_open_read_mode_still_ignored(self, project_dir: Path):
+        cmd = f"python -c \"open('{BLOCKED_REL}', 'r').read()\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_fstring_with_no_placeholder_allowed_path(self, project_dir: Path):
+        """An f-string with NO `{...}` placeholder is just a literal and must
+        resolve (not block) like any other plain string."""
+        cmd = "python -c \"open(f'notes.md', 'w').write('x')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+    def test_py_path_in_non_destination_position_not_blocked(self, project_dir: Path):
+        """A `.py` path appearing somewhere in the one-liner OTHER than a
+        destination argument (here: printed, not written) must not block."""
+        cmd = f"python -c \"print('{BLOCKED_REL}')\""
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"rc={result.returncode} stderr={result.stderr}"
+
+
+class TestFourthRevisionPropertyNotInstance:
+    """Prove Fix A and Fix B are each load-bearing: patch out exactly that
+    one change in a temporary copy of the hook and confirm the corresponding
+    defect returns."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_dest_expr_allows_the_plus_bypass(self, project_dir: Path, tmp_path: Path):
+        """Fix A: swap Read-PyDestExpr back for the old adjacency-only
+        Read-PyStringLiteral in the open() branch and confirm the `+`
+        bypass is allowed again."""
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "        $arg1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)\n"
+            "        if (-not $arg1) { continue }\n"
+            "        $j = $arg1.End\n"
+            "        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \\t]') { $j++ }\n"
+            "        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }\n"
+            "        $j++\n"
+            "        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \\t]') { $j++ }\n"
+            "        $arg2 = Read-PyStringLiteral $cmd $j\n"
+            "        if ($arg2 -and ($arg2.Value -match '[wax]') -and\n"
+            "            (Test-BlockedDest $arg1.Value $arg1.Start (-not $arg1.Resolvable))) {\n",
+            "        $arg1 = Read-PyStringLiteral $cmd ($oh.Index + $oh.Length)\n"
+            "        if (-not $arg1) { continue }\n"
+            "        $j = $arg1.End\n"
+            "        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \\t]') { $j++ }\n"
+            "        if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }\n"
+            "        $j++\n"
+            "        while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \\t]') { $j++ }\n"
+            "        $arg2 = Read-PyStringLiteral $cmd $j\n"
+            "        if ($arg2 -and ($arg2.Value -match '[wax]')) {\n",
+        )
+        cmd = "python -c \"open('hydra_core/' + 'supervisor.py', 'w').write('x')\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, (
+            f"property check failed: reverting to Read-PyStringLiteral should have "
+            f"allowed the '+' bypass again, but rc={result.returncode} stderr={result.stderr}"
+        )
+
+    def test_removing_open_destination_check_refuses_notes_md(self, project_dir: Path, tmp_path: Path):
+        """Fix B: make the open() branch match on mode alone again (as it
+        did before Test-BlockedDest was added) and confirm open('notes.md',
+        'w') goes back to being refused."""
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "        if ($arg2 -and ($arg2.Value -match '[wax]') -and\n"
+            "            (Test-BlockedDest $arg1.Value $arg1.Start (-not $arg1.Resolvable))) {\n",
+            "        if ($arg2 -and ($arg2.Value -match '[wax]')) {\n",
+        )
+        cmd = "python -c \"open('notes.md', 'w').write('x')\""
+        result = self._run(patched_hook, cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, (
+            f"property check failed: removing the destination check should have "
+            f"refused open('notes.md','w') again, but rc={result.returncode} stderr={result.stderr}"
+        )

@@ -418,6 +418,129 @@ function Read-PyStringLiteral {
     return [pscustomobject]@{ Value = $sb.ToString(); Start = $start; End = $i }
 }
 
+# --- DESTINATION-EXPRESSION RESOLUTION (security hardening, 2026-09) --------
+# ROOT CAUSE this closes: Read-PyStringLiteral (above) folds only ADJACENT
+# literals (`'a' 'b'`), but its callers then require a `,` or `)` immediately
+# after the folded run. `'hydra_core/' + 'supervisor.py'` (Python `+`
+# concatenation) is not adjacency, so the whole destination-detection branch
+# stopped parsing right there and the write went unexamined — proven 0 on
+# BOTH 29dbe89 and every revision through c634849, for all three python -c
+# branches (open/Path/shutil).
+#
+# Read-PyDestExpr reads a whole destination EXPRESSION — a chain of string
+# literals joined by any mix of implicit adjacency and `+`, arbitrary
+# whitespace allowed — and classifies it: Resolvable=$true with a folded
+# Value when every operand is a plain string literal (an f-string with no
+# `{...}` placeholder counts as plain), Resolvable=$false the moment ANY
+# operand is not a literal (a bare name, an attribute, a call such as
+# os.path.join(...), an f-string containing a placeholder, or any operand of
+# `+` that isn't itself a literal). Either way End is left positioned at the
+# true top-level terminator (the `,` or `)` that closes this argument), by
+# walking a full paren/bracket/quote-aware skip over a non-literal operand
+# rather than just stopping where recognition failed — otherwise callers
+# would look for `,`/`)` in the middle of an unresolved expression and never
+# reach the mode/second-argument check that decides whether to block at all.
+#
+# An unresolvable destination is treated through the SAME mechanism as a
+# shell `$VAR`/`$(...)` expansion: the caller passes `-not $arg.Resolvable`
+# as Test-BlockedDest's `$hasExpansion`, which fails closed and prints the
+# same distinguishable "UNRESOLVABLE destination" refusal — not a fourth
+# mechanism.
+function Read-PyLiteralAtom {
+    # Reads ONE (optionally prefixed: f/F/r/R/b/B/u/U, alone or paired, e.g.
+    # rb/fr) Python string literal atom starting at $start. Returns $null if
+    # this position is not such a literal. HasPlaceholder is set when an
+    # f-string contains an unescaped `{...}` (an f-string with NO placeholder,
+    # e.g. f'hydra_core/supervisor.py', is just a literal and is not flagged).
+    param([string]$s, [int]$start)
+    $n = $s.Length
+    $i = [Math]::Max(0, $start)
+    $prefixEnd = $i
+    while ($prefixEnd -lt $n -and $prefixEnd -lt ($i + 2) -and $s[$prefixEnd] -match '[fFrRbBuU]') { $prefixEnd++ }
+    if ($prefixEnd -ge $n -or ($s[$prefixEnd] -ne "'" -and $s[$prefixEnd] -ne '"')) { return $null }
+    $isF = $s.Substring($i, $prefixEnd - $i) -match '[fF]'
+    $q = $s[$prefixEnd]
+    $j = $prefixEnd + 1
+    $sb = New-Object System.Text.StringBuilder
+    $hasPlaceholder = $false
+    while ($j -lt $n -and $s[$j] -ne $q) {
+        if ($s[$j] -eq '\' -and ($j + 1) -lt $n) { [void]$sb.Append($s[$j + 1]); $j += 2; continue }
+        if ($isF -and $s[$j] -eq '{') {
+            if (($j + 1) -lt $n -and $s[$j + 1] -eq '{') { [void]$sb.Append('{'); $j += 2; continue }
+            $hasPlaceholder = $true
+        } elseif ($isF -and $s[$j] -eq '}' -and ($j + 1) -lt $n -and $s[$j + 1] -eq '}') {
+            [void]$sb.Append('}'); $j += 2; continue
+        }
+        [void]$sb.Append($s[$j]); $j++
+    }
+    if ($j -lt $n) { $j++ }
+    return [pscustomobject]@{ Value = $sb.ToString(); End = $j; HasPlaceholder = $hasPlaceholder }
+}
+
+function Read-PyDestExpr {
+    param([string]$s, [int]$start)
+    $n = $s.Length
+    $i = [Math]::Max(0, $start)
+    while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
+    if ($i -ge $n) { return $null }
+    $beginIdx = $i
+    $sb = New-Object System.Text.StringBuilder
+    $resolvable = $true
+    $startI = $i
+    while ($true) {
+        while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
+        $atom = Read-PyLiteralAtom $s $i
+        if ($atom) {
+            if ($atom.HasPlaceholder) { $resolvable = $false }
+            [void]$sb.Append($atom.Value)
+            $i = $atom.End
+        } else {
+            # Non-literal operand (bare name, attribute, call, number, ...):
+            # mark unresolvable and skip the whole balanced sub-expression so
+            # $i still lands on the true top-level terminator afterward.
+            $resolvable = $false
+            $depth = 0
+            while ($i -lt $n) {
+                $c = $s[$i]
+                if ($c -eq "'" -or $c -eq '"') {
+                    $q = $c; $i++
+                    while ($i -lt $n -and $s[$i] -ne $q) {
+                        if ($s[$i] -eq '\' -and ($i + 1) -lt $n) { $i += 2; continue }
+                        $i++
+                    }
+                    if ($i -lt $n) { $i++ }
+                    continue
+                }
+                if ($c -eq '(' -or $c -eq '[' -or $c -eq '{') { $depth++; $i++; continue }
+                if ($c -eq ')' -or $c -eq ']' -or $c -eq '}') {
+                    if ($depth -eq 0) { break }
+                    $depth--; $i++; continue
+                }
+                if ($depth -eq 0 -and ($c -eq ',' -or $c -eq '+')) { break }
+                if ($depth -eq 0 -and $c -match '[ \t]') {
+                    $peek = $i
+                    while ($peek -lt $n -and $s[$peek] -match '[ \t]') { $peek++ }
+                    if ($peek -ge $n -or $s[$peek] -eq ',' -or $s[$peek] -eq ')' -or $s[$peek] -eq '+') { $i = $peek; break }
+                    $i = $peek
+                    continue
+                }
+                $i++
+            }
+        }
+        # Continue the chain on an explicit top-level '+', or on implicit
+        # adjacency (another literal directly follows); otherwise stop here.
+        $save = $i
+        while ($i -lt $n -and $s[$i] -match '[ \t]') { $i++ }
+        if ($i -lt $n -and $s[$i] -eq '+') { $i++; continue }
+        $peekAtom = Read-PyLiteralAtom $s $i
+        if ($peekAtom) { continue }
+        $i = $save
+        break
+    }
+    if ($i -eq $startI) { return $null }   # nothing here at all (e.g. an empty argument)
+    return [pscustomobject]@{ Value = $sb.ToString(); Start = $beginIdx; End = $i; Resolvable = $resolvable }
+}
+
 # Set by Test-BlockedDest on its most recent call so the final reporting block
 # can tell an "unresolvable destination" block apart from an ordinary
 # "blocked extension" block and print a distinguishable operator message.
@@ -426,16 +549,22 @@ $script:bwUnresolvedReason = $null
 function Test-BlockedDest {
     param([string]$dest, [int]$atIndex = [int]::MaxValue, [bool]$hasExpansion = $false)
     $script:bwUnresolvedReason = $null
-    if (-not $dest) { return $false }
     # FAIL CLOSED on an unresolvable destination: a shell expansion in the
     # reconstructed argument means this hook cannot statically know the real
     # destination, so it cannot be waved through even when everything else
     # about it (worktree membership, allow-listed dir, extension) looks fine.
-    # See the FAIL-CLOSED header comment at the top of this file.
+    # See the FAIL-CLOSED header comment at the top of this file. Checked
+    # BEFORE the empty-$dest guard below: a Read-PyDestExpr fallback over a
+    # non-literal operand (a bare name, os.path.join(...), ...) legitimately
+    # folds to an EMPTY Value (it never appends non-literal content) while
+    # still being a real, unresolvable destination — `if (-not $dest)` alone
+    # would have waved that through as "no destination at all" instead of
+    # failing closed.
     if ($hasExpansion) {
         $script:bwUnresolvedReason = 'expansion'
         return $true
     }
+    if (-not $dest) { return $false }
     # $dest arrives already fully unquoted/reconstructed from Read-ShellArgument
     # or Read-PyStringLiteral; Trim() here is a harmless no-op safety net for
     # any caller that still passes a raw single-quote-wrapped literal.
@@ -557,15 +686,22 @@ if (-not $matched) {
 #              python -c "open('bar.ts','wb').write(b'...')"
 #              python -c "open('q.py','a+').write('...')"
 if (-not $matched) {
-    # Locate `open(` then reconstruct arg1 (path, may be fragmented across
-    # adjacent literals) and arg2 (mode) via Read-PyStringLiteral rather than a
-    # single quote-pair regex — the old regex demanded arg1 be EXACTLY one
-    # quoted literal immediately followed by a comma, so splitting the path
-    # across two literals (`'sup' 'ervisor.py'`) made the whole pattern fail to
-    # match, silently un-detecting the write regardless of mode.
+    # Locate `open(` then reconstruct arg1 (destination EXPRESSION — may be
+    # fragmented across adjacent literals and/or joined with `+`) via
+    # Read-PyDestExpr, and arg2 (mode) via Read-PyStringLiteral. Arg1 used to
+    # be read with Read-PyStringLiteral (adjacency-only) and its destination
+    # was NEVER passed through Test-BlockedDest — ANY write-mode open() was
+    # treated as a hit regardless of destination, which is why
+    # open('notes.md','w') and open('docs/plans/p.html','w') (a destination
+    # the docs/plans carve-out exists specifically to allow) both refused.
+    # Read-PyDestExpr also fails closed on an unresolvable destination (a
+    # bare name, os.path.join(...), an f-string with a `{...}` placeholder)
+    # by setting Resolvable=$false, which is passed through as
+    # Test-BlockedDest's $hasExpansion — the open() branch was the one place
+    # still failing OPEN on that shape while every other branch fails closed.
     $openHits = [regex]::Matches($cmd, '\bopen\s*\(\s*')
     foreach ($oh in $openHits) {
-        $arg1 = Read-PyStringLiteral $cmd ($oh.Index + $oh.Length)
+        $arg1 = Read-PyDestExpr $cmd ($oh.Index + $oh.Length)
         if (-not $arg1) { continue }
         $j = $arg1.End
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
@@ -573,7 +709,8 @@ if (-not $matched) {
         $j++
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
         $arg2 = Read-PyStringLiteral $cmd $j
-        if ($arg2 -and ($arg2.Value -match '[wax]')) {
+        if ($arg2 -and ($arg2.Value -match '[wax]') -and
+            (Test-BlockedDest $arg1.Value $arg1.Start (-not $arg1.Resolvable))) {
             $matched = $true
             $reason  = "python -c with open() in write/append/exclusive mode ('$($arg2.Value)') targeting '$($arg1.Value)'"
             break
@@ -588,14 +725,14 @@ if (-not $matched) {
 if (-not $matched) {
     $plHits = [regex]::Matches($cmd, '\bPath\s*\(\s*')
     foreach ($ph in $plHits) {
-        $arg = Read-PyStringLiteral $cmd ($ph.Index + $ph.Length)
+        $arg = Read-PyDestExpr $cmd ($ph.Index + $ph.Length)
         if (-not $arg) { continue }
         $j = $arg.End
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
         if ($j -ge $cmd.Length -or $cmd[$j] -ne ')') { continue }
         $j++
         if ($cmd.Substring($j) -notmatch '^\s*\.\s*write_(?:text|bytes)\b') { continue }
-        if (Test-BlockedDest $arg.Value $arg.Start) {
+        if (Test-BlockedDest $arg.Value $arg.Start (-not $arg.Resolvable)) {
             $matched = $true
             $reason = "pathlib.Path.write_text/write_bytes to '$($arg.Value)'"
             break
@@ -612,15 +749,15 @@ if (-not $matched) {
 if (-not $matched) {
     $shHits = [regex]::Matches($cmd, '\bshutil\s*\.\s*(?:copy2?|copyfile|copytree|move)\s*\(\s*')
     foreach ($sh in $shHits) {
-        $a1 = Read-PyStringLiteral $cmd ($sh.Index + $sh.Length)
+        $a1 = Read-PyDestExpr $cmd ($sh.Index + $sh.Length)
         if (-not $a1) { continue }
         $j = $a1.End
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
         if ($j -ge $cmd.Length -or $cmd[$j] -ne ',') { continue }
         $j++
         while ($j -lt $cmd.Length -and $cmd[$j] -match '[ \t]') { $j++ }
-        $a2 = Read-PyStringLiteral $cmd $j
-        if ($a2 -and (Test-BlockedDest $a2.Value $a2.Start)) {
+        $a2 = Read-PyDestExpr $cmd $j
+        if ($a2 -and (Test-BlockedDest $a2.Value $a2.Start (-not $a2.Resolvable))) {
             $matched = $true
             $reason = "python -c shutil write to '$($a2.Value)'"
             break
