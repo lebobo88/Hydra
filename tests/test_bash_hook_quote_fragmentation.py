@@ -1381,6 +1381,17 @@ class TestInstallWrite:
             "pip install ruamel.yaml",
             "npm install @scope/pkg",
             "go install example.com/cmd/tool@latest",
+            "npm install ./local/pkg",
+            "npm run install",
+            # wrapper commands in front of a package manager must not
+            # reclassify its subcommand as coreutils install
+            "sudo npm install express",
+            "env npm install express",
+            "command npm install express",
+            "env FOO=1 npm install express",
+            # the word appearing inside a quoted/echoed string, not as a
+            # command word at all
+            "echo install hydra_core/supervisor.py",
         ],
     )
     def test_package_manager_install_allowed(self, project_dir: Path, cmd: str):
@@ -1855,5 +1866,146 @@ class TestSixthRevisionPropertyNotInstance:
         assert result.returncode == 0, (
             f"property check failed: removing the cp/mv -t target-directory "
             f"handling should have allowed the bypass, but "
+            f"rc={result.returncode} stderr={result.stderr}"
+        )
+
+
+class TestCommandWordPrefixChain:
+    """SEVENTH REVISION (2026-09) — `Test-IsCommandWord` used to accept only a
+    single previous word (start of string, after a `;`/`&`/`|`/newline
+    separator, or the bare words `sudo`/`env`/`nice`). That missed a whole
+    class of wrapper prefixes that still put `install` in command-word
+    position: `command` (POSIX builtin), a leading `\` (alias suppression),
+    a `VAR=value` assignment between a wrapper and the command, and a
+    wrapper's own OPTION-WITH-VALUE (`sudo -u root`, `nice -n 5`), plus the
+    `exec`/`time` wrappers. All seven measured exit 0 (falsely allowed) on
+    `main@29dbe89`, pre-dating this branch.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the seven new forms this revision closes
+            f"command install a {BLOCKED_REL}",
+            f"\install a {BLOCKED_REL}",
+            f"env FOO=1 install a {BLOCKED_REL}",
+            f"sudo -u root install a {BLOCKED_REL}",
+            f"nice -n 5 install a {BLOCKED_REL}",
+            f"exec install a {BLOCKED_REL}",
+            f"time install a {BLOCKED_REL}",
+            # regression guards: already-correct forms must stay blocked
+            f"install a {BLOCKED_REL}",
+            f"sudo install a {BLOCKED_REL}",
+            f"env install a {BLOCKED_REL}",
+            f"nice install a {BLOCKED_REL}",
+            f"true && install a {BLOCKED_REL}",
+            f"true; install a {BLOCKED_REL}",
+            f"true\ninstall a {BLOCKED_REL}",
+        ],
+    )
+    def test_prefix_chain_forms_blocked(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 2, f"{cmd!r}: expected BLOCK, got rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # every false positive a prefix-chain walk could plausibly
+            # introduce must stay allowed
+            "npm install",
+            "npm install express",
+            "npm i",
+            "npm run install",
+            "sudo npm install express",
+            "env npm install express",
+            "command npm install express",
+            "env FOO=1 npm install express",
+            "pnpm install",
+            "yarn install",
+            "bun install",
+            "pip install requests",
+            "pip3 install -r requirements.txt",
+            "python -m pip install -e .",
+            "apt install curl",
+            "apt-get install -y curl",
+            "dnf install curl",
+            "yum install curl",
+            "brew install jq",
+            "cargo install ripgrep",
+            "go install ./...",
+            "gem install bundler",
+            "composer install",
+            "choco install git",
+            "winget install Git.Git",
+            "pip install ruamel.yaml",
+            "npm install @scope/pkg",
+            "go install example.com/cmd/tool@latest",
+            "npm install ./local/pkg",
+            "echo install hydra_core/supervisor.py",
+        ],
+    )
+    def test_false_positive_list_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "tar -tf archive.tar",
+            "sort -t, -k2 data.csv",
+            "docker run -t image",
+            "ssh -t host cmd",
+            "systemctl list-units -t service",
+            "timeout -t 5 cmd",
+        ],
+    )
+    def test_dash_t_trap_still_allowed(self, project_dir: Path, cmd: str):
+        result = _run_bash_hook(cmd, cwd=project_dir, project_dir=project_dir)
+        assert result.returncode == 0, f"{cmd!r}: expected ALLOW, got rc={result.returncode} stderr={result.stderr}"
+
+
+class TestSeventhRevisionPropertyNotInstance:
+    """Prove the prefix-chain walk is load-bearing: patch out exactly the new
+    wrapper recognition (drop `command` from the wrapper table) in a
+    temporary copy of the hook and confirm `command install a <protected>`
+    returns to exit 0 — the pre-fix false negative."""
+
+    def _patched_hook(self, tmp_path: Path, old: str, new: str) -> Path:
+        hook_text = (HOOKS_DIR / BASH_HOOK).read_text(encoding="utf-8")
+        assert old in hook_text, "expected hook text not found; test is stale"
+        patched_hook = tmp_path / BASH_HOOK
+        patched_hook.write_text(hook_text.replace(old, new), encoding="utf-8")
+        return patched_hook
+
+    def _run(self, hook_path: Path, cmd: str, *, cwd: Path, project_dir: Path) -> subprocess.CompletedProcess:
+        payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}
+        env = {**os.environ}
+        env["HYDRA_ENFORCE_ROUTING"] = "1"
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        env.pop("HYDRA_PP_STAGE_ACTIVE", None)
+        env.pop("HYDRA_WORKTREE_ROOT", None)
+        return subprocess.run(
+            [_PWSH, "-NoProfile", "-File", str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_removing_command_wrapper_recognition_allows_the_bypass(
+        self, project_dir: Path, tmp_path: Path
+    ):
+        patched_hook = self._patched_hook(
+            tmp_path,
+            "$wrappers = @('sudo', 'env', 'nice', 'command', 'exec', 'time', 'nohup', 'stdbuf', 'ionice', 'setsid')\n",
+            "$wrappers = @('sudo', 'env', 'nice', 'exec', 'time', 'nohup', 'stdbuf', 'ionice', 'setsid')\n",
+        )
+        result = self._run(
+            patched_hook, f"command install a {BLOCKED_REL}", cwd=project_dir, project_dir=project_dir
+        )
+        assert result.returncode == 0, (
+            f"property check failed: removing `command` from the wrapper "
+            f"table should have allowed the bypass, but "
             f"rc={result.returncode} stderr={result.stderr}"
         )

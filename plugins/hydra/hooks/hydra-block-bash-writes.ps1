@@ -59,6 +59,19 @@
 #     from a file, or built by a `python -c` one-liner, and no static
 #     path-scanning PreToolUse hook can resolve those. Do not read the
 #     placeholder fix as closing indirect execution in general.
+#   - THE INVENTORY OF WRITE-CAPABLE PROGRAMS IS OPEN, NOT CLOSED. This file
+#     recognizes a fixed list of idioms; it does not and cannot enumerate
+#     every program that can write a file. Known-unguarded surfaces (measured
+#     unguarded, tracked, deliberately not closed here) are catalogued in
+#     docs/audits/WRITE-GUARD-INVENTORY-BACKLOG.md — currently: `rsync`,
+#     `patch -o`, `node`'s `fs.writeFileSync`, `7z`, `unzip -o`, `perl -i`,
+#     `split`/`csplit`, `tar -x`/`--extract`, PowerShell `Set-Content` /
+#     `Out-File` / `Add-Content` (partially covered; audit needed), and
+#     `git apply`. `git checkout -- <path>` is a DELIBERATE NON-GOAL, not an
+#     oversight: it restores a tracked file from git rather than writing
+#     arbitrary content, and `git checkout -- .` is a routine developer
+#     command — blocking it would be a material false positive, and false
+#     positives in this file have proven as costly as bypasses.
 #
 # FAIL-CLOSED ON UNRESOLVABLE DESTINATIONS (security hardening, 2026-09) —
 # the hook does NOT run a shell and cannot know what `$(...)`, a backtick
@@ -424,25 +437,78 @@ function Get-ShellBasename {
 }
 
 function Test-IsCommandWord {
-    # INVENTORY EXTENSION (2026-09) — the false-positive discriminator for
+    # PREFIX-CHAIN WALK (2026-09) — the false-positive discriminator for
     # dd/truncate/ln/install: a word like "install" only counts as ITS OWN
-    # command when it sits in a command-word position (start of string, or
-    # immediately after a statement separator `;`/`&`/`|`/newline, or
-    # immediately after the literal word `sudo`/`env`/`nice`) — NOT when it is
-    # a subcommand argument of another program (`npm install`, `pip install`,
-    # `apt-get install`, `cargo install`, ...). A package name is not a path,
-    # and `install`/`dd`/`ln`/`truncate` appearing as someone else's argument
-    # must never be treated as this hook's own write idiom.
+    # command when the ENTIRE run of tokens between it and the nearest
+    # statement separator (`;`/`&`/`|`/newline, or start of string) is made
+    # up exclusively of: a known wrapper command (sudo/env/nice/command/exec/
+    # time/nohup/stdbuf/ionice/setsid), a `VAR=value` assignment, an option
+    # token (`-x`), or the value of a value-taking option belonging to one of
+    # those wrappers. The first bare word in that run that is none of those
+    # IS the real command, and our word is its argument — this is what keeps
+    # `npm install`, `sudo npm install`, `env FOO=1 npm install`, etc. allowed
+    # while still catching `command install`, `\install` (alias suppression),
+    # `env FOO=1 install`, `sudo -u root install`, `nice -n 5 install`,
+    # `exec install`, and `time install`.
+    #
+    # The value-taking-option table is a small, closed, per-wrapper list of
+    # real CLI contracts (sudo -u/-g/-p/-C, nice -n, env -u, ionice -c/-n,
+    # stdbuf -i/-o/-e; command/exec/time/nohup/setsid take none). An option
+    # not in this table is never assumed to take a value — the safe direction
+    # for false positives, since treating its next word as a value (instead
+    # of as the real command) is what could turn `sudo npm install` into a
+    # false block.
     param([string]$s, [int]$wordStart)
-    $i = $wordStart - 1
-    while ($i -ge 0 -and $s[$i] -match '[ \t]') { $i-- }
-    if ($i -lt 0) { return $true }
-    $c = $s[$i]
-    if ($c -eq ';' -or $c -eq '&' -or $c -eq '|' -or $c -eq "`n" -or $c -eq "`r") { return $true }
-    $j = $i
-    while ($j -ge 0 -and $s[$j] -notmatch '[\s;&|]') { $j-- }
-    $prevWord = $s.Substring($j + 1, $i - $j)
-    return $prevWord -in @('sudo', 'env', 'nice')
+
+    $wrappers = @('sudo', 'env', 'nice', 'command', 'exec', 'time', 'nohup', 'stdbuf', 'ionice', 'setsid')
+    $valueOpts = @{
+        'sudo'   = @('-u', '-g', '-p', '-C')
+        'nice'   = @('-n')
+        'env'    = @('-u')
+        'ionice' = @('-c', '-n')
+        'stdbuf' = @('-i', '-o', '-e')
+    }
+
+    # A `\` glued directly onto the word (no space) suppresses alias
+    # expansion and does not change tokenization — the boundary check below
+    # runs from the backslash's own position instead of the word's.
+    $boundary = $wordStart
+    if ($boundary -gt 0 -and $s[$boundary - 1] -eq '\') { $boundary-- }
+
+    # Find the start of the statement this word lives in: the character just
+    # after the nearest `;`/`&`/`|`/newline before $boundary, or 0.
+    $runStart = 0
+    $k = $boundary - 1
+    while ($k -ge 0) {
+        $ck = $s[$k]
+        if ($ck -eq ';' -or $ck -eq '&' -or $ck -eq '|' -or $ck -eq "`n" -or $ck -eq "`r") { $runStart = $k + 1; break }
+        $k--
+    }
+
+    $run = $s.Substring($runStart, $boundary - $runStart).Trim()
+    if (-not $run) { return $true }
+    $tokens = [regex]::Split($run, '\s+') | Where-Object { $_ -ne '' }
+
+    $lastWrapper = $null
+    $expectingValueFor = $null
+    foreach ($t in $tokens) {
+        if ($expectingValueFor) {
+            $expectingValueFor = $null
+            continue
+        }
+        if ($t -match '^[A-Za-z_][A-Za-z0-9_]*=') { continue }
+        if ($t.StartsWith('-')) {
+            if ($lastWrapper -and $valueOpts.ContainsKey($lastWrapper) -and ($t -in $valueOpts[$lastWrapper])) {
+                $expectingValueFor = $lastWrapper
+            }
+            continue
+        }
+        if ($t -in $wrappers) { $lastWrapper = $t; continue }
+        # A bare word that is none of the above IS the real command — every
+        # token from here on (including our own word) is its argument.
+        return $false
+    }
+    return $true
 }
 
 function Get-BalancedParenText {
