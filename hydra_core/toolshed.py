@@ -703,9 +703,19 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                         "force-dispatch",
                         "change-squads",
                         "recover-stalled-stage",
+                        "modify-plan",
                     ],
                 },
                 "option": {"type": "string"},
+                "critique_ref": {
+                    "type": "string",
+                    "description": (
+                        "modify-plan only: a file path or repo:artifact:<path> "
+                        "MemoryRef key naming the operator's revision critique. "
+                        "The critique text itself must never be passed via "
+                        "'option' -- that field is character- and length-bounded."
+                    ),
+                },
             },
             "required": ["workflow_id", "action"],
         },

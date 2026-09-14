@@ -35,6 +35,7 @@ from .schemas import Plan, PlanStep
 __all__ = [
     "PlanFigure",
     "PlanFigureError",
+    "append_governance_note",
     "plan_slug",
     "render_plan_html",
     "render_plan_json",
@@ -441,6 +442,53 @@ def render_plan_html(
     parts.append("\n".join(prov_lines))
 
     return "\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Governance notes -- P5c
+# ---------------------------------------------------------------------------
+
+_GOVERNANCE_NOTES_RE = re.compile(
+    r'(<h2>Governance Notes</h2>\s*<ul class="plan-list">)(.*?)(</ul>)',
+    re.DOTALL,
+)
+
+
+def append_governance_note(html_text: str, note: str) -> str:
+    """Append a governance note (e.g. a force-dispatch plan-gate bypass) to a
+    rendered plan artifact's HTML, in place.
+
+    A plan artifact is written once by the ingest PLAN branch
+    (`render_plan_html`) and never re-rendered from the `Plan` model
+    afterward -- a governance event that happens AFTER the artifact exists
+    (an operator force-dispatching past `plan_gate`, for instance) has no
+    `Plan` to re-render, only the HTML text already on disk. This function
+    edits that text directly rather than requiring a `Plan` object.
+
+    If a "Governance Notes" section already exists (from a prior note), the
+    new note is appended as another ``<li>`` inside that SAME section's
+    ``<ul>`` -- never a second heading. Structurally idempotent (one
+    heading, ever); NOT content-idempotent (every call adds one more note --
+    callers decide whether a given note has already been recorded, the same
+    convention the rest of this engine's ``hitl_history`` uses).
+    """
+    entry = f"  <li>{_esc(note)}</li>"
+    match = _GOVERNANCE_NOTES_RE.search(html_text)
+    if match:
+        existing_items = match.group(2).rstrip()
+        merged = f"{existing_items}\n{entry}\n" if existing_items else f"{entry}\n"
+        return (
+            html_text[: match.start()]
+            + match.group(1) + "\n" + merged + match.group(3)
+            + html_text[match.end():]
+        )
+    section = (
+        "\n<h2>Governance Notes</h2>\n"
+        '<ul class="plan-list">\n'
+        f"{entry}\n"
+        "</ul>\n"
+    )
+    return html_text.rstrip("\n") + "\n" + section
 
 
 # ---------------------------------------------------------------------------

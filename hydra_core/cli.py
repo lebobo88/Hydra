@@ -44,7 +44,14 @@ _WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 warnings.filterwarnings("ignore", category=UserWarning, module=r"langchain_core.*")
 
 from .squad_loader import discover_squads
-from .state import HydraState, plan_barrier_active, plan_deps_satisfied
+from .state import (
+    HydraState,
+    TaskState,
+    plan_barrier_active,
+    plan_deps_satisfied,
+    plan_max_revisions,
+    plan_revision_ceiling_reached,
+)
 from .telemetry import emit, trace_path
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1038,147 @@ def _release_resume_lock(fd, lock_path) -> None:
         pass
 
 
+def _plan_artifact_relpath(location: str | None) -> str | None:
+    """Extract the repo-relative path from a `plan_artifact_location`
+    MemoryRef key (``repo:artifact:<relpath>``, the shape
+    `hydra_core.artifact_store.write_repo_artifact` returns). Returns None
+    for any other shape (a checkpoint predating P2/P5b, an unset location,
+    or a `--critique-ref` that is simply a plain file path rather than a
+    MemoryRef key) -- callers treat that as "not a repo-artifact MemoryRef",
+    never raise.
+    """
+    if not location or not location.startswith("repo:artifact:"):
+        return None
+    return location[len("repo:artifact:"):]
+
+
+def _append_plan_governance_note(
+    project: Path, wf: str, plan_artifact_location: str | None, note: str,
+) -> None:
+    """Best-effort: append ``note`` to the tracked plan artifact's Governance
+    Notes section (see `hydra_core.plan_artifact.append_governance_note`).
+
+    Fail-soft by design: a missing, unreadable, or unwritable plan artifact
+    must never block the operator action that triggered this note (a
+    force-dispatch past `plan_gate` has already proceeded regardless — see
+    Task 1). A workflow whose plan was never actually committed to disk (or
+    whose artifact write failed earlier) still gets a real `policy_override`
+    trace event and `hitl_history` entry; only the artifact-side note is
+    skipped.
+
+    Fail-soft does NOT mean fail-silent (cross-vendor judge finding, P5c
+    revise round): a `policy_override` event and a `plan_gate_bypassed`
+    hitl_history entry both claim the bypass was recorded, but if THIS
+    write fails, the artifact note never landed and nothing anywhere said
+    so -- the audit trail implies a completeness it does not have. Emit
+    `plan_governance_note_failed` on every failure path (containment
+    refusal included) so a consumer tailing the trace can tell the
+    difference between "no note was needed" (no `plan_artifact_location`,
+    the common non-plan-gate case -- no event either way) and "a note was
+    owed and silently did not happen".
+
+    Read-before-write is validated through the SAME containment check
+    `write_repo_artifact` itself uses
+    (`hydra_core.artifact_store.resolve_repo_artifact_path`) -- this
+    function used to build `Path(project) / relpath` and call `read_text()`
+    on it directly, validating only on the LATER `write_repo_artifact` call,
+    by which point the (potentially path-escaping) read had already
+    happened. One containment check, shared with the write path, not a
+    second hand-rolled one (see `_read_plan_critique`'s sibling comment).
+    """
+    relpath = _plan_artifact_relpath(plan_artifact_location)
+    if relpath is None:
+        return
+    try:
+        from .artifact_store import resolve_repo_artifact_path, write_repo_artifact
+        from .plan_artifact import append_governance_note
+        full = resolve_repo_artifact_path(project, relpath)
+        existing = full.read_text(encoding="utf-8") if full.is_file() else ""
+        updated = append_governance_note(existing, note)
+        write_repo_artifact(project, relpath, updated)
+    except Exception as exc:  # noqa: BLE001 — fail-soft (never block the resume), but say so
+        try:
+            emit(project, wf, "plan_governance_note_failed", {
+                "plan_artifact_location": plan_artifact_location,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        except Exception:  # noqa: BLE001 — even the failure trace must never block the resume
+            pass
+
+
+class _PlanCritiqueError(ValueError):
+    """Raised by `_read_plan_critique` for a `--critique-ref` that cannot be
+    resolved to real critique text (missing --critique-ref, unreadable file,
+    or empty content)."""
+
+
+def _read_plan_critique(ref: str, project: Path) -> str:
+    """Resolve `--critique-ref` (a file path or a `repo:artifact:<path>`
+    MemoryRef key) to the operator's full, untruncated revision critique.
+
+    P5c Task 2: the critique text reaches this CLI via `--critique-ref`,
+    never via `--option`. `_OPTION_RE`
+    (mcp_servers/hydra_control/server.py) caps `option` at 200 characters of
+    ``[A-Za-z0-9 ,._-]`` — real prose critique (parentheses, colons,
+    quotation marks, more than 200 characters) would be rejected or
+    truncated by that boundary, which exists to guard a string that reaches
+    a subprocess argv, not to carry free text. `critique_ref` is validated
+    by the wider `_CRITIQUE_REF_RE` at the MCP boundary instead (still no
+    shell metacharacters, no leading `-`); this function then reads the
+    FULL file content it names, so punctuation and length survive intact.
+
+    Containment, mirroring `hydra_core.artifact_store.write_repo_artifact`'s
+    discipline for the READ side of this same feature: `critique_ref` is not
+    operator-only, it is a parameter on the `hydra.workflow.resume` MCP verb
+    (`_CRITIQUE_REF_RE` guards shell metacharacters and argv-flag confusion,
+    never path containment — it deliberately allows `/`/`\\`/`:` so real
+    paths pass), so an absolute path or a `..`-escaping relative path here is
+    an arbitrary-file-read reachable by any caller of that verb, not just a
+    human operator with their own filesystem access. The resolved candidate
+    MUST land under the resolved project root — this also defeats a symlink
+    that sits inside the project but points outside it, since resolving
+    before comparing follows the symlink to its real target. Refusal is
+    always `_PlanCritiqueError`, never a bare OSError/ValueError leaking the
+    filesystem's own message.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        raise _PlanCritiqueError("empty --critique-ref")
+    relpath = _plan_artifact_relpath(ref)
+    if relpath is not None:
+        raw_candidate = Path(project) / relpath
+    else:
+        raw_candidate = Path(ref)
+        if not raw_candidate.is_absolute():
+            raw_candidate = Path(project) / raw_candidate
+
+    try:
+        project_root = Path(project).resolve()
+    except OSError as exc:
+        raise _PlanCritiqueError(f"could not resolve project root: {exc}") from exc
+    try:
+        candidate = raw_candidate.resolve()
+    except OSError as exc:
+        raise _PlanCritiqueError(
+            f"could not resolve --critique-ref {ref!r}: {exc}"
+        ) from exc
+    if not candidate.is_relative_to(project_root):
+        raise _PlanCritiqueError(
+            f"--critique-ref {ref!r} resolves outside the project root — refused"
+        )
+
+    try:
+        text = candidate.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _PlanCritiqueError(
+            f"could not read --critique-ref {ref!r}: {exc}"
+        ) from exc
+    text = text.strip()
+    if not text:
+        raise _PlanCritiqueError(f"--critique-ref {ref!r} is empty")
+    return text
+
+
 def _cmd_resume(args) -> int:
     """Resume an HITL-paused workflow from its checkpoint.
 
@@ -1188,7 +1336,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # (WS-AUTH run-A comment: this block is intentionally non-enforcing on the
     # operator side; the degraded-warn posture is the documented run-A stance.)
     _MUTATING_RESUME_ACTIONS = frozenset({"approve", "force-dispatch",
-                                          "modify-budget", "change-squads"})
+                                          "modify-budget", "change-squads",
+                                          "modify-plan"})
     operator_capability_patch: dict | None = None
     if action in _MUTATING_RESUME_ACTIONS:
         import logging as _logging
@@ -1328,6 +1477,70 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                   file=sys.stderr)
             return 1
 
+    # P5c Task 2: --modify-plan. Validated and prepared here (alongside the
+    # other per-action patch blocks); the actual graph re-entry happens
+    # further down, in its own early-return branch next to reject/abort --
+    # `sup.invoke(None, config=config)` at the bottom of this function would
+    # resume the graph from wherever it is genuinely parked (`plan_gate`),
+    # re-running `node_plan_gate` against the OLD `plan_ref` and materialising
+    # the WRONG plan's steps. `_modify_plan_task`/`_modify_plan_new_revision`
+    # are consumed by that later branch.
+    _modify_plan_task: TaskState | None = None
+    _modify_plan_new_revision: int | None = None
+    _modify_plan_prior_envelope_id = None
+    if action == "modify-plan":
+        if resolution.get("gate_node") != "plan_gate":
+            print(json.dumps({
+                "error": "modify-plan is only valid at the plan_gate",
+                "gate_node": resolution.get("gate_node"),
+            }), file=sys.stderr)
+            return 1
+        _critique_ref = getattr(args, "critique_ref", None)
+        if not _critique_ref:
+            print(json.dumps({
+                "error": "modify-plan needs --critique-ref <path-or-memoryref> "
+                         "(the critique text itself never travels as --option)",
+            }), file=sys.stderr)
+            return 1
+        try:
+            _critique_text = _read_plan_critique(_critique_ref, project)
+        except _PlanCritiqueError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            return 1
+        _cur_revision = int(values.get("plan_revision") or 0)
+        _max_revisions = plan_max_revisions()
+        if plan_revision_ceiling_reached(_cur_revision, _max_revisions):
+            print(json.dumps({
+                "error": "revision_ceiling_reached",
+                "plan_revision": _cur_revision,
+                "max_revisions": _max_revisions,
+            }), file=sys.stderr)
+            return 1
+        _modify_plan_new_revision = _cur_revision + 1
+        _modify_plan_prior_envelope_id = values.get("plan_envelope_id")
+        _modify_plan_task = TaskState(
+            owner_squad="planning",
+            description=(
+                f"Revise the {values.get('plan_rigor') or 'standard'}-rigor plan "
+                f"(revision {_modify_plan_new_revision}) for: "
+                f"{values.get('root_goal', '')}"
+            ),
+            priority="P2",
+            # Deliberately non-zero (unlike node_planner's P5a seed, which
+            # leaves this at the TaskState default 0) -- this task's own
+            # plan_revision is stamped to the NEW revision it is authoring,
+            # so if a later modify-plan supersedes it before it is ever
+            # dispatched, the stale-revision filters the four selectors
+            # already apply (cli.py, node_dispatch's sequential loop) skip
+            # it exactly like they skip a superseded plan STEP task.
+            plan_revision=_modify_plan_new_revision,
+            plan_critique=_critique_text,
+            supersedes_plan_envelope_id=(
+                str(_modify_plan_prior_envelope_id)
+                if _modify_plan_prior_envelope_id else None
+            ),
+        )
+
     # F8: reflexion_override → approve_override_raise_to_N handler.
     # When the operator approves a reflexion_override gate with the raise-to-N
     # option, parse N and set reflexion_override_granted_until on the state so
@@ -1390,6 +1603,41 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     if action in ("approve", "force-dispatch"):
         patch["hitl_return_node"] = None
 
+    # P5c Task 1: force-dispatch is a governance event, not a synonym for
+    # approve -- two runbooks (plugins/hydra/skills/hitl-protocol/SKILL.md,
+    # plugins/hydra/skills/resume/SKILL.md) already promise a `policy_override`
+    # audit trail for `--force-dispatch`; the engine never actually emitted
+    # one anywhere. This closes that gap for EVERY force-dispatch, not only
+    # at plan_gate — a pre-existing defect on every other gate too, now
+    # visible to any consumer tailing the trace for the first time.
+    if action == "force-dispatch":
+        _fd_gate_node = resolution.get("gate_node")
+        emit(project, wf, "policy_override", {
+            "gate_node": _fd_gate_node,
+            "gate_reason": _gate_reason,
+            "option": option,
+            "operator": _operator,
+        })
+        if _fd_gate_node == "plan_gate":
+            # `bypassed` is NOT a member of `_PLAN_BARRIER_STATES` (state.py)
+            # -- this write cannot raise the plan barrier, unlike the
+            # `rejected` write below, which the reject path scopes to
+            # plan_gate for exactly that reason. Still scoped here too, so a
+            # force-dispatch past a DIFFERENT gate never touches plan_status.
+            patch["plan_status"] = "bypassed"
+            _bypass_note = {
+                "event": "plan_gate_bypassed",
+                "workflow_id": wf,
+                "note": "dispatch proceeded without plan approval (force-dispatch)",
+                "resolved_at": resolution["resolved_at"],
+            }
+            patch["hitl_history"] = [resolution, _bypass_note]
+            _append_plan_governance_note(
+                project, wf, values.get("plan_artifact_location"),
+                "dispatch proceeded without plan approval (force-dispatch, "
+                f"resolved_at={resolution['resolved_at']})",
+            )
+
     sup.update_state(config, patch)
 
     # C3: prevent a later spool replay from filing a ticket for this
@@ -1433,13 +1681,62 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
 
     if action == "reject":
         # A rejected gate does NOT continue the graph; the workflow stays
-        # parked as 'surfaced' with the resolution on record.
-        sup.update_state(config, {"phase": "surfaced"})
+        # parked as 'surfaced' with the resolution on record. Deliberately
+        # NO automatic re-plan: an engine that authors another plan the
+        # moment one is rejected is a loop the operator cannot stop. The
+        # rejected plan stays on disk marked rejected.
+        _reject_patch: dict[str, Any] = {"phase": "surfaced"}
+        # P5c Task 3: `rejected` IS a member of `_PLAN_BARRIER_STATES`
+        # (state.py) -- writing it RAISES the plan barrier. This handler
+        # runs for EVERY gate rejection (budget, high_risk, constitution,
+        # plan_gate, ...), so the write must be scoped to plan_gate: an
+        # unscoped write here would raise a barrier that, with
+        # HYDRA_PLAN_PHASE off, no flag-gated code could ever clear —
+        # exactly the total-dispatch-freeze class of bug the flag exists to
+        # prevent, reachable from an ordinary operator reject. See the
+        # `bypassed` write above (Task 1) for the safe-by-construction
+        # counterpart, and state.py's `_PLAN_BARRIER_STATES` comment.
+        if resolution.get("gate_node") == "plan_gate":
+            _reject_patch["plan_status"] = "rejected"
+        sup.update_state(config, _reject_patch)
         print(json.dumps({
             "workflow_id": wf,
             "resumed": False,
             "action": "reject",
             "phase": "surfaced",
+        }, indent=2))
+        return 0
+
+    if action == "modify-plan":
+        # P5c Task 2: re-enter the graph the same way the ingest PLAN branch
+        # does (`_reenter_graph_after_dispatch`, P5b Task 3) -- as_node=
+        # "dispatch" makes the graph believe dispatch just finished so
+        # after_dispatch's conditional edge fires fresh against the NEW
+        # plan_status ("authoring", not "drafted"), routing to "await_host"
+        # (-> END) rather than re-running the still-parked `plan_gate`
+        # interrupt node against the OLD `plan_ref`. Reusing this exact
+        # primitive (rather than writing a second copy) is deliberate — see
+        # this function's brief on hand-duplicated decisions.
+        assert _modify_plan_task is not None and _modify_plan_new_revision is not None
+        parked_at = _reenter_graph_after_dispatch(sup, config, {
+            "plan_status": "authoring",
+            "plan_revision": _modify_plan_new_revision,
+            "tasks": [_modify_plan_task],
+        })
+        emit(project, wf, "plan_modify_requested", {
+            "prior_plan_envelope_id": (
+                str(_modify_plan_prior_envelope_id)
+                if _modify_plan_prior_envelope_id else None
+            ),
+            "plan_revision": _modify_plan_new_revision,
+        })
+        print(json.dumps({
+            "workflow_id": wf,
+            "resumed": True,
+            "action": "modify-plan",
+            "plan_status": "authoring",
+            "plan_revision": _modify_plan_new_revision,
+            "plan_parked_at": parked_at,
         }, indent=2))
         return 0
 
@@ -4715,11 +5012,17 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--action", required=True,
                     choices=["approve", "reject", "modify-budget",
                              "force-dispatch", "change-squads",
-                             "recover-stalled-stage"])
+                             "recover-stalled-stage", "modify-plan"])
     rs.add_argument("--option", help=(
         "Action argument: chosen option label, new budget USD for "
         "modify-budget, comma-separated squads for change-squads, or the "
         "stalled attended cursor's run_id for recover-stalled-stage"))
+    rs.add_argument("--critique-ref", dest="critique_ref", metavar="PATH_OR_MEMORYREF",
+                    help=(
+                        "modify-plan only: a file path or repo:artifact:<path> "
+                        "MemoryRef key naming the operator's revision critique. "
+                        "Never pass the critique text itself via --option -- "
+                        "that channel is character- and length-bounded."))
     rs.add_argument("--live", action="store_true",
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
     rs.add_argument("--verbose", action="store_true")
