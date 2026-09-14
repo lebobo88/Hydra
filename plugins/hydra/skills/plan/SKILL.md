@@ -5,16 +5,26 @@ description: "The planning squad's own runbook: Pyrrha (plan-author) → Momus (
 
 # Plan
 
-## What this is (and is not) yet
+## What this is, and what gates it
 
-This skill documents the `planning` squad pack's contract. As of P4 of the
-planning-phase build, the pack is **discovered but never selected**: nothing
-in `hydra_core/router.py` or `hydra_core/supervisor.py` seeds a planning
-task, routes to `planning`, or authors a plan. That wiring is P5. Until then,
-this skill's runbook describes intent, not a live path — do not treat it as
-license to hand-author a plan artifact inline from this skill, from
-`/hydra:run`, or from any other command. The whole point of a dedicated
-`plan-scribe` gate (below) is that nothing else writes the plan file.
+This skill documents the `planning` squad pack's contract. The engine wiring
+is now in place: `node_planner` seeds a planning task, the plan barrier holds
+every other task until the plan resolves, and `node_plan_judge` /
+`node_plan_gate` carry it from drafted through judged to approved.
+
+**It is gated behind `HYDRA_PLAN_PHASE`, which is default OFF.** With the flag
+off nothing seeds a planning task and no plan is authored — the engine behaves
+exactly as it did before this feature. The flag gates *writers* of
+`plan_status`, never readers; that asymmetry is deliberate and is what stops
+turning the flag off mid-flight from releasing a barrier over unplanned work.
+See the `_PLAN_BARRIER_STATES` comment in `hydra_core/state.py`.
+
+Unchanged, and the reason this skill exists: do not treat any of this as
+license to hand-author a plan artifact inline — from this skill, from
+`/hydra:run`, or from anywhere else. The whole point of a dedicated
+`plan-scribe` gate (below) is that nothing else writes the plan file. A plan
+reaches disk through the ingest PLAN branch and `write_repo_artifact`, or it
+does not exist.
 
 ## Why `claude-native`
 

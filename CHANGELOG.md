@@ -8,6 +8,55 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Added — the plan phase, behind `HYDRA_PLAN_PHASE` (default OFF)
+
+Hydra could route, govern, budget, judge and replay, but it had no plan. It had
+a task list: `node_planner` synthesised one task per selected squad whose
+description was the operator's goal verbatim, and the approval gate asked the
+operator to bless a squad list they could not see. The plan phase gives that
+decision an artifact.
+
+A `PLAN` envelope with typed, acyclic, per-step decomposition; a `planning`
+squad pack whose three heads author, critique and scribe it; a barrier that
+holds every other task until the plan resolves; a cross-vendor judged
+`plan_gate` where the operator approves, rejects, or requests a revision
+against the rendered plan; and the plan itself written to `docs/plans/` as a
+tracked artifact so `git diff` is the review surface.
+
+Everything above is inert while the flag is off, which is its default. The flag
+gates *writers* of `plan_status` and never readers — turning it off mid-flight
+therefore cannot release a barrier over unplanned work.
+
+### Changed — the pre-dispatch approval gate stands down when a plan is coming
+
+**This is a declared behaviour change, not a no-op, and it is recorded here
+rather than left to be discovered.**
+
+`_task_is_high_risk` inspects every task in the workflow, so a P0/P1 task — or
+any squad declaring a `hitl_required` gate — used to raise the one-line,
+sight-unseen `approval` gate *before* any plan existed, on exactly the
+high-risk workflows that most need one. Leaving it in place would have
+double-gated the same decision and trained operators to rubber-stamp the first
+of two prompts.
+
+When the plan phase is active and rigor is not `trivial`, the `high_risk`
+driver stands down and `plan_gate` becomes the single, *informed* approval.
+`budget_exhausted` is deliberately excluded from the stand-down — an
+over-budget workflow still stops at `approval` with `reason="over_budget"`,
+because budget is not a risk signal that a plan can inform.
+
+The previous precedence is preserved byte-for-byte for `trivial` rigor, for
+checkpoints predating the feature, and whenever the flag is off — which is
+every existing workflow today.
+
+### Added — `policy_override` is now actually emitted
+
+`--force-dispatch` has been documented in two runbooks as logging a
+`policy_override` event, with the operator owning the risk. The engine emitted
+nothing, anywhere. Force-dispatching past *any* gate — budget, high-risk,
+constitution — left no trace. It now emits for every force-dispatch, and the
+emit is not contingent on any side effect succeeding.
+
 ### Added — Hydra's own register (plugin 0.1.7)
 
 - New primary agents `plugins/hydra/agents/hydra.md` (cathedral register) and

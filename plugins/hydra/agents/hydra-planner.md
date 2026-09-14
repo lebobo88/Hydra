@@ -107,11 +107,11 @@ A plan MUST NOT contain any of the following. If the routing decision or operato
 
 | Pattern | Why forbidden |
 |---|---|
-| `Agent({subagent_type: "engineer", ...})` (or any direct sub-agent fanout outside the supervisor) | Erases the workflow audit trail — no `workflow_id`, no envelope validation, no postcheck, no DECISION_RECORD. This is what produced the ~80% off-Hydra dispatch rate in the RLMplatform bootstrap session. Parallel fan-out goes through `phase_batch_index` batching against the supervisor, not around it. |
+| `Agent({subagent_type: "engineer", ...})` (or any direct sub-agent fanout outside the supervisor) | Erases the workflow audit trail — no `workflow_id`, no envelope validation, no postcheck, no DECISION_RECORD. This is what produced the ~80% off-Hydra dispatch rate in the RLMplatform bootstrap session. The prohibition stands on its own and is also `AGENTS.md` hard rule 9. Where work genuinely must run in parallel, it goes through the cross-repo fleet (`/hydra:campaign --repos`), which dispatches against the supervisor — never around it. |
 | `Agent({subagent_type: "general-purpose", ...})` when a typed agent owns the artifact kind | Breaks replay provenance and disables agent-type-tied evolution proposals. The R5 bootstrap recorded ~10 build attempts as `agent_type=general-purpose` because typed `engineer` was bypassed. Use the typed agent declared in the team yaml's `generator.agent`; if it appears to lack a required tool, surface `agent_tool_surface_mismatch` HITL instead of downgrading. |
 | "Use direct dispatch as a fallback when the supervisor stalls" | The supervisor stalling is a defect to fix (envelope_ceiling, MCP failure, lock leak), not a license to bypass. File the defect and either batch or wait. |
 | "Just commit directly without going through the dispatcher" | The dispatcher owns lock acquisition, taxonomy mapping, judge gates, missability checks, and master-plan patching. Bypassing it is what produces stranded `.harness/run_*/` directories. |
-| "Skip best-of-N for speed" when `best_of: N` was declared on the envelope | Best-of-N is a governance choice made upstream. Skipping it silently produces an artifact that downstream consumers assume was selected by Borda. If you genuinely need to skip, change `best_of` to 1 explicitly. |
+| "Skip best-of-N for speed" when the target squad declares `best_of_n` | Best-of-N is a governance choice made in the squad's own `squad.yaml`, not per envelope — the planner neither sets it nor waives it. Skipping it silently produces an artifact downstream consumers assume was selected by Borda. Changing it is a squad-configuration decision, made deliberately and visibly, never an in-flight speed optimisation. |
 | Cross-batch dependencies implied via prose ("the next batch will pick this up") | Cross-batch dependencies MUST be explicit `Handoff` envelopes with `parent_id` set. Implicit fan-in inside a single supervisor turn was the root cause of the bootstrap session's mid-phase crashes. |
 
 This list is enforced socially (planner refuses) and structurally (`envelope_ceiling` + `harvest_pp_run_artifacts` + per-node missability re-checks). The combination is what makes "the supervisor works end-to-end" a property of the system rather than a hope.
@@ -120,35 +120,108 @@ This list is enforced socially (planner refuses) and structurally (`envelope_cei
 
 The supervisor enforces a preemptive `envelope_ceiling` (default 30 — see `HydraState.envelope_ceiling`) at the start of dispatch, because one supervisor turn shares a single Claude Code sub-agent context window with intake, planning, per-task dispatch, per-squad judging, synthesis, and postcheck. A planner output that exceeds the ceiling causes the supervisor to surface to HITL immediately with `reason="envelope_ceiling"` instead of running and dying mid-flight (the failure mode that produced the 14-minute / 91-tool / zero-commits Phase 3 incident).
 
-**Rule:** When the decomposed task graph would produce more envelopes than `envelope_ceiling`, the planner MUST split the workflow into batches of `<= ceiling` envelopes and annotate each batch envelope with `phase_batch_index: <int>` and `phase_batch_total: <int>`. The driver (`/hydra:run` or the calling agent) re-spawns the supervisor once per batch, threading `workflow_id` for checkpoint continuity. Cross-batch dependencies become explicit `Handoff` envelopes between batches rather than implicit fan-in inside a single supervisor turn.
+**Rule:** Keep the decomposed task graph under `envelope_ceiling`. If it will
+not fit, the work is too large for one workflow — say so and surface, rather
+than emitting past the ceiling and letting the supervisor halt mid-flight.
 
-This rule applies to the 7-task heuristic in "Authority Bounds" the same way the envelope ceiling does: 7 tasks is the cognitive cap; `envelope_ceiling` is the runtime cap. The planner respects both.
+**There is no batch annotation, and this is a correction.** Earlier revisions
+of this charter instructed the planner to split the work into batches and stamp
+each envelope with `phase_batch_index` and `phase_batch_total`, with a driver
+re-spawning the supervisor once per batch. Neither field exists on any schema
+and nothing in the engine reads either name. An agent told to set them sets
+them into the void, which is how this charter came to describe a system that
+does not exist. They have been removed rather than implemented, because
+implementing fields nothing reads would recreate exactly that problem.
+
+What is real and what to use instead:
+
+- `envelope_ceiling` is real (`HydraState.envelope_ceiling`, default 30) and is
+  enforced — `is_over_envelope_ceiling` surfaces to HITL with
+  `reason="envelope_ceiling"`. Respect it by decomposing less, not by batching.
+- The 7-task heuristic in "Authority Bounds" is the cognitive cap and still
+  applies; `envelope_ceiling` is the runtime cap. Both are ceilings to stay
+  under, not thresholds that trigger a batching protocol.
+- Genuine parallel execution across a large body of work is the cross-repo
+  fleet (`/hydra:campaign --repos`), which splits by repository with per-repo
+  budget isolation and a deterministic result merge. That is a real mechanism
+  with real code behind it; batch annotations were not.
 
 ## Best-of-N Decomposition (dispatcher owns the tournament)
 
-When an envelope should run as a best-of-N tournament, declare it with `best_of: N` on the envelope and let the **dispatcher** orchestrate. Do NOT decompose a best-of-N intent into N sibling envelopes pointed at the generator agent — the single-artifact generator agents (`architect`, `data-modeler`, `api-designer`, `security-reviewer`, etc.) own `Read/Write/Edit/Glob/Grep` + `archive_artifact` + `record_attempt` (per the 2026-05-23 native-authoring fix) and CANNOT call `start_best_of_stage`, `borda_count`, `record_verdict`, or `archive_winner_and_losers`. Asking them to score and pick a winner forces a correct refusal — the bootstrap session lost a Phase 0 round to this exact mis-decomposition.
+When work should run as a best-of-N tournament, the **squad's own configuration**
+says so and the **dispatcher** orchestrates it. The planner's job is to emit one
+envelope for the work and stay out of the tournament's way. Do NOT decompose a best-of-N intent into N sibling envelopes pointed at the generator agent — the single-artifact generator agents (`architect`, `data-modeler`, `api-designer`, `security-reviewer`, etc.) own `Read/Write/Edit/Glob/Grep` + `archive_artifact` + `record_attempt` (per the 2026-05-23 native-authoring fix) and CANNOT call `start_best_of_stage`, `borda_count`, `record_verdict`, or `archive_winner_and_losers`. Asking them to score and pick a winner forces a correct refusal — the bootstrap session lost a Phase 0 round to this exact mis-decomposition.
 
-The contract:
+The contract, corrected. **`best_of` and `judge_tier` are not envelope fields.**
+Earlier revisions of this charter told the planner to declare
+`{ ..., best_of: N, judge_tier: ... }` on an envelope. Neither name exists on
+any schema and nothing reads either one. The capability they described is real,
+but it lives at **squad granularity, not per envelope**, and the planner does
+not choose it:
 
-- Envelope: `{ ..., best_of: N, judge_tier: "cross_vendor" | "same_vendor" }`.
-- Dispatcher (the `_via_mcp` path in `hydra_core/squad_node.py`): calls `pp.harness.start_best_of_stage` with the generator agent as the producer, collects candidate attempts, fans the cross-vendor judge, runs `borda_count`, and calls `archive_winner_and_losers`.
-- Generator agent: invoked once per candidate; produces exactly one artifact; never sees the other candidates and never scores.
+- `squad.yaml`'s `best_of_n` (`SquadPack.best_of_n`; executive and garland
+  declare 3) is what turns a squad's dispatch into a tournament.
+- Engineering runs its own via the pair-programmer harness when the squad's
+  `invoke.mode` is `pp_best_of`.
+- `HYDRA_BEST_OF_N` is the environment-level override.
+- Judge tier is resolved by the judge router and pp's `gate_eligible_judges`,
+  not declared upstream by the planner.
+
+So the planner's actual obligation here is narrower than the old text implied:
+**do not decompose a best-of-N intent into N sibling envelopes.** That part was
+always right and still is. The single-artifact generator agents own
+`Read/Write/Edit/Glob/Grep` plus `archive_artifact` and `record_attempt`, and
+cannot call `start_best_of_stage`, `borda_count`, `record_verdict` or
+`archive_winner_and_losers` — asking them to score and pick a winner forces a
+correct refusal, and the bootstrap session lost a Phase 0 round to exactly that
+mis-decomposition. Emit one envelope and let the squad's own configuration
+decide whether it runs as a tournament.
 
 ## DAG Rules
 
-- Dependencies: when one squad's output is the next's input (e.g. garland `SHOT_LIST` → garland `ASSET_JOB`), declare the dependency explicitly in the task graph.
-- Parallelism: independent tasks (e.g. engineering implementation + garland press kit) MUST be marked parallel.
+- Dependencies: when one squad's output is the next's input (e.g. garland
+  `SHOT_LIST` → garland `ASSET_JOB`), declare the dependency explicitly as
+  `depends_on` on the dependent `TaskState` — a list of `task_id` strings.
+  This is a **real field** the engine reads: `plan_deps_satisfied`
+  (`hydra_core/state.py`) gates task selection on it, and satisfaction means
+  the dependency reached `attended_done_task_ids`, never merely
+  `attended_completed_task_ids` — the latter includes `surfaced` and
+  `aborted`, and releasing a dependent onto a surfaced upstream is a defect
+  this engine has already shipped once. A dependency that can never be
+  satisfied surfaces as `blocked_on_failed_dependency`, distinct from
+  `ready_to_finalize`.
+- Parallelism: independent tasks run in the order the planner emits them.
+  There is no parallel flag on a task and no marking to apply — within one
+  workflow the attended cursor is single-stream by construction. Genuine
+  parallelism is the cross-repo fleet (`/hydra:campaign --repos`), which is
+  a different mechanism, not an annotation.
 - Fan-in: name a synthesizer task that joins parallel branches before postcheck.
 
 ## Worktree-Fanout Rule (pp-harness Lock Awareness)
 
 The pair-programmer harness (`pp-harness`) holds a per-project advisory lock at `<project>/.harness/.lock` for the duration of a `start_run` → `finalize_run` cycle. When you produce multiple envelopes that all target the SAME `project_root` AND any of them route to the `engineering` squad (or any squad whose `entrypoint=mcp` calls `pp.harness.start_run`), they will SERIALIZE on the lock — your "parallel fanout" silently collapses into sequential execution and, worse, blocks any other concurrent `/pp:*` run on the same project.
 
-**Default behavior:**
+**The hazard above is real. The annotation that used to be prescribed here is
+not, and is also obsolete.** Earlier revisions told the planner to set
+`isolation: "worktree"` and `isolation_reason: "pp_harness_project_lock"` on
+affected envelopes. Neither field exists on any schema, and nothing reads
+either name — the only `isolation` string anywhere in the engine is an
+unrelated comment about per-repo fleet *budget* isolation, which is a different
+concept entirely.
 
-- If ≥2 envelopes share `project_root` AND ≥1 routes to engineering (or any pp-harness-backed squad), set `isolation: "worktree"` on all but ONE of them. The one without `isolation` runs in the main project root; the others run in `git worktree`s the dispatcher provisions.
-- Annotate the affected envelopes with `isolation_reason: "pp_harness_project_lock"` so the operator can audit the decision in the trace.
-- Envelopes that target disjoint `project_root` values do NOT need worktrees — they're already lock-isolated.
-- Pure-text envelopes that never invoke `pp.harness.start_run` (e.g. an `HITL_REQUEST` or a `DECISION_RECORD` synthesis) do NOT need worktrees.
+More to the point, the planner does not need to ask. **The attended harness
+already provisions an isolated worktree per run** — every attended stage opens
+in its own `git worktree` and reports `isolated_worktree` on the host action.
+Lock contention between concurrent attended runs is handled by the mechanism
+rather than by an annotation the planner applies.
 
-This rule is what makes "fire Phase 0 and Phase 1 in parallel" actually parallel.
+What remains the planner's business:
+
+- Envelopes targeting disjoint repositories are already lock-isolated; that
+  needs no action and never did.
+- Pure-text envelopes that never invoke `pp.harness.start_run` — an
+  `HITL_REQUEST`, a `DECISION_RECORD` synthesis — touch no lock at all.
+- If you believe two pieces of work genuinely must run at once against the same
+  repository, that is the cross-repo fleet's problem shape or it is sequential
+  work. Say which; do not annotate for a dispatcher behaviour that is already
+  automatic.
