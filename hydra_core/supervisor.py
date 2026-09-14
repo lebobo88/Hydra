@@ -55,6 +55,8 @@ from .state import (
     TaskState,
     make_checkpoint_serde,
     plan_barrier_active,
+    plan_max_revisions,
+    plan_revision_ceiling_reached,
     plan_deps_satisfied,
 )
 
@@ -3744,6 +3746,7 @@ def build_supervisor(
         }
 
         use_client = critique_client if critique_client is not None else NoOpCritiqueClient()
+        judge_vendor = "codex"
         try:
             judge_vendor = (list(judge_policy.preferred_judge_vendors) or ["codex"])[0]
             verdict = dispatch_judge(
@@ -3765,12 +3768,43 @@ def build_supervisor(
                 "rubric_id": "plan-decomposition-quality@1",
             }
 
+        # P5c: the `--modify-plan` revision ceiling. `plan_revision_ceiling_
+        # reached` is the ONE shared decision (state.py) `hydra_core.cli`'s
+        # `--modify-plan` handler also calls before seeding another
+        # revision -- defined once so the gate's advertised options and the
+        # CLI's enforcement can never drift apart.
+        max_revisions = plan_max_revisions()
+        revision_ceiling_reached = plan_revision_ceiling_reached(
+            state.plan_revision, max_revisions
+        )
+
         plan_detail: dict[str, Any] = {
             "estimated_total_budget_usd": estimated_total,
             "remaining_budget_usd": remaining_budget,
             "over_plan_budget": over_plan_budget,
             "verdict_outcome": verdict_dict.get("outcome"),
             "step_count": len(plan_steps),
+            "max_revisions": max_revisions,
+            "revisions_used": max(0, state.plan_revision - 1),
+            "revision_ceiling_reached": revision_ceiling_reached,
+            # What the gate must render (hitl-protocol format): the plan's
+            # repo-relative path, the step table with dependencies, the
+            # judge verdict and vendor, the budget estimate (above), and the
+            # open-question count. No node in this engine ever runs `git
+            # commit` -- say so rather than let the operator assume the
+            # artifact is committed.
+            "artifact_location": state.plan_artifact_location,
+            "artifact_committed": False,
+            "judge_vendor": judge_vendor,
+            "open_question_count": len(plan_ref.get("open_questions") or []),
+            "steps_with_dependencies": [
+                {
+                    "step_id": s.get("step_id"),
+                    "description": s.get("description"),
+                    "depends_on": s.get("depends_on") or [],
+                }
+                for s in plan_steps if isinstance(s, dict)
+            ],
         }
 
         summary = (
@@ -3780,6 +3814,23 @@ def build_supervisor(
         )
         if over_plan_budget:
             summary += " ESTIMATED PLAN COST EXCEEDS REMAINING BUDGET."
+        if not state.plan_artifact_location:
+            summary += " No plan artifact on record."
+
+        if revision_ceiling_reached:
+            # P5c: HYDRA_PLAN_MAX_REVISIONS is spent -- offer only a
+            # terminal decision. `abort` (not `reject`) is the default here:
+            # `reject` still raises the plan barrier permanently (see
+            # state.py's `_PLAN_BARRIER_STATES` comment), which is the
+            # correct outcome for a genuine rejection but the wrong DEFAULT
+            # for an unattended gate expiry at the ceiling -- `abort` parks
+            # the workflow without stamping a rejection the operator never
+            # actually chose.
+            options = ["approve", "abort"]
+            default_option = "abort"
+        else:
+            options = ["approve", "reject", "modify-plan", "modify-budget"]
+            default_option = "reject"
 
         hitl = HITLRequest(
             workflow_id=state.workflow_id,
@@ -3787,8 +3838,8 @@ def build_supervisor(
             target_squad="human",
             reason="plan_approval",
             summary=summary,
-            options=["approve", "reject", "modify-budget"],
-            default_option="reject",
+            options=options,
+            default_option=default_option,
         )
         hitl_dict = hitl.model_dump(mode="json")
         hitl_dict["gate_node"] = "plan_gate"  # C2-style dedupe key half

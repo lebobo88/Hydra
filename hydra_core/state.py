@@ -5,6 +5,7 @@ for collections (tasks, messages, artifacts) and replace-by-default for scalars.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Optional
 from uuid import UUID, uuid4
@@ -179,6 +180,19 @@ class TaskState(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     plan_step_id: Optional[str] = None
     plan_revision: int = 0
+    # P5c: `--modify-plan` seeds a fresh "planning" task carrying the
+    # operator's revision critique instead of a plan STEP -- this task has
+    # no `plan_step_id`. `plan_critique` is the critique's full, untruncated
+    # text (read from the `--critique-ref` file/MemoryRef by
+    # `hydra_core.cli._read_plan_critique`, never routed through the
+    # `_OPTION_RE`-bounded `--option` string). `supersedes_plan_envelope_id`
+    # names the prior `Plan.id` this revision replaces, mirroring
+    # `hydra_core.schemas.Plan.supersedes` (a UUID there; a str here since a
+    # TaskState is not itself an envelope and need not round-trip through
+    # envelope validation). Both additive-only Optional fields -- an
+    # existing checkpoint loads fine with both None.
+    plan_critique: Optional[str] = None
+    supersedes_plan_envelope_id: Optional[str] = None
 
 
 class HydraState(BaseModel):
@@ -437,7 +451,66 @@ class HydraState(BaseModel):
 # here" -- gets the safety direction backwards; see
 # `test_p5b_plan_lifecycle.py`'s locked-in regression tests for the property
 # this asymmetry buys.
+#
+# P5c adds TWO more writers, both in `hydra_core/cli.py`'s resume handler,
+# and both scoped to `gate_node == "plan_gate"` rather than written
+# unconditionally -- unlike the two seeding writers above, these run inside
+# a handler (the resume/reject path) that also serves EVERY OTHER gate in
+# the engine, so an unscoped write here would raise or move the barrier from
+# an action that has nothing to do with planning:
+#   * `--force-dispatch` past `plan_gate` writes `plan_status="bypassed"`.
+#     `"bypassed"` is deliberately NOT a member of `_PLAN_BARRIER_STATES` --
+#     it cannot raise the barrier by construction, so this write is safe even
+#     if the scoping were ever dropped by accident. It is still scoped, so
+#     the next reader does not have to re-derive that safety argument.
+#   * `--reject` at `plan_gate` writes `plan_status="rejected"`, which IS a
+#     barrier member -- unlike `bypassed`, an unscoped write here WOULD raise
+#     the barrier from an ordinary rejection of ANY gate (budget, high_risk,
+#     constitution, ...), with `HYDRA_PLAN_PHASE` off and no flag-gated code
+#     anywhere able to ever clear it. This is exactly the total-dispatch-
+#     freeze class of bug the flag exists to prevent, reachable from a
+#     routine operator reject -- the scoping to `plan_gate` is load-bearing,
+#     not cosmetic. See `tests/test_p5c_plan_operator_surfaces.py`.
 _PLAN_BARRIER_STATES = frozenset({"authoring", "drafted", "judged", "rejected"})
+
+
+def plan_max_revisions() -> int:
+    """HYDRA_PLAN_MAX_REVISIONS -- the `--modify-plan` revision ceiling.
+
+    Default 2. Shared by `node_plan_judge` (supervisor.py, which reads it to
+    decide what options the plan_gate advertises) and `hydra_core.cli`'s
+    `--modify-plan` handler (which enforces it before seeding another
+    revision) so the ceiling is defined exactly once -- see
+    `plan_revision_ceiling_reached` below for why a hand-duplicated second
+    copy of the comparison itself would be worse than a hand-duplicated env
+    read.
+    """
+    raw = os.environ.get("HYDRA_PLAN_MAX_REVISIONS", "")
+    if not raw:
+        return 2
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    return value if value > 0 else 2
+
+
+def plan_revision_ceiling_reached(plan_revision: int, max_revisions: int) -> bool:
+    """True once the operator has used every `--modify-plan` revision the
+    ceiling allows.
+
+    `plan_revision` starts at 1 for the first authored plan (the initial
+    draft is not itself a "revision"); each `--modify-plan` call increments
+    it by one, so the number of revisions actually consumed is
+    ``plan_revision - 1``. Defined ONCE here -- both `node_plan_judge` (to
+    decide whether the gate offers `modify-plan` at all) and the CLI's
+    `--modify-plan` handler (to refuse a request that would exceed the
+    ceiling) call this instead of re-deriving the comparison, so the two
+    can never drift the way a prior phase's hand-duplicated decision did
+    (see `_ingest_item_should_release_claim`'s docstring in cli.py for that
+    history).
+    """
+    return max(0, plan_revision - 1) >= max_revisions
 
 
 def plan_barrier_active(state) -> bool:

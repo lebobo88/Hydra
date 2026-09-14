@@ -54,12 +54,21 @@ _HYDRA_ROOT = Path(os.environ.get("HYDRA_ROOT") or _HERE.parents[2])
 from hydra_core.proc import no_window_creationflags  # noqa: E402 — needs sys.path.insert above
 
 _RESUME_ACTIONS = ("approve", "reject", "modify-budget", "force-dispatch",
-                   "change-squads", "recover-stalled-stage")
+                   "change-squads", "recover-stalled-stage", "modify-plan")
 
 # workflow_id is used as a subprocess argument — restrict to UUID-ish tokens
 # so a malicious payload can never smuggle flags or shell metacharacters.
 _WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
+
+# P5c: `--modify-plan`'s critique reference. A file path or a
+# `repo:artifact:<path>` MemoryRef key -- both need `/` (and, on Windows,
+# `\` and `:`), which `_OPTION_RE` deliberately excludes. The critique TEXT
+# itself never travels through this field (or through `option`) -- only a
+# reference the CLI reads on its own side (`hydra_core.cli._read_plan_
+# critique`). No leading `-` (argparse-flag confusion), no shell
+# metacharacters, generous length (a real repo path can be long).
+_CRITIQUE_REF_RE = re.compile(r"^(?!-)[A-Za-z0-9 ,._:/\\-]{1,4096}$")
 
 # C5: audit — cockpit write actions that may appear in hydra.cockpit.audit calls.
 # This is informational/validation; we do not restrict the action field to this set
@@ -67,7 +76,7 @@ _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
 _COCKPIT_WRITE_ACTIONS = frozenset({
     "launch", "approve", "reject", "modify-budget",
     "force-dispatch", "change-squads", "recover-stalled-stage",
-    "replay", "tag_memory",
+    "modify-plan", "replay", "tag_memory",
 })
 
 # ---------------------------------------------------------------------------
@@ -346,7 +355,8 @@ def _normalize_and_validate_envelopes(
     return normalized, rejected
 
 
-def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[str, Any]:
+def _launch_resume(workflow_id: str, action: str, option: str | None,
+                   critique_ref: str | None = None) -> dict[str, Any]:
     # Detached gate: resume is automation-only. No fleet exemption — a resume
     # call carries no fleet goal string, so fleet detection is not applicable.
     if not _detached_allowed():
@@ -364,6 +374,8 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
     ]
     if option:
         cmd.extend(["--option", option])
+    if critique_ref:
+        cmd.extend(["--critique-ref", critique_ref])
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
@@ -768,6 +780,10 @@ def _tool_handlers() -> dict[str, Any]:
         action = str(args.get("action") or "")
         option = args.get("option")
         option = str(option) if option not in (None, "") else None
+        # P5c: `--modify-plan`'s critique carried as a file path / MemoryRef
+        # key, NEVER as `option` — see `_CRITIQUE_REF_RE`'s comment above.
+        critique_ref = args.get("critique_ref")
+        critique_ref = str(critique_ref) if critique_ref not in (None, "") else None
 
         if not _WORKFLOW_ID_RE.match(workflow_id):
             return {"ok": False, "error": "invalid_workflow_id"}
@@ -776,8 +792,17 @@ def _tool_handlers() -> dict[str, Any]:
                     "valid": list(_RESUME_ACTIONS)}
         if option is not None and not _OPTION_RE.match(option):
             return {"ok": False, "error": "invalid_option"}
+        if critique_ref is not None and not _CRITIQUE_REF_RE.match(critique_ref):
+            return {"ok": False, "error": "invalid_critique_ref"}
 
         try:
+            # Pass critique_ref only when actually present: keeps the call
+            # shape identical to the pre-P5c 3-positional-arg form for every
+            # non-modify-plan action, so a test double (or any other caller)
+            # written against `_launch_resume(workflow_id, action, option)`
+            # is unaffected by this additive parameter.
+            if critique_ref is not None:
+                return _launch_resume(workflow_id, action, option, critique_ref=critique_ref)
             return _launch_resume(workflow_id, action, option)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("resume launch failed")
@@ -1426,6 +1451,15 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "workflow_id": {"type": "string"},
                 "action": {"type": "string", "enum": list(_RESUME_ACTIONS)},
                 "option": {"type": "string"},
+                "critique_ref": {
+                    "type": "string",
+                    "description": (
+                        "modify-plan only: a file path or repo:artifact:<path> "
+                        "MemoryRef key naming the operator's revision critique. "
+                        "The critique text itself must never be passed via "
+                        "'option' -- that field is character- and length-bounded."
+                    ),
+                },
             },
             "required": ["workflow_id", "action"],
         },
