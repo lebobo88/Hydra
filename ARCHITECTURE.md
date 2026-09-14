@@ -84,6 +84,48 @@ Conditional edges from `postcheck` route to `done`, back to `dispatch`
 (if a missed dependency was discovered), or to `surfaced` (a terminal
 state meaning "human must intervene").
 
+### 2a. The plan phase (`HYDRA_PLAN_PHASE`, default OFF)
+
+Two further nodes, `plan_judge` and `plan_gate`, sit on a loop **through**
+dispatch rather than before it. That placement is forced: the attended cursor
+machinery a plan must be authored through is reachable only from dispatch, so a
+pre-dispatch leg could not author anything without fabricating it.
+
+| Phase | Node | Purpose |
+|---|---|---|
+| `dispatch` | `plan_judge` | Reached when `plan_status == "drafted"`. Judges the `PLAN` against `plan-decomposition-quality@1`, computes the budget estimate and the revision ceiling, and files the gate pre-interrupt. |
+| `dispatch` | `plan_gate` | `interrupt_before` checkpoint, `reason="plan_approval"`. On approval writes `plan_status="approved"` and materialises one `TaskState` per `PlanStep` — here, on approval only. |
+
+The **plan barrier** is what makes this binding. While `plan_status` is one of
+`authoring`, `drafted`, `judged` or `rejected`, `node_dispatch` holds every task
+whose `owner_squad` is not `planning`, the fleet predicate is suppressed, and
+the attended selectors will not pick a non-planning task. This is enforced in
+four selectors plus the ingest path, because a barrier enforced in three of five
+places is not a barrier.
+
+Two properties are worth stating because both are load-bearing and neither is
+obvious:
+
+- **The flag gates writers, not readers.** Every reader of `plan_status` is
+  unconditional; only the writers check `HYDRA_PLAN_PHASE`. With the flag off
+  nothing can move the status off `"none"`, so the barrier can never rise — and
+  turning the flag off mid-flight therefore cannot release a barrier over work
+  that was never planned. Reading it the other way round gets the safety
+  direction backwards.
+- **Steps are materialised on approval, never at draft.** `HydraState.tasks`
+  carries an append reducer, so nothing can remove a task once appended.
+  Materialising at draft time would leave a rejected or superseded revision's
+  steps selectable permanently. Materialisation is additionally idempotent per
+  step at the current `plan_revision`, because `plan_gate` can execute more than
+  once — `hydra replay` re-invokes the graph against a snapshot that already
+  holds the first materialisation.
+
+The plan itself is a `PLAN` envelope, validated at construction (duplicate,
+self-referential, dangling and cyclic step dependencies are all refused), and
+rendered to `docs/plans/plan-<slug>.html` through `write_repo_artifact` — the
+only repo-bound writer, fenced to an allow-listed subtree. It is tracked, so
+`git diff` is the review surface. No graph node ever runs `git commit`.
+
 Checkpointing uses `SqliteSaver(thread_id=workflow_id)` so long-running
 campaigns survive a restart. `/hydra:resume` re-enters at the last
 persisted node; `/hydra:replay` reconstructs deterministically from the

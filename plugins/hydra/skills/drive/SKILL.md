@@ -34,6 +34,26 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
 2. **Approval gate.** If `pending_hitl` is set (`requires_human_approval`),
    render it and STOP. The operator resolves via `/hydra:approve <workflow_id>`
    (which calls `hydra.workflow.resume`) before you step into engineering.
+
+   With the plan phase on at non-`trivial` rigor, this gate deliberately
+   stands down for `high_risk` and the decision moves to `plan_gate`, where
+   the operator approves a plan they can actually read instead of a squad list
+   they cannot. `budget_exhausted` still stops here — budget is not a risk
+   signal a plan can inform. With the flag off, this gate behaves exactly as
+   it always has.
+
+2a. **The plan leg** (plan phase on, rigor not `trivial`). The first task the
+   cursor returns is a `planning` task and the barrier holds everything else.
+   Drive it like any other attended task, and return the authored `PLAN` in
+   `submit_host_result`'s `emitted_envelopes` — **not** through
+   `hydra.workflow.submit_envelopes`, which detaches and would race the resume
+   lock. The engine validates the plan (a cyclic or dangling dependency is
+   refused at construction), writes `docs/plans/plan-<slug>.html`, judges it,
+   and parks at `plan_gate`. Render the plan and STOP: path, step table with
+   dependencies, judge verdict and vendor, budget estimate, open questions, and
+   whether the artifact is committed — no node ever runs `git commit`, so say
+   so rather than letting the operator assume. Steps become tasks only on
+   approval.
 3. **Drive engineering, one stage at a time.** Loop:
    a. Call `hydra.workflow.step {workflow_id}`. It scaffolds a pp run for the next
       engineering task and returns `{status:"awaiting_host", host_action, run_id}`

@@ -17,8 +17,24 @@ Companion to `/hydra:approve`. Drives non-approve resume paths:
 
 - `--reject`: mark the workflow `surfaced`, write a rejection note.
 - `--modify-budget 250`: update `state.budget.budget_usd` and re-enter dispatch.
-- `--force-dispatch`: dispatch even though a gate failed (logs a `policy_override` event; operator owns the risk).
+- `--force-dispatch`: dispatch even though a gate failed (logs a `policy_override` event; operator owns the risk). At `plan_gate` this additionally stamps `plan_status="bypassed"` and appends a governance note to the plan artifact, so proceeding without an approved plan is evidence rather than a gap.
 - `--squads engineering,garland`: replace `selected_squads` and re-plan.
+- `--modify-plan --critique-ref <path-or-memoryref>`: request a plan revision.
+  Valid **only** at `plan_gate`. Bumps `plan_revision`, sets
+  `plan_status="authoring"`, and seeds one planning task carrying the critique
+  and the prior plan's id as `supersedes`. Bounded by
+  `HYDRA_PLAN_MAX_REVISIONS` (default 2); at the ceiling the gate offers only
+  `approve` and `abort`.
+  **The critique travels as a reference, never as `--option`.** That field is
+  capped at 200 characters of a restricted character class because it guards a
+  string bound for a subprocess argument list — real prose would be truncated
+  or refused outright. The referenced file must resolve inside the project
+  root; an escaping path is refused rather than read.
+
+Rejecting at `plan_gate` parks the workflow and deliberately does **not**
+trigger a re-plan. An engine that authors a fresh plan the instant one is
+rejected is a loop the operator cannot stop. The rejected plan stays on disk,
+marked rejected — it is evidence of a decision, not waste.
 
 First render the current pending HITL request from `python -m hydra_core.cli
 status <workflow_id>` and obtain an explicit operator decision. Then call
