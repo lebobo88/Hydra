@@ -34,6 +34,7 @@ _TYPE_DEFAULTS: dict[str, tuple[Cell, ...]] = {
     "HITL_REQUEST":            ("zhen",),         # triggers
     "DECISION_RECORD":         ("li",),          # focus; dissents add kan, wins add dui
     "HANDOFF":                 ("li",),
+    "PLAN":                    ("li", "qian", "gen"),  # focus + the vision it serves + the constraints it accepts
 }
 
 

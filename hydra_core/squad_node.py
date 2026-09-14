@@ -1018,6 +1018,17 @@ _ENVELOPE_TYPE_TO_KIND = {
     "ARCH_RFC": "design",
     "DEV_TASK": "code",
     "HANDOFF": "code",
+    # P5b: a PLAN is a decomposition artifact, same shape of judgment as a
+    # PRD -- without this a PLAN judged through this path would be graded
+    # code_style against the wrong rubric. Reuses "spec" rather than
+    # inventing a "plan" pp gate type: the pp GateType union is
+    # hand-duplicated in four places and start_stage does not validate it,
+    # so a half-migrated new gate type would be silently lossy. In practice
+    # node_plan_judge (supervisor.py) scores a PLAN directly against
+    # "plan-decomposition-quality@1" and never routes through this map --
+    # this entry exists for the offline/ingest-adjacent callers that do
+    # resolve a gate_type from an envelope's `type`.
+    "PLAN": "spec",
 }
 
 
@@ -3871,6 +3882,16 @@ def _resolve_skill_shim(slug: str) -> dict[str, str] | None:
 _DELEGATION_EMIT_TYPES: frozenset[str] = frozenset({
     "PRD", "DEV_TASK", "ARCH_RFC",
     "CREATIVE_BRIEF", "SHOT_LIST", "ASSET_JOB", "HANDOFF",
+    # P5b: a claude-skill orchestrator (e.g. the planning pack, run
+    # attended) may emit a PLAN for the host to feed back in. This protects
+    # `_extract_emitted_envelopes` below, which is called from the two
+    # in-graph forwarding sweep sites in this module (squad_node.py:3781,
+    # :4103) -- NOT the attended CLI path: `_cmd_attended_submit`
+    # (cli.py:2886) reads `res["emitted_envelopes"]` directly and hands it
+    # straight to `hydra_core.ingest.dispatch_ingested_envelopes`, bypassing
+    # this allow-list entirely. Added on both paths anyway so a PLAN is never
+    # silently dropped regardless of which leg produced it.
+    "PLAN",
 })
 
 

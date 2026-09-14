@@ -88,6 +88,13 @@ def _plan_phase_enabled() -> bool:
 # when the producing orchestrator (e.g. rlm-gaming) does not name an explicit
 # target_squad. DEV_TASK/PRD/ARCH_RFC -> engineering (pair-programmer);
 # CREATIVE_BRIEF/SHOT_LIST/ASSET_JOB -> garland (RLM-Creative / Helios).
+#
+# P5b: PLAN is deliberately ABSENT from this map. A PLAN does not forward to
+# a squad -- it is consumed by the graph itself (node_plan_judge / node_plan_
+# gate). `hydra_core.ingest.dispatch_ingested_envelopes`'s PLAN branch
+# returns before it ever reaches `_resolve_forward_target`, so an entry here
+# would never be read. Do not add one "for completeness" -- an unread map
+# entry is exactly the kind of fiction this feature exists to close.
 _FORWARD_TARGET_BY_TYPE: dict[str, str] = {
     "DEV_TASK": "engineering",
     "PRD": "engineering",
@@ -3803,11 +3810,108 @@ def build_supervisor(
         `node_approval`'s clobber guard: only clear a gate this node owns, so
         a different gate that landed via replay/update_state between the
         operator's clear and this continuation is never silently discarded.
+
+        P5b Task 4: materialises one `TaskState` per `PlanStep` HERE, ON
+        APPROVAL ONLY — never in ingest, never at "drafted". `state.tasks` is
+        append-only (the `_append` reducer in state.py), so nothing can ever
+        delete a task once appended; materialising earlier would leave a
+        rejected or superseded revision's steps selectable forever (a
+        rejected plan never reaches this node at all today — see the
+        docstring above — but a REVISED plan does re-author and re-judge, and
+        only the newest revision's steps should ever become tasks). Each
+        materialised task is stamped with `plan_revision=state.plan_revision`
+        so the four stale-revision-aware selectors (`_next_attended_task`,
+        `_next_stub_attended_task`, `_attended_pending_task_ids` in cli.py,
+        and node_dispatch's own sequential loop, above) skip a step task from
+        an older revision exactly the way they already skip any other
+        stale-revision task.
+
+        Idempotent PER STEP, not per node-execution. `hydra replay` re-invokes
+        the graph from a checkpoint snapshot at `--from-phase`; a snapshot
+        taken at or after `plan_gate` already carries the first
+        materialisation's tasks, so replaying through this node again -- or
+        any other path that re-raises the `plan_approval` gate and re-runs
+        this node against the same revision -- must not re-materialise a step
+        that already has a same-revision TaskState. `state.tasks` is
+        append-only, so a node-level "have I run" flag would either
+        under-materialise a partially-applied prior run or, done wrong,
+        double it; checking per `plan_step_id` at the CURRENT `plan_revision`
+        converges on exactly one task per step per revision regardless of
+        whether the previous materialisation was complete or partial. A step
+        at an OLDER revision is unaffected — it still materialises fresh here
+        under the new revision, which is the revision-bump case this
+        docstring's paragraph above already covers.
         """
         cur = state.pending_hitl
         if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
             return {"phase": "approval"}
-        return {
+
+        plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
+        valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]
+
+        # Steps already materialised THIS revision (a replay, or a re-raised
+        # gate re-running this node) must not be re-created.
+        existing_by_step_id: dict[str, TaskState] = {
+            str(t.plan_step_id): t
+            for t in (getattr(state, "tasks", None) or [])
+            if t.plan_step_id and t.plan_revision == state.plan_revision
+        }
+
+        new_tasks_by_step_id: dict[str, TaskState] = {}
+        for step in valid_steps:
+            step_id = str(step.get("step_id") or "")
+            if (not step_id or step_id in existing_by_step_id
+                    or step_id in new_tasks_by_step_id):
+                # Already materialised this revision, or a defensive skip of
+                # a duplicate step_id (Plan._validate_dag already rejects
+                # duplicates at construction; this is belt-and-suspenders).
+                continue
+            new_tasks_by_step_id[step_id] = TaskState(
+                owner_squad=step.get("target_squad") or "engineering",
+                description=step.get("description") or "",
+                priority=step.get("priority") or "P2",
+                model_tier=step.get("model_tier"),
+                target_repo_id=step.get("target_repo_id"),
+                target_repo_subpath=step.get("target_repo_subpath"),
+                plan_step_id=step_id,
+                plan_revision=state.plan_revision,
+            )
+
+        # Second pass: translate each PlanStep's step_id-keyed `depends_on`
+        # into the task_id-keyed `depends_on` TaskState/plan_deps_satisfied
+        # actually read. The lookup map covers BOTH already-existing
+        # (this-revision) tasks and the newly created ones — a new step's
+        # dependency on an already-materialised step must resolve to the
+        # EXISTING task's id, not be silently dropped (dropping it would
+        # release the new step with its prerequisite unsatisfied, which is
+        # worse than the duplicate this idempotency guard fixes). Only newly
+        # created tasks need their `depends_on` set here — an existing task's
+        # `depends_on` was already resolved and stamped when IT was first
+        # materialised, and it is not re-emitted in this patch.
+        task_id_by_step_id: dict[str, str] = {
+            sid: str(t.task_id) for sid, t in existing_by_step_id.items()
+        }
+        task_id_by_step_id.update(
+            {sid: str(t.task_id) for sid, t in new_tasks_by_step_id.items()}
+        )
+        for step in valid_steps:
+            step_id = str(step.get("step_id") or "")
+            task = new_tasks_by_step_id.get(step_id)
+            if task is None:
+                continue
+            task.depends_on = [
+                task_id_by_step_id[str(dep)]
+                for dep in (step.get("depends_on") or [])
+                # Belt-and-braces, not a reachable case: Plan._validate_dag
+                # already rejects a dangling `depends_on` (an id naming no
+                # step in the plan) at construction, for every plan_ref this
+                # dict came from a validated Plan. This filter's only live
+                # purpose is dropping a dependency on a step this SAME call
+                # skipped as a defensive duplicate, above.
+                if str(dep) in task_id_by_step_id
+            ]
+
+        patch: dict[str, Any] = {
             "pending_hitl": None,
             # Explicit write, not an omission — see node_planner's P5a
             # seeding comment on why an omitted plan_status key here would
@@ -3816,6 +3920,9 @@ def build_supervisor(
             "plan_status": "approved",
             "phase": "dispatch",
         }
+        if new_tasks_by_step_id:
+            patch["tasks"] = list(new_tasks_by_step_id.values())
+        return patch
 
     # ----- routing edges -----
 

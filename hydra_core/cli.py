@@ -1595,14 +1595,18 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     # item is at-most-once; its pp run, if started, is finalize-aborted by the
     # drive loop's own exception handler or drained by `hydra reap`.
     from .ingest import IngestItemResult, normalize_for_ingest, release_ingested_ids
-    # Only un-claim a status that PROVABLY never reached execute_squad, so a
-    # corrected re-submit with the same id is not suppressed. `unknown_target`
-    # qualifies (routing rejected it before any squad call). `failed` does NOT —
-    # it can be a post-`start_run` drive-loop abort that already registered an
-    # open pp run, and un-claiming that would make it re-dispatchable (double
-    # run). A `failed` id stays claimed; retry with a fresh envelope id (codex
-    # follow-up: at-most-once must never re-dispatch a started run).
-    _NOT_DISPATCHED = {"unknown_target"}
+    # The claim/release decision is `_ingest_item_should_release_claim`
+    # (defined above in this module) — the SAME function `_cmd_attended_
+    # submit`'s emitted-envelopes loop calls. P5b revise round item 3: this
+    # loop used to carry its own hand-duplicated copy of the decision (a
+    # local `_NOT_DISPATCHED = {"unknown_target"}` plus an inline
+    # `failed`-with-errors check) that agreed with the extracted function on
+    # every case except `plan_phase_disabled` -- added to the extracted
+    # function for item 2, but never to this copy, leaving a PLAN submitted
+    # through `hydra ingest` with the flag off permanently claimed. This is
+    # the third time this feature produced that exact defect shape (a rule
+    # duplicated by hand, then updated in one copy only); collapsing to one
+    # call is the fix, not adding the missing case here too.
     processed: set[str] = set(load_ingested_ids(project, wf))
     agg_items: list = []
     over_budget = False
@@ -1624,17 +1628,20 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
             state, [env_dict], packs=packs, dispatcher=dispatcher,
             already_ingested=processed, emit_fn=_emit_ingest,
         )
-        # Un-claim if this envelope never reached a squad (wrong type/parse fail)
-        # so it can be re-submitted after correction; otherwise mark it processed.
+        # Un-claim if this envelope never reached a squad (wrong type/parse
+        # fail/flag-refused) so it can be re-submitted after correction;
+        # otherwise mark it processed. `dispatch_ingested_envelopes` was
+        # called above with a SINGLE-element `[env_dict]`, so `out_i.items`
+        # holds at most one entry for this envelope — `[-1]` is "the one
+        # item for this envelope" (or None if dispatch produced nothing,
+        # which the `last_item is not None` check below treats as "keep
+        # claimed", matching this loop's prior behaviour). Same shape as
+        # `_cmd_attended_submit`'s per-envelope loop, which also dispatches
+        # one envelope at a time and reads `outcome.items[-1]` the same way
+        # — that symmetry is why calling the one shared decision function
+        # here is faithful to what THIS loop iterates, not just convenient.
         last_item = out_i.items[-1] if out_i.items else None
-        item_status = last_item.status if last_item is not None else "failed"
-        # E2-34: a SCHEMA-rejected item (structured field errors) provably never
-        # reached execute_squad either — it failed before any pp call — so it is
-        # un-claimed like unknown_target. That is narrower than `failed` at
-        # large, which can be a post-start_run abort and must stay claimed.
-        schema_rejected = bool(last_item is not None and last_item.errors)
-        if eid and (item_status in _NOT_DISPATCHED
-                    or (item_status == "failed" and schema_rejected)):
+        if eid and last_item is not None and _ingest_item_should_release_claim(last_item):
             release_ingested_ids(project, wf, [eid])
         elif eid:
             processed.add(eid)
@@ -2712,6 +2719,139 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     return 0
 
 
+def _reenter_graph_after_dispatch(
+    sup: Any, config: dict, patch: dict[str, object], *, max_iterations: int = 6,
+    target_next: tuple[str, ...] = ("plan_gate",),
+) -> list[str]:
+    """P5b Task 3: re-enter the compiled graph as if `dispatch` just finished.
+
+    `hydra_core.ingest` never calls `build_supervisor`/`update_state`/`invoke`
+    itself (see its module docstring) — setting `plan_status="drafted"` on the
+    checkpoint alone cannot reach `plan_judge`, because `after_dispatch` is a
+    conditional edge evaluated only when the `dispatch` node finishes.
+    `as_node="dispatch"` makes the graph believe dispatch just finished so
+    that edge fires; the loop then drives `invoke(None)` until the graph
+    parks at ``target_next`` or has nothing left to run (``next`` empty).
+
+    Bounded at ``max_iterations`` — mirrors `_cmd_finalize`'s identical
+    `for _ in range(6)` idiom. A stuck graph (a routing bug that never
+    reaches ``target_next`` and never empties ``next``) must be a loud,
+    bounded no-op here, not a hang.
+
+    Returns the final ``next`` tuple as a list (JSON-friendly), for the
+    caller to report back to the operator.
+    """
+    sup.update_state(config, patch, as_node="dispatch")
+    for _ in range(max_iterations):
+        parked_at = getattr(sup.get_state(config), "next", None)
+        if not parked_at or tuple(parked_at) == target_next:
+            break
+        sup.invoke(None, config=config)
+    return list(getattr(sup.get_state(config), "next", None) or [])
+
+
+def _ingest_item_should_release_claim(item: Any) -> bool:
+    """Whether a `dispatch_ingested_envelopes` item result means the claimed
+    envelope_id (the dedup ledger claim `_cmd_attended_submit` AND
+    `_cmd_ingest_locked` both take before dispatching) must be released so a
+    retry under the SAME id is possible, rather than being silently skipped
+    forever as `skipped_duplicate`. The ONE decision function both callers
+    use — P5b revise round item 3 found a hand-duplicated second copy in
+    `_cmd_ingest_locked` that had drifted out of sync with this one (see that
+    call site's comment); do not let a THIRD copy happen — extend this
+    function, never inline a new condition at a call site.
+
+    Three cases release the claim: the envelope never reached a squad
+    because no delegation target exists (`unknown_target`); it failed
+    schema validation (`failed` WITH structured `errors`) (E2-34) -- a bare
+    `failed` with no structured errors does NOT qualify, because that can be
+    a post-`start_run` drive-loop abort that already registered an open pp
+    run, and un-claiming it would make an at-most-once dispatch
+    re-dispatchable (a double run); or a PLAN was refused because
+    `HYDRA_PLAN_PHASE` is off (`plan_phase_disabled`, P5b revise round item
+    2) -- this last one matters most at the exact moment the flag flips ON
+    and the operator resubmits, under the same id, the plan that was just
+    refused. Every other status (done/drafted/deferred_to_host/
+    skipped_duplicate/surfaced/running) keeps the claim, because the
+    envelope genuinely reached (or is queued for) real work.
+    """
+    return (
+        item.status == "unknown_target"
+        or item.status == "plan_phase_disabled"
+        or (item.status == "failed" and bool(item.errors))
+    )
+
+
+def _apply_plan_reentry(
+    sup: Any, config: dict, project: Path, wf: str,
+    plan_reentry_patch: dict[str, object], plan_reentry_envelope_id: str | None,
+    res: dict[str, object], *, emit_fn: Any, release_fn: Any,
+) -> None:
+    """Drive `_reenter_graph_after_dispatch` and report the OUTCOME, not an
+    optimistic guess, into `res` (mutated in place).
+
+    Cross-vendor judge finding (P5b revise round): `_reenter_graph_after_
+    dispatch`'s very first statement is `sup.update_state(...)`, which is
+    fallible. The envelope_id was already claimed in the dedup ledger by the
+    time this runs (`_cmd_attended_submit`'s per-envelope loop, above), so on
+    failure the checkpoint may never have advanced while the id stays
+    claimed — a retry would be silently skipped as `skipped_duplicate` and
+    the plan would become permanently unreachable with no error surfaced
+    anywhere. Follow the two patterns `_cmd_attended_submit` already uses for
+    exactly this shape of problem instead of inventing a third: release the
+    claim (mirrors the unknown_target/failed release in the per-envelope
+    loop) and flip a caller-visible top-level status (mirrors
+    `envelopes_rejected` below it) rather than reporting the optimistic
+    "drafted" set before the fallible call ran.
+    """
+    try:
+        parked_at = _reenter_graph_after_dispatch(sup, config, plan_reentry_patch)
+    except Exception as exc:  # noqa: BLE001
+        emit_fn(project, wf, "attended.plan_reentry_failed", {"error": str(exc)})
+        if plan_reentry_envelope_id is not None:
+            release_fn(project, wf, [plan_reentry_envelope_id])
+        res["status"] = "plan_reentry_failed"
+        res["plan_status"] = "plan_reentry_failed"
+        res["plan_reentry_error"] = str(exc)
+    else:
+        res["plan_status"] = plan_reentry_patch.get("plan_status")
+        res["plan_parked_at"] = parked_at
+
+
+def _apply_rejected_envelopes(
+    res: dict[str, object], rejected: list[dict[str, object]], *,
+    record_fn: Any, emit_fn: Any, project: Path, wf: str, cfile: Any, run_id: str,
+) -> None:
+    """Surface a batch's schema-rejected delegation envelopes (mutates `res`
+    in place). The engineering task itself stays attended-complete (it is
+    already in `attended_done_task_ids`); what is NOT complete is the
+    delegation it emitted, so this parks it on the cursor for `step`/
+    `finalize` to render and always records it under `res["rejected_envelopes"]`.
+
+    P5b revise round item 1: `res["status"]` used to be overwritten
+    UNCONDITIONALLY to `"envelopes_rejected"` here, which clobbered a
+    `"plan_reentry_failed"` status `_apply_plan_reentry` may have just set
+    when the SAME batch also carried a PLAN whose re-entry raised.
+    `plan_status`/`plan_reentry_error` survive under their own keys either
+    way, but a caller that branches only on the single top-level `status`
+    field would be told "envelopes_rejected" and act on that alone, never
+    learning the checkpoint may not have advanced. `rejected_envelopes` is
+    always recorded regardless of which status wins, so that signal is never
+    lost — only the single top-level `status` string has to pick one.
+    Deliberate choice: a failed plan re-entry wins, because it can leave the
+    graph checkpoint mid-transition with a claimed-but-unreachable envelope
+    id, which is a worse-to-miss failure than a rejected delegation (already
+    safely un-claimed and retryable on its own).
+    """
+    res["rejected_envelopes"] = rejected
+    record_fn(cfile, rejected)
+    emit_fn(project, wf, "attended.envelopes_rejected", {
+        "run_id": run_id, "rejected_count": len(rejected),
+    })
+    if res.get("status") != "plan_reentry_failed":
+        res["status"] = "envelopes_rejected"
+
+
 def _cmd_attended_submit(args) -> int:
     """Feed a host subagent's result back into an attended stage and advance it
     one step. On stage completion, charge the accrued cost on the checkpointed
@@ -2901,6 +3041,14 @@ def _cmd_attended_submit(args) -> int:
                         # the top-level status to "envelopes_rejected" so the
                         # delegation is never dropped inside a "complete".
                         rejected: list[dict[str, object]] = []
+                        # P5b Task 3: the state patch a PLAN item produced
+                        # (set by dispatch_ingested_envelopes on
+                        # outcome.plan_patch), applied via the graph re-entry
+                        # idiom AFTER this loop. Last-one-wins is fine — a
+                        # single attended submit ingesting more than one PLAN
+                        # is not a real scenario the host produces.
+                        plan_reentry_patch: dict[str, object] | None = None
+                        plan_reentry_envelope_id: str | None = None
                         processed = load_ingested_ids(project, wf)
                         for raw in emitted:
                             if not isinstance(raw, dict):
@@ -2938,8 +3086,7 @@ def _cmd_attended_submit(args) -> int:
                                 # squad, so un-claim it: the host can re-submit
                                 # a corrected envelope under the same id without
                                 # being suppressed as a duplicate (E2-34).
-                                if (item.status == "unknown_target"
-                                        or (item.status == "failed" and item.errors)):
+                                if _ingest_item_should_release_claim(item):
                                     release_ingested_ids(project, wf, [str(envelope_id)])
                                 else:
                                     processed.add(str(envelope_id))
@@ -2953,22 +3100,31 @@ def _cmd_attended_submit(args) -> int:
                             except Exception as exc:  # noqa: BLE001
                                 emit(project, wf, "attended.emitted_persist_failed",
                                      {"error": str(exc)})
+                            if outcome.plan_patch:
+                                plan_reentry_patch = dict(outcome.plan_patch)
+                                # Tracked separately from `processed`/the
+                                # ledger so a re-entry failure below can
+                                # release exactly this claim without touching
+                                # any other envelope_id this loop processed.
+                                plan_reentry_envelope_id = (
+                                    str(envelope_id) if envelope_id is not None else None
+                                )
                             outcomes.extend(vars(it) for it in outcome.items)
                             rejected.extend(vars(it) for it in outcome.rejected)
                         res["ingest"] = outcomes
+                        if plan_reentry_patch:
+                            _apply_plan_reentry(
+                                sup, config, project, wf,
+                                plan_reentry_patch, plan_reentry_envelope_id, res,
+                                emit_fn=emit, release_fn=release_ingested_ids,
+                            )
                         if rejected:
-                            # The engineering task itself stays attended-complete
-                            # (it is already in attended_done_task_ids); what is
-                            # NOT complete is the delegation it emitted. Surface
-                            # that as the top-level status and park it on the
-                            # cursor so `step`/finalize can render it.
-                            res["status"] = "envelopes_rejected"
-                            res["rejected_envelopes"] = rejected
-                            host_bridge.record_rejected_envelopes(cfile, rejected)
-                            emit(project, wf, "attended.envelopes_rejected", {
-                                "run_id": str(args.run_id),
-                                "rejected_count": len(rejected),
-                            })
+                            _apply_rejected_envelopes(
+                                res, rejected,
+                                record_fn=host_bridge.record_rejected_envelopes,
+                                emit_fn=emit, project=project, wf=wf,
+                                cfile=cfile, run_id=str(args.run_id),
+                            )
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
