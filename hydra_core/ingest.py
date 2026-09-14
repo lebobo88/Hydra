@@ -52,6 +52,7 @@ from .state import HydraState, TaskState, plan_barrier_active
 from .supervisor import (
     _FORWARD_TARGET_BY_TYPE,
     _extract_squad_cost,
+    _plan_phase_enabled,
     _resolve_forward_target,
 )
 
@@ -341,7 +342,7 @@ class IngestItemResult:
     envelope_id: str
     envelope_type: str | None
     target: str | None
-    status: str          # done | failed | surfaced | running | skipped_duplicate | deferred_to_host | unknown_target
+    status: str          # done | failed | surfaced | running | skipped_duplicate | deferred_to_host | unknown_target | drafted | plan_phase_disabled
     run_id: str | None = None
     detail: str = ""
     # E2-34: structured pydantic errors for a `failed` validation item, so the
@@ -361,6 +362,15 @@ class IngestOutcome:
     # the loop stops and the wrapper surfaces an over_budget HITL.
     budget_downgrade: bool = False
     over_budget: bool = False
+    # P5b Task 3: the HydraState patch a PLAN item produced (plan_status=
+    # "drafted" + plan_envelope_id/plan_ref/plan_artifact_location/
+    # plan_revision), or empty when this call ingested no PLAN. This module
+    # never calls build_supervisor/update_state/invoke itself (see the module
+    # docstring) -- the CLI wrapper (`_cmd_attended_submit`) reads this field
+    # to drive the graph re-entry idiom (`sup.update_state(..., as_node=
+    # "dispatch")` + a bounded `invoke(None)` loop) that gets a drafted plan
+    # to `plan_judge`/`plan_gate`.
+    plan_patch: dict[str, Any] = field(default_factory=dict)
 
     @property
     def dispatched_ids(self) -> list[str]:
@@ -418,6 +428,13 @@ def dispatch_ingested_envelopes(
         is itself a claude-skill squad, so it cannot run headlessly — those
         items are returned with ``status="deferred_to_host"`` for the host to run
         as a follow-up skill, never silently dropped.
+      * ``PLAN`` (P5b) -> not forwarded at all, and gated on
+        ``HYDRA_PLAN_PHASE``: with the flag off, refused with
+        ``status="plan_phase_disabled"`` (never silently dropped, never
+        forwarded). With the flag on, written as a repo artifact via
+        ``write_repo_artifact`` and returned with ``status="drafted"`` plus
+        ``IngestOutcome.plan_patch`` — the caller re-enters the graph so
+        ``node_plan_judge``/``node_plan_gate`` consume it, never a squad.
 
     Dedup: an envelope whose id is already a ``TaskState.envelope_id`` or in
     ``already_ingested`` (the ledger) is skipped (``skipped_duplicate``). Within
@@ -492,6 +509,100 @@ def dispatch_ingested_envelopes(
             _emit("ingest.skip_duplicate", {"envelope_id": eid, "type": etype})
             continue
         seen_existing.add(eid)
+
+        # P5b Task 2: a PLAN is not forwarded to a squad -- it is consumed by
+        # the graph itself (node_plan_judge / node_plan_gate). This branch
+        # MUST sit here: after the dedup check above (so a resubmitted
+        # identical PLAN id is `skipped_duplicate` and a revision with a
+        # fresh envelope id still processes) and before
+        # `_resolve_forward_target` (so PLAN never needs -- and never gets --
+        # an entry in `_FORWARD_TARGET_BY_TYPE`; see that map's own comment).
+        #
+        # `validate_envelope`, above, already ran `Plan._validate_dag`
+        # (cyclic/dangling step-dependency rejection) as part of constructing
+        # `env` -- not re-implemented here. `write_repo_artifact` is the ONLY
+        # repo writer this module uses: `write_native_artifact` resolves
+        # against the planning pack's own non-tracked output root and its
+        # suffix allow-list has no `.html`, so it cannot hold the rendered
+        # plan. This branch does NOT call `execute_squad` and does NOT
+        # materialise step tasks -- that happens in `node_plan_gate`, ON
+        # APPROVAL ONLY (Task 4; `tasks` is append-only, so materialising
+        # here would leave a rejected/superseded revision's steps selectable
+        # forever).
+        if etype == "PLAN":
+            # Cross-vendor judge finding (P5b revise round): this branch is
+            # the SECOND writer of `plan_status` in the engine, alongside
+            # `node_planner`'s `_plan_gate_active` check (the one the Task 0
+            # comment in state.py names). The reader/writer asymmetry Task 0
+            # documents is only safe BECAUSE every writer that can move
+            # `plan_status` off "none" is itself flag-gated -- with the flag
+            # off, nothing can ever raise the barrier, so unconditional
+            # readers are safe. An ungated write here would break that
+            # invariant transitively: it is also what makes "judged"/
+            # "approved" safe, since those only run because something already
+            # moved the status off "none". Task 1 made PLAN submittable
+            # through the MCP verb and the emitted_envelopes path with the
+            # flag OFF (those allow-lists carry no flag check of their own),
+            # so without this gate a PLAN would raise the barrier and hold
+            # every non-planning task pending a resolution no flag-gated code
+            # will ever drive -- the exact stall HYDRA_PLAN_PHASE exists to
+            # prevent. Refuse LOUDLY (a real item status, not a silent drop)
+            # rather than falling through to `_resolve_forward_target` (which
+            # would misreport this as `unknown_target`) or to a bare `failed`.
+            if not _plan_phase_enabled():
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="plan_phase_disabled",
+                    detail=(
+                        "HYDRA_PLAN_PHASE is off; PLAN envelopes are refused, "
+                        "not silently dropped or forwarded"
+                    ),
+                ))
+                _emit("ingest.plan_phase_disabled", {"envelope_id": eid, "type": etype})
+                continue
+
+            from .artifact_store import ArtifactStoreError, write_repo_artifact
+            from .plan_artifact import plan_slug, render_plan_html
+
+            plan_env = env  # SCHEMA_REGISTRY["PLAN"] -> Plan; already validated
+            repo_root = getattr(dispatcher, "project_root", None)
+            try:
+                if repo_root is None:
+                    raise ArtifactStoreError(
+                        "dispatcher has no project_root; cannot write the plan artifact"
+                    )
+                slug = plan_slug(
+                    getattr(plan_env, "goal_restatement", "") or "", plan_env.workflow_id
+                )
+                html_text = render_plan_html(plan_env)
+                ref = write_repo_artifact(repo_root, f"docs/plans/{slug}.html", html_text)
+                artifact_ref = ref.model_dump(mode="json")
+            except (ArtifactStoreError, OSError) as exc:
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="failed", detail=f"plan artifact write failed: {exc}",
+                    errors=[{"field": "", "msg": str(exc)}],
+                ))
+                _emit("ingest.plan_artifact_failed", {"envelope_id": eid, "error": str(exc)})
+                continue
+
+            outcome.plan_patch = {
+                "plan_status": "drafted",
+                "plan_envelope_id": str(plan_env.id),
+                "plan_ref": plan_env.model_dump(mode="json"),
+                "plan_artifact_location": artifact_ref.get("key"),
+                "plan_revision": plan_env.plan_revision,
+            }
+            outcome.items.append(IngestItemResult(
+                envelope_id=eid, envelope_type=etype, target=None,
+                status="drafted",
+                detail="plan materialised as a repo artifact; awaiting plan_judge/plan_gate",
+            ))
+            _emit("ingest.plan_drafted", {
+                "envelope_id": eid, "artifact": artifact_ref,
+                "revision": plan_env.plan_revision,
+            })
+            continue
 
         target = _resolve_forward_target(env, getattr(env, "origin_squad", "") or "")
         if target is None or target not in _FORWARD_TARGET_BY_TYPE.values():

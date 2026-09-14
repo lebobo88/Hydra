@@ -406,12 +406,37 @@ class HydraState(BaseModel):
         return False, None
 
 
-# P1 plan-barrier predicates. Both are NO-OPs today: nothing ever sets
-# plan_status away from its default "none", so plan_barrier_active is always
-# False and plan_deps_satisfied is only consulted behind that gate (except
-# where a caller applies it unconditionally, per its own docstring). Defined
-# ONCE here and imported everywhere else — a divergent second definition is
-# the documented trap from the worktree-relocation incident.
+# P1 plan-barrier predicates, defined ONCE here and imported everywhere else —
+# a divergent second definition is the documented trap from the
+# worktree-relocation incident.
+#
+# P5b: the flag gates WRITERS, not READERS -- deliberately. There are exactly
+# TWO places in the engine that write `plan_status` while deciding whether the
+# plan phase is even active -- i.e. that can move it OFF its default "none":
+# `node_planner`'s `_plan_gate_active` check in supervisor.py (seeds
+# "authoring"), and the ingest PLAN branch in `hydra_core/ingest.py` (seeds
+# "drafted", gated on `_plan_phase_enabled()`). Both MUST be flag-gated --
+# that is the entire safety argument this asymmetry rests on. Everything
+# downstream of them (`node_plan_judge`/`node_plan_gate`, which write
+# "judged"/"approved") writes unconditionally, but only ever runs because one
+# of the two gated writers above already moved `plan_status` off "none" --
+# an ungated writer anywhere in that pair would transitively make "judged"/
+# "approved" reachable with the flag off too. (A prior revision of this
+# branch shipped the ingest writer ungated; a cross-vendor judge caught it
+# before merge -- see `test_p5b_plan_lifecycle.py::TestTask1AllowLists`'s
+# flag-off refusal test.) `plan_barrier_active` and `plan_deps_satisfied`
+# below, and every caller of them (the four selectors in cli.py,
+# node_dispatch's sequential loop, `after_dispatch`), read `plan_status`
+# UNCONDITIONALLY -- with no `HYDRA_PLAN_PHASE` check anywhere in the read
+# path. This is intentional, not an oversight: it means flipping the flag OFF
+# mid-flight can never release the barrier and let unplanned work dispatch
+# out from under an in-progress plan -- the barrier, once raised, only ever
+# comes down through the plan's own lifecycle (approved/rejected/bypassed),
+# never through an environment variable. Reading this the other way around
+# -- "the flag being off should make the barrier inert everywhere, including
+# here" -- gets the safety direction backwards; see
+# `test_p5b_plan_lifecycle.py`'s locked-in regression tests for the property
+# this asymmetry buys.
 _PLAN_BARRIER_STATES = frozenset({"authoring", "drafted", "judged", "rejected"})
 
 

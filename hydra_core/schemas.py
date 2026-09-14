@@ -317,7 +317,22 @@ class Plan(HydraEnvelope):
     open_questions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     artifact_path: Optional[str] = None
-    plan_revision: int = 1
+    # P5b: >= 1, never 0 or negative. This value gets copied verbatim onto
+    # every TaskState materialised from this plan's steps (node_plan_gate),
+    # and the four attended-selectors filter stale work with
+    # `getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision`
+    # -- a leading truthiness test that treats 0 as "not a plan step at all"
+    # (TaskState.plan_revision's own default). An unconstrained Plan let
+    # plan_revision=0 through construction, which would stamp every step task
+    # 0 and make that truthiness test exempt a superseded revision's steps
+    # FOREVER -- the exact append-only stale-task bug the whole "materialise
+    # on approval only" design exists to close, reachable through a
+    # perfectly valid envelope. A negative value is a different failure: it
+    # is truthy and can never equal state.plan_revision, so every step would
+    # be filtered permanently and the operator's approval would silently
+    # dispatch nothing. Neither failure raises anywhere else in the pipeline
+    # -- this is the one place that can catch it, at construction.
+    plan_revision: int = Field(default=1, ge=1)
     supersedes: Optional[UUID] = None
     authored_by: list[str] = Field(default_factory=list)
     dissents: list[str] = Field(default_factory=list)

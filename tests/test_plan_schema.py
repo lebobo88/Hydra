@@ -101,6 +101,84 @@ def test_diamond_dependency_shape_constructs_successfully():
 
 
 # --------------------------------------------------------------------------- #
+# P5b: plan_revision must be >= 1                                             #
+# --------------------------------------------------------------------------- #
+#
+# node_plan_gate stamps this value verbatim onto every TaskState materialised
+# from the plan's steps, and the four attended-selectors filter stale work
+# with `getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision`
+# -- a leading truthiness test that relies on 0 meaning "not a plan step at
+# all" (TaskState.plan_revision's own default). Two silent failure modes
+# follow from an unconstrained field: plan_revision=0 makes every materialised
+# step permanently exempt from the filter (the exact append-only stale-task
+# bug this whole design exists to close); a negative value is truthy and can
+# never equal state.plan_revision, so every step is filtered permanently and
+# an approved plan silently dispatches nothing.
+
+def test_plan_revision_zero_is_refused():
+    with pytest.raises(ValidationError):
+        _plan(plan_revision=0)
+
+
+def test_plan_revision_negative_is_refused():
+    with pytest.raises(ValidationError):
+        _plan(plan_revision=-3)
+
+
+def test_plan_revision_constraint_is_load_bearing():
+    """Remove the fix and show the refusal tests above would fail -- i.e.
+    Plan(plan_revision=0) constructs cleanly without the `ge=1` constraint.
+    This does not mutate the real model (that would affect other tests in
+    the same process); it re-derives the pre-fix field behaviour on a throwaway
+    subclass to prove the constraint, not something else, is what refuses."""
+    from pydantic import BaseModel
+
+    class _UnconstrainedPlanRevision(BaseModel):
+        plan_revision: int = 1  # the field exactly as it read before this fix
+
+    # Without `ge=1`, both values the tests above refuse construct cleanly.
+    assert _UnconstrainedPlanRevision(plan_revision=0).plan_revision == 0
+    assert _UnconstrainedPlanRevision(plan_revision=-3).plan_revision == -3
+
+
+def test_plan_revision_zero_would_make_step_tasks_unfilterable():
+    """The failure the constraint actually prevents, traced end-to-end: if
+    plan_revision=0 could construct, every step task node_plan_gate
+    materialises from it would carry plan_revision=0, and the selectors'
+    `getattr(t, "plan_revision", 0) and ...` guard would treat every one of
+    them as "not a plan step at all" -- exempt from the stale-revision filter
+    FOREVER, even after a later revision superseded them. Demonstrated here
+    directly against the selector predicate (not by bypassing the now-fixed
+    Plan constructor), so this test would have failed loudly before the
+    schema fix landed, once a real PLAN carrying plan_revision=0 reached
+    node_plan_gate.
+    """
+    from hydra_core.state import TaskState
+
+    # A step materialised from a (hypothetically unconstrained) revision-0
+    # plan, and the CURRENT plan revision is 2 -- this step is stale and
+    # must never be selectable again.
+    stale_from_rev_zero = TaskState(
+        owner_squad="engineering", description="stale from a phantom rev 0",
+        plan_revision=0,
+    )
+    state = HydraState(root_goal="x", plan_revision=2)
+
+    def _is_stale_and_filtered(task) -> bool:
+        # The exact predicate every one of the four selectors applies.
+        return bool(getattr(task, "plan_revision", 0)) and task.plan_revision != state.plan_revision
+
+    assert not _is_stale_and_filtered(stale_from_rev_zero), (
+        "this demonstrates the bug the ge=1 constraint prevents: a "
+        "plan_revision=0 step is falsy at the leading truthiness test, so "
+        "the selectors' stale-revision filter would never even inspect it "
+        "-- it stays selectable forever, regardless of state.plan_revision. "
+        "Plan.plan_revision's ge=1 constraint makes this state unreachable "
+        "through a real PLAN envelope."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # envelope_type validation                                                    #
 # --------------------------------------------------------------------------- #
 

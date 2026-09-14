@@ -147,6 +147,21 @@ _ENVELOPE_EXTRA_FIELDS: dict[str, frozenset[str]] = {
         "period", "coverage", "themes", "escalation_patterns",
         "delight_signals", "recommendations",
     }),
+    # P5b: without this entry, every PLAN-specific field is silently
+    # stripped at this MCP boundary before the envelope ever reaches
+    # `hydra_core.ingest.dispatch_ingested_envelopes`'s PLAN branch, and
+    # validation then fails downstream with a misleading "missing required
+    # field" instead of the real "field stripped at intake" cause. Derived
+    # from `hydra_core.schemas.Plan`'s own fields minus the base
+    # `HydraEnvelope` fields and `_RESERVED_ENVELOPE_KEYS` (hand-typed here,
+    # like every other entry in this dict, but pinned to the model by
+    # `tests/test_p5b_plan_lifecycle.py::test_plan_extra_fields_match_model`
+    # so the two cannot drift apart silently).
+    "PLAN": frozenset({
+        "rigor", "goal_restatement", "summary", "steps", "non_goals",
+        "open_questions", "risks", "artifact_path", "plan_revision",
+        "supersedes", "authored_by", "dissents",
+    }),
 }
 
 # Sanity-check at module import: no allow-listed key may shadow a reserved
