@@ -1,0 +1,163 @@
+<title>Plan: Add a customer-data export feature with a documented size ceiling and reviewed r</title>
+<style>
+:root {
+  --plan-bg: #fbfbfa;
+  --plan-fg: #1b1b18;
+  --plan-muted: #6b6b63;
+  --plan-border: #ddd9d0;
+  --plan-surface: #ffffff;
+  --plan-accent: #7c5cff;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --plan-bg: #17171a;
+    --plan-fg: #eceae5;
+    --plan-muted: #9a988f;
+    --plan-border: #35342f;
+    --plan-surface: #202024;
+    --plan-accent: #a78bfa;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --plan-bg: #17171a;
+  --plan-fg: #eceae5;
+  --plan-muted: #9a988f;
+  --plan-border: #35342f;
+  --plan-surface: #202024;
+  --plan-accent: #a78bfa;
+  color-scheme: dark;
+}
+body {
+  background: var(--plan-bg);
+  color: var(--plan-fg);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding-inline: 20px;
+  padding-block: 24px;
+  max-width: 920px;
+  margin-inline: auto;
+}
+h1, h2, h3 { color: var(--plan-fg); }
+h2 { border-bottom: 1px solid var(--plan-border); padding-bottom: 6px; margin-top: 2em; }
+.plan-meta { color: var(--plan-muted); font-size: 0.9em; }
+.plan-table-wrap { overflow-x: auto; }
+table.plan-steps { border-collapse: collapse; width: 100%; font-size: 0.92em; }
+table.plan-steps th, table.plan-steps td {
+  border: 1px solid var(--plan-border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+table.plan-steps th { background: var(--plan-surface); }
+.plan-step-detail {
+  border: 1px solid var(--plan-border);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-block-end: 12px;
+  background: var(--plan-surface);
+}
+.plan-list { margin: 0; padding-inline-start: 1.4em; }
+.plan-figure img { max-width: 100%; border: 1px solid var(--plan-border); border-radius: 4px; }
+</style>
+<h1>Plan: Add a customer-data export feature with a documented size ceiling and reviewed retention posture.</h1>
+<h2>Goal</h2>
+<p>Add a customer-data export feature with a documented size ceiling and reviewed retention posture.</p>
+<h2>Rigor and Why</h2>
+<p><strong>major</strong> &mdash; Four steps: specify the surface, decide the generation strategy against it, implement behind a default-off flag, and review the retention and transfer posture in parallel with implementation.</p>
+<h2>Non-Goals</h2>
+<ul class="plan-list">
+  <li>Import. This plan covers export only.</li>
+  <li>Scheduled or recurring exports; this is on-demand only.</li>
+</ul>
+<h2>Open Questions</h2>
+<ul class="plan-list">
+  <li>Does the size ceiling apply per-request or per-account per-day?</li>
+  <li>Which regimes are in scope for s4 — is any non-EU transfer expected?</li>
+</ul>
+<h2>Assumptions / Risks</h2>
+<ul class="plan-list">
+  <li>A buffered implementation could exceed the memory ceiling at the maximum permitted size, which is why s2 depends on s1 rather than running beside it.</li>
+  <li>The legal review can complete while implementation proceeds, but a finding could invalidate the specified surface.</li>
+</ul>
+<h2>Steps</h2>
+<div class="plan-table-wrap">
+<table class="plan-steps">
+<thead>
+<tr><th>step_id</th><th>title</th><th>squad</th><th>envelope</th><th>depends_on</th><th>priority</th><th>budget</th></tr>
+</thead>
+<tbody>
+<tr><td>s1-prd</td><td>Specify the export surface: formats, size ceilings, and the failure modes a partial export must report.</td><td>engineering</td><td>PRD</td><td>—</td><td>P2</td><td>$3.00</td></tr>
+<tr><td>s2-arch</td><td>Decide streaming versus buffered generation against the size ceiling from s1.</td><td>engineering</td><td>ARCH_RFC</td><td>s1-prd</td><td>P2</td><td>$4.00</td></tr>
+<tr><td>s3-impl</td><td>Implement the exporter behind a feature flag, defaulting off.</td><td>engineering</td><td>DEV_TASK</td><td>s2-arch</td><td>P2</td><td>$8.00</td></tr>
+<tr><td>s4-legal</td><td>Review the export against retention and cross-border transfer obligations.</td><td>legal-compliance</td><td>HANDOFF</td><td>s1-prd</td><td>P2</td><td>$2.00</td></tr>
+</tbody>
+</table>
+</div>
+<h2>Step Details</h2>
+<div class="plan-step-detail" id="step-s1-prd">
+<h3>s1-prd</h3>
+<p>Specify the export surface: formats, size ceilings, and the failure modes a partial export must report.</p>
+<p class="plan-meta">squad: engineering &middot; envelope: PRD &middot; priority: P2</p>
+<p><strong>Acceptance criteria</strong></p>
+<ul class="plan-list">
+  <li>Every supported format names its size ceiling</li>
+  <li>A partial export reports which records were skipped and why</li>
+</ul>
+</div>
+<div class="plan-step-detail" id="step-s2-arch">
+<h3>s2-arch</h3>
+<p>Decide streaming versus buffered generation against the size ceiling from s1.</p>
+<p class="plan-meta">squad: engineering &middot; envelope: ARCH_RFC &middot; priority: P2</p>
+<p><strong>Acceptance criteria</strong></p>
+<ul class="plan-list">
+  <li>The decision states the memory ceiling it assumes</li>
+  <li>A rejected alternative is recorded with its reason</li>
+</ul>
+</div>
+<div class="plan-step-detail" id="step-s3-impl">
+<h3>s3-impl</h3>
+<p>Implement the exporter behind a feature flag, defaulting off.</p>
+<p class="plan-meta">squad: engineering &middot; envelope: DEV_TASK &middot; priority: P2</p>
+<p><strong>Acceptance criteria</strong></p>
+<ul class="plan-list">
+  <li>Flag off is byte-identical to today</li>
+  <li>A partial export surfaces rather than silently truncating</li>
+</ul>
+</div>
+<div class="plan-step-detail" id="step-s4-legal">
+<h3>s4-legal</h3>
+<p>Review the export against retention and cross-border transfer obligations.</p>
+<p class="plan-meta">squad: legal-compliance &middot; envelope: HANDOFF &middot; priority: P2</p>
+<p><strong>Acceptance criteria</strong></p>
+<ul class="plan-list">
+  <li>Each obligation cites its regime</li>
+  <li>Any unresolved transfer question is surfaced, not assumed</li>
+</ul>
+</div>
+<h2>Dependency Graph</h2>
+<pre class="mermaid">
+graph TD
+    n0["s1-prd: Specify the export surface: formats, size ceiling..."]
+    n1["s2-arch: Decide streaming versus buffered generation agai..."]
+    n2["s3-impl: Implement the exporter behind a feature flag, de..."]
+    n3["s4-legal: Review the export against retention and cross-b..."]
+    n0 --> n1
+    n1 --> n2
+    n0 --> n3
+</pre>
+<h2>Budget Estimate</h2>
+<p>Sum of per-step estimates: $17.00 &middot; Plan-level cap: not set</p>
+<h2>Judge Verdict and Dissents</h2>
+<p>No verdict recorded yet.</p>
+<p class="plan-meta">No dissents recorded.</p>
+<h2>Approval Record</h2>
+<p>Not yet approved.</p>
+<h2>Provenance</h2>
+<ul class="plan-list">
+  <li>workflow_id: a042c803-a3f8-4c9f-ac82-4d0b92087aa8</li>
+  <li>plan envelope id: b051277f-c4a8-417e-abdf-6d75db9f85d5</li>
+  <li>plan_revision: 1</li>
+  <li>constitution hash: not recorded</li>
+  <li>imagery: none</li>
+</ul>
