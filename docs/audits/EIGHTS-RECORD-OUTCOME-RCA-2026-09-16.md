@@ -1,365 +1,465 @@
-# RCA — TheEights record outcomes, the spool, and "check the return"
+# RCA — TheEights record outcomes, the spool, replay, and the path to finishing the plan phase
 
-**Status:** diagnosis complete — **passed cross-vendor review** (codex
-`gpt-5.6-terra`, four passes). Reviews 1–3 returned **revise**; review 4 returned
-**pass** with every dimension at the maximum, and independently reproduced the
-measurements. Every point raised was verified against source before being folded
-in. Findings added after review 1 are marked **NEW IN R2**; corrections after
-reviews 2 and 3 are marked **R3**. Remediation is not implemented; §6 is the
-recommended path.
-**Date:** 2026-09-16. **Observed:** Hydra `feat/planning-phase`, TheEights
-`fable-audit-2`, operator spool `~/.hydra/eights-pending{,-dead}`, TheEights
-state `~/.eights/state.db` (read-only, `mode=ro`, `query_only`).
+**Status:** revision 6 — **passed cross-vendor review.** Findings confirmed by agy
+`gemini-3.8-flash-medium` reviews B and C (pass) and A (revise, all points folded in);
+the path forward (§6–§8) confirmed correct, complete and correctly ordered by
+integrative review D (pass, "no required dependency is missing, and none is
+superfluous"). Remediation is not implemented.
 
-**Trigger.** The planning-phase plan (§10a, gate 8) asserted a *live* bug —
-Hydra envelope types that cannot reach TheEights, with the rejection discarded
-unchecked at `mcp_servers/hydra_control/server.py` — and prescribed "fix the
-enum, and check the return". The operator asked for a root-cause analysis before
-deciding.
+## Review history
 
-Labels: **MEASURED** (observed on this machine) · **READ** (established from
-source) · **INFERRED** (follows from measured/read facts, not directly observed).
+| Rev | Reviewer | Outcome | What it changed |
+|---|---|---|---|
+| 1 | codex `gpt-5.6-terra` | revise | Reason-string classification unsafe (timeouts are `failed` too); gateway drops `isError`. |
+| 2 | codex | revise | `exception:*` is not provably unsent; memory scope overstated. |
+| 3 | codex | revise → pass | Idempotency needs a client-sent stable key; 26% of HITL ids empty. |
+| 4 | — | withdrawn | Mapping to the goal showed rev 3's first remediation step (quarantine every `stub`) was wrong, despite passing review. |
+| 5 | agy `gemini-3.8-flash-medium` | A **revise**, B **pass**, C **pass** | Replay telemetry was ≥ 99.7% test runs; the attended lifecycle does not drain the spool; path S and K constraints; `.partial` files. |
+| 6 | agy `gemini-3.8-flash-medium` | D **pass** | Every rev-5 finding folded in; all figures re-measured. Review D confirmed §6–§8 and added three refinements marked **[D]**. |
+
+Rev 4's own agy review hit the gateway's 1,800 s tool cap with no verdict; rev 5 was
+therefore split into three focused reviews run directly through the agy CLI in
+read-only plan mode. Before and after every judge run, the operator's pending spool,
+dead-letter queue, TheEights state database and all three repositories were
+verified byte-identical to a recorded baseline.
+
+## Method
+
+**Evidence bundle.** Every measurement comes from one read-only script whose exact
+text and verbatim output are in
+`C:\Users\robob\AppData\Local\Temp\claude\C--AiAppDeployments-Hydra\8c7d2187-dff9-46a6-8e50-2a885c8e7d29\scratchpad\rca-evidence.md`
+(sections M0–M6). It reads spool JSON, project traces, `backends.json`, and
+TheEights state through a read-only SQLite URI with `PRAGMA query_only=ON`. It
+never writes, replays, drains or sends. Building and reviewing the bundle caught
+four flaws in the author's own measurements, all corrected here: M3's test/real
+classification, M5's substring matching, counting `.json.partial` files as live
+spool entries, and an `id(d)` fallback key in M2.
+
+**Labels:** **MEASURED** — observed on this machine · **REPRODUCED** — shown in an
+isolated harness with every state path redirected to a temp directory · **READ** —
+established from source · **INFERRED** — follows from the above, not directly
+observed · **DISPROVED** — tested and found false. **[A]**, **[B]**, **[C]** mark
+facts independently confirmed by the corresponding rev-5 agy review.
+
+**Scope.** Observed: Hydra `feat/planning-phase`; TheEights `fable-audit-2`;
+operator spool `C:\Users\robob\.hydra\eights-pending` and `...\eights-pending-dead`;
+TheEights state `C:\Users\robob\.eights\state.db`; project traces
+`C:\AiAppDeployments\Hydra\.hydra\*\trace.jsonl`.
+
+**Goal.** Finish the planning phase — X3 (TheEights), X2 (AgentSmith), X1
+(pair-programmer), then flip the `HYDRA_PLAN_PHASE` default — and determine what
+in the TheEights integration blocks that, if anything.
 
 ---
 
 ## 1. Summary
 
-The prescription targets the wrong defect, and the defects it misses are larger.
-
-1. **The enum gap is latent.** Zero of ~1,375 spool/dead-letter records carry the
-   five affected types. The fix is still correct and cheap.
-2. **"Check the return" is a no-op** at every direct call site: the attestor
-   returns the same `None` for a rejection, a timeout, a non-live run and a bug.
-3. **The spool mixes payloads that must never be replayed (`stub`, provably
-   unsent) with payloads of unknown outcome, and replay treats them identically.**
-   The doctor banner recommends an unfiltered bulk replay of the dead-letter
-   queue into a live TheEights.
-4. **Replay is not idempotent on the daemon.** A replayed HITL request files a
-   *new* ticket every time; a replayed envelope record errors rather than
-   deduplicating — contradicting the attestor's own docstring. **NEW IN R2**
-5. **The gateway proxy reports every backend tool error as success.**
-6. **No recorded Hydra envelope has a linked semantic memory row** — 0 of 1,989
-   by `memory_id`, and 0 of 14,704 memories reference any recorded envelope id at
-   all. The indexing step of envelope recording has not run for Hydra envelopes,
-   because Hydra's attestor strips the envelope before sending it. Other
-   Hydra-related memories do exist, written by other routes. **NEW IN R2, scope
-   corrected in R3**
+1. **Primary root cause of `stub` pollution: non-live control verbs emit real
+   governance through a stub dispatcher.** `hydra.workflow.plan` and non-live
+   `hydra run` build a supervisor on `_NullDispatcher` because they never dispatch —
+   but that supervisor also performs the workflow's constitution attestation and
+   raises planner HITL requests, and routes both through the same stub.
+2. **A `stub` entry's legitimacy depends on its workflow, not its reason.** 65 are
+   attended workflows' only constitution attestations and must be delivered; every
+   `stub` HITL request is stale, and almost all spooled HITL requests lack an
+   expiry, so replaying them would file never-expiring tickets.
+3. **The attended lifecycle does not drain the spool.** Replay runs on a daemon
+   thread inside short-lived CLI subprocesses and dies with them: 73 of 77 pending
+   entries have never been attempted, and all 77 are past the age at which any
+   completed replay would have removed them.
+4. **"Check the return" is a no-op**: every failure mode returns the same `None`.
+5. **Replay is not idempotent** on TheEights, and idempotency needs a stable key
+   sent by the client; 26% of spooled HITL requests have an empty id, traced to
+   three raw-dict producers.
+6. **The gateway reports every backend tool error as success.**
+7. **Envelope recording has never produced a linked memory.**
+8. **`hydra.workflow.resume` is refused in attended sessions**, and the approve
+   runbook states the opposite. The CLI route works today.
+9. **Three spool payloads are silently lost** as orphaned `.json.partial` files.
+10. **The enum gap X3 fixes is latent**, and X3 should proceed.
 
 ---
 
 ## 2. Findings
 
-### F1 · Outcomes collapse to `None` — READ, reproduced
+### F1 · Every failure mode collapses to `None` — READ, REPRODUCED
 
-`EightsAttestor._call` (`hydra_core/eights/attestation.py:261`):
+`EightsAttestor._call` (`C:\AiAppDeployments\Hydra\hydra_core\eights\attestation.py:261`):
 
-| Outcome | Spooled? | Returns |
+| Outcome | Spooled as | Returns |
 |---|---|---|
-| attestor disabled / no dispatcher | yes, `eights_disabled_or_no_dispatcher` | `None` |
-| `_dispatch_call` raised | yes, `exception:<Type>` | `None` |
-| advisory constitution rejection | no | `None` |
-| non-success result — covers daemon rejection, **timeout**, transport error, and `stub` | yes, `_failure_reason(result)` | `None` |
+| attestor disabled / no dispatcher | `eights_disabled_or_no_dispatcher` | `None` |
+| `_dispatch_call` raised | `exception:<Type>` | `None` |
+| advisory constitution rejection | not spooled | `None` |
+| non-success result — daemon rejection, **timeout**, post-connect transport error, `stub` | `_failure_reason(result)` | `None` |
 | success | — | result dict |
 
-`_failure_reason` (`:228`) computes a discriminator and hands it only to the
-spool. `envelope_record` (`:502`) returns `_call`'s value unchanged.
+`_failure_reason` (`:228`) computes a discriminator and passes it only to the spool;
+`envelope_record` (`:502`) returns `_call`'s value unchanged. REPRODUCED:
+`_NullDispatcher`, a dispatcher without `call_mcp`, and a rejecting dispatcher each
+yield `None` and are spooled as `stub`, `exception:AttributeError`, `failed:...`.
 
-Reproduced against a temporary spool (`HYDRA_EIGHTS_SPOOL`/`_DEAD_LETTER`; real
-spool untouched): a `_NullDispatcher`, a dispatcher object without `call_mcp`,
-and a dispatcher returning a rejection each gave `envelope_record(...) is None`
-and were spooled as `stub`, `exception:AttributeError` and `failed:...`.
+The cockpit audit (`...\mcp_servers\hydra_control\server.py:247-250`) is the one
+caller with any signal: a `pending_count()` delta tells *spooled vs not*, not *why*,
+and is racy against concurrent writers. **"Check the return" is a no-op at the direct
+`envelope_record` call sites.**
 
-**Qualification (from review, verified).** One caller does get a signal: the
-cockpit audit (`server.py:247-250`) compares `attestor.pending_count()` before
-and after, and reports `spooled`. That distinguishes *spooled vs not* — it does
-not say *why*, and it is racy against concurrent spool writers. So "check the
-return" is a no-op at the direct `envelope_record` call sites; the cockpit
-caller has a coarse, unreasoned signal.
-
-### F2 · `failed` does not mean "rejected" — READ
+### F2 · `failed` does not mean rejected — READ
 
 `MCPStdioDispatcher.call_mcp` maps raw MCP `isError` to `status: "failed"`
-(`hydra_core/dispatcher.py:749`, `:876`) — so a daemon-side Zod rejection is
-correctly a failure on the direct path, not a silent success. **But the same
-status is used for a timeout** (`:852-863`, `"timeout": True`) and for an
-exception raised by `call_tool` after connect. A timeout is an *unknown*
-outcome: the daemon may have committed the write. The spool reason string
-`failed:...` therefore cannot be used to decide that a payload is permanently
-unreplayable. *(This invalidates revision 1's remediation D — see §5.)*
+(`...\hydra_core\dispatcher.py:749`, `:876`), so on the direct path a daemon
+rejection is correctly a failure. The same status is used for a timeout
+(`:852-863`, `"timeout": True`) and for exceptions after connect. A timeout is an
+**unknown** outcome — the daemon may have committed. A reason string cannot decide
+permanence.
 
 ### F3 · The gateway reports tool errors as success — READ
 
-`mcp_servers/hydra_gateway/server.py` `_extract_result` (`:662-677`) always
-returns `{"status": "done", ...}` and never inspects `isError`; the module has
-no `isError` reference at all. A backend tool error proxied through the gateway
-— a Zod rejection, `unknown tool`, a readiness refusal, a deadline — arrives
-with `status: "done"` and the error inside `result`. Anything keying on
-`status` treats it as success.
-**Scope.** The supervisor's attestor dispatches directly through
-`MCPStdioDispatcher`, which is correct (F2); it is not affected. Consumers going
-through the gateway — host sessions, subagents, judges reading `status` — are.
-The full consumer set was not enumerated.
+`...\mcp_servers\hydra_gateway\server.py` `_extract_result` (`:662-677`) always
+returns `{"status": "done", ...}` and never reads `isError`. Any backend tool error
+proxied through the gateway arrives as `done`. The supervisor's attestor dispatches
+directly (F2) and is unaffected; host sessions, subagents and judges reading
+`status` through the gateway are affected. The consumer set is not enumerated.
 
-### F4 · The spool admits non-replayable payloads — MEASURED
+### F4 · RC6 — non-live control verbs emit real governance through a stub — READ, MEASURED [A]
 
-`_maybe_spool` spools every non-success outcome. Two reasons are never
-transport-ambiguous:
+- `_cmd_plan` (`...\hydra_core\cli.py:757-765`), the entry point of every attended
+  workflow, sets `dispatcher = _NullDispatcher()` with the comment *"Planning never
+  dispatches, so a NullDispatcher is correct and cheap"*, and builds the supervisor
+  with it. **[A]**
+- **Non-live `hydra run`** (`_cmd_run_locked`, `cli.py:~626`) does the same in its
+  `else` branch. **[A]**
+- `build_supervisor` creates the TheEights attestor from that dispatcher:
+  `eights = EightsAttestor(dispatcher=dispatcher)` (`...\hydra_core\supervisor.py:296`). **[A]**
+- Governance therefore goes out through the stub: the **only** production
+  constitution-attestation call, in `node_intake` (`supervisor.py:1061`) **[A]**, and
+  planner HITL requests (`supervisor.py:1185-1207` missing engineering target).
+- `_NullDispatcher` (`cli.py:98-110`) is the **sole** producer of a `stub` status
+  across Hydra's core, its MCP servers, and TheEights' daemon; its four methods
+  perform no I/O. Every other `"stub"` in those trees refers to a stub *squad pack*
+  or a stub *graph driver*. **[A]**
 
-- **`stub`** — a result with `status: "stub"`. `_NullDispatcher`
-  (`hydra_core/cli.py:~99`) returns that from every call on non-live CLI paths.
-  A stub call never reached a daemon.
-- **`exception:AttributeError`** — `_dispatch_call` raised `AttributeError`.
-  The observed shape is consistent with a dispatcher object lacking
-  `call_mcp` (as the offline test doubles used this week do); that shape was
-  reproduced. The suite is hermetic via `tests/conftest.py`; processes outside
-  it write to the real `~/.hydra`.
+The design assumption was sound about dispatch and wrong about governance.
 
-**Provenance, corrected in R2.** A spool record stores `tool, args, reason,
-attempts, spooled_at, workflow_id` — no caller, process, or traceback. A reason
-establishes the *result shape*, not the originating process. The attributions
-above are the reproduced producers of those shapes, not proof of origin.
+**MEASURED origin of the 293 `stub` spool entries** (bundle M1; `*.json` only), by
+whether the workflow has attended cursors under `...\Hydra\.hydra\<wf>\attended\`:
 
-**The two reasons are not equally certain, corrected in R3.**
-- `stub` **is provably unsent.** Its only producer anywhere is `_NullDispatcher`
-  (`hydra_core/cli.py:102-108`, four methods, all returning immediately with no
-  I/O), and TheEights has no producer of a `stub` status. A `stub` record cannot
-  correspond to a write the daemon received. — READ
-- `exception:AttributeError` **is not.** It comes from the broad `except` around
-  the entire `_dispatch_call` → `call_mcp` invocation
-  (`attestation.py:266-275`). An `AttributeError` raised inside a dispatcher
-  *after* it issued the request produces an identical record to a dispatcher
-  with no `call_mcp`. The persisted record cannot prove the error preceded the
-  send, so these entries are **unknown outcomes**, not junk. Revision 2 called
-  them provably unsent; that was wrong.
+| Attended workflow? | Tool | Detail | Count |
+|---|---|---|---|
+| yes | `constitution.attest` | — | **65** |
+| no | `constitution.attest` | — | 116 |
+| no | `hydra.envelope.record` | — | 75 |
+| no | `governance.hitl.request` | planner / `missing_engineering_target` | 21 |
+| no | `governance.hitl.request` | approval / `high_risk` | 12 |
+| no | `governance.hitl.request` | dispatch / `over_budget` | 2 |
+| no | `governance.hitl.request` | judge_per_squad / `reflexion_override` | 2 |
 
-| Reason | Pending | Dead-letter |
-|---|---|---|
-| `stub` | 45–48 (varies as live replay drains); newest 2026-09-14 08:23 | 248 (136 attest, 75 envelope.record, 37 hitl.request) |
-| `exception:AttributeError` | 2 (1 attest, 1 hitl.request), 2026-09-13 21:51 | 488 (360 attest, 98 hitl.request, 30 envelope.record) |
+The 191 non-HITL "no" rows are unattributable: the record stores no process
+identity, and workflows without attended cursors include plan calls halted at a
+gate, surfaced workflows, other projects, and test or ad-hoc runs.
 
-Pending totals moved between measurements (80 → 77) because replay drained
-entries; dead-letter counts reproduce exactly (1,298; 736 of these two reasons;
-135 `hitl.request`).
+### F5 · `stub` legitimacy is per-workflow; stale HITLs lack expiry — MEASURED [A]
 
-**Correction to earlier in this session:** these were described as a stopped,
-historical backlog. New entries of both reasons appeared on 2026-09-13/14, so
-their producers are still active — though, per above, not attributable to a
-specific process.
+- **The 65 attended-workflow `stub` attestations are legitimate.** Attended workflows
+  attest only in `node_intake`; later `step` and `submit_host_result` calls do not
+  re-attest **[A]**. Replay through a live dispatcher is currently their only route to
+  TheEights. **Quarantining `stub` wholesale — revision 3's step 1 — would discard
+  them. Withdrawn.** **[A]**
+- **All 37 `stub` HITL requests belong to workflows that never reached an attended
+  stage.** The operator saw those gates in-band at the time; the TheEights ticket
+  was only the shared-ledger copy.
+- **159 of 163 spooled HITL requests carry no `expires_at`** (4 carry a past one)
+  (bundle M2). Their arguments were persisted before the E2-17 expiry fix; current
+  `hitl_request` always sets one (`attestation.py:~718`). Because TheEights'
+  `hitlRequest` plain-inserts a pending row (F10), replaying them would create
+  **never-expiring pending tickets** — the zombie-ticket failure E2-17 cleaned up. **[A]**
 
-### F5 · Replay does not filter, and runs at scale — READ + MEASURED
+### F6 · `exception:AttributeError` is an unknown outcome — READ
 
-`PendingSpool.replay` (`pending_spool.py:237`) and
-`EightsAttestor.replay_pending._send` (`attestation.py:380`) retry every entry
-through the **current** dispatcher; nothing reads `reason`. `node_intake`
-drains once per workflow (`supervisor.py:~432`, `HYDRA_EIGHTS_REPLAY_MAX_REPLAYS`
-default 1); so do `cli.py:1240`, `:1831`, `:4806`.
+The reason comes from the broad `except` around the whole `_dispatch_call` →
+`call_mcp` (`attestation.py:266-275`). An `AttributeError` raised after a request went
+out is recorded identically to a dispatcher with no `call_mcp`. These entries (488
+dead-letter, 2 pending) cannot be proven unsent.
 
-**MEASURED:** `Hydra/.hydra/*/trace.jsonl` contains 14,014
-`supervisor.eights_replay` events whose `sent` fields sum to **8,296**.
-Caveats: `sent` counts calls where `send_fn` returned success, so a stub
-dispatcher contributes nothing, but a test double returning success would
-inflate it; project-local traces may include non-production runs.
+### F7 · Some never-attempted payloads are legitimate — READ
 
-**INFERRED, not attributable:** a `stub`-origin payload has never reached a
-daemon, so the first live replay would record it for real — a constitution
-attestation, HITL ticket or envelope record for work that never ran live. Once
-sent it is indistinguishable, since `reason` is not transmitted. The number of
-such sends, if any, cannot be recovered.
-Precedent that the class is real: `_prune_spooled_hitl_requests` (C3) already
-guards one case (tickets for since-resolved gates).
+`_guarded_call` spools `eights_guard_breaker_open` and `eights_guard_inflight`
+without calling `_call` — never attempted, but from live runs. They must stay
+replayable. On guard timeout the worker keeps the call and spools only if it finally
+fails, so the guard does not double-send (**DISPROVED**: guard-induced duplicate
+write). "Never sent" and "must not replay" are independent properties.
 
-### F6 · The recommended remediation triggers the hazard — READ, review-confirmed
+### F8 · Replay is unfiltered; a stub replay burns attempts — READ, REPRODUCED
 
-`hydra doctor` (and the SessionStart banner) prints `run hydra eights-drain
---replay-dead-letter` above a dead-letter threshold. That path
-(`cli.py:~4786`) calls `requeue_dead_letters` (`pending_spool.py:296`), which
-moves **all** dead letters back with attempts reset (`:316`), disables the age
-check, and replays through a real `MCPStdioDispatcher`. Today that would re-send
-736 payloads: 248 `stub` entries that provably never reached a daemon (recording
-them would create records for work that never ran live) and 488
-`exception:AttributeError` entries of unknown outcome (replaying those risks
-duplicates under F7). 135 of the 736 are HITL requests.
+- `PendingSpool.replay` (`...\hydra_core\eights\pending_spool.py:236-262`) and
+  `EightsAttestor.replay_pending._send` (`attestation.py:380`) retry every entry
+  through the **current** dispatcher; nothing reads `reason`. **[B]**
+- A failed replay increments `attempts` (`pending_spool.py:267`, `:272`).
+- **REPRODUCED with default settings:** a legitimate `daemon_unavailable` payload
+  replayed through `_NullDispatcher` — as `node_intake` does on the two F4 paths —
+  was **dead-lettered after six replays without ever being sent**.
+- Stub-dispatcher replay entry points are exactly two: `node_intake`
+  (`supervisor.py:432`) reached from `_cmd_plan` and from non-live `_cmd_run_locked`.
+  `cli.py:1240` and `:1831` replay only under `--live`; `eights-drain` always uses a
+  live dispatcher. **[A]**
+- **Withdrawn as production evidence.** Earlier revisions cited 14,014
+  `supervisor.eights_replay` events (8,296 sent) as "replay runs at scale". Bundle M3
+  splits the 13,840 trace directories containing them into **12,992 with no
+  `workflow_start`**, **711 with a named-test goal**, and **137 other workflows**;
+  sends split **7,737 / 536 / 23**. Tests redirect the spool to
+  `.tmp-pytest\hydra-home\` (`tests\conftest.py:76-86`) but traces are built from
+  the project root with no environment override (`hydra_core\telemetry.py:19-22`),
+  so they land in the project's `.hydra\`. **At least 99.7% of that telemetry
+  describes test runs, not the operator's spool.** **[B]**
+- **Production incidence of the burn is UNKNOWN**, and likely low: the stub-dispatcher
+  replays are exactly the asynchronous ones F14 shows rarely complete.
+- `daemon_unavailable` dead-letter counts are therefore not reliable evidence of a
+  real outage.
 
-**Correction to earlier in this session:** clearing the backlog was described as
-"a `hydra eights-drain --replay-dead-letter` decision for the operator". Without
-first separating these entries, that advice is hazardous.
+### F9 · The recommended bulk replay is hazardous — READ
 
-### F7 · Replay is not idempotent on the daemon — READ · NEW IN R2
+`hydra doctor` and the SessionStart banner print `run hydra eights-drain
+--replay-dead-letter` above a threshold. That path (`cli.py:~4786`) calls
+`requeue_dead_letters` (`pending_spool.py:296`), which moves **all** dead letters back
+with attempts reset, disables the age check, and replays through a real
+`MCPStdioDispatcher`. Run today it would send, undifferentiated: stale HITL requests
+with no expiry (F5), unattributable `stub` records (F4), and 488 unknown-outcome
+entries into a non-idempotent daemon (F6, F10).
 
-- **HITL requests duplicate.** `GovernanceState.hitlRequest`
-  (`TheEights/daemon/src/engines/governance-state.ts:222`) mints a fresh
-  `request_id = hitl_${nanoid()}` on every call and does a plain `INSERT`;
-  `hitl_queue.request_id` is the primary key (`stores/sqlite.ts:360`), so nothing
-  deduplicates. Every replay of the same request — including a timeout whose
-  original write actually committed — files **another pending ticket**.
-- **Envelope records error instead of deduplicating.** `HydraEngine.record`
-  (`engines/hydra.ts:~44-80`) does a plain `INSERT` keyed on
-  `hydra_envelopes.envelope_id PRIMARY KEY` (`stores/sqlite.ts:321`). Replaying an
-  already-committed envelope violates the key, throws, returns `isError`, is
-  spooled, and retries until dead-lettered. The attestor docstring's claim —
-  "Idempotent — the daemon dedupes by envelope id" (`attestation.py:503`) — is
-  **false**.
-- `record` also calls `memory.add` **before** that insert, with **no idempotency
-  key**. Each failing retry would therefore leave a duplicate memory row — except
-  that, per F8, the memory write never happens for Hydra envelopes today. The
-  amplification is latent, not realised.
+### F10 · Replay is not idempotent; the fix needs a client key — READ, MEASURED [C]
 
-**Consequence for remediation:** "keep unknown outcomes retryable" is unsafe for
-`hitl.request` until the daemon is idempotent. Retry safety is per-tool.
+- `GovernanceState.hitlRequest`
+  (`C:\AiAppDeployments\TheEights\daemon\src\engines\governance-state.ts:222-231`)
+  mints `hitl_${nanoid()}` per call and plain-inserts. **Every replay files a new
+  ticket.** **[C]**
+- `HydraEngine.record` (`...\daemon\src\engines\hydra.ts:42-77`) calls `memory.add`
+  first, then plain-inserts on `hydra_envelopes.envelope_id TEXT PRIMARY KEY`
+  (`...\daemon\src\stores\sqlite.ts:320-332`); a duplicate raises a UNIQUE-constraint
+  error rather than deduplicating. The attestor docstring "the daemon dedupes by
+  envelope id" (`attestation.py:503-504`) is **false**. **[C]**
+- No index or migration changes either: `hitl_queue` has only status and run
+  indexes, `hydra_envelopes` only workflow, type and target indexes
+  (`sqlite.ts:333-335`, `:370-371`). **[C]**
+- `HitlRequestArgs` has no key (`...\daemon\src\mcp\governance.ts:47-52`); Hydra
+  sends none. Daemon support alone is not sufficient. **[C]**
+- `hitl_id` (the HITL envelope id) is replay-stable: the spool persists arguments
+  verbatim and replay re-sends them. **MEASURED (bundle M2):** of 163 spooled HITL
+  requests, **43 (26%) have an empty `hitl_id`**; the 120 non-empty ids are all
+  distinct; `(workflow_id, gate_node)` maps to more than one request once, so it is
+  not a safe key. **[C]**
+- **Empty-id producers**, built as raw dicts with no `id`: `missing_engineering_target`
+  (21) at `supervisor.py:1185-1207`; `envelope_ceiling` (16) at `:1877-1897`;
+  `over_budget` (6) at `:1910-1923`. `attestation.py:711`
+  (`str(hitl_envelope.get("id", ""))`) turns each into `""`. **[C]**
 
-**Idempotency needs a stable key sent by the client, not only accepted by the
-daemon — R3, established after review 3.** Neither side has a key today:
-TheEights' `HitlRequestArgs` is `{envelope, run_id?, kind, payload}`
-(`TheEights/daemon/src/mcp/governance.ts:47`), and Hydra's
-`EightsAttestor.hitl_request` (`attestation.py:~707`) sends `run_id`, `kind` and a
-payload. A daemon that merely *accepts* a key does not deduplicate a request whose
-first call committed and timed out if the replay carries no key or a different
-one.
+### F11 · Envelope recording has never produced a linked memory — MEASURED
 
-The obvious candidate is the payload's `hitl_id`, which is
-`str(hitl_envelope.get("id", ""))` — the HITL envelope's own id, and therefore
-identical between an original call and its spooled replay, since the spool stores
-arguments verbatim. MEASURED across all 163 spooled and dead-lettered
-`hitl.request` records:
+1,989 `hydra_envelopes` rows, **0** with a `memory_id` (bundle M5). `extractSummary`
+(`hydra.ts`) probes only `objective`, `summary`, `description`, `goal`; Hydra's
+attestor sends only `id, type, workflow_id, origin_squad, target_squad, parent_id`
+(`attestation.py:502-515`), so `memory.add` is never called — 1,880 stored payloads
+have exactly that key set. Of 14,704 memories, 27 Hydra-related ones were written by
+other routes (`pp-bridge`, `execsuite-bridge`, direct `hydra-supervisor` writes).
+**By exact token, none references a recorded envelope id**, and none carries a
+`hydra-envelope://` URI. Substring matching would report 1,007 false links, all on
+one hand-named envelope id `x`; 119 of the 1,989 ids are such hand-named test or
+probe ids sitting in the production database. A memory paraphrasing an envelope
+without its id cannot be excluded.
 
-- **43 (26%) have an empty `hitl_id`.** The `""` fallback fires in practice. A key
-  derived naively from `hitl_id` would collapse all of them into one ticket, or
-  silently skip deduplication for them.
-- The 120 non-empty ids are **all distinct**, so `hitl_id` is a sound key where
-  present.
-- `(workflow_id, gate_node)` is **not** a sound key: 1 of 161 such pairs already
-  maps to more than one distinct request, which it would wrongly merge.
-- INFERRED: the empty ids come from HITL payloads built as raw dicts without an
-  `id`, rather than as `HITLRequest` models — the plan (C-g) records six such
-  producers.
+### F12 · `hydra.workflow.resume` is refused in attended sessions — READ, MEASURED [C]
 
-Envelope records and their memory rows already have a natural stable key, the
-envelope id; `memory.add` supports an idempotency key when one is supplied
-(`TheEights/daemon/src/engines/memory.ts:81-98`).
+- `_launch_resume` (`...\mcp_servers\hydra_control\server.py:358-364`) returns
+  `_detached_refusal("resume")` unless `HYDRA_ALLOW_DETACHED == "1"`, and the
+  `workflow_resume` handler (`:778-811`) routes to it unconditionally, with **no
+  attended or in-process branch**. **[C]**
+- The `hydra_control` backend is started with only `HYDRA_OPERATOR_KEY`,
+  `HYDRA_ROOT`, `PYTHONPATH` (`C:\Users\robob\.hydra\backends.json:154-167`; bundle
+  M6). **[C]**
+- `...\plugins\hydra\skills\approve\SKILL.md:21-33` tells the operator to call
+  `hydra.workflow.resume` and asserts that *"attended workflows are unaffected:
+  approval continues in-process."* **That statement is false.** **[C]**
+- P5c attached `--modify-plan` and `critique_ref` to exactly this verb.
+- **A working route exists today:** the CLI — `python -m hydra_core.cli approve
+  <workflow_id>` or `... resume <workflow_id> --action approve` — runs in-process
+  on `_NullDispatcher` (`cli.py:1244`), bypasses `_launch_resume`, and does not
+  replay (resume skips `node_intake`; `cli.py:1240` replays only under `--live`). **[C]**
+- **Not exercised live on purpose**: a successful MCP resume launches `hydra resume
+  --live`, whose entry replays the spool.
+- Pre-existing; affects every gate, not only `plan_gate`.
 
-### F8 · No recorded Hydra envelope is linked to a semantic memory — MEASURED · NEW IN R2, scope corrected in R3
+### F13 · Hypotheses tested and disproved
 
-In `~/.eights/state.db`: **1,989** `hydra_envelopes` rows, **0** with a non-null
-`memory_id` (DECISION_RECORD 1,886; COCKPIT_WRITE 47; DEV_TASK 36; others ≤ 6).
+| Hypothesis | Result |
+|---|---|
+| A daemon rejection counts as success | **DISPROVED on the direct path** (F2); **true through the gateway** (F3). |
+| The enum gap is causing live data loss | **DISPROVED**: 0 of the spool/dead-letter records carry the five types. |
+| The guard's timeout-abandon double-sends | **DISPROVED** (F7). |
+| Approving a plan through non-live resume fabricates completed work | **DISPROVED, REPRODUCED:** on `_NullDispatcher`, `node_dispatch` marks an approved engineering plan step `deferred_to_host`, emits no envelopes, spools nothing. |
+| The stranded types feed the dead-letter backlog | **DISPROVED.** |
+| Duplicate memories accumulate from replays | **Not realised**: no envelope memory is written (F11); latent until that changes. |
+| Replay runs against the operator's spool at scale | **DISPROVED** (F8, F14). |
 
-**Scope, established in R3 after review 2 found Hydra-looking memories.** Of
-14,704 memories, a broad match (`hydra` in provenance or scopes, or
-`DECISION_RECORD` / "hydra envelope" in content) finds 27. They were written by
-other routes: `pp-bridge` (6 episodic), `hydra-supervisor` (5 semantic, 6
-episodic — direct memory writes in June/July with URIs such as ADR paths and
-`goal:` keys, or none), `execsuite-bridge` (3), `pp-daemon` (2 meta), and one
-model-authored row. Linkage was then tested directly: **none of the 14,704
-memories references any of the 1,989 recorded envelope ids** in provenance or
-scopes, and none carries the `hydra-envelope://` URI that `HydraEngine.record`
-stamps. So the finding is specifically that *envelope recording* has produced no
-linked memory; Hydra-related memory does exist through other routes. A memory
-whose *content* paraphrases an envelope without citing its id cannot be excluded
-by this method.
+### F14 · RC8 — the attended lifecycle does not drain the spool — READ, MEASURED [B]
 
-Cause, READ and confirmed against stored payloads:
-- `extractSummary` (`engines/hydra.ts`) accepts only `objective`, `summary`,
-  `description` or `goal`; if none is a non-empty string it returns `null` and
-  `memory.add` is **never called** (not rejected — skipped).
-- Hydra's `EightsAttestor.envelope_record` (`attestation.py:502-515`) sends a
-  whitelist of six fields: `id, type, workflow_id, origin_squad, target_squad,
-  parent_id`.
-- **MEASURED:** 1,880 of 1,989 stored payloads have exactly that key set (plus
-  schema-defaulted `context_refs`), and none of the five most common key sets
-  contains any of the four probed fields. The 20 richer records carry `decision`
-  and `rationale`, which `extractSummary` does not probe.
+- `replay_pending_async` starts `threading.Thread(..., daemon=True)`
+  (`attestation.py:469-475`); a daemon thread dies with its process. **[B]**
+- The attended verbs `plan`, `step` and `submit_host_result` each run `python -m
+  hydra_core.cli` as a **short-lived synchronous subprocess** through `_run_cli_json`
+  (`server.py:582-608`), called from `_run_plan`, `_run_step` and
+  `_run_submit_host_result` (`:673-725`). **[B]**
+- `PendingSpool.replay` sweeps expired entries **before** the replay cap
+  (`pending_spool.py:247-260`), 24 h default, and dead-lettering does not count
+  against the cap; every production lifecycle caller uses that default. So one
+  completed default replay dead-letters every entry over 24 h, even with a cap of 1. **[B]**
+- **MEASURED (bundle M4):** all 77 pending entries are over 24 h old (youngest 59.5 h,
+  median 91.5 h, oldest 288.2 h) and **73 of 77 have `attempts == 0`**. No default
+  replay has completed against the real spool since they aged out, despite `plan`,
+  `step` and `submit` calls in this session. **[B]** Consistent with M3: only **23**
+  replay sends in all recorded history came from non-test workflows — plausibly
+  long-lived processes such as a detached `hydra run --live`.
+- Consequence: legitimate governance, including the 65 attended attestations, is not
+  delivered by the lifecycle. It waits until something long-lived or synchronous
+  replays it.
+- **And that wait is not safe either [B]:** the next *completed* default replay —
+  for instance any long-lived detached run — would **dead-letter all 65 legitimate
+  attestations without delivering them**, because they are over the 24 h limit.
+  Dead-lettered entries are retained, not deleted, so this is recoverable through
+  triage (T), but it moves them into the queue F9 warns against bulk-replaying.
+- Dead-letter file modification times reflect spool time (moves preserve mtime), so
+  they cannot date when dead-lettering happened.
 
-So the indexing step of TheEights' "semantically-indexed record" has not run for
-Hydra envelopes: memory search surfaces nothing *derived from envelope
-recording*, though it can surface Hydra-related memories written by other
-routes. This also bounds a claim made during X3: a PLAN gets a
-memory row when `HydraEngine.record` receives the full envelope, as in its unit
-test, but **not** through Hydra's attestor as it stands — and nothing in Hydra
-records a PLAN to TheEights today anyway.
+### F15 · Three spool payloads are silently lost — MEASURED [A]
 
-### F9 · The plan's original claims, re-examined
+The pending directory holds **77 `.json` files and 3 `.json.partial` files**
+(bundle M0). `PendingSpool.spool` writes `<id>.json.partial` then `os.replace`s it
+to `<id>.json` (`pending_spool.py:147-163`). `replay` iterates only `*.json`, so a
+partial is **never replayed and never dead-lettered**. **[A]**
+
+Read directly (MEASURED): all three are **complete, valid JSON** — the write
+finished and only the rename did not happen.
+
+| File | Tool | Reason | Spooled | Attended workflow? |
+|---|---|---|---|---|
+| `2e4b2581…` | `constitution.attest` | `stub` | 2026-09-04 11:10 | yes |
+| `505a0b5a…` | `constitution.attest` | `stub` | 2026-09-04 16:01 | yes |
+| `3dcac060…` | `hydra.envelope.record` | `stub` | 2026-09-01 21:22 | no |
+
+So two more attended workflows have lost their only attestation (F5), and all three
+are recoverable by completing the rename. Cause — INFERRED, not established: either
+the process died between write and rename, or `os.replace` raised (on Windows,
+commonly a transient lock such as antivirus scanning) and the error was swallowed by
+the "spool write must never crash dispatch" handler in `_maybe_spool`.
+
+---
+
+## 3. The plan's original claims, re-examined
 
 | Plan claim | Finding |
 |---|---|
-| Hydra types "cannot reach TheEights" | True of the closed 11-member enum for PLAN, SUPPORT_TICKET, PORTABLE_CONTEXT, VOC_REPORT, JUDGE_VERDICT. |
-| It is **live** | Not observed: 0 occurrences across spool and dead-letter. Reachable: the supervisor records whatever a squad produced (`produced.model_dump`, `supervisor.py:2235/2551/2664`). |
-| Rejection discarded at `server.py:~1281` | True in code; that verb returns `{"ok": true}` regardless. Its declared caller, AgentSmith `HydraBridge.envelopeRecord`, is defined and not called anywhere in AgentSmith. |
-| Fix: "check the return" | No-op at direct call sites (F1). |
-
-Observed, out of scope: 30 pending entries fail `not_ready: audit verification in
-progress`, consistent with the known TheEights audit-ledger bloat.
+| Hydra types "cannot reach TheEights" | True of the closed 11-member enum. |
+| It is **live** | Not observed (F13). Reachable: the supervisor records whatever a squad produced (`produced.model_dump`, `supervisor.py:2235/2551/2664`). |
+| Rejection discarded at `server.py:~1281` | True in code; that verb returns `{"ok": true}` regardless. Its declared caller, AgentSmith `HydraBridge.envelopeRecord`, is defined and never called. |
+| Fix: "check the return" | No-op (F1). |
 
 ---
 
-## 3. What is not known
+## 4. What is not known
 
-1. Whether any of the 8,296 replayed sends were `stub`- or test-double-origin.
-2. The originating process of any `stub` or `exception:AttributeError` record.
-3. Whether duplicate HITL tickets already exist in TheEights from replays of
-   committed-but-timed-out requests. Measurable read-only, not yet measured.
+1. Whether TheEights already holds records of `stub` origin from some past completed
+   replay; the telemetry that could say is test data (F8).
+2. The originating process of any unattributable `stub` or `exception:*` entry.
+3. Whether duplicate HITL tickets already exist in TheEights.
 4. The full set of gateway consumers that key on `status`.
-5. For each `exception:*` record, whether the error occurred before or after the
-   request reached the daemon. Not recoverable from existing records (R3).
+5. Whether each `exception:*` entry failed before or after the send.
+6. Which process performed the dead-lettering that did occur (1,298 entries).
+7. How often, in production, a stub-dispatcher replay completes and burns an attempt.
 
 ---
 
-## 4. Root causes
+## 5. Root causes
 
 | # | Root cause | Findings |
 |---|---|---|
-| RC1 | Outcome information is flattened to strings/`None` before the component that must act on it — dispatcher → attestor → spool → replay. | F1, F2, F4, F5 |
-| RC2 | Writes to TheEights are not idempotent, while the client assumes they are. | F7 |
-| RC3 | The spool/replay layer has no notion of *replayability*; operator tooling trusts it. | F4, F5, F6 |
-| RC4 | Gateway flattening discards the MCP error bit. | F3 |
-| RC5 | Hydra's attestor and TheEights disagree on the envelope contract: the client whitelists routing fields, the daemon indexes content fields. | F8 |
+| **RC6** | **Non-live control verbs emit real governance through a stub dispatcher, and the attestor and spool treat a stub result as a genuine attempt.** Primary cause of `stub` pollution. | F4, F5, F8 |
+| **RC8** | **Spool replay is fire-and-forget on daemon threads inside short-lived subprocesses, so the attended lifecycle never drains the spool.** | F14 |
+| **RC7** | **The operator resume verb has no attended route, and the runbook says it does.** | F12 |
+| RC1 | Outcome information is flattened to strings and `None` before the component that must act on it. | F1, F2, F6 |
+| RC2 | Writes to TheEights are not idempotent while the client assumes they are, and no client key exists. | F10 |
+| RC3 | The spool and replay have no notion of legitimacy, staleness, or orphaned partial writes; operator tooling trusts them. | F5, F7, F9, F15 |
+| RC4 | The gateway discards the MCP error bit. | F3 |
+| RC5 | The attestor's envelope and TheEights' indexing contract disagree. | F11 |
 
 ---
 
-## 5. Candidate paths, revised
+## 6. Implications for the planning-phase goal
 
-Revision 1 proposed **D — classify at spool time from the reason** and ranked it
-first. Review showed, and source confirms, that a reason string cannot separate
-a rejection from a timeout (F2); D as written would drop payloads whose outcome
-was genuinely unknown. It is replaced by D′.
+| Goal item | Status | Why |
+|---|---|---|
+| **X3** (enum) | **Proceed now.** | Correct and additive. Commit message must call the gap latent and must not claim a PLAN gets a memory row in production (F11); nothing in Hydra records a PLAN to TheEights. |
+| **X2**, **X1** | **Proceed, independent.** | None of F1–F15 touches them. |
+| **Plan-gate HITL delivery** | **Sound.** | Built as a `HITLRequest` (non-empty id) by `node_plan_judge` (`supervisor.py:3703-3848`) and sent through the live dispatcher of `_cmd_attended_submit` (`cli.py:3180`, `:3413-3417`). On resume, `_prune_spooled_hitl_requests` and `_resolve_eights_hitl_for_workflow` close it. **[C]** |
+| **Plan-gate operator actions** | **Broken through the documented verb (F12).** | Approve / reject / `--modify-plan` / force-dispatch via `hydra.workflow.resume` are refused in attended sessions. **The CLI route works now** and is functionally safe (F13). |
+| **Approval stand-down (P5a)** | Helps. | Removes the planner's `approval/high_risk` HITL — a current `stub` producer — at non-trivial rigor. **Flipping the flag therefore reduces, rather than increases, `stub` emissions** (`supervisor.py:1344-1347`). **[D]** |
+| **Planner `missing_engineering_target` HITL** | Pre-existing defect on the plan path. | Raw dict with empty id (F10), emitted through the stub (F4). |
+| **Plan memory lineage (plan §13b)** | **Never implemented.** | If built: deliver through a live path, pass an idempotency key, only after I. |
+| **TheEights idempotency and replay (F8–F11, F14)** | **Not blockers for the goal.** | The plan-gate HITL is delivered synchronously and never spooled on the attended path. **[C]** |
+| **Flag flip** | **Gate on K**, plus the planned holistic cross-vendor pass. | Flipping makes `plan_gate` the primary operator decision point; without K the documented verb for that decision fails. **[C]** |
+
+---
+
+## 7. Candidate paths
 
 | # | Path | Assessment |
 |---|---|---|
-| B | "Check the return" as prescribed | No-op. **Decline.** |
-| C | Change `_call`'s public return contract for all callers | Wide hot-path blast radius; callers are fire-and-forget by design. **Decline.** |
-| F | **Containment, narrowed in R3.** (a) Quarantine only `stub` entries, from both queues, into a directory no drain reads — the one reason proven unsent. (b) Change `eights-drain --replay-dead-letter` so it never replays `stub`, and replays `exception:*` only when the operator explicitly opts in, instead of bulk re-queuing everything. (c) Change the doctor message so it no longer recommends an unfiltered bulk replay. Deletes nothing. | Closes the F6 trigger. Does **not** alter normal intake replay of pending `exception:*` entries, which stay retryable as today. |
-| E′ | **Replay-time filter restricted to `stub`**, applied on **every** drain path. **Narrowed in R3:** revision 2 also filtered "dispatcher-shape exceptions raised before any send", but no existing record can prove that (F4), so filtering them would stop retrying unknown writes. | Safe under uncertainty: touches only an outcome with no ambiguity. |
-| I | **End-to-end idempotency — both sides, specified in R3.** *Daemon (TheEights):* `HitlRequestArgs` gains an idempotency key and `hitlRequest` returns the existing row on repeat; `record` checks for an existing `envelope_id` and returns success without re-writing, and passes the envelope id as `memory.add`'s idempotency key. *Client (Hydra):* `hitl_request` **must transmit a stable key** — the HITL envelope id — on the original call so every replay carries the same one. **Uniqueness contract:** the key must be non-empty and identify one logical request. A HITL with no id must never be sent or spooled keyless: either the producer is fixed to build a real `HITLRequest` (the 43 empty-id records show raw-dict producers exist), or a deterministic key is derived from the request's full identity — never from `(workflow_id, gate_node)` alone, which measurably collides. Existing keyless spool records stay un-deduplicable and are held for operator ruling. | Prerequisite for any retry of an unknown outcome to be safe. Daemon support alone is **not** sufficient. |
-| D′ | **Typed outcome from the dispatcher.** The dispatcher, which alone sees raw `isError`, the timeout, and whether a send was attempted, attaches a structured outcome class (`rejected` / `unknown` / `not_sent` / `not_live`) and a pre-send / attempted-send marker that is **persisted into the spool record**. The attestor spools only `unknown` and `not_sent`; logs `rejected` distinctly; never spools `not_live`. Public `Optional[dict]` unchanged. | Correct long-term fix for RC1, and the only way future `exception:*` records become classifiable (§3.5). Depends on I for `unknown` retries to be safe. |
-| H | **Gateway preserves the MCP error bit** (`status: "failed"` when `isError`). | Fixes RC4. Broad consumer blast radius; needs its own consumer audit. |
-| J | **Resolve the envelope contract (RC5):** either the attestor sends a summarisable field, or `extractSummary` also probes `decision`/`rationale`. Needs a decision on which side owns it. | Restores precedent retrieval. Interacts with I: turning indexing on while replay is non-idempotent would activate the latent duplicate-memory amplification (F7). |
+| B | "Check the return" | No-op. **Decline.** |
+| C | Change `_call`'s public return contract | Wide hot-path blast radius, no caller needs it. **Decline.** |
+| E′ (rev 3) | Quarantine all `stub` entries | **Withdrawn**: discards the 65 attended attestations (F5). |
+| **S** | **Disarm stub replay, and drop the bulk-replay advice.** Specified precisely [A]: (1) `_NullDispatcher` declares an **explicit dry-run marker**; (2) **both** `replay_pending` and `replay_pending_async` return early when the dispatcher carries it — gating only the former still spawns a thread per call; (3) do **not** key on `live_execution`, because test doubles such as `_UpDispatcher` in `tests\test_eights_replay_queue.py:333-340` lack it and would silently stop replaying; (4) covers both F4 paths, `_cmd_plan` and non-live `_cmd_run_locked`; (5) remove the doctor/banner advice to run an unfiltered bulk replay. | Small and safe. Removes F8's mechanism and F9's trigger. |
+| **K** | **Give the operator resume an attended route.** Either an in-process, non-detached resume for attended sessions — as `plan`, `step` and `submit_host_result` already are — or correct the approve and resume runbooks to the working CLI form, removing the false "attended workflows are unaffected" statement. **Constraint [C]:** K must **not** be implemented by spawning `hydra resume --live`, which replays the spool at `cli.py:1240`; a resume that proceeds into dispatch can live long enough for that unfiltered drain to *complete*. K resumes without replay, or S lands first. **Concrete safe implementation [D]:** route `hydra.workflow.resume` through the existing non-detaching transport `_run_cli_json(["resume", <wf>, "--action", <action>, ...])` (`server.py:582-608`) **without** `--live` — a short-lived in-process resume on `_NullDispatcher` that takes the resume lock, verifies the operator capability token, prunes the spooled request, resolves the gate in TheEights, and does not replay. | Goal-critical: before the flag flip. |
+| **R** | **Deliver control-verb governance live at emission.** The control verbs keep a stub *dispatcher* for dispatch but send attestation and HITL through a live attestor, following `_reconcile_attestor` (`cli.py:~958`). **Tradeoff [A]:** no failure risk — `_guarded_call` is fail-soft and `node_intake` treats a `None` receipt as degraded-open — but a hung daemon can add up to **~10 s** to `hydra plan` (two independently guarded calls at the 5 s `_EIGHTS_GUARD_TIMEOUT_DEFAULT`, `attestation.py:48-49`, before breakers trip), plus cold-start cost for an `MCPStdioDispatcher`. **Mitigation [D]:** `ceiling_tick` is unnecessary on the plan path, which never loops; bound the plan-path guard timeout to 1–2 s, or make intake attestation non-blocking while still durable. | Removes the primary cause of new `stub` entries. |
+| **T** | **Triage the backlog by legitimacy and staleness, not reason.** Attended-workflow attestations → deliver after I; HITL requests for never-progressed workflows or with no `expires_at` → never replay as pending (record as historical / expired); guard-skip reasons → replay; `exception:*` and unattributable entries → operator ruling; `.json.partial` files → inspect and either restore or record as lost. Include entries already dead-lettered (F14). | Replaces blanket quarantine; recovers what F14 and F15 would lose. |
+| **I** | **End-to-end idempotency.** TheEights: key on `HitlRequestArgs`, `hitlRequest` returns the existing row; `record` checks for an existing `envelope_id`; `memory.add` keyed by envelope id. Hydra: `hitl_request` sends a stable non-empty key; the three raw-dict producers (`supervisor.py:1185`, `:1877`, `:1910`) build real `HITLRequest`s; no keyless send or spool. | Prerequisite for replaying anything of unknown outcome, and for T, L and J. |
+| **L** | **Make lifecycle replay actually complete** — a bounded synchronous drain in the long-lived `hydra_control` server, or a scheduled one, rather than a daemon thread in each short-lived subprocess. | Fixes RC8. **Must follow S, R, T and I** (§8). |
+| D′ | Typed outcome from the dispatcher (`rejected` / `unknown` / `not_sent` / `not_live`) plus a persisted pre-send marker; spool only `unknown` and legitimate `not_sent`. | Long-term fix for RC1; makes future `exception:*` classifiable. |
+| J | Fix the envelope contract so indexing works. | Strictly after I, or it activates duplicate-memory amplification. |
+| H | Gateway preserves the MCP error bit. | Own run with a consumer audit. |
+| P | Recover orphaned `.json.partial` writes, and make a startup sweep detect them. | Closes F15. |
 
-## 6. Proposed path forward (for cross-vendor re-review)
+---
 
-**Now, operationally:** do not run `hydra eights-drain --replay-dead-letter`.
+## 8. Proposed path forward
 
-**Sequencing, and why this order:**
+**Operational guidance, effective now:**
+- Do **not** run `hydra eights-drain --replay-dead-letter`.
+- Do **not** quarantine or delete spool entries.
+- To approve, reject or revise at an attended gate, use the **CLI**:
+  `python -m hydra_core.cli approve <workflow_id>` (non-live). Do **not** add
+  `--live`.
+- Be aware that a long-lived or detached `hydra run --live` would dead-letter the 65
+  legitimate attestations on its first completed replay. They remain recoverable
+  from dead-letter through T.
 
-1. **F + E′** — containment and a replay filter that is safe under uncertainty.
-   Narrowed in R3 to the one provably-unsent reason, `stub`, plus removing the
-   bulk replay recommendation. The 488 dead-lettered and 2 pending
-   `exception:AttributeError` entries are **not** quarantined: their outcome is
-   unknown, so they are held out of bulk replay pending an operator ruling rather
-   than treated as junk.
-2. **I** — end-to-end idempotency: the TheEights contract accepts a key, **and**
-   Hydra sends a stable, non-empty one on every call, with raw-dict HITL producers
-   fixed so no request goes out keyless. Daemon support without the client key
-   does not make retries safe. Required before D′ permits unknown outcomes to
-   retry, and before J.
-3. **D′** — typed outcomes, once I makes retry of `unknown` safe.
-4. **J** — semantic indexing, strictly after I; otherwise enabling memory writes
-   activates the duplicate-memory amplification.
-5. **H** — gateway error bit, as its own run with a consumer audit.
+**For the goal:**
+1. **X3** — finalize and merge now, with the corrected commit message.
+2. **X2** and **X1** — proceed; independent.
+3. **S**, then **K** — S first, so K cannot re-arm the drain.
+4. **Flag flip** — its own commit, after K, with the holistic cross-vendor pass.
 
-**X3** proceeds: the enum change is correct. Its commit message must describe it
-as closing a *latent* gap, and must not claim PLAN gets a memory row in
-production (F8).
+**For the TheEights integration** (separate governed runs, not part of the planning
+feature), in order:
+1. **S** — disarm stub replay; remove the bulk-replay advice. *(Shared with the goal
+   sequence above.)*
+2. **R** — deliver control-verb governance live at emission.
+3. **I** — end-to-end idempotency, including the three raw-dict HITL producers.
+4. **T** and **P** — triage the backlog and recover partial writes.
+5. **L** — make lifecycle replay complete.
+6. **D′** — typed outcomes.
+7. **J** — indexing.
+8. **H** — gateway error bit.
 
-**Scope.** None of 1–5 belongs to the planning-phase feature. Each is a separate
-governed run. B and C are declined.
-
-**Open forensic question for the operator:** whether duplicate HITL tickets or
-non-live records already exist in TheEights (§3.1, §3.3).
+**Why this order.** L before S, R, T and I would be harmful in *both* directions
+**[B]**: a working drain would deliver stale zombie tickets and dry-run records, and
+its expiry sweep would dead-letter every legitimate attestation it had not yet
+delivered. Today's broken drain is accidentally protective. I precedes T, L and J
+because each of them replays or writes something whose outcome may be unknown. K
+follows S because the obvious implementation of K would otherwise re-arm the drain.
