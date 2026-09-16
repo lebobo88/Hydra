@@ -463,3 +463,53 @@ its expiry sweep would dead-letter every legitimate attestation it had not yet
 delivered. Today's broken drain is accidentally protective. I precedes T, L and J
 because each of them replays or writes something whose outcome may be unknown. K
 follows S because the obvious implementation of K would otherwise re-arm the drain.
+
+## 9. Addendum — forensic check of TheEights records (read-only, 2026-09-16)
+
+Measured against `~/.eights/state.db` through a `mode=ro` connection with
+`PRAGMA query_only=ON`. Nothing was written, drained or replayed.
+
+**Scale.** `hitl_queue` 1,038 rows: 1,030 `pending`, 8 `approved`. 1,019 of the
+pending rows carry no `expires_at`. By request day the pending rows are 825 on
+2026-07-06, 170 on 2026-09-01, 25 on 2026-07-11, and 10 elsewhere.
+
+**Finding G1 — a bulk drain produced most of the zombie backlog.** On 2026-07-06,
+between 06:38Z and 06:40Z, TheEights accepted 774 HITL requests and 1,499 envelope
+records in three minutes. That is 20 minutes after merge 168a474 (RA-7, "eights
+spool drain"). The pending backlog is mostly the output of one drain, not of
+ongoing production. This is direct evidence for F9 and for putting T before L.
+
+**Finding G2 — five exact duplicate tickets, all from that burst.** Five runs hold
+pairs of HITL rows with byte-identical payloads, requested 0–10 ms apart
+(`cb5d069a`, `eb4dd7d5`, `7b8876fc`, `9f3d5808`, `b2839d00`; all 2026-07-06
+06:38:57–06:39:00Z). A spacing of milliseconds means concurrent double sends, not
+a retry after a timeout. Path I therefore needs a key that the server enforces.
+Client-side "send once" discipline is not enough. This corroborates F10.
+
+**Finding G3 — the unit test suite wrote to the live daemon until E2-26.**
+`tests/test_cli.py:317` (`test_run_workflow_id_passthrough`) uses the fixture
+workflow id `c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2`. The live ledger holds, under
+that id: 117 envelope records, 71 HITL requests (65 `lock_release_pending`
+postcheck gates and 6 `missing_engineering_target` planner gates, all pending),
+and 70 constitution attestations. By day: 64 HITL on 07-06, 1 on 07-11, 6 on
+09-01. A further 104 attestations use trace id `no-workflow`, on the same days.
+The last fixture write is 2026-09-01 21:45:36Z. Commit 457d56f (E2-26, the
+hermetic Hydra home with `HYDRA_TEST_NO_DAEMONS=1`) landed at 21:47:58Z the same
+day. Nothing has leaked since, so this is **historical and closed**. The records
+remain, and T must classify them as test pollution. They are not live gates.
+
+**Classification for T.**
+
+| Class | Identification | Count |
+|---|---|---|
+| Test pollution | `run_id`/`workflow_id` = the `c2c2c2c2-…` fixture; attest trace `no-workflow` on 07-06/07-11/09-01 | 71 HITL, 117 envelopes, 70 + 104 attestations |
+| Concurrent duplicates | identical payload, same run, ≤10 ms apart | 5 extra HITL rows |
+| Hand-named envelope ids | non-UUID `envelope_id` (for example `env-a11y-r9-*`, `cms-admin-portal-r8`) | 119 envelopes; operator-authored campaign records, **legitimate** |
+| Drain-era zombies | pending, no `expires_at`, requested 2026-07-06 | about 750 after removing the rows above |
+
+AgentSmith attestations repeated under its constitution-hash trace id (77 and 4)
+are boot re-attestations. They are expected and are not duplicates.
+
+**Effect on the path.** None of this changes the order in §8. It sharpens two
+paths. T gains a deterministic first pass (the fixture id and the drain-burst
+window). I must be enforced on the server.
