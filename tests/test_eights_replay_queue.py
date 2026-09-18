@@ -457,3 +457,100 @@ def test_attestor_replay_drops_advisory_constitution_entries(tmp_path: Path) -> 
         "dead_lettered_expired": 0,
     }
     assert spool.count() == 0
+
+
+# ----- Path S: dry-run dispatcher disarms replay ---------------------------
+#
+# docs/audits/EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7 path S. cli.py's
+# `_NullDispatcher` (used by every non-`--live` CLI path, and by `hydra plan`)
+# carries an explicit `dry_run = True` marker. `EightsAttestor.replay_pending`
+# / `replay_pending_async` must key ONLY on that marker and skip all spool
+# I/O — never touch a populated spool just because a stub build happened to
+# run through `node_intake`.
+
+
+class _DryRunDispatcher:
+    """Mirrors cli._NullDispatcher's dry-run contract without importing cli
+    (keeps this test module free of the langgraph import chain)."""
+    dry_run = True
+
+    def call_mcp(self, *_a: Any, **_k: Any) -> Any:
+        raise AssertionError("dry-run dispatcher must never be called")
+
+
+def _spool_file_snapshot(root: Path) -> dict[str, bytes]:
+    if not root.is_dir():
+        return {}
+    return {p.name: p.read_bytes() for p in sorted(root.iterdir()) if p.is_file()}
+
+
+def test_replay_pending_skips_dry_run_dispatcher_untouched(tmp_path: Path) -> None:
+    spool = PendingSpool(root=tmp_path)
+    # Populate with an entry from a real (non-dry-run) failure so the spool
+    # has something a buggy guard could touch.
+    seed = EightsAttestor(dispatcher=_DownDispatcher(), workflow_id="wf-seed", spool=spool)
+    seed._call("eights.evolution.propose", {"slug": "router/v3"})
+    assert spool.count() == 1
+    before = _spool_file_snapshot(tmp_path)
+    dead_before = _spool_file_snapshot(spool.dead_letter_root)
+
+    attestor = EightsAttestor(
+        dispatcher=_DryRunDispatcher(),
+        workflow_id="wf-dry",
+        spool=spool,
+    )
+    summary = attestor.replay_pending()
+
+    assert summary == {
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "dead_lettered": 0,
+        "dead_lettered_expired": 0,
+        "skipped_dry_run": True,
+    }
+    # Spool is byte-identical — no reads/writes/dead-letter moves happened.
+    assert _spool_file_snapshot(tmp_path) == before
+    assert _spool_file_snapshot(spool.dead_letter_root) == dead_before
+    assert spool.count() == 1
+
+
+def test_replay_pending_async_skips_dry_run_dispatcher_no_thread(tmp_path: Path) -> None:
+    spool = PendingSpool(root=tmp_path)
+    seed = EightsAttestor(dispatcher=_DownDispatcher(), workflow_id="wf-seed2", spool=spool)
+    seed._call("eights.evolution.propose", {"slug": "router/v4"})
+    before = _spool_file_snapshot(tmp_path)
+
+    from hydra_core.eights import attestation as attestation_mod
+
+    threads_before = set(attestation_mod._REPLAY_THREADS.keys())
+
+    attestor = EightsAttestor(
+        dispatcher=_DryRunDispatcher(),
+        workflow_id="wf-dry2",
+        spool=spool,
+    )
+    started = attestor.replay_pending_async()
+
+    assert started is False
+    # No new replay worker thread was registered for this spool root.
+    assert set(attestation_mod._REPLAY_THREADS.keys()) == threads_before
+    assert _spool_file_snapshot(tmp_path) == before
+    assert spool.count() == 1
+
+
+def test_replay_pending_still_runs_for_dispatcher_without_marker(tmp_path: Path) -> None:
+    """Regression guard: a dispatcher lacking `dry_run` (e.g. _UpDispatcher)
+    must keep replaying normally — the guard must key ONLY on the explicit
+    marker, never on `live_execution` or dispatcher identity."""
+    spool = PendingSpool(root=tmp_path)
+    down = EightsAttestor(dispatcher=_DownDispatcher(), workflow_id="wf-A2", spool=spool)
+    down._call("eights.evolution.propose", {"slug": "router/v5"})
+    assert spool.count() == 1
+
+    up_dispatcher = _UpDispatcher()
+    assert not hasattr(up_dispatcher, "dry_run")
+    up = EightsAttestor(dispatcher=up_dispatcher, workflow_id="wf-B2", spool=spool)
+    summary = up.replay_pending()
+    assert summary["sent"] == 1
+    assert spool.count() == 0

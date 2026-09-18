@@ -97,7 +97,19 @@ except Exception:  # noqa: BLE001 — degrade: missing deps at load time
 
 class _NullDispatcher:
     """Inert dispatcher for the CLI smoke path. Real dispatchers come from
-    the Claude Code plugin / MCP host."""
+    the Claude Code plugin / MCP host.
+
+    ``dry_run = True`` is an explicit, load-bearing marker: this dispatcher
+    performs no I/O of any kind. Every "call" below is a fabricated stub
+    response, and callers that key off this marker (e.g.
+    ``EightsAttestor.replay_pending`` / ``replay_pending_async`` — see
+    docs/audits/EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7 path S) treat it as
+    a signal to skip any operation whose only purpose is to talk to a real
+    daemon, such as draining the eights spool. Do not remove this attribute
+    without auditing every ``getattr(dispatcher, "dry_run", False)`` call
+    site."""
+    dry_run = True
+
     def call_mcp(self, server, tool, args, **_kw):
         return {"status": "stub", "tool": tool, "args": args, "run_id": str(uuid4())[:8]}
     def spawn_subprocess(self, cmd, env=None):
@@ -227,8 +239,9 @@ def _cmd_doctor(args) -> int:
         _dead_depth = _spool.dead_letter_count()
         if _dead_depth > 0:
             print(
-                f"WARN: eights dead-letter depth={_dead_depth} — "
-                "run `hydra eights-drain --replay-dead-letter`"
+                f"WARN: eights dead-letter depth={_dead_depth} — triage before "
+                "replay (see docs/audits/EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md "
+                "§7 path T); an unfiltered bulk replay is NOT recommended"
             )
         else:
             print(f"OK:   eights dead-letter  depth={_dead_depth}")
@@ -4837,9 +4850,12 @@ def _cmd_eights_drain(args) -> int:
             f"WARN: {dead_lettered_expired} spool entr"
             f"{'y' if dead_lettered_expired == 1 else 'ies'} dead-lettered for "
             f"age (older than --max-age-hours={max_age_hours}). They were NOT "
-            "replayed. Recover them with "
-            "`hydra eights-drain --replay-dead-letter`, or raise "
-            "--max-age-hours before the next drain.",
+            f"replayed. dead_letter_depth={dead_letter_depth} — triage each "
+            "entry before replaying it (see "
+            "docs/audits/EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7 path T); "
+            "an unfiltered bulk replay is NOT recommended. Raising "
+            "--max-age-hours before the next drain is a separate, unrelated "
+            "knob.",
             file=sys.stderr,
         )
 

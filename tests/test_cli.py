@@ -265,6 +265,53 @@ def test_plan_halts_before_dispatch_without_executing(capsys, tmp_path, monkeypa
     assert payload["workflow_id"]
 
 
+def test_plan_leaves_populated_spool_untouched(capsys, tmp_path, monkeypatch):
+    """`hydra plan` builds its supervisor on `_NullDispatcher` (dry_run=True).
+    Path S (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7): node_intake's replay
+    call must skip entirely, so a PRE-EXISTING spooled entry must survive the
+    run byte-identical and un-dead-lettered. (The run's own attestation calls
+    against the stub dispatcher may legitimately spool NEW entries of their
+    own — that is `_call`'s ordinary durable-payload behavior, unrelated to
+    replay, and out of scope for this guard.)"""
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "cp.db"))
+    pending, dead = _spool_env(monkeypatch, tmp_path)
+    seed_path = pending / "seed.json"
+    _write_spooled(seed_path, call_id="seed")
+    seed_before = seed_path.read_bytes()
+
+    rc = _run(["plan", "fix a small typo in the README", "--squad", "engineering",
+              "--repo", "hydra"],
+              project_root=REPO_ROOT)
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"
+    assert seed_path.read_bytes() == seed_before
+    dead_names = {p.name for p in dead.iterdir()} if dead.is_dir() else set()
+    assert "seed.json" not in dead_names
+    assert not any(n.startswith("seed") for n in dead_names)
+
+
+def test_run_non_live_leaves_populated_spool_untouched(capsys, tmp_path, monkeypatch):
+    """Same guarantee for the default (non `--live`) `hydra run` path, which
+    also builds its supervisor on `_NullDispatcher`."""
+    pending, dead = _spool_env(monkeypatch, tmp_path)
+    seed_path = pending / "seed.json"
+    _write_spooled(seed_path, call_id="seed")
+    seed_before = seed_path.read_bytes()
+
+    rc = _run(["run", "Test goal: outline a Q3 marketing campaign for Helios",
+               "--squad", "garland"], project_root=REPO_ROOT)
+    capsys.readouterr()
+
+    assert rc == 0
+    assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"
+    assert seed_path.read_bytes() == seed_before
+    dead_names = {p.name for p in dead.iterdir()} if dead.is_dir() else set()
+    assert "seed.json" not in dead_names
+    assert not any(n.startswith("seed") for n in dead_names)
+
+
 def test_plan_surfaces_pending_approval_hitl(capsys, tmp_path, monkeypatch):
     """When the planner requires approval, `hydra plan` honestly returns the
     pending approval HITL (it does NOT pretend pending_hitl is null) and still
@@ -1077,9 +1124,13 @@ def test_eights_drain_reports_dead_lettered_and_warns_on_age(
     assert payload["dead_letter_depth"] == 1
     assert payload["remaining"] == 0
     assert payload["dead_letter_root"] == str(dead)
-    # The operator MUST be told the backlog aged out, and how to recover it.
+    # The operator MUST be told the backlog aged out AND pointed at the
+    # triage path, but must NOT be advised to run an unfiltered bulk replay
+    # (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7 path S).
     assert "WARN" in captured.err
-    assert "--replay-dead-letter" in captured.err
+    assert "EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md" in captured.err
+    assert "path T" in captured.err
+    assert "run `hydra eights-drain --replay-dead-letter`" not in captured.err
 
 
 def test_eights_drain_max_age_hours_zero_drains_aged_backlog(
@@ -1140,7 +1191,11 @@ def test_doctor_warns_on_eights_dead_letter_depth(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
 
     assert "WARN: eights dead-letter depth=1" in out
-    assert "--replay-dead-letter" in out
+    # Points at the triage path instead of advising an unfiltered bulk
+    # replay (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7 path S).
+    assert "EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md" in out
+    assert "path T" in out
+    assert "run `hydra eights-drain --replay-dead-letter`" not in out
 
 
 def test_doctor_reports_clean_eights_dead_letter_depth(tmp_path, monkeypatch, capsys):
