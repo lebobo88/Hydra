@@ -7,6 +7,7 @@ when someone runs `hydra doctor`) is regression-proof.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,29 @@ def test_plan_rejects_repo_and_repos_together(capsys):
 
 # --- plan (non-detaching attended planning surface) --------------------------
 
+def _drain_replay_thread(spool_root: Path, timeout: float = 2.0) -> None:
+    """Deterministically join the background replay thread (if any) that
+    `EightsAttestor.replay_pending_async`'s single-flight registry started
+    for ``spool_root``. With the dry-run guard intact, `_NullDispatcher`
+    never starts a thread, so this returns immediately (no thread to find).
+    If the guard is removed, node_intake's replay call spawns a real worker
+    thread that touches the spool — waiting for it here (instead of racing
+    the assertion against it) is what makes that regression observable."""
+    from hydra_core.eights import attestation as attestation_mod
+
+    key = str(spool_root.resolve(strict=False))
+    deadline = time.monotonic() + timeout
+    thread = None
+    while time.monotonic() < deadline:
+        with attestation_mod._REPLAY_THREADS_LOCK:
+            thread = attestation_mod._REPLAY_THREADS.get(key)
+        if thread is not None:
+            break
+        time.sleep(0.01)
+    if thread is not None:
+        thread.join(timeout=timeout)
+
+
 def _extract_json(out: str):
     lines = out.splitlines()
     for i, line in enumerate(lines):
@@ -283,6 +307,10 @@ def test_plan_leaves_populated_spool_untouched(capsys, tmp_path, monkeypatch):
               "--repo", "hydra"],
               project_root=REPO_ROOT)
     capsys.readouterr()
+    # Bound the wait against node_intake's background replay worker so this
+    # assertion can't pass by racing an unguarded replay thread that hasn't
+    # touched the spool yet — see `_drain_replay_thread`.
+    _drain_replay_thread(pending)
 
     assert rc == 0
     assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"
@@ -303,6 +331,9 @@ def test_run_non_live_leaves_populated_spool_untouched(capsys, tmp_path, monkeyp
     rc = _run(["run", "Test goal: outline a Q3 marketing campaign for Helios",
                "--squad", "garland"], project_root=REPO_ROOT)
     capsys.readouterr()
+    # See `_drain_replay_thread`: bound the wait on any background replay
+    # worker so this can't pass by racing an unguarded replay thread.
+    _drain_replay_thread(pending)
 
     assert rc == 0
     assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"

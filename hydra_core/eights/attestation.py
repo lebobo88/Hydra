@@ -420,7 +420,6 @@ class EightsAttestor:
                 "skipped": 0,
                 "dead_lettered": 0,
                 "dead_lettered_expired": 0,
-                "skipped_dry_run": True,
             }
 
         def _send(spooled_call: SpooledCall) -> Any:

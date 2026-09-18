@@ -507,7 +507,6 @@ def test_replay_pending_skips_dry_run_dispatcher_untouched(tmp_path: Path) -> No
         "skipped": 0,
         "dead_lettered": 0,
         "dead_lettered_expired": 0,
-        "skipped_dry_run": True,
     }
     # Spool is byte-identical — no reads/writes/dead-letter moves happened.
     assert _spool_file_snapshot(tmp_path) == before
@@ -552,5 +551,50 @@ def test_replay_pending_still_runs_for_dispatcher_without_marker(tmp_path: Path)
     assert not hasattr(up_dispatcher, "dry_run")
     up = EightsAttestor(dispatcher=up_dispatcher, workflow_id="wf-B2", spool=spool)
     summary = up.replay_pending()
+    assert summary["sent"] == 1
+    assert spool.count() == 0
+
+
+class _MarkerDispatcher(_UpDispatcher):
+    """`_UpDispatcher` that carries an explicit `dry_run` marker value, so
+    the guard's exact comparison (`is True`) can be exercised against
+    non-True values without touching the real daemon-down path."""
+
+    def __init__(self, dry_run_value: Any) -> None:
+        super().__init__()
+        self.dry_run = dry_run_value
+
+
+def test_replay_pending_still_runs_when_dry_run_is_false(tmp_path: Path) -> None:
+    """`dry_run = False` is the explicit "this is a real dispatcher" case —
+    must replay exactly like a dispatcher with no marker at all."""
+    spool = PendingSpool(root=tmp_path)
+    down = EightsAttestor(dispatcher=_DownDispatcher(), workflow_id="wf-A3", spool=spool)
+    down._call("eights.evolution.propose", {"slug": "router/v6"})
+    assert spool.count() == 1
+
+    dispatcher = _MarkerDispatcher(dry_run_value=False)
+    attestor = EightsAttestor(dispatcher=dispatcher, workflow_id="wf-B3", spool=spool)
+    summary = attestor.replay_pending()
+    assert summary["sent"] == 1
+    assert spool.count() == 0
+
+
+@pytest.mark.parametrize("truthy_marker", [1, "true"])
+def test_replay_pending_still_runs_for_truthy_non_true_marker(
+    tmp_path: Path, truthy_marker: Any
+) -> None:
+    """The guard must key on `dry_run is True` specifically, not on ordinary
+    truthiness — `1` and the string `"true"` are both truthy in Python but
+    are not the sentinel `True` the dry-run stub sets, so they must still
+    replay normally."""
+    spool = PendingSpool(root=tmp_path)
+    down = EightsAttestor(dispatcher=_DownDispatcher(), workflow_id="wf-A4", spool=spool)
+    down._call("eights.evolution.propose", {"slug": "router/v7"})
+    assert spool.count() == 1
+
+    dispatcher = _MarkerDispatcher(dry_run_value=truthy_marker)
+    attestor = EightsAttestor(dispatcher=dispatcher, workflow_id="wf-B4", spool=spool)
+    summary = attestor.replay_pending()
     assert summary["sent"] == 1
     assert spool.count() == 0
