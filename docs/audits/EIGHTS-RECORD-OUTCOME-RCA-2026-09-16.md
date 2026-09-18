@@ -513,3 +513,44 @@ are boot re-attestations. They are expected and are not duplicates.
 **Effect on the path.** None of this changes the order in §8. It sharpens two
 paths. T gains a deterministic first pass (the fixture id and the drain-burst
 window). I must be enforced on the server.
+
+## 10. Addendum — X1c (`generate_image`) deferred, 2026-09-18
+
+X1c is **not merged**, by decision. The work is preserved on pair-programmer branch
+`attended/run_8jZ0GaC9Cb2m` at commit 76dfe1d and can be resumed at any time.
+
+**Why defer.** The plan makes imagery explicitly degrade-open: a plan renders
+without it and says so in its provenance, and an image "must never be able to
+block a plan gate". X1c is therefore not on the path to the `HYDRA_PLAN_PHASE`
+flip. Three cross-vendor passes scored `security_hygiene` 1, 1 and 1, each time
+on a *new* surface, because harvesting files a vendor CLI wrote into a shared
+directory is a hostile-filesystem problem, not a feature problem.
+
+**What the work does deliver** (worth keeping when it resumes): the codex path
+harvests only the session directory that `codex exec --json` reports, never by
+newest mtime — the race the plan warned about; downscaling uses the existing
+`pngjs` dependency; and it returns file paths, never base64, which §7a requires.
+
+**What the last pass still found open** (all in `daemon/src/mcp/codex-server.ts`):
+1. Containment is **lexical, not physical**. A session directory replaced by a
+   symlink passes `dirname(resolve(...))`; `readdirSync` follows it. A file can be
+   swapped from regular file to symlink between `lstatSync` and `readFileSync`.
+   `wx` protects only the leaf, so a symlinked `output_dir` parent escapes while
+   `isInside` still reports a lexical child. Needs `O_NOFOLLOW`-equivalent opens
+   (open the directory handle once and read relative to it) rather than path
+   re-resolution.
+2. `readPngDimensionsFast` validates 24 bytes only — no IHDR length/CRC, no
+   IDAT/IEND. A partially written 24-byte file passes `fitsAsIs`, is copied
+   verbatim, and is reported `ok`, so the advertised per-file malformed-PNG
+   failure does not hold. Polling returns as soon as any `.png` name appears,
+   which makes this a realistic flush race.
+3. The caps do not bound the pre-call snapshot, which walks every session
+   directory under the images root.
+
+**Also settled by X1c's probe, and worth recording** — `agy` *can* generate an
+image, but writes it to a single global scratch directory
+(`~/.gemini/antigravity-cli/scratch/`) under a model-chosen name reported only in
+prose, with no per-turn handle in stdout. A deterministic per-turn harvest is
+therefore impossible without an mtime scan that races concurrent agy sessions.
+This corrects §7b, which assumed agy's named tool would be the cleaner of the
+two: it is the *less* harvestable of the two.
