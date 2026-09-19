@@ -905,3 +905,92 @@ class EightsAttestor:
             "resource_id": resource_id,
             "proposal_id": proposal_id,
         })
+
+
+class GateOnlyHitlClient:
+    """Minimal, spool-free live client for the attended gate-only resume
+    route's single narrow TheEights call (operator decision 2, hydra_core.cli
+    `_resolve_eights_hitl_gate_only`): list pending `hydra_gate` tickets and
+    resolve the one matching this workflow's just-cleared gate.
+
+    Deliberately NOT `EightsAttestor`: `EightsAttestor.hitl_resolve` routes
+    through `_call`, which spools `eights.governance.hitl.resolve` on ANY
+    failure (`_SPOOLABLE_TOOLS` above) so `replay_pending`/
+    `replay_pending_async` can retry it later — exactly the durable-retry
+    behaviour this route forbids (a failed resolve here must report
+    "unavailable", never queue a retry). This class talks to
+    `dispatcher.call_mcp` directly and never imports or references
+    `PendingSpool`, `replay_pending`, or `replay_pending_async` — there is
+    nothing in it capable of spooling a payload.
+    """
+
+    def __init__(self, dispatcher: Any, *, workflow_id: str):
+        self._dispatcher = dispatcher
+        # Public alias (cross-vendor finding 2, RESOLVE-GATE-ONLY follow-up):
+        # `hydra_core.cli._best_effort_close_gate_only_dispatcher` needs a
+        # reference to the underlying dispatcher to attempt a best-effort
+        # close on the gate-only route's inner deadline. `_dispatcher` stays
+        # private for this class's own internal use; this is purely additive.
+        self.dispatcher = dispatcher
+        self._workflow_id = str(workflow_id)
+
+    def _envelope(self) -> dict[str, Any]:
+        return {
+            "tenant_id": "local",
+            "actor_id": "hydra.supervisor",
+            "project_id": "Hydra",
+            "domain": "orchestration",
+            "scope": [],
+            "trace_id": self._workflow_id,
+        }
+
+    @staticmethod
+    def _is_success(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        status = result.get("status")
+        return status is None or status in {"done", "ok", "complete"}
+
+    def hitl_list(
+        self, *, status: str = "pending", kind: Optional[str] = "hydra_gate",
+    ) -> Optional[list[dict]]:
+        """List HITL rows from the shared ledger. Returns ``None`` when the
+        daemon did not service the call (unreachable/disabled/malformed
+        reply) — read-only, so there is nothing to spool on failure."""
+        args = {"envelope": self._envelope(), "status": status}
+        result = self._dispatcher.call_mcp(
+            EIGHTS_MCP_SERVER, "eights.governance.hitl.list", args)
+        if not self._is_success(result):
+            return None
+        inner = result.get("result", result) if isinstance(result, dict) else None
+        if isinstance(inner, dict):
+            inner = inner.get("rows") or inner.get("requests")
+        if not isinstance(inner, list):
+            return None
+        rows = [r for r in inner if isinstance(r, dict)]
+        if kind:
+            rows = [r for r in rows if r.get("kind") == kind]
+        return rows
+
+    def hitl_resolve(
+        self, *, request_id: str, decision: str, note: str = "",
+    ) -> Optional[dict]:
+        """Resolve one pending HITL request. Returns ``None`` on any failure
+        (unreachable, rejected, malformed reply) -- NEVER spooled; the caller
+        (`_resolve_eights_hitl_gate_only`) reports "unavailable" instead."""
+        rid = str(request_id or "").strip()
+        if not rid:
+            return None
+        envelope = self._envelope()
+        token = _mint_hitl_resolve_token(
+            request_id=rid, workflow_id=self._workflow_id)
+        if token is not None:
+            envelope["capability_token"] = token
+        result = self._dispatcher.call_mcp(
+            EIGHTS_MCP_SERVER, "eights.governance.hitl.resolve", {
+                "envelope": envelope,
+                "request_id": rid,
+                "decision": decision,
+                "note": note,
+            })
+        return result if self._is_success(result) else None

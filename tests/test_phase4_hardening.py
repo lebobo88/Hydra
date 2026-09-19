@@ -947,9 +947,12 @@ def test_detached_gate_launch_blocked_without_env(
 def test_detached_gate_resume_blocked_without_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """_launch_resume returns a detached_disabled refusal when HYDRA_ALLOW_DETACHED
-    is not set, and subprocess.Popen is never called.  No log directory must be
-    created — the gate fires before any filesystem side-effects."""
+    """RCA path K (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16.md §7): without
+    HYDRA_ALLOW_DETACHED, `_launch_resume` no longer refuses outright — it
+    routes through the non-detaching `_run_cli_json` transport instead
+    (never spawning `subprocess.Popen`, never passing `--live`). See
+    tests/test_resume_attended_route.py for the full contract; this test
+    keeps the historical "no Popen, no log dir" side-effect assertions."""
     from mcp_servers.hydra_control import server as _srv
 
     monkeypatch.delenv("HYDRA_ALLOW_DETACHED", raising=False)
@@ -960,20 +963,28 @@ def test_detached_gate_resume_blocked_without_env(
     class _ShouldNotBeCalled:
         def __init__(self, *a: Any, **kw: Any) -> None:
             raise AssertionError(
-                "Popen must NOT be called when the detached gate is active"
+                "Popen must NOT be called on the attended (non-detached) resume route"
             )
 
     monkeypatch.setattr(subprocess, "Popen", _ShouldNotBeCalled)
 
+    captured: list[list[str]] = []
+
+    def _fake_run_cli_json(cli_args, *, timeout_s, err_label, workflow_id=None):
+        captured.append(list(cli_args))
+        return {"ok": True, "workflow_id": workflow_id, "resumed": True}
+
+    monkeypatch.setattr(_srv, "_run_cli_json", _fake_run_cli_json)
+
     out = _srv._launch_resume("wf-gate-2", "approve", None)
-    assert out["ok"] is False, "gate off → ok must be False"
-    assert out["error"] == "detached_disabled", f"unexpected error key: {out}"
-    assert "HYDRA_ALLOW_DETACHED" in out.get("remediation", ""), (
-        "remediation must mention HYDRA_ALLOW_DETACHED"
+    assert out["ok"] is True, f"attended route must succeed via _run_cli_json: {out}"
+    assert captured and "--live" not in captured[0], (
+        "attended resume must never pass --live"
     )
-    # Side-effect assertion: no workflow directory must have been created.
+    # Side-effect assertion: no workflow directory must have been created —
+    # the non-detaching route has no log_dir.mkdir at all.
     assert not (tmp_path / ".hydra" / "wf-gate-2").exists(), (
-        "gate must fire before log_dir.mkdir — no workflow subdir may be created"
+        "the non-detaching resume route must not create a detached log dir"
     )
 
 
