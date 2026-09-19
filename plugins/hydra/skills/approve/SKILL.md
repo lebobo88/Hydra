@@ -52,29 +52,40 @@ follow-up): `hydra.workflow.resume` picks its transport from
   continues from the cursor afterward, exactly as if the workflow had never
   paused. This response body is ADDITIVE, not byte-for-byte identical to
   the pre-gate-only shape (`gate_only` and, when applicable,
-  `eights_resolution` are new fields). If the operator identity is unknown
-  or the minted capability is degraded (missing `HYDRA_OPERATOR_ID` /
-  `HYDRA_OPERATOR_KEY`), the approve REFUSES up front (`{ok: false, error:
+  `eights_resolution` are new fields). Identity is checked TWICE: a
+  pure, state-free precheck (operator id known + a signing key present)
+  runs BEFORE the resume lock is acquired and before the checkpoint is
+  opened — so an unauthenticated call creates no `.hydra/<workflow>/`
+  directory and no checkpoint database at all — and the real mint+verify
+  (bound to the actual pending gate) runs again right after the checkpoint
+  loads. If either fails (unknown operator, no `HYDRA_OPERATOR_ID`, no
+  signing key `HYDRA_OPERATOR_KEY`, or a capability that fails
+  verification), the approve REFUSES up front (`{ok: false, error:
   "operator_identity_required"}`) rather than proceeding on an unverifiable
   token — this check applies to every mutating resume action reachable
-  through `/hydra:resume` too, not only `approve`. TheEights resolution is
-  reported honestly as `eights_resolution: "deferred"` — it is swept on the
-  next live call, not resolved from the stub. A retry after an interrupted
+  through `/hydra:resume` too, not only `approve`. Once the gate clears
+  locally, TheEights' matching pending ticket is resolved NOW with one
+  narrow live call (list + resolve, never a replay or spool drain); the
+  response reports `eights_resolution: "resolved"` on success or
+  `eights_resolution: "unavailable"` (with a reason) when TheEights cannot
+  be reached — never a hardcoded "deferred". A retry after an interrupted
   gate-only resume reconciles any stale spooled HITL request for the
   already-resolved gate.
 
   `recover-stalled-stage` (see `/hydra:resume`) is refused outright on this
-  route, before any subprocess runs, because it is a LIVE operation, not a
-  gate resolution — only the detached CLI (`HYDRA_ALLOW_DETACHED=1`) may
-  run it.
+  route, before `_run_cli_json` ever spawns the resume child process,
+  because it is a LIVE operation, not a gate resolution — only the detached
+  CLI (`HYDRA_ALLOW_DETACHED=1`) may run it.
 
-  **Timeout and retry:** the gate-only subprocess is bounded by a
-  30-second synchronous timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
-  A gate-only resolution never dispatches — it is in-process mint+verify,
-  a checkpoint patch, and a spool prune, all on `_NullDispatcher` — so 30s
-  is generous headroom for cold start, not an expected duration; a timeout
-  usually means the host process itself is stalled, not that the gate is
-  slow. On a timeout or any other failure, simply retry the same
+  **Timeout and retry:** the MCP transport runs `hydra resume --gate-only`
+  as a real, synchronous CHILD PROCESS (`_run_cli_json`, `subprocess.run`)
+  bounded by a 30-second timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
+  The child itself never dispatches — it does mint+verify, a checkpoint
+  patch, a spool prune, and one narrow live TheEights list+resolve call, all
+  on `_NullDispatcher` for graph re-entry purposes — so 30s is generous
+  headroom for cold start, not an expected duration; a timeout usually means
+  the child process itself is stalled, not that the gate is slow. On a
+  timeout or any other failure, simply retry the same
   `hydra.workflow.resume` call (or the equivalent `cli resume --gate-only`
   invocation) with the same `workflow_id`/`action`/`option`: the route is
   idempotent — a retry after a resolution that already landed on the

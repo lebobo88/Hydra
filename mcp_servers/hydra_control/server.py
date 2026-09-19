@@ -422,11 +422,15 @@ def _run_resume_attended(workflow_id: str, action: str, option: str | None,
     `_NullDispatcher`. This is deliberately NOT the same guarantee as E2-22's
     non-live deferral filter (which still applies to node_dispatch generally
     and is untouched) — gate-only is a stronger, explicit guarantee that
-    graph execution never happens on this transport at all. TheEights
-    resolution is honestly reported as deferred (decision C): `_NullDispatcher`
-    cannot reach the shared ledger, so the ticket is left for the next live
-    call (`hydra eights-hitl-reconcile` / `hydra reap --apply`) rather than
-    being silently skipped or falsely claimed resolved. The host's existing
+    graph execution never happens on this transport at all. Operator
+    decision 2: once the gate clears locally, TheEights' matching pending
+    ticket is resolved NOW, via a dedicated narrow live client
+    (`hydra_core.cli._resolve_eights_hitl_gate_only` /
+    `hydra_core.eights.attestation.GateOnlyHitlClient` — one list + one
+    resolve call, never `replay_pending`/`replay_pending_async`, never a
+    spool write on failure). The CLI result reports `eights_resolution:
+    "resolved"` on success or `"unavailable"` (with a reason) when TheEights
+    cannot be reached — never a hardcoded "deferred". The host's existing
     step/submit loop (hydra.workflow.step / hydra.workflow.submit_host_result)
     then continues the workflow from its cursor exactly as if it had never
     paused — the CLI result JSON says so explicitly

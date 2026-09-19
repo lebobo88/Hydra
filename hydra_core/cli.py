@@ -1039,6 +1039,109 @@ def _resolve_eights_hitl_for_workflow(
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _build_gate_only_eights_client(project: Path, wf: str):
+    """Factory for the attended gate-only resume route's narrow live
+    TheEights client (operator decision 2). A DEDICATED minimal client, not
+    `EightsAttestor`: `EightsAttestor.hitl_resolve` routes through `_call`,
+    which spools `eights.governance.hitl.resolve` on ANY failure
+    (`_SPOOLABLE_TOOLS` in hydra_core/eights/attestation.py) so a later
+    `replay_pending` can retry it — exactly the durability behaviour this
+    route forbids (a failed resolve here must report `unavailable`, never
+    queue a retry). `GateOnlyHitlClient` calls `dispatcher.call_mcp` directly
+    and never imports `PendingSpool`/`replay_pending`/`replay_pending_async`
+    — there is nothing in it to spool with.
+
+    The dispatcher itself is a real, live `MCPStdioDispatcher`: it reads the
+    SAME backend registry (`~/.hydra/backends.json` / `HYDRA_BACKENDS`) and
+    `.mcp.json` every other Hydra dispatcher reads (`hydra_core.dispatcher.
+    _load_mcp_config`), and its `call_mcp` refuses to open a stdio session at
+    all when `HYDRA_TEST_NO_DAEMONS=1` (the hermetic suite's conftest sets
+    this for every test) — see `hydra_core.dispatcher.daemons_disabled()`,
+    checked at the very top of `call_mcp` before any subprocess work. So even
+    a test that does NOT inject a stub client here can never fork a real
+    `node TheEights/daemon/dist/index.js` child.
+
+    Tests inject a stub in-process by monkeypatching this factory directly
+    (`hydra_core.cli._build_gate_only_eights_client`) rather than touching
+    global env, so "reachable"/"unreachable" TheEights can be simulated
+    deterministically without relying on the daemon kill-switch.
+    """
+    from .dispatcher import MCPStdioDispatcher
+    from .eights.attestation import GateOnlyHitlClient
+    dispatcher = MCPStdioDispatcher(project, verbose=False)
+    return GateOnlyHitlClient(dispatcher, workflow_id=wf)
+
+
+def _resolve_eights_hitl_gate_only(
+    project: Path, workflow_id: str, *, note: str, decision: str,
+    gate_node: str | None = None,
+) -> dict:
+    """Operator decision 2 (RESOLVE-GATE-ONLY follow-up): on the attended
+    gate-only resume route, resolve TheEights' matching pending HITL ticket
+    NOW, with exactly ONE narrow live round trip: list the workflow's
+    pending `hydra_gate` tickets, then resolve the one(s) matching this
+    gate. Never constructs a supervisor or dispatch, never calls
+    `replay_pending`/`replay_pending_async`/any spool drain, and never
+    spools anything on failure (see `_build_gate_only_eights_client`'s
+    docstring for why `GateOnlyHitlClient`, not `EightsAttestor`, is used
+    here). Returns ``{"eights_resolution": "resolved"|"unavailable",
+    "reason": <str, when unavailable>, "resolved": <int, when resolved>}``;
+    an unreachable daemon or a failed call reports "unavailable" with a
+    reason and never claims "resolved".
+    """
+    try:
+        client = _build_gate_only_eights_client(project, workflow_id)
+    except Exception as exc:  # noqa: BLE001 — never block the gate-only return
+        return {"eights_resolution": "unavailable",
+                "reason": f"client_build_failed: {type(exc).__name__}: {exc}"}
+    try:
+        rows = client.hitl_list()
+    except Exception as exc:  # noqa: BLE001
+        return {"eights_resolution": "unavailable",
+                "reason": f"list_failed: {type(exc).__name__}: {exc}"}
+    if rows is None:
+        return {"eights_resolution": "unavailable", "reason": "eights_unreachable"}
+    from .eights.hitl_reconcile import row_workflow_id, row_gate_node
+    wf = str(workflow_id)
+    matched = [r for r in rows if row_workflow_id(r) == wf]
+    if gate_node:
+        matched = [r for r in matched if row_gate_node(r) == gate_node]
+    if not matched:
+        return {"eights_resolution": "unavailable", "reason": "no_matching_ticket"}
+    resolved = 0
+    last_reason = "resolve_failed"
+    for row in matched:
+        request_id = row.get("request_id")
+        if not request_id:
+            continue
+        try:
+            out = client.hitl_resolve(
+                request_id=str(request_id), decision=decision, note=note)
+        except Exception as exc:  # noqa: BLE001
+            out = None
+            last_reason = f"{type(exc).__name__}: {exc}"
+        if out is not None:
+            resolved += 1
+    if resolved == 0:
+        return {"eights_resolution": "unavailable", "reason": last_reason}
+    return {"eights_resolution": "resolved", "resolved": resolved}
+
+
+def _eights_resolution_fields(gate_only: bool, result: dict) -> dict:
+    """Additive JSON fields for a gate-only response body (operator decision
+    2): {} when not gate_only, otherwise the honest `eights_resolution`
+    outcome from `_resolve_eights_hitl_gate_only` -- "resolved" or
+    "unavailable" (never a hardcoded "deferred")."""
+    if not gate_only:
+        return {}
+    out: dict = {"eights_resolution": result.get("eights_resolution", "unavailable")}
+    if result.get("reason"):
+        out["eights_resolution_reason"] = result["reason"]
+    if result.get("resolved"):
+        out["eights_resolved_count"] = result["resolved"]
+    return out
+
+
 def _release_resume_lock(fd, lock_path) -> None:
     import os as _os
     try:
@@ -1247,17 +1350,17 @@ def _resolve_operator_capability_for_resume(
             "message": (
                 "attended gate-only resume requires a known operator "
                 "identity to mint a verifiable capability for a "
-                "state-mutating action; set HYDRA_OPERATOR_ID (env) or "
-                "pass --operator to identify the caller. Nothing was "
-                "changed."
+                "state-mutating action; set the HYDRA_OPERATOR_ID "
+                "environment variable to identify the caller (there is no "
+                "--operator CLI flag). Nothing was changed."
             ),
         }
 
     if _force_degraded:
         _log_cli.warning(
             "operator identity unknown for action=%r; capability degraded — "
-            "set HYDRA_OPERATOR_ID (or args.operator) to a real operator id "
-            "to issue a verifiable capability token",
+            "set the HYDRA_OPERATOR_ID environment variable to a real "
+            "operator id to issue a verifiable capability token",
             action,
         )
         # Use a sentinel actor_id for the degraded token payload so the wire
@@ -1449,6 +1552,65 @@ def _resolve_operator_capability_for_resume(
     return operator_capability_patch, _operator, None
 
 
+def _precheck_operator_identity_gate_only(args) -> dict | None:
+    """Operator decision 1: on the attended gate-only resume route, verify a
+    real, non-degraded operator identity is even POSSIBLE before the resume
+    lock is acquired or any workflow state is touched — so an unauthenticated
+    call writes NOTHING at all: no `.hydra/<workflow>/` directory (created by
+    `_acquire_resume_lock`'s `lock_dir.mkdir(...)`, the very first side effect
+    on the old path), no `resume.lock`, no checkpoint database (opened by
+    `build_supervisor`), no telemetry.
+
+    This is a PURE, state-free check (env/args only — no checkpoint read, no
+    workflow lookup of any kind, since none exists yet at this point in
+    `_cmd_resume`): the operator id must be known and non-empty, AND a
+    signing key must be present so a later mint (`mint_for_approval`, which
+    DOES need the loaded pending-gate state and so cannot run this early)
+    could plausibly produce a non-degraded capability. This does not mint or
+    verify anything itself — it only rules out the two conditions that would
+    make the later mint degraded/refused regardless of which gate is
+    eventually loaded. The real mint+verify
+    (`_resolve_operator_capability_for_resume`, called from
+    `_cmd_resume_locked` immediately after the checkpoint load) is UNCHANGED
+    and still runs -- it binds the token to the actual pending gate, which
+    this pre-lock check cannot see yet.
+
+    Returns a refusal dict (caller prints it and returns 1) when identity is
+    missing/unknown or no signing key is configured; ``None`` to proceed.
+    Only applies to the gate-only route — the legacy non-gate_only CLI path
+    keeps its original warn-and-proceed posture (WS-AUTH run-A), unchanged,
+    and is not called here.
+    """
+    operator = (
+        getattr(args, "operator", None)
+        or os.environ.get("HYDRA_OPERATOR_ID", "")
+        or ""
+    ).strip()
+    if not operator or operator == "unknown":
+        return {
+            "ok": False,
+            "error": "operator_identity_required",
+            "message": (
+                "attended gate-only resume requires a known operator "
+                "identity BEFORE the resume lock is acquired; set the "
+                "HYDRA_OPERATOR_ID environment variable to identify the "
+                "caller (there is no --operator CLI flag). Nothing was "
+                "created or changed."
+            ),
+        }
+    if not os.environ.get("HYDRA_OPERATOR_KEY"):
+        return {
+            "ok": False,
+            "error": "operator_identity_required",
+            "message": (
+                "attended gate-only resume requires a signing key to mint a "
+                "verifiable operator capability; HYDRA_OPERATOR_KEY is not "
+                "set. Nothing was created or changed."
+            ),
+        }
+    return None
+
+
 def _cmd_resume(args) -> int:
     """Resume an HITL-paused workflow from its checkpoint.
 
@@ -1464,6 +1626,29 @@ def _cmd_resume(args) -> int:
     wf = str(args.workflow_id)
     action = args.action
     option = getattr(args, "option", None)
+
+    # Operator decision 1: on the gate-only route, refuse an unauthenticated
+    # caller BEFORE the resume lock exists and BEFORE build_supervisor opens
+    # the checkpoint database -- this check needs no workflow state (it runs
+    # ahead of the lock/checkpoint on purpose) so it can sit here, first.
+    #
+    # Scoped to every action EXCEPT recover-stalled-stage: that action is
+    # refused unconditionally under gate_only regardless of who is asking
+    # (cross-vendor finding 1 -- it is a LIVE operation, the opposite of what
+    # gate-only promises, and `_cmd_resume_locked` already refuses it before
+    # validating --option or looking for a cursor file). Requiring identity
+    # first would just replace one pre-lock, no-state-touched refusal with
+    # another, more specific one -- and would mask
+    # `recovery_is_live_operation` behind `operator_identity_required` for an
+    # action that was never going to run regardless of identity.
+    if (bool(getattr(args, "gate_only", False))
+            and action != "recover-stalled-stage"):
+        _pre_refusal = _precheck_operator_identity_gate_only(args)
+        if _pre_refusal is not None:
+            print(json.dumps({
+                **_pre_refusal, "workflow_id": wf, "action": action,
+            }), file=sys.stderr)
+            return 1
 
     # Atomic claim BEFORE reading gate state (claim-then-check): the loser of
     # a concurrent double-resume must never observe the still-uncleared gate.
@@ -1991,17 +2176,36 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # E2-17: the gate is now resolved on the Hydra side — close the matching
     # row in TheEights' shared ledger too, or it stays pending forever. Scoped
     # to the resolved gate identity (same key the spool prune uses), so another
-    # open gate in this workflow survives. Fail-soft: an unreachable daemon
-    # spools the resolve for the next drain.
+    # open gate in this workflow survives.
+    #
+    # Operator decision 2: under gate_only there is no live dispatcher at all
+    # (gate_only forbids --live -- see the mutual-exclusion guard above), so
+    # the legacy `_resolve_eights_hitl_for_workflow(dispatcher=dispatcher)`
+    # call below would only ever run against `_NullDispatcher`, which cannot
+    # reach TheEights. Resolve TheEights NOW instead, with the dedicated
+    # narrow live client (`_resolve_eights_hitl_gate_only` -- never spools,
+    # never replays). The legacy call (fail-soft, spools on failure) stays
+    # for the non-gate_only CLI path, unchanged.
     _terminal_resolution = action == "reject" or option == "abort"
-    _eights_hitl = _resolve_eights_hitl_for_workflow(
-        project, wf,
-        note=("workflow terminal: surfaced" if _terminal_resolution
-              else f"hydra resume: {action}"),
-        decision="rejected" if _terminal_resolution else "approved",
-        gate_node=resolution.get("gate_node") or None,
-        dispatcher=dispatcher,
-    )
+    if gate_only:
+        _eights_gate_only = _resolve_eights_hitl_gate_only(
+            project, wf,
+            note=("workflow terminal: surfaced" if _terminal_resolution
+                  else f"hydra resume: {action}"),
+            decision="rejected" if _terminal_resolution else "approved",
+            gate_node=resolution.get("gate_node") or None,
+        )
+        _eights_hitl = {"resolved": _eights_gate_only.get("resolved", 0)}
+    else:
+        _eights_gate_only = {}
+        _eights_hitl = _resolve_eights_hitl_for_workflow(
+            project, wf,
+            note=("workflow terminal: surfaced" if _terminal_resolution
+                  else f"hydra resume: {action}"),
+            decision="rejected" if _terminal_resolution else "approved",
+            gate_node=resolution.get("gate_node") or None,
+            dispatcher=dispatcher,
+        )
     emit(project, wf, "hitl_resumed", {
         "action": action,
         "option": option,
@@ -2035,7 +2239,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # an unfamiliar key, not the same document.
             "gate_only": gate_only,
             "graph_reentered": False,
-            **({"eights_resolution": "deferred"} if gate_only else {}),
+            **_eights_resolution_fields(gate_only, _eights_gate_only),
         }, indent=2))
         return 0
 
@@ -2077,7 +2281,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # set (cross-vendor finding 5).
             "gate_only": gate_only,
             "graph_reentered": False,
-            **({"eights_resolution": "deferred"} if gate_only else {}),
+            **_eights_resolution_fields(gate_only, _eights_gate_only),
         }, indent=2))
         return 0
 
@@ -2124,7 +2328,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         if gate_only:
             _modify_plan_out["gate_only"] = True
             _modify_plan_out["graph_reentered"] = False
-            _modify_plan_out["eights_resolution"] = "deferred"
+            _modify_plan_out.update(_eights_resolution_fields(gate_only, _eights_gate_only))
             _modify_plan_out["note"] = (
                 "plan revision task recorded, graph not re-entered — call "
                 "hydra.workflow.step to continue"
@@ -2156,7 +2360,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "status": _post_phase,
             "gate_node": resolution.get("gate_node"),
             "pending_hitl": _post_values.get("pending_hitl"),
-            "eights_resolution": "deferred",
+            **_eights_resolution_fields(gate_only, _eights_gate_only),
             "note": (
                 "gate resolved without re-entering the graph — call "
                 "hydra.workflow.step to continue"

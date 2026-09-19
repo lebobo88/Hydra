@@ -13,12 +13,17 @@ Only `hydra.workflow.resume` (or the matching Hydra CLI) may validate and
 persist the decision, modify a budget, alter squads, or re-enter the graph.
 </authority_boundary>
 
-Companion to `/hydra:approve`. Drives non-approve resume paths:
+Companion to `/hydra:approve`. Drives non-approve resume paths. The
+descriptions below are the LEGACY (non-attended, `--live`) CLI behavior —
+re-entering the graph/dispatch. On the attended default (gate-only, see the
+Note below), every one of these actions instead applies its state patch and
+STOPS without ever calling `sup.invoke`; nothing here "dispatches" or
+"re-enters" on that route:
 
 - `--reject`: mark the workflow `surfaced`, write a rejection note.
-- `--modify-budget 250`: update `state.budget.budget_usd` and re-enter dispatch.
-- `--force-dispatch`: dispatch even though a gate failed (logs a `policy_override` event; operator owns the risk). At `plan_gate` this additionally stamps `plan_status="bypassed"` and appends a governance note to the plan artifact, so proceeding without an approved plan is evidence rather than a gap.
-- `--squads engineering,garland`: replace `selected_squads` and re-plan.
+- `--modify-budget 250`: update `state.budget.budget_usd`; legacy path re-enters dispatch, attended gate-only path only patches the budget and stops.
+- `--force-dispatch`: dispatch even though a gate failed (logs a `policy_override` event; operator owns the risk) on the legacy path; the attended gate-only path records the same `policy_override` event and per-action patch but never actually re-enters dispatch. At `plan_gate` this additionally stamps `plan_status="bypassed"` and appends a governance note to the plan artifact, so proceeding without an approved plan is evidence rather than a gap.
+- `--squads engineering,garland`: replace `selected_squads`; legacy path re-plans, attended gate-only path only patches `selected_squads` and stops.
 - `--modify-plan --critique-ref <path-or-memoryref>`: request a plan revision.
   Valid **only** at `plan_gate`. Bumps `plan_revision`, sets
   `plan_status="authoring"`, and seeds one planning task carrying the critique
@@ -66,18 +71,26 @@ detached.
   The operator-identity check covers EVERY action that can mutate
   checkpoint state or the spool, including `--reject` (not only
   `approve`/`force-dispatch`/`modify-budget`/`change-squads`/`modify-plan`).
-  If the operator identity is unknown (no `HYDRA_OPERATOR_ID`) or the
-  minted capability is degraded (no `HYDRA_OPERATOR_KEY`), the resume
-  REFUSES with `{ok: false, error: "operator_identity_required"}` before
-  touching any state — it does not silently proceed with a degraded token.
-  TheEights resolution is honestly reported as `eights_resolution:
-  "deferred"`: `_NullDispatcher` cannot reach the shared ledger, so the
-  matching row is left for the next live sweep
-  (`hydra eights-hitl-reconcile` / `hydra reap --apply`) rather than being
-  silently skipped or falsely claimed resolved. A retry after an
-  interrupted gate-only resume (killed between its checkpoint patch and its
-  spool prune) reconciles the stale spooled HITL request for the
-  already-resolved gate rather than leaving it orphaned.
+  Identity is verified TWICE, at two different points: a pure, state-free
+  precheck (operator id known + a signing key present) runs BEFORE the
+  resume lock is even acquired and before the checkpoint is opened, so an
+  unauthenticated call creates nothing on disk at all (no `.hydra/<workflow>/`
+  lock directory, no checkpoint database); the real mint+verify (bound to
+  the actual pending gate) runs again immediately after the checkpoint
+  loads, before any state mutation. If either check fails — unknown
+  operator (no `HYDRA_OPERATOR_ID`), no signing key (no
+  `HYDRA_OPERATOR_KEY`), or a capability that fails verification — the
+  resume REFUSES with `{ok: false, error: "operator_identity_required"}`
+  before touching any state — it does not silently proceed with a degraded
+  token. Once the gate clears locally, TheEights' matching pending ticket is
+  resolved NOW with one narrow live call (list + resolve, never a replay or
+  spool drain); the result reports `eights_resolution: "resolved"` on
+  success or `eights_resolution: "unavailable"` (with a reason) when
+  TheEights cannot be reached — never a hardcoded "deferred", and never a
+  spooled retry on this route. A retry after an interrupted gate-only resume
+  (killed between its checkpoint patch and its spool prune) reconciles the
+  stale spooled HITL request for the already-resolved gate rather than
+  leaving it orphaned.
 
   `recover-stalled-stage` is the ONE resume action this route REFUSES
   outright, before any subprocess runs (`{ok: false, error:
@@ -94,12 +107,18 @@ detached.
   combination before doing any work (argparse-level and, defensively, a
   matching runtime check).
 
-  **Timeout and retry:** the gate-only subprocess is bounded by a
-  30-second synchronous timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
-  Gate-only work is in-process mint+verify, a checkpoint patch, and a
-  spool prune on `_NullDispatcher` — no dispatch, no subprocess, no
-  network call — so a timeout signals a stalled host process, not a slow
-  gate. Retry the identical `hydra.workflow.resume` call (same
+  **Timeout and retry:** the MCP transport (`_run_cli_json` in
+  `mcp_servers/hydra_control/server.py`) runs `hydra resume --gate-only` as
+  a synchronous CHILD PROCESS (`subprocess.run([sys.executable, "-m",
+  "hydra_core.cli", ...])`) and waits for it in-band — this is a real
+  subprocess, not an in-process call; "no subprocess" describes only the
+  work the child itself does once running (mint+verify, a checkpoint patch,
+  a spool prune, and now one narrow live TheEights list+resolve call — no
+  dispatch, no live squad/engineering work, no replay). That whole call is
+  bounded by a 30-second synchronous timeout
+  (`HYDRA_RESUME_TIMEOUT_S`, default `30`); a timeout signals a stalled
+  child process, not a slow gate. Retry the identical `hydra.workflow.resume`
+  call (same
   `workflow_id`/`action`/`option`) on any failure; the route is
   idempotent, including reconciling a stale spooled HITL request left by
   a prior call that was interrupted between its checkpoint patch and its

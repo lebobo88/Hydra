@@ -229,21 +229,45 @@ class _CliNullDispatcher:
         return None
 
 
+def _hermetic_project(tmp_path, monkeypatch) -> Path:
+    """An isolated project root (never REPO_ROOT) so a test's own workflow
+    telemetry/checkpoint/lock never lands in the shared attended worktree
+    checkout — squads/CONSTITUTION.md are redirected to the real REPO_ROOT
+    tree (the same pattern tests/test_p5b_plan_lifecycle.py uses)."""
+    project = tmp_path / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO_ROOT / "CONSTITUTION.md", project / "CONSTITUTION.md")
+    from hydra_core.squad_loader import discover_squads as _real_discover_squads
+    monkeypatch.setattr("hydra_core.cli.discover_squads",
+                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
+    return project
+
+
 def _start_paused_attended_workflow(
     tmp_path, monkeypatch, *, selected_squads: list[str] | None = None,
-) -> str:
+) -> tuple[Path, str]:
     """Run a workflow with an engineering task alongside executive (plus,
     optionally, additional squads — e.g. a claude-skill pack and a stub pack,
     cross-vendor finding 5), pausing at the approval gate (executive's
-    requires_human_approval)."""
+    requires_human_approval).
+
+    Returns ``(project, workflow_id)``. Uses an isolated hermetic project
+    root (never REPO_ROOT, per the same discipline `_hermetic_project` and
+    `_start_paused_attended_workflow_at` already apply below) — this was the
+    older of the two seeding helpers and, unlike its sibling, used to write
+    its `.hydra/<workflow>` checkpoint/lock/telemetry traces straight into
+    the shared attended worktree checkout."""
+    project = _hermetic_project(tmp_path, monkeypatch)
     monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(tmp_path / "checkpoints.db"))
     wf = uuid4()
     initial = HydraState(workflow_id=wf, root_goal="resume-attended-route test goal")
     initial.selected_squads = selected_squads or ["executive", "engineering"]
     initial.target_repo_id = "hydra"
-    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_CliNullDispatcher())
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
     sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
-    return str(wf)
+    return project, str(wf)
 
 
 @pytest.fixture(autouse=True)
@@ -263,7 +287,7 @@ def test_attended_resume_via_cli_defers_engineering_no_stub_completion(
     `cli.main` (mirrors the MU7/MU15 test style): the gate clears,
     pending_hitl clears, and the engineering task is never marked done from
     stub output."""
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
 
     h = mem_handlers()
     pre_status = h["hydra-mem.workflow_status"]({"workflow_id": wf})
@@ -271,7 +295,7 @@ def test_attended_resume_via_cli_defers_engineering_no_stub_completion(
         "precondition: workflow must be paused at a real HITL gate before resume"
     )
 
-    rc = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+    rc = cli.main(["--project", str(project), "resume", wf, "--action", "approve"])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0, f"resume failed: {out}"
     assert out.get("resumed") is True
@@ -323,8 +347,8 @@ def test_attended_resume_leaves_populated_spool_byte_identical(
     seed_path.write_text(call.to_json(), encoding="utf-8")
     seed_before = seed_path.read_bytes()
 
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
-    rc = cli.main(["--project", str(REPO_ROOT), "resume", wf, "--action", "approve"])
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    rc = cli.main(["--project", str(project), "resume", wf, "--action", "approve"])
     capsys.readouterr()
     assert rc == 0
 
@@ -366,7 +390,7 @@ def test_gate_only_approve_records_no_squad_result_no_spool(
     dead.mkdir(parents=True, exist_ok=True)
     _set_known_operator(monkeypatch)
 
-    wf = _start_paused_attended_workflow(
+    project, wf = _start_paused_attended_workflow(
         tmp_path, monkeypatch,
         selected_squads=["executive", "engineering", "customer-support", "healthcare"],
     )
@@ -375,7 +399,7 @@ def test_gate_only_approve_records_no_squad_result_no_spool(
     dead_before = sorted(p.name for p in dead.iterdir())
 
     config = {"configurable": {"thread_id": wf}}
-    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_CliNullDispatcher())
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
     pre_snap = sup.get_state(config)
     pre_values = pre_snap.values
     assert pre_values.get("pending_hitl"), "precondition: must pause at a real gate"
@@ -384,7 +408,7 @@ def test_gate_only_approve_records_no_squad_result_no_spool(
     pre_artifact_count = len(pre_values.get("artifacts") or [])
 
     rc = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
+        "--project", str(project), "resume", wf,
         "--action", "approve", "--gate-only",
     ])
     out = json.loads(capsys.readouterr().out)
@@ -394,7 +418,13 @@ def test_gate_only_approve_records_no_squad_result_no_spool(
     assert out.get("gate_only") is True
     assert out.get("graph_reentered") is False
     assert out.get("pending_hitl") in (None, {})
-    assert out.get("eights_resolution") == "deferred"
+    # Operator decision 2: the hermetic suite's HYDRA_TEST_NO_DAEMONS=1
+    # blocks the narrow live TheEights client from ever forking a real
+    # daemon (see hydra_core.cli._build_gate_only_eights_client), so the
+    # attempted resolution honestly reports "unavailable" -- never the old
+    # hardcoded "deferred" (this route now genuinely tries, and says so).
+    assert out.get("eights_resolution") == "unavailable"
+    assert out.get("eights_resolution_reason")
 
     post_snap = sup.get_state(config)
     post_values = post_snap.values
@@ -456,16 +486,16 @@ def test_gate_only_unknown_operator_refuses_before_any_mutation(
     pending.mkdir(parents=True, exist_ok=True)
     dead.mkdir(parents=True, exist_ok=True)
 
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
     config = {"configurable": {"thread_id": wf}}
-    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_CliNullDispatcher())
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
     pre_values = sup.get_state(config).values
     assert pre_values.get("pending_hitl")
 
     spool_before = sorted(p.name for p in pending.iterdir())
 
     rc = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
+        "--project", str(project), "resume", wf,
         "--action", "approve", "--gate-only",
     ])
     _captured = capsys.readouterr()
@@ -495,9 +525,9 @@ def test_gate_only_reject_and_abort_identical_to_full_resume(tmp_path, monkeypat
     required here since cross-vendor finding 2 now covers `reject` under
     gate_only too."""
     _set_known_operator(monkeypatch)
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
     rc = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
+        "--project", str(project), "resume", wf,
         "--action", "reject", "--gate-only",
     ])
     out = json.loads(capsys.readouterr().out)
@@ -516,9 +546,9 @@ def test_gate_only_force_dispatch_records_policy_override_but_never_invokes(
     """force-dispatch is a governance event (policy_override emitted) even
     under gate-only, but the graph itself is never re-entered."""
     _set_known_operator(monkeypatch)
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
     rc = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
+        "--project", str(project), "resume", wf,
         "--action", "force-dispatch", "--gate-only",
     ])
     out = json.loads(capsys.readouterr().out)
@@ -533,23 +563,9 @@ def test_gate_only_force_dispatch_records_policy_override_but_never_invokes(
 # ===========================================================================
 # Cross-vendor findings 2, 3, 6: identity coverage widened to every
 # state-mutating action, and the checkpoint-patch/spool-prune interleaving
-# is reconciled on retry. Uses an isolated project root (never REPO_ROOT) so
-# these tests' telemetry never lands in the shared attended worktree
-# checkout -- squads/CONSTITUTION.md are redirected to the real REPO_ROOT
-# tree (the same pattern as tests/test_p5b_plan_lifecycle.py).
+# is reconciled on retry. `_hermetic_project` is defined above (used by both
+# seeding helpers in this module).
 # ===========================================================================
-
-def _hermetic_project(tmp_path, monkeypatch) -> Path:
-    project = tmp_path / "proj"
-    project.mkdir(parents=True, exist_ok=True)
-    shutil.copy(REPO_ROOT / "CONSTITUTION.md", project / "CONSTITUTION.md")
-    from hydra_core.squad_loader import discover_squads as _real_discover_squads
-    monkeypatch.setattr("hydra_core.cli.discover_squads",
-                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
-    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
-                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
-    return project
-
 
 def _start_paused_attended_workflow_at(
     project, monkeypatch, *, selected_squads: list[str] | None = None,
@@ -615,9 +631,14 @@ def test_gate_only_reject_refused_without_identity_state_unchanged(
 def test_gate_only_known_identity_missing_key_refused_as_degraded(
     tmp_path, monkeypatch, capsys
 ):
-    """A known HYDRA_OPERATOR_ID with NO HYDRA_OPERATOR_KEY mints a degraded
-    capability (sig.degraded=True); gate-only must refuse it exactly like an
-    unknown operator, before touching state."""
+    """A known HYDRA_OPERATOR_ID with NO HYDRA_OPERATOR_KEY can only ever mint
+    a degraded capability (sig.degraded=True); gate-only must refuse it
+    exactly like an unknown operator, before touching state. Operator
+    decision 1 catches this even earlier than the post-checkpoint mint+verify
+    now: the pre-lock precheck (`_precheck_operator_identity_gate_only`)
+    refuses before the resume lock is even acquired, since a missing signing
+    key already rules out a non-degraded mint regardless of which gate is
+    loaded."""
     monkeypatch.setenv("HYDRA_OPERATOR_ID", "lebobo88")
     monkeypatch.delenv("HYDRA_OPERATOR_KEY", raising=False)
     project = _hermetic_project(tmp_path, monkeypatch)
@@ -635,7 +656,7 @@ def test_gate_only_known_identity_missing_key_refused_as_degraded(
     assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
     assert out.get("ok") is False
     assert out.get("error") == "operator_identity_required"
-    assert "degraded" in out.get("message", "").lower()
+    assert "HYDRA_OPERATOR_KEY" in out.get("message", "")
 
     post_values = sup.get_state(config).values
     assert post_values.get("pending_hitl") == pre_values.get("pending_hitl")
@@ -1212,3 +1233,187 @@ def test_gate_only_verify_exception_refuses(tmp_path, monkeypatch, capsys):
 
     post_values = sup.get_state(config).values
     assert post_values.get("pending_hitl") == pre_values.get("pending_hitl")
+
+
+# ===========================================================================
+# Operator decision 1: identity is verified BEFORE the resume lock exists.
+# ===========================================================================
+
+def test_precheck_unauthenticated_never_existed_workflow_creates_no_files(
+    tmp_path, monkeypatch, capsys
+):
+    """An unauthenticated gate-only resume for a workflow id that NEVER
+    existed must create NOTHING on disk anywhere under the isolated state
+    root -- no `.hydra/<workflow>/` lock directory, no resume.lock, no
+    checkpoint database, no telemetry -- because
+    `_precheck_operator_identity_gate_only` runs in `_cmd_resume` BEFORE
+    `_acquire_resume_lock` (whose `lock_dir.mkdir(...)` is otherwise the
+    very first side effect) and BEFORE `build_supervisor` ever opens the
+    checkpoint database. The whole temp state tree is snapshotted
+    before/after -- not just the two paths this test happens to think of."""
+    monkeypatch.delenv("HYDRA_OPERATOR_ID", raising=False)
+    monkeypatch.delenv("HYDRA_OPERATOR_KEY", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    ckpt_db = tmp_path / "checkpoints.db"
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(ckpt_db))
+
+    def _snapshot() -> set[str]:
+        return {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")}
+
+    before = _snapshot()
+    wf = str(uuid4())
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert out.get("ok") is False
+    assert out.get("error") == "operator_identity_required"
+
+    after = _snapshot()
+    assert after == before, (
+        "an unauthenticated gate-only resume for a workflow that never "
+        f"existed must create NOTHING on disk: new={after - before}"
+    )
+    assert not (project / ".hydra").exists(), (
+        "no .hydra/<workflow> resume-lock directory may be created"
+    )
+    assert not ckpt_db.exists(), "no checkpoint database may be created"
+
+
+# ===========================================================================
+# Operator decision 2: TheEights is resolved NOW on the gate-only route, with
+# a narrow, spool-free, replay-free live call. `GateOnlyHitlClient` is
+# injected via `hydra_core.cli._build_gate_only_eights_client` so no test
+# here ever needs a real daemon.
+# ===========================================================================
+
+class _StubReachableEightsClient:
+    """A reachable TheEights: one pending ticket matching the resolved gate."""
+
+    def __init__(self, workflow_id: str, gate_node: str | None):
+        self._workflow_id = workflow_id
+        self._gate_node = gate_node
+        self.resolved_calls: list[tuple[str, str, str]] = []
+
+    def hitl_list(self, *, status: str = "pending", kind=None):
+        return [{
+            "request_id": "req-1",
+            "kind": "hydra_gate",
+            "payload": {
+                "workflow_id": self._workflow_id,
+                "gate_node": self._gate_node,
+            },
+        }]
+
+    def hitl_resolve(self, *, request_id: str, decision: str, note: str = ""):
+        self.resolved_calls.append((request_id, decision, note))
+        return {"status": "ok", "request_id": request_id}
+
+
+class _StubUnreachableEightsClient:
+    """An unreachable TheEights: hitl_list reports the daemon never serviced
+    the call (the same `None` `EightsAttestor.hitl_list` and
+    `GateOnlyHitlClient.hitl_list` both return on failure)."""
+
+    def hitl_list(self, *, status: str = "pending", kind=None):
+        return None
+
+    def hitl_resolve(self, **_kw):  # pragma: no cover
+        raise AssertionError(
+            "hitl_resolve must never be called once hitl_list already "
+            "reported TheEights unreachable"
+        )
+
+
+def _forbid_replay_and_spool(monkeypatch) -> None:
+    """Spy fixtures for the mutation proof: replay_pending,
+    replay_pending_async, and any spool write must never fire on the
+    gate-only eights resolution path."""
+    from hydra_core.eights.attestation import EightsAttestor
+    from hydra_core.eights.pending_spool import PendingSpool
+
+    def _boom_replay(self, *a, **k):
+        raise AssertionError(
+            "replay_pending must NEVER be called on the gate-only resume "
+            "route's TheEights resolution"
+        )
+
+    def _boom_replay_async(self, *a, **k):
+        raise AssertionError(
+            "replay_pending_async must NEVER be called on the gate-only "
+            "resume route's TheEights resolution"
+        )
+
+    def _boom_spool(self, **kw):
+        raise AssertionError(
+            "nothing may be spooled on the gate-only resume route's "
+            f"TheEights resolution: {kw}"
+        )
+
+    monkeypatch.setattr(EightsAttestor, "replay_pending", _boom_replay)
+    monkeypatch.setattr(EightsAttestor, "replay_pending_async", _boom_replay_async)
+    monkeypatch.setattr(PendingSpool, "spool", _boom_spool)
+
+
+def test_gate_only_reachable_eights_resolves_no_replay_no_spool(
+    tmp_path, monkeypatch, capsys
+):
+    """A gate-only approve with an injected REACHABLE TheEights resolves the
+    matching ticket and reports "resolved" -- and never touches replay or
+    the spool."""
+    _set_known_operator(monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pending_hitl = sup.get_state(config).values.get("pending_hitl")
+    assert pending_hitl, "precondition: must pause at a real gate"
+    gate_node = pending_hitl.get("gate_node")
+
+    stub = _StubReachableEightsClient(wf, gate_node)
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: stub)
+    _forbid_replay_and_spool(monkeypatch)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"gate-only approve failed: {out}"
+    assert out.get("pending_hitl") in (None, {})
+    assert out.get("eights_resolution") == "resolved"
+    assert out.get("eights_resolved_count") == 1
+    assert stub.resolved_calls == [("req-1", "approved", "hydra resume: approve")]
+
+
+def test_gate_only_unreachable_eights_reports_unavailable_gate_still_clears(
+    tmp_path, monkeypatch, capsys
+):
+    """With an injected UNREACHABLE TheEights: the result reports
+    "unavailable" with a reason, the local gate is still cleared, and
+    nothing is spooled/replayed."""
+    _set_known_operator(monkeypatch)
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+
+    stub = _StubUnreachableEightsClient()
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: stub)
+    _forbid_replay_and_spool(monkeypatch)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"gate-only approve failed: {out}"
+    assert out.get("pending_hitl") in (None, {}), (
+        "the local gate must still clear even when TheEights is unreachable"
+    )
+    assert out.get("eights_resolution") == "unavailable"
+    assert out.get("eights_resolution_reason") == "eights_unreachable"
+    assert "eights_resolved_count" not in out
