@@ -18,6 +18,7 @@ resume genuinely stops at the attended hand-off.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -486,8 +487,14 @@ def test_gate_only_unknown_operator_refuses_before_any_mutation(
 
 def test_gate_only_reject_and_abort_identical_to_full_resume(tmp_path, monkeypatch, capsys):
     """reject and force-dispatch/abort-option already end without graph
-    re-entry in the non-gate-only path — gate-only must behave identically
-    (operator decision A)."""
+    re-entry in the non-gate-only path — that BEHAVIOR (never re-entering
+    the graph) is identical under gate-only too (operator decision A). The
+    JSON body itself is additive, not byte-for-byte identical (cross-vendor
+    finding 5) -- `gate_only`/`eights_resolution` are new keys, checked
+    explicitly below rather than assumed. A known operator identity is
+    required here since cross-vendor finding 2 now covers `reject` under
+    gate_only too."""
+    _set_known_operator(monkeypatch)
     wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
     rc = cli.main([
         "--project", str(REPO_ROOT), "resume", wf,
@@ -523,27 +530,353 @@ def test_gate_only_force_dispatch_records_policy_override_but_never_invokes(
     assert out["pending_hitl"] in (None, {})
 
 
-def test_gate_only_recover_stalled_stage_unaffected_by_flag(tmp_path, monkeypatch, capsys):
-    """recover-stalled-stage never touches sup.invoke at all (only
-    sup.update_state) -- it must behave identically whether or not
-    --gate-only is passed (it returns cursor_not_found here since no cursor
-    was ever opened, which is enough to prove the flag changed nothing)."""
-    wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
-    rc_a = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
-        "--action", "recover-stalled-stage", "--option", "does-not-exist",
+# ===========================================================================
+# Cross-vendor findings 2, 3, 6: identity coverage widened to every
+# state-mutating action, and the checkpoint-patch/spool-prune interleaving
+# is reconciled on retry. Uses an isolated project root (never REPO_ROOT) so
+# these tests' telemetry never lands in the shared attended worktree
+# checkout -- squads/CONSTITUTION.md are redirected to the real REPO_ROOT
+# tree (the same pattern as tests/test_p5b_plan_lifecycle.py).
+# ===========================================================================
+
+def _hermetic_project(tmp_path, monkeypatch) -> Path:
+    project = tmp_path / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO_ROOT / "CONSTITUTION.md", project / "CONSTITUTION.md")
+    from hydra_core.squad_loader import discover_squads as _real_discover_squads
+    monkeypatch.setattr("hydra_core.cli.discover_squads",
+                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
+    monkeypatch.setattr("hydra_core.supervisor.discover_squads",
+                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
+    return project
+
+
+def _start_paused_attended_workflow_at(
+    project, monkeypatch, *, selected_squads: list[str] | None = None,
+) -> str:
+    monkeypatch.setenv("HYDRA_CHECKPOINT_DB", str(Path(project) / "checkpoints.db"))
+    wf = uuid4()
+    initial = HydraState(workflow_id=wf, root_goal="resume-attended-route test goal")
+    initial.selected_squads = selected_squads or ["executive", "engineering"]
+    initial.target_repo_id = "hydra"
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
+    return str(wf)
+
+
+def test_gate_only_reject_refused_without_identity_state_unchanged(
+    tmp_path, monkeypatch, capsys
+):
+    """Cross-vendor finding 2 (HIGH): `reject` was never a member of the
+    historical `_MUTATING_RESUME_ACTIONS` allow-list, so a gate-only reject
+    cleared pending_hitl with NO identity check at all. It must now refuse
+    identically to an unidentified approve -- pending_hitl, hitl_history,
+    phase, and the spool are all unchanged."""
+    monkeypatch.delenv("HYDRA_OPERATOR_ID", raising=False)
+    monkeypatch.delenv("HYDRA_OPERATOR_KEY", raising=False)
+    project = _hermetic_project(tmp_path, monkeypatch)
+    pending = tmp_path / "pending"
+    dead = tmp_path / "dead"
+    monkeypatch.setenv("HYDRA_EIGHTS_SPOOL", str(pending))
+    monkeypatch.setenv("HYDRA_EIGHTS_DEAD_LETTER", str(dead))
+    pending.mkdir(parents=True, exist_ok=True)
+    dead.mkdir(parents=True, exist_ok=True)
+
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+    assert pre_values.get("pending_hitl"), "precondition: must pause at a real gate"
+    spool_before = sorted(p.name for p in pending.iterdir())
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "reject", "--gate-only",
     ])
-    _cap_a = capsys.readouterr()
-    out_a = json.loads(_cap_a.out or _cap_a.err or "{}")
-    rc_b = cli.main([
-        "--project", str(REPO_ROOT), "resume", wf,
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert out.get("ok") is False
+    assert out.get("error") == "operator_identity_required"
+
+    post_values = sup.get_state(config).values
+    assert post_values.get("pending_hitl") == pre_values.get("pending_hitl"), (
+        "an identity-refused gate-only reject must not clear pending_hitl"
+    )
+    assert post_values.get("hitl_history") == pre_values.get("hitl_history"), (
+        "an identity-refused gate-only reject must not record a resolution"
+    )
+    assert post_values.get("phase") != "surfaced", (
+        "an identity-refused gate-only reject must not surface the workflow"
+    )
+    assert sorted(p.name for p in pending.iterdir()) == spool_before
+
+
+def test_gate_only_known_identity_missing_key_refused_as_degraded(
+    tmp_path, monkeypatch, capsys
+):
+    """A known HYDRA_OPERATOR_ID with NO HYDRA_OPERATOR_KEY mints a degraded
+    capability (sig.degraded=True); gate-only must refuse it exactly like an
+    unknown operator, before touching state."""
+    monkeypatch.setenv("HYDRA_OPERATOR_ID", "lebobo88")
+    monkeypatch.delenv("HYDRA_OPERATOR_KEY", raising=False)
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert out.get("ok") is False
+    assert out.get("error") == "operator_identity_required"
+    assert "degraded" in out.get("message", "").lower()
+
+    post_values = sup.get_state(config).values
+    assert post_values.get("pending_hitl") == pre_values.get("pending_hitl")
+
+
+def test_gate_only_mint_exception_refused(tmp_path, monkeypatch, capsys):
+    """`mint_for_approval` raising outright must refuse gate-only rather than
+    proceeding without a capability token (the legacy non-gate_only warn-
+    and-proceed posture is deliberately NOT applied on this route)."""
+    _set_known_operator(monkeypatch)
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+
+    def _boom(**_k):
+        raise RuntimeError("mint exploded")
+
+    monkeypatch.setattr("hydra_core.auth.capability.mint_for_approval", _boom)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert out.get("ok") is False
+    assert out.get("error") == "operator_identity_required"
+    assert "mint failed" in out.get("message", "")
+
+    post_values = sup.get_state(config).values
+    assert post_values.get("pending_hitl") == pre_values.get("pending_hitl")
+
+
+def test_gate_only_verify_failure_refused(tmp_path, monkeypatch, capsys):
+    """A minted capability that fails `verify_operator_capability` (tampered/
+    invalid, not merely degraded) must refuse gate-only rather than warn-
+    and-proceed."""
+    _set_known_operator(monkeypatch)
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+
+    def _fake_verify(*_a, **_k):
+        return {"valid": False, "reason": "signature_mismatch"}
+
+    monkeypatch.setattr(
+        "hydra_core.auth.capability.verify_operator_capability", _fake_verify)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert "capability_verify_failed" in out.get("error", "")
+
+    post_values = sup.get_state(config).values
+    assert post_values.get("pending_hitl") == pre_values.get("pending_hitl")
+
+
+def test_gate_only_no_pending_gate_prunes_stale_spool_after_interleaved_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """Cross-vendor finding 3 (HIGH): the checkpoint patch (pending_hitl=None,
+    hitl_history append) is written BEFORE the spool prune. Simulate a child
+    killed exactly between those two writes -- the checkpoint already
+    reflects the resolved gate, but its spooled hitl.request survives.
+
+    A retry lands on the BARE-INTERRUPT gate_only early return, not the
+    deeper `no_pending_gate` branch: under gate_only `sup.invoke` is never
+    called, so `snap.next` never advances past the original interrupt --
+    `pending_hitl` is already cleared, but the graph is still "paused"
+    there, which is exactly what a bare interrupt looks like. That branch
+    must reconcile the spool itself, or `retry_after_partial_gate_only_is_
+    safe` (mcp_servers/hydra_control/server.py) is a lie."""
+    _set_known_operator(monkeypatch)
+    project = _hermetic_project(tmp_path, monkeypatch)
+    pending = tmp_path / "pending"
+    monkeypatch.setenv("HYDRA_EIGHTS_SPOOL", str(pending))
+    monkeypatch.setenv("HYDRA_EIGHTS_DEAD_LETTER", str(tmp_path / "dead"))
+    pending.mkdir(parents=True, exist_ok=True)
+
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+    pending_hitl = pre_values.get("pending_hitl")
+    assert pending_hitl, "precondition: must pause at a real gate"
+    gate_node = pending_hitl.get("gate_node")
+    assert gate_node
+
+    # Spool a stale hitl.request for the SAME gate, exactly as EightsAttestor
+    # would have when the gate was first filed.
+    stale = pending / "stale-hitl.json"
+    stale.write_text(json.dumps({
+        "id": "stale-hitl", "tool": "eights.governance.hitl.request",
+        "workflow_id": wf, "attempts": 0,
+        "args": {"run_id": wf, "payload": {"gate_node": gate_node}},
+    }), encoding="utf-8")
+
+    # Simulate the crash: apply exactly the checkpoint patch
+    # `_cmd_resume_locked` would apply for an approve, WITHOUT its spool
+    # prune -- a kill between the two writes.
+    from datetime import datetime, timezone
+    resolution = {
+        **pending_hitl, "resolution": "approve", "option": None,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sup.update_state(config, {"pending_hitl": None, "hitl_history": [resolution]})
+    assert stale.exists(), "precondition: the stale spool entry must still be present"
+
+    # Retry: the same resume call again, now hitting the bare-interrupt
+    # gate_only early return (see docstring).
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"retry must be a safe no-op, got rc={rc} out={out}"
+    assert out.get("pending_hitl") is None
+    assert out.get("pruned_spooled_hitl_requests", 0) >= 1, (
+        f"the retry must reconcile the stale spooled hitl.request: {out}"
+    )
+    assert not stale.exists(), (
+        "a retry after an interleaved patch-then-prune failure must remove "
+        "the stale spooled hitl.request for the already-resolved gate"
+    )
+
+
+def test_gate_only_recover_stalled_stage_refused_before_option_check(
+    tmp_path, monkeypatch, capsys
+):
+    """Cross-vendor finding 1 (CRITICAL): recover-stalled-stage is a LIVE
+    operation (a real MCPStdioDispatcher can replay a pp verdict, run
+    smoke/finalize, and merge code) -- the OPPOSITE of what gate-only
+    promises (operator decision A). The attended (--gate-only) route must
+    refuse it outright, even before validating --option / looking for a
+    cursor file, so it is refused identically whether or not a matching
+    cursor exists. The non-gate-only (would-be --live) CLI path is
+    unaffected and still reaches the real cursor-not-found check."""
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+
+    rc_gate_only = cli.main([
+        "--project", str(project), "resume", wf,
         "--action", "recover-stalled-stage", "--option", "does-not-exist",
         "--gate-only",
     ])
-    _cap_b = capsys.readouterr()
-    out_b = json.loads(_cap_b.out or _cap_b.err or "{}")
-    assert rc_a == rc_b == 1
-    assert out_a.get("error") == out_b.get("error") == "cursor_not_found"
+    _cap_go = capsys.readouterr()
+    out_go = json.loads(_cap_go.err or _cap_go.out or "{}")
+    assert rc_gate_only == 1
+    assert out_go.get("ok") is False
+    assert out_go.get("error") == "recovery_is_live_operation"
+    assert "detached" in out_go.get("message", "").lower()
+
+    rc_legacy = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "recover-stalled-stage", "--option", "does-not-exist",
+    ])
+    _cap_legacy = capsys.readouterr()
+    out_legacy = json.loads(_cap_legacy.out or _cap_legacy.err or "{}")
+    assert rc_legacy == 1
+    assert out_legacy.get("error") == "cursor_not_found", (
+        "the non-gate-only CLI path must be unaffected by the gate-only "
+        f"refusal: {out_legacy}"
+    )
+
+
+def test_gate_only_recover_stalled_stage_refused_no_live_dispatcher(
+    tmp_path, monkeypatch, capsys
+):
+    """Cross-vendor finding 1 / 6: with a VALID stalled recovery cursor on
+    disk (so the refusal cannot be mistaken for the unrelated
+    cursor_not_found early-return), the attended gate-only route must refuse
+    BEFORE ever constructing a live `MCPStdioDispatcher` -- the whole point
+    of the refusal is that this dispatcher must never be built on this
+    route."""
+    from hydra_core import host_bridge
+
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    run_id = "stalled-run-1"
+    cfile = host_bridge.cursor_path(project, wf, run_id)
+    host_bridge.save_cursor(cfile, {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "run_id": run_id,
+        "workflow_id": wf,
+        "task_id": "t-1",
+        "stage_id": "generate-0",
+        "status": "running",
+    })
+
+    class _ShouldNotBeConstructed:
+        def __init__(self, *a, **k):
+            raise AssertionError(
+                "MCPStdioDispatcher must NOT be constructed on the attended "
+                "gate-only resume route for recover-stalled-stage"
+            )
+
+    monkeypatch.setattr("hydra_core.dispatcher.MCPStdioDispatcher",
+                        _ShouldNotBeConstructed)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "recover-stalled-stage", "--option", run_id,
+        "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    assert rc == 1, f"expected refusal exit code, got rc={rc} out={out}"
+    assert out.get("ok") is False
+    assert out.get("error") == "recovery_is_live_operation"
+    assert cfile.exists(), "the refusal must not touch the cursor file"
+
+
+def test_run_resume_attended_refuses_recover_stalled_stage_before_subprocess(
+    monkeypatch,
+):
+    """Cross-vendor finding 1: the MCP server (`_run_resume_attended`) must
+    refuse recover-stalled-stage BEFORE ever calling `_run_cli_json` -- i.e.
+    before any subprocess is spawned -- rather than relying solely on the
+    CLI's own `--gate-only` refusal (defence in depth, server side)."""
+    from mcp_servers.hydra_control import server as _srv
+
+    def _boom(*a, **k):
+        raise AssertionError(
+            "_run_cli_json must NOT be called for recover-stalled-stage on "
+            "the attended resume route"
+        )
+
+    monkeypatch.setattr(_srv, "_run_cli_json", _boom)
+
+    out = _srv._run_resume_attended("wf-recover-1", "recover-stalled-stage", "run-1")
+    assert out.get("ok") is False
+    assert out.get("error") == "recovery_is_live_operation"
 
 
 # ===========================================================================

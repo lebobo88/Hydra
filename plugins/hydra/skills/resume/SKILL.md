@@ -59,12 +59,30 @@ detached.
   result JSON says so explicitly (`graph_reentered: false`, a `note` naming
   `hydra.workflow.step`); the host's existing step/submit loop continues the
   workflow from its own cursor afterward, exactly as if it had never
-  paused. If the operator identity is unknown (no `HYDRA_OPERATOR_ID`) or
-  the minted capability is degraded (no `HYDRA_OPERATOR_KEY`), the resume
+  paused. This JSON body is ADDITIVE relative to the pre-gate-only shape —
+  `gate_only` and (when applicable) `eights_resolution` are new fields, not
+  a byte-for-byte-identical document.
+
+  The operator-identity check covers EVERY action that can mutate
+  checkpoint state or the spool, including `--reject` (not only
+  `approve`/`force-dispatch`/`modify-budget`/`change-squads`/`modify-plan`).
+  If the operator identity is unknown (no `HYDRA_OPERATOR_ID`) or the
+  minted capability is degraded (no `HYDRA_OPERATOR_KEY`), the resume
   REFUSES with `{ok: false, error: "operator_identity_required"}` before
   touching any state — it does not silently proceed with a degraded token.
   TheEights resolution is honestly reported as `eights_resolution:
   "deferred"`: `_NullDispatcher` cannot reach the shared ledger, so the
   matching row is left for the next live sweep
   (`hydra eights-hitl-reconcile` / `hydra reap --apply`) rather than being
-  silently skipped or falsely claimed resolved.
+  silently skipped or falsely claimed resolved. A retry after an
+  interrupted gate-only resume (killed between its checkpoint patch and its
+  spool prune) reconciles the stale spooled HITL request for the
+  already-resolved gate rather than leaving it orphaned.
+
+  `recover-stalled-stage` is the ONE resume action this route REFUSES
+  outright, before any subprocess runs (`{ok: false, error:
+  "recovery_is_live_operation"}`): it is a LIVE operation — a real
+  `MCPStdioDispatcher` that can replay a pp verdict, run
+  smoke/finalization, and merge code — not a gate resolution. Only the
+  DETACHED route (`hydra resume --live --action recover-stalled-stage`,
+  requires `HYDRA_ALLOW_DETACHED=1`) may run it.

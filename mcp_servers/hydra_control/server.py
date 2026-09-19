@@ -30,11 +30,22 @@ launching ANY detached subprocess from an interactive session is refused by
 RESOLVE-GATE-ONLY (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7 path K follow-up)
 resolves the gate synchronously and in-band (`_run_cli_json`, never `--live`)
 via `hydra resume --gate-only`, which mints+verifies the operator capability
-(refusing before touching state if the identity is unknown or the token is
-degraded), applies the per-action state patch, prunes the spool, and returns
-WITHOUT calling `sup.invoke` — no node_dispatch, no squad of any kind runs.
-The attended host's own step/submit loop continues the workflow from its
-cursor; the result JSON says explicitly `graph_reentered: false`.
+for EVERY action that can mutate checkpoint state or the spool (refusing
+before touching anything if the identity is unknown or the token is
+degraded — cross-vendor finding 2: this now covers `reject`, which was
+historically exempt), applies the per-action state patch, prunes the spool,
+and returns WITHOUT calling `sup.invoke` — no node_dispatch, no squad of any
+kind runs. The attended host's own step/submit loop continues the workflow
+from its cursor; the result JSON says explicitly `graph_reentered: false`
+(an ADDITIVE field, not part of a byte-for-byte-identical body — see
+cross-vendor finding 5).
+
+Exception: `recover-stalled-stage` is NOT a gate resolution at all -- it is
+a LIVE operation (a real `MCPStdioDispatcher` that can replay a pp verdict,
+run smoke/finalization, and merge code). It is refused outright on this
+attended route, before `_run_cli_json` is ever called (cross-vendor finding
+1); only the DETACHED route (`hydra resume --live --action
+recover-stalled-stage`, requires `HYDRA_ALLOW_DETACHED=1`) may run it.
 
 This server is intentionally SEPARATE from hydra_memory: hydra_memory is a
 read-only surface that AgentMesh's read/stitch federation clients may call;
@@ -372,7 +383,16 @@ def _normalize_and_validate_envelopes(
     return normalized, rejected
 
 
-_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "300"))
+# Cross-vendor finding 4: the attended gate-only route never dispatches --
+# it mints/verifies an operator capability, patches the checkpoint, and
+# prunes the spool, all in-process on `_NullDispatcher` with no subprocess or
+# network call of its own. That is a sub-second operation in the normal
+# case; 30s leaves generous headroom for Python/module cold-start on a busy
+# Windows host without blocking the MCP client for anywhere near the 300s a
+# LIVE resume (squad dispatch, judging) would need. This constant is used
+# ONLY by the gate-only transport below -- every other `_run_cli_json` call
+# in this module keeps its own, larger timeout (plan/step/submit/finalize).
+_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "30"))
 
 
 def _run_resume_attended(workflow_id: str, action: str, option: str | None,
@@ -389,8 +409,11 @@ def _run_resume_attended(workflow_id: str, action: str, option: str | None,
     <action> --gate-only [--option ...] [--critique-ref ...]` WITHOUT `--live`,
     short-lived and in-process on `_NullDispatcher`.
 
-    RESOLVE-GATE-ONLY (operator decision A, cross-vendor finding 1): this
-    ALWAYS passes `--gate-only`. The CLI's gate_only mode resolves the gate
+    RESOLVE-GATE-ONLY (operator decision A): EXCEPT for `recover-stalled-
+    stage`, which is refused outright below before any subprocess runs
+    (cross-vendor finding 1: it is a live operation, not a gate resolution --
+    see the refusal block immediately after this docstring), this ALWAYS
+    passes `--gate-only`. The CLI's gate_only mode resolves the gate
     (lock, operator-capability mint+verify — REFUSING before any state change
     if the operator identity is unknown or the minted capability is degraded,
     decision B — spool prune, per-action state patch clearing pending_hitl and
@@ -409,6 +432,32 @@ def _run_resume_attended(workflow_id: str, action: str, option: str | None,
     paused — the CLI result JSON says so explicitly
     (`graph_reentered: false`, a `note` naming `hydra.workflow.step`).
     """
+    # Cross-vendor finding 1 (CRITICAL): recover-stalled-stage is a LIVE
+    # operation (`_attended_live_dispatcher` -> `MCPStdioDispatcher` ->
+    # `host_bridge.recover_stalled_stage`, which can replay a pp verdict,
+    # run smoke/finalization, and merge code) -- exactly what the attended
+    # gate-only route (operator decision A) promises never to run. Refuse it
+    # HERE, before any subprocess is ever spawned, rather than relying solely
+    # on the CLI's own `--gate-only` refusal (hydra_core.cli
+    # `_cmd_resume_locked`, defence in depth). The DETACHED route (`hydra
+    # resume --live --action recover-stalled-stage`, requires
+    # HYDRA_ALLOW_DETACHED=1) is the only route that may run this recovery.
+    if action == "recover-stalled-stage":
+        return {
+            "ok": False,
+            "error": "recovery_is_live_operation",
+            "workflow_id": workflow_id,
+            "action": action,
+            "message": (
+                "recover-stalled-stage can replay a pp verdict and run live "
+                "squad/engineering work (smoke, finalize, merge); it is "
+                "refused on the attended resume route. Set "
+                "HYDRA_ALLOW_DETACHED=1 to use the detached `hydra resume "
+                "--live --action recover-stalled-stage` route instead. "
+                "Nothing was changed."
+            ),
+        }
+
     cli_args = ["resume", workflow_id, "--action", action, "--gate-only"]
     if option:
         cli_args.extend(["--option", option])
@@ -741,7 +790,15 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
             # even mid-patch) is therefore safe: it either re-runs the small
             # gate-only sequence from scratch, or — if the patch had already
             # landed — observes pending_hitl already cleared and reports
-            # `no_pending_gate` rather than re-mutating anything.
+            # `no_pending_gate` rather than re-mutating anything. Cross-
+            # vendor finding 3: this claim depends on the `no_pending_gate`
+            # path also reconciling the spool, since the checkpoint patch is
+            # written before the spool prune (a kill in between would
+            # otherwise strand a spooled HITL request for an already-
+            # resolved gate forever). `_cmd_resume_locked`'s no-pending
+            # branch now idempotently prunes the last resolved gate's
+            # spooled entry on every gate-only call, so this is true, not
+            # just true for the checkpoint half of the operation.
             _tout["retry_after_partial_gate_only_is_safe"] = True
         return _tout
     if proc.returncode != 0:
@@ -1548,9 +1605,21 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "cursor. Refuses with {ok: false, error: "
             "\"operator_identity_required\"} before touching any state if "
             "the operator identity is unknown or the minted capability is "
-            "degraded. Idempotent at the CLI layer — no pending gate means "
-            "no-op. WRITE tool: only reachable via meshd's sanctioned write "
-            "path."),
+            "degraded -- this check covers EVERY action that can mutate "
+            "checkpoint state or the spool, including 'reject' (not just "
+            "'approve'/'force-dispatch'/'modify-budget'/'change-squads'/"
+            "'modify-plan'). action='recover-stalled-stage' is the ONE "
+            "exception: it is a LIVE operation (can replay a pp verdict, "
+            "run smoke/finalize, and merge code), so it is refused outright "
+            "on this attended route ({ok: false, error: "
+            "\"recovery_is_live_operation\"}) before any subprocess runs; "
+            "only the detached `hydra resume --live --action "
+            "recover-stalled-stage` route (HYDRA_ALLOW_DETACHED=1) may run "
+            "it. Idempotent at the CLI layer — no pending gate means "
+            "no-op, and a retry after an interrupted gate-only resume "
+            "reconciles any stale spooled HITL request for the "
+            "already-resolved gate. WRITE tool: only reachable via meshd's "
+            "sanctioned write path."),
         "inputSchema": {
             "type": "object",
             "properties": {
