@@ -13,8 +13,18 @@ git-diffable, on-disk representations:
   a future AgentSmith ``checkPlan`` validator would read, since the HTML has
   no frontmatter to inspect.
 
-Nothing in this module is wired into the engine yet (P2 is additive-only,
-same as P0/P1) -- see the run's task brief.
+Production wiring (cross-vendor judge finding, b1baf30 revise round, item 2):
+``render_plan_html`` IS on the production path -- ``hydra_core.ingest.
+dispatch_ingested_envelopes`` calls it directly for every ingested ``PLAN``
+envelope and writes the result via ``write_repo_artifact``, THEN stores the
+same envelope's ``model_dump(mode="json")`` on ``state.plan_ref``.
+``render_plan_json`` is a STANDALONE helper nothing in the engine calls yet
+-- the live judge path instead reads ``state.plan_ref`` and serializes it
+through ``judge.dispatcher._envelope_to_text`` (which shares this module's
+strict-JSON guarantee via ``hydra_core.strict_json.dumps_strict``, not
+``render_plan_json`` itself). Both writers protect against a non-finite
+value independently; see each function's own docstring for its specific
+backstop.
 
 **Diffability is the whole point.** Both renderers are deterministic
 (rendering the same `Plan` twice is byte-identical): no timestamps, no
@@ -25,12 +35,12 @@ from __future__ import annotations
 
 import hashlib
 import html
-import json
 import re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Sequence
 
 from .schemas import Plan, PlanStep
+from .strict_json import dumps_strict
 
 __all__ = [
     "PlanFigure",
@@ -212,6 +222,26 @@ def _esc(text: str | None) -> str:
     return html.escape(text or "", quote=True)
 
 
+def _format_budget(value: float | None) -> str:
+    """Format a USD amount for the HTML report, or refuse a non-finite one.
+
+    Cross-vendor judge finding (item 5): ``Constraints.budget_usd`` and
+    ``PlanStep.estimated_budget_usd`` reject NaN/Infinity/-Infinity at
+    construction, so a normally-validated ``Plan`` can never carry one here.
+    A ``Plan`` reaching this renderer via ``model_construct``/``model_copy``
+    (both skip validation) could, though — and ``f"${value:.2f}"`` happily
+    formats a NaN/Infinity float as the literal string ``$nan``/``$inf``
+    rather than erroring. Refuse instead of silently rendering that.
+    """
+    if value is None:
+        return "—"
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(
+            f"refusing to render a non-finite budget value in the plan HTML: {value!r}"
+        )
+    return f"${value:.2f}"
+
+
 def _list_block(items: Sequence[str], empty_text: str) -> str:
     if not items:
         return f"<p class=\"plan-meta\">{_esc(empty_text)}</p>"
@@ -236,11 +266,7 @@ def _step_table(steps: Sequence[PlanStep]) -> str:
     ]
     for step in steps:
         depends = ", ".join(step.depends_on) if step.depends_on else "—"
-        budget = (
-            f"${step.estimated_budget_usd:.2f}"
-            if step.estimated_budget_usd is not None
-            else "—"
-        )
+        budget = _format_budget(step.estimated_budget_usd)
         rows.append(
             "<tr>"
             f"<td>{_esc(step.step_id)}</td>"
@@ -401,9 +427,10 @@ def render_plan_html(
     parts.append(_mermaid_graph(plan.steps))
 
     parts.append("<h2>Budget Estimate</h2>")
-    cap_text = f"${plan_budget_cap:.2f}" if plan_budget_cap is not None else "not set"
+    total_budget_text = _format_budget(total_budget)
+    cap_text = _format_budget(plan_budget_cap) if plan_budget_cap is not None else "not set"
     parts.append(
-        f"<p>Sum of per-step estimates: ${total_budget:.2f} &middot; "
+        f"<p>Sum of per-step estimates: {_esc(total_budget_text)} &middot; "
         f"Plan-level cap: {_esc(cap_text)}</p>"
     )
 
@@ -496,31 +523,6 @@ def append_governance_note(html_text: str, note: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _find_non_finite_field(obj: Any, path: str = "$") -> str | None:
-    """Depth-first search for the first non-finite float in ``obj``.
-
-    Returns a dotted/bracketed path string (e.g. ``"$.steps[2].estimated_
-    budget_usd"``) naming the offending field, or ``None`` if every float in
-    ``obj`` is finite. Used only to build a clear error message after
-    ``json.dumps(..., allow_nan=False)`` has already raised ``ValueError`` --
-    the backstop needs to say WHICH field broke strict JSON, not just that
-    something did.
-    """
-    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
-        return path
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            found = _find_non_finite_field(value, f"{path}.{key}")
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for i, value in enumerate(obj):
-            found = _find_non_finite_field(value, f"{path}[{i}]")
-            if found is not None:
-                return found
-    return None
-
-
 def render_plan_json(plan: Plan) -> str:
     """Render ``plan`` as a deterministic, machine-readable JSON companion.
 
@@ -531,19 +533,17 @@ def render_plan_json(plan: Plan) -> str:
     ``Constraints.budget_usd`` and ``PlanStep.estimated_budget_usd`` already
     reject NaN/Infinity/-Infinity at construction (see `hydra_core.schemas`),
     so a normally-constructed `Plan` can never reach this function holding a
-    non-finite value. ``allow_nan=False`` is a BACKSTOP for a `Plan` built via
-    `model_construct` (which skips validation) or any other path that bypasses
-    the schema: rather than silently emitting the bare word `NaN`/`Infinity`
-    (valid Python-`json` output, invalid RFC 8259 JSON that AgentSmith's
-    `checkPlan` refuses), this raises `ValueError` naming the offending field
-    and never writes anything.
+    non-finite value. ``dumps_strict`` (``hydra_core.strict_json`` — the one
+    shared seam every envelope/plan-to-JSON-text site routes through, see
+    that module's docstring) is a BACKSTOP for a `Plan` built via
+    `model_construct`/`model_copy` (both skip validation) or any other path
+    that bypasses the schema: rather than silently emitting the bare word
+    `NaN`/`Infinity` (valid Python-`json` output, invalid RFC 8259 JSON that
+    AgentSmith's `checkPlan` refuses), this raises `ValueError` naming the
+    offending field and never writes anything.
     """
     payload = plan.model_dump(mode="json")
-    try:
-        return json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    except ValueError as exc:
-        field = _find_non_finite_field(payload)
-        raise ValueError(
-            f"Plan {plan.id} contains a non-finite value at {field or '<unknown field>'}; "
-            "refusing to write invalid JSON"
-        ) from exc
+    return dumps_strict(
+        payload, label=f"Plan {plan.id}",
+        sort_keys=True, indent=2, ensure_ascii=False,
+    ) + "\n"

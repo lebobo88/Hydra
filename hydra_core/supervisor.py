@@ -3213,8 +3213,47 @@ def build_supervisor(
                     env, direction="synthesis_merge", squad_id=origin,
                 )
                 squad_to_envs.setdefault(origin, []).append(redacted)
-            except (ValueError, Exception):
-                squad_to_envs.setdefault(origin, []).append(env)
+            except ValueError as exc:
+                # Cross-vendor judge finding (b1baf30 revise round, item 3):
+                # this branch used to append the RAW envelope on ANY
+                # exception (`except (ValueError, Exception)` — the same
+                # class twice, since ValueError already IS an Exception —
+                # which is exactly why it silently swallowed everything,
+                # schema failures and unrelated bugs alike, and leaked the
+                # unredacted envelope through the boundary either way). A
+                # legacy envelope that fails the newer, stricter schema (e.g.
+                # a PLAN with a non-finite budget now rejected at
+                # `Constraints`/`PlanStep` construction, see schemas.py) must
+                # still be redacted so synthesis keeps working for it — it
+                # must NEVER cross the boundary unredacted. Narrowed to
+                # `ValueError` (what `validate_envelope` raises, including
+                # pydantic's `ValidationError`) so a genuinely unrelated bug
+                # in `_validate_and_redact_envelope` propagates instead of
+                # being silently swallowed here.
+                try:
+                    redacted = dict(env)
+                    for text_field in ("objective", "summary", "instructions",
+                                       "decision", "rationale",
+                                       "risk_assessment", "rollout_plan"):
+                        if text_field in redacted and isinstance(redacted[text_field], str):
+                            redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
+                    emit_trace(judge_trace_root, "boundary",
+                               "envelope_validation_failed_redacted_fallback", {
+                                   "envelope_id": env.get("id"),
+                                   "envelope_type": env.get("type"),
+                                   "squad_id": origin,
+                                   "error": str(exc),
+                               })
+                    squad_to_envs.setdefault(origin, []).append(redacted)
+                except Exception as redact_exc:  # noqa: BLE001 — last-resort: drop, never leak raw
+                    emit_trace(judge_trace_root, "boundary",
+                               "envelope_dropped_unredactable", {
+                                   "envelope_id": env.get("id"),
+                                   "envelope_type": env.get("type"),
+                                   "squad_id": origin,
+                                   "validation_error": str(exc),
+                                   "redaction_error": str(redact_exc),
+                               })
 
         # ------------------------------------------------------------------ #
         # WS8 SLICE 2: detect whether this was a fleet run.

@@ -256,18 +256,40 @@ def normalize_pack_envelope(env: dict) -> dict:
 
     budget = out.pop("budget_usd", None)
     if budget is not None:
-        constraints = dict(out.get("constraints") or {})
-        folded = False
-        if constraints.get("budget_usd") is None:
-            try:
-                constraints["budget_usd"] = float(budget)
+        # Cross-vendor judge finding (b1baf30 revise round, item 6): `float()`
+        # happily converts "nan"/"inf"/"-inf" strings, so a non-finite pack
+        # budget used to be silently folded into constraints.budget_usd (only
+        # to be rejected much later, at `Constraints` construction, with a
+        # generic pydantic message that never names this pack field) -- or,
+        # when a finite constraints budget already existed, silently copied
+        # verbatim into `instructions` with NO validation at all. Surface an
+        # explicit, field-naming error for either shape instead of doing
+        # either of those.
+        try:
+            budget_value = float(budget)
+        except (TypeError, ValueError) as exc:
+            out["_budget_conversion_error"] = (
+                f"pack envelope budget_usd={budget!r} could not be converted "
+                f"to a float: {exc}"
+            )
+            budget_value = None
+        if budget_value is not None and (
+            budget_value != budget_value
+            or budget_value in (float("inf"), float("-inf"))
+        ):
+            out["_budget_conversion_error"] = (
+                f"pack envelope budget_usd={budget!r} is non-finite "
+                "(NaN/Infinity); refusing to fold into constraints.budget_usd"
+            )
+            budget_value = None
+        if budget_value is not None:
+            constraints = dict(out.get("constraints") or {})
+            if constraints.get("budget_usd") is None:
+                constraints["budget_usd"] = budget_value
                 out["constraints"] = constraints
                 defaulted.append("constraints.budget_usd<-budget_usd")
-                folded = True
-            except (TypeError, ValueError):
-                folded = False
-        if not folded:
-            tail_lines.append(f"budget_usd: {budget}")
+            else:
+                tail_lines.append(f"budget_usd: {budget_value}")
     if title:
         out.pop("title", None)
         tail_lines.insert(0, f"Title: {title}")
@@ -304,10 +326,22 @@ def normalize_for_ingest(env: dict,
     Idempotent: normalizing an already-normalized envelope defaults nothing and
     emits nothing, which is what lets the CLI normalize once for dedup and still
     pass the dict through ``dispatch_ingested_envelopes``.
+
+    Raises ``ValueError`` if ``normalize_pack_envelope`` could not convert a
+    pack-supplied ``budget_usd`` to a finite float (item 6, b1baf30 revise
+    round): ``normalize_pack_envelope`` itself never raises (its own
+    docstring's contract), so this is the seam that turns its
+    ``_budget_conversion_error`` marker into an explicit, actionable failure
+    instead of letting the bad value flow on to `validate_envelope`'s generic
+    (and, for the "already had a budget" shape, previously nonexistent)
+    error.
     """
     if not isinstance(env, dict):
         return env
     out = normalize_pack_envelope(env)
+    budget_error = out.pop("_budget_conversion_error", None)
+    if budget_error:
+        raise ValueError(budget_error)
     fields_defaulted = out.pop("_normalized_fields", None)
     if fields_defaulted and emit_fn is not None:
         try:
@@ -459,12 +493,35 @@ def dispatch_ingested_envelopes(
         # goes through normalize_pack_envelope, which supplies the required
         # fields the prose contract never documented (owner/branch) and folds
         # pack-only keys into real schema fields.
-        normalized = normalize_for_ingest(raw, _emit) if isinstance(raw, dict) else raw
+        normalized: dict | HydraEnvelope = raw
         try:
-            env = (normalized if isinstance(normalized, HydraEnvelope)
-                   else validate_envelope(dict(normalized)))
+            if isinstance(raw, dict):
+                normalized = normalize_for_ingest(raw, _emit)
+            if isinstance(normalized, HydraEnvelope):
+                # Cross-vendor judge finding (b1baf30 revise round, item 1a):
+                # a caller-supplied TYPED envelope can reach this function via
+                # `Plan.model_copy(update=...)` or `model_construct`, both of
+                # which skip field validators (e.g. `allow_inf_nan=False` on
+                # a budget). Round-trip through `model_validate` so the SAME
+                # constructor-only bypass that would otherwise reach the
+                # PLAN-write / judge-serialize code below is caught HERE,
+                # with pydantic's own field-naming error, instead of at
+                # whichever downstream strict-JSON writer happens to notice.
+                env = type(normalized).model_validate(
+                    normalized.model_dump(mode="json")
+                )
+            else:
+                env = validate_envelope(dict(normalized))
         except Exception as exc:  # noqa: BLE001 — bad envelope is an item failure, not a crash
-            bad = normalized if isinstance(normalized, dict) else {}
+            if isinstance(normalized, dict):
+                bad = normalized
+            elif isinstance(normalized, HydraEnvelope):
+                try:
+                    bad = normalized.model_dump(mode="json")
+                except Exception:  # noqa: BLE001 — best-effort id/type for the report
+                    bad = {}
+            else:
+                bad = {}
             errors = validation_error_details(exc)
             outcome.items.append(IngestItemResult(
                 envelope_id=str(bad.get("id", "?")),

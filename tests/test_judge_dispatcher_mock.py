@@ -146,3 +146,43 @@ def test_unknown_rubric_raises():
             workflow_id=wf,
             client=NoOpCritiqueClient(),
         )
+
+
+def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
+    """Cross-vendor judge finding (b1baf30 revise round, item 1/2): the live
+    PLAN-judging path hands a `model_dump(mode="json")` dict (e.g.
+    `state.plan_ref`) straight to `dispatch_judge`, not a validated `Plan`
+    instance -- so a legacy plan that predates the non-finite-budget schema
+    guard can still carry a NaN/Infinity value here. `_envelope_to_text` must
+    refuse before ever calling the critique client, naming the offending
+    field, not silently emit the bare `NaN` token into the judge prompt.
+    """
+    wf = uuid4()
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    client = _ScriptedClient({
+        "outcome": "pass", "critique_md": "x" * 100, "score_json": {"a": 1},
+    })
+    with pytest.raises(ValueError, match="constraints.budget_usd"):
+        dispatch_judge(
+            envelope=hostile,
+            rubric_id="constitution-alignment@1",
+            judge_vendor="agy",
+            workflow_id=wf,
+            client=client,
+        )
+    # Never reached the client -- the refusal happens before dispatch.
+    assert client.calls == []
+
+
+def test_dispatch_judge_allow_nan_true_would_have_leaked_nan_into_prompt():
+    """Mutation proof (revert immediately): show plain `json.dumps` (the
+    pre-fix behaviour, before `_envelope_to_text` routed through
+    `strict_json.dumps_strict`) would have silently written the literal
+    `NaN` token into the judge-facing artifact text instead of refusing.
+    """
+    import json as _json
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    text = _json.dumps(hostile, indent=2, default=str, sort_keys=True)
+    assert "NaN" in text

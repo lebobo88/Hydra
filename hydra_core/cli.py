@@ -2782,7 +2782,23 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         # E2-34: normalize first so a missing or non-UUID pack id becomes a real
         # UUID before it is used as the ledger key — otherwise such an envelope
         # bypasses `processed` and can dispatch twice.
-        env_dict = normalize_for_ingest(env_dict, _emit_ingest)
+        try:
+            env_dict = normalize_for_ingest(env_dict, _emit_ingest)
+        except ValueError as exc:
+            # b1baf30 revise round item 6: normalize_for_ingest raises when a
+            # pack-supplied budget_usd could not be converted to a finite
+            # float. Report it as a real failed item instead of crashing the
+            # whole submit batch.
+            bad_id = str(env_dict.get("id", "?"))
+            errors = [{"field": "budget_usd", "msg": str(exc)}]
+            agg_items.append(IngestItemResult(
+                envelope_id=bad_id, envelope_type=env_dict.get("type"), target=None,
+                status="failed", detail=f"invalid envelope: {exc}", errors=errors,
+            ))
+            _emit_ingest("ingest.invalid_envelope", {
+                "envelope_id": bad_id, "type": env_dict.get("type"), "errors": errors,
+            })
+            continue
         eid = env_dict.get("id")
         eid = str(eid) if eid is not None else None
         if eid and eid in processed:
@@ -4244,10 +4260,26 @@ def _cmd_attended_submit(args) -> int:
                             # omit `id` or use a non-UUID label; keying dedup on
                             # the raw value would let such an envelope bypass
                             # `processed` and dispatch twice.
-                            raw = normalize_for_ingest(
-                                raw,
-                                lambda event, payload: emit(project, wf, event, payload),
-                            )
+                            try:
+                                raw = normalize_for_ingest(
+                                    raw,
+                                    lambda event, payload: emit(project, wf, event, payload),
+                                )
+                            except ValueError as exc:
+                                # b1baf30 revise round item 6: a pack-supplied
+                                # budget_usd that could not be converted to a
+                                # finite float. Real failed item, not a crash.
+                                bad_id = raw.get("id")
+                                bad_errors = [{"field": "budget_usd", "msg": str(exc)}]
+                                bad = {"envelope_id": str(bad_id) if bad_id is not None else "?",
+                                       "status": "failed", "detail": f"invalid envelope: {exc}",
+                                       "errors": bad_errors}
+                                outcomes.append(bad)
+                                rejected.append(bad)
+                                emit(project, wf, "ingest.invalid_envelope",
+                                     {"envelope_id": bad.get("envelope_id"),
+                                      "type": raw.get("type"), "errors": bad_errors})
+                                continue
                             envelope_id = raw.get("id")
                             if envelope_id is not None and str(envelope_id) in processed:
                                 outcomes.append({"envelope_id": str(envelope_id),

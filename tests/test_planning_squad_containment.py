@@ -300,6 +300,108 @@ def test_materialize_attended_results_planning_origin_also_excluded():
 
 
 # --------------------------------------------------------------------------- #
+# 6b. Synthesis: an envelope that FAILS schema validation is still redacted,
+#     never passed through raw (cross-vendor judge finding, b1baf30 revise
+#     round, item 3).
+# --------------------------------------------------------------------------- #
+
+def test_synthesis_redacts_envelope_that_fails_validation_never_raw(monkeypatch):
+    """A legacy envelope that fails `validate_envelope` (here: an ``owner``
+    outside DevTask's literal set -- the same shape as `test_
+    unrepairable_envelope_is_rejected_with_trace_event`) used to fall through
+    a bare ``except (ValueError, Exception)`` and get appended to synthesis
+    RAW, unredacted. It must now still cross the boundary redacted, and the
+    envelope must still be counted (not dropped) -- legacy synthesis must
+    keep working."""
+    import hydra_core.supervisor as supervisor_mod
+
+    trace_calls: list[tuple] = []
+    real_emit_trace = supervisor_mod.emit_trace
+    monkeypatch.setattr(
+        supervisor_mod, "emit_trace",
+        lambda *a, **kw: trace_calls.append((a, kw)) or real_emit_trace(*a, **kw),
+    )
+
+    state = HydraState(root_goal="anything")
+    state.selected_squads = ["engineering"]
+    state.envelopes = [{
+        "id": "e1", "type": "DEV_TASK", "origin_squad": "engineering",
+        "target_squad": "hydra", "workflow_id": str(state.workflow_id),
+        "owner": "not-a-real-owner-literal",  # fails schema enum validation
+        "branch": "b", "repo": "hydra",
+        "instructions": "contact ops@example.com about the fix",
+    }]
+    patch = _synthesis_fn()(state) or {}
+    rationale = json.dumps(patch, default=str)
+
+    # The unredacted PII never crosses the boundary in the rendered output.
+    assert "ops@example.com" not in rationale
+    # The envelope was still counted -- redacted-fallback, not silently
+    # dropped -- so legacy synthesis keeps working.
+    assert "(engineering): 1 envelope(s)" in rationale
+    # The redacted-fallback path actually ran (proves it wasn't just excluded
+    # some other way) and its trace event fired.
+    fallback_events = [
+        a for (a, kw) in trace_calls if len(a) >= 3 and a[2] == "envelope_validation_failed_redacted_fallback"
+    ]
+    assert len(fallback_events) == 1
+    assert fallback_events[0][3]["envelope_id"] == "e1"
+
+
+def test_synthesis_drops_envelope_when_redaction_itself_fails(monkeypatch):
+    """If redacting the raw dict fallback ALSO raises, the envelope must be
+    dropped -- never leaked raw as a last resort."""
+    import hydra_core.supervisor as supervisor_mod
+
+    def _boom(_text):
+        raise RuntimeError("redaction backend down")
+
+    monkeypatch.setattr(supervisor_mod, "redact_for_squad_boundary", _boom)
+
+    state = HydraState(root_goal="anything")
+    state.selected_squads = ["engineering"]
+    state.envelopes = [{
+        "id": "e1", "type": "DEV_TASK", "origin_squad": "engineering",
+        "target_squad": "hydra", "workflow_id": str(state.workflow_id),
+        "owner": "not-a-real-owner-literal",
+        "branch": "b", "repo": "hydra",
+        "instructions": "contact ops@example.com about the fix",
+    }]
+    patch = _synthesis_fn()(state) or {}
+    rationale = json.dumps(patch, default=str)
+    assert "ops@example.com" not in rationale
+    assert "(engineering):" not in rationale
+
+
+def test_synthesis_unrelated_bug_in_boundary_helper_is_not_swallowed(monkeypatch):
+    """Cross-vendor judge finding (item 3, second half): the old
+    ``except (ValueError, Exception)`` caught EVERY exception, including a
+    genuine bug unrelated to schema validation. Narrowing to ``ValueError``
+    must let something else propagate instead of being silently absorbed
+    into the raw-envelope fallback."""
+    import hydra_core.supervisor as supervisor_mod
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("unrelated bug, not a validation failure")
+
+    # `_validate_and_redact_envelope` is a closure local to `build_supervisor`
+    # that calls the module-level `validate_envelope` name -- patch that name
+    # directly so the closure picks it up.
+    monkeypatch.setattr(supervisor_mod, "validate_envelope", _boom)
+
+    state = HydraState(root_goal="anything")
+    state.selected_squads = ["engineering"]
+    state.envelopes = [{
+        "id": "e1", "type": "DEV_TASK", "origin_squad": "engineering",
+        "target_squad": "hydra", "workflow_id": str(state.workflow_id),
+        "owner": "not-a-real-owner-literal",
+        "branch": "b", "repo": "hydra", "instructions": "x",
+    }]
+    with pytest.raises(RuntimeError, match="unrelated bug"):
+        _synthesis_fn()(state)
+
+
+# --------------------------------------------------------------------------- #
 # 7. Native-pack entry resolves; output_root is not the tracked plan dir.
 # --------------------------------------------------------------------------- #
 

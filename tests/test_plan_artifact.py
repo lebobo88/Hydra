@@ -1239,6 +1239,44 @@ def test_mermaid_has_no_library_import():
 
 
 # --------------------------------------------------------------------------- #
+# render_plan_html — refuses a non-finite budget rather than rendering       #
+# `$nan`/`$inf` (cross-vendor judge finding, b1baf30 revise round, item 5)   #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_plan_html_refuses_non_finite_step_budget():
+    plan = _diamond_plan()
+    hostile_step = plan.steps[3].model_copy(update={"estimated_budget_usd": float("nan")})
+    hostile_steps = list(plan.steps[:3]) + [hostile_step]
+    hostile_plan = plan.model_construct(**{**plan.__dict__, "steps": hostile_steps})
+
+    with pytest.raises(ValueError, match="non-finite"):
+        render_plan_html(hostile_plan)
+
+
+def test_render_plan_html_refuses_non_finite_plan_level_cap():
+    from hydra_core.schemas import Constraints
+
+    plan = _diamond_plan()
+    hostile_plan = plan.model_construct(
+        **{**plan.__dict__,
+           "constraints": Constraints.model_construct(budget_usd=float("inf"))}
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        render_plan_html(hostile_plan)
+
+
+def test_render_plan_html_pre_fix_format_would_render_nan_literal():
+    """Mutation proof (revert immediately): show the pre-fix
+    `f"${value:.2f}"` formatting (bypassing `_format_budget`) happily
+    stringifies NaN as the literal `nan`, which is what `_format_budget`
+    now refuses instead of silently emitting."""
+    assert f"${float('nan'):.2f}" == "$nan"
+    assert f"${float('inf'):.2f}" == "$inf"
+
+
+# --------------------------------------------------------------------------- #
 # render_plan_json                                                           #
 # --------------------------------------------------------------------------- #
 

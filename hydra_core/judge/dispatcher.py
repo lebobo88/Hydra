@@ -138,9 +138,22 @@ def _wrap_untrusted(text: str) -> str:
 
 
 def _envelope_to_text(envelope: dict[str, Any]) -> str:
-    """Serialize an envelope dict as compact JSON for the judge to inspect."""
-    import json
-    return json.dumps(envelope, indent=2, default=str, sort_keys=True)
+    """Serialize an envelope dict as strict JSON for the judge to inspect.
+
+    Cross-vendor judge finding (b1baf30 revise round, item 1/2): this is the
+    live path a PLAN reaches the judge through (`state.plan_ref`, a
+    `model_dump(mode="json")` dict, not a `Plan` instance) -- the standalone
+    `plan_artifact.render_plan_json` backstop never runs on it. Routes
+    through the shared `strict_json.dumps_strict` (``allow_nan=False``) so a
+    non-finite value anywhere in the envelope raises a clear, field-naming
+    error here instead of emitting the bare ``NaN``/``Infinity`` token into
+    the judge prompt (valid Python-`json` output, invalid RFC 8259 JSON).
+    """
+    from ..strict_json import dumps_strict
+    return dumps_strict(
+        envelope, label=f"envelope {envelope.get('id', '?')}",
+        indent=2, default=str, sort_keys=True,
+    )
 
 
 def _apply_pragmatic_pass_guard(
