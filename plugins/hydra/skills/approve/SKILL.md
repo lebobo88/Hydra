@@ -13,6 +13,16 @@ human decision. Hydra's resume API is the only authority allowed to validate a
 gate, append HITL history, patch checkpoint state, and continue the graph.
 </authority_boundary>
 
+**Prerequisite:** the attended route reads the operator identity from the
+`hydra_control` MCP server's OWN environment, not from the operator's client
+shell. Both `HYDRA_OPERATOR_ID` and `HYDRA_OPERATOR_KEY` must be set in the
+`hydra_control` entry's `env` block in `~/.hydra/backends.json`, and the
+`hydra_control` server must be RESTARTED after changing them — a variable
+exported in the operator's own shell never reaches the already-running
+server process. Symptom when either is missing: every attended `approve` (and
+every other mutating resume action) returns `{ok: false, error:
+"operator_identity_required"}`.
+
 Operationally:
 
 1. Query `python -m hydra_core.cli status <workflow_id>` and render the pending
@@ -115,10 +125,11 @@ follow-up): `hydra.workflow.resume` picks its transport from
 
   If the outer window is exceeded repeatedly, or you want to confirm state
   directly rather than trusting the transport's own report, inspect the
-  workflow with `hydra.workflow.step` (advances/reports the attended cursor)
-  or `python -m hydra_core.cli status <workflow_id>` / `/hydra:status` —
-  both read the checkpoint directly and do not depend on the resume
-  transport at all.
+  workflow with `hydra status <workflow_id>` / `/hydra:status` — it reads
+  the checkpoint directly and does not depend on the resume transport at
+  all. Do **not** use `hydra.workflow.step` for this: it opens the next
+  attended engineering stage and MUTATES the workflow rather than merely
+  reporting on it.
 
   **Known limitation:** on the inner (8s) TheEights deadline, the resume
   child makes a best-effort, time-bounded attempt to close the live MCP
