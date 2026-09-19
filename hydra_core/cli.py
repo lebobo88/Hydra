@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import threading
 import warnings
 from pathlib import Path
 from typing import Callable
@@ -1072,9 +1073,26 @@ def _build_gate_only_eights_client(project: Path, wf: str):
     return GateOnlyHitlClient(dispatcher, workflow_id=wf)
 
 
+# Cross-vendor finding 1a (HIGH): the bounded inner deadline for the whole
+# gate-only TheEights round trip (connect + list + resolve). This is
+# DELIBERATELY far below the transport's own worst-case connect budget (3
+# attempts x 2 x HYDRA_DISPATCH_CONNECT_TIMEOUT_S=20s = up to 120s, see
+# MCPStdioDispatcher._get_or_connect_pooled_session) and below the tool-call
+# timeout (HYDRA_DISPATCH_TOOL_TIMEOUT_S=120s default) -- the whole point of
+# this wrapper is to never let the transport's own timeouts govern how long
+# a gate-only resume can block. HYDRA_RESUME_TIMEOUT_S (mcp_servers/
+# hydra_control/server.py, default 45s) is the OUTER hard kill on the whole
+# `hydra resume --gate-only` child process; this inner budget must clear
+# with margin: 8s (inner) + ~1s (identity check, checkpoint patch, spool
+# prune, JSON serialize -- no other live I/O on this route) + margin
+# (~36s) < 45s (outer).
+_GATE_ONLY_EIGHTS_TIMEOUT_S = float(
+    os.environ.get("HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", "8"))
+
+
 def _resolve_eights_hitl_gate_only(
     project: Path, workflow_id: str, *, note: str, decision: str,
-    gate_node: str | None = None,
+    gate_node: str | None = None, reconcile: bool = False,
 ) -> dict:
     """Operator decision 2 (RESOLVE-GATE-ONLY follow-up): on the attended
     gate-only resume route, resolve TheEights' matching pending HITL ticket
@@ -1084,10 +1102,23 @@ def _resolve_eights_hitl_gate_only(
     `replay_pending`/`replay_pending_async`/any spool drain, and never
     spools anything on failure (see `_build_gate_only_eights_client`'s
     docstring for why `GateOnlyHitlClient`, not `EightsAttestor`, is used
-    here). Returns ``{"eights_resolution": "resolved"|"unavailable",
-    "reason": <str, when unavailable>, "resolved": <int, when resolved>}``;
-    an unreachable daemon or a failed call reports "unavailable" with a
-    reason and never claims "resolved".
+    here). Returns ``{"eights_resolution": "resolved"|"unavailable"|
+    "none_pending", "reason": <str, when unavailable>, "resolved": <int,
+    when resolved>}``; an unreachable daemon or a failed call reports
+    "unavailable" with a reason and never claims "resolved".
+
+    Callers use this DIRECTLY (never call it in-thread without a deadline):
+    see `_resolve_eights_hitl_gate_only_bounded` below, which is the only
+    call site this module uses on the live resume paths.
+
+    ``reconcile=True`` (cross-vendor finding 1b): this is a RETRY on the
+    no-pending-gate route, not the original resolution. TheEights showing no
+    matching ticket here means the gate was ALREADY resolved (by this
+    function's own earlier, possibly-abandoned attempt, or by a prior
+    successful call) -- that is success, not failure, so it is reported as
+    `"none_pending"` rather than `"unavailable"`. A genuinely unreachable
+    daemon or a failed list/resolve call still reports `"unavailable"`
+    either way.
     """
     try:
         client = _build_gate_only_eights_client(project, workflow_id)
@@ -1107,6 +1138,8 @@ def _resolve_eights_hitl_gate_only(
     if gate_node:
         matched = [r for r in matched if row_gate_node(r) == gate_node]
     if not matched:
+        if reconcile:
+            return {"eights_resolution": "none_pending"}
         return {"eights_resolution": "unavailable", "reason": "no_matching_ticket"}
     resolved = 0
     last_reason = "resolve_failed"
@@ -1125,6 +1158,75 @@ def _resolve_eights_hitl_gate_only(
     if resolved == 0:
         return {"eights_resolution": "unavailable", "reason": last_reason}
     return {"eights_resolution": "resolved", "resolved": resolved}
+
+
+def _resolve_eights_hitl_gate_only_bounded(
+    project: Path, workflow_id: str, *, note: str, decision: str,
+    gate_node: str | None = None, reconcile: bool = False,
+    timeout_s: float | None = None,
+) -> dict:
+    """Cross-vendor finding 1a: wall-clock bound around
+    `_resolve_eights_hitl_gate_only`'s ENTIRE connect+list+resolve round
+    trip, enforced independently of any timeout inside the MCP transport
+    (dispatcher.py's connect/tool-call timeouts bound individual ops, not
+    the retry loop around them -- see `_GATE_ONLY_EIGHTS_TIMEOUT_S` above
+    for the arithmetic against the outer child deadline).
+
+    Runs the resolution on a DAEMON thread and joins with `timeout_s`. If it
+    has not finished by the deadline, returns `"unavailable"` (reason=
+    "deadline") immediately WITHOUT waiting further -- the caller (this
+    gate-only resume) proceeds and returns to the host on schedule. The
+    abandoned thread cannot write any HYDRA state afterward: the gate-only
+    route's only local state mutation (`sup.update_state`, the spool prune)
+    already happened BEFORE this call runs (see the call sites), and this
+    function's own thread touches nothing but TheEights' remote ledger over
+    MCP -- there is no Hydra-local write left for it to race. Being a daemon
+    thread also means the abandoned attempt can never keep the CLI's own
+    process alive past this function's return: when `hydra resume
+    --gate-only` finishes printing its JSON body and exits, Python's
+    interpreter shutdown does not wait for daemon threads, so the process
+    exits (and, on Windows, `subprocess.run`'s own outer timeout in
+    mcp_servers/hydra_control/server.py additionally SIGKILLs/TerminateProcess
+    it if it somehow didn't).
+    """
+    if timeout_s is None:
+        # Read the env var at CALL time (not at module import) so tests --
+        # and operators -- can override it per-invocation via
+        # monkeypatch/env without needing to reload this module.
+        timeout_s = float(os.environ.get(
+            "HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", str(_GATE_ONLY_EIGHTS_TIMEOUT_S)))
+    _box: list[dict] = []
+
+    def _worker() -> None:
+        try:
+            _box.append(_resolve_eights_hitl_gate_only(
+                project, workflow_id, note=note, decision=decision,
+                gate_node=gate_node, reconcile=reconcile,
+            ))
+        except Exception as exc:  # noqa: BLE001 — never raise off-thread
+            _box.append({"eights_resolution": "unavailable",
+                        "reason": f"{type(exc).__name__}: {exc}"})
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if _box:
+        return _box[0]
+    return {"eights_resolution": "unavailable", "reason": "deadline"}
+
+
+def _eights_decision_for_history_entry(entry: dict | None) -> str:
+    """Cross-vendor finding 1b: map a `hitl_history` entry back to the
+    TheEights resolve `decision` it was originally recorded with (`resolved`
+    key is `"resolution"`/`"option"` -- see the `resolution` dict built
+    above). Mirrors `_terminal_resolution`'s reject-or-abort test at the
+    original resolve call site so a retry reconciliation resolves the SAME
+    decision the original attempt would have."""
+    if not isinstance(entry, dict):
+        return "approved"
+    if entry.get("resolution") == "reject" or entry.get("option") == "abort":
+        return "rejected"
+    return "approved"
 
 
 def _eights_resolution_fields(gate_only: bool, result: dict) -> dict:
@@ -1627,6 +1729,37 @@ def _cmd_resume(args) -> int:
     action = args.action
     option = getattr(args, "option", None)
 
+    # Cross-vendor finding 2 (HIGH): recover-stalled-stage is refused
+    # unconditionally on the gate-only route (`_cmd_resume_locked` already
+    # does this below, at ~1732, as defence in depth for direct callers of
+    # that function) -- but that refusal used to run AFTER
+    # `_acquire_resume_lock` had already created `.hydra/<workflow>/` and
+    # written `resume.lock` (its `lock_dir.mkdir(...)` is the very first
+    # side effect on this route). A gate-only route that promises "never
+    # writes" for a refused action must not write a lock file first. Refuse
+    # HERE, before the lock is even attempted, and before the pre-lock
+    # identity precheck below (this action is refused regardless of who is
+    # asking, not based on identity -- same reasoning the precheck-skip
+    # comment below already documents).
+    if (bool(getattr(args, "gate_only", False))
+            and action == "recover-stalled-stage"):
+        print(json.dumps({
+            "ok": False,
+            "error": "recovery_is_live_operation",
+            "workflow_id": wf,
+            "action": action,
+            "message": (
+                "recover-stalled-stage can replay a pp verdict and run "
+                "live squad/engineering work (smoke, finalize, merge); "
+                "it is refused on the attended gate-only resume route. "
+                "Use the detached CLI (`hydra resume --live --action "
+                "recover-stalled-stage --option <run_id>`, requires "
+                "HYDRA_ALLOW_DETACHED=1) to run this recovery. Nothing "
+                "was created or changed."
+            ),
+        }), file=sys.stderr)
+        return 1
+
     # Operator decision 1: on the gate-only route, refuse an unauthenticated
     # caller BEFORE the resume lock exists and BEFORE build_supervisor opens
     # the checkpoint database -- this check needs no workflow state (it runs
@@ -1848,9 +1981,21 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 # stale, or `hitl_history` is empty (no gate ever resolved).
                 _last_hist = values.get("hitl_history") or []
                 _last_gate_node = None
+                _last_hist_entry: dict | None = None
                 if _last_hist and isinstance(_last_hist[-1], dict):
-                    _last_gate_node = _last_hist[-1].get("gate_node")
+                    _last_hist_entry = _last_hist[-1]
+                    _last_gate_node = _last_hist_entry.get("gate_node")
                 _pruned_stale = _prune_spooled_hitl_requests(wf, _last_gate_node)
+                _reconcile_out: dict = {}
+                if _last_gate_node:
+                    _reconcile_result = _resolve_eights_hitl_gate_only_bounded(
+                        project, wf,
+                        note=f"hydra resume retry-reconcile: {action}",
+                        decision=_eights_decision_for_history_entry(_last_hist_entry),
+                        gate_node=_last_gate_node,
+                        reconcile=True,
+                    )
+                    _reconcile_out = _eights_resolution_fields(True, _reconcile_result)
                 print(json.dumps({
                     "workflow_id": wf,
                     "ok": True,
@@ -1867,6 +2012,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                     "note": ("bare interrupt observed, no pending_hitl gate to "
                              "clear; graph not re-entered — call "
                              "hydra.workflow.step to continue"),
+                    **_reconcile_out,
                 }))
                 return 0
             final_dict = sup.invoke(None, config=config)
@@ -1944,10 +2090,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # empty (workflow never had a gate at all).
             _last_hist = values.get("hitl_history") or []
             _last_gate_node = None
+            _last_hist_entry = None
             if _last_hist and isinstance(_last_hist[-1], dict):
-                _last_gate_node = _last_hist[-1].get("gate_node")
+                _last_hist_entry = _last_hist[-1]
+                _last_gate_node = _last_hist_entry.get("gate_node")
             _no_gate_out["pruned_spooled_hitl_requests"] = (
                 _prune_spooled_hitl_requests(wf, _last_gate_node))
+            # Cross-vendor finding 1b: same bounded reconciliation as the
+            # bare-interrupt gate_only branch above -- a retry that lands
+            # HERE (checkpoint already shows no pending gate) must also
+            # reconcile TheEights' ledger for the most recently resolved
+            # gate, not just the local spool.
+            if _last_gate_node:
+                _reconcile_result = _resolve_eights_hitl_gate_only_bounded(
+                    project, wf,
+                    note=f"hydra resume retry-reconcile: {action}",
+                    decision=_eights_decision_for_history_entry(_last_hist_entry),
+                    gate_node=_last_gate_node,
+                    reconcile=True,
+                )
+                _no_gate_out.update(
+                    _eights_resolution_fields(True, _reconcile_result))
         print(json.dumps(_no_gate_out))
         return 0
 
@@ -2188,7 +2351,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # for the non-gate_only CLI path, unchanged.
     _terminal_resolution = action == "reject" or option == "abort"
     if gate_only:
-        _eights_gate_only = _resolve_eights_hitl_gate_only(
+        _eights_gate_only = _resolve_eights_hitl_gate_only_bounded(
             project, wf,
             note=("workflow terminal: surfaced" if _terminal_resolution
                   else f"hydra resume: {action}"),

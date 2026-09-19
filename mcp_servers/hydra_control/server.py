@@ -387,12 +387,21 @@ def _normalize_and_validate_envelopes(
 # it mints/verifies an operator capability, patches the checkpoint, and
 # prunes the spool, all in-process on `_NullDispatcher` with no subprocess or
 # network call of its own. That is a sub-second operation in the normal
-# case; 30s leaves generous headroom for Python/module cold-start on a busy
-# Windows host without blocking the MCP client for anywhere near the 300s a
-# LIVE resume (squad dispatch, judging) would need. This constant is used
-# ONLY by the gate-only transport below -- every other `_run_cli_json` call
-# in this module keeps its own, larger timeout (plan/step/submit/finalize).
-_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "30"))
+# case. This constant is used ONLY by the gate-only transport below --
+# every other `_run_cli_json` call in this module keeps its own, larger
+# timeout (plan/step/submit/finalize).
+#
+# Cross-vendor finding 1a: the ONE piece of live I/O this route does perform
+# is the bounded gate-only TheEights round trip
+# (`hydra_core.cli._resolve_eights_hitl_gate_only_bounded`), capped at
+# HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S=8s by default -- deliberately far below
+# this process's own kill timeout so that inner deadline always wins and
+# reports "unavailable" rather than being cut off mid-call. Raised from 30s
+# to 45s here so the arithmetic has real margin even on a slow/cold Windows
+# host: 8s (inner eights deadline) + ~1s (identity precheck, checkpoint
+# patch, spool prune, JSON encode -- the only other work on this path) +
+# ~36s margin for Python/module cold start = 45s.
+_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "45"))
 
 
 def _run_resume_attended(workflow_id: str, action: str, option: str | None,

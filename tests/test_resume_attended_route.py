@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -1417,3 +1418,240 @@ def test_gate_only_unreachable_eights_reports_unavailable_gate_still_clears(
     assert out.get("eights_resolution") == "unavailable"
     assert out.get("eights_resolution_reason") == "eights_unreachable"
     assert "eights_resolved_count" not in out
+
+
+# ===========================================================================
+# Cross-vendor critique of add9e1a (gpt-5.6-terra, revise; security 4):
+# findings 1a/1b (bounded inner deadline + retry-reconciliation) and 2
+# (recover-stalled-stage refused before the resume lock).
+# ===========================================================================
+
+class _StubSlowEightsClient:
+    """A reachable-but-WEDGED TheEights: `hitl_list` blocks longer than the
+    gate-only inner deadline. Sleeps in `hitl_list` (before any matching or
+    resolving) so `hitl_resolve` is never reached, deterministically proving
+    the abandoned attempt never got far enough to write anything."""
+
+    def __init__(self, delay_s: float):
+        self._delay_s = delay_s
+        self.resolved_calls: list[tuple[str, str, str]] = []
+
+    def hitl_list(self, *, status: str = "pending", kind=None):
+        time.sleep(self._delay_s)
+        return [{"request_id": "req-slow", "kind": "hydra_gate",
+                "payload": {"workflow_id": "irrelevant", "gate_node": None}}]
+
+    def hitl_resolve(self, *, request_id: str, decision: str, note: str = ""):
+        self.resolved_calls.append((request_id, decision, note))
+        return {"status": "ok", "request_id": request_id}
+
+
+class _StubNoTicketEightsClient:
+    """A REACHABLE TheEights with no matching (or no) pending ticket at all
+    -- distinct from `_StubUnreachableEightsClient` (which reports the
+    daemon unreachable, `hitl_list` -> None). This is the "already resolved
+    on TheEights' side" case a retry-reconciliation must treat as success."""
+
+    def __init__(self):
+        self.resolved_calls: list[tuple[str, str, str]] = []
+
+    def hitl_list(self, *, status: str = "pending", kind=None):
+        return []
+
+    def hitl_resolve(self, **_kw):  # pragma: no cover
+        raise AssertionError(
+            "hitl_resolve must never be called when hitl_list reports no "
+            "matching ticket"
+        )
+
+
+def test_gate_only_slow_eights_reports_unavailable_within_inner_deadline(
+    tmp_path, monkeypatch, capsys
+):
+    """Finding 1a: an injected TheEights client SLOWER than the inner
+    deadline must not block the gate-only resume past that deadline. The
+    call returns "unavailable" (reason: deadline) well inside the inner
+    budget, the local gate still clears, nothing is spooled, and the slow
+    client's `hitl_resolve` is never reached (proving the abandoned attempt
+    got nowhere close to writing anything)."""
+    _set_known_operator(monkeypatch)
+    monkeypatch.setenv("HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", "0.3")
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+
+    slow = _StubSlowEightsClient(delay_s=5.0)
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: slow)
+    _forbid_replay_and_spool(monkeypatch)
+
+    _t0 = time.perf_counter()
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _elapsed = time.perf_counter() - _t0
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"gate-only approve failed: {out}"
+    assert _elapsed < 3.0, (
+        f"gate-only resume took {_elapsed:.2f}s against a 5s-slow eights "
+        "client -- the inner deadline did not bound the call"
+    )
+    assert out.get("pending_hitl") in (None, {}), (
+        "the local gate must still clear even when TheEights is wedged"
+    )
+    assert out.get("eights_resolution") == "unavailable"
+    assert out.get("eights_resolution_reason") == "deadline"
+    assert slow.resolved_calls == [], (
+        "the abandoned slow attempt must never reach hitl_resolve within "
+        "the test's lifetime"
+    )
+
+
+def test_gate_only_retry_no_pending_reconciles_and_resolves(
+    tmp_path, monkeypatch, capsys
+):
+    """Finding 1b: a retry that lands on the no-pending-gate route (the
+    checkpoint already shows the gate cleared, e.g. a prior attempt was
+    killed after the checkpoint patch but before/during TheEights
+    resolution) must reconcile TheEights' ledger for the last resolved gate
+    -- with a REACHABLE client showing a still-pending ticket, it resolves
+    it and reports "resolved", using the ORIGINAL action's decision."""
+    _set_known_operator(monkeypatch)
+    project = _hermetic_project(tmp_path, monkeypatch)
+
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+    pending_hitl = pre_values.get("pending_hitl")
+    assert pending_hitl, "precondition: must pause at a real gate"
+    gate_node = pending_hitl.get("gate_node")
+    assert gate_node
+
+    # Simulate a prior partial gate-only approve: checkpoint patched
+    # (pending_hitl cleared, hitl_history recorded) but never reconciled
+    # against TheEights (the exact interleaving this fix targets).
+    from datetime import datetime, timezone
+    resolution = {
+        **pending_hitl, "resolution": "approve", "option": None,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sup.update_state(config, {"pending_hitl": None, "hitl_history": [resolution]})
+
+    stub = _StubReachableEightsClient(wf, gate_node)
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: stub)
+    _forbid_replay_and_spool(monkeypatch)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"retry must be a safe no-op, got out={out}"
+    assert out.get("pending_hitl") is None
+    assert out.get("eights_resolution") == "resolved", out
+    assert out.get("eights_resolved_count") == 1
+    assert stub.resolved_calls == [
+        ("req-1", "approved", "hydra resume retry-reconcile: approve")
+    ]
+
+
+def test_gate_only_retry_no_pending_ticket_reports_none_pending_no_error(
+    tmp_path, monkeypatch, capsys
+):
+    """Finding 1b: the same retry, but TheEights shows NO pending ticket for
+    the last-resolved gate (already resolved, e.g. by an earlier attempt
+    that got further than this retry needs to know about) -- reported as
+    "none_pending", never an error, and `hitl_resolve` is never called."""
+    _set_known_operator(monkeypatch)
+    project = _hermetic_project(tmp_path, monkeypatch)
+
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+    config = {"configurable": {"thread_id": wf}}
+    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    pre_values = sup.get_state(config).values
+    pending_hitl = pre_values.get("pending_hitl")
+    assert pending_hitl, "precondition: must pause at a real gate"
+
+    from datetime import datetime, timezone
+    resolution = {
+        **pending_hitl, "resolution": "approve", "option": None,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sup.update_state(config, {"pending_hitl": None, "hitl_history": [resolution]})
+
+    stub = _StubNoTicketEightsClient()
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: stub)
+    _forbid_replay_and_spool(monkeypatch)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"retry must be a safe no-op, got out={out}"
+    assert out.get("pending_hitl") is None
+    assert out.get("eights_resolution") == "none_pending", out
+    assert "eights_resolution_reason" not in out
+    assert stub.resolved_calls == []
+
+
+def test_gate_only_recover_stalled_stage_refused_no_files_written(
+    tmp_path, monkeypatch, capsys
+):
+    """Finding 2: recover-stalled-stage under --gate-only must be refused
+    BEFORE `_acquire_resume_lock` creates `.hydra/<workflow>/` and
+    `resume.lock` -- a full temp-tree snapshot before/after the refusal must
+    be byte-for-byte identical (no file created, moved, or modified)."""
+    project = _hermetic_project(tmp_path, monkeypatch)
+    wf = _start_paused_attended_workflow_at(project, monkeypatch)
+
+    def _snapshot() -> set[str]:
+        return {
+            str(p.relative_to(project))
+            for p in project.rglob("*") if p.is_file()
+        }
+
+    before = _snapshot()
+    # `.hydra/<workflow>/` may already exist from the initial invoke's own
+    # telemetry/checkpoint writes (unrelated to the resume lock); the
+    # smoking gun for finding 2 is specifically `resume.lock`, which only
+    # `_acquire_resume_lock` ever creates.
+    lock_path = project / ".hydra" / wf / "resume.lock"
+    assert not lock_path.exists(), (
+        "precondition: no resume.lock yet (nothing to confuse the snapshot "
+        "with)"
+    )
+
+    # `resume.lock` is unlinked in `_release_resume_lock`'s `finally`, so its
+    # absence AFTER the call alone cannot distinguish "never created" from
+    # "created then removed" -- assert `_acquire_resume_lock` itself is
+    # never even called, which is the real claim (refused BEFORE the lock).
+    def _boom_acquire(*_a, **_k):
+        raise AssertionError(
+            "_acquire_resume_lock must never be called for a gate-only "
+            "recover-stalled-stage refusal"
+        )
+    monkeypatch.setattr(cli, "_acquire_resume_lock", _boom_acquire)
+
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "recover-stalled-stage", "--option", "does-not-exist",
+        "--gate-only",
+    ])
+    _cap = capsys.readouterr()
+    out = json.loads(_cap.err or _cap.out or "{}")
+    after = _snapshot()
+
+    assert rc == 1
+    assert out.get("ok") is False
+    assert out.get("error") == "recovery_is_live_operation"
+    assert not lock_path.exists(), (
+        "the refusal must run before _acquire_resume_lock ever creates "
+        "resume.lock"
+    )
+    assert after == before, (
+        f"the gate-only recover-stalled-stage refusal wrote files: "
+        f"added={after - before} removed={before - after}"
+    )
