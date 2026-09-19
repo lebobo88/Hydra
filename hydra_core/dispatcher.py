@@ -959,6 +959,55 @@ class MCPStdioDispatcher:
             return
         await self._close_partial_pool(pooled.stdio_cm, pooled.session_cm)
 
+    def close_pooled_sessions(self, *, timeout_s: float = 1.5) -> None:
+        """Cross-vendor finding 2 (RESOLVE-GATE-ONLY follow-up): best-effort,
+        time-bounded close of every pooled MCP session this dispatcher
+        instance currently holds. Added specifically for the attended
+        gate-only resume route's bounded TheEights call
+        (`hydra_core.cli._resolve_eights_hitl_gate_only_bounded`): when that
+        call's inner deadline fires, it abandons a worker thread that may
+        still hold a live stdio session to a TheEights child process this
+        dispatcher spawned. This gives that caller a chance to close the
+        session down instead of leaking it silently.
+
+        NEW, additive method: nothing else in this module (or elsewhere)
+        calls it, so no other dispatcher code path's behavior changes.
+
+        Never raises. `timeout_s` bounds the actual close work
+        (`asyncio.wait_for`), but acquiring `self._run_lock` first has no
+        timeout of its own -- if another in-flight call on THIS SAME
+        dispatcher instance still holds it (e.g. the very call this is
+        trying to clean up after, still blocked inside a slow daemon
+        connect), this method can still block past `timeout_s` waiting for
+        the lock. A caller that must never block longer than `timeout_s`
+        should invoke this from its own bounded thread instead of relying
+        on `timeout_s` alone (see
+        `hydra_core.cli._best_effort_close_gate_only_dispatcher`, the only
+        current caller).
+
+        KNOWN LIMITATION (Windows): even when this closes the SDK-level
+        stdio session cleanly, the underlying TheEights child process this
+        dispatcher spawned can still be alive afterward. Windows does not
+        tie a child process's lifetime to its parent's the way POSIX process
+        groups can, and this deliberately does NOT attempt a process-tree
+        sweep to force it down -- a prior attempt at that elsewhere in this
+        ecosystem had to be withdrawn because it could kill an unrelated
+        process that later reused the same pid. A slow-but-not-wedged
+        daemon connect can therefore still outlive the CLI child that
+        spawned it in the worst case; this method only prevents the SDK
+        session object itself from leaking silently in the common case.
+        """
+        async def _close_all() -> None:
+            for server in list(self._pooled_sessions.keys()):
+                try:
+                    await self._drop_pooled_session(server)
+                except Exception:  # noqa: BLE001 — best-effort only
+                    pass
+        try:
+            self._run(asyncio.wait_for(_close_all(), timeout_s))
+        except Exception:  # noqa: BLE001 — never raise out of a best-effort close
+            pass
+
     async def _close_partial_pool(self, stdio_cm: Any, session_cm: Any) -> None:
         # W2-1: bound each teardown with the same overall-deadline reasoning
         # P1.3 applied to the non-pooled path. Pooling pp_harness means its

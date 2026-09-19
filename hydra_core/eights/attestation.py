@@ -926,6 +926,12 @@ class GateOnlyHitlClient:
 
     def __init__(self, dispatcher: Any, *, workflow_id: str):
         self._dispatcher = dispatcher
+        # Public alias (cross-vendor finding 2, RESOLVE-GATE-ONLY follow-up):
+        # `hydra_core.cli._best_effort_close_gate_only_dispatcher` needs a
+        # reference to the underlying dispatcher to attempt a best-effort
+        # close on the gate-only route's inner deadline. `_dispatcher` stays
+        # private for this class's own internal use; this is purely additive.
+        self.dispatcher = dispatcher
         self._workflow_id = str(workflow_id)
 
     def _envelope(self) -> dict[str, Any]:

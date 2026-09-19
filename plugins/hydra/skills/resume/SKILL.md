@@ -56,8 +56,9 @@ detached.
   DETACHED `hydra resume --live` subprocess and returns immediately
   (`{ok, launched: true, pid, log}`). Unchanged.
 - **Attended (the normal interactive session, gate not set)**: runs
-  `hydra resume --gate-only` SYNCHRONOUSLY in-process on `_NullDispatcher`.
-  This resolves the gate (lock, operator-capability mint+verify, spool
+  `hydra resume --gate-only` as a real, synchronous CHILD PROCESS spawned by
+  `hydra_control` (`_run_cli_json`, `subprocess.run`), on `_NullDispatcher`,
+  and waits for it in-band. This resolves the gate (lock, operator-capability mint+verify, spool
   prune, per-action state patch clearing `pending_hitl`) and returns
   WITHOUT EVER re-entering the compiled graph — no `sup.invoke`, no
   `node_dispatch`, no squad of any kind runs, not even a stub result. The
@@ -84,13 +85,17 @@ detached.
   before touching any state — it does not silently proceed with a degraded
   token. Once the gate clears locally, TheEights' matching pending ticket is
   resolved NOW with one narrow live call (list + resolve, never a replay or
-  spool drain); the result reports `eights_resolution: "resolved"` on
-  success or `eights_resolution: "unavailable"` (with a reason) when
-  TheEights cannot be reached — never a hardcoded "deferred", and never a
-  spooled retry on this route. A retry after an interrupted gate-only resume
-  (killed between its checkpoint patch and its spool prune) reconciles the
-  stale spooled HITL request for the already-resolved gate rather than
-  leaving it orphaned.
+  spool drain), bounded by its OWN inner deadline
+  (`HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S`, default `8` seconds — see **Timeout
+  and retry** below); the result reports `eights_resolution: "resolved"` on
+  success or `eights_resolution: "unavailable"` (with a reason, e.g.
+  `"deadline"` or `"eights_unreachable"`) when TheEights cannot be reached
+  in time — never a hardcoded "deferred", and never a spooled retry on this
+  route. A retry after an interrupted or timed-out gate-only resume
+  (killed, or the inner deadline fired, between its checkpoint patch and
+  TheEights resolution) reconciles the already-resolved gate against
+  TheEights' ledger AND any stale spooled HITL request, rather than leaving
+  either orphaned.
 
   `recover-stalled-stage` is the ONE resume action this route REFUSES
   outright, before any subprocess runs (`{ok: false, error:
@@ -109,17 +114,49 @@ detached.
 
   **Timeout and retry:** the MCP transport (`_run_cli_json` in
   `mcp_servers/hydra_control/server.py`) runs `hydra resume --gate-only` as
-  a synchronous CHILD PROCESS (`subprocess.run([sys.executable, "-m",
+  a real, synchronous CHILD PROCESS (`subprocess.run([sys.executable, "-m",
   "hydra_core.cli", ...])`) and waits for it in-band — this is a real
-  subprocess, not an in-process call; "no subprocess" describes only the
-  work the child itself does once running (mint+verify, a checkpoint patch,
-  a spool prune, and now one narrow live TheEights list+resolve call — no
-  dispatch, no live squad/engineering work, no replay). That whole call is
-  bounded by a 30-second synchronous timeout
-  (`HYDRA_RESUME_TIMEOUT_S`, default `30`); a timeout signals a stalled
-  child process, not a slow gate. Retry the identical `hydra.workflow.resume`
-  call (same
-  `workflow_id`/`action`/`option`) on any failure; the route is
-  idempotent, including reconciling a stale spooled HITL request left by
-  a prior call that was interrupted between its checkpoint patch and its
-  spool prune.
+  subprocess every time, never an in-process call. The work the child
+  itself does once running (mint+verify, a checkpoint patch, a spool prune,
+  and one narrow live TheEights list+resolve call — no dispatch, no live
+  squad/engineering work, no replay) is what "no subprocess" refers to
+  elsewhere in this doc; the CHILD ITSELF is always a real subprocess.
+
+  Two DISTINCT, nested timeouts govern this call:
+  - The WHOLE child is bounded by an outer timeout
+    (`HYDRA_RESUME_TIMEOUT_S`, default `45` seconds). Everything the child
+    does besides the TheEights call is sub-second, so this outer bound
+    exists mainly to catch a genuinely stalled child process (Python/module
+    cold start, an unrelated hang) — not to bound the TheEights call
+    itself.
+  - The live TheEights list+resolve call, INSIDE that child, has its own,
+    separate, tighter inner deadline (`HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S`,
+    default `8` seconds), enforced independently of the outer bound and of
+    whatever timeout the MCP transport to TheEights itself might apply.
+    When this inner deadline fires, the local gate is ALREADY cleared (the
+    checkpoint patch happens before this call), so the child still returns
+    normally with `eights_resolution: "unavailable"` (reason: `"deadline"`)
+    rather than hanging or being killed — it is TheEights' ledger entry
+    that is left unresolved, not the workflow's own state.
+
+  If the OUTER (45s) timeout fires instead, that does signal a genuinely
+  stalled child process (not merely a slow TheEights daemon, which the
+  inner deadline already absorbs on its own).
+
+  Either way, retry the identical `hydra.workflow.resume` call (same
+  `workflow_id`/`action`/`option`); the route is idempotent. A retry lands
+  on the no-pending-gate path (the checkpoint already shows the gate
+  cleared) and reconciles TheEights' ledger for that same gate with the
+  same bounded call — reporting `eights_resolution: "resolved"` if a
+  pending ticket was still there and got resolved, or `"none_pending"` if
+  TheEights already shows no matching ticket (already resolved earlier, or
+  nothing was ever pending) — never treating "no ticket" as an error. It
+  also reconciles a stale spooled HITL request left by a prior call that
+  was interrupted between its checkpoint patch and its spool prune.
+
+  To inspect state directly rather than trusting the transport's own
+  report — for example after repeatedly exceeding the outer window — use
+  `hydra.workflow.step` (advances/reports the attended cursor) or
+  `python -m hydra_core.cli status <workflow_id>` / `/hydra:status`; both
+  read the checkpoint directly and do not depend on this resume transport
+  at all.

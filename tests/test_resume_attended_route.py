@@ -1446,6 +1446,30 @@ class _StubSlowEightsClient:
         return {"status": "ok", "request_id": request_id}
 
 
+class _FakeGateOnlyDispatcher:
+    """Records whether/how `close_pooled_sessions` was invoked -- the real
+    method lives on `MCPStdioDispatcher` (hydra_core/dispatcher.py); this
+    fake stands in for it via `_StubSlowEightsClientWithDispatcher.dispatcher`
+    so the mutation-sensitive close-on-deadline behavior can be tested
+    without a live TheEights daemon."""
+
+    def __init__(self):
+        self.close_calls: list[float] = []
+
+    def close_pooled_sessions(self, *, timeout_s: float = 1.5):
+        self.close_calls.append(timeout_s)
+
+
+class _StubSlowEightsClientWithDispatcher(_StubSlowEightsClient):
+    """`_StubSlowEightsClient` plus a `.dispatcher` attribute exposing the
+    fake `close_pooled_sessions`, matching `GateOnlyHitlClient`'s public
+    `dispatcher` attribute (cross-vendor finding 2)."""
+
+    def __init__(self, delay_s: float):
+        super().__init__(delay_s)
+        self.dispatcher = _FakeGateOnlyDispatcher()
+
+
 class _StubNoTicketEightsClient:
     """A REACHABLE TheEights with no matching (or no) pending ticket at all
     -- distinct from `_StubUnreachableEightsClient` (which reports the
@@ -1503,6 +1527,43 @@ def test_gate_only_slow_eights_reports_unavailable_within_inner_deadline(
     assert slow.resolved_calls == [], (
         "the abandoned slow attempt must never reach hitl_resolve within "
         "the test's lifetime"
+    )
+
+
+def test_gate_only_slow_eights_closes_dispatcher_session_on_deadline(
+    tmp_path, monkeypatch, capsys
+):
+    """Cross-vendor finding 2: when the inner deadline fires, the gate-only
+    resume must make a best-effort attempt to close the dispatcher/session
+    the abandoned attempt was using (`close_pooled_sessions`) -- proven here
+    via a fake dispatcher (`_FakeGateOnlyDispatcher`) that records whether
+    it was called, bounded so the whole resume still returns quickly."""
+    _set_known_operator(monkeypatch)
+    monkeypatch.setenv("HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", "0.3")
+    project, wf = _start_paused_attended_workflow(tmp_path, monkeypatch)
+
+    slow = _StubSlowEightsClientWithDispatcher(delay_s=5.0)
+    monkeypatch.setattr(cli, "_build_gate_only_eights_client",
+                        lambda _project, _wf: slow)
+    _forbid_replay_and_spool(monkeypatch)
+
+    _t0 = time.perf_counter()
+    rc = cli.main([
+        "--project", str(project), "resume", wf,
+        "--action", "approve", "--gate-only",
+    ])
+    _elapsed = time.perf_counter() - _t0
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, f"gate-only approve failed: {out}"
+    assert _elapsed < 3.0, (
+        f"gate-only resume took {_elapsed:.2f}s -- the close-on-deadline "
+        "attempt must stay bounded, not block the resume"
+    )
+    assert out.get("eights_resolution") == "unavailable"
+    assert out.get("eights_resolution_reason") == "deadline"
+    assert slow.dispatcher.close_calls, (
+        "the abandoned attempt's dispatcher must have close_pooled_sessions "
+        "invoked on the inner deadline"
     )
 
 

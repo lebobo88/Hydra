@@ -42,9 +42,10 @@ follow-up): `hydra.workflow.resume` picks its transport from
   (`{ok, launched: true, pid, log}`); progress is only observable via
   `hydra.status` / the trace.
 - Without the gate (the normal interactive session), it runs
-  `hydra resume --gate-only` SYNCHRONOUSLY, in-process, WITHOUT `--live` (on
-  `_NullDispatcher`), and returns the resolved gate plus the workflow's
-  resulting `status`/`pending_hitl` in-band. This resolves the gate (lock,
+  `hydra resume --gate-only` as a real, synchronous CHILD PROCESS spawned by
+  `hydra_control` (`_run_cli_json`, `subprocess.run`), WITHOUT `--live` (on
+  `_NullDispatcher`), and waits for it in-band, returning the resolved gate
+  plus the workflow's resulting `status`/`pending_hitl`. This resolves the gate (lock,
   operator-capability mint+verify, spool prune, per-action state patch) but
   NEVER re-enters the compiled graph — no `sup.invoke`, no `node_dispatch`,
   no squad of any kind runs, not even on the stub. The response says so
@@ -65,29 +66,66 @@ follow-up): `hydra.workflow.resume` picks its transport from
   token — this check applies to every mutating resume action reachable
   through `/hydra:resume` too, not only `approve`. Once the gate clears
   locally, TheEights' matching pending ticket is resolved NOW with one
-  narrow live call (list + resolve, never a replay or spool drain); the
-  response reports `eights_resolution: "resolved"` on success or
-  `eights_resolution: "unavailable"` (with a reason) when TheEights cannot
-  be reached — never a hardcoded "deferred". A retry after an interrupted
-  gate-only resume reconciles any stale spooled HITL request for the
-  already-resolved gate.
+  narrow live call (list + resolve, never a replay or spool drain), bounded
+  by its OWN inner deadline (`HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S`, default
+  `8` seconds — see **Timeout and retry** below); the response reports
+  `eights_resolution: "resolved"` on success or `eights_resolution:
+  "unavailable"` (with a reason, e.g. `"deadline"` or
+  `"eights_unreachable"`) when TheEights cannot be reached in time — never a
+  hardcoded "deferred". A retry after an interrupted or timed-out gate-only
+  resume reconciles the already-resolved gate against TheEights' ledger
+  (see below), not just the local spool.
 
   `recover-stalled-stage` (see `/hydra:resume`) is refused outright on this
   route, before `_run_cli_json` ever spawns the resume child process,
   because it is a LIVE operation, not a gate resolution — only the detached
   CLI (`HYDRA_ALLOW_DETACHED=1`) may run it.
 
-  **Timeout and retry:** the MCP transport runs `hydra resume --gate-only`
-  as a real, synchronous CHILD PROCESS (`_run_cli_json`, `subprocess.run`)
-  bounded by a 30-second timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
-  The child itself never dispatches — it does mint+verify, a checkpoint
-  patch, a spool prune, and one narrow live TheEights list+resolve call, all
-  on `_NullDispatcher` for graph re-entry purposes — so 30s is generous
-  headroom for cold start, not an expected duration; a timeout usually means
-  the child process itself is stalled, not that the gate is slow. On a
-  timeout or any other failure, simply retry the same
-  `hydra.workflow.resume` call (or the equivalent `cli resume --gate-only`
-  invocation) with the same `workflow_id`/`action`/`option`: the route is
-  idempotent — a retry after a resolution that already landed on the
-  checkpoint reconciles any stale spooled HITL request rather than
-  double-applying the gate or erroring.
+  **Timeout and retry:** `hydra_control` runs `hydra resume --gate-only` as
+  a real, synchronous CHILD PROCESS (`_run_cli_json`, `subprocess.run`) and
+  waits for it in-band — this is a real subprocess every time, never an
+  in-process call. The WHOLE child is bounded by an outer timeout
+  (`HYDRA_RESUME_TIMEOUT_S`, default `45` seconds). Inside that child, the
+  one live TheEights list+resolve call described above has its own,
+  separate, much tighter inner deadline (`HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S`,
+  default `8` seconds) — deliberately far below the outer bound, so the
+  inner deadline is what actually governs a slow TheEights daemon, not the
+  outer kill. Everything else the child does (mint+verify, a checkpoint
+  patch, a spool prune) is sub-second, so the two timeouts serve different
+  purposes:
+  - If the inner (8s) TheEights deadline fires: the child still finishes
+    normally and returns `eights_resolution: "unavailable"` (reason:
+    `"deadline"`) — the local gate is ALREADY cleared by this point, so
+    nothing is lost; only TheEights' own ledger entry is left unresolved.
+  - If the outer (45s) child timeout fires instead, the child itself is
+    genuinely stalled (not merely a slow TheEights daemon, which the inner
+    deadline already absorbs) and `hydra_control` reports a timeout/failure
+    for the whole call.
+
+  Either way, retry the identical `hydra.workflow.resume` call (same
+  `workflow_id`/`action`/`option`): the route is idempotent. A retry lands
+  on the no-pending-gate path (the checkpoint already shows the gate
+  cleared) and reconciles TheEights' ledger for that same gate with the
+  same bounded call — reporting `eights_resolution: "resolved"` if a
+  pending ticket was found and resolved, or `"none_pending"` if TheEights
+  already shows no matching ticket (already resolved by an earlier attempt,
+  or nothing was ever pending) — never treating "no ticket" as an error. It
+  also reconciles any stale spooled HITL request left by a prior call that
+  was interrupted between its checkpoint patch and its spool prune.
+
+  If the outer window is exceeded repeatedly, or you want to confirm state
+  directly rather than trusting the transport's own report, inspect the
+  workflow with `hydra.workflow.step` (advances/reports the attended cursor)
+  or `python -m hydra_core.cli status <workflow_id>` / `/hydra:status` —
+  both read the checkpoint directly and do not depend on the resume
+  transport at all.
+
+  **Known limitation:** on the inner (8s) TheEights deadline, the resume
+  child makes a best-effort, time-bounded attempt to close the live MCP
+  session that call was using (so a slow-but-not-wedged TheEights daemon it
+  spawned doesn't leak). On Windows, the underlying daemon PROCESS can
+  still outlive the resume child regardless — Windows does not tie a
+  child's lifetime to its parent's, and this fix deliberately does not
+  attempt a process-tree sweep to force it down (a prior attempt at that
+  elsewhere in this ecosystem had to be withdrawn because it could kill an
+  unrelated process that later reused the same pid).

@@ -30,7 +30,7 @@ import sys
 import threading
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 # Validation regex for workflow ids supplied via --workflow-id.
@@ -1083,9 +1083,10 @@ def _build_gate_only_eights_client(project: Path, wf: str):
 # a gate-only resume can block. HYDRA_RESUME_TIMEOUT_S (mcp_servers/
 # hydra_control/server.py, default 45s) is the OUTER hard kill on the whole
 # `hydra resume --gate-only` child process; this inner budget must clear
-# with margin: 8s (inner) + ~1s (identity check, checkpoint patch, spool
-# prune, JSON serialize -- no other live I/O on this route) + margin
-# (~36s) < 45s (outer).
+# with margin: 8s (inner) + up to ~1.5s (the deadline-only best-effort
+# session close, `_best_effort_close_gate_only_dispatcher`) + ~1s (identity
+# check, checkpoint patch, spool prune, JSON serialize -- no other live I/O
+# on this route) + margin (~33.5s) < 45s (outer).
 _GATE_ONLY_EIGHTS_TIMEOUT_S = float(
     os.environ.get("HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", "8"))
 
@@ -1093,6 +1094,7 @@ _GATE_ONLY_EIGHTS_TIMEOUT_S = float(
 def _resolve_eights_hitl_gate_only(
     project: Path, workflow_id: str, *, note: str, decision: str,
     gate_node: str | None = None, reconcile: bool = False,
+    client: Any = None,
 ) -> dict:
     """Operator decision 2 (RESOLVE-GATE-ONLY follow-up): on the attended
     gate-only resume route, resolve TheEights' matching pending HITL ticket
@@ -1119,12 +1121,21 @@ def _resolve_eights_hitl_gate_only(
     `"none_pending"` rather than `"unavailable"`. A genuinely unreachable
     daemon or a failed list/resolve call still reports `"unavailable"`
     either way.
+
+    ``client``, when given (cross-vendor finding 2, RESOLVE-GATE-ONLY
+    follow-up), is a pre-built client to use instead of constructing a new
+    one here. `_resolve_eights_hitl_gate_only_bounded` builds the client on
+    the CALLING thread (fast, no I/O) and passes it in so it retains a
+    reference to it even if the worker thread running this function is
+    later abandoned at the inner deadline -- otherwise there would be no
+    way to attempt closing the dispatcher the abandoned attempt was using.
     """
-    try:
-        client = _build_gate_only_eights_client(project, workflow_id)
-    except Exception as exc:  # noqa: BLE001 — never block the gate-only return
-        return {"eights_resolution": "unavailable",
-                "reason": f"client_build_failed: {type(exc).__name__}: {exc}"}
+    if client is None:
+        try:
+            client = _build_gate_only_eights_client(project, workflow_id)
+        except Exception as exc:  # noqa: BLE001 — never block the gate-only return
+            return {"eights_resolution": "unavailable",
+                    "reason": f"client_build_failed: {type(exc).__name__}: {exc}"}
     try:
         rows = client.hitl_list()
     except Exception as exc:  # noqa: BLE001
@@ -1188,6 +1199,16 @@ def _resolve_eights_hitl_gate_only_bounded(
     exits (and, on Windows, `subprocess.run`'s own outer timeout in
     mcp_servers/hydra_control/server.py additionally SIGKILLs/TerminateProcess
     it if it somehow didn't).
+
+    Cross-vendor finding 2 (RESOLVE-GATE-ONLY follow-up): on the deadline
+    path, this also makes a best-effort, time-bounded attempt to close the
+    live MCP session the abandoned attempt was using (see
+    `_best_effort_close_gate_only_dispatcher` below) so a slow-but-not-
+    wedged TheEights daemon this call spawned does not leak past the
+    resume. That close attempt is capped separately and can add up to
+    roughly its own cap on top of `timeout_s` before this function returns
+    -- see `_GATE_ONLY_EIGHTS_TIMEOUT_S`'s arithmetic comment above, which
+    accounts for it.
     """
     if timeout_s is None:
         # Read the env var at CALL time (not at module import) so tests --
@@ -1195,13 +1216,21 @@ def _resolve_eights_hitl_gate_only_bounded(
         # monkeypatch/env without needing to reload this module.
         timeout_s = float(os.environ.get(
             "HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S", str(_GATE_ONLY_EIGHTS_TIMEOUT_S)))
+    # Built on THIS (calling) thread -- fast, no I/O (see the docstring on
+    # `client=` above) -- so a reference to it survives even if the worker
+    # below is abandoned at the deadline.
+    try:
+        client = _build_gate_only_eights_client(project, workflow_id)
+    except Exception as exc:  # noqa: BLE001 — never block the gate-only return
+        return {"eights_resolution": "unavailable",
+                "reason": f"client_build_failed: {type(exc).__name__}: {exc}"}
     _box: list[dict] = []
 
     def _worker() -> None:
         try:
             _box.append(_resolve_eights_hitl_gate_only(
                 project, workflow_id, note=note, decision=decision,
-                gate_node=gate_node, reconcile=reconcile,
+                gate_node=gate_node, reconcile=reconcile, client=client,
             ))
         except Exception as exc:  # noqa: BLE001 — never raise off-thread
             _box.append({"eights_resolution": "unavailable",
@@ -1212,7 +1241,52 @@ def _resolve_eights_hitl_gate_only_bounded(
     thread.join(timeout_s)
     if _box:
         return _box[0]
+    _best_effort_close_gate_only_dispatcher(client)
     return {"eights_resolution": "unavailable", "reason": "deadline"}
+
+
+def _best_effort_close_gate_only_dispatcher(
+    client: Any, *, timeout_s: float = 1.5,
+) -> None:
+    """Cross-vendor finding 2 (RESOLVE-GATE-ONLY follow-up): when the
+    gate-only TheEights call's inner deadline fires
+    (`_resolve_eights_hitl_gate_only_bounded`), the abandoned worker thread
+    can still hold a live MCP stdio session to a TheEights daemon process it
+    spawned. `MCPStdioDispatcher.close_pooled_sessions` (hydra_core/
+    dispatcher.py) is a best-effort close of that session; this wrapper
+    runs it on its OWN daemon thread and joins with `timeout_s`, so a lock
+    held by the still-running abandoned attempt (see
+    `close_pooled_sessions`'s own docstring) can never block the gate-only
+    resume's return by more than `timeout_s` -- if the close hasn't
+    finished by then, this simply returns anyway and leaves that thread to
+    finish (or not) on its own, exactly like the abandoned resolution
+    attempt itself.
+
+    Never raises. A no-op when `client` has no `dispatcher` attribute (e.g.
+    a test double) or `dispatcher` has no `close_pooled_sessions` method.
+
+    KNOWN LIMITATION: even when the close succeeds, the underlying
+    TheEights child process can still be alive afterward on Windows (see
+    `close_pooled_sessions`'s docstring) -- this is a best-effort mitigation
+    of session leakage, not a guarantee against an orphaned process. No
+    process-tree sweep is attempted here (or anywhere in this fix) because
+    a prior attempt at that elsewhere in this ecosystem had to be withdrawn:
+    it could kill an unrelated process that later reused the same pid.
+    """
+    dispatcher = getattr(client, "dispatcher", None)
+    close = getattr(dispatcher, "close_pooled_sessions", None)
+    if not callable(close):
+        return
+
+    def _closer() -> None:
+        try:
+            close(timeout_s=timeout_s)
+        except Exception:  # noqa: BLE001 — best-effort only
+            pass
+
+    closer_thread = threading.Thread(target=_closer, daemon=True)
+    closer_thread.start()
+    closer_thread.join(timeout_s)
 
 
 def _eights_decision_for_history_entry(entry: dict | None) -> str:
