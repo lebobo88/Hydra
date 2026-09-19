@@ -1293,12 +1293,16 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                       else getattr(final_dict, "phase", "?"))
             print(json.dumps({
                 "workflow_id": wf,
+                "ok": True,
                 "resumed": True,
                 "action": action,
                 "continued_bare_interrupt": True,
                 "interrupted_before": list(_snap_next),
                 "gate_node": None,
                 "phase": _phase,
+                "status": _phase,
+                "pending_hitl": (final_dict.get("pending_hitl")
+                                 if isinstance(final_dict, dict) else None),
                 "trace": str(trace_path(project, wf)),
             }))
             return 0
@@ -1308,9 +1312,13 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             sup.update_state(config, {"phase": "surfaced"})
             print(json.dumps({
                 "workflow_id": wf,
+                "ok": True,
                 "resumed": False,
                 "action": "reject",
                 "phase": "surfaced",
+                "status": "surfaced",
+                "gate_node": None,
+                "pending_hitl": None,
                 "continued_bare_interrupt": False,
             }))
             return 0
@@ -1320,9 +1328,13 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # that approve would work when a bare interrupt is pending.
         _no_gate_out: dict = {
             "workflow_id": wf,
+            "ok": True,
             "resumed": False,
             "reason": "no_pending_gate",
             "phase": values.get("phase"),
+            "status": values.get("phase"),
+            "gate_node": None,
+            "pending_hitl": values.get("pending_hitl"),
         }
         if _snap_next:
             _no_gate_out["hint"] = "bare_interrupt_pending"
@@ -1686,9 +1698,13 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         sup.update_state(config, {"phase": "surfaced"})
         print(json.dumps({
             "workflow_id": wf,
+            "ok": True,
             "resumed": False,
             "action": "abort_option",
             "phase": "surfaced",
+            "status": "surfaced",
+            "gate_node": resolution.get("gate_node"),
+            "pending_hitl": None,
         }, indent=2))
         return 0
 
@@ -1714,9 +1730,13 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         sup.update_state(config, _reject_patch)
         print(json.dumps({
             "workflow_id": wf,
+            "ok": True,
             "resumed": False,
             "action": "reject",
             "phase": "surfaced",
+            "status": "surfaced",
+            "gate_node": resolution.get("gate_node"),
+            "pending_hitl": None,
         }, indent=2))
         return 0
 
@@ -1745,21 +1765,31 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         })
         print(json.dumps({
             "workflow_id": wf,
+            "ok": True,
             "resumed": True,
             "action": "modify-plan",
             "plan_status": "authoring",
+            "status": "authoring",
             "plan_revision": _modify_plan_new_revision,
             "plan_parked_at": parked_at,
+            "gate_node": resolution.get("gate_node"),
+            "pending_hitl": None,
         }, indent=2))
         return 0
 
     final_dict = sup.invoke(None, config=config)
     phase = final_dict.get("phase") if isinstance(final_dict, dict) else getattr(final_dict, "phase", "?")
+    _resulting_pending = (final_dict.get("pending_hitl")
+                          if isinstance(final_dict, dict) else None)
     print(json.dumps({
         "workflow_id": wf,
+        "ok": True,
         "resumed": True,
         "action": action,
         "phase": phase,
+        "status": phase,
+        "gate_node": resolution.get("gate_node"),
+        "pending_hitl": _resulting_pending,
         "trace": str(trace_path(project, wf)),
     }, indent=2))
     return 0

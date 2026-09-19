@@ -42,7 +42,15 @@ status <workflow_id>` and obtain an explicit operator decision. Then call
 the matching action and option (or the matching `hydra resume` CLI form). Do
 not patch checkpoint state or any trace directly.
 
-Note (G4): when the resume path would re-detach a background `hydra resume
---live` subprocess (detached workflows), it is gated by
-`HYDRA_ALLOW_DETACHED=1` and otherwise returns `error: "detached_disabled"`.
-Attended workflows resume in-process and continue via `step`/`submit`.
+Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7): the transport
+`hydra.workflow.resume` picks is governed by `HYDRA_ALLOW_DETACHED`, not by
+whether the workflow itself is attended or detached. With the gate set, it
+launches a DETACHED `hydra resume --live` subprocess and returns immediately
+(`{ok, launched: true, pid, log}`). Without the gate — the normal interactive
+session — it runs `hydra resume` SYNCHRONOUSLY in-process WITHOUT `--live`
+(on `_NullDispatcher`, which never re-dispatches a host-bridged squad like
+engineering on the stub) and returns the resolved gate and the workflow's
+resulting `status`/`pending_hitl` in the same call. Either way, an attended
+workflow's engineering (and any other host-bridged) tasks are deferred back
+to the host rather than executed, so `step`/`submit` continues from the
+cursor afterward.

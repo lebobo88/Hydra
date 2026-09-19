@@ -355,12 +355,60 @@ def _normalize_and_validate_envelopes(
     return normalized, rejected
 
 
+_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "300"))
+
+
+def _run_resume_attended(workflow_id: str, action: str, option: str | None,
+                         critique_ref: str | None = None) -> dict[str, Any]:
+    """Resolve a paused workflow's HITL gate SYNCHRONOUSLY and in-band, via
+    the non-detaching `_run_cli_json` transport — the attended counterpart to
+    `_launch_resume`.
+
+    EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7 path K [D]: when detached launch
+    is not allowed (the normal interactive-session case), a resume must never
+    spawn `hydra resume --live` (a DETACHED, long-running process the
+    interactive session's `_detached_allowed()` gate exists specifically to
+    refuse). Instead this runs `python -m hydra_core.cli resume <id> --action
+    <action> [--option ...] [--critique-ref ...]` WITHOUT `--live`, short-lived
+    and in-process on `_NullDispatcher`.
+
+    Path S makes `_NullDispatcher` never replay the eights spool, and E2-22
+    (hydra_core/supervisor.py's dispatch node) already defers every `mcp` /
+    `claude-native` squad task to the attended host the moment it sees a
+    non-live dispatcher (`live_execution` unset) — so this resume resolves the
+    gate (lock, capability mint+verify, spool prune, TheEights resolve) and
+    then genuinely stops at the attended hand-off: `sup.invoke(None, ...)`
+    re-enters the graph, but `node_dispatch` marks every mcp/claude-native task
+    `deferred_to_host` rather than executing it on the stub, and
+    `after_dispatch` routes straight to `await_host` -> END. No stage, squad
+    result, or workflow completion is ever recorded from stub output on this
+    path. The host's existing step/submit loop (hydra.workflow.step /
+    hydra.workflow.submit_host_result) then continues engineering from its
+    cursor exactly as if the workflow had never paused.
+    """
+    cli_args = ["resume", workflow_id, "--action", action]
+    if option:
+        cli_args.extend(["--option", option])
+    if critique_ref:
+        cli_args.extend(["--critique-ref", critique_ref])
+    result = _run_cli_json(cli_args, timeout_s=_RESUME_TIMEOUT_S,
+                           err_label="resume", workflow_id=workflow_id)
+    if "ok" not in result:
+        # _run_cli_json's own error shapes (timeout/failed/unparseable) don't
+        # set "ok" — normalise so every caller can key off it uniformly.
+        result = {"ok": False, **result}
+    return result
+
+
 def _launch_resume(workflow_id: str, action: str, option: str | None,
                    critique_ref: str | None = None) -> dict[str, Any]:
-    # Detached gate: resume is automation-only. No fleet exemption — a resume
-    # call carries no fleet goal string, so fleet detection is not applicable.
+    # Detached gate: resume is automation-only in an interactive session.
+    # When detached launch is not allowed, route through the non-detaching,
+    # in-band `_run_resume_attended` transport instead of refusing outright
+    # (RCA path K) — this NEVER spawns `hydra resume --live`.
     if not _detached_allowed():
-        return _detached_refusal("resume")
+        return _run_resume_attended(workflow_id, action, option,
+                                    critique_ref=critique_ref)
 
     log_dir = _HYDRA_ROOT / ".hydra" / workflow_id
     log_dir.mkdir(parents=True, exist_ok=True)

@@ -26,8 +26,17 @@ Do not directly edit `HydraState`, `hitl_history`, a checkpoint, or a trace.
 
 For rejection or budget mutation, use `/hydra:resume` instead.
 
-Note (G4): resuming a **detached** workflow re-detaches `hydra resume --live`
-in the background, which is gated by `HYDRA_ALLOW_DETACHED=1` — without the
-gate the server returns `error: "detached_disabled"`. Attended workflows are
-unaffected: approval continues in-process and the attended `step`/`submit`
-loop picks up from the cursor.
+Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7): `hydra.workflow.resume`
+picks its transport from `HYDRA_ALLOW_DETACHED`, not from anything about the
+workflow itself. With the gate set (`HYDRA_ALLOW_DETACHED=1`, automation-only),
+it launches a DETACHED `hydra resume --live` and returns immediately
+(`{ok, launched: true, pid, log}`); progress is only observable via
+`hydra.status` / the trace. Without the gate (the normal interactive session),
+it instead runs `hydra resume` SYNCHRONOUSLY, in-process, WITHOUT `--live`
+(on `_NullDispatcher`) and returns the resolved gate plus the workflow's
+resulting `status`/`pending_hitl` in-band. That in-process resume clears the
+gate (lock, capability check, spool prune, TheEights resolve) but genuinely
+stops at the attended hand-off — engineering (and any other host-bridged)
+tasks are deferred back to the host rather than dispatched on the stub — so
+the attended `step`/`submit` loop continues from the cursor afterward exactly
+as if the workflow had never paused.
