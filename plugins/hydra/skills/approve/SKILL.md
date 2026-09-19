@@ -26,17 +26,26 @@ Do not directly edit `HydraState`, `hitl_history`, a checkpoint, or a trace.
 
 For rejection or budget mutation, use `/hydra:resume` instead.
 
-Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7): `hydra.workflow.resume`
-picks its transport from `HYDRA_ALLOW_DETACHED`, not from anything about the
-workflow itself. With the gate set (`HYDRA_ALLOW_DETACHED=1`, automation-only),
-it launches a DETACHED `hydra resume --live` and returns immediately
-(`{ok, launched: true, pid, log}`); progress is only observable via
-`hydra.status` / the trace. Without the gate (the normal interactive session),
-it instead runs `hydra resume` SYNCHRONOUSLY, in-process, WITHOUT `--live`
-(on `_NullDispatcher`) and returns the resolved gate plus the workflow's
-resulting `status`/`pending_hitl` in-band. That in-process resume clears the
-gate (lock, capability check, spool prune, TheEights resolve) but genuinely
-stops at the attended hand-off — engineering (and any other host-bridged)
-tasks are deferred back to the host rather than dispatched on the stub — so
-the attended `step`/`submit` loop continues from the cursor afterward exactly
-as if the workflow had never paused.
+Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7; RESOLVE-GATE-ONLY
+follow-up): `hydra.workflow.resume` picks its transport from
+`HYDRA_ALLOW_DETACHED`, not from anything about the workflow itself.
+
+- With the gate set (`HYDRA_ALLOW_DETACHED=1`, automation-only), it launches
+  a DETACHED `hydra resume --live` and returns immediately
+  (`{ok, launched: true, pid, log}`); progress is only observable via
+  `hydra.status` / the trace.
+- Without the gate (the normal interactive session), it runs
+  `hydra resume --gate-only` SYNCHRONOUSLY, in-process, WITHOUT `--live` (on
+  `_NullDispatcher`), and returns the resolved gate plus the workflow's
+  resulting `status`/`pending_hitl` in-band. This resolves the gate (lock,
+  operator-capability mint+verify, spool prune, per-action state patch) but
+  NEVER re-enters the compiled graph — no `sup.invoke`, no `node_dispatch`,
+  no squad of any kind runs, not even on the stub. The response says so
+  explicitly (`graph_reentered: false`); the attended `step`/`submit` loop
+  continues from the cursor afterward, exactly as if the workflow had never
+  paused. If the operator identity is unknown or the minted capability is
+  degraded (missing `HYDRA_OPERATOR_ID` / `HYDRA_OPERATOR_KEY`), the approve
+  REFUSES up front (`{ok: false, error: "operator_identity_required"}`)
+  rather than proceeding on an unverifiable token. TheEights resolution is
+  reported honestly as `eights_resolution: "deferred"` — it is swept on the
+  next live call, not resolved from the stub.

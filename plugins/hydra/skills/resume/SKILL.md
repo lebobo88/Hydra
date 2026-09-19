@@ -42,15 +42,29 @@ status <workflow_id>` and obtain an explicit operator decision. Then call
 the matching action and option (or the matching `hydra resume` CLI form). Do
 not patch checkpoint state or any trace directly.
 
-Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7): the transport
-`hydra.workflow.resume` picks is governed by `HYDRA_ALLOW_DETACHED`, not by
-whether the workflow itself is attended or detached. With the gate set, it
-launches a DETACHED `hydra resume --live` subprocess and returns immediately
-(`{ok, launched: true, pid, log}`). Without the gate — the normal interactive
-session — it runs `hydra resume` SYNCHRONOUSLY in-process WITHOUT `--live`
-(on `_NullDispatcher`, which never re-dispatches a host-bridged squad like
-engineering on the stub) and returns the resolved gate and the workflow's
-resulting `status`/`pending_hitl` in the same call. Either way, an attended
-workflow's engineering (and any other host-bridged) tasks are deferred back
-to the host rather than executed, so `step`/`submit` continues from the
-cursor afterward.
+Note (RCA path K, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7; RESOLVE-GATE-ONLY
+follow-up): the transport `hydra.workflow.resume` picks is governed by
+`HYDRA_ALLOW_DETACHED`, not by whether the workflow itself is attended or
+detached.
+
+- **Detached-allowed** (automation, `HYDRA_ALLOW_DETACHED=1`): launches a
+  DETACHED `hydra resume --live` subprocess and returns immediately
+  (`{ok, launched: true, pid, log}`). Unchanged.
+- **Attended (the normal interactive session, gate not set)**: runs
+  `hydra resume --gate-only` SYNCHRONOUSLY in-process on `_NullDispatcher`.
+  This resolves the gate (lock, operator-capability mint+verify, spool
+  prune, per-action state patch clearing `pending_hitl`) and returns
+  WITHOUT EVER re-entering the compiled graph — no `sup.invoke`, no
+  `node_dispatch`, no squad of any kind runs, not even a stub result. The
+  result JSON says so explicitly (`graph_reentered: false`, a `note` naming
+  `hydra.workflow.step`); the host's existing step/submit loop continues the
+  workflow from its own cursor afterward, exactly as if it had never
+  paused. If the operator identity is unknown (no `HYDRA_OPERATOR_ID`) or
+  the minted capability is degraded (no `HYDRA_OPERATOR_KEY`), the resume
+  REFUSES with `{ok: false, error: "operator_identity_required"}` before
+  touching any state — it does not silently proceed with a degraded token.
+  TheEights resolution is honestly reported as `eights_resolution:
+  "deferred"`: `_NullDispatcher` cannot reach the shared ledger, so the
+  matching row is left for the next live sweep
+  (`hydra eights-hitl-reconcile` / `hydra reap --apply`) rather than being
+  silently skipped or falsely claimed resolved.

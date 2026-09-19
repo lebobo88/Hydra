@@ -1231,9 +1231,25 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # is a host_bridge cursor whose pp-ledger call never landed, not an
     # HITL-paused graph. Route it separately, still under the same
     # claim-and-resume lock `_cmd_resume` already acquired above (governance:
-    # a paused/stranded workflow resumes only via approve/resume).
+    # a paused/stranded workflow resumes only via approve/resume). It never
+    # calls `sup.invoke` (only `sup.update_state`), so it is gate-only-
+    # identical regardless of the flag -- nothing further needed here.
     if action == "recover-stalled-stage":
         return _cmd_recover_stalled_stage(args, project, wf, option)
+
+    # RESOLVE-GATE-ONLY (operator decision A, EIGHTS-RECORD-OUTCOME-RCA-2026-09-16
+    # §7 path K follow-up): the attended MCP route (`_run_resume_attended` in
+    # mcp_servers/hydra_control/server.py) always passes `--gate-only`. When set,
+    # this function resolves the pending gate (lock already held by the caller,
+    # operator-capability mint+verify, spool prune, state patch clearing
+    # pending_hitl, hitl_history) and returns WITHOUT ever calling `sup.invoke` —
+    # no node_dispatch, no squad of any kind runs on the stub dispatcher. The
+    # host's own step/submit loop (hydra.workflow.step / submit_host_result)
+    # continues the workflow from its cursor. This is a narrower, explicit CLI
+    # mode -- NOT a change to node_dispatch's non-live deferral filter, which is
+    # untouched (and still applies to the ordinary --live-less resume below when
+    # gate_only is False, e.g. direct CLI usage).
+    gate_only = bool(getattr(args, "gate_only", False))
 
     critique_client = None
     if getattr(args, "live", False):
@@ -1281,13 +1297,37 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # from a genuinely terminal state (snap.next empty).
         _snap_next = getattr(snap, "next", ()) or ()
         if _snap_next and action in ("approve", "force-dispatch"):
-            # Bare interrupt + approve/force-dispatch: continue the graph.
+            # Bare interrupt + approve/force-dispatch: continue the graph --
+            # UNLESS gate_only, in which case there is nothing to clear (no
+            # pending_hitl exists here at all) and the graph must not be
+            # re-entered either; just report the bare interrupt honestly so
+            # the host knows to call step, exactly like every other gate_only
+            # exit.
             emit(project, wf, "hitl_resumed", {
                 "action": action,
                 "option": option,
                 "gate_node": None,
                 "bare_interrupt": list(_snap_next),
+                "gate_only": gate_only,
             })
+            if gate_only:
+                print(json.dumps({
+                    "workflow_id": wf,
+                    "ok": True,
+                    "resumed": False,
+                    "gate_only": True,
+                    "graph_reentered": False,
+                    "action": action,
+                    "interrupted_before": list(_snap_next),
+                    "gate_node": None,
+                    "phase": values.get("phase"),
+                    "status": values.get("phase"),
+                    "pending_hitl": None,
+                    "note": ("bare interrupt observed, no pending_hitl gate to "
+                             "clear; graph not re-entered — call "
+                             "hydra.workflow.step to continue"),
+                }))
+                return 0
             final_dict = sup.invoke(None, config=config)
             _phase = (final_dict.get("phase") if isinstance(final_dict, dict)
                       else getattr(final_dict, "phase", "?"))
@@ -1379,6 +1419,29 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # This applies uniformly to all _MUTATING_RESUME_ACTIONS (WS-AUTH run-A).
         _UNKNOWN_OPERATORS = {"", "unknown"}
         _force_degraded = _operator.strip() in _UNKNOWN_OPERATORS
+
+        # Operator decision B (RESOLVE-GATE-ONLY, finding 2): on the attended
+        # gate_only route, an unknown operator identity must REFUSE before
+        # clearing the gate — never mint a degraded token and warn-proceed
+        # (the run-A posture below, kept for the non-gate_only/legacy CLI
+        # path). Nothing has been mutated yet at this point (no mint, no
+        # verify, no state patch, no spool prune) — this is a pure refusal.
+        if gate_only and _force_degraded:
+            print(json.dumps({
+                "ok": False,
+                "error": "operator_identity_required",
+                "workflow_id": wf,
+                "action": action,
+                "message": (
+                    "attended gate-only resume requires a known operator "
+                    "identity to mint a verifiable capability for a "
+                    "state-mutating action; set HYDRA_OPERATOR_ID (env) or "
+                    "pass --operator to identify the caller. Nothing was "
+                    "changed."
+                ),
+            }), file=sys.stderr)
+            return 1
+
         if _force_degraded:
             _log_cli.warning(
                 "operator identity unknown for action=%r; capability degraded — "
@@ -1414,12 +1477,49 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             operator_capability_patch = _cap_token
             if _cap_token.get("sig", {}).get("degraded") and not _force_degraded:
                 # Real operator but no key configured.
+                if gate_only:
+                    # Decision B: a degraded token (missing HYDRA_OPERATOR_KEY)
+                    # refuses on the gate_only route exactly like an unknown
+                    # operator — no state has been touched yet (mint is pure).
+                    print(json.dumps({
+                        "ok": False,
+                        "error": "operator_identity_required",
+                        "workflow_id": wf,
+                        "action": action,
+                        "message": (
+                            "attended gate-only resume requires a verifiable "
+                            "operator capability; the minted token is degraded "
+                            "(no HYDRA_OPERATOR_KEY configured). Set "
+                            "HYDRA_OPERATOR_ID and HYDRA_OPERATOR_KEY to "
+                            "identify and authenticate the caller. Nothing "
+                            "was changed."
+                        ),
+                    }), file=sys.stderr)
+                    return 1
                 _log_cli.warning(
                     "operator capability degraded (no HYDRA_OPERATOR_KEY); "
                     "gated consumers will reject — set HYDRA_OPERATOR_KEY to enable "
                     "cryptographic proof of approval"
                 )
         except Exception as _cap_exc:  # noqa: BLE001 — never block an approval on mint failure
+            if gate_only:
+                # Decision B: mint failing outright means we cannot verify
+                # operator identity at all — refuse rather than proceed
+                # without a capability token.
+                print(json.dumps({
+                    "ok": False,
+                    "error": "operator_identity_required",
+                    "workflow_id": wf,
+                    "action": action,
+                    "message": (
+                        "attended gate-only resume requires a verifiable "
+                        f"operator capability; mint failed ({type(_cap_exc).__name__}: "
+                        f"{_cap_exc}). Set HYDRA_OPERATOR_ID and "
+                        "HYDRA_OPERATOR_KEY to identify and authenticate the "
+                        "caller. Nothing was changed."
+                    ),
+                }), file=sys.stderr)
+                return 1
             _log_cli.warning(
                 "mint_for_approval raised %s: %s — approval proceeds without capability token",
                 type(_cap_exc).__name__, _cap_exc,
@@ -1705,6 +1805,11 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "status": "surfaced",
             "gate_node": resolution.get("gate_node"),
             "pending_hitl": None,
+            # abort never re-entered the graph even before gate_only existed —
+            # identical either way (operator decision A).
+            "gate_only": gate_only,
+            "graph_reentered": False,
+            **({"eights_resolution": "deferred"} if gate_only else {}),
         }, indent=2))
         return 0
 
@@ -1737,6 +1842,11 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "status": "surfaced",
             "gate_node": resolution.get("gate_node"),
             "pending_hitl": None,
+            # reject never re-entered the graph even before gate_only existed
+            # — identical either way (operator decision A).
+            "gate_only": gate_only,
+            "graph_reentered": False,
+            **({"eights_resolution": "deferred"} if gate_only else {}),
         }, indent=2))
         return 0
 
@@ -1751,22 +1861,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # primitive (rather than writing a second copy) is deliberate — see
         # this function's brief on hand-duplicated decisions.
         assert _modify_plan_task is not None and _modify_plan_new_revision is not None
+        # RESOLVE-GATE-ONLY: the state mutation (new revision task, plan_status
+        # "authoring") is applied either way; only the invoke loop that would
+        # actually run the graph is skipped under gate_only (see
+        # `_reenter_graph_after_dispatch`'s gate_only docstring).
         parked_at = _reenter_graph_after_dispatch(sup, config, {
             "plan_status": "authoring",
             "plan_revision": _modify_plan_new_revision,
             "tasks": [_modify_plan_task],
-        })
+        }, gate_only=gate_only)
         emit(project, wf, "plan_modify_requested", {
             "prior_plan_envelope_id": (
                 str(_modify_plan_prior_envelope_id)
                 if _modify_plan_prior_envelope_id else None
             ),
             "plan_revision": _modify_plan_new_revision,
+            "gate_only": gate_only,
         })
-        print(json.dumps({
+        _modify_plan_out: dict = {
             "workflow_id": wf,
             "ok": True,
-            "resumed": True,
+            "resumed": not gate_only,
             "action": "modify-plan",
             "plan_status": "authoring",
             "status": "authoring",
@@ -1774,6 +1889,47 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "plan_parked_at": parked_at,
             "gate_node": resolution.get("gate_node"),
             "pending_hitl": None,
+        }
+        if gate_only:
+            _modify_plan_out["gate_only"] = True
+            _modify_plan_out["graph_reentered"] = False
+            _modify_plan_out["eights_resolution"] = "deferred"
+            _modify_plan_out["note"] = (
+                "plan revision task recorded, graph not re-entered — call "
+                "hydra.workflow.step to continue"
+            )
+        print(json.dumps(_modify_plan_out, indent=2))
+        return 0
+
+    if gate_only:
+        # RESOLVE-GATE-ONLY (decision A): every remaining action here
+        # (approve, force-dispatch, modify-budget, change-squads) has already
+        # had its gate resolved above -- pending_hitl cleared, hitl_history
+        # recorded, per-action patch applied (budget/squads/reflexion-override/
+        # policy_override), spool pruned, TheEights resolution attempted.
+        # Stop here: never call `sup.invoke` -- no node_dispatch, no squad of
+        # any kind runs on the stub. Re-read the checkpoint (not `values`,
+        # which is the PRE-patch snapshot) so phase/pending_hitl reflect what
+        # was actually just written.
+        _post_snap = sup.get_state(config)
+        _post_values = _post_snap.values if _post_snap is not None and _post_snap.values else {}
+        _post_phase = _post_values.get("phase", values.get("phase"))
+        print(json.dumps({
+            "workflow_id": wf,
+            "ok": True,
+            "resumed": False,
+            "gate_only": True,
+            "graph_reentered": False,
+            "action": action,
+            "phase": _post_phase,
+            "status": _post_phase,
+            "gate_node": resolution.get("gate_node"),
+            "pending_hitl": _post_values.get("pending_hitl"),
+            "eights_resolution": "deferred",
+            "note": (
+                "gate resolved without re-entering the graph — call "
+                "hydra.workflow.step to continue"
+            ),
         }, indent=2))
         return 0
 
@@ -3061,7 +3217,7 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
 
 def _reenter_graph_after_dispatch(
     sup: Any, config: dict, patch: dict[str, object], *, max_iterations: int = 6,
-    target_next: tuple[str, ...] = ("plan_gate",),
+    target_next: tuple[str, ...] = ("plan_gate",), gate_only: bool = False,
 ) -> list[str]:
     """P5b Task 3: re-enter the compiled graph as if `dispatch` just finished.
 
@@ -3080,8 +3236,20 @@ def _reenter_graph_after_dispatch(
 
     Returns the final ``next`` tuple as a list (JSON-friendly), for the
     caller to report back to the operator.
+
+    ``gate_only`` (RESOLVE-GATE-ONLY, resume --gate-only's modify-plan branch):
+    the ``update_state(..., as_node="dispatch")`` call is a pure checkpoint
+    mutation -- it stamps the new plan task/revision onto the state but does
+    NOT execute any graph node. The ``sup.invoke(None, ...)`` calls in the loop
+    below are what actually re-enter the graph (running `after_dispatch` and
+    whatever it routes to). When ``gate_only`` is set, apply the state
+    mutation and return immediately without ever invoking -- the host's
+    step/submit loop picks up the newly-authored plan-revision task from its
+    own cursor exactly like a fresh planner task.
     """
     sup.update_state(config, patch, as_node="dispatch")
+    if gate_only:
+        return list(getattr(sup.get_state(config), "next", None) or [])
     for _ in range(max_iterations):
         parked_at = getattr(sup.get_state(config), "next", None)
         if not parked_at or tuple(parked_at) == target_next:
@@ -5071,6 +5239,17 @@ def main(argv: list[str] | None = None) -> int:
                         "that channel is character- and length-bounded."))
     rs.add_argument("--live", action="store_true",
                     help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
+    rs.add_argument("--gate-only", dest="gate_only", action="store_true",
+                    help=(
+                        "Resolve the pending HITL gate (lock, operator-capability "
+                        "mint+verify, spool prune, state patch) WITHOUT re-entering "
+                        "the compiled graph (no sup.invoke, no node_dispatch, no "
+                        "squad of any kind runs). The attended MCP route "
+                        "(hydra.workflow.resume when detached launch is not "
+                        "allowed) always passes this flag; the host's existing "
+                        "step/submit loop continues the workflow from its cursor. "
+                        "Mutually informative with --live: gate-only never spawns "
+                        "the live MCP dispatcher's drive-pp loop regardless."))
     rs.add_argument("--verbose", action="store_true")
 
     # Continuation transport: inject host-completed skill envelopes into a

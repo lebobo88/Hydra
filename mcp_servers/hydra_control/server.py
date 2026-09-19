@@ -5,19 +5,36 @@ C5 eights-audit (2026-06-07): added hydra.cockpit.audit tool.
 
 Tools:
   - hydra.control.ping       — no-arg liveness probe (AgentMesh healthProbe)
-  - hydra.workflow.resume    — resolve a pending HITL gate by launching a
-                               DETACHED `hydra resume` CLI subprocess
+  - hydra.workflow.resume    — resolve a pending HITL gate. Two transports,
+                               chosen by HYDRA_ALLOW_DETACHED (see below):
+                               a DETACHED `hydra resume --live` CLI subprocess,
+                               or (the normal interactive-session case) a
+                               SYNCHRONOUS in-process `hydra resume --gate-only`
+                               that resolves the gate and returns WITHOUT ever
+                               re-entering the compiled graph.
   - hydra.cockpit.audit      — file a 'cockpit_write' eights audit envelope
                                for every cockpit write action (spool-safe)
 
-Why detached: a LangGraph continuation is long-running (squad dispatch,
-judging, synthesis) and cannot complete synchronously inside an MCP tool
-call without blocking stdio and blowing the caller's per-call timeout. The
-tool therefore validates, launches, and returns immediately with
-{ok, launched: true, pid, log}; progress is observable via
-hydra-mem.workflow_status and the workflow's trace.jsonl. The CLI itself is
-idempotent — resuming a workflow whose gate is already cleared is a no-op —
-so a retried launch never double-applies.
+Why detached (automation path, HYDRA_ALLOW_DETACHED=1): a LangGraph
+continuation is long-running (squad dispatch, judging, synthesis) and cannot
+complete synchronously inside an MCP tool call without blocking stdio and
+blowing the caller's per-call timeout. The tool therefore validates,
+launches, and returns immediately with {ok, launched: true, pid, log};
+progress is observable via hydra-mem.workflow_status and the workflow's
+trace.jsonl. The CLI itself is idempotent — resuming a workflow whose gate is
+already cleared is a no-op — so a retried launch never double-applies.
+
+Why gate-only, not detached (attended/interactive path, the default):
+launching ANY detached subprocess from an interactive session is refused by
+`_detached_allowed()` regardless of tool — resume must not be an exception.
+RESOLVE-GATE-ONLY (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7 path K follow-up)
+resolves the gate synchronously and in-band (`_run_cli_json`, never `--live`)
+via `hydra resume --gate-only`, which mints+verifies the operator capability
+(refusing before touching state if the identity is unknown or the token is
+degraded), applies the per-action state patch, prunes the spool, and returns
+WITHOUT calling `sup.invoke` — no node_dispatch, no squad of any kind runs.
+The attended host's own step/submit loop continues the workflow from its
+cursor; the result JSON says explicitly `graph_reentered: false`.
 
 This server is intentionally SEPARATE from hydra_memory: hydra_memory is a
 read-only surface that AgentMesh's read/stitch federation clients may call;
@@ -369,24 +386,30 @@ def _run_resume_attended(workflow_id: str, action: str, option: str | None,
     spawn `hydra resume --live` (a DETACHED, long-running process the
     interactive session's `_detached_allowed()` gate exists specifically to
     refuse). Instead this runs `python -m hydra_core.cli resume <id> --action
-    <action> [--option ...] [--critique-ref ...]` WITHOUT `--live`, short-lived
-    and in-process on `_NullDispatcher`.
+    <action> --gate-only [--option ...] [--critique-ref ...]` WITHOUT `--live`,
+    short-lived and in-process on `_NullDispatcher`.
 
-    Path S makes `_NullDispatcher` never replay the eights spool, and E2-22
-    (hydra_core/supervisor.py's dispatch node) already defers every `mcp` /
-    `claude-native` squad task to the attended host the moment it sees a
-    non-live dispatcher (`live_execution` unset) — so this resume resolves the
-    gate (lock, capability mint+verify, spool prune, TheEights resolve) and
-    then genuinely stops at the attended hand-off: `sup.invoke(None, ...)`
-    re-enters the graph, but `node_dispatch` marks every mcp/claude-native task
-    `deferred_to_host` rather than executing it on the stub, and
-    `after_dispatch` routes straight to `await_host` -> END. No stage, squad
-    result, or workflow completion is ever recorded from stub output on this
-    path. The host's existing step/submit loop (hydra.workflow.step /
-    hydra.workflow.submit_host_result) then continues engineering from its
-    cursor exactly as if the workflow had never paused.
+    RESOLVE-GATE-ONLY (operator decision A, cross-vendor finding 1): this
+    ALWAYS passes `--gate-only`. The CLI's gate_only mode resolves the gate
+    (lock, operator-capability mint+verify — REFUSING before any state change
+    if the operator identity is unknown or the minted capability is degraded,
+    decision B — spool prune, per-action state patch clearing pending_hitl and
+    recording the resolution) and returns WITHOUT EVER calling `sup.invoke`:
+    no node_dispatch, no squad of any kind runs, not even on the stub
+    `_NullDispatcher`. This is deliberately NOT the same guarantee as E2-22's
+    non-live deferral filter (which still applies to node_dispatch generally
+    and is untouched) — gate-only is a stronger, explicit guarantee that
+    graph execution never happens on this transport at all. TheEights
+    resolution is honestly reported as deferred (decision C): `_NullDispatcher`
+    cannot reach the shared ledger, so the ticket is left for the next live
+    call (`hydra eights-hitl-reconcile` / `hydra reap --apply`) rather than
+    being silently skipped or falsely claimed resolved. The host's existing
+    step/submit loop (hydra.workflow.step / hydra.workflow.submit_host_result)
+    then continues the workflow from its cursor exactly as if it had never
+    paused — the CLI result JSON says so explicitly
+    (`graph_reentered: false`, a `note` naming `hydra.workflow.step`).
     """
-    cli_args = ["resume", workflow_id, "--action", action]
+    cli_args = ["resume", workflow_id, "--action", action, "--gate-only"]
     if option:
         cli_args.extend(["--option", option])
     if critique_ref:
@@ -699,6 +722,27 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
                     "janitor sweep_stale_worktrees reap it once terminal)"
                 ),
             ]
+        if err_label == "resume":
+            # Operator decision D: a timed-out (gate_only) resume must tell
+            # the caller how to discover state before retrying, and whether a
+            # retry is safe.
+            _tout["retry_guidance"] = (
+                f"read state first via hydra.workflow.step({workflow_id!r}) or "
+                "`hydra status` before retrying the resume — the gate may "
+                "already be resolved (a retry against an already-cleared gate "
+                "is a documented no-op, reason=no_pending_gate)."
+            )
+            # Safe: gate-only never re-enters the graph (no sup.invoke), and
+            # `_acquire_resume_lock` reclaims by OWNER LIVENESS, not
+            # wall-clock — subprocess.run kills the timed-out child on
+            # TimeoutExpired, so its PID goes dead immediately and the lock is
+            # reclaimed on the very next attempt rather than staying stuck.
+            # A retry after a partial gate-only resume (killed mid-mint, or
+            # even mid-patch) is therefore safe: it either re-runs the small
+            # gate-only sequence from scratch, or — if the patch had already
+            # landed — observes pending_hitl already cleared and reports
+            # `no_pending_gate` rather than re-mutating anything.
+            _tout["retry_after_partial_gate_only_is_safe"] = True
         return _tout
     if proc.returncode != 0:
         return {"ok": False, "error": f"{err_label}_failed", "workflow_id": workflow_id,
@@ -1489,10 +1533,24 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "hydra.workflow.resume": {
         "description": (
-            "Resolve a pending HITL gate: launches a DETACHED `hydra resume` "
-            "CLI subprocess and returns immediately ({ok, launched, pid, log}). "
-            "Idempotent at the CLI layer — no pending gate means no-op. "
-            "WRITE tool: only reachable via meshd's sanctioned write path."),
+            "Resolve a pending HITL gate. Transport depends on "
+            "HYDRA_ALLOW_DETACHED: with the gate set (automation), launches a "
+            "DETACHED `hydra resume --live` CLI subprocess and returns "
+            "immediately ({ok, launched, pid, log}). Without it (the normal "
+            "interactive session), runs `hydra resume --gate-only` "
+            "SYNCHRONOUSLY in-process and returns the resolved gate's result "
+            "in the same call ({ok, resumed: false, gate_only: true, "
+            "graph_reentered: false, phase, pending_hitl, ...}) — the gate "
+            "clears (lock, operator-capability mint+verify, spool prune, "
+            "state patch) but the compiled graph is NEVER re-entered (no "
+            "sup.invoke, no node_dispatch, no squad runs); the caller's "
+            "existing step/submit loop continues the workflow from its "
+            "cursor. Refuses with {ok: false, error: "
+            "\"operator_identity_required\"} before touching any state if "
+            "the operator identity is unknown or the minted capability is "
+            "degraded. Idempotent at the CLI layer — no pending gate means "
+            "no-op. WRITE tool: only reachable via meshd's sanctioned write "
+            "path."),
         "inputSchema": {
             "type": "object",
             "properties": {
