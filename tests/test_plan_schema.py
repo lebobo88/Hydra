@@ -15,7 +15,7 @@ from hydra_core.eights import ALL_CELLS, cell_of, to_eights_cell
 from hydra_core.judge.registry import get_rubric, list_rubrics
 from hydra_core.judge.router import route_judge
 from hydra_core.judge.rubric_resolution import DEFAULT_RUBRIC_BY_GATE_TYPE
-from hydra_core.schemas import Plan, PlanStep, SCHEMA_REGISTRY, validate_envelope
+from hydra_core.schemas import Constraints, PRD, Plan, PlanStep, SCHEMA_REGISTRY, validate_envelope
 from hydra_core.state import HydraState
 
 
@@ -258,3 +258,78 @@ def test_plan_envelope_type_routes_cross_vendor_with_rubric():
     assert route.tier == "cross_vendor"
     assert "plan-decomposition-quality@1" in route.rubric_ids
     assert "constitution-alignment@1" in route.rubric_ids
+
+
+# --------------------------------------------------------------------------- #
+# Strict RFC 8259 JSON — non-finite budgets rejected at construction          #
+# --------------------------------------------------------------------------- #
+#
+# AgentSmith's checkPlan validator (X2) refuses NaN/Infinity/-Infinity, which
+# are not valid JSON tokens even though Python's `json` module writes them by
+# default. `Constraints.budget_usd` and `PlanStep.estimated_budget_usd` must
+# reject those three values at construction while still accepting `None` and
+# ordinary finite floats.
+
+_NON_FINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE, ids=["nan", "inf", "-inf"])
+def test_constraints_budget_usd_rejects_non_finite(bad):
+    with pytest.raises(ValidationError, match="budget_usd"):
+        Constraints(budget_usd=bad)
+
+
+@pytest.mark.parametrize("bad", _NON_FINITE, ids=["nan", "inf", "-inf"])
+def test_plan_step_estimated_budget_usd_rejects_non_finite(bad):
+    with pytest.raises(ValidationError, match="estimated_budget_usd"):
+        PlanStep(step_id="a", target_squad="engineering", envelope_type="DEV_TASK",
+                  description="A", estimated_budget_usd=bad)
+
+
+def test_constraints_budget_usd_accepts_none_and_finite():
+    assert Constraints(budget_usd=None).budget_usd is None
+    assert Constraints(budget_usd=0.0).budget_usd == 0.0
+    assert Constraints(budget_usd=123.45).budget_usd == 123.45
+
+
+def test_plan_step_estimated_budget_usd_accepts_none_and_finite():
+    step_none = PlanStep(step_id="a", target_squad="engineering", envelope_type="DEV_TASK",
+                          description="A")
+    assert step_none.estimated_budget_usd is None
+    step_val = PlanStep(step_id="b", target_squad="engineering", envelope_type="DEV_TASK",
+                         description="B", estimated_budget_usd=42.0)
+    assert step_val.estimated_budget_usd == 42.0
+
+
+def test_prd_constraints_still_validates_finite_budget():
+    # Constraints is shared by every HydraEnvelope subclass, not just Plan.
+    # A non-Plan envelope embedding it (PRD here) must still construct
+    # normally with an ordinary finite budget.
+    prd = PRD(
+        origin_squad="hydra", workflow_id=WF, source_goal_id=uuid.uuid4(),
+        summary="a prd", constraints=Constraints(budget_usd=99.0),
+    )
+    assert prd.constraints.budget_usd == 99.0
+
+
+def test_prd_constraints_rejects_non_finite_budget():
+    with pytest.raises(ValidationError, match="budget_usd"):
+        PRD(
+            origin_squad="hydra", workflow_id=WF, source_goal_id=uuid.uuid4(),
+            summary="a prd", constraints=Constraints(budget_usd=float("nan")),
+        )
+
+
+def test_removing_allow_inf_nan_would_let_nan_through():
+    """Mutation proof (revert immediately): re-derive the pre-fix field on a
+    throwaway subclass to show NaN/Infinity constructed cleanly before the
+    `allow_inf_nan=False` constraint existed. Does not mutate the real model.
+    """
+    from pydantic import BaseModel
+    from typing import Optional as _Optional
+
+    class _UnconstrainedBudget(BaseModel):
+        budget_usd: _Optional[float] = None  # the field exactly as it read before this fix
+
+    assert _UnconstrainedBudget(budget_usd=float("nan")).budget_usd != _UnconstrainedBudget(budget_usd=float("nan")).budget_usd
+    assert _UnconstrainedBudget(budget_usd=float("inf")).budget_usd == float("inf")

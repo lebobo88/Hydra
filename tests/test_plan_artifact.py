@@ -1254,6 +1254,55 @@ def test_render_plan_json_round_trips_step_ids():
     assert {s["step_id"] for s in payload["steps"]} == {"a", "b", "c", "d"}
 
 
+def _reject_constants(token: str):
+    raise ValueError(f"strict JSON parser refused constant: {token}")
+
+
+def test_render_plan_json_parses_with_strict_rfc8259_parser():
+    """`json.loads` accepts the literal `NaN`/`Infinity`/`-Infinity` tokens by
+    default (Python's own non-standard extension) -- passing
+    `parse_constant` makes it behave like a strict RFC 8259 parser that
+    refuses those tokens, so this test actually proves the emitted text has
+    none of them, not merely that ordinary `json.loads` didn't choke.
+    """
+    plan = _diamond_plan()
+    text = render_plan_json(plan)
+    payload = json.loads(text, parse_constant=_reject_constants)
+    assert payload["steps"][3]["estimated_budget_usd"] == 42.0
+
+
+def test_render_plan_json_raises_on_model_construct_nan_budget():
+    """Mutation proof (revert immediately): a `Plan` forced to hold NaN via
+    `model_construct` (bypasses field validation entirely) must make
+    `render_plan_json` raise naming the field, never write the literal `NaN`.
+    """
+    plan = _diamond_plan()
+    hostile_step = plan.steps[3].model_copy(update={"estimated_budget_usd": float("nan")})
+    hostile_steps = list(plan.steps[:3]) + [hostile_step]
+    hostile_plan = plan.model_construct(**{**plan.__dict__, "steps": hostile_steps})
+
+    with pytest.raises(ValueError, match="estimated_budget_usd"):
+        render_plan_json(hostile_plan)
+
+
+def test_render_plan_json_allow_nan_true_would_write_invalid_json():
+    """Mutation proof (revert immediately): show that plain `json.dumps`
+    (the pre-fix `allow_nan=True` default) would happily write the literal
+    `NaN` token for the same hostile plan `render_plan_json` now refuses --
+    i.e. the `allow_nan=False` backstop, not something else, is what raises.
+    """
+    plan = _diamond_plan()
+    hostile_step = plan.steps[3].model_copy(update={"estimated_budget_usd": float("nan")})
+    hostile_steps = list(plan.steps[:3]) + [hostile_step]
+    hostile_plan = plan.model_construct(**{**plan.__dict__, "steps": hostile_steps})
+
+    payload = hostile_plan.model_dump(mode="json")
+    text = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False)
+    assert "NaN" in text
+    with pytest.raises(ValueError):
+        json.loads(text, parse_constant=_reject_constants)
+
+
 # --------------------------------------------------------------------------- #
 # Hook lockstep — docs/plans carve-out (both hooks must agree)               #
 # --------------------------------------------------------------------------- #

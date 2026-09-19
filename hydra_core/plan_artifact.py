@@ -28,7 +28,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from .schemas import Plan, PlanStep
 
@@ -496,12 +496,54 @@ def append_governance_note(html_text: str, note: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _find_non_finite_field(obj: Any, path: str = "$") -> str | None:
+    """Depth-first search for the first non-finite float in ``obj``.
+
+    Returns a dotted/bracketed path string (e.g. ``"$.steps[2].estimated_
+    budget_usd"``) naming the offending field, or ``None`` if every float in
+    ``obj`` is finite. Used only to build a clear error message after
+    ``json.dumps(..., allow_nan=False)`` has already raised ``ValueError`` --
+    the backstop needs to say WHICH field broke strict JSON, not just that
+    something did.
+    """
+    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
+        return path
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            found = _find_non_finite_field(value, f"{path}.{key}")
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            found = _find_non_finite_field(value, f"{path}[{i}]")
+            if found is not None:
+                return found
+    return None
+
+
 def render_plan_json(plan: Plan) -> str:
     """Render ``plan`` as a deterministic, machine-readable JSON companion.
 
     This is what a future AgentSmith ``checkPlan`` validator would consume,
     since the HTML rendering above has no frontmatter to inspect. Keys are
     sorted and the payload is stable across calls for the same `Plan`.
+
+    ``Constraints.budget_usd`` and ``PlanStep.estimated_budget_usd`` already
+    reject NaN/Infinity/-Infinity at construction (see `hydra_core.schemas`),
+    so a normally-constructed `Plan` can never reach this function holding a
+    non-finite value. ``allow_nan=False`` is a BACKSTOP for a `Plan` built via
+    `model_construct` (which skips validation) or any other path that bypasses
+    the schema: rather than silently emitting the bare word `NaN`/`Infinity`
+    (valid Python-`json` output, invalid RFC 8259 JSON that AgentSmith's
+    `checkPlan` refuses), this raises `ValueError` naming the offending field
+    and never writes anything.
     """
     payload = plan.model_dump(mode="json")
-    return json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    try:
+        return json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    except ValueError as exc:
+        field = _find_non_finite_field(payload)
+        raise ValueError(
+            f"Plan {plan.id} contains a non-finite value at {field or '<unknown field>'}; "
+            "refusing to write invalid JSON"
+        ) from exc

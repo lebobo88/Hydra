@@ -37,7 +37,13 @@ class MemoryRef(BaseModel):
 
 
 class Constraints(BaseModel):
-    budget_usd: Optional[float] = None
+    # AgentSmith's checkPlan validator (X2) requires strict RFC 8259 JSON —
+    # NaN/Infinity/-Infinity are not valid JSON tokens even though Python's
+    # `json` module accepts them by default (`allow_nan=True`). `allow_
+    # inf_nan=False` rejects those three inputs at construction time while
+    # still accepting `None` and any ordinary finite float; no other
+    # constraint (e.g. non-negativity) is added.
+    budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
     token_limit: Optional[int] = None
     deadline_ts: Optional[datetime] = None
     risk_tolerance: Literal["low", "medium", "high"] = "medium"
@@ -278,7 +284,8 @@ class PlanStep(BaseModel):
     model_tier: Optional[str] = None
     target_repo_id: Optional[str] = None
     target_repo_subpath: Optional[str] = None
-    estimated_budget_usd: Optional[float] = None
+    # See Constraints.budget_usd above — same strict-JSON rationale.
+    estimated_budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
     taxonomy_section: Optional[str] = None
     rationale: Optional[str] = None
 
