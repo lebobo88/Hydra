@@ -18,9 +18,16 @@ Operationally:
 1. Query `python -m hydra_core.cli status <workflow_id>` and render the pending
    HITL request exactly enough for the operator to review.
 2. Obtain the operator's explicit confirmation. Never infer it from prior text.
-3. Call `hydra.workflow.resume` with `action: "approve"` (or
-   `python -m hydra_core.cli approve <workflow_id>`). Render the authoritative
-   response and stop again if it returns another gate.
+3. Call `hydra.workflow.resume` with `action: "approve"` (or, from a shell,
+   `python -m hydra_core.cli resume <workflow_id> --action approve
+   --gate-only`). Render the authoritative response and stop again if it
+   returns another gate.
+
+   Do **not** use `python -m hydra_core.cli approve <workflow_id>` for an
+   attended workflow: that subcommand has no `--gate-only` and always
+   re-enters the graph on `_NullDispatcher` (a stub dispatch, not the real
+   attended step/submit loop) — the stub-dispatch gap. It exists only for
+   the legacy non-attended path.
 
 Do not directly edit `HydraState`, `hitl_history`, a checkpoint, or a trace.
 
@@ -60,3 +67,16 @@ follow-up): `hydra.workflow.resume` picks its transport from
   route, before any subprocess runs, because it is a LIVE operation, not a
   gate resolution — only the detached CLI (`HYDRA_ALLOW_DETACHED=1`) may
   run it.
+
+  **Timeout and retry:** the gate-only subprocess is bounded by a
+  30-second synchronous timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
+  A gate-only resolution never dispatches — it is in-process mint+verify,
+  a checkpoint patch, and a spool prune, all on `_NullDispatcher` — so 30s
+  is generous headroom for cold start, not an expected duration; a timeout
+  usually means the host process itself is stalled, not that the gate is
+  slow. On a timeout or any other failure, simply retry the same
+  `hydra.workflow.resume` call (or the equivalent `cli resume --gate-only`
+  invocation) with the same `workflow_id`/`action`/`option`: the route is
+  idempotent — a retry after a resolution that already landed on the
+  checkpoint reconciles any stale spooled HITL request rather than
+  double-applying the gate or erroring.

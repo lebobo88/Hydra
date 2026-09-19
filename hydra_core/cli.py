@@ -1338,7 +1338,14 @@ def _resolve_operator_capability_for_resume(
 
     # M3: verify the just-minted capability before applying the patch.
     # Fail-closed on a tampered/invalid token; warn-and-continue on a
-    # degraded token (no key or unknown operator — already warned at mint).
+    # degraded token (no key or unknown operator — already warned at mint)
+    # -- but ONLY on the legacy non-gate_only CLI path. Cross-vendor
+    # finding 4: the substring-based degrade-and-proceed posture below is
+    # NOT safe under gate_only, where operator decision B demands failing
+    # CLOSED on any verification result whose `valid` is not exactly
+    # `True`, and on any verifier exception -- a "degraded"/"no operator
+    # key"/"no key" substring in the failure reason must not be treated as
+    # a green light for an unauthenticated resume.
     if operator_capability_patch is not None:
         try:
             from .auth.capability import verify_operator_capability as _verify_cap
@@ -1361,10 +1368,8 @@ def _resolve_operator_capability_for_resume(
                 expected_workflow_id=wf,
                 expected_resource_id=_m3_resource_id,
             )
-            if not _m3_result.get("valid"):
+            if _m3_result.get("valid") is not True:
                 _m3_reason = _m3_result.get("reason", "unknown")
-                # Degrade-warn for cases where no key was configured or the
-                # token is intentionally degraded (foundation run posture).
                 _m3_sig = (operator_capability_patch.get("sig") or {})
                 _m3_is_degraded = (
                     _m3_sig.get("degraded") is True
@@ -1373,6 +1378,38 @@ def _resolve_operator_capability_for_resume(
                     or "no operator key" in _m3_reason
                     or "no key" in _m3_reason
                 )
+                if gate_only:
+                    # Decision B: fail closed, unconditionally -- no
+                    # substring carve-out for "degraded"/"no operator
+                    # key"/"no key" is allowed to proceed under gate_only.
+                    # Nothing has been mutated yet. A previously-degraded
+                    # reason now surfaces the identity-required shape (it
+                    # used to warn-and-proceed, the gap this closes); a
+                    # non-degraded reason keeps the pre-existing
+                    # `capability_verify_failed` shape, which already
+                    # refused on gate_only before this fix.
+                    if _m3_is_degraded:
+                        return None, _operator, {
+                            "ok": False,
+                            "error": "operator_identity_required",
+                            "workflow_id": wf,
+                            "action": action,
+                            "message": (
+                                "attended gate-only resume requires a "
+                                "verifiable operator capability; "
+                                f"verification failed ({_m3_reason}). Set "
+                                "HYDRA_OPERATOR_ID and HYDRA_OPERATOR_KEY to "
+                                "identify and authenticate the caller. "
+                                "Nothing was changed."
+                            ),
+                        }
+                    return None, _operator, {
+                        "error": f"capability_verify_failed: {_m3_reason}",
+                        "workflow_id": wf,
+                    }
+                # Legacy non-gate_only path: degrade-warn for cases where no
+                # key was configured or the token is intentionally degraded
+                # (foundation run posture); fail closed on anything else.
                 if _m3_is_degraded:
                     _log_cli.warning(
                         "capability verify: degraded (%s) — approval proceeds "
@@ -1382,14 +1419,28 @@ def _resolve_operator_capability_for_resume(
                 else:
                     # This refusal shape (bare "capability_verify_failed", no
                     # "ok"/"operator_identity_required" wrapper) predates
-                    # gate_only and is unchanged for both transports — the
-                    # caller always prints-and-returns-1 for any non-None
-                    # refusal, gate_only or not.
+                    # gate_only and is unchanged for the legacy transport.
                     return None, _operator, {
                         "error": f"capability_verify_failed: {_m3_reason}",
                         "workflow_id": wf,
                     }
         except Exception as _m3_exc:  # noqa: BLE001
+            if gate_only:
+                # Decision B: a verifier exception under gate_only must
+                # refuse, not warn-and-proceed -- an exception is not proof
+                # of a valid capability.
+                return None, _operator, {
+                    "ok": False,
+                    "error": "operator_identity_required",
+                    "workflow_id": wf,
+                    "action": action,
+                    "message": (
+                        "attended gate-only resume requires a verifiable "
+                        "operator capability; verification raised "
+                        f"{type(_m3_exc).__name__}: {_m3_exc}. Nothing was "
+                        "changed."
+                    ),
+                }
             _log_cli.warning(
                 "verify_operator_capability raised %s: %s — approval proceeds",
                 type(_m3_exc).__name__, _m3_exc,
@@ -1449,6 +1500,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # below -- that branch is the one action here that is NOT gate-only-safe
     # (cross-vendor finding 1) and needs the flag to refuse.
     gate_only = bool(getattr(args, "gate_only", False))
+
+    # Cross-vendor finding 3 (defence in depth -- argparse's mutually_exclusive_group
+    # on the `resume` subparser already rejects this combination before any code
+    # here runs; this guard covers any other caller of `_cmd_resume_locked`, e.g. a
+    # future subcommand or a test that builds `args` directly). Checked BEFORE any
+    # side effect of any kind -- no dispatcher construction, no spool drain, no
+    # checkpoint load, nothing.
+    if gate_only and getattr(args, "live", False):
+        print(json.dumps({
+            "ok": False,
+            "error": "gate_only_live_conflict",
+            "workflow_id": wf,
+            "action": action,
+            "message": (
+                "--gate-only and --live are mutually exclusive: --gate-only "
+                "never spawns a live MCP dispatcher or drains the eights "
+                "spool. Use --gate-only alone for the attended host loop, or "
+                "--live alone for a detached resume. Nothing was changed."
+            ),
+        }), file=sys.stderr)
+        return 1
 
     # W2-4: recover-stalled-stage does not touch the LangGraph checkpoint
     # interrupt machinery the actions below use -- a stranded attended stage
@@ -1532,6 +1604,31 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         return 1
     values = snap.values
     pending = values.get("pending_hitl")
+
+    # RESOLVE-GATE-ONLY single auth gate (cross-vendor finding 1, CRITICAL):
+    # resolve the operator capability EXACTLY ONCE here, immediately after
+    # the checkpoint is loaded and BEFORE ANY side effect below -- no
+    # telemetry write (`emit(...)`), no spool prune/reconcile
+    # (`_prune_spooled_hitl_requests`), no `sup.update_state`, no
+    # `hitl_history` append, no graph re-entry (`sup.invoke`), and no
+    # early-return branch of any kind that writes anything. Every gate_only
+    # branch further down (bare-interrupt approve/force-dispatch, bare-
+    # interrupt reject, the no-pending-gate branch, and the general
+    # pending-gate path) reuses this single result instead of re-resolving
+    # or, worse, skipping the check entirely (the CRITICAL gap: every
+    # no-pending gate_only branch used to prune the spool with zero identity
+    # verification). An unresolved refusal here changes NOTHING -- the
+    # checkpoint was only read (`sup.get_state`), never written.
+    operator_capability_patch: dict | None = None
+    _operator = ""
+    if gate_only:
+        operator_capability_patch, _operator, _refusal = (
+            _resolve_operator_capability_for_resume(
+                args, wf, action, pending, gate_only=gate_only))
+        if _refusal is not None:
+            print(json.dumps(_refusal), file=sys.stderr)
+            return 1
+
     if not pending:
         # MU7: inspect snap.next to distinguish a bare LangGraph interrupt
         # (no pending_hitl but graph paused before synthesis/judge_synthesis)
@@ -1612,14 +1709,10 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # Cross-vendor finding 2: this branch mutates checkpoint state
             # (`sup.update_state` below) with no pending_hitl gate at all --
             # it must pass through the SAME identity check as every other
-            # mutating branch under gate_only, not skip it because there
-            # happens to be no `pending` dict to attach a capability to.
-            if gate_only:
-                _cap_patch, _operator, _refusal = _resolve_operator_capability_for_resume(
-                    args, wf, action, None, gate_only=gate_only)
-                if _refusal is not None:
-                    print(json.dumps(_refusal), file=sys.stderr)
-                    return 1
+            # mutating branch under gate_only. That check now runs exactly
+            # ONCE, at the top of this function (finding 1) -- a refusal
+            # there already returned before this branch could ever be
+            # reached, so there is nothing further to verify here.
             sup.update_state(config, {"phase": "surfaced"})
             print(json.dumps({
                 "workflow_id": wf,
@@ -1686,17 +1779,19 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # mutation (`sup.update_state(config, patch)` below). Historically this
     # only ran for `_MUTATING_RESUME_ACTIONS`; `reject` was NOT a member, so
     # a gate-only reject cleared pending_hitl with no identity check at all.
-    # Widened to `or gate_only` so every action reaching this point under
-    # gate_only goes through the identical single-source-of-truth check in
-    # `_resolve_operator_capability_for_resume` -- the legacy non-gate_only
-    # CLI path keeps the original narrower allow-list (WS-AUTH run-A warn-
-    # and-proceed posture, unchanged).
+    #
+    # Under gate_only, `operator_capability_patch`/`_operator` were ALREADY
+    # resolved exactly once at the top of this function (finding 1) -- a
+    # refusal there would have returned before reaching this point, so
+    # nothing further needs to happen here and the resolved values must NOT
+    # be re-initialised/overwritten. Only the legacy non-gate_only CLI path
+    # (direct `hydra resume` without --gate-only) still mints here, scoped to
+    # its original narrower allow-list (WS-AUTH run-A warn-and-proceed
+    # posture, unchanged).
     _MUTATING_RESUME_ACTIONS = frozenset({"approve", "force-dispatch",
                                           "modify-budget", "change-squads",
                                           "modify-plan"})
-    operator_capability_patch: dict | None = None
-    _operator = ""
-    if action in _MUTATING_RESUME_ACTIONS or gate_only:
+    if not gate_only and action in _MUTATING_RESUME_ACTIONS:
         operator_capability_patch, _operator, _refusal = (
             _resolve_operator_capability_for_resume(
                 args, wf, action, pending, gate_only=gate_only))
@@ -5373,9 +5468,19 @@ def main(argv: list[str] | None = None) -> int:
                         "MemoryRef key naming the operator's revision critique. "
                         "Never pass the critique text itself via --option -- "
                         "that channel is character- and length-bounded."))
-    rs.add_argument("--live", action="store_true",
-                    help="Continue with the live MCP dispatcher (talks to pp_harness etc.)")
-    rs.add_argument("--gate-only", dest="gate_only", action="store_true",
+    # Cross-vendor finding 3: --gate-only and --live are MUTUALLY EXCLUSIVE,
+    # not merely "informative" of one another -- --live constructs a live
+    # MCPStdioDispatcher and starts a background eights spool drain before
+    # any gate-only logic runs; that is exactly the live side effect the
+    # attended gate-only route promises never to trigger. Enforced two ways:
+    # (1) an argparse mutually-exclusive group rejects the combination before
+    # any code in this module runs at all; (2) `_cmd_resume_locked` also
+    # checks explicitly (defence in depth for any non-argparse caller).
+    _rs_live_gate = rs.add_mutually_exclusive_group()
+    _rs_live_gate.add_argument("--live", action="store_true",
+                    help="Continue with the live MCP dispatcher (talks to pp_harness etc.). "
+                         "Mutually exclusive with --gate-only.")
+    _rs_live_gate.add_argument("--gate-only", dest="gate_only", action="store_true",
                     help=(
                         "Resolve the pending HITL gate (lock, operator-capability "
                         "mint+verify -- covering EVERY action that can mutate "
@@ -5389,8 +5494,9 @@ def main(argv: list[str] | None = None) -> int:
                         "operation, not a gate resolution -- use the detached "
                         "--live route for it instead); the host's existing "
                         "step/submit loop continues the workflow from its cursor. "
-                        "Mutually informative with --live: gate-only never spawns "
-                        "the live MCP dispatcher's drive-pp loop regardless."))
+                        "Mutually EXCLUSIVE with --live: gate-only never spawns the "
+                        "live MCP dispatcher and refuses outright if --live is also "
+                        "given."))
     rs.add_argument("--verbose", action="store_true")
 
     # Continuation transport: inject host-completed skill envelopes into a

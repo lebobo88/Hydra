@@ -86,3 +86,21 @@ detached.
   smoke/finalization, and merge code — not a gate resolution. Only the
   DETACHED route (`hydra resume --live --action recover-stalled-stage`,
   requires `HYDRA_ALLOW_DETACHED=1`) may run it.
+
+  `--gate-only` and `--live` are mutually exclusive on the `hydra resume`
+  CLI — never pass both. `--live` builds a real `MCPStdioDispatcher` and
+  starts a background eights spool drain, exactly the live side effects
+  the gate-only route promises never to trigger; the CLI refuses the
+  combination before doing any work (argparse-level and, defensively, a
+  matching runtime check).
+
+  **Timeout and retry:** the gate-only subprocess is bounded by a
+  30-second synchronous timeout (`HYDRA_RESUME_TIMEOUT_S`, default `30`).
+  Gate-only work is in-process mint+verify, a checkpoint patch, and a
+  spool prune on `_NullDispatcher` — no dispatch, no subprocess, no
+  network call — so a timeout signals a stalled host process, not a slow
+  gate. Retry the identical `hydra.workflow.resume` call (same
+  `workflow_id`/`action`/`option`) on any failure; the route is
+  idempotent, including reconciling a stale spooled HITL request left by
+  a prior call that was interrupted between its checkpoint patch and its
+  spool prune.
