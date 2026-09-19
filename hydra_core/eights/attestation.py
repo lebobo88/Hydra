@@ -400,6 +400,27 @@ class EightsAttestor:
                 "dead_lettered": 0,
                 "dead_lettered_expired": 0,
             }
+        # Path S (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7): a stub dispatcher
+        # (e.g. cli._NullDispatcher, used on every non-`--live` CLI path and
+        # by `hydra plan`) carries an explicit `dry_run = True` marker. It
+        # performs no I/O, so replaying against it would be a no-op that
+        # still reads the spool, retries entries against a fake "success",
+        # and can dead-letter or move files for no operator-visible reason.
+        # Key ONLY on the explicit marker — never on `live_execution` — so
+        # real test doubles without the marker (e.g. tests/test_eights_replay_
+        # queue.py's `_UpDispatcher`) keep replaying untouched.
+        if getattr(self.dispatcher, "dry_run", False) is True:
+            logger.info(
+                "eights.replay_pending: skipped — dispatcher is a dry run "
+                "(dry_run=True); no spool reads, writes, or dead-letter moves"
+            )
+            return {
+                "sent": 0,
+                "failed": 0,
+                "skipped": 0,
+                "dead_lettered": 0,
+                "dead_lettered_expired": 0,
+            }
 
         def _send(spooled_call: SpooledCall) -> Any:
             args = {
@@ -443,6 +464,15 @@ class EightsAttestor:
         At most one replay worker runs per spool root inside this process.
         """
         if not self.enabled or self.dispatcher is None:
+            return False
+        # Path S: same dry-run short-circuit as `replay_pending` — a stub
+        # dispatcher must never start a background replay thread, since it
+        # would still touch the spool on a dry-run supervisor build.
+        if getattr(self.dispatcher, "dry_run", False) is True:
+            logger.info(
+                "eights.replay_pending_async: skipped — dispatcher is a dry "
+                "run (dry_run=True); no thread started, spool untouched"
+            )
             return False
         spool_key = str(self.spool.root.resolve(strict=False))
 
