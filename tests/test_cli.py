@@ -7,7 +7,7 @@ when someone runs `hydra doctor`) is regression-proof.
 from __future__ import annotations
 
 import json
-import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -221,27 +221,50 @@ def test_plan_rejects_repo_and_repos_together(capsys):
 
 # --- plan (non-detaching attended planning surface) --------------------------
 
-def _drain_replay_thread(spool_root: Path, timeout: float = 2.0) -> None:
-    """Deterministically join the background replay thread (if any) that
-    `EightsAttestor.replay_pending_async`'s single-flight registry started
-    for ``spool_root``. With the dry-run guard intact, `_NullDispatcher`
-    never starts a thread, so this returns immediately (no thread to find).
-    If the guard is removed, node_intake's replay call spawns a real worker
-    thread that touches the spool — waiting for it here (instead of racing
-    the assertion against it) is what makes that regression observable."""
+class _RecordingReplayThreads(dict):
+    """Stand-in for `attestation._REPLAY_THREADS` that remembers every spool
+    key ever registered, even after the worker's own completion callback pops
+    it back out. `replay_pending_async`'s `_worker` removes its own entry
+    from the registry once it finishes (see attestation.py), so an empty
+    dict at assertion time is ambiguous between "no worker was ever started"
+    and "a worker started, ran, and already cleaned up" — exactly the race
+    this test guards against. Recording at the `__setitem__` registration
+    point (rather than reading the dict's current contents) removes that
+    ambiguity: "never registered" becomes a claim this can actually make."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ever_registered: set[str] = set()
+
+    def __setitem__(self, key, value):  # noqa: D105 - dict protocol
+        self.ever_registered.add(key)
+        super().__setitem__(key, value)
+
+
+def _watch_replay_registrations(monkeypatch) -> _RecordingReplayThreads:
+    """Swap `attestation._REPLAY_THREADS` for a recording dict for the
+    duration of the test so callers can assert a spool root's key was never
+    registered, instantly and without waiting on anything."""
+    from hydra_core.eights import attestation as attestation_mod
+
+    recorder = _RecordingReplayThreads()
+    monkeypatch.setattr(attestation_mod, "_REPLAY_THREADS", recorder)
+    return recorder
+
+
+def _registered_replay_thread(spool_root: Path) -> threading.Thread | None:
+    """Locate (without waiting) any thread currently registered in the
+    single-flight registry for `spool_root`, or None if there is none right
+    now. This is a point-in-time lookup only — it does not prove a worker
+    was never started (see `_watch_replay_registrations` for that claim);
+    it exists so a still-live worker (the guard-removed regression case) can
+    be joined and asserted dead before comparing spool bytes, instead of
+    racing the assertion against it."""
     from hydra_core.eights import attestation as attestation_mod
 
     key = str(spool_root.resolve(strict=False))
-    deadline = time.monotonic() + timeout
-    thread = None
-    while time.monotonic() < deadline:
-        with attestation_mod._REPLAY_THREADS_LOCK:
-            thread = attestation_mod._REPLAY_THREADS.get(key)
-        if thread is not None:
-            break
-        time.sleep(0.01)
-    if thread is not None:
-        thread.join(timeout=timeout)
+    with attestation_mod._REPLAY_THREADS_LOCK:
+        return attestation_mod._REPLAY_THREADS.get(key)
 
 
 def _extract_json(out: str):
@@ -302,15 +325,30 @@ def test_plan_leaves_populated_spool_untouched(capsys, tmp_path, monkeypatch):
     seed_path = pending / "seed.json"
     _write_spooled(seed_path, call_id="seed")
     seed_before = seed_path.read_bytes()
+    recorder = _watch_replay_registrations(monkeypatch)
 
     rc = _run(["plan", "fix a small typo in the README", "--squad", "engineering",
               "--repo", "hydra"],
               project_root=REPO_ROOT)
     capsys.readouterr()
-    # Bound the wait against node_intake's background replay worker so this
-    # assertion can't pass by racing an unguarded replay thread that hasn't
-    # touched the spool yet — see `_drain_replay_thread`.
-    _drain_replay_thread(pending)
+
+    # Instant, strongest statement of the guard: no background replay worker
+    # was EVER registered for this spool root — not just "none currently in
+    # the registry", which a finished worker's self-cleanup would make
+    # ambiguous. See `_watch_replay_registrations`.
+    key = str(pending.resolve(strict=False))
+    assert key not in recorder.ever_registered, (
+        "replay must never register a background worker against a "
+        "populated dry-run spool"
+    )
+    # Mutation-proof path: only reachable if the guard above is removed and
+    # this assertion is bypassed. Join any still-live worker and assert it
+    # is dead before touching spool bytes, so a slow worker fails the test
+    # on liveness rather than racing the byte comparison below.
+    thread = _registered_replay_thread(pending)
+    if thread is not None:
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "replay worker did not finish before assertion"
 
     assert rc == 0
     assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"
@@ -327,13 +365,23 @@ def test_run_non_live_leaves_populated_spool_untouched(capsys, tmp_path, monkeyp
     seed_path = pending / "seed.json"
     _write_spooled(seed_path, call_id="seed")
     seed_before = seed_path.read_bytes()
+    recorder = _watch_replay_registrations(monkeypatch)
 
     rc = _run(["run", "Test goal: outline a Q3 marketing campaign for Helios",
                "--squad", "garland"], project_root=REPO_ROOT)
     capsys.readouterr()
-    # See `_drain_replay_thread`: bound the wait on any background replay
-    # worker so this can't pass by racing an unguarded replay thread.
-    _drain_replay_thread(pending)
+
+    # See test_plan_leaves_populated_spool_untouched: assert the guarded
+    # expectation directly (never registered) rather than racing a lookup.
+    key = str(pending.resolve(strict=False))
+    assert key not in recorder.ever_registered, (
+        "replay must never register a background worker against a "
+        "populated dry-run spool"
+    )
+    thread = _registered_replay_thread(pending)
+    if thread is not None:
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "replay worker did not finish before assertion"
 
     assert rc == 0
     assert seed_path.is_file(), "replay must not remove/move the pre-existing entry"
