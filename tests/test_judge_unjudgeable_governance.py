@@ -693,3 +693,115 @@ def test_single_normal_step_budget_still_sums_correctly():
     plan_detail = patch["pending_hitl"]["plan_detail"]
     assert plan_detail["estimated_total_budget_usd"] == 15.0
     assert plan_detail["estimated_total_budget_overflowed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-vendor judge finding (2026-09-20, item 1 HIGH): a persisted
+# JUDGE_VERDICT envelope with a normal outcome (e.g. "pass") but a
+# NaN-poisoned score_json must still hard-block -- the unconditional
+# `continue` in the JUDGE_VERDICT branch must never run before the
+# envelope-wide non-finite scan.
+# ---------------------------------------------------------------------------
+
+def test_persisted_pass_verdict_with_nan_score_json_hard_blocks():
+    """The bug this round's structural fix closes: a legacy checkpoint holds
+    a JUDGE_VERDICT envelope with outcome="pass" (not "unjudgeable") whose
+    `score_json` contains NaN, alongside its finite source envelope which is
+    ALREADY judged (a prior verdict targets it). Before the fix, the
+    JUDGE_VERDICT branch's own `continue` fired before the non-finite scan
+    ever ran for this envelope, so the poisoned score_json reached synthesis
+    untouched. The scan must now be the FIRST statement in the loop body, so
+    it catches this JUDGE_VERDICT envelope regardless of its outcome."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="legacy pass verdict with poisoned score_json")
+    source_id = str(uuid4())
+    finite_source_envelope = {
+        "id": source_id,
+        "type": "C_SUITE_DECISION_PACKET",
+        "origin_squad": "executive",
+        "workflow_id": str(state.workflow_id),
+        "origin": "BOARDROOM",
+        "objective": "already-judged source",
+        "constraints": {"budget_usd": 1000.0},
+    }
+    poisoned_pass_verdict = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": source_id,
+        "outcome": "pass",
+        "rubric_id": "board-decision-quality@1",
+        "judge_vendor": "codex",
+        "generator_vendor": "claude",
+        # Poisoned nested payload -- not the top-level `outcome` field.
+        "score_json": {"overall": float("nan")},
+    }
+    state.envelopes = [finite_source_envelope, poisoned_pass_verdict]
+    # The finite source is already judged -- proves the block comes from the
+    # scan on the JUDGE_VERDICT envelope itself, not from the source ever
+    # being unjudged.
+    state.verdicts = [dict(poisoned_pass_verdict)]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "a persisted pass verdict whose score_json contains NaN must hard-"
+        "block, not silently reach synthesis"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    unjudgeable = [v for v in patch["verdicts"] if v.get("outcome") == "unjudgeable"]
+    assert unjudgeable, "expected a fresh unjudgeable verdict from the envelope scan"
+    assert "score_json" in patch["pending_hitl"]["summary"]
+
+
+def test_persisted_clean_pass_verdict_with_finite_source_takes_fast_path():
+    """Control for the fix above: a persisted `pass` JUDGE_VERDICT envelope
+    with a clean (finite) score_json, alongside its already-judged finite
+    source envelope, must take the ordinary fast path -- no re-judge, no
+    HITL, advances straight to synthesis."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="clean pass verdict, finite source")
+    source_id = str(uuid4())
+    finite_source_envelope = {
+        "id": source_id,
+        "type": "C_SUITE_DECISION_PACKET",
+        "origin_squad": "executive",
+        "workflow_id": str(state.workflow_id),
+        "origin": "BOARDROOM",
+        "objective": "already-judged source",
+        "constraints": {"budget_usd": 1000.0},
+    }
+    clean_pass_verdict = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": source_id,
+        "outcome": "pass",
+        "rubric_id": "board-decision-quality@1",
+        "judge_vendor": "codex",
+        "generator_vendor": "claude",
+        "score_json": {"overall": 0.95},
+    }
+    state.envelopes = [finite_source_envelope, clean_pass_verdict]
+    state.verdicts = [dict(clean_pass_verdict)]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "synthesis"
+    assert patch.get("pending_hitl") is None
+    retargeting = [
+        v for v in patch["verdicts"] if v.get("target_envelope_id") == source_id
+    ]
+    assert not retargeting, (
+        "an already-judged, finite source with a clean persisted verdict "
+        f"must not be re-judged: got fresh verdicts {retargeting}"
+    )

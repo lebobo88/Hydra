@@ -416,3 +416,44 @@ def test_dumps_tool_response_safe_ordinary_nesting_unaffected():
     parsed = json.loads(text)
     assert parsed == payload
     assert not any("sanitized" in k for k in parsed)
+
+
+class _HostileStr:
+    """An object whose own `__str__` raises -- `sanitize_non_finite` must
+    never call it unguarded."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("hostile __str__ boom")
+
+
+def test_dumps_tool_response_safe_handles_object_whose_str_raises():
+    """Cross-vendor judge finding (this round, item 2 MEDIUM): an unsupported
+    object whose own `str()` conversion raises must be replaced by a fixed,
+    type-labelled marker instead of letting the exception propagate out of
+    `sanitize_non_finite` / `dumps_tool_response_safe`, breaking the
+    documented never-raise contract."""
+    payload = {"a": 1, "b": _HostileStr()}
+    text = dumps_tool_response_safe(payload)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["a"] == 1
+    assert isinstance(parsed["b"], str)
+    assert "_HostileStr" in parsed["b"], (
+        f"expected a type-labelled marker, got {parsed['b']!r}"
+    )
+    assert parsed["_non_finite_fields_sanitized"], (
+        "the hostile-str substitution must be recorded, not silently swallowed"
+    )
+    assert any("$.b" in f for f in parsed["_non_finite_fields_sanitized"])
+
+
+def test_dumps_tool_response_safe_handles_hostile_str_dict_key():
+    """Same guard, but for the `str(k)` conversion of an unsupported dict
+    key rather than the `str(node)` conversion of a value."""
+    payload = {"a": 1, _HostileStr(): "value"}
+    text = dumps_tool_response_safe(payload)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["a"] == 1
+    hostile_keys = [k for k in parsed if k not in ("a", "_non_finite_fields_sanitized")]
+    assert len(hostile_keys) == 1
+    assert "_HostileStr" in hostile_keys[0]
+    assert parsed["_non_finite_fields_sanitized"]
