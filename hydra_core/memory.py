@@ -23,6 +23,7 @@ from uuid import UUID
 from .eights import ALL_CELLS, Cell, validate_cells
 from .eights.classifier import classify
 from .schemas import MemoryRef
+from .strict_json import dumps_strict
 
 
 # E2-26: both are resolved at import time (the public helpers below bind
@@ -95,12 +96,19 @@ def append_episodic(
         inferred = classify(envelope_type=kind, origin_squad=origin_squad, payload=payload)
     else:
         inferred = validate_cells(cells)
-    cells_json = json.dumps(inferred)
+    # Strict: `cells` and `payload` are read back verbatim by
+    # `resolve_episodic`/`list_episodic`/`query_by_cell` and drive cell-tag
+    # membership checks (redaction/RBAC decisions) and downstream judge/
+    # budget reasoning over `payload`. A silently substituted field here
+    # would be a wrong redaction decision or a corrupted verdict/budget
+    # value acted on later, not a display defect — refuse instead.
+    cells_json = dumps_strict(inferred, label=f"episodic cells for {key}")
     with _ensure_episodic(db) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO episodic (key, workflow_id, kind, payload_json, created_at, cells) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (key, str(workflow_id), kind, json.dumps(payload),
+            (key, str(workflow_id), kind,
+             dumps_strict(payload, label=f"episodic payload for {key}"),
              datetime.now(timezone.utc).isoformat(), cells_json),
         )
         conn.commit()
@@ -135,7 +143,10 @@ def tag_episodic(
             for c in validated:
                 if c not in merged:
                     merged.append(c)
-        conn.execute("UPDATE episodic SET cells=? WHERE key=?", (json.dumps(merged), key))
+        conn.execute(
+            "UPDATE episodic SET cells=? WHERE key=?",
+            (dumps_strict(merged, label=f"episodic cells for {key}"), key),
+        )
         conn.commit()
     return merged
 

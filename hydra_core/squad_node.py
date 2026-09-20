@@ -46,6 +46,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
+from .strict_json import dumps_strict
 from .tool_scope import build_tool_scope_directive
 from .version import DoubleSpawnRefused, SquadDeprecated
 
@@ -2911,7 +2912,18 @@ def _ensure_jest_excludes(cfg_path: Path) -> bool:
             return False
         target["testPathIgnorePatterns"] = existing
         try:
-            cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            # Strict: `data` is the operator's OWN package.json/jest.config
+            # parsed whole and about to be rewritten whole. If some
+            # unrelated field in it is non-finite we refuse to write it back
+            # rather than silently substitute a null into a file we don't
+            # own the schema of -- the existing broad `except Exception`
+            # here already treats that refusal exactly like any other
+            # write failure (skip this run's edit, leave the file
+            # untouched, `changed` state is simply not persisted).
+            cfg_path.write_text(
+                dumps_strict(data, label=f"jest config at {cfg_path}", indent=2) + "\n",
+                encoding="utf-8",
+            )
         except Exception:  # noqa: BLE001
             return False
         return True

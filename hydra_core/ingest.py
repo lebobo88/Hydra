@@ -46,6 +46,7 @@ from .governance import charge_and_gate, redact_for_squad_boundary
 from .schemas import HydraEnvelope, validate_envelope
 from .squad_node import execute_squad
 from .state import HydraState, TaskState, plan_barrier_active
+from .strict_json import dumps_strict
 # Reuse the in-graph routing + cost helpers so ingest and node_dispatch stay in
 # lockstep. supervisor's langgraph import is guarded (pure-python fallback), so
 # importing these module-level helpers is safe even without langgraph.
@@ -855,7 +856,16 @@ def load_ingested_ids(project_root: Path, workflow_id: str) -> set[str]:
 def _write_ledger(project_root: Path, workflow_id: str, ids: set[str]) -> None:
     p = ingest_ledger_path(project_root, workflow_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"ingested_ids": sorted(ids)}, indent=2), encoding="utf-8")
+    # Strict: `load_ingested_ids` reads this back to decide the exactly-once
+    # dispatch set (which envelope ids have already been ingested for this
+    # workflow) -- the ledger this whole module exists to make correct
+    # across retries/crashes. Every id is already coerced to `str` before
+    # this call, so this can never actually trip, but the guard keeps the
+    # invariant explicit rather than relying on caller discipline.
+    p.write_text(
+        dumps_strict({"ingested_ids": sorted(ids)}, label=f"ingest ledger for {workflow_id}", indent=2),
+        encoding="utf-8",
+    )
 
 
 def claim_ingested_ids(project_root: Path, workflow_id: str, ids: Iterable[str]) -> set[str]:

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .squad_loader import SquadPack
+from .strict_json import dumps_tool_response_safe
 
 
 @dataclass
@@ -134,7 +135,18 @@ class ToolUsageTracker:
         count = 0
         with path.open("a", encoding="utf-8") as f:
             for call in self._calls:
-                f.write(json.dumps({
+                # Sanitize, not strict: this loop writes one JSONL line per
+                # call and only clears `self._calls` after the whole loop
+                # completes. A refusal here would raise mid-loop, leaving
+                # already-written lines re-queued for the next flush
+                # (duplicated) and the poisoned call stuck at the same
+                # position forever (it would raise identically on every
+                # future flush) -- a stuck-buffer failure mode, not just a
+                # lost record. `duration_ms` is informational telemetry
+                # (curation recommendations/top-tools counts), not a
+                # budget/verdict decision, so substituting one field is the
+                # right tradeoff.
+                f.write(dumps_tool_response_safe({
                     "ts": call.timestamp,
                     "workflow_id": call.workflow_id,
                     "squad_id": call.squad_id,
@@ -143,7 +155,7 @@ class ToolUsageTracker:
                     "tool": call.tool,
                     "status": call.status,
                     "duration_ms": call.duration_ms,
-                }, default=str) + "\n")
+                }, label="tool_usage_call") + "\n")
                 count += 1
         self._calls.clear()
         return count

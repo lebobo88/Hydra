@@ -47,6 +47,7 @@ from .judge_vendor import (
     _judge_vendor_chain,
 )
 from .proc import run_text
+from .strict_json import dumps_strict
 from .squad_node import (
     Dispatcher,
     _augment_with_critique,
@@ -1477,7 +1478,17 @@ def save_cursor(path: str | Path, cursor: dict[str, Any]) -> None:
     # Atomic-ish write: temp + replace so a crash mid-write never leaves a
     # truncated cursor that would wedge the workflow.
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(cursor, indent=2, default=str), encoding="utf-8")
+    # Strict: the engine reads this back via `load_cursor` to drive the
+    # attended stage state machine (budget/cost fields, verdict scores,
+    # retry counts). A non-finite value silently swapped to `null` here
+    # is not a display defect -- it is a stage-machine decision made on a
+    # wrong value (the same "budget comparison fails open on NaN" class of
+    # bug `strict_json.reject_non_finite` guards at the CLI boundary).
+    # Refuse rather than persist a poisoned cursor.
+    tmp.write_text(
+        dumps_strict(cursor, label=f"attended cursor at {p}", indent=2, default=str),
+        encoding="utf-8",
+    )
     os.replace(tmp, p)
 
 
@@ -1598,7 +1609,16 @@ def _capture_baseline_failures(
             if _cache_file is not None:
                 try:
                     _cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    _cache_file.write_text(_json.dumps(failing), encoding="utf-8")
+                    # Strict: read back by `_json.loads` above and used to
+                    # skip re-running the whole baseline suite; `failing` is
+                    # a list of test-id strings so this can never actually
+                    # trip, but guarding it keeps the enforcement test from
+                    # needing an allow-list entry for a genuinely read-back
+                    # value.
+                    _cache_file.write_text(
+                        dumps_strict(failing, label=f"baseline cache for {_sha}"),
+                        encoding="utf-8",
+                    )
                 except Exception:  # noqa: BLE001 — cache write is best-effort
                     pass
             # Return the first successful (or empty) result — empty is valid

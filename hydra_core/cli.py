@@ -45,7 +45,12 @@ _WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 warnings.filterwarnings("ignore", category=UserWarning, module=r"langchain_core.*")
 
 from .squad_loader import discover_squads
-from .strict_json import finite_float_arg, reject_non_finite
+from .strict_json import (
+    dumps_strict,
+    finite_float_arg,
+    reject_non_finite,
+    sanitize_non_finite,
+)
 from .state import (
     HydraState,
     PoisonedStateError,
@@ -56,6 +61,57 @@ from .state import (
     plan_revision_ceiling_reached,
 )
 from .telemetry import emit, trace_path
+
+# ---------------------------------------------------------------------------
+# CLI stdout/stderr is a machine boundary, uniformly.
+#
+# Every `json.dumps(...)` call in this module serializes a structured
+# command-result dict (`{"ok": ...}`, `{"error": ...}`, a workflow/status/plan
+# payload, ...) for `print()` -- none is free-form human prose interpolated
+# through `json.dumps` (prose in this file is printed directly, never
+# JSON-encoded). `hydra status`/`hydra plan`/etc. output is documented and
+# scripted against: a bare `NaN`/`Infinity` token would make that output
+# invalid RFC 8259 JSON, so a conforming parser on the other end either
+# rejects the whole document or misparses it -- the same defect the MCP
+# gateway responses had (see `strict_json.dumps_tool_response_safe`), in
+# different clothing.
+#
+# The policy is therefore ONE policy, not per-site: sanitize, never refuse.
+# A CLI invocation must always print exactly ONE complete JSON document --
+# raising instead (the `dumps_strict`/WRITE policy) would abort the process
+# mid-print and hand the caller NO output and a traceback instead of a
+# parseable result, which is strictly worse than one substituted field for a
+# process whose entire contract with its caller is "print a JSON document
+# and exit". This mirrors `dumps_tool_response_safe`'s reasoning for MCP tool
+# responses exactly; `_cli_json_dumps` exists only because that helper's
+# fixed `(payload, *, label)` signature does not forward the `indent=`/
+# `default=` formatting kwargs this file's call sites already rely on --
+# it is a local composition of the same exported primitives
+# (`dumps_strict` / `sanitize_non_finite`), not a widened contract on either.
+def _cli_json_dumps(payload: Any, **kwargs: Any) -> str:
+    """``json.dumps`` for CLI stdout/stderr: sanitizes non-finite floats
+    (and any other non-natively-JSON value) instead of raising, so a
+    `hydra <cmd>` invocation always completes and prints one valid JSON
+    document. See the module-level comment above for why this differs from
+    `dumps_strict`'s refuse policy used on WRITE paths."""
+    try:
+        return dumps_strict(payload, label="cli_output", **kwargs)
+    except (ValueError, TypeError, RecursionError):
+        sanitized, fields = sanitize_non_finite(payload)
+        if isinstance(sanitized, dict):
+            marker_key = "_non_finite_fields_sanitized"
+            if marker_key in sanitized:
+                marker_key = "_hydra_non_finite_fields_sanitized"
+                while marker_key in sanitized:
+                    marker_key = f"_{marker_key}"
+            sanitized = {**sanitized, marker_key: fields}
+        else:
+            sanitized = {
+                "_value": sanitized,
+                "_non_finite_fields_sanitized": fields,
+            }
+        return json.dumps(sanitized, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # MU1: MCP probe table for `hydra doctor`.
@@ -460,7 +516,7 @@ def _cmd_verify(args) -> int:
     except FileNotFoundError as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
-    print(json.dumps({
+    print(_cli_json_dumps({
         "path": str(snap.path),
         "sha256": snap.sha256,
         "refusals": len(snap.refusals),
@@ -474,12 +530,12 @@ def _cmd_memory_query(args) -> int:
     from .memory import query_by_cell
 
     if args.cell not in ALL_CELLS:
-        print(json.dumps({"error": f"invalid cell {args.cell!r}",
+        print(_cli_json_dumps({"error": f"invalid cell {args.cell!r}",
                           "valid": list(ALL_CELLS)}), file=sys.stderr)
         return 1
     rows = query_by_cell(args.cell, limit=int(args.limit),
                          workflow_id=args.workflow_id)
-    print(json.dumps({"cell": args.cell, "count": len(rows), "rows": rows},
+    print(_cli_json_dumps({"cell": args.cell, "count": len(rows), "rows": rows},
                      default=str, indent=2))
     return 0
 
@@ -489,20 +545,20 @@ def _cmd_memory_tag(args) -> int:
 
     cells = [c.strip() for c in (args.cells or "").split(",") if c.strip()]
     if not cells:
-        print(json.dumps({"error": "no cells supplied"}), file=sys.stderr)
+        print(_cli_json_dumps({"error": "no cells supplied"}), file=sys.stderr)
         return 1
     merged = tag_episodic(args.key, cells, replace=bool(args.replace))
     # MU11: tag_episodic returns an error dict when the key does not exist.
     if isinstance(merged, dict) and "error" in merged:
-        print(json.dumps(merged, indent=2))
+        print(_cli_json_dumps(merged, indent=2))
         return 1
-    print(json.dumps({"key": args.key, "cells": merged}, indent=2))
+    print(_cli_json_dumps({"key": args.key, "cells": merged}, indent=2))
     return 0
 
 
 def _cmd_squads(args) -> int:
     packs = discover_squads(Path(args.project) if args.project else None)
-    print(json.dumps({
+    print(_cli_json_dumps({
         slug: {
             "name": p.name,
             "entrypoint": p.entrypoint,
@@ -530,22 +586,22 @@ def _cmd_repo(args) -> int:
                 args.repo_id, args.path, force=args.force, init=args.init,
             )
         except (ValueError, TimeoutError) as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            print(_cli_json_dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
             return 1
-        print(json.dumps({"ok": True, **result}, indent=2))
+        print(_cli_json_dumps({"ok": True, **result}, indent=2))
         return 0
     if args.repocmd == "unregister":
         try:
             result = unregister_repo(args.repo_id)
         except (ValueError, TimeoutError) as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            print(_cli_json_dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
             return 1
-        print(json.dumps({"ok": True, **result}, indent=2))
+        print(_cli_json_dumps({"ok": True, **result}, indent=2))
         return 0
     if args.repocmd == "list":
-        print(json.dumps({"ok": True, "repos": list_registered_repos()}, indent=2))
+        print(_cli_json_dumps({"ok": True, "repos": list_registered_repos()}, indent=2))
         return 0
-    print(json.dumps({"ok": False, "error": f"unknown repocmd {args.repocmd!r}"}), file=sys.stderr)
+    print(_cli_json_dumps({"ok": False, "error": f"unknown repocmd {args.repocmd!r}"}), file=sys.stderr)
     return 1
 
 
@@ -561,7 +617,7 @@ def _cmd_run(args) -> int:
     # field a downstream branch happens to prefer. Fail fast instead.
     if getattr(args, "repo", None) and getattr(args, "repos", None):
         print(
-            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            _cli_json_dumps({"error": "--repo and --repos are mutually exclusive"}),
             file=sys.stderr,
         )
         return 1
@@ -666,7 +722,7 @@ def _cmd_run(args) -> int:
             config={"configurable": {"thread_id": str(workflow_id)}},
         )
         final = HydraState.model_validate(final_state_dict) if isinstance(final_state_dict, dict) else final_state_dict
-    print(json.dumps({
+    print(_cli_json_dumps({
         "workflow_id": str(workflow_id),
         "phase": getattr(final, "phase", "?"),
         "selected_squads": getattr(final, "selected_squads", []),
@@ -726,7 +782,7 @@ def _cmd_plan(args) -> int:
     # whichever branch happens to run instead of being rejected.
     if getattr(args, "repo", None) and getattr(args, "repos", None):
         print(
-            json.dumps({"error": "--repo and --repos are mutually exclusive"}),
+            _cli_json_dumps({"error": "--repo and --repos are mutually exclusive"}),
             file=sys.stderr,
         )
         return 1
@@ -780,7 +836,7 @@ def _cmd_plan(args) -> int:
         plan_only=True,
     )
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "ok": False,
             "error": "langgraph unavailable — plan requires the checkpointing supervisor",
         }), file=sys.stderr)
@@ -805,7 +861,7 @@ def _cmd_plan(args) -> int:
         return dict(t) if isinstance(t, dict) else {"value": str(t)}
 
     pending = final.pending_hitl
-    print(json.dumps({
+    print(_cli_json_dumps({
         "ok": True,
         "workflow_id": str(workflow_id),
         "phase": getattr(final, "phase", "?"),
@@ -1819,7 +1875,7 @@ def _cmd_resume(args) -> int:
     # comment below already documents).
     if (bool(getattr(args, "gate_only", False))
             and action == "recover-stalled-stage"):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "ok": False,
             "error": "recovery_is_live_operation",
             "workflow_id": wf,
@@ -1854,7 +1910,7 @@ def _cmd_resume(args) -> int:
             and action != "recover-stalled-stage"):
         _pre_refusal = _precheck_operator_identity_gate_only(args)
         if _pre_refusal is not None:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 **_pre_refusal, "workflow_id": wf, "action": action,
             }), file=sys.stderr)
             return 1
@@ -1863,7 +1919,7 @@ def _cmd_resume(args) -> int:
     # a concurrent double-resume must never observe the still-uncleared gate.
     lock_fd, lock_path = _acquire_resume_lock(project, wf)
     if lock_fd is None:
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf,
             "resumed": False,
             "reason": "resume_in_progress",
@@ -1902,7 +1958,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # side effect of any kind -- no dispatcher construction, no spool drain, no
     # checkpoint load, nothing.
     if gate_only and getattr(args, "live", False):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "ok": False,
             "error": "gate_only_live_conflict",
             "workflow_id": wf,
@@ -1940,7 +1996,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # only route that may run this recovery; that behaviour is unchanged.
     if action == "recover-stalled-stage":
         if gate_only:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "ok": False,
                 "error": "recovery_is_live_operation",
                 "workflow_id": wf,
@@ -1986,7 +2042,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         critique_client=critique_client,
     )
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": "langgraph unavailable — resume requires the checkpointing supervisor",
         }), file=sys.stderr)
         return 1
@@ -1994,7 +2050,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     config = {"configurable": {"thread_id": wf}}
     snap = sup.get_state(config)
     if snap is None or not snap.values:
-        print(json.dumps({"workflow_id": wf, "error": "not_found"}))
+        print(_cli_json_dumps({"workflow_id": wf, "error": "not_found"}))
         return 1
     values = snap.values
     pending = values.get("pending_hitl")
@@ -2020,7 +2076,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             _resolve_operator_capability_for_resume(
                 args, wf, action, pending, gate_only=gate_only))
         if _refusal is not None:
-            print(json.dumps(_refusal), file=sys.stderr)
+            print(_cli_json_dumps(_refusal), file=sys.stderr)
             return 1
 
     if not pending:
@@ -2072,7 +2128,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                         reconcile=True,
                     )
                     _reconcile_out = _eights_resolution_fields(True, _reconcile_result)
-                print(json.dumps({
+                print(_cli_json_dumps({
                     "workflow_id": wf,
                     "ok": True,
                     "resumed": False,
@@ -2094,7 +2150,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             final_dict = sup.invoke(None, config=config)
             _phase = (final_dict.get("phase") if isinstance(final_dict, dict)
                       else getattr(final_dict, "phase", "?"))
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "workflow_id": wf,
                 "ok": True,
                 "resumed": True,
@@ -2121,7 +2177,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # there already returned before this branch could ever be
             # reached, so there is nothing further to verify here.
             sup.update_state(config, {"phase": "surfaced"})
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "workflow_id": wf,
                 "ok": True,
                 "resumed": False,
@@ -2187,7 +2243,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 )
                 _no_gate_out.update(
                     _eights_resolution_fields(True, _reconcile_result))
-        print(json.dumps(_no_gate_out))
+        print(_cli_json_dumps(_no_gate_out))
         return 0
 
     from datetime import datetime, timezone
@@ -2220,7 +2276,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             _resolve_operator_capability_for_resume(
                 args, wf, action, pending, gate_only=gate_only))
         if _refusal is not None:
-            print(json.dumps(_refusal), file=sys.stderr)
+            print(_cli_json_dumps(_refusal), file=sys.stderr)
             return 1
 
     patch: dict = {"pending_hitl": None, "hitl_history": [resolution]}
@@ -2229,7 +2285,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
 
     if action == "change-squads":
         if not option:
-            print(json.dumps({"error": "change-squads needs --option \"squad-a,squad-b\""}),
+            print(_cli_json_dumps({"error": "change-squads needs --option \"squad-a,squad-b\""}),
                   file=sys.stderr)
             return 1
         patch["selected_squads"] = [s.strip() for s in option.split(",") if s.strip()]
@@ -2255,7 +2311,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             detail = str(e) if "finite number" in str(e) else (
                 f"modify-budget needs a numeric --option, got {option!r}"
             )
-            print(json.dumps({"error": detail}), file=sys.stderr)
+            print(_cli_json_dumps({"error": detail}), file=sys.stderr)
             return 1
 
     # P5c Task 2: --modify-plan. Validated and prepared here (alongside the
@@ -2271,14 +2327,14 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     _modify_plan_prior_envelope_id = None
     if action == "modify-plan":
         if resolution.get("gate_node") != "plan_gate":
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "error": "modify-plan is only valid at the plan_gate",
                 "gate_node": resolution.get("gate_node"),
             }), file=sys.stderr)
             return 1
         _critique_ref = getattr(args, "critique_ref", None)
         if not _critique_ref:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "error": "modify-plan needs --critique-ref <path-or-memoryref> "
                          "(the critique text itself never travels as --option)",
             }), file=sys.stderr)
@@ -2286,12 +2342,12 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         try:
             _critique_text = _read_plan_critique(_critique_ref, project)
         except _PlanCritiqueError as exc:
-            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            print(_cli_json_dumps({"error": str(exc)}), file=sys.stderr)
             return 1
         _cur_revision = int(values.get("plan_revision") or 0)
         _max_revisions = plan_max_revisions()
         if plan_revision_ceiling_reached(_cur_revision, _max_revisions):
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "error": "revision_ceiling_reached",
                 "plan_revision": _cur_revision,
                 "max_revisions": _max_revisions,
@@ -2471,7 +2527,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # recorded before returning (mirrors the reject path).
     if option == "abort":
         sup.update_state(config, {"phase": "surfaced"})
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,
             "resumed": False,
@@ -2515,7 +2571,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         if resolution.get("gate_node") == "plan_gate":
             _reject_patch["plan_status"] = "rejected"
         sup.update_state(config, _reject_patch)
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,
             "resumed": False,
@@ -2585,7 +2641,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 "plan revision task recorded, graph not re-entered — call "
                 "hydra.workflow.step to continue"
             )
-        print(json.dumps(_modify_plan_out, indent=2))
+        print(_cli_json_dumps(_modify_plan_out, indent=2))
         return 0
 
     if gate_only:
@@ -2601,7 +2657,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         _post_snap = sup.get_state(config)
         _post_values = _post_snap.values if _post_snap is not None and _post_snap.values else {}
         _post_phase = _post_values.get("phase", values.get("phase"))
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,
             "resumed": False,
@@ -2624,7 +2680,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     phase = final_dict.get("phase") if isinstance(final_dict, dict) else getattr(final_dict, "phase", "?")
     _resulting_pending = (final_dict.get("pending_hitl")
                           if isinstance(final_dict, dict) else None)
-    print(json.dumps({
+    print(_cli_json_dumps({
         "workflow_id": wf,
         "ok": True,
         "resumed": True,
@@ -2672,22 +2728,22 @@ def _cmd_ingest(args) -> int:
     wf = str(args.workflow_id)
 
     if not _WORKFLOW_ID_RE.match(wf):
-        print(json.dumps({"error": f"invalid workflow_id {wf!r}"}), file=sys.stderr)
+        print(_cli_json_dumps({"error": f"invalid workflow_id {wf!r}"}), file=sys.stderr)
         return 1
 
     try:
         envelopes = _load_envelopes_file(Path(args.envelopes))
     except (OSError, ValueError) as e:
-        print(json.dumps({"error": f"could not read --envelopes: {e}"}), file=sys.stderr)
+        print(_cli_json_dumps({"error": f"could not read --envelopes: {e}"}), file=sys.stderr)
         return 1
     if not envelopes:
-        print(json.dumps({"workflow_id": wf, "ingested": False,
+        print(_cli_json_dumps({"workflow_id": wf, "ingested": False,
                           "reason": "no_envelopes"}))
         return 0
 
     lock_fd, lock_path = _acquire_resume_lock(project, wf)
     if lock_fd is None:
-        print(json.dumps({"workflow_id": wf, "ingested": False,
+        print(_cli_json_dumps({"workflow_id": wf, "ingested": False,
                           "reason": "resume_in_progress", "lock": str(lock_path)}))
         return 0
     try:
@@ -2735,20 +2791,20 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
     sup = build_supervisor(project_root=project, dispatcher=dispatcher,
                            critique_client=critique_client)
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf, "ingested": False,
             "error": "langgraph unavailable — ingest requires the checkpointing supervisor",
         }), file=sys.stderr)
         return 1
     snap = sup.get_state(config)
     if snap is None or not snap.values:
-        print(json.dumps({"workflow_id": wf, "ingested": False, "error": "not_found",
+        print(_cli_json_dumps({"workflow_id": wf, "ingested": False, "error": "not_found",
                           "detail": "no checkpoint for this workflow_id"}), file=sys.stderr)
         return 1
     try:
         state = HydraState.model_validate(snap.values)
     except Exception as e:  # noqa: BLE001
-        print(json.dumps({"workflow_id": wf, "ingested": False,
+        print(_cli_json_dumps({"workflow_id": wf, "ingested": False,
                           "error": f"checkpoint_invalid: {e}"}), file=sys.stderr)
         return 1
 
@@ -2877,7 +2933,7 @@ def _cmd_ingest_locked(args, project: Path, wf: str, envelopes: list[dict]) -> i
         "budget_usd": state.budget.budget_usd,
     }
     emit(project, wf, "ingest.complete", summary)
-    print(json.dumps({
+    print(_cli_json_dumps({
         "workflow_id": wf, "ingested": True, **summary,
         "trace": str(trace_path(project, wf)),
     }, indent=2, default=str))
@@ -3537,13 +3593,13 @@ def _cmd_attended_step(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
-        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+        print(_cli_json_dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
               file=sys.stderr)
         return 1
 
     lock_fd, lock_path = _acquire_resume_lock(project, wf)
     if lock_fd is None:
-        print(json.dumps({"ok": False, "status": "resume_in_progress",
+        print(_cli_json_dumps({"ok": False, "status": "resume_in_progress",
                           "lock": str(lock_path)}))
         return 0
     try:
@@ -3551,14 +3607,14 @@ def _cmd_attended_step(args) -> int:
         from .supervisor import build_supervisor, _PurePythonRunner
         sup = build_supervisor(project_root=project, dispatcher=dispatcher)
         if isinstance(sup, _PurePythonRunner):
-            print(json.dumps({"ok": False,
+            print(_cli_json_dumps({"ok": False,
                               "error": "langgraph unavailable — attended step requires "
                                        "the checkpointing supervisor"}), file=sys.stderr)
             return 1
         config = {"configurable": {"thread_id": wf}}
         snap = sup.get_state(config)
         if snap is None or not snap.values:
-            print(json.dumps({"ok": False, "error": "not_found",
+            print(_cli_json_dumps({"ok": False, "error": "not_found",
                               "detail": "no checkpoint — run `hydra plan` first"}),
                   file=sys.stderr)
             return 1
@@ -3584,7 +3640,7 @@ def _cmd_attended_step(args) -> int:
                 project_path = _resolve_task_project_path(task, state, project)
             except MissingEngineeringTargetError as _missing_target_err:
                 from .repo_registry import unknown_repo_hitl_fields
-                print(json.dumps({
+                print(_cli_json_dumps({
                     "ok": False,
                     "error": "missing_engineering_target",
                     "detail": str(_missing_target_err),
@@ -3608,7 +3664,7 @@ def _cmd_attended_step(args) -> int:
                 if not (_agents_dir / name).exists()
             ]
             if _missing_agents:
-                print(json.dumps({
+                print(_cli_json_dumps({
                     "ok": False, "error": "missing_agent_dependency",
                     "detail": (
                         f"attended engineering requires agent stubs: "
@@ -3649,7 +3705,7 @@ def _cmd_attended_step(args) -> int:
                 if isinstance(inner, dict) else None
             )
             if not run_id:
-                print(json.dumps({"ok": False, "error": "start_run returned no run_id",
+                print(_cli_json_dumps({"ok": False, "error": "start_run returned no run_id",
                                   "detail": str(start)[:500]}), file=sys.stderr)
                 return 1
 
@@ -3711,7 +3767,7 @@ def _cmd_attended_step(args) -> int:
                         "subpath": getattr(task, "target_repo_subpath", None),
                         "source": "task_override",
                     }
-            print(json.dumps({"ok": True, "resolved_target": _resolved_target, **res},
+            print(_cli_json_dumps({"ok": True, "resolved_target": _resolved_target, **res},
                              indent=2, default=str))
             return 0
 
@@ -3724,7 +3780,7 @@ def _cmd_attended_step(args) -> int:
         if stub_task is not None and _task_precedes(state, stub_task, _sel_task):
             res = _drive_stub_task(sup, config, project, wf, state,
                                    stub_task, stub_pack)
-            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
         if _sel_kind == "squad":
@@ -3780,7 +3836,7 @@ def _cmd_attended_step(args) -> int:
                 "squad_slug": ne_pack.slug,
                 "state": res.get("state"),
             })
-            print(json.dumps({"ok": True, **res}, indent=2, default=str))
+            print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
         # P1: awaiting_plan_approval — a plan-gate HITL is open. Distinct from
@@ -3789,7 +3845,7 @@ def _cmd_attended_step(args) -> int:
         # files a pending_hitl with gate_node == "plan_gate".
         _pending_hitl = getattr(state, "pending_hitl", None)
         if isinstance(_pending_hitl, dict) and _pending_hitl.get("gate_node") == "plan_gate":
-            print(json.dumps({"ok": True, "status": "awaiting_plan_approval",
+            print(_cli_json_dumps({"ok": True, "status": "awaiting_plan_approval",
                               "pending_hitl": _pending_hitl,
                               "workflow_id": wf}, indent=2, default=str))
             return 0
@@ -3806,7 +3862,7 @@ def _cmd_attended_step(args) -> int:
             and not plan_deps_satisfied(state, t)
         ]
         if _blocked_deps:
-            print(json.dumps({"ok": True, "status": "blocked_on_failed_dependency",
+            print(_cli_json_dumps({"ok": True, "status": "blocked_on_failed_dependency",
                               "blocked_task_ids": _blocked_deps,
                               "workflow_id": wf}, indent=2, default=str))
             return 0
@@ -3816,7 +3872,7 @@ def _cmd_attended_step(args) -> int:
         # synthesis/judge_synthesis/postcheck. Tell the host to call
         # `hydra finalize` (status), keeping `no_pending_task` as a
         # compatibility alias for hosts pinned to the old contract.
-        print(json.dumps({"ok": True, "status": "ready_to_finalize",
+        print(_cli_json_dumps({"ok": True, "status": "ready_to_finalize",
                           "no_pending_task": True,
                           "next_action": "hydra.workflow.finalize",
                           "workflow_id": wf}))
@@ -3838,7 +3894,7 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     """
     from . import host_bridge
     if not option:
-        print(json.dumps({"ok": False,
+        print(_cli_json_dumps({"ok": False,
                           "error": "recover-stalled-stage needs --option <run_id>"}),
               file=sys.stderr)
         return 1
@@ -3846,13 +3902,13 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
     cfile = host_bridge.cursor_path(project, wf, run_id)
     if not Path(cfile).exists():
-        print(json.dumps({"ok": False, "error": "cursor_not_found", "detail": str(cfile)}),
+        print(_cli_json_dumps({"ok": False, "error": "cursor_not_found", "detail": str(cfile)}),
               file=sys.stderr)
         return 1
 
     res = host_bridge.recover_stalled_stage(dispatcher, cursor_file=cfile)
     if not res.get("ok", True):
-        print(json.dumps(res, indent=2, default=str), file=sys.stderr)
+        print(_cli_json_dumps(res, indent=2, default=str), file=sys.stderr)
         return 1
 
     if res.get("status") in ("complete", "surfaced", "aborted") and not res.get("already_charged"):
@@ -3914,7 +3970,7 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
 
     emit(project, wf, "attended.recovery.resume",
          {"run_id": run_id, "status": res.get("status")})
-    print(json.dumps({"ok": True, **res}, indent=2, default=str))
+    print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
     return 0
 
 
@@ -4073,7 +4129,7 @@ def _cmd_attended_submit(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
-        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+        print(_cli_json_dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
               file=sys.stderr)
         return 1
     try:
@@ -4081,20 +4137,20 @@ def _cmd_attended_submit(args) -> int:
         if not isinstance(result, dict):
             raise ValueError("result file must be a JSON object")
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        print(json.dumps({"ok": False, "error": f"could not read --result: {e}"}),
+        print(_cli_json_dumps({"ok": False, "error": f"could not read --result: {e}"}),
               file=sys.stderr)
         return 1
 
     lock_fd, lock_path = _acquire_resume_lock(project, wf)
     if lock_fd is None:
-        print(json.dumps({"ok": False, "status": "resume_in_progress",
+        print(_cli_json_dumps({"ok": False, "status": "resume_in_progress",
                           "lock": str(lock_path)}))
         return 0
     try:
         dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
         cfile = host_bridge.cursor_path(project, wf, str(args.run_id))
         if not Path(cfile).exists():
-            print(json.dumps({"ok": False, "error": "cursor_not_found",
+            print(_cli_json_dumps({"ok": False, "error": "cursor_not_found",
                               "detail": str(cfile)}), file=sys.stderr)
             return 1
         res = host_bridge.submit_host_result(
@@ -4113,7 +4169,7 @@ def _cmd_attended_submit(args) -> int:
                 emit(project, wf, "attended.submit",
                      {"run_id": str(args.run_id), "call_key": str(args.call_key),
                       "status": res.get("status"), "already_charged": True})
-                print(json.dumps({"ok": True, **res}, indent=2, default=str))
+                print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
                 return 0
             # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
             # budget write to the LangGraph checkpoint so that a crash between
@@ -4356,7 +4412,7 @@ def _cmd_attended_submit(args) -> int:
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
                                               "status": res.get("status")})
-        print(json.dumps({"ok": True, **res}, indent=2, default=str))
+        print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
         return 0
     finally:
         _release_resume_lock(lock_fd, lock_path)
@@ -4383,13 +4439,13 @@ def _cmd_finalize(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
-        print(json.dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
+        print(_cli_json_dumps({"ok": False, "error": f"invalid workflow_id {wf!r}"}),
               file=sys.stderr)
         return 1
 
     lock_fd, lock_path = _acquire_resume_lock(project, wf)
     if lock_fd is None:
-        print(json.dumps({"ok": False, "status": "resume_in_progress",
+        print(_cli_json_dumps({"ok": False, "status": "resume_in_progress",
                           "lock": str(lock_path)}))
         return 0
     try:
@@ -4397,7 +4453,7 @@ def _cmd_finalize(args) -> int:
         dispatcher = _attended_live_dispatcher(project, getattr(args, "verbose", False))
         sup = build_supervisor(project_root=project, dispatcher=dispatcher)
         if isinstance(sup, _PurePythonRunner):
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "ok": False,
                 "error": "langgraph unavailable — finalize requires the checkpointing supervisor",
             }), file=sys.stderr)
@@ -4405,20 +4461,20 @@ def _cmd_finalize(args) -> int:
         config = {"configurable": {"thread_id": wf}}
         snap = sup.get_state(config)
         if snap is None or not snap.values:
-            print(json.dumps({"ok": False, "workflow_id": wf, "error": "not_found"}),
+            print(_cli_json_dumps({"ok": False, "workflow_id": wf, "error": "not_found"}),
                   file=sys.stderr)
             return 1
         try:
             state = HydraState.model_validate(snap.values)
         except Exception as e:  # noqa: BLE001
-            print(json.dumps({"ok": False, "workflow_id": wf,
+            print(_cli_json_dumps({"ok": False, "workflow_id": wf,
                               "error": f"checkpoint_invalid: {e}"}), file=sys.stderr)
             return 1
 
         # Idempotent: a second call never re-synthesizes (that would duplicate
         # the episodic rows RA-8 writes inside node_synthesis).
         if state.attended_finalized_record_id:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "ok": True, "status": "already_finalized", "workflow_id": wf,
                 "decision_record_id": state.attended_finalized_record_id,
                 "phase": state.phase,
@@ -4427,7 +4483,7 @@ def _cmd_finalize(args) -> int:
 
         pending = _attended_pending_task_ids(state)
         if pending:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "ok": False, "status": "tasks_pending", "workflow_id": wf,
                 "pending": pending,
                 "detail": ("attended tasks still open — drive them with "
@@ -4461,7 +4517,7 @@ def _cmd_finalize(args) -> int:
         from .strict_json import find_non_finite_field
         bad_field = find_non_finite_field({"envelopes": envelopes, "artifacts": artifacts})
         if bad_field is not None:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "ok": False, "status": "unjudgeable", "workflow_id": wf,
                 "field": bad_field,
                 "detail": (
@@ -4523,7 +4579,7 @@ def _cmd_finalize(args) -> int:
             "pending_hitl": final_state.pending_hitl,
             "trace": str(trace_path(project, wf)),
         }
-        print(json.dumps(payload, indent=2, default=str))
+        print(_cli_json_dumps(payload, indent=2, default=str))
         return 0 if record_id else 1
     except PoisonedStateError as e:
         # Choke-point catch (see `state.make_checkpoint_serde`): the
@@ -4532,7 +4588,7 @@ def _cmd_finalize(args) -> int:
         # somewhere in `verdicts`/`envelopes`/`artifacts`/`plan_ref`/
         # `attended_results`/etc. Surface the SAME `unjudgeable` shape the
         # rest of the codebase uses and never touch the checkpoint.
-        print(json.dumps({
+        print(_cli_json_dumps({
             "ok": False, "status": "unjudgeable", "workflow_id": wf,
             "field": e.field,
             "detail": (
@@ -4579,7 +4635,7 @@ def _cmd_budget(args) -> int:
     # workflow_id it would otherwise fall through to the list-all path and be
     # silently discarded, leaving the operator believing a cap was written.
     if set_usd is not None and not wf_arg:
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": "--set requires a workflow_id (e.g. `hydra budget <id> --set 250`)",
         }), file=sys.stderr)
         return 1
@@ -4587,7 +4643,7 @@ def _cmd_budget(args) -> int:
     from .supervisor import build_supervisor, _PurePythonRunner
     sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": "langgraph unavailable — budget requires the checkpointing supervisor",
         }), file=sys.stderr)
         return 1
@@ -4595,19 +4651,19 @@ def _cmd_budget(args) -> int:
     # ---- Single-workflow path (detail or --set) --------------------------------
     if wf_arg:
         if not _WORKFLOW_ID_RE.match(wf_arg):
-            print(json.dumps({"error": f"invalid workflow_id {wf_arg!r}"}),
+            print(_cli_json_dumps({"error": f"invalid workflow_id {wf_arg!r}"}),
                   file=sys.stderr)
             return 1
         config = {"configurable": {"thread_id": wf_arg}}
         snap = sup.get_state(config)
         if snap is None or not snap.values:
-            print(json.dumps({"workflow_id": wf_arg, "error": "not_found"}),
+            print(_cli_json_dumps({"workflow_id": wf_arg, "error": "not_found"}),
                   file=sys.stderr)
             return 1
         try:
             state = HydraState.model_validate(snap.values)
         except Exception as e:  # noqa: BLE001
-            print(json.dumps({"workflow_id": wf_arg,
+            print(_cli_json_dumps({"workflow_id": wf_arg,
                               "error": f"checkpoint_invalid: {e}"}),
                   file=sys.stderr)
             return 1
@@ -4618,7 +4674,7 @@ def _cmd_budget(args) -> int:
             try:
                 new_usd = float(set_usd)
             except (TypeError, ValueError):
-                print(json.dumps({"error": (
+                print(_cli_json_dumps({"error": (
                     f"--set requires a numeric USD value, got {set_usd!r}"
                 )}), file=sys.stderr)
                 return 1
@@ -4631,10 +4687,10 @@ def _cmd_budget(args) -> int:
             try:
                 reject_non_finite(new_usd, flag="--set")
             except ValueError as e:
-                print(json.dumps({"error": str(e)}), file=sys.stderr)
+                print(_cli_json_dumps({"error": str(e)}), file=sys.stderr)
                 return 1
             if new_usd < 0:
-                print(json.dumps({"error": "budget_usd must be non-negative"}),
+                print(_cli_json_dumps({"error": "budget_usd must be non-negative"}),
                       file=sys.stderr)
                 return 1
 
@@ -4696,7 +4752,7 @@ def _cmd_budget(args) -> int:
                     )
                 else:
                     # Key IS configured but mint failed — fail closed.
-                    print(json.dumps({
+                    print(_cli_json_dumps({
                         "error": (
                             f"capability_mint_failed: {type(_mint_exc_bs).__name__}: "
                             f"{_mint_exc_bs}"
@@ -4729,7 +4785,7 @@ def _cmd_budget(args) -> int:
                                 _m3_reason_bs,
                             )
                         else:
-                            print(json.dumps({
+                            print(_cli_json_dumps({
                                 "error": f"capability_verify_failed: {_m3_reason_bs}",
                                 "workflow_id": wf_arg,
                             }), file=sys.stderr)
@@ -4743,7 +4799,7 @@ def _cmd_budget(args) -> int:
                         )
                     else:
                         # Key IS configured but verify raised — fail closed.
-                        print(json.dumps({
+                        print(_cli_json_dumps({
                             "error": (
                                 f"capability_verify_exception: {type(_v_exc_bs).__name__}: "
                                 f"{_v_exc_bs}"
@@ -4759,13 +4815,13 @@ def _cmd_budget(args) -> int:
                     patch_bs["operator_capability"] = _cap_token_bs
                 sup.update_state(config, patch_bs)
             except Exception as e:  # noqa: BLE001
-                print(json.dumps({"error": f"checkpoint update failed: {e}"}),
+                print(_cli_json_dumps({"error": f"checkpoint update failed: {e}"}),
                       file=sys.stderr)
                 return 1
             emit(project, wf_arg, "budget.set",
                  {"workflow_id": wf_arg, "budget_usd": new_usd,
                   "spent_usd": b.spent_usd, "operator": _operator_bs})
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "workflow_id": wf_arg,
                 "set": True,
                 "budget_usd": new_usd,
@@ -4779,7 +4835,7 @@ def _cmd_budget(args) -> int:
             return 0
 
         # Detail view
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf_arg,
             "phase": getattr(state, "phase", "?"),
             "root_goal": (getattr(state, "root_goal", "") or "")[:80],
@@ -4799,7 +4855,7 @@ def _cmd_budget(args) -> int:
         or str(Path.home() / ".hydra" / "checkpoints.db")
     )
     if not cp_db.exists():
-        print(json.dumps({"workflows": [], "reason": "no_checkpoint_db"}, indent=2))
+        print(_cli_json_dumps({"workflows": [], "reason": "no_checkpoint_db"}, indent=2))
         return 0
 
     conn = sqlite3.connect(
@@ -4856,7 +4912,7 @@ def _cmd_budget(args) -> int:
     for r in rows:
         del r["_mtime"]
 
-    print(json.dumps({"count": len(rows), "workflows": rows}, indent=2))
+    print(_cli_json_dumps({"count": len(rows), "workflows": rows}, indent=2))
     return 0
 
 
@@ -4907,7 +4963,7 @@ def _cmd_reap(args) -> int:
     from .supervisor import build_supervisor, _PurePythonRunner
     sup = build_supervisor(project_root=project, dispatcher=_NullDispatcher())
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": "langgraph unavailable — reap requires the checkpointing supervisor",
         }), file=sys.stderr)
         return 1
@@ -4916,7 +4972,7 @@ def _cmd_reap(args) -> int:
     cp_db = Path(os.environ.get("HYDRA_CHECKPOINT_DB")
                  or (Path.home() / ".hydra" / "checkpoints.db"))
     if not cp_db.exists():
-        print(json.dumps({"scanned": 0, "candidates": [], "reaped": [],
+        print(_cli_json_dumps({"scanned": 0, "candidates": [], "reaped": [],
                           "reason": "no_checkpoint_db"}, indent=2))
         return 0
     conn = sqlite3.connect(f"file:{cp_db.as_posix()}?mode=ro", uri=True,
@@ -5004,7 +5060,7 @@ def _cmd_reap(args) -> int:
         except Exception as exc:  # noqa: BLE001 — never fail a reap on this
             eights_hitl["error"] = f"{type(exc).__name__}: {exc}"
 
-    print(json.dumps({
+    print(_cli_json_dumps({
         "mode": "apply" if do_apply else "dry-run",
         "older_than_hours": older_than_h,
         "eights_hitl": eights_hitl,
@@ -5075,7 +5131,7 @@ def _cmd_sweep_worktrees(args) -> int:
             "error": e.get("error"),
         })
 
-    print(json.dumps({
+    print(_cli_json_dumps({
         "mode": "apply" if do_apply else "dry-run",
         "project": project,
         "count_removed": sum(1 for e in entries if e["decision"] in ("removed", "would-remove")),
@@ -5140,7 +5196,7 @@ def _cmd_status(args) -> int:
                             "gate_node": _pending.get("gate_node"),
                             "summary": (_pending.get("summary", "") or "")[:120],
                         }
-                    print(json.dumps({
+                    print(_cli_json_dumps({
                         "workflow_id": wf,
                         "phase": _state.phase,
                         "root_goal": (_state.root_goal or "")[:120],
@@ -5170,7 +5226,7 @@ def _cmd_status(args) -> int:
             # which substitutes every non-finite value with null, reports
             # each substituted field, and never touches this checkpoint
             # (only the freshly minted replay workflow is persisted).
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "workflow_id": wf,
                 "status": "unjudgeable",
                 "field": e.field,
@@ -5193,7 +5249,7 @@ def _cmd_status(args) -> int:
         # Fall back: structured view of the most recent trace events (NOT raw dump).
         p = trace_path(project, wf)
         if not p.exists():
-            print(json.dumps({"error": f"no trace for workflow_id={wf!r}"}))
+            print(_cli_json_dumps({"error": f"no trace for workflow_id={wf!r}"}))
             return 1
         lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
         recent_events: list[dict] = []
@@ -5202,7 +5258,7 @@ def _cmd_status(args) -> int:
                 recent_events.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
-        print(json.dumps({
+        print(_cli_json_dumps({
             "workflow_id": wf,
             "note": "checkpoint unavailable — showing last 30 trace events",
             "events": recent_events,
@@ -5211,7 +5267,7 @@ def _cmd_status(args) -> int:
 
     # --- No arg: list workflows, latest-first by trace mtime ---
     if not base.exists():
-        print(json.dumps({"workflows": []}, indent=2))
+        print(_cli_json_dumps({"workflows": []}, indent=2))
         return 0
 
     wf_dirs = [d for d in base.iterdir() if d.is_dir()]
@@ -5290,7 +5346,7 @@ def _cmd_status(args) -> int:
                     pass
         rows.append(row)
 
-    print(json.dumps({"workflows": rows}, indent=2))
+    print(_cli_json_dumps({"workflows": rows}, indent=2))
     return 0
 
 
@@ -5354,7 +5410,7 @@ def _cmd_replay(args) -> int:
 
     # Validate source workflow_id
     if not _WORKFLOW_ID_RE.match(source_wf):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": f"invalid workflow_id {source_wf!r}",
             "detail": "must match ^[A-Za-z0-9][A-Za-z0-9\\-_]{{0,63}}$",
         }), file=sys.stderr)
@@ -5363,7 +5419,7 @@ def _cmd_replay(args) -> int:
     from_phase = getattr(args, "from_phase", None) or "intake"
     # Validate --from-phase against known phases
     if from_phase not in _KNOWN_PHASES:
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": f"invalid --from-phase {from_phase!r}",
             "valid": sorted(_KNOWN_PHASES),
         }), file=sys.stderr)
@@ -5371,7 +5427,7 @@ def _cmd_replay(args) -> int:
 
     swap_model = getattr(args, "swap_model", None)
     if swap_model is not None and not _MODEL_ID_RE.match(swap_model):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": f"invalid --swap-model {swap_model!r}",
             "detail": "must match ^[A-Za-z0-9][A-Za-z0-9\\-_./:]{{0,127}}$",
         }), file=sys.stderr)
@@ -5402,7 +5458,7 @@ def _cmd_replay(args) -> int:
     )
 
     if isinstance(sup, _PurePythonRunner):
-        print(json.dumps({
+        print(_cli_json_dumps({
             "error": "langgraph unavailable — replay requires the checkpointing supervisor",
         }), file=sys.stderr)
         return 1
@@ -5425,7 +5481,7 @@ def _cmd_replay(args) -> int:
         # freshly-minted `replay_wf` thread_id below, never written back
         # over `source_wf`).
         if not sanitize:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "source_workflow_id": source_wf,
                 "ok": False,
                 "status": "unjudgeable",
@@ -5492,7 +5548,7 @@ def _cmd_replay(args) -> int:
 
         raw_values = _read_raw_checkpoint_for_sanitize(source_wf)
         if raw_values is None:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "source_workflow_id": source_wf,
                 "error": "checkpoint_not_found",
                 "detail": f"No checkpoint for workflow_id={source_wf!r}. "
@@ -5504,7 +5560,7 @@ def _cmd_replay(args) -> int:
             values = {}
     else:
         if snap is None or not snap.values:
-            print(json.dumps({
+            print(_cli_json_dumps({
                 "source_workflow_id": source_wf,
                 "error": "checkpoint_not_found",
                 "detail": f"No checkpoint for workflow_id={source_wf!r}. "
@@ -5589,7 +5645,7 @@ def _cmd_replay(args) -> int:
         else getattr(final_dict, "phase", "?")
     )
 
-    print(json.dumps({
+    print(_cli_json_dumps({
         "source_workflow_id": source_wf,
         "replay_workflow_id": str(replay_wf),
         "from_phase": from_phase,
@@ -5667,7 +5723,7 @@ def _cmd_gateway_export_backends(args) -> int:
             )
     BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
     BACKEND_REGISTRY.write_text(
-        json.dumps(servers, indent=2, default=str), encoding="utf-8"
+        _cli_json_dumps(servers, indent=2, default=str), encoding="utf-8"
     )
     print(f"Exported {len(servers)} backends to {BACKEND_REGISTRY}")
     for name in sorted(servers):
@@ -5743,7 +5799,7 @@ def _cmd_gateway_remove_old_backends(args) -> int:
         del mcp[k]
 
     raw["mcpServers"] = mcp
-    claude_json.write_text(json.dumps(raw, indent=2, default=str), encoding="utf-8")
+    claude_json.write_text(_cli_json_dumps(raw, indent=2, default=str), encoding="utf-8")
     print(f"Removed {len(removed)} backend entries from ~/.claude.json: {removed}")
     print(f"Remaining: {sorted(mcp.keys())}")
     return 0
@@ -5844,7 +5900,7 @@ def _cmd_gateway_setup(args) -> int:
 
     from .dispatcher import BACKEND_REGISTRY
     BACKEND_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
-    BACKEND_REGISTRY.write_text(json.dumps(backends, indent=2), encoding="utf-8")
+    BACKEND_REGISTRY.write_text(_cli_json_dumps(backends, indent=2), encoding="utf-8")
     print(f"\nWrote {len(backends)} backends to {BACKEND_REGISTRY}")
     return 0
 
@@ -5983,7 +6039,7 @@ def _cmd_eights_drain(args) -> int:
             file=sys.stderr,
         )
 
-    print(json.dumps(out, indent=2))
+    print(_cli_json_dumps(out, indent=2))
     return 0
 
 
@@ -6006,14 +6062,14 @@ def _cmd_eights_hitl_reconcile(args) -> int:
         attestor = _reconcile_attestor(project)
         lookup = _make_phase_lookup(project)
     except Exception as exc:  # noqa: BLE001 — report, never traceback
-        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
+        print(_cli_json_dumps({"error": f"{type(exc).__name__}: {exc}"}, indent=2),
               file=sys.stderr)
         return 1
 
     summary = reconcile(attestor, lookup, apply=do_apply,
                         limit=int(limit) if limit is not None else None)
     summary["mode"] = "apply" if do_apply else "dry-run"
-    print(json.dumps(summary, indent=2))
+    print(_cli_json_dumps(summary, indent=2))
     return 0
 
 
@@ -6432,7 +6488,7 @@ def main(argv: list[str] | None = None) -> int:
         # individually — the choke point itself already did the only work
         # that matters (refusing to deserialize); this just keeps the CLI's
         # exit contract (`ok: false` JSON, not a bare traceback) uniform.
-        print(json.dumps({
+        print(_cli_json_dumps({
             "ok": False, "status": "unjudgeable",
             "workflow_id": getattr(args, "workflow_id", None),
             "field": e.field,
