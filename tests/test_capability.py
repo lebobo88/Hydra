@@ -269,9 +269,24 @@ def test_verify_malformed_no_raise(monkeypatch, bad_token: Any, label: str):
 # ---------------------------------------------------------------------------
 
 def _make_signed_token_with_exp(monkeypatch, exp_value: Any) -> dict:
-    """Build a structurally valid HMAC-signed token with a bad exp field."""
+    """Build a structurally valid HMAC-signed token with a bad exp field.
+
+    ``_canonical_body`` (the module's real signing path) is now strict (this
+    stage's fix: a non-finite field is SIGNED material, so mint refuses it --
+    see ``test_canonical_body_refuses_non_finite_field`` below). A token with
+    ``exp=float("inf")`` can therefore no longer be produced through the
+    module's own canonicalization at all. For that one case only, this
+    fixture falls back to the PRE-hardening canonicalization (plain
+    ``json.dumps``, matching what ``_canonical_body`` did before this stage)
+    to simulate a forged/legacy token an attacker (or an artifact predating
+    this fix) might present -- the point of this fixture is to prove
+    ``verify_capability``'s OWN ``_is_valid_exp`` type check independently
+    rejects a non-int ``exp`` no matter how the bytes were produced, not to
+    prove anything about how the bytes were produced.
+    """
     monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
     from hydra_core.auth.capability import _canonical_body, _compute_sig, _load_operator_key
+    from hydra_core.strict_json import is_non_finite_float
     body = {
         "v": 1,
         "actor_id": "rob@example.com",
@@ -281,10 +296,26 @@ def _make_signed_token_with_exp(monkeypatch, exp_value: Any) -> dict:
         "exp": exp_value,
     }
     key_bytes, key_id = _load_operator_key()
-    canonical = _canonical_body(body)
+    if is_non_finite_float(exp_value):
+        import json as _json
+        canonical = _json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    else:
+        canonical = _canonical_body(body)
     sig_val = _compute_sig(canonical, key_bytes)
     body["sig"] = {"alg": "HMAC-SHA256", "key_id": key_id, "value": sig_val}
     return body
+
+
+def test_canonical_body_refuses_non_finite_field(monkeypatch):
+    """This stage's fix: a signed payload must refuse a non-finite field
+    outright rather than silently sign whatever bytes `allow_nan=True`
+    happens to produce."""
+    monkeypatch.setenv("HYDRA_OPERATOR_KEY", TEST_KEY_HEX)
+    from hydra_core.auth.capability import _canonical_body
+    with pytest.raises(ValueError, match="exp"):
+        _canonical_body({"v": 1, "exp": float("inf")})
 
 
 @pytest.mark.parametrize("bad_exp, label", [

@@ -466,7 +466,21 @@ def _load_ticket(tasks: Path, ticket_id: str) -> dict[str, Any] | None:
 
 def _save_ticket(tasks: Path, ticket: dict[str, Any]) -> None:
     p = _ticket_path(tasks, ticket["ticket_id"])
-    p.write_text(json.dumps(ticket, indent=2, default=str), encoding="utf-8")
+    # This is a WRITE/persistence path (the ticket store), not a tool
+    # RESPONSE -- refuse rather than silently persist a substituted field.
+    # Callers run inside the shared `_pack_shim.run_server` tool-handler
+    # loop, whose `except Exception` (SDK path: mcp's own call_tool
+    # decorator; bare path: `_pack_shim._serve_bare`) already turns a raised
+    # ValueError into a structured error response rather than crashing the
+    # stdio loop.
+    from hydra_core.strict_json import dumps_strict
+    p.write_text(
+        dumps_strict(
+            ticket, label=f"ticket:{ticket.get('ticket_id')}",
+            indent=2, default=str,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _now_iso() -> str:

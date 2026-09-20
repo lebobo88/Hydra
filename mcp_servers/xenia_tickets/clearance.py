@@ -86,7 +86,16 @@ def _canonical_body(token_dict: dict) -> bytes:
       json.dumps(body_minus_sig, sort_keys=True, separators=(',',':')).encode('utf-8')
     """
     body = {k: v for k, v in token_dict.items() if k != _SIG_FIELD}
-    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # Signed payload: a silently substituted non-finite field would change
+    # the bytes actually signed/compared vs. what the caller believes was
+    # signed. Refuse (strict) rather than sanitize -- callers already
+    # wrap both the mint and verify use sites (mint fails loud; verify's
+    # `except Exception` below turns this into a fail-closed result).
+    from hydra_core.strict_json import dumps_strict
+    return dumps_strict(
+        body, label="clearance_token_canonical_body",
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

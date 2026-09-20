@@ -162,7 +162,9 @@ def _serve_with_mcp_sdk() -> bool:
         if name not in handlers:
             raise ValueError(f"unknown tool: {name}")
         result = handlers[name](arguments)
-        return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+        from hydra_core.strict_json import dumps_tool_response_safe
+        text = dumps_tool_response_safe(result, label=f"tool_response:{name}")
+        return [t.TextContent(type="text", text=text)]
 
     import asyncio
 
@@ -198,7 +200,8 @@ def _serve_bare() -> None:
                 out = {"id": msg.get("id"), "error": f"unknown_method: {method!r}"}
         except Exception as e:
             out = {"id": msg.get("id"), "error": str(e)}
-        sys.stdout.write(json.dumps(out, default=str) + "\n")
+        from hydra_core.strict_json import dumps_tool_response_safe
+        sys.stdout.write(dumps_tool_response_safe(out, label="toolshed_bare_response") + "\n")
         sys.stdout.flush()
 
 

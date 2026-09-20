@@ -70,7 +70,15 @@ async def _run(path: Path) -> int:
         return 1
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, default=str), encoding="utf-8")
+    # Persisted cache the gateway loads at startup and overlays onto its tool
+    # catalog -- refuse rather than silently write a substituted schema
+    # constraint (e.g. a `minimum`/`maximum` numeric bound) that would then
+    # be trusted uncritically on every future gateway boot.
+    from hydra_core.strict_json import dumps_strict
+    path.write_text(
+        dumps_strict(cache, label="gateway_schema_cache", indent=2, default=str),
+        encoding="utf-8",
+    )
     total = sum(len(v) for v in cache.values())
     print(f"\nWrote {total} tool schema(s) across {len(cache)} backend(s) to {path}")
     return 0
