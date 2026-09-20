@@ -3044,7 +3044,47 @@ def build_supervisor(
         # fails, and for an unjudgeable verdict (checked first — a broken
         # candidate outranks a policy-quality breach). These were emitted
         # during dispatch on candidate envelopes before this node ran.
+        # Cross-vendor judge finding (this round, item 1 CRITICAL, read-side
+        # backstop): a verdict already sitting in an OLD checkpoint
+        # (persisted before `judge.dispatcher.dispatch_judge`'s write-side
+        # guard existed, or restored from an import that bypassed it) can
+        # carry a NaN/Infinity `score_json` under an ordinary "pass"/
+        # "revise" outcome. `_verdict_outcome(prior) == "unjudgeable"` below
+        # only catches a verdict already TAGGED unjudgeable; it says nothing
+        # about a normal-looking verdict whose payload is itself poisoned.
+        # Recorded here but only applied as `unjudgeable_hit` AFTER the
+        # envelope loop below has had a chance to run: if the SAME poisoned
+        # payload also exists as a `state.envelopes` entry (the common case
+        # -- a persisted JUDGE_VERDICT envelope alongside its `state.verdicts`
+        # copy), the envelope loop's scan constructs the richer, freshly
+        # emitted `unjudgeable` verdict (with full `_judge_attempts`
+        # bookkeeping); this scan is the fallback for a verdict that exists
+        # ONLY in `state.verdicts` (e.g. a best-of-N internal verdict that
+        # was never also persisted as an envelope) with no such counterpart.
+        verdict_only_unjudgeable_hit: dict | None = None
         for prior in state.verdicts:
+            bad_verdict_field = find_non_finite_field(prior)
+            if bad_verdict_field is not None and verdict_only_unjudgeable_hit is None:
+                emit_trace(judge_trace_root, state.workflow_id, "judge.unjudgeable_verdict_scan", {
+                    "verdict_id": prior.get("id"),
+                    "target_envelope_id": prior.get("target_envelope_id"),
+                    "field": bad_verdict_field,
+                })
+                # Synthesize a critique_md matching `_NON_FINITE_FIELD_RE` so
+                # `_unjudgeable_field_path` (used by the HITL summary below)
+                # names the actual offending field instead of falling back to
+                # "<unknown field>" — this prior verdict never went through
+                # `_unjudgeable_verdict` (it may predate the write-side
+                # guard), so it has no such message of its own.
+                verdict_only_unjudgeable_hit = {
+                    **prior,
+                    "critique_md": (
+                        "[UNJUDGEABLE — persisted verdict contains a "
+                        f"non-finite value at {bad_verdict_field}; refusing "
+                        "to write invalid JSON]"
+                    ),
+                }
+                continue
             if _verdict_outcome(prior) == "unjudgeable" and unjudgeable_hit is None:
                 unjudgeable_hit = prior
             if (prior.get("outcome") == "fail"
@@ -3252,6 +3292,15 @@ def build_supervisor(
                     # routes to hitl_gate_judge instead of postcheck/halt.
                     "hitl_return_node": state.hitl_return_node,
                 }
+
+        # Fallback application of the `state.verdicts`-only non-finite scan
+        # (see its docstring above): only takes effect if nothing in the
+        # envelope loop above already caught the same (or a different)
+        # unjudgeable condition, so a verdict WITH a matching envelope still
+        # gets the richer, freshly emitted `unjudgeable` verdict from the
+        # envelope-level scan instead of this raw fallback.
+        if unjudgeable_hit is None and verdict_only_unjudgeable_hit is not None:
+            unjudgeable_hit = verdict_only_unjudgeable_hit
 
         # R3-tail: also scan the just-completed retry verdicts. If a retry
         # envelope's own re-judge came back `revise`, the next pass would need

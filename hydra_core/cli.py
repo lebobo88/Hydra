@@ -4430,6 +4430,34 @@ def _cmd_finalize(args) -> int:
             patch["envelopes"] = envelopes
         if artifacts:
             patch["artifacts"] = artifacts
+        # Cross-vendor judge finding (this round, item 2 HIGH): `as_node=
+        # "judge_per_squad"` below re-enters the graph via `after_judge_per_
+        # squad`'s conditional edge WITHOUT ever running `node_judge_per_
+        # squad` -- so its unconditional non-finite scan (over `state.
+        # envelopes`/`state.verdicts`) never executes for the envelopes/
+        # artifacts this function just materialized from attended results.
+        # A non-finite value injected here (e.g. via a corrupted attended
+        # result payload) would reach `synthesis` untouched; `synthesis`'s
+        # own strict-serialization failure is caught and REDACTED further
+        # downstream, so a fresh, finite DecisionRecord silently replaces
+        # the broken data instead of surfacing it. Scan the exact payload
+        # about to be checkpointed, here, before the mutation, and refuse
+        # with the same field-naming shape `node_judge_per_squad` uses.
+        from .strict_json import find_non_finite_field
+        bad_field = find_non_finite_field({"envelopes": envelopes, "artifacts": artifacts})
+        if bad_field is not None:
+            print(json.dumps({
+                "ok": False, "status": "unjudgeable", "workflow_id": wf,
+                "field": bad_field,
+                "detail": (
+                    "attended result data contains a non-finite value at "
+                    f"{bad_field}; refusing to finalize into synthesis. Fix "
+                    "the offending attended result at source and re-run "
+                    "finalize."
+                ),
+            }, indent=2, default=str))
+            return 0
+
         emit(project, wf, "finalize.materialized", {
             "envelopes": len(envelopes), "artifacts": len(artifacts),
             "attended_results": len(state.attended_results or []),

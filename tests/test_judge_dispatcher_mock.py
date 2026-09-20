@@ -254,6 +254,57 @@ def test_dispatch_judge_with_fallback_still_produces_ordinary_skip_for_infra_out
     assert all(a.get("reason") != "non_finite_envelope" for a in attempts)
 
 
+def test_dispatch_judge_refuses_non_finite_score_json_at_record_time():
+    """Cross-vendor judge finding (this round, item 1 CRITICAL): a VERDICT
+    can itself carry non-finite data -- the judge model's own `score_json`
+    response is untrusted, and nothing upstream of `dispatch_judge`
+    constrains it to finite values the way `_envelope_to_text` constrains
+    the envelope being judged. A NaN score must be refused at construction,
+    surfacing as the same `unjudgeable`-shaped `JudgeDispatchError` a
+    non-finite ENVELOPE raises, with the offending field named."""
+    wf = uuid4()
+    client = _ScriptedClient({
+        "outcome": "pass",
+        "critique_md": "Solid memo. " * 20,
+        "score_json": {"objective_clarity": float("nan")},
+    })
+    with pytest.raises(JudgeDispatchError) as exc_info:
+        dispatch_judge(
+            envelope=_env(),
+            rubric_id="board-decision-quality@1",
+            judge_vendor="agy",
+            workflow_id=wf,
+            client=client,
+        )
+    err = exc_info.value
+    assert err.reason == "non_finite_envelope"
+    assert not err.retryable
+    assert "score_json.objective_clarity" in str(err)
+
+
+def test_dispatch_judge_with_fallback_surfaces_unjudgeable_for_non_finite_verdict():
+    """The fallback loop's existing all-vendors-failed check (keyed on
+    `reason=="non_finite_envelope"`) folds a non-finite VERDICT into the
+    same `unjudgeable` outcome a non-finite ENVELOPE gets -- never a
+    fabricated `pass`."""
+    wf = uuid4()
+    client = _ScriptedClient({
+        "outcome": "pass",
+        "critique_md": "Solid memo. " * 20,
+        "score_json": {"objective_clarity": float("inf")},
+    })
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=_env(),
+        rubric_id="board-decision-quality@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "unjudgeable"
+    assert "score_json.objective_clarity" in verdict.critique_md
+    assert client.calls, "both vendors were genuinely attempted, not skipped"
+
+
 def test_dispatch_judge_allow_nan_true_would_have_leaked_nan_into_prompt():
     """Mutation proof (revert immediately): show plain `json.dumps` (the
     pre-fix behaviour, before `_envelope_to_text` routed through

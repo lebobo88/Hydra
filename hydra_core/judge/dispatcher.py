@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 
 from .registry import get_rubric
 from .schemas import JudgeOutcome, JudgeVendor, JudgeVerdict
+from ..strict_json import find_non_finite_field
 
 
 JudgeErrorReason = Literal[
@@ -234,13 +235,28 @@ def dispatch_judge(
 
     outcome, critique, scores = _apply_pragmatic_pass_guard(raw)
 
+    # Cross-vendor judge finding (this round, item 1 CRITICAL): `raw` (and
+    # therefore `scores`) is the JUDGE MODEL'S OWN untrusted response --
+    # nothing upstream constrains `score_json` to finite values the way
+    # `_envelope_to_text` constrains the envelope being judged. A verdict
+    # built from a NaN/Infinity score is itself state (`HydraState.verdicts`)
+    # that best-of-N ranks on (`borda_winner`) and that the per-squad scan
+    # would otherwise wave through with a normal "pass"/"revise" outcome --
+    # unlike a non-finite ENVELOPE, a non-finite VERDICT was never checked by
+    # any existing guard. Refuse to persist it: raise the SAME
+    # `JudgeDispatchError(reason="non_finite_envelope")` a non-finite
+    # envelope raises, so `dispatch_judge_with_fallback`'s existing
+    # all-vendors-failed check (below) folds it into the same `unjudgeable`
+    # outcome instead of a fabricated `pass`/`revise`/`fail`. Checked on the
+    # fully-built payload (not just `scores`) so a future field added to
+    # `JudgeVerdict` gets the same guarantee without a second call site.
     target_id = envelope.get("id")
     if isinstance(target_id, str):
         target_id = UUID(target_id)
     elif target_id is None:
         target_id = uuid4()
 
-    return JudgeVerdict(
+    verdict = JudgeVerdict(
         workflow_id=workflow_id,
         origin_squad="hydra-judge",
         target_squad=envelope.get("origin_squad"),
@@ -254,6 +270,22 @@ def dispatch_judge(
         retry_index=retry_index,
         parent_verdict_id=parent_verdict_id,
     )
+    # `mode="python"`, not `mode="json"`: pydantic's JSON-mode serializer
+    # silently coerces a non-finite float to `null` (JSON has no NaN/Inf
+    # literal), which would make this scan always find nothing -- the exact
+    # bug this guard exists to prevent, just moved one line earlier. The
+    # python-mode dump preserves the raw `float("nan")`/`inf` value so
+    # `find_non_finite_field` can actually see it.
+    bad_field = find_non_finite_field(verdict.model_dump(mode="python"))
+    if bad_field is not None:
+        raise JudgeDispatchError(
+            f"verdict payload contains a non-finite value at {bad_field} "
+            f"(vendor={judge_vendor}, rubric={rubric_id}); refusing to "
+            "persist a non-finite verdict",
+            vendor=judge_vendor, rubric_id=rubric_id,
+            reason="non_finite_envelope", retryable=False,
+        )
+    return verdict
 
 
 def _skip_verdict(

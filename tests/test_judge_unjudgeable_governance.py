@@ -805,3 +805,57 @@ def test_persisted_clean_pass_verdict_with_finite_source_takes_fast_path():
         "an already-judged, finite source with a clean persisted verdict "
         f"must not be re-judged: got fresh verdicts {retargeting}"
     )
+
+
+def test_verdict_only_nan_score_json_hard_blocks_with_no_matching_envelope():
+    """This round's read-side backstop (item 1 CRITICAL): a verdict can sit
+    in `state.verdicts` with NO counterpart in `state.envelopes` at all --
+    e.g. a best-of-N internal verdict recorded via `node_dispatch`'s
+    `verdicts_out.extend(...)`, which never mints a JUDGE_VERDICT envelope
+    for each candidate rubric pass. A NaN in that verdict's `score_json`
+    must still hard-block `node_judge_per_squad`, not silently take the fast
+    path just because the poisoned payload never appears in `state.envelopes`
+    for the unconditional envelope-loop scan to catch."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="verdict-only NaN score, no envelope counterpart")
+    source_id = str(uuid4())
+    finite_source_envelope = {
+        "id": source_id,
+        "type": "C_SUITE_DECISION_PACKET",
+        "origin_squad": "executive",
+        "workflow_id": str(state.workflow_id),
+        "origin": "BOARDROOM",
+        "objective": "best-of-n winner, no JUDGE_VERDICT envelope minted",
+        "constraints": {"budget_usd": 1000.0},
+    }
+    verdict_only_poisoned = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": source_id,
+        "outcome": "pass",
+        "rubric_id": "board-decision-quality@1",
+        "judge_vendor": "codex",
+        "generator_vendor": "claude",
+        "score_json": {"overall": float("nan")},
+    }
+    # Only the source envelope is present in `state.envelopes` -- the
+    # poisoned verdict lives ONLY in `state.verdicts`, unlike the
+    # `test_persisted_pass_verdict_with_nan_score_json_hard_blocks` case
+    # above, which also carries the poisoned payload as an envelope.
+    state.envelopes = [finite_source_envelope]
+    state.verdicts = [dict(verdict_only_poisoned)]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "a state.verdicts-only NaN score_json must hard-block even with no "
+        "matching state.envelopes entry"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    assert "score_json" in patch["pending_hitl"]["summary"]
