@@ -247,3 +247,63 @@ def test_sanitize_non_finite_names_a_nan_dict_key():
     result, fields = sanitize_non_finite({float("nan"): "x"})
     assert "null" in result
     assert any("<key:" in f for f in fields)
+
+
+# ---------------------------------------------------------------------------
+# Cross-vendor judge finding (this round, item 2 MEDIUM): key collisions,
+# marker overwrite, and cyclic transport input.
+# ---------------------------------------------------------------------------
+
+def test_sanitize_non_finite_key_collision_keeps_both_values_distinct():
+    """A genuine `"null"` key and a non-finite-float key that would
+    naively map to the same replacement key must both survive, distinctly."""
+    payload = {"null": "real", float("nan"): "replacement"}
+    result, fields = sanitize_non_finite(payload)
+    assert result["null"] == "real", "the caller's genuine 'null' value must not be lost"
+    assert "real" in result.values()
+    assert "replacement" in result.values()
+    # Exactly two entries -- no value silently dropped by a key collision.
+    assert len(result) == 2
+    assert any("<key:" in f for f in fields)
+
+
+def test_dumps_tool_response_safe_marker_does_not_overwrite_caller_field():
+    """A caller-authored `_non_finite_fields_sanitized` field must survive
+    untouched; the sanitizer's own marker lands under a different name."""
+    payload = {
+        "budget": float("nan"),
+        "_non_finite_fields_sanitized": "caller-owned-value",
+    }
+    text = dumps_tool_response_safe(payload)
+    parsed = json.loads(text)
+    assert parsed["_non_finite_fields_sanitized"] == "caller-owned-value", (
+        "the sanitizer must never clobber the caller's own field of the same name"
+    )
+    # The sanitizer's own marker still names the sanitized field, just under
+    # a non-colliding key.
+    marker_keys = [k for k in parsed if k != "_non_finite_fields_sanitized" and "sanitized" in k]
+    assert marker_keys, "expected a fallback marker key naming the sanitized field"
+    assert any("$.budget" in f for f in parsed[marker_keys[0]])
+
+
+def test_dumps_tool_response_safe_cyclic_payload_returns_marker_not_raise():
+    """`dumps_tool_response_safe` promises to NEVER raise on the transport
+    path -- a cyclic payload (which trips `dumps_strict`'s ValueError, then
+    used to come back out of `sanitize_non_finite` unchanged and blow up the
+    fallback `json.dumps` call) must instead produce valid JSON with an
+    explicit circular-reference marker."""
+    cyclic: dict[str, object] = {"a": 1}
+    cyclic["self"] = cyclic
+    text = dumps_tool_response_safe(cyclic, label="cyclic-tool-response")
+    parsed = json.loads(text)  # must not raise
+    assert parsed["a"] == 1
+    assert parsed["self"] == "<circular reference>"
+
+
+def test_sanitize_non_finite_cyclic_dict_returns_marker_directly():
+    cyclic: dict[str, object] = {"a": 1}
+    cyclic["self"] = cyclic
+    result, fields = sanitize_non_finite(cyclic)
+    assert result["self"] == "<circular reference>"
+    assert any("circular reference" in f for f in fields)
+    json.dumps(result)  # must not raise

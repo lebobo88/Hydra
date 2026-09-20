@@ -245,6 +245,150 @@ def test_persisted_unjudgeable_verdict_already_in_state_verdicts_not_double_coun
     assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
 
 
+def test_unrelated_verdict_sharing_id_does_not_suppress_block():
+    """Cross-vendor judge finding (this round, item 1 HIGH, follow-up): an
+    id match ALONE must never suppress the hard block. An unrelated verdict
+    that happens to share the same `id` as the persisted unjudgeable
+    envelope (but a DIFFERENT outcome) is not "the same record already
+    folded in" -- the block must still fire."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="id collision resume")
+    shared_id = str(uuid4())
+    unrelated_pass_verdict = {
+        "id": shared_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
+        "outcome": "pass",
+        "rubric_id": "owasp-asvs-l1@1",
+    }
+    persisted_unjudgeable_envelope = {
+        "id": shared_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
+        "outcome": "unjudgeable",
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
+    }
+    state.verdicts = [unrelated_pass_verdict]
+    state.envelopes = [persisted_unjudgeable_envelope]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "an id collision with an unrelated verdict must never suppress a "
+        "genuine unjudgeable hit"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+
+
+def test_unjudgeable_envelope_missing_id_still_blocks():
+    """A raw record with no `id` at all must never be treated as matching
+    a persisted verdict via a `None`-to-`None` id collision."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="missing id resume")
+    verdict_missing_id = {
+        # no "id" key at all
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
+        "outcome": "pass",
+        "rubric_id": "owasp-asvs-l1@1",
+    }
+    persisted_unjudgeable_envelope_no_id = {
+        # also no "id" key
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
+        "outcome": "unjudgeable",
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
+    }
+    state.verdicts = [verdict_missing_id]
+    state.envelopes = [persisted_unjudgeable_envelope_no_id]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "a missing/None id must never collide with another missing/None id"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+
+
+def test_nested_payload_outcome_unjudgeable_still_blocks():
+    """A persisted JUDGE_VERDICT envelope carrying its outcome nested under
+    `payload.outcome` (rather than flattened at the top level) must still
+    hard-block -- the top-level `outcome` read must not silently miss it."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="nested payload outcome resume")
+    nested_unjudgeable_envelope = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
+        "payload": {"outcome": "unjudgeable"},
+    }
+    state.envelopes = [nested_unjudgeable_envelope]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced"
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+
+
+def test_genuinely_matching_verdict_not_double_counted_via_id_and_outcome():
+    """Companion to the id-collision fix: a persisted envelope that IS the
+    same record (same id AND same outcome) already folded into
+    `state.verdicts` must still hard-block (via the `state.verdicts` scan)
+    without the envelope-scan path re-processing it as a second, distinct
+    hit."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="genuine match resume")
+    verdict_id = str(uuid4())
+    target_id = str(uuid4())
+    verdict = {
+        "id": verdict_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": target_id,
+        "outcome": "unjudgeable",
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
+    }
+    state.verdicts = [verdict]
+    state.envelopes = [dict(verdict)]  # exact same record, also persisted as an envelope
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced"
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    # Exactly one unjudgeable verdict drives the HITL (the state.verdicts
+    # scan's hit), not a second one manufactured by the envelope scan.
+    unjudgeable_verdicts = [v for v in patch["verdicts"] if v.get("outcome") == "unjudgeable"]
+    assert len(unjudgeable_verdicts) <= 1
+
+
 def test_unjudgeable_final_record_blocks_postcheck_from_marking_done():
     """`node_judge_synthesis` must surface (not advance to postcheck→done)
     when the final DecisionRecord itself fails strict serialization."""
