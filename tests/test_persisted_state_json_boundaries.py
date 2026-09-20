@@ -295,3 +295,97 @@ def test_flush_to_file_finite_calls_all_survive_the_loop(tmp_path):
     for line in lines:
         parsed = json.loads(line)
         assert "_non_finite_fields_sanitized" not in parsed
+
+
+# ---------------------------------------------------------------------------
+# cli.py gateway-* config writes (STRICT, reclassified from the CLI-stdout
+# sanitize policy -- these three sites write PERSISTED OPERATOR
+# CONFIGURATION to disk, not a printed command result).
+# ---------------------------------------------------------------------------
+
+def test_gateway_export_backends_refuses_non_finite_and_leaves_registry_untouched(
+    tmp_path, monkeypatch
+):
+    import argparse
+    import hydra_core.dispatcher as dispatcher_module
+    from hydra_core import cli as cli_module
+
+    registry = tmp_path / "backends.json"
+    original = json.dumps({"pre_existing": {"command": "true"}})
+    registry.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(dispatcher_module, "BACKEND_REGISTRY", registry)
+    monkeypatch.setattr(
+        dispatcher_module, "_load_user_scope_mcp",
+        lambda: {"hostile": {"command": "true", "env": {"budget": float("nan")}}},
+    )
+    # `_cmd_gateway_export_backends` does `from .dispatcher import
+    # _load_user_scope_mcp, BACKEND_REGISTRY` INSIDE the function, so
+    # patching the dispatcher module's attributes (not cli_module's) is
+    # what actually takes effect at call time.
+    with pytest.raises(ValueError, match="non-finite value"):
+        cli_module._cmd_gateway_export_backends(argparse.Namespace())
+    assert registry.read_text(encoding="utf-8") == original
+
+
+def test_gateway_remove_old_backends_refuses_non_finite_and_leaves_claude_json_untouched(
+    tmp_path, monkeypatch
+):
+    import argparse
+    import hydra_core.dispatcher as dispatcher_module
+    from hydra_core import cli as cli_module
+
+    registry = tmp_path / "backends.json"
+    registry.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(dispatcher_module, "BACKEND_REGISTRY", registry)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    claude_json = tmp_path / ".claude.json"
+    original = json.dumps({
+        # The non-finite value sits on a KEPT entry (mcpServers.hydra_gateway
+        # survives the prune, unlike old_one below) so it is still present
+        # in `raw` at write time -- this proves the refusal happens on the
+        # POST-PRUNE write, not merely on whatever gets deleted.
+        "mcpServers": {
+            "hydra_gateway": {"command": "true", "meta": float("inf")},
+            "old_one": {"command": "true"},
+        },
+    })
+    claude_json.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-finite value"):
+        cli_module._cmd_gateway_remove_old_backends(argparse.Namespace())
+    assert claude_json.read_text(encoding="utf-8") == original
+
+
+def test_gateway_setup_refuses_non_finite_and_leaves_registry_untouched(
+    tmp_path, monkeypatch
+):
+    import argparse
+    from pathlib import Path as PathClass
+    import hydra_core.dispatcher as dispatcher_module
+    from hydra_core import cli as cli_module
+
+    registry = tmp_path / "backends.json"
+    original = json.dumps({"pre_existing": {"command": "true"}})
+    registry.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(dispatcher_module, "BACKEND_REGISTRY", registry)
+
+    hostile_templates = json.dumps({
+        "hostile": {
+            "type": "stdio", "command": "true", "args": [],
+            "env": {"budget": float("nan")}, "required": True,
+        },
+    })
+    real_read_text = PathClass.read_text
+
+    def fake_read_text(self, *a, **kw):
+        if self.name == "gateway_templates.json":
+            return hostile_templates
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(PathClass, "read_text", fake_read_text)
+
+    with pytest.raises(ValueError, match="non-finite value"):
+        cli_module._cmd_gateway_setup(argparse.Namespace())
+    assert registry.read_text(encoding="utf-8") == original
