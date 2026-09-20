@@ -2080,10 +2080,53 @@ def _rank_key(outcome: str, score: dict[str, Any], smoke_status: str) -> float:
     by 1000 so it outranks any rubric scale), then smoke-pass, then mean rubric
     score. A `fail` can never outrank a `revise`/`pass` regardless of score
     magnitude (rubrics may be 0-1 or 0-10). Booleans (e.g. _cross_vendor) are
-    excluded from the mean."""
+    excluded from the mean.
+
+    Cross-vendor judge finding (follow-up round, HIGH -- the ORIGINAL defect
+    class of this whole thread, found on a path nothing else covered): the
+    `isinstance(v, (int, float))` filter already excludes a non-numeric
+    dimension (a string, a dict, ...) from the mean, but a GENUINE float
+    NaN/Infinity dimension (the judge model's own untrusted response --
+    `judge.dispatcher.dispatch_judge` refuses to even construct a
+    `JudgeVerdict` carrying one via `find_non_finite_field`, but THIS
+    module's independent best-of-N loop never routes its `score` dict
+    through that or any other guard) passes the isinstance check unchanged
+    and poisons `mean` to NaN. This return value is the sole ranking key
+    for `sorted(eligible, key=lambda s: s["rank"], reverse=True)`: every
+    comparison against a NaN key is False, so the candidate's position in
+    the sort is effectively ARBITRARY (it could land first, i.e. WIN) --
+    and silently, because a run with a poisoned rank looks exactly like an
+    ordinary run that chose a winner. Best-of-N ranking decides which
+    candidate's CODE gets merged, so this is the sharpest consequence in
+    this thread: an arbitrary, silent choice of which code ships.
+
+    Fix: EXCLUDE a non-finite dimension from the mean, the same treatment
+    the isinstance filter already gives an unusable (non-numeric) value --
+    not a wholesale refusal of the candidate. Refusing the whole candidate
+    would also discard its OUTCOME and SMOKE status, which already DOMINATE
+    this rank (the `base * 1000` / `+100` terms dwarf any rubric score,
+    capped at 999) -- a candidate that passed review and passed smoke but
+    had one judge mis-report a single rubric dimension as non-finite should
+    not be thrown out entirely over that one field, any more than it would
+    be if that field were merely missing or non-numeric.
+
+    A candidate left with NO usable dimension (every value absent,
+    non-numeric, or non-finite) contributes `mean = 0.0` -- explicitly: not
+    a fabricated "scored zero" being compared against a real measured
+    score as if it were equally trustworthy fact, but the existing NEUTRAL
+    default this function already used for "no score dimensions were
+    reported at all" (0.0 is the lower bound of the rubric-score
+    contribution in this additive scheme, so it can never inflate a
+    candidate's rank above one with any genuine positive score -- and it
+    can never make it WIN over a candidate with the same outcome/smoke and
+    a positive real score. It can only ever be a neutral tiebreak
+    contribution, identical to a candidate that genuinely scored the
+    rubric floor).
+    """
     base = {"pass": 2, "revise": 1, "fail": 0}.get(outcome, 0)
     nums = [float(v) for v in (score or {}).values()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)]
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and not is_non_finite_float(float(v))]
     mean = (sum(nums) / len(nums)) if nums else 0.0
     return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + min(mean, 999.0)
 
