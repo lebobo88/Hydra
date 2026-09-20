@@ -650,3 +650,64 @@ result and that classification has no basis at all.
 **Until fixed:** both `run_FZ4a7AXavRQn` and `run_zjFm-RuvKXeX` are falsely
 surfaced with their work merged. Dismiss with `ack_run`; do not `/pp:retry`
 either, which would redo landed work.
+
+---
+
+## §12 — Strict-JSON stages B1/B2: what the sweep actually found (2026-09-20)
+
+B1 and B2 were scoped as "close the remaining permissive `json.dumps` sites."
+Almost nothing they found was a serialization bug. Recorded because the pattern
+is the reusable part.
+
+**The serialization work was the instrument, not the target.** Forcing every
+value crossing a boundary to be either valid or explicitly refused made a series
+of pre-existing defects visible — nearly all of which had been silently
+producing *plausible numbers* rather than errors:
+
+| Defect | Consequence |
+|---|---|
+| Vendor stdout cost parsed with bare `float()` | NaN cost → every budget comparison False → **gate never blocks**; demonstrated: budget $1.00/$1.00 exhausted, `should_block_for_budget: False` |
+| `cost_source` discarded by the accumulators | rejected cost indistinguishable from genuine $0.00 → **silent under-charging**, `unmeasured_stages` never incremented |
+| Guard validated *before* the `float()` cast | `"NaN"` as a JSON **string** bypassed the guard added that same round |
+| `_extract_squad_cost` arity change | `ingest.py:768` unpacked 2 of 3 → **guaranteed `ValueError`** on the ingestion path (7 suite failures) |
+| `_rank_key` unfiltered NaN | best-of-N ranking poisoned → **the wrong candidate's code kept**; demonstrated by wrong winner through the real drive loop |
+| Documented-but-unimplemented non-negative clamp | negative tokens → **priced cost −12.0**, below the input-only price |
+| Negative pricing override floored to 0.0 | broken rate became a **confident free call** |
+| Unhashable `cost_source` | `TypeError` → outer handler → **entire run aborted**, `wrote_changes: False` |
+
+### Three lessons worth keeping
+
+1. **Re-deriving a judgement from an already-judged value discards the
+   judgement.** This appeared three times: accrual sites re-deriving "was it
+   reported" over the coercion helper, and re-deriving provenance over the
+   parser's verdict. The *correct* rule (`coerce_untrusted_cost(0.0) == measured`)
+   is what destroyed the upstream verdict — which is why it was hard to see.
+2. **Patching paths does not converge; fixing the rule does.** Findings B, 6, X
+   and Y were four routes to one state (`$0.00` labelled measured). Each round
+   closed one. It converged only when the *default* was inverted: measured now
+   requires positive evidence, so a new vendor inherits the safe answer. This is
+   the same shape as the earlier serialization work, which took twelve rounds
+   before moving to a single choke point.
+3. **A fix can create the defect it removes, one level down.** Making an upstream
+   verdict authoritative let a *vendor* spoof provenance (`{'cost_usd':'NaN',
+   'cost_source':'measured'}` → measured). Corrected to a monotone rule — upstream
+   may weaken, never strengthen — expressed as a rank table with `min()` so a
+   future fourth source cannot reintroduce an upgrade path. Then the guard written
+   to treat vendor input as untrusted **assumed that input was a string**, and an
+   unhashable value crashed it.
+
+### Open follow-ups (not fixed; logged deliberately)
+
+- **`squad_node.py:2002` — the sibling of the unhashable crash.** `outcome in
+  {"pass","revise","fail"}` hashes a vendor-controlled value; same outer handler,
+  same whole-run abort. Pre-existing, medium. The general class is *an untrusted
+  vendor field read inside a loop whose only handler aborts the run* — worth a
+  sweep rather than another one-off fix.
+- **`hydra.workflow.budget` is absent from `HYDRA_CONTROL_TOOLS`**, so
+  `test_hydra_control_schema_parity` never checks its schema. Its runtime
+  rejection is real and judge-verified; the schema itself is simply outside the
+  guard that caught the `launch`/`plan` drift.
+- **The attended false-generate-failure** (§11, §11a) remains unfixed.
+
+Suite across the sweep: 2 744 → 3 139 passing. Constitution `4060cb542fcc…`
+unchanged throughout.
