@@ -554,3 +554,99 @@ prose, with no per-turn handle in stdout. A deterministic per-turn harvest is
 therefore impossible without an mtime scan that races concurrent agy sessions.
 This corrects §7b, which assumed agy's named tool would be the cleaner of the
 two: it is the *less* harvestable of the two.
+
+---
+
+## §11 — The attended path can still report a false generate-failure (2026-09-20)
+
+Recorded because it cost a stage teardown and is a recurrence of a defect this
+ledger already believed closed.
+
+**What happened.** Strict-JSON stage A (workflow `b5f951d1`, run
+`run_FZ4a7AXavRQn`) completed: the engineer committed `3a51ee6` and `c84eda7`,
+the full suite passed (2 779 passed, 5 skipped, 1 known pre-existing
+marketing-symlink failure), and the cross-vendor judge (codex `gpt-5.6-terra`)
+returned `pass` with zero findings. `hydra.workflow.submit_host_result` then
+returned:
+
+```
+"status": "surfaced", "stage_outcome": "error",
+"changed_paths": [], "smoke_status": "skipped",
+"merge": {"merged": false, "error": "discarded_non_complete"},
+"error": "codex generate returned no output (no code written)"
+```
+
+**Why it is false.** No codex generator runs on the attended path — the host
+supplies the result. The engine nonetheless reached a generator-failure
+classification, concluded `changed_paths: []`, and discarded its own merge. The
+commits were intact on `attended/run_FZ4a7AXavRQn` the whole time and survived
+worktree teardown.
+
+**Relationship to the 2026-06-23 fix.** That fix stopped the engine trusting
+`_GEN_FAIL_MARKERS` found in a *result summary*, and added diff-aware
+classification plus a host-side smoke. This is the adjacent hole: the attended
+path can still arrive at an empty `changed_paths` and label it a generation
+failure, on a run where no generator was ever invoked. The marker-scanning fix
+does not cover it, which is why it reappeared.
+
+**Resolution taken.** Salvage, not re-run, per the recorded lesson. Verified the
+commits survived teardown, confirmed `feat/planning-phase` was a strict ancestor
+of `c84eda7`, and fast-forwarded. No rebuild, no `git add -u`. Post-merge full
+suite on the main checkout: **2 783 passed, 2 skipped, 0 failed** — the symlink
+failure is worktree-only, as expected. Constitution `4060cb542fcc…` unchanged.
+
+**Open.** The misclassification itself is unfixed. Two things want doing, and
+neither is in the strict-JSON scope: the attended branch should not consult a
+generator-failure path at all, and an empty `changed_paths` on a run whose branch
+carries commits ahead of its base should be treated as a detection fault rather
+than a generation failure. Until then, **a surfaced attended stage is not
+evidence the work is absent** — check the run branch before re-running anything.
+
+**Second-order cost.** A falsely surfaced run stays in the pp surfaced list and
+is offered for retry (`/pp:retry run_FZ4a7AXavRQn`). Retrying a run whose work is
+already merged would redo landed work. The surfaced entry should be dismissed with
+`ack_run`, not retried.
+
+### §11a — Root cause confirmed (2026-09-20, second occurrence)
+
+Stage B1 (workflow `aa4ffdf1`, run `run_zjFm-RuvKXeX`) reproduced §11 and
+identified the mechanism.
+
+That run's `submit_host_result` returned the same
+`"codex generate returned no output (no code written)"` with the same
+`discarded_non_complete` merge, but `changed_paths` was **not** empty:
+
+```
+"changed_paths": ["hydra_core/auth/capability.py"]
+```
+
+That is exactly — and only — the file carrying a stale git stat-cache `M` flag
+after a mutation proof was reverted. Its content was provably byte-identical to
+`HEAD` (`git diff --exit-code` clean; `git hash-object` and
+`git rev-parse HEAD:<path>` both `68905b71…`). Nine files were committed in that
+stage; eight of them, being cleanly committed, did not appear.
+
+**Therefore `changed_paths` is computed from the DIRTY WORKING TREE, not from the
+commit diff against the stage base.** The two observations fit exactly:
+
+| Run | Worktree state | `changed_paths` | Engine verdict |
+|---|---|---|---|
+| `run_FZ4a7AXavRQn` | fully clean | `[]` | "no code written" |
+| `run_zjFm-RuvKXeX` | one stale stat flag | that one file | "no code written" |
+
+**The consequence is the defect.** An engineer that does the right thing — commits
+its work and leaves a clean tree — is indistinguishable from one that did nothing.
+The check rewards an uncommitted tree and punishes a committed one, which is
+backwards: a committed stage is the *stronger* outcome. It also means the signal
+is non-deterministic, since it depends on stat-cache noise rather than on content.
+
+**Fix direction** (not taken here; outside the strict-JSON scope): compare the run
+branch against the stage base — `git diff --name-only <base>..<branch_head>` — and
+treat a non-empty commit range as work performed regardless of working-tree
+cleanliness. Reserve the generator-failure classification for the detached path,
+where a generator is actually invoked; on the attended path the host supplies the
+result and that classification has no basis at all.
+
+**Until fixed:** both `run_FZ4a7AXavRQn` and `run_zjFm-RuvKXeX` are falsely
+surfaced with their work merged. Dismiss with `ack_run`; do not `/pp:retry`
+either, which would redo landed work.
