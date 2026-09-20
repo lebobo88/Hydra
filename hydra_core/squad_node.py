@@ -46,7 +46,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
-from .strict_json import dumps_strict
+from .strict_json import dumps_strict, is_non_finite_float
 from .tool_scope import build_tool_scope_directive
 from .version import DoubleSpawnRefused, SquadDeprecated
 
@@ -763,9 +763,44 @@ def _parse_claude_cli_result(
     ``total_cost_usd`` and ``usage.{input,output}_tokens``. Real model id + spend
     flow into the budget ledger so the 80%/100% tripwires stay live. Degrade to
     raw stdout (cost 0 — budget blind on this attempt) when the output isn't JSON.
+
+    Cross-vendor judge finding (this round, CRITICAL): ``total_cost_usd`` /
+    ``usage.{input,output}_tokens`` come from the vendor CLI's OWN stdout --
+    an untrusted trust boundary, the same class of exposure
+    ``strict_json.reject_non_finite`` closes for an operator-supplied
+    ``--budget`` value. A NaN cost makes every later budget COMPARISON fail
+    open (``x < nan`` is always ``False``, so the block/downgrade gates
+    never fire); an Infinity cost disables the cap outright. Reachable in
+    ordinary operation -- it is whatever the CLI happens to print, not
+    something Hydra controls.
+
+    Unlike an operator-supplied flag, this is NOT input we can simply
+    refuse: the subprocess has already RUN by the time this parses its
+    output (real money may already be spent, and ``text`` carries the real
+    completed work -- the engineer's file edits already happened as side
+    effects). Discarding the whole result over an untrustworthy cost figure
+    would be strictly worse than the poisoned number itself. Instead, a
+    non-finite reported cost is treated exactly like a MISSING one:
+    ``cost_usd=0.0`` with ``cost_source="unmeasured"`` -- the same concept
+    ``host_bridge._priced_cost`` already uses for a host that reports no
+    cost at all -- so nothing downstream ever compares a NaN/Infinity to a
+    budget cap, yet the call is never silently indistinguishable from a
+    genuine free call (``cost_source`` tells them apart, and ``text`` notes
+    the rejection for the record) or thrown away.
+
+    ``usage.input_tokens``/``usage.output_tokens`` get the same treatment
+    (clamped to 0 rather than fed to ``int()``, which would otherwise raise
+    ``ValueError``/``OverflowError`` on a NaN/Infinity token count and
+    discard this ENTIRE result -- including the real ``text`` -- via the
+    caller's unrelated broad exception handler). Tokens are informational
+    counters in this module (no downstream budget COMPARISON reads them
+    directly, unlike ``cost_usd``), but a hostile value must not be able to
+    destroy an otherwise-successful generation's output as a side effect of
+    an unrelated field.
     """
     text = stdout or "(claude returned no output)"
     cost = 0.0
+    cost_source = "unmeasured"
     tin = tout = 0
     mdl = model
     try:
@@ -775,14 +810,28 @@ def _parse_claude_cli_result(
     if isinstance(obj, dict):
         text = str(obj.get("result") or obj.get("text") or stdout
                    or "(claude returned no output)")
-        cost = float(obj.get("total_cost_usd") or obj.get("cost_usd") or 0.0)
+        raw_cost = obj.get("total_cost_usd")
+        if raw_cost is None:
+            raw_cost = obj.get("cost_usd")
+        if raw_cost is None:
+            cost, cost_source = 0.0, "unmeasured"
+        elif is_non_finite_float(raw_cost):
+            cost, cost_source = 0.0, "unmeasured"
+            text += (
+                "\n[hydra] vendor CLI reported a non-finite cost_usd "
+                f"({raw_cost!r}); treated as unmeasured, not charged as $0."
+            )
+        else:
+            cost, cost_source = float(raw_cost), "measured"
         usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-        tin = int(usage.get("input_tokens") or 0)
-        tout = int(usage.get("output_tokens") or 0)
+        raw_tin = usage.get("input_tokens")
+        raw_tout = usage.get("output_tokens")
+        tin = 0 if raw_tin is None or is_non_finite_float(raw_tin) else int(raw_tin)
+        tout = 0 if raw_tout is None or is_non_finite_float(raw_tout) else int(raw_tout)
         mdl = str(obj.get("model") or model)
     if returncode != 0 and stderr:
         text += f"\n[claude stderr] {stderr[-800:]}"
-    return {"text": text, "model": mdl, "cost_usd": cost,
+    return {"text": text, "model": mdl, "cost_usd": cost, "cost_source": cost_source,
             "tokens_in": tin, "tokens_out": tout,
             "status": "done" if returncode == 0 else "error"}
 
@@ -860,7 +909,8 @@ def _run_claude_cli(
         return _parse_claude_cli_result(res.stdout, res.stderr, res.returncode, mdl)
     except Exception as e:  # noqa: BLE001 — never crash the loop on a CLI hiccup
         return {"text": f"[claude-cli error] {e!r}", "model": mdl,
-                "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                "cost_usd": 0.0, "cost_source": "unmeasured",
+                "tokens_in": 0, "tokens_out": 0,
                 "status": "error"}
 
 
@@ -886,8 +936,15 @@ def _claude_critique(artifact_text: str, rubric_md: str, cwd: str) -> dict[str, 
         parsed = json.loads(s)
     except Exception:  # noqa: BLE001 — degrade to revise on unparseable judge output
         parsed = {"outcome": "revise", "critique_md": raw[:1000], "score": {}}
+    # `res["cost_usd"]` already passed through `_parse_claude_cli_result`'s
+    # (or `_run_claude_cli`'s exception-fallback) non-finite guard -- it is
+    # never NaN/Infinity here. `cost_source` is propagated (defaulting to
+    # the min-trust "unmeasured", never a false "measured") rather than
+    # dropped, so a caller can still tell a genuinely-measured cost from an
+    # unmeasured/rejected one after this re-wrap.
     return {"parsed": parsed, "model": res.get("model") or "claude-sonnet-4-6",
             "cost_usd": float(res.get("cost_usd") or 0.0),
+            "cost_source": res.get("cost_source") or "unmeasured",
             "tokens_in": int(res.get("tokens_in") or 0),
             "tokens_out": int(res.get("tokens_out") or 0)}
 
