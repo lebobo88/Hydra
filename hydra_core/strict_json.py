@@ -403,7 +403,15 @@ def sanitize_non_finite(obj: Any, path: str = "$") -> tuple[Any, list[str]]:
                 _walk(v, f"{cur_path}[{i}]", child_ancestors)
                 for i, v in enumerate(node)
             ]
-        if isinstance(node, (str, int, bool)) or node is None:
+        if isinstance(node, (str, int, bool, float)) or node is None:
+            # A finite float reaches here only after the non-finite check
+            # above already handled NaN/+-Infinity, so every float that
+            # survives to this branch is natively JSON-representable. Once
+            # sanitization is triggered by an unrelated field, this branch
+            # (like the str/int/bool/None passthrough it now joins) must
+            # still return every otherwise valid scalar unchanged -- a
+            # finite float used to fall through to the "unsupported type"
+            # branch below and get needlessly stringified.
             return node
         # Cross-vendor judge finding (this round, item 4 MEDIUM): anything
         # else is not natively JSON-representable. Record the substitution

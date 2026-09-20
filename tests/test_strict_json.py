@@ -243,6 +243,32 @@ def test_dumps_tool_response_safe_ordinary_payload_unaffected():
     assert json.loads(text) == {"a": 1, "b": "x"}
 
 
+def test_dumps_tool_response_safe_keeps_valid_scalars_intact_once_triggered():
+    """Once ANY field triggers fallback sanitization, every OTHER already
+    valid, natively JSON-representable scalar (finite float, int, bool,
+    str, None) must round-trip unchanged -- not get needlessly stringified
+    as if it were an unsupported object."""
+    payload = {
+        "bad": float("nan"),
+        "cost": 1.5,
+        "count": 3,
+        "ok": True,
+        "name": "engineer",
+        "note": None,
+    }
+    text = dumps_tool_response_safe(payload)
+    parsed = json.loads(text)
+    assert parsed["bad"] is None
+    assert parsed["cost"] == 1.5 and isinstance(parsed["cost"], float)
+    assert parsed["count"] == 3 and isinstance(parsed["count"], int)
+    assert parsed["ok"] is True
+    assert parsed["name"] == "engineer"
+    assert parsed["note"] is None
+    fields = parsed["_non_finite_fields_sanitized"]
+    assert any("bad" in f for f in fields)
+    assert not any("cost" in f for f in fields)
+
+
 def test_sanitize_non_finite_names_a_nan_dict_key():
     result, fields = sanitize_non_finite({float("nan"): "x"})
     assert "null" in result
