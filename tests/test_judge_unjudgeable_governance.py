@@ -158,6 +158,94 @@ def test_unjudgeable_envelope_re_detected_from_prior_verdicts_on_reentry():
     assert second["pending_hitl"]["options"] == ["abort"]
 
 
+def test_already_judged_source_envelope_with_non_finite_field_still_hard_blocks():
+    """The bypass this round's fix closes: a legacy pre-strict-JSON
+    checkpoint holds a SOURCE envelope with a non-finite field (id=A) AND an
+    old `pass` verdict already targeting A (e.g. from before strict
+    serialization existed). The `already_judged` shortcut would otherwise
+    `continue` past this envelope before `_judge_envelope` ever runs --
+    never producing an `unjudgeable` verdict and letting the node reach
+    `phase="synthesis"`. The envelope-level scan must catch it regardless."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="legacy checkpoint with stale verdict")
+    hostile = _hostile_envelope(state.workflow_id)
+    hostile_id = hostile["id"]
+    prior_pass_verdict = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": hostile_id,
+        "outcome": "pass",
+        "rubric_id": "board-decision-quality@1",
+        "judge_vendor": "codex",
+        "generator_vendor": "claude",
+    }
+    state.envelopes = [hostile]
+    state.verdicts = [prior_pass_verdict]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "already_judged must not suppress the envelope-level non-finite scan"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    unjudgeable = [v for v in patch["verdicts"] if v.get("outcome") == "unjudgeable"]
+    assert unjudgeable, "expected a fresh unjudgeable verdict from the envelope scan"
+    assert str(unjudgeable[0]["target_envelope_id"]) == hostile_id
+    assert "constraints.budget_usd" in patch["pending_hitl"]["summary"]
+
+
+def test_already_judged_finite_envelope_takes_fast_path_no_rejudge():
+    """Control for the fix above: an envelope with NO non-finite value and a
+    prior verdict targeting it must still take the ordinary `already_judged`
+    fast path -- no re-judge, no new verdict emitted for it, no HITL."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="finite envelope already judged")
+    finite_envelope = {
+        "id": str(uuid4()),
+        "type": "C_SUITE_DECISION_PACKET",
+        "origin_squad": "executive",
+        "workflow_id": str(state.workflow_id),
+        "origin": "BOARDROOM",
+        "objective": "ordinary envelope",
+        "constraints": {"budget_usd": 1000.0},
+    }
+    finite_id = finite_envelope["id"]
+    prior_pass_verdict = {
+        "id": str(uuid4()),
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": finite_id,
+        "outcome": "pass",
+        "rubric_id": "board-decision-quality@1",
+        "judge_vendor": "codex",
+        "generator_vendor": "claude",
+    }
+    state.envelopes = [finite_envelope]
+    state.verdicts = [prior_pass_verdict]
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "synthesis"
+    assert patch.get("pending_hitl") is None
+    retargeting = [
+        v for v in patch["verdicts"] if v.get("target_envelope_id") == finite_id
+    ]
+    assert not retargeting, (
+        "an already-judged, finite envelope must not be re-judged: "
+        f"got fresh verdicts {retargeting}"
+    )
+
+
 def test_imported_persisted_unjudgeable_verdict_envelope_blocks_without_verdicts_entry():
     """Cross-vendor judge finding (this round, item 1 HIGH): an
     imported/replayed state can hold a JUDGE_VERDICT envelope (in

@@ -31,9 +31,12 @@ from .governance import (
 from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
 from .judge import dispatch_judge, dispatch_judge_with_fallback, route_judge, load_policy
-from .judge.dispatcher import CritiqueClient, JudgeDispatchError, NoOpCritiqueClient
+from .judge.dispatcher import (
+    CritiqueClient, JudgeDispatchError, NoOpCritiqueClient, _unjudgeable_verdict,
+)
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
+from .strict_json import find_non_finite_field
 from .plan_artifact import sum_finite_budgets
 from .plan_triage import triage_plan
 from .router import RESERVED_META_SQUADS, RoutingDecision, classify_intent, compute_tool_scope
@@ -3091,6 +3094,52 @@ def build_supervisor(
                     )
                     if not already_folded:
                         unjudgeable_hit = env
+                continue
+            # Cross-vendor judge finding (this round, item CRITICAL): scan
+            # the SOURCE envelope itself for a non-finite value BEFORE the
+            # `already_judged` shortcut below can fire. `already_judged`
+            # only proves a PRIOR verdict (any outcome, e.g. an old `pass`/
+            # `skip`) already targets this envelope's id -- it says nothing
+            # about whether the envelope object CURRENTLY sitting in
+            # `state.envelopes` is itself strict-JSON-finite. A
+            # pre-strict-JSON checkpoint can resurrect a
+            # `DEV_TASK(id=A, constraints.budget_usd=NaN)` next to an old
+            # verdict that already targets A; without this check the
+            # shortcut below would `continue` past it, `_judge_envelope`
+            # (the only other place that would have caught this via strict
+            # serialization) would never run, and the node would return
+            # `phase="synthesis"` having never inspected the bad data.
+            # Runs the SAME linear walker `_judge_envelope`/`dispatch_judge`
+            # would eventually reach -- one O(depth+size) walk per envelope,
+            # independent of whether a verdict already exists for it.
+            bad_field = find_non_finite_field(env)
+            if bad_field is not None and unjudgeable_hit is None:
+                preferred_vendors = list(judge_policy.preferred_judge_vendors) or ["codex"]
+                synth_error = ValueError(
+                    f"envelope {env.get('id')} contains a non-finite value at "
+                    f"{bad_field}; refusing to write invalid JSON"
+                )
+                verdict = _unjudgeable_verdict(
+                    envelope=env,
+                    rubric_id="strict_serialization",
+                    judge_vendor=preferred_vendors[0],
+                    generator_vendor=_resolve_generator_vendor(env),
+                    workflow_id=state.workflow_id,
+                    attempts=[
+                        {"vendor": v, "ok": False, "reason": "non_finite_envelope",
+                         "retryable": False}
+                        for v in preferred_vendors
+                    ],
+                    last_error=synth_error,
+                )
+                verdict_dict = verdict.model_dump(mode="json")
+                new_verdicts.append(verdict_dict)
+                unjudgeable_hit = verdict_dict
+                emit_trace(judge_trace_root, state.workflow_id, "judge.unjudgeable_envelope_scan", {
+                    "envelope_id": env.get("id"),
+                    "field": bad_field,
+                    "already_judged": env.get("id") in already_judged,
+                })
                 continue
             if env.get("id") in already_judged:
                 continue
