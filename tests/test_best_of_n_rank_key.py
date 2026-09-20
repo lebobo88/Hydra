@@ -17,6 +17,14 @@ in this whole thread.
 
 These tests assert the SELECTION OUTCOME (which candidate's critique/code
 "wins"), not merely that `_rank_key`'s return value is finite.
+
+Follow-up round correction: the first fix EXCLUDED a non-finite dimension
+from the mean. That was itself wrong -- excluding raises the mean of the
+remainder, so a poisoned dimension could IMPROVE a candidate's rank. See
+the "Finding 3" tests below for the corrected fix (a non-finite dimension
+now counts AGAINST the candidate at a score floor, and every dimension is
+clamped into a bounded range so the outcome/smoke dominance invariant holds
+for negative and huge inputs too).
 """
 from __future__ import annotations
 
@@ -142,6 +150,72 @@ def test_ordinary_finite_scores_control_unaffected():
     assert winner["critique"] == "A"
     # Exact pre-existing arithmetic: base*1000 + smoke*100 + mean.
     assert rank_a == pytest.approx(2000.0 + 100.0 + 0.75)
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 (follow-up round, HIGH): an EARLIER version of this fix simply
+# EXCLUDED a non-finite dimension from the mean -- but excluding RAISES the
+# mean of the remainder, so a poisoned dimension could IMPROVE a candidate's
+# rank (a candidate benefits from its worst dimension being unusable). Fixed
+# by counting a non-finite dimension AGAINST the candidate at the score
+# floor (included in the mean) instead of dropping it, and by clamping every
+# dimension into a bounded range so the outcome/smoke dominance invariant
+# holds for negative and huge inputs too (the "outcome/smoke dominate
+# absolutely" claim was false as previously written: `min(mean, 999)`
+# bounded the mean above but not below).
+# ---------------------------------------------------------------------------
+
+def test_poisoned_dimension_cannot_improve_a_candidates_rank():
+    """The inversion this finding is about: a candidate reporting an
+    ADDITIONAL poisoned dimension alongside a genuine one must never rank
+    BETTER than if it had reported the genuine dimension alone (excluding
+    a poisoned dimension would raise the mean of the remainder and do
+    exactly that)."""
+    rank_with_poison = _rank_key("pass", {"a": 0.9, "b": float("nan")}, "pass")
+    rank_without_extra_dim = _rank_key("pass", {"a": 0.9}, "pass")
+    assert rank_with_poison <= rank_without_extra_dim
+    # And strictly worse against a genuine second dimension, in EITHER
+    # selection ordering.
+    rank_genuine_second_dim = _rank_key("pass", {"a": 0.9, "b": 0.3}, "pass")
+    for scored in (
+        [{"ci": "poisoned", "rank": rank_with_poison},
+         {"ci": "genuine", "rank": rank_genuine_second_dim}],
+        [{"ci": "genuine", "rank": rank_genuine_second_dim},
+         {"ci": "poisoned", "rank": rank_with_poison}],
+    ):
+        assert _select_winner(scored)["ci"] == "genuine"
+
+
+def test_negative_and_huge_scores_cannot_break_the_outcome_invariant():
+    """The docstring's stated invariant -- a `fail` can never outrank a
+    `revise`/`pass`, regardless of score magnitude -- verified for
+    UNBOUNDED negative, unbounded positive, and poisoned inputs together,
+    not just the documented 0-1/0-10 rubric range."""
+    huge_fail = _rank_key("fail", {"a": 1e12}, "pass")
+    tiny_revise = _rank_key("revise", {"a": -1e12}, "skipped")
+    huge_revise = _rank_key("revise", {"a": 1e12}, "pass")
+    tiny_pass = _rank_key("pass", {"a": -1e12}, "skipped")
+    poisoned_pass = _rank_key("pass", {"a": float("inf")}, "skipped")
+
+    assert tiny_revise > huge_fail        # revise ALWAYS beats fail
+    assert tiny_pass > huge_revise        # pass ALWAYS beats revise
+    assert poisoned_pass > huge_revise    # a poisoned pass still beats any revise
+    # A negative score does not drag a pass below a revise, nor let an
+    # all-floored candidate look worse than it should relative to a WORSE
+    # outcome tier.
+    assert _rank_key("pass", {"a": -9999.0}, "skipped") > \
+        _rank_key("revise", {"a": 9999.0}, "pass")
+
+
+def test_all_dimensions_unusable_equals_all_dimensions_floored():
+    """An all-unusable candidate (no numeric dimension at all) and a
+    candidate whose only dimension came back non-finite (floored to 0, but
+    still counted) both land at the SAME neutral contribution -- neither
+    is treated as if it had a real positive score, and neither is punished
+    beyond the floor."""
+    assert _rank_key("pass", {}, "pass") == _rank_key(
+        "pass", {"a": float("nan")}, "pass",
+    )
 
 
 # ---------------------------------------------------------------------------

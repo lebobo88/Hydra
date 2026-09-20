@@ -104,3 +104,41 @@ def test_string_valued_score_dimension_is_excluded_not_cast():
     ]
     winner, board = borda_winner([a, b], verdicts)
     assert winner == b  # b's real=5 beats a's real=1; the string never inflates/poisons a's score
+
+
+def test_bool_valued_score_dimension_does_not_inflate_ranking():
+    """Cross-vendor judge finding (follow-up round, HIGH): `bool` is an
+    `int` subclass in Python, so `isinstance(val, (int, float))` alone lets
+    a boolean dimension through -- `score_json` is the judge's own
+    UNTRUSTED response with arbitrary keys, so a hostile/buggy judge
+    reporting `"looks_good": True` would previously add `float(True) ==
+    1.0` to the sum, inflating a candidate's Borda ranking for free.
+    Excluded explicitly (mirroring `squad_node._rank_key`'s own
+    `not isinstance(v, bool)` guard) -- proven here by SELECTION, not by
+    inspecting the summed score directly."""
+    wf = uuid4()
+    a, b = str(uuid4()), str(uuid4())
+    verdicts = [
+        # `a`'s only REAL score (real=1) is strictly lower than b's genuine
+        # real=1.5; a's bogus boolean dimension, IF counted, would push a's
+        # total to 2 (1 bool + 1 real) -- strictly ABOVE b's 1.5, flipping
+        # the winner. Chosen so the outcome is a clean strict inequality
+        # flip either way, never a tie broken by (random) candidate id.
+        _v(a, "r@1", {"looks_good": True, "real": 1}, wf),
+        _v(b, "r@1", {"real": 1.5}, wf),
+    ]
+    winner, _ = borda_winner([a, b], verdicts)
+    assert winner == b  # the bool must not let a's lower real score win
+
+
+def test_ordinary_numeric_scores_control_unaffected():
+    """Control: ordinary int/float score dimensions (no bool, no string,
+    no non-finite) rank and select exactly as before."""
+    wf = uuid4()
+    a, b = str(uuid4()), str(uuid4())
+    verdicts = [
+        _v(a, "r@1", {"correctness": 4, "adherence": 3.5}, wf),
+        _v(b, "r@1", {"correctness": 1, "adherence": 1.0}, wf),
+    ]
+    winner, _ = borda_winner([a, b], verdicts)
+    assert winner == a

@@ -4196,7 +4196,7 @@ def _cmd_attended_submit(args) -> int:
         # cast site now does, at the same coercion-first-then-check
         # boundary, before the resume lock or `submit_host_result` (and, in
         # turn, the ledger) is ever reached.
-        from .squad_node import coerce_untrusted_cost
+        from .squad_node import coerce_untrusted_cost, _coerce_finite_float
         if result.get("cost_usd") is not None:
             _, _cost_src = coerce_untrusted_cost(result["cost_usd"])
             if _cost_src == "unmeasured":
@@ -4205,11 +4205,17 @@ def _cmd_attended_submit(args) -> int:
                     "to a finite number; refusing before any ledger/cursor "
                     "side effect"
                 )
+        # `tokens_in`/`tokens_out` are COUNTS, not a cost -- validated
+        # through the shared `_coerce_finite_float` primitive directly
+        # (cross-vendor judge finding, follow-up round, HIGH: using
+        # `coerce_untrusted_cost`'s cost-specific "measured"/"unmeasured"
+        # labeling here was the wrong helper for the field type), the same
+        # finiteness check `coerce_untrusted_count` applies downstream.
         for _tok_field in ("tokens_in", "tokens_out"):
             _raw_tok = result.get(_tok_field)
             if _raw_tok is not None:
-                _, _tok_src = coerce_untrusted_cost(_raw_tok)
-                if _tok_src == "unmeasured":
+                _, _tok_ok = _coerce_finite_float(_raw_tok)
+                if not _tok_ok:
                     raise ValueError(
                         f"--result.{_tok_field} {_raw_tok!r} does not coerce "
                         "to a finite number; refusing before any "

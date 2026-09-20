@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .strict_json import is_non_finite_float
+
 
 @dataclass(frozen=True)
 class ModelRate:
@@ -126,14 +128,36 @@ def price_call(
     ``None`` is NOT an error — callers (``hydra_core/host_bridge.py``,
     ``hydra_core/transcript_cost.py``) must treat an unknown model as
     *unmeasured*, never as a free ($0.0) call.
+
+    Cross-vendor judge finding (follow-up round, HIGH): a negative token
+    count (e.g. from a caller that does not route through
+    ``squad_node.coerce_untrusted_count``'s non-negative clamp) or a
+    corrupted rate (a malformed/hostile ``pricing.json`` operator override
+    parsed as a negative or non-finite float -- ``_load_override_table``
+    only guards against a structurally broken ENTRY, not a hostile numeric
+    VALUE within an otherwise well-formed one) could make this
+    multiplication REDUCE the returned cost below zero, or non-finite. A
+    priced estimate must never lower a stage's charge below what the
+    genuinely measured/estimated portion alone would total, so every
+    count-like input is floored at 0 here (never trust a caller's own
+    clamp as the only line of defense) and the OUTPUT is both finiteness-
+    checked (a non-finite total degrades to ``None`` -- unpriceable, the
+    same never-free contract this function already promises for an
+    unknown model) and floored at 0.0.
     """
     rate = get_rate(model_id)
     if rate is None:
         return None
+    _tokens_in = max(tokens_in, 0)
+    _tokens_out = max(tokens_out, 0)
+    _cache_write = max(cache_write_tokens, 0)
+    _cache_read = max(cache_read_tokens, 0)
     cost = (
-        tokens_in * rate.input_per_mtok
-        + tokens_out * rate.output_per_mtok
-        + cache_write_tokens * rate.cache_write_per_mtok
-        + cache_read_tokens * rate.cache_read_per_mtok
+        _tokens_in * rate.input_per_mtok
+        + _tokens_out * rate.output_per_mtok
+        + _cache_write * rate.cache_write_per_mtok
+        + _cache_read * rate.cache_read_per_mtok
     ) / 1_000_000.0
-    return round(cost, 8)
+    if is_non_finite_float(cost):
+        return None
+    return round(max(cost, 0.0), 8)

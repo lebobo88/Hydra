@@ -765,8 +765,8 @@ def dispatch_ingested_envelopes(
         # Charge + gate through the SAME helper node_dispatch uses, so ingested
         # engineering honours the 80% downgrade tripwire and the >= 100% block —
         # not a budget-blind side door (codex review item 3).
-        cost_usd, cost_tok = _extract_squad_cost(result)
-        block, downgrade = charge_and_gate(state, cost_usd, cost_tok)
+        cost_usd, cost_tok, cost_src = _extract_squad_cost(result)
+        block, downgrade = charge_and_gate(state, cost_usd, cost_tok, source=cost_src)
         # F34: budget_charge to eights (fail-soft; never blocks local work).
         try:
             from .eights.attestation import EightsAttestor as _EightsAttestor

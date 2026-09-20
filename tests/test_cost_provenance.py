@@ -182,6 +182,31 @@ class TestPriceCall:
         assert pricing.price_call("totally-unheard-of-model-xyz", 1000, 1000) is None
         assert pricing.get_rate("totally-unheard-of-model-xyz") is None
 
+    def test_negative_tokens_cannot_reduce_the_priced_cost(self) -> None:
+        """Cross-vendor judge finding (follow-up round, HIGH): a negative
+        token count must never SUBTRACT from a priced estimate. A negative
+        `tokens_out` must be floored at 0, never let the total drop below
+        the input-only price."""
+        input_only = pricing.price_call("claude-sonnet-5", 1_000_000, 0)
+        with_negative_output = pricing.price_call(
+            "claude-sonnet-5", 1_000_000, -1_000_000,
+        )
+        assert with_negative_output == input_only
+        assert with_negative_output >= 0.0
+
+    def test_negative_cache_tokens_cannot_reduce_the_priced_cost(self) -> None:
+        baseline = pricing.price_call("claude-sonnet-5", 1_000_000, 1_000_000)
+        with_negative_cache = pricing.price_call(
+            "claude-sonnet-5", 1_000_000, 1_000_000,
+            cache_write_tokens=-1_000_000, cache_read_tokens=-1_000_000,
+        )
+        assert with_negative_cache == baseline
+
+    def test_ordinary_finite_positive_tokens_control_unaffected(self) -> None:
+        """Control: the normal (all-positive) case is unaffected by the floor."""
+        cost = pricing.price_call("claude-sonnet-5", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(18.0)
+
 
 # ---------------------------------------------------------------------------
 # 4. HYDRA_HOME call-time resolution + malformed override resilience

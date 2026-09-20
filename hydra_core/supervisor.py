@@ -193,7 +193,9 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
     """
     usd: float = 0.0
     tokens: int = 0
-    any_measured = False
+    any_measured_inner = False
+    drive_loop_present = False
+    drive_loop_measured = False
     for artifact in getattr(result, "artifacts", []):
         if not isinstance(artifact, dict):
             continue
@@ -210,11 +212,11 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
         if "cost_usd" in inner:
             c, src = coerce_untrusted_cost(inner["cost_usd"])
             usd = max(usd, c)
-            any_measured = any_measured or src == "measured"
+            any_measured_inner = any_measured_inner or src == "measured"
         elif "cost" in inner:
             c, src = coerce_untrusted_cost(inner["cost"])
             usd = max(usd, c)
-            any_measured = any_measured or src == "measured"
+            any_measured_inner = any_measured_inner or src == "measured"
         # Token counts
         tok_raw = 0
         if "tokens_in" in inner or "tokens_out" in inner:
@@ -233,6 +235,7 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
         if isinstance(dl, dict) and (
             "cost_usd" in dl or "tokens_in" in dl or "tokens_out" in dl
         ):
+            drive_loop_present = True
             c, src = coerce_untrusted_cost(dl.get("cost_usd"))
             # `dl["cost_usd"]` is the drive loop's ALREADY-coerced running
             # total (see `squad_node.coerce_untrusted_cost`'s per-candidate
@@ -247,11 +250,29 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
             if c == 0.0 and src == "measured" and (dl.get("unmeasured_count") or 0) > 0:
                 src = "unmeasured"
             usd = max(usd, c)
-            any_measured = any_measured or src == "measured"
+            drive_loop_measured = drive_loop_measured or src == "measured"
             dl_tok = (coerce_untrusted_count(dl.get("tokens_in"))
                       + coerce_untrusted_count(dl.get("tokens_out")))
             tokens = max(tokens, dl_tok)
-    cost_source = "measured" if any_measured else "unmeasured"
+    # Cross-vendor judge finding (follow-up round, MEDIUM): `start_run`'s
+    # own scaffold-only response ALWAYS reports a finite `cost_usd` (`0.0`
+    # when it merely scaffolds -- see the F6 comment above), which
+    # `coerce_untrusted_cost` correctly resolves as "measured" (it IS a
+    # genuine, if uninformative, number). OR-ing that into a single
+    # `any_measured` flag meant a driven stage whose REAL cost (the drive
+    # loop's, reconciled above) was entirely rejected still got labeled
+    # "measured" overall, because the scaffold placeholder alone was always
+    # enough to satisfy the OR -- exactly the outcome this whole provenance
+    # thread exists to prevent. Once a drive loop is present, IT is the
+    # authoritative source for whether this stage's real cost was measured
+    # (the inner scaffold value never represents the driven work's actual
+    # spend); only fall back to the inner-only flag for the legacy
+    # scaffold-only (non-driven) dispatch path, where inner IS the whole
+    # story.
+    if drive_loop_present:
+        cost_source = "measured" if drive_loop_measured else "unmeasured"
+    else:
+        cost_source = "measured" if any_measured_inner else "unmeasured"
     return usd, tokens, cost_source
 
 

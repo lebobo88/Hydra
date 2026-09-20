@@ -799,37 +799,57 @@ def coerce_untrusted_cost(raw: Any) -> tuple[float, str]:
     unparseable, or non-finite after coercion -- a rejected report is never
     silently indistinguishable from a genuine free call.
     """
+    value, ok = _coerce_finite_float(raw)
+    return value, ("measured" if ok else "unmeasured")
+
+
+def _coerce_finite_float(raw: Any) -> tuple[float, bool]:
+    """Shared coercion primitive behind `coerce_untrusted_cost` and
+    `coerce_untrusted_count`: coerce FIRST, then check finiteness on the
+    COERCED value. Returns ``(value, ok)`` -- ``ok`` is ``False`` for
+    anything missing, unparseable, or non-finite after coercion (value is
+    then ``0.0``), so a caller that needs to REJECT a submission (rather
+    than clamp/relabel it) can do so without borrowing `coerce_untrusted_cost`'s
+    cost-specific ``"measured"``/``"unmeasured"`` labeling for a field that
+    isn't a dollar amount (e.g. `cli.py`'s `_cmd_attended_submit` preflight
+    validates `tokens_in`/`tokens_out` -- a COUNT, not a cost -- through
+    this primitive directly, cross-vendor judge finding, follow-up round,
+    HIGH: using the cost-labeled wrapper there was the wrong helper for the
+    field type)."""
     if raw is None:
-        return 0.0, "unmeasured"
+        return 0.0, False
     try:
         value = float(raw)
     except (TypeError, ValueError, OverflowError):
-        return 0.0, "unmeasured"
+        return 0.0, False
     if is_non_finite_float(value):
-        return 0.0, "unmeasured"
-    return value, "measured"
+        return 0.0, False
+    return value, True
 
 
 def coerce_untrusted_count(raw: Any) -> int:
     """Coerce an UNTRUSTED vendor-reported token count to a non-negative
-    int, clamping anything unparseable or non-finite (including a
+    int, clamping anything unparseable, non-finite (including a
     NaN/Infinity STRING -- see `coerce_untrusted_cost`'s coerce-then-check
-    rationale) to 0 rather than raising. Tokens are informational counters
-    (no downstream budget COMPARISON reads them directly), but a hostile
-    value must never be able to discard an otherwise-successful result via
-    an unrelated exception handler."""
-    if raw is None:
+    rationale), OR NEGATIVE to 0 rather than raising or passing the
+    negative value through. Tokens are informational counters in most
+    callers, but `host_bridge._priced_cost` feeds them into
+    `pricing.price_call`'s multiplication -- cross-vendor judge finding
+    (follow-up round, HIGH): this docstring already PROMISED a
+    non-negative clamp but the implementation never enforced it, so a
+    vendor reporting a negative token count could REDUCE a stage's priced
+    cost below what the actually-measured portion alone would charge. A
+    hostile value must never be able to discard an otherwise-successful
+    result via an unrelated exception handler, nor lower a charge by going
+    negative."""
+    value, ok = _coerce_finite_float(raw)
+    if not ok:
         return 0
     try:
-        value = float(raw)
+        n = int(value)
     except (TypeError, ValueError, OverflowError):
         return 0
-    if is_non_finite_float(value):
-        return 0
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0
+    return n if n >= 0 else 0
 
 
 def _parse_claude_cli_result(
@@ -2075,60 +2095,106 @@ def _best_of_n() -> int | None:
     return n if 2 <= n <= 8 else None
 
 
+# Safety BOUND (not a scale assumption) on any single rubric dimension's
+# contribution to `_rank_key`'s mean -- rubrics are documented as 0-1 or
+# 0-10, but nothing upstream enforces that on an untrusted judge response.
+# Clamping every dimension into this range BEFORE averaging is what makes
+# the outcome (*1000) / smoke (+100) terms dominate ABSOLUTELY, for any
+# input (see `_rank_key`'s docstring, cross-vendor judge finding, follow-up
+# round, HIGH): with an unbounded mean, a sufficiently negative score could
+# make a "pass" lose to a "revise", and an unbounded positive score could
+# already only reach `min(mean, 999)` -- bounded above, but NOT below.
+_SCORE_DIM_FLOOR = 0.0
+_SCORE_DIM_CEIL = 10.0
+
+
 def _rank_key(outcome: str, score: dict[str, Any], smoke_status: str) -> float:
     """Scalar rank for a best-of candidate. Verdict DOMINATES absolutely (scaled
     by 1000 so it outranks any rubric scale), then smoke-pass, then mean rubric
     score. A `fail` can never outrank a `revise`/`pass` regardless of score
-    magnitude (rubrics may be 0-1 or 0-10). Booleans (e.g. _cross_vendor) are
-    excluded from the mean.
+    magnitude (rubrics may be 0-1 or 0-10; this is proven for ANY numeric
+    input below, not just that documented range). Booleans (e.g.
+    _cross_vendor) and non-numeric metadata fields (e.g. `_judge_tier`,
+    `_rubric_id`) are excluded from the mean entirely -- they were never a
+    scoring attempt.
 
     Cross-vendor judge finding (follow-up round, HIGH -- the ORIGINAL defect
-    class of this whole thread, found on a path nothing else covered): the
-    `isinstance(v, (int, float))` filter already excludes a non-numeric
-    dimension (a string, a dict, ...) from the mean, but a GENUINE float
-    NaN/Infinity dimension (the judge model's own untrusted response --
-    `judge.dispatcher.dispatch_judge` refuses to even construct a
-    `JudgeVerdict` carrying one via `find_non_finite_field`, but THIS
+    class of this whole thread, found on a path nothing else covered): a
+    GENUINE float NaN/Infinity dimension (the judge model's own untrusted
+    response -- `judge.dispatcher.dispatch_judge` refuses to even construct
+    a `JudgeVerdict` carrying one via `find_non_finite_field`, but THIS
     module's independent best-of-N loop never routes its `score` dict
-    through that or any other guard) passes the isinstance check unchanged
-    and poisons `mean` to NaN. This return value is the sole ranking key
-    for `sorted(eligible, key=lambda s: s["rank"], reverse=True)`: every
-    comparison against a NaN key is False, so the candidate's position in
-    the sort is effectively ARBITRARY (it could land first, i.e. WIN) --
-    and silently, because a run with a poisoned rank looks exactly like an
-    ordinary run that chose a winner. Best-of-N ranking decides which
-    candidate's CODE gets merged, so this is the sharpest consequence in
-    this thread: an arbitrary, silent choice of which code ships.
+    through that or any other guard) poisons the ranking key that
+    `sorted(eligible, key=lambda s: s["rank"], reverse=True)` uses to pick
+    which candidate's CODE gets merged.
 
-    Fix: EXCLUDE a non-finite dimension from the mean, the same treatment
-    the isinstance filter already gives an unusable (non-numeric) value --
-    not a wholesale refusal of the candidate. Refusing the whole candidate
-    would also discard its OUTCOME and SMOKE status, which already DOMINATE
-    this rank (the `base * 1000` / `+100` terms dwarf any rubric score,
-    capped at 999) -- a candidate that passed review and passed smoke but
-    had one judge mis-report a single rubric dimension as non-finite should
-    not be thrown out entirely over that one field, any more than it would
-    be if that field were merely missing or non-numeric.
+    Two DISTINCT bugs, both fixed here (cross-vendor judge finding,
+    follow-up round, HIGH, both items):
 
-    A candidate left with NO usable dimension (every value absent,
-    non-numeric, or non-finite) contributes `mean = 0.0` -- explicitly: not
-    a fabricated "scored zero" being compared against a real measured
-    score as if it were equally trustworthy fact, but the existing NEUTRAL
-    default this function already used for "no score dimensions were
-    reported at all" (0.0 is the lower bound of the rubric-score
-    contribution in this additive scheme, so it can never inflate a
-    candidate's rank above one with any genuine positive score -- and it
-    can never make it WIN over a candidate with the same outcome/smoke and
-    a positive real score. It can only ever be a neutral tiebreak
-    contribution, identical to a candidate that genuinely scored the
-    rubric floor).
+    1. An EARLIER version of this fix simply EXCLUDED a non-finite
+       dimension from the mean, the same treatment the isinstance filter
+       gives a genuinely non-numeric value. That was wrong: excluding a bad
+       dimension RAISES the mean of the remainder (`{0.9, NaN}` excluded ->
+       mean 0.9, versus `{0.9, 0.3}` -> mean 0.6), so a candidate whose
+       WORST dimension happened to come back non-finite could rank BETTER
+       than one that was honestly scored low on that same dimension --
+       "a candidate benefits from its worst dimension being unusable".
+       Fixed by COUNTING a non-finite dimension AGAINST the candidate at
+       the score FLOOR (`_SCORE_DIM_FLOOR`) instead of dropping it: it is
+       still included in the mean's denominator, exactly like a genuine
+       floor-value score would be. A poisoned dimension can therefore only
+       ever hurt a candidate's rank, never help it -- this is the "ranking
+       basis that cannot be gamed by omission" the finding asked for,
+       chosen over refusing the whole candidate for the same reason the
+       earlier (also-correct) reasoning gave: outcome and smoke still
+       dominate this rank (see point 2), so a candidate should not be
+       thrown out entirely over one bad rubric field.
+       A non-numeric/bool value is still EXCLUDED, not floored: it was
+       never a scoring attempt (Hydra's own bookkeeping fields like
+       `_cross_vendor`/`_judge_tier`/`_rubric_id` live in this same dict),
+       and floor-penalizing every candidate identically for its own
+       metadata would be nonsensical, not a defect being closed.
+
+    2. The "outcome/smoke dominate absolutely" claim was FALSE as
+       previously written: `min(mean, 999)` bounds the mean ABOVE but not
+       BELOW, so an unbounded negative score (nothing rejects a judge
+       reporting a negative rubric value) could drag a "pass" (`2000 +
+       mean`) below a "revise" (`1000 + mean'`), and an all-unusable
+       candidate's neutral `mean=0.0` could outrank a genuinely-scored
+       candidate with a valid negative mean. Fixed by clamping every
+       INDIVIDUAL dimension into `[_SCORE_DIM_FLOOR, _SCORE_DIM_CEIL]`
+       before averaging (not clamping the mean after the fact, which would
+       let one wildly out-of-range dimension still skew the average of the
+       others): the resulting mean is therefore ALWAYS in `[0, 10]`,
+       dwarfed by the `*1000`/`+100` terms for any input whatsoever --
+       verified below and in the accompanying test suite for negative,
+       huge, and poisoned inputs together.
+
+    A candidate left with NO scoring attempt at all (every value absent,
+    non-numeric, or bool) contributes `mean = 0.0` -- the pre-existing
+    NEUTRAL default, identical to a dimension floored for being non-finite,
+    so it is never distinguishable from "scored the floor on everything".
     """
     base = {"pass": 2, "revise": 1, "fail": 0}.get(outcome, 0)
-    nums = [float(v) for v in (score or {}).values()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-            and not is_non_finite_float(float(v))]
-    mean = (sum(nums) / len(nums)) if nums else 0.0
-    return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + min(mean, 999.0)
+    dims: list[float] = []
+    for v in (score or {}).values():
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue  # not a scoring attempt: metadata, string, dict, bool, ...
+        fv = float(v)
+        if is_non_finite_float(fv):
+            # Reported but unusable: counts AGAINST the candidate at the
+            # floor (included in the mean), never simply dropped -- see
+            # point 1 above.
+            dims.append(_SCORE_DIM_FLOOR)
+        else:
+            dims.append(min(max(fv, _SCORE_DIM_FLOOR), _SCORE_DIM_CEIL))
+    mean = (sum(dims) / len(dims)) if dims else 0.0
+    # Redundant with the per-dimension clamp above by construction (mean of
+    # values in [0, 10] is itself in [0, 10]) -- kept as an explicit,
+    # self-documenting invariant at the return site rather than relying
+    # solely on the loop above never changing.
+    mean = min(max(mean, _SCORE_DIM_FLOOR), 999.0)
+    return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + mean
 
 
 def _drive_best_of_loop(

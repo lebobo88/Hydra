@@ -163,3 +163,52 @@ def test_attended_submit_finite_cost_is_unaffected(tmp_path, monkeypatch):
     assert rc == 1
     payload = json.loads(buf.getvalue())
     assert payload.get("error") in ("cursor_not_found",) or "cursor_not_found" in str(payload)
+
+
+def test_attended_submit_fractional_string_token_is_accepted_not_rejected(
+    tmp_path, monkeypatch
+):
+    """Cross-vendor judge finding (follow-up round, HIGH): the preflight
+    used to validate `tokens_in`/`tokens_out` -- a COUNT, not a cost --
+    through `coerce_untrusted_cost` (a float validator), so a finite
+    fractional STRING like "1.5" passed the preflight (it genuinely is a
+    finite float) and then raised at `int("1.5")` downstream (Python's
+    `int()` does not parse decimal strings directly). The preflight now
+    validates through the SAME finiteness primitive the cast site uses
+    (`squad_node._coerce_finite_float` / `coerce_untrusted_count`), so a
+    fractional string is CONSISTENTLY accepted at both tiers (truncated
+    downstream, never rejected nor crashing) rather than accepted-then-
+    crashing."""
+    called = {"n": 0}
+
+    class _StubDispatcher:
+        live_execution = False
+
+        def call_mcp(self, *_a, **_kw):
+            return {"status": "done", "result": {}}
+
+    def _fake_live_dispatcher(*_a, **_kw):
+        called["n"] += 1
+        return _StubDispatcher()
+
+    monkeypatch.setattr(cli_module, "_attended_live_dispatcher", _fake_live_dispatcher)
+
+    result_file = tmp_path / "result.json"
+    result_file.write_text(
+        json.dumps({"cost_usd": 0.02, "tokens_in": "1.5"}), encoding="utf-8",
+    )
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = cli_module._cmd_attended_submit(_args(tmp_path, result_file))
+
+    # Accepted at the boundary -- reached the dispatcher, was not rejected
+    # as "does not coerce to a finite number".
+    assert called["n"] == 1
+    payload = json.loads(buf.getvalue())
+    assert "does not coerce to a finite number" not in str(payload)
+
+    # And the SAME value is handled consistently at the cast site: coerced
+    # (truncated), never raising.
+    from hydra_core.squad_node import coerce_untrusted_count
+    assert coerce_untrusted_count("1.5") == 1

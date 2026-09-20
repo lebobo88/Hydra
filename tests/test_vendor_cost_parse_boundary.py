@@ -239,6 +239,26 @@ def test_coerce_untrusted_count_measured_control():
     assert coerce_untrusted_count("500") == 500
 
 
+def test_coerce_untrusted_count_clamps_negative_to_zero():
+    """Cross-vendor judge finding (follow-up round, HIGH): the docstring
+    already promised a non-negative clamp, but the implementation never
+    enforced it -- `_priced_cost` feeds this into `pricing.price_call`'s
+    multiplication, so a negative token count could REDUCE a stage's
+    priced cost below what the measured portion alone would total."""
+    assert coerce_untrusted_count(-500) == 0
+    assert coerce_untrusted_count("-500") == 0
+    assert coerce_untrusted_count(-0.5) == 0
+
+
+def test_coerce_untrusted_count_fractional_string_truncates_not_raises():
+    """Cross-vendor judge finding (follow-up round, HIGH): a fractional
+    STRING (e.g. from a preflight that only checked finiteness, not
+    integer-ness) must be handled the same way at the cast site -- coerced
+    (truncated), never raising."""
+    assert coerce_untrusted_count("1.5") == 1
+    assert coerce_untrusted_count(1.9) == 1
+
+
 def test_parse_claude_cli_result_string_nan_cost_is_unmeasured_not_zero():
     """The exact bypass shape at the real parse site: a vendor stdout JSON
     document (a perfectly valid, ordinary JSON document -- the string
@@ -423,4 +443,74 @@ def test_extract_squad_cost_finite_control_is_measured():
     usd, tokens, source = _extract_squad_cost(result)
     assert usd == pytest.approx(0.42)
     assert tokens == 150
+    assert source == "measured"
+
+
+# ---------------------------------------------------------------------------
+# Finding 6 (follow-up round, MEDIUM): `start_run`'s own scaffold-only
+# response always reports a finite `cost_usd` (0.0 when it merely scaffolds),
+# which resolves "measured" -- accurate in isolation, but OR-ing that into a
+# single stage-wide flag meant a DRIVEN stage whose real cost (the drive
+# loop's) was entirely rejected was still labeled "measured" overall, since
+# the scaffold placeholder alone always satisfied the OR. The drive loop is
+# now authoritative whenever it is present.
+# ---------------------------------------------------------------------------
+
+def test_all_rejected_drive_loop_cost_is_unmeasured_even_with_finite_inner_scaffold():
+    """The exact scenario Finding 6 describes: `inner["cost_usd"] == 0.0`
+    (the scaffold-only start_run placeholder, genuinely "measured" in
+    isolation) alongside a drive_loop whose entire cost was rejected
+    (`cost_usd=0.0`, `unmeasured_count>=1`). The STAGE must be labeled
+    unmeasured -- the scaffold placeholder must not paper over a driven
+    run's real, entirely-rejected cost."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{
+            "kind": "pp_run", "ref": "r1",
+            "raw": {"status": "done", "result": {"cost_usd": 0.0, "run_id": "r1"}},
+            "drive_loop": {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                          "unmeasured_count": 1},
+        }],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    assert usd == 0.0
+    assert source == "unmeasured"
+
+
+def test_drive_loop_with_real_money_is_measured_despite_finite_inner_scaffold():
+    """Control: when the drive loop DOES report genuine money, the stage is
+    correctly "measured" -- the fix must not flip a genuinely-measured
+    driven stage to unmeasured."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{
+            "kind": "pp_run", "ref": "r1",
+            "raw": {"status": "done", "result": {"cost_usd": 0.0, "run_id": "r1"}},
+            "drive_loop": {"cost_usd": 0.07, "tokens_in": 10, "tokens_out": 5,
+                          "unmeasured_count": 0},
+        }],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    assert usd == pytest.approx(0.07)
+    assert source == "measured"
+
+
+def test_legacy_scaffold_only_dispatch_without_drive_loop_stays_measured():
+    """Control: the pre-existing legacy (non-driven) scaffold-only dispatch
+    path -- no `drive_loop` key at all -- is UNCHANGED: `inner["cost_usd"]
+    == 0.0` alone is the whole story for that artifact and stays
+    "measured", exactly as before this fix."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{"kind": "pp_run", "ref": "r1",
+                    "raw": {"status": "done", "result": {"cost_usd": 0.0, "run_id": "r1"}}}],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    assert usd == 0.0
     assert source == "measured"

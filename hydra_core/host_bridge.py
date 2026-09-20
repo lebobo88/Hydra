@@ -2026,8 +2026,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # source="unmeasured" ($0.0, logged, non-blocking).
     _gen_cost, _gen_source = _priced_cost(cursor, result, label="generate")
     cursor["cost_usd"] = float(cursor["cost_usd"]) + _gen_cost
-    cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
-    cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+    cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
+    cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
 
     pre_dirty = set(cursor.get("pre_dirty") or [])
     run_changed = _worktree_dirty_set(work_path) - pre_dirty
@@ -2062,8 +2062,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
                 cm("pp_harness", "record_attempt", {
                     "stage_id": stage_id, "producer": producer, "model_id": model_id,
                     "agent_type": "engineer",   # F29
-                    "tokens_in": int(result.get("tokens_in") or 0),
-                    "tokens_out": int(result.get("tokens_out") or 0),
+                    "tokens_in": coerce_untrusted_count(result.get("tokens_in")),
+                    "tokens_out": coerce_untrusted_count(result.get("tokens_out")),
                     "cost_usd": _gen_cost,
                     "status": "error", "retry_index": gen_idx,
                     "notes": {"candidate_index": 1},
@@ -2104,8 +2104,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
             cm("pp_harness", "record_attempt", {
                 "stage_id": stage_id, "producer": producer, "model_id": model_id,
                 "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
-                "tokens_in": int(result.get("tokens_in") or 0),
-                "tokens_out": int(result.get("tokens_out") or 0),
+                "tokens_in": coerce_untrusted_count(result.get("tokens_in")),
+                "tokens_out": coerce_untrusted_count(result.get("tokens_out")),
                 "cost_usd": _gen_cost,
                 "status": "ok", "retry_index": gen_idx,
                 "notes": {"candidate_index": 1},
@@ -2403,8 +2403,8 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             model_hint=str(result.get("judge_model_id") or "") or None,
         )
         cursor["cost_usd"] = float(cursor["cost_usd"]) + _judge_cost
-        cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
-        cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+        cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
+        cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
         if call_key is not None:
             cursor["judge_cost_applied_for"] = call_key
 
@@ -3190,9 +3190,9 @@ def _apply_squad_result(
     _squad_cost, _squad_cost_source = _priced_cost(cursor, result, label="squad_result")
     cursor["cost_usd"] = float(cursor.get("cost_usd") or 0.0) + _squad_cost
     cursor["tokens_in"] = (int(cursor.get("tokens_in") or 0)
-                           + int(result.get("tokens_in") or 0))
+                           + coerce_untrusted_count(result.get("tokens_in")))
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
-                            + int(result.get("tokens_out") or 0))
+                            + coerce_untrusted_count(result.get("tokens_out")))
     cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
     # Native pack results may delegate typed work to another squad.  Keep the
     # raw list in the cursor so the CLI can validate/redact/ingest it under the

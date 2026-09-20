@@ -136,6 +136,48 @@ def test_generate_then_judge_then_finalize_complete(tmp_path):
     assert all(q == "engineering" for _s, _t, _a, q in disp.calls)
 
 
+def test_submit_host_result_fractional_string_tokens_do_not_crash_mcp_path(tmp_path):
+    """Cross-vendor judge finding (follow-up round, HIGH): `submit_host_result`
+    is reachable directly from the MCP tool surface (`hydra.workflow.
+    submit_host_result`) WITHOUT going through `cli.py`'s `_cmd_attended_
+    submit` preflight at all -- every raw `int(result.get("tokens_in") or
+    0)` cast in `_apply_generate`/`_apply_judge`/`_apply_squad_result` used
+    to raise on a fractional STRING token count (`int("1.5")` -- Python's
+    `int()` does not parse decimal strings). Routed through
+    `coerce_untrusted_count`, this now truncates instead of raising, on the
+    MCP path with no CLI involved at all."""
+    disp = FakeDispatcher()
+    res = _begin(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.10,
+                "tokens_in": "1.5", "tokens_out": "2.9",
+                "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"  # did not raise/crash
+    assert res["state"] == "await_judge"
+
+
+def test_submit_host_result_negative_tokens_do_not_reduce_pricing(tmp_path, monkeypatch):
+    """Cross-vendor judge finding (follow-up round, HIGH): a negative token
+    count must never REDUCE a stage's priced cost. Missing `cost_usd` but
+    present tokens+model routes through `pricing.price_call`; a negative
+    `tokens_out` must be clamped to 0 (`coerce_untrusted_count`), not
+    subtract from the estimate."""
+    disp = FakeDispatcher()
+    res = _begin(disp, tmp_path)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "edited foo.py",
+                "tokens_in": 1_000_000, "tokens_out": -1_000_000,
+                "model": "claude-sonnet-5"})
+    assert res["status"] == "awaiting_host"  # did not raise/crash
+    # A negative tokens_out clamped to 0 must price >= the input-only cost,
+    # never LESS (a raw negative value would have subtracted).
+    from hydra_core import pricing
+    input_only = pricing.price_call("claude-sonnet-5", 1_000_000, 0)
+    assert res["cost_usd"] >= input_only
+
+
 def test_record_attempt_notes_only_allowed_keys(tmp_path):
     """Regression: the pp daemon's record_attempt rejects unrecognized `notes`
     keys (zod strict). The attended driver must send only the allowed shape —
