@@ -32,6 +32,7 @@ from hydra_core.squad_node import (
     _run_claude_cli,
     coerce_untrusted_cost,
     coerce_untrusted_count,
+    resolve_reported_cost,
 )
 from hydra_core.state import BudgetLedger, HydraState
 
@@ -540,3 +541,210 @@ def test_legacy_scaffold_only_dispatch_without_drive_loop_stays_measured():
     usd, tokens, source = _extract_squad_cost(result)
     assert usd == 0.0
     assert source == "measured"
+
+
+# ---------------------------------------------------------------------------
+# resolve_reported_cost (follow-up round, HIGH -- the fifth route, on the
+# PRIMARY generation path): `_parse_claude_cli_result` already determines
+# whether a Claude CLI call's cost was measured/unmeasured and substitutes a
+# finite `0.0` placeholder for the unmeasured case -- but `coerce_untrusted_
+# cost(0.0)` correctly returns "measured" (0.0 IS a valid finite float), so
+# re-deriving the verdict from the coerced value at the accrual site
+# silently overturned the parser's own judgement. `resolve_reported_cost`
+# trusts an UPSTREAM `cost_source` when present, and only coerces fresh when
+# no upstream verdict exists.
+# ---------------------------------------------------------------------------
+
+def test_resolve_reported_cost_trusts_upstream_unmeasured_verdict_absent():
+    gi = _parse_claude_cli_result(
+        json.dumps({"result": "implemented the thing"}), "", 0, "claude-opus-4-8",
+    )
+    assert gi["cost_source"] == "unmeasured"
+    value, source = resolve_reported_cost(gi)
+    assert source == "unmeasured"
+    assert value == 0.0
+
+
+def test_resolve_reported_cost_trusts_upstream_unmeasured_verdict_rejected():
+    gi = _parse_claude_cli_result(
+        json.dumps({"result": "ok", "total_cost_usd": "NaN"}), "", 0, "m",
+    )
+    assert gi["cost_source"] == "unmeasured"
+    value, source = resolve_reported_cost(gi)
+    assert source == "unmeasured"
+    assert value == 0.0
+
+
+def test_resolve_reported_cost_still_measured_for_a_genuine_affirmative_zero():
+    """The over-correction control: a vendor that AFFIRMATIVELY reports
+    `cost_usd: 0.0` must still be measured -- do not trade under-charging
+    for a meaningless unmeasured signal on every genuine free call."""
+    gi = _parse_claude_cli_result(
+        json.dumps({"result": "ok", "total_cost_usd": 0.0}), "", 0, "m",
+    )
+    assert gi["cost_source"] == "measured"
+    value, source = resolve_reported_cost(gi)
+    assert source == "measured"
+    assert value == 0.0
+
+
+def test_resolve_reported_cost_falls_back_to_fresh_coercion_with_no_upstream_verdict():
+    """A codex/host-driven result shape carries no `cost_source` at all --
+    falls back to fresh coercion exactly as before."""
+    value, source = resolve_reported_cost({"cost_usd": 0.42})
+    assert (value, source) == (0.42, "measured")
+    value, source = resolve_reported_cost({"cost_usd": "NaN"})
+    assert (value, source) == (0.0, "unmeasured")
+    value, source = resolve_reported_cost({})
+    assert (value, source) == (0.0, "unmeasured")
+
+
+def _claude_gen_responses(*, gen_result: dict, critique_cost_usd: float | None = 0.03) -> dict:
+    """Same-vendor critique routed to codex (`required_cross_vendor=True`)
+    so this exercises ONLY the generate accrual site's fix, not the
+    critique's -- `_claude_critique` (same-vendor) also calls
+    `_run_claude_cli` and would otherwise double up the effect under test.
+
+    ``critique_cost_usd=None`` omits the critique's own cost field (so a
+    test asserting the STAGE-LEVEL ledger label reflects the generate call
+    ALONE, rather than being correctly overridden to "measured" by an
+    unrelated genuinely-measured critique cost -- see Finding 6's
+    "a stage with ANY real money stays measured" rule, which is correct
+    and must not be confused with this fix)."""
+    critique_result = {
+        "parsed": {"outcome": "pass", "critique_md": "c" * 90,
+                   "score": {"correctness": 9}},
+    }
+    if critique_cost_usd is not None:
+        critique_result["cost_usd"] = critique_cost_usd
+    return {
+        ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": True, "rubric_id": "rfc-2119-normative"}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
+        ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},
+        ("pp_codex", "critique"): {"status": "done", "result": critique_result},
+        ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {"status": "done", "result": {"status": "complete"}},
+    }
+
+
+def _charge_drive_loop_and_get_state(out: dict) -> HydraState:
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{"kind": "pp_run", "ref": "r1",
+                    "raw": {"status": "done", "result": {"run_id": "r1"}},
+                    "drive_loop": out}],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    state = HydraState(root_goal="x", budget=BudgetLedger(budget_usd=10.0, spent_usd=0.0))
+    charge_and_gate(state, usd, tokens, source=source)
+    return state
+
+
+def test_claude_cli_absent_cost_recorded_unmeasured_end_to_end(monkeypatch):
+    """END TO END through the real drive loop: a Claude CLI generate call
+    with an ABSENT cost is recorded unmeasured all the way to the LEDGER,
+    not merely in the parser's return value. The critique's own cost is
+    ALSO omitted here so the stage-level label reflects this fix, rather
+    than being correctly overridden to "measured" by an unrelated real
+    critique cost (Finding 6's "any real money in the stage stays
+    measured" rule -- a different, already-covered case)."""
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: _parse_claude_cli_result(
+            json.dumps({"result": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}"}),
+            "", 0, "claude-opus-4-8",
+        ),
+    )
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 1
+    assert state.budget.spent_usd == 0.0
+
+
+def test_claude_cli_rejected_cost_recorded_unmeasured_end_to_end(monkeypatch):
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: _parse_claude_cli_result(
+            json.dumps({
+                "result": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+                "total_cost_usd": "NaN",
+            }),
+            "", 0, "claude-opus-4-8",
+        ),
+    )
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 1
+    assert state.budget.spent_usd == 0.0
+
+
+def test_claude_cli_genuine_affirmative_zero_still_measured_end_to_end(monkeypatch):
+    """The over-correction control, end to end: a vendor AFFIRMATIVELY
+    reporting `cost_usd: 0.0` must still be measured on the ledger."""
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: _parse_claude_cli_result(
+            json.dumps({
+                "result": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+                "total_cost_usd": 0.0,
+            }),
+            "", 0, "claude-opus-4-8",
+        ),
+    )
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(_claude_gen_responses(gen_result={}))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 0
+
+
+def test_claude_cli_ordinary_finite_cost_measured_and_charged_end_to_end(monkeypatch):
+    """Control: an ordinary finite Claude CLI cost is measured and charged
+    exactly as before."""
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: _parse_claude_cli_result(
+            json.dumps({
+                "result": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+                "total_cost_usd": 0.11,
+            }),
+            "", 0, "claude-opus-4-8",
+        ),
+    )
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(_claude_gen_responses(gen_result={}))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 0
+    assert state.budget.spent_usd == pytest.approx(0.11 + 0.03)  # generate + critique

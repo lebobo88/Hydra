@@ -852,6 +852,51 @@ def coerce_untrusted_count(raw: Any) -> int:
     return n if n >= 0 else 0
 
 
+def resolve_reported_cost(result: dict[str, Any]) -> tuple[float, str]:
+    """Resolve a vendor call's ``(cost_usd, cost_source)``, honoring an
+    UPSTREAM verdict when ``result`` already carries one instead of
+    RE-DERIVING it from the coerced value.
+
+    Cross-vendor judge finding (follow-up round, HIGH -- the SAME shape as
+    the accrual sites re-deriving "was this reported at all" on top of
+    `coerce_untrusted_cost`'s own answer, one layer further out, on the
+    PRIMARY generation path): `_parse_claude_cli_result` (and
+    `_claude_critique`, which forwards it) already determines whether a
+    Claude CLI call's cost was genuinely measured or rejected/absent, and
+    substitutes a finite `0.0` placeholder for the unmeasured case so
+    downstream arithmetic never sees a non-finite value. But
+    `coerce_untrusted_cost(0.0)` correctly returns `"measured"` -- `0.0`
+    IS a valid finite float -- so re-running that check on the ALREADY-
+    JUDGED placeholder silently overturns the parser's own `"unmeasured"`
+    verdict. This is the accrual-site fix from the previous round
+    (`coerce_untrusted_cost`'s own answer is authoritative, not re-derived
+    on top of) applied one layer further out: an UPSTREAM `cost_source` is
+    now authoritative over a fresh re-coercion the same way.
+
+    The raw value is still coerced (defensively, for VALUE only, NEVER to
+    re-derive SOURCE) when an upstream verdict exists, in case something
+    tampers with `cost_usd` independently of `cost_source`. When NO
+    upstream verdict exists at all -- the codex/agy MCP critique response
+    shape and the host-driven engineer subagent shape carry no such
+    concept -- this falls back to fresh coercion exactly as before,
+    unchanged.
+
+    Tokens have NO analogous upstream provenance to lose: no parser in
+    this codebase ever emits a `tokens_in_source`/`tokens_out_source`
+    verdict (tokens are plain informational counters, clamped by
+    `coerce_untrusted_count` directly from the raw field at every site,
+    with no "was this measured" concept ever attached to them upstream) --
+    so there is nothing here for tokens to re-derive over, and
+    `coerce_untrusted_count(result.get("tokens_in"))` remains correct
+    as-is at every accrual site.
+    """
+    upstream_source = result.get("cost_source")
+    if upstream_source in ("measured", "estimated", "unmeasured"):
+        value, _ = coerce_untrusted_cost(result.get("cost_usd"))
+        return value, upstream_source
+    return coerce_untrusted_cost(result.get("cost_usd"))
+
+
 def _parse_claude_cli_result(
     stdout: str, stderr: str, returncode: int, model: str,
 ) -> dict[str, Any]:
@@ -1659,13 +1704,17 @@ def _drive_pp_stage_loop(
             # the success path (and break-ing out on failure) under-charged the
             # budget ledger and weakened the 80%/100% tripwires. Hard failures
             # (timeout/transport) carry no cost fields → add 0, harmless.
-            # Coerced ONCE here (`coerce_untrusted_cost`/`coerce_untrusted_count`)
+            # Resolved ONCE here (`resolve_reported_cost`/`coerce_untrusted_count`)
             # and reused for every downstream use of this generate envelope's
             # cost/tokens in this iteration (the accumulator, both
             # `record_attempt` calls, and the cost-unknown trace check below)
             # -- so `gi`'s raw, vendor-controlled fields are never re-cast
             # with a bare `float()`/`int()` anywhere in this loop body.
-            _gen_cost, _gen_src = coerce_untrusted_cost(gi.get("cost_usd"))
+            # `resolve_reported_cost` (not a bare `coerce_untrusted_cost`)
+            # because `gi` may already carry an UPSTREAM `cost_source` from
+            # `_parse_claude_cli_result` -- see that function's docstring
+            # for why re-coercing an already-judged value is wrong.
+            _gen_cost, _gen_src = resolve_reported_cost(gi)
             _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
             _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
             out["cost_usd"] += _gen_cost
@@ -1866,9 +1915,12 @@ def _drive_pp_stage_loop(
             degraded = required_cross and not cross_vendor
 
             # F6: critique cost counts toward the run's budget charge too.
-            # Vendor-controlled (pp_agy / pp_codex / Claude) -- coerced the
-            # same way as the generate cost above.
-            _crit_cost, _crit_src = coerce_untrusted_cost(ci.get("cost_usd"))
+            # Vendor-controlled (pp_agy / pp_codex / Claude) -- resolved the
+            # same way as the generate cost above (`ci` carries an upstream
+            # `cost_source` when the judge is `_claude_critique`; the
+            # codex/agy MCP critique shape carries none and falls back to
+            # fresh coercion).
+            _crit_cost, _crit_src = resolve_reported_cost(ci)
             out["cost_usd"] += _crit_cost
             out["tokens_in"] += coerce_untrusted_count(ci.get("tokens_in"))
             out["tokens_out"] += coerce_untrusted_count(ci.get("tokens_out"))
@@ -2337,10 +2389,10 @@ def _drive_best_of_loop(
                 model_tier=model_tier, sq=sq)
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
-            # Coerced ONCE (see the sequential drive loop's identical
+            # Resolved ONCE (see the sequential drive loop's identical
             # comment) and reused for the accumulator, `record_attempt`, and
             # the cost-unknown trace check below.
-            _gen_cost, _gen_src = coerce_untrusted_cost(gi.get("cost_usd"))
+            _gen_cost, _gen_src = resolve_reported_cost(gi)
             _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
             _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
             out["cost_usd"] += _gen_cost
@@ -2461,7 +2513,7 @@ def _drive_best_of_loop(
                 jci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
                     "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
-            _jci_cost, _jci_src = coerce_untrusted_cost(jci.get("cost_usd"))
+            _jci_cost, _jci_src = resolve_reported_cost(jci)
             out["cost_usd"] += _jci_cost
             out["tokens_in"] += coerce_untrusted_count(jci.get("tokens_in"))
             out["tokens_out"] += coerce_untrusted_count(jci.get("tokens_out"))
