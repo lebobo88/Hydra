@@ -923,7 +923,17 @@ def resolve_reported_cost(result: dict[str, Any]) -> tuple[float, str]:
     """
     coerced_value, coerced_source = coerce_untrusted_cost(result.get("cost_usd"))
     upstream_source = result.get("cost_source")
-    if upstream_source not in _COST_SOURCE_RANK:
+    # `upstream_source not in _COST_SOURCE_RANK` below is a dict-key
+    # membership test, which HASHES `upstream_source` -- an unhashable
+    # vendor-supplied value (a dict or list, e.g. a vendor sending a JSON
+    # object for `cost_source`) would raise TypeError before the fallback
+    # ever runs, turning a would-be degrade-to-coerced case into a crashed
+    # drive loop. Require `str` explicitly first: anything not a string
+    # (unhashable or not) falls back to the coerced verdict exactly like an
+    # unrecognized string does, and this check alone is sufficient because
+    # `bool`/`int`/`None` are already hashable and already fall back
+    # correctly via the membership test.
+    if not isinstance(upstream_source, str) or upstream_source not in _COST_SOURCE_RANK:
         return coerced_value, coerced_source
     final_source = min(
         (coerced_source, upstream_source),

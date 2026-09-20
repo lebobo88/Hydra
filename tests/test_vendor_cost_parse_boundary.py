@@ -600,6 +600,80 @@ def test_resolve_reported_cost_falls_back_to_fresh_coercion_with_no_upstream_ver
 
 
 # ---------------------------------------------------------------------------
+# An unhashable `cost_source` must degrade to the coerced verdict, not crash
+# (follow-up round, HIGH): `upstream_source not in _COST_SOURCE_RANK` hashes
+# `upstream_source`, and a vendor-supplied dict/list/set for `cost_source`
+# raised TypeError before the fallback could run -- a vendor sending a JSON
+# object where a string was expected could crash the drive loop outright.
+# ---------------------------------------------------------------------------
+
+def test_resolve_reported_cost_unhashable_dict_source_falls_back_to_coercion():
+    value, source = resolve_reported_cost(
+        {"cost_usd": 0.25, "cost_source": {"claim": "measured"}})
+    assert (value, source) == (0.25, "measured")
+
+
+def test_resolve_reported_cost_unhashable_list_source_falls_back_to_coercion():
+    value, source = resolve_reported_cost(
+        {"cost_usd": "NaN", "cost_source": ["measured"]})
+    assert (value, source) == (0.0, "unmeasured")
+
+
+def test_resolve_reported_cost_unhashable_set_source_falls_back_to_coercion():
+    value, source = resolve_reported_cost(
+        {"cost_usd": 0.42, "cost_source": {"measured"}})
+    assert (value, source) == (0.42, "measured")
+
+
+def test_resolve_reported_cost_unrecognized_string_none_int_sources_unchanged():
+    """Existing fallback behaviour for hashable-but-unrecognized sources must
+    be identical after adding the `isinstance(str)` guard."""
+    value, source = resolve_reported_cost({"cost_usd": 0.42, "cost_source": "trusted"})
+    assert (value, source) == (0.42, "measured")
+    value, source = resolve_reported_cost({"cost_usd": 0.42, "cost_source": None})
+    assert (value, source) == (0.42, "measured")
+    value, source = resolve_reported_cost({"cost_usd": 0.42, "cost_source": 1})
+    assert (value, source) == (0.42, "measured")
+
+
+def test_resolve_reported_cost_monotone_behaviour_unchanged_for_recognized_sources():
+    """Recognized string sources still combine by rank -- the isinstance
+    guard only affects non-string input, never the monotone rule itself."""
+    # coerced measured + upstream weaker (estimated) -> weaker wins
+    value, source = resolve_reported_cost({"cost_usd": 0.5, "cost_source": "estimated"})
+    assert (value, source) == (0.5, "estimated")
+    # coerced unmeasured + upstream measured -> still unmeasured
+    value, source = resolve_reported_cost({"cost_usd": "NaN", "cost_source": "measured"})
+    assert (value, source) == (0.0, "unmeasured")
+    # coerced measured + upstream measured -> measured
+    value, source = resolve_reported_cost({"cost_usd": 0.0, "cost_source": "measured"})
+    assert (value, source) == (0.0, "measured")
+
+
+class _ScriptedDispatcherUnhashableCostSource(_ScriptedDispatcherForCost):
+    """Adds `run_host_agent` returning an unhashable `cost_source`, to drive
+    the crash/degrade behaviour through the REAL loop, not just the helper
+    in isolation."""
+
+    def run_host_agent(self, agent_type, prompt, *, cwd):
+        return {"status": "done", "result": {
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+            "cost_usd": 0.25, "cost_source": {"claim": "measured"},
+        }}
+
+
+def test_e2e_unhashable_cost_source_does_not_crash_the_drive_loop(monkeypatch):
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherUnhashableCostSource(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.spent_usd == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
 # The fix from the previous round turning on itself (follow-up round, HIGH):
 # an upstream `cost_source` may only WEAKEN the coerced verdict, never
 # strengthen it. `resolve_reported_cost` is applied to more than Hydra's own
