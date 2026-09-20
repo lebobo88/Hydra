@@ -300,6 +300,62 @@ def _skip_verdict(
     )
 
 
+def _unjudgeable_verdict(
+    *,
+    envelope: dict[str, Any],
+    rubric_id: str,
+    judge_vendor: JudgeVendor,
+    generator_vendor: str,
+    workflow_id: UUID,
+    attempts: list[dict[str, Any]],
+    last_error: Exception | None,
+    retry_index: int = 0,
+    parent_verdict_id: UUID | None = None,
+) -> JudgeVerdict:
+    """Build an ``unjudgeable`` verdict for an envelope that failed STRICT
+    SERIALIZATION (``reason="non_finite_envelope"``), distinct from
+    :func:`_skip_verdict`'s honest ``skip``.
+
+    Cross-vendor judge finding (item 1/6, CRITICAL): a serialization failure
+    is a genuine DATA DEFECT (e.g. a legacy non-finite field a
+    pre-strict-JSON checkpoint carried) -- every preferred vendor fails
+    IDENTICALLY because the failure happens before any vendor's client is
+    even invoked (`_wrap_untrusted(_envelope_to_text(envelope))` raises in
+    `dispatch_judge` before `use_client.critique(...)` runs). This is NOT a
+    transient infra outage the way an unreachable vendor or an expired tier
+    is, so it must not be folded into `skip` (which every downstream site
+    treats as "no signal, but nothing to block on either"). Names the
+    offending field (from the `JudgeDispatchError` message, which itself
+    threads through `find_non_finite_field`) so the surfaced HITL/trace is
+    actionable without the operator re-deriving it.
+    """
+    target_id = envelope.get("id")
+    if isinstance(target_id, str):
+        target_id = UUID(target_id)
+    elif target_id is None:
+        target_id = uuid4()
+    reasons = "; ".join(
+        f"{a.get('vendor')}:{a.get('reason', '?')}" for a in attempts if not a.get("ok")
+    )
+    return JudgeVerdict(
+        workflow_id=workflow_id,
+        origin_squad="hydra-judge",
+        target_squad=envelope.get("origin_squad"),
+        target_envelope_id=target_id,
+        outcome="unjudgeable",
+        rubric_id=rubric_id,
+        judge_vendor=judge_vendor,
+        generator_vendor=generator_vendor,
+        critique_md=(
+            "[UNJUDGEABLE — envelope failed strict serialization, cannot be "
+            f"evaluated by any vendor] {reasons}. Last error: {last_error}"
+        ),
+        score_json={"_error": True, "_unjudgeable": True, "_judge_attempts": attempts},
+        retry_index=retry_index,
+        parent_verdict_id=parent_verdict_id,
+    )
+
+
 def dispatch_judge_with_fallback(
     *,
     envelope: dict[str, Any],
@@ -355,6 +411,32 @@ def dispatch_judge_with_fallback(
             })
             last_error = e
             continue
+    # Cross-vendor judge finding (item 1/6, CRITICAL): every attempt failing
+    # with `reason="non_finite_envelope"` means the envelope itself could not
+    # be serialized -- deterministic across ALL vendors (the failure happens
+    # before any vendor's client is invoked), not a per-vendor infra outage.
+    # Return the distinct `unjudgeable` outcome instead of folding it into
+    # `skip`, so every downstream consumer can tell "genuinely nothing to
+    # judge" (skip) apart from "should have been judged but the data is
+    # broken" (unjudgeable) and block on the latter.
+    if attempts and all(
+        (not a.get("ok")) and a.get("reason") == "non_finite_envelope"
+        for a in attempts
+    ):
+        return (
+            _unjudgeable_verdict(
+                envelope=envelope,
+                rubric_id=rubric_id,
+                judge_vendor=vendors[0],
+                generator_vendor=generator_vendor,
+                workflow_id=workflow_id,
+                attempts=attempts,
+                last_error=last_error,
+                retry_index=retry_index,
+                parent_verdict_id=parent_verdict_id,
+            ),
+            attempts,
+        )
     return (
         _skip_verdict(
             envelope=envelope,

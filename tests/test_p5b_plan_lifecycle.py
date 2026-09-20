@@ -400,6 +400,39 @@ class TestTask2IngestBranch:
         assert not outcome.plan_patch
         assert state.plan_status == "none"
 
+    def test_ingest_plan_unrelated_runtime_error_is_not_swallowed(
+        self, packs, monkeypatch, tmp_path,
+    ):
+        """Cross-vendor judge finding (item 5/6, MEDIUM): the ingest PLAN
+        branch's except clause previously caught bare `RuntimeError` too --
+        not a documented failure mode of `render_plan_html` (raises
+        `ValueError`/`PlanFigureError`, a `ValueError` subclass) or
+        `write_repo_artifact` (raises only `ArtifactStoreError`, also a
+        `ValueError` subclass, or lets a genuine `OSError` propagate). A
+        `RuntimeError` from an UNRELATED engine bug transiting this code
+        path must surface as the real defect it is, not be silently
+        relabeled as an ordinary "plan artifact write failed" user-input
+        item failure.
+
+        Mutation proof (revert immediately): re-add `RuntimeError` to the
+        except tuple and this test fails because the exception is caught
+        and folded into a structured "failed" item instead of propagating.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("unrelated engine bug, not a render/serialization failure")
+        monkeypatch.setattr("hydra_core.plan_artifact.render_plan_html", _boom)
+
+        state = HydraState(root_goal="x")
+        plan = _minimal_plan_dict(state.workflow_id)
+        with pytest.raises(RuntimeError, match="unrelated engine bug"):
+            dispatch_ingested_envelopes(
+                state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
+            )
+        # And the barrier must not have risen on the crashed attempt.
+        assert state.plan_status == "none"
+
     def test_resubmitted_identical_plan_is_skipped_fresh_revision_is_not(
         self, packs, monkeypatch, tmp_path,
     ):

@@ -31,9 +31,10 @@ from .governance import (
 from .heads import cathedral_name, crown_label_for_squad, heads_in_crown
 from .immortal_head import load_constitution
 from .judge import dispatch_judge, dispatch_judge_with_fallback, route_judge, load_policy
-from .judge.dispatcher import CritiqueClient, NoOpCritiqueClient
+from .judge.dispatcher import CritiqueClient, JudgeDispatchError, NoOpCritiqueClient
 from .judge.reflexion import MAX_RETRY_INDEX, effective_max_retry_index, package_retry
 from .judge.schemas import JudgeVerdict
+from .plan_artifact import sum_finite_budgets
 from .plan_triage import triage_plan
 from .router import RESERVED_META_SQUADS, RoutingDecision, classify_intent, compute_tool_scope
 from .telemetry import emit as emit_trace
@@ -1675,7 +1676,11 @@ def build_supervisor(
         Returns the WINNING envelopes (loser envelopes archived in artifacts).
         Falls back to single-shot dispatch if anything goes wrong.
         """
-        from .judge.best_of_n import judge_and_rank, NoRankableVerdictsError
+        from .judge.best_of_n import (
+            judge_and_rank,
+            NoRankableVerdictsError,
+            UnjudgeableEnvelopeError,
+        )
 
         n = pack.best_of_n
         squad_enabled = judge_policy.squad_enabled(pack.slug)
@@ -1828,6 +1833,27 @@ def build_supervisor(
             try:
                 state.error_counters["judge_unavailable"] = (
                     state.error_counters.get("judge_unavailable", 0) + 1
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return candidates
+        except UnjudgeableEnvelopeError as e:
+            # Cross-vendor judge finding (item 1/6, CRITICAL): unlike a vendor
+            # outage, this means at least one candidate's envelope itself is
+            # broken (failed strict serialization). Do NOT anoint a winner
+            # from a pool that may include it — return the un-ranked
+            # candidates unchanged. Every returned envelope still passes
+            # through `node_judge_per_squad`'s normal per-envelope judging
+            # (this function's callers never tag winners as pre-judged), so
+            # the SAME serialization failure is caught there and hard-blocks
+            # the workflow (surfaced, never synthesis/done) rather than this
+            # best-of-N helper silently working around it.
+            emit_trace(judge_trace_root, state.workflow_id, "judge.bon_unjudgeable", {
+                "squad": pack.slug, "n": len(candidates), "error": str(e),
+            })
+            try:
+                state.error_counters["unjudgeable_envelope"] = (
+                    state.error_counters.get("unjudgeable_envelope", 0) + 1
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -2933,6 +2959,15 @@ def build_supervisor(
         retry_envelopes: list[dict] = []
         retry_verdicts: list[dict] = []
         breach: dict | None = None
+        # Cross-vendor judge finding (item 1/6, CRITICAL): the FIRST verdict
+        # with outcome="unjudgeable" (envelope failed strict serialization —
+        # a data defect, not an infra outage or a quality judgment) HARD
+        # BLOCKS this node's advance to synthesis, checked and honored ahead
+        # of `breach`/`ceiling_blocked` below. Distinct from a legitimately
+        # routed `skip` (`route.tier == "skip"` / no rubric ids at
+        # `_judge_envelope` ~line 1543), which still returns `[]` and is
+        # correctly excluded from every gate exactly as before.
+        unjudgeable_hit: dict | None = None
         # R3-tail: envelopes whose `revise` verdict could not be retried
         # because the active Reflexion ceiling is exhausted. Collected here
         # and surfaced as one `reflexion_override` HITL at the end of the
@@ -2944,9 +2979,12 @@ def build_supervisor(
         )
 
         # First: scan best_of_n verdicts already in state for HITL-severity
-        # fails. These were emitted during dispatch on candidate envelopes
-        # before this node ran.
+        # fails, and for an unjudgeable verdict (checked first — a broken
+        # candidate outranks a policy-quality breach). These were emitted
+        # during dispatch on candidate envelopes before this node ran.
         for prior in state.verdicts:
+            if prior.get("outcome") == "unjudgeable" and unjudgeable_hit is None:
+                unjudgeable_hit = prior
             if (prior.get("outcome") == "fail"
                     and judge_policy.is_hitl_severity(prior.get("rubric_id", ""))):
                 breach = prior
@@ -2987,6 +3025,19 @@ def build_supervisor(
                 continue
             env_verdicts = _judge_envelope(state, env, is_post_synthesis=False)
             new_verdicts.extend(env_verdicts)
+
+            # (0) Unjudgeable envelope: HARD BLOCK, checked before anything
+            # else. Cross-vendor judge finding (item 1/6, CRITICAL) — this is
+            # a data defect (strict serialization failure), not a policy
+            # verdict or a retryable `revise`; it must never be treated as
+            # "no signal" (skip) and silently let the loop advance.
+            env_unjudgeable = next(
+                (v for v in env_verdicts if v.get("outcome") == "unjudgeable"),
+                None,
+            )
+            if env_unjudgeable and unjudgeable_hit is None:
+                unjudgeable_hit = env_unjudgeable
+                continue  # do not attempt fail-severity/revise handling on unjudged content
 
             # (3) HITL escalation per envelope.
             severity_fail = next(
@@ -3068,7 +3119,42 @@ def build_supervisor(
             "envelopes": retry_envelopes,
             "phase": "synthesis",
         }
-        if breach:
+        if unjudgeable_hit:
+            # Cross-vendor judge finding (item 1/6, CRITICAL): checked FIRST,
+            # ahead of `breach`/`ceiling_blocked` — an unjudgeable envelope is
+            # a data defect, not a quality verdict, and must never be treated
+            # as though real judgment occurred. Never advances to synthesis,
+            # never marks the workflow done (the `phase="surfaced"` set here
+            # is exactly what `node_postcheck`'s
+            # `elif state.phase != "surfaced": state.phase = "done"` guard
+            # checks — see supervisor.py's postcheck node).
+            hitl = HITLRequest(
+                workflow_id=state.workflow_id,
+                origin_squad="hydra-judge",
+                target_squad="human",
+                reason="unjudgeable_envelope",
+                summary=(
+                    f"Envelope {unjudgeable_hit.get('target_envelope_id')} could not "
+                    f"be judged — strict serialization failed on rubric "
+                    f"{unjudgeable_hit.get('rubric_id')}. This is a data defect, not "
+                    f"a quality verdict; investigate before proceeding. "
+                    f"Detail: {(unjudgeable_hit.get('critique_md') or '')[:200]}"
+                ),
+                options=["acknowledge", "abort"],
+                default_option="abort",
+            )
+            hitl_dict = hitl.model_dump(mode="json")
+            hitl_dict["gate_node"] = "judge_per_squad"  # C2 dedupe key half
+            eights.hitl_request(hitl_dict, gate_node="judge_per_squad")
+            out["pending_hitl"] = hitl_dict
+            out["phase"] = "surfaced"
+            out["hitl_return_node"] = "judge_per_squad"
+            emit_trace(judge_trace_root, state.workflow_id, "judge.unjudgeable_escalation", {
+                "stage": "per_squad",
+                "rubric_id": unjudgeable_hit.get("rubric_id"),
+                "envelope_id": unjudgeable_hit.get("target_envelope_id"),
+            })
+        elif breach:
             hitl = HITLRequest(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra-judge",
@@ -3571,6 +3657,14 @@ def build_supervisor(
             return {"phase": "postcheck"}
         verdicts = _judge_envelope(state, record_env, is_post_synthesis=True)
 
+        # Cross-vendor judge finding (item 1/6, CRITICAL): an unjudgeable
+        # final DecisionRecord (strict serialization failed) must never let
+        # `node_postcheck` mark the workflow done — checked ahead of
+        # `breach` below, same priority as `node_judge_per_squad`.
+        unjudgeable = next(
+            (v for v in verdicts if v.get("outcome") == "unjudgeable"), None,
+        )
+
         # HITL escalation: any fail on a high-severity rubric surfaces.
         breach = next(
             (v for v in verdicts
@@ -3579,7 +3673,33 @@ def build_supervisor(
             None,
         )
         out: dict[str, Any] = {"verdicts": verdicts, "phase": "postcheck"}
-        if breach:
+        if unjudgeable:
+            hitl = HITLRequest(
+                workflow_id=state.workflow_id,
+                origin_squad="hydra-judge",
+                target_squad="human",
+                reason="unjudgeable_envelope",
+                summary=(
+                    f"Final DecisionRecord could not be judged — strict "
+                    f"serialization failed on rubric {unjudgeable.get('rubric_id')}. "
+                    f"This is a data defect, not a quality verdict; investigate before "
+                    f"marking the workflow done. "
+                    f"Detail: {(unjudgeable.get('critique_md') or '')[:200]}"
+                ),
+                options=["acknowledge", "abort"],
+                default_option="abort",
+            )
+            hitl_dict = hitl.model_dump(mode="json")
+            hitl_dict["gate_node"] = "judge_synthesis"  # C2 dedupe key half
+            eights.hitl_request(hitl_dict, gate_node="judge_synthesis")
+            out["pending_hitl"] = hitl_dict
+            out["phase"] = "surfaced"
+            emit_trace(judge_trace_root, state.workflow_id, "judge.unjudgeable_escalation", {
+                "stage": "synthesis",
+                "rubric_id": unjudgeable.get("rubric_id"),
+                "envelope_id": unjudgeable.get("target_envelope_id"),
+            })
+        elif breach:
             hitl = HITLRequest(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra-judge",
@@ -3760,13 +3880,27 @@ def build_supervisor(
         """
         plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
         plan_steps = plan_ref.get("steps") or []
-        estimated_total = 0.0
-        for step in plan_steps:
-            v = step.get("estimated_budget_usd") if isinstance(step, dict) else None
-            if isinstance(v, (int, float)):
-                estimated_total += float(v)
+        # Cross-vendor judge finding (item 2/6, HIGH): route through the SAME
+        # overflow-aware helper `plan_artifact._sum_step_budgets` uses, not
+        # an independent unguarded `+=` loop. Two individually-valid,
+        # individually-finite step budgets near `sys.float_info.max` (e.g.
+        # two 1e308s) still overflow a plain sum to `inf` -- and this dict
+        # summation, unlike `_sum_step_budgets`'s typed `PlanStep` path, IS
+        # the live path a plan's budget total reaches `plan_detail`
+        # (checkpoint/HITL/MCP-visible data) and the approval summary
+        # through. `estimated_total` is `None` when the sum overflowed;
+        # every consumer below must treat that as "unavailable", never
+        # format a `None`/`inf` as a dollar amount.
+        def _raw_step_budgets():
+            for step in plan_steps:
+                v = step.get("estimated_budget_usd") if isinstance(step, dict) else None
+                yield v if isinstance(v, (int, float)) else None
+
+        estimated_total, _estimated_total_overflowed = sum_finite_budgets(_raw_step_budgets())
         remaining_budget = max(0.0, state.budget.budget_usd - state.budget.spent_usd)
-        over_plan_budget = estimated_total > remaining_budget
+        over_plan_budget = (
+            False if estimated_total is None else estimated_total > remaining_budget
+        )
 
         # A PLAN-shaped envelope for the judge to inspect. Prefer the real
         # plan_ref (set once the ingest PLAN branch materialises it — P5b);
@@ -3797,6 +3931,34 @@ def build_supervisor(
                 client=use_client,
             )
             verdict_dict = verdict.model_dump(mode="json")
+        except JudgeDispatchError as e:
+            if e.reason == "non_finite_envelope":
+                # Cross-vendor judge finding (item 1/6, CRITICAL): a
+                # serialization failure is a genuine data defect, not a
+                # vendor/infra outage — fabricate the DISTINCT `unjudgeable`
+                # outcome, never the ordinary `skip` this except clause used
+                # to fold every failure into (which the gate below then
+                # offered the ordinary approve/reject/modify options for, as
+                # if the plan HAD been judged).
+                emit_trace(judge_trace_root, state.workflow_id, "plan_judge.unjudgeable", {
+                    "error": str(e),
+                })
+                verdict_dict = {
+                    "outcome": "unjudgeable",
+                    "critique_md": (
+                        f"[UNJUDGEABLE — plan failed strict serialization] {e}"
+                    ),
+                    "rubric_id": "plan-decomposition-quality@1",
+                }
+            else:
+                emit_trace(judge_trace_root, state.workflow_id, "plan_judge.error", {
+                    "error": str(e),
+                })
+                verdict_dict = {
+                    "outcome": "skip",
+                    "critique_md": f"[plan_judge error] {e}",
+                    "rubric_id": "plan-decomposition-quality@1",
+                }
         except Exception as e:  # noqa: BLE001 — a judge outage must not wedge the plan gate
             emit_trace(judge_trace_root, state.workflow_id, "plan_judge.error", {
                 "error": str(e),
@@ -3818,7 +3980,12 @@ def build_supervisor(
         )
 
         plan_detail: dict[str, Any] = {
+            # `None` (never `inf`/`NaN`) when the sum overflowed -- JSON
+            # `null` is valid RFC 8259; the raw float would not be. The
+            # sibling `_overflowed` flag lets a consumer render "unavailable"
+            # instead of misreading `null` as "no budget estimated at all".
             "estimated_total_budget_usd": estimated_total,
+            "estimated_total_budget_overflowed": _estimated_total_overflowed,
             "remaining_budget_usd": remaining_budget,
             "over_plan_budget": over_plan_budget,
             "verdict_outcome": verdict_dict.get("outcome"),
@@ -3846,17 +4013,50 @@ def build_supervisor(
             ],
         }
 
+        # Cross-vendor judge finding (item 2/6, HIGH): never format `None`
+        # (the overflow sentinel) as a dollar amount -- report "unavailable"
+        # in the operator-facing summary the same way `plan_detail` does.
+        _estimated_total_display = (
+            "unavailable (sum of step budgets overflowed float range)"
+            if estimated_total is None else f"${estimated_total:.2f}"
+        )
         summary = (
             f"Review plan (rigor={state.plan_rigor}) for goal: {state.root_goal!r} — "
-            f"estimated step budget ${estimated_total:.2f} of ${remaining_budget:.2f} "
-            f"remaining."
+            f"estimated step budget {_estimated_total_display} of "
+            f"${remaining_budget:.2f} remaining."
         )
         if over_plan_budget:
             summary += " ESTIMATED PLAN COST EXCEEDS REMAINING BUDGET."
         if not state.plan_artifact_location:
             summary += " No plan artifact on record."
 
-        if revision_ceiling_reached:
+        plan_unjudgeable = verdict_dict.get("outcome") == "unjudgeable"
+        if plan_unjudgeable:
+            # Cross-vendor judge finding (item 1/6, CRITICAL): the plan was
+            # NEVER actually evaluated (strict serialization failed) — never
+            # offer the ordinary approve/reject/modify-plan/modify-budget
+            # options as if a real judgment had occurred. Surface a hard
+            # stop with its own reason instead.
+            reason = "unjudgeable_plan"
+            summary = (
+                f"Plan for goal {state.root_goal!r} could not be judged — strict "
+                f"serialization failed. This is a data defect, not a quality "
+                f"verdict; investigate before proceeding. Detail: "
+                f"{(verdict_dict.get('critique_md') or '')[:200]}"
+            )
+            # Deliberately ONLY `abort` (a terminal resolution — see
+            # cli.py's `_terminal_resolution = action == "reject" or
+            # option == "abort"`), never `acknowledge`: `node_plan_gate`
+            # materialises tasks on any non-terminal resume regardless of
+            # which option was chosen (it only checks whether a DIFFERENT
+            # gate is pending, not the resolved option or `state.verdicts`),
+            # unlike `judge_per_squad`/`judge_synthesis` where the same
+            # unjudgeable verdict is re-detected from `state.verdicts` on
+            # every re-entry. Offering `acknowledge` here would silently
+            # behave exactly like `approve`.
+            options = ["abort"]
+            default_option = "abort"
+        elif revision_ceiling_reached:
             # P5c: HYDRA_PLAN_MAX_REVISIONS is spent -- offer only a
             # terminal decision. `abort` (not `reject`) is the default here:
             # `reject` still raises the plan barrier permanently (see
@@ -3865,9 +4065,11 @@ def build_supervisor(
             # for an unattended gate expiry at the ceiling -- `abort` parks
             # the workflow without stamping a rejection the operator never
             # actually chose.
+            reason = "plan_approval"
             options = ["approve", "abort"]
             default_option = "abort"
         else:
+            reason = "plan_approval"
             options = ["approve", "reject", "modify-plan", "modify-budget"]
             default_option = "reject"
 
@@ -3875,7 +4077,7 @@ def build_supervisor(
             workflow_id=state.workflow_id,
             origin_squad="hydra",
             target_squad="human",
-            reason="plan_approval",
+            reason=reason,
             summary=summary,
             options=options,
             default_option=default_option,

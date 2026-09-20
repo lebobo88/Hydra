@@ -112,6 +112,40 @@ def test_find_non_finite_field_reports_cycle_promptly_instead_of_looping():
     assert elapsed < 2.0, f"expected prompt cycle detection, took {elapsed:.2f}s"
 
 
+def test_find_non_finite_field_allows_shared_acyclic_reference():
+    """Cross-vendor judge finding (item 4/6, MEDIUM): a container that
+    appears MORE THAN ONCE in the tree (e.g. the same dict referenced by two
+    sibling keys) is not circular just because it repeats -- `json.dumps`
+    walks it fine. The previous implementation tracked visited containers in
+    one `seen` set shared across the WHOLE walk, so the second occurrence of
+    `child` (under an unrelated branch, not an ancestor) was wrongly
+    reported as `<circular reference>`.
+
+    Mutation proof (revert immediately): restore the global `seen` set (in
+    place of the per-branch ancestor-chain set) and this test fails because
+    `$.c[0]` (or similar) is reported as circular even though the payload
+    has no actual cycle and `json.dumps` serializes it without error.
+    """
+    import json
+
+    child = {"x": 1.0, "y": [1, 2, 3]}
+    payload = {"a": child, "b": child, "c": [child, child]}
+    # Sanity: this really is acyclic as far as the stdlib is concerned.
+    json.dumps(payload)
+    assert find_non_finite_field(payload) is None
+
+
+def test_find_non_finite_field_still_reports_genuine_self_reference():
+    """Companion to the shared-acyclic-reference test above: a container
+    that is its OWN ancestor is still a real cycle and must still be
+    reported promptly, not just non-ancestor repeats tolerated."""
+    child: dict[str, object] = {"x": 1.0}
+    child["self"] = child
+    payload = {"a": child}
+    result = find_non_finite_field(payload)
+    assert result is not None and "circular reference" in result
+
+
 def test_dumps_strict_reports_cycle_instead_of_hanging():
     cyclic: dict[str, object] = {"a": 1}
     cyclic["self"] = cyclic

@@ -187,14 +187,25 @@ def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
     assert client.calls == []
 
 
-def test_dispatch_judge_with_fallback_degrades_non_finite_envelope_to_recorded_skip():
+def test_dispatch_judge_with_fallback_degrades_non_finite_envelope_to_recorded_unjudgeable():
     """The end-to-end resume path: `supervisor._judge_envelope` calls
-    `dispatch_judge_with_fallback`, which already converts every
-    `JudgeDispatchError` (infra/auth/quota/timeout -- and now
-    non-finite-envelope) into an honest `skip` verdict instead of
-    propagating. A legacy checkpoint envelope with a non-finite budget must
-    therefore resume and be judged (never abort), with the problem RECORDED
-    in the verdict's critique_md and score_json, not silently swallowed.
+    `dispatch_judge_with_fallback`, which converts every `JudgeDispatchError`
+    (infra/auth/quota/timeout) into an honest `skip` verdict -- EXCEPT a
+    non-finite-envelope failure, which is a genuine DATA DEFECT (deterministic
+    across every vendor, since it happens before any client is invoked), not
+    a transient outage. A legacy checkpoint envelope with a non-finite budget
+    must therefore resume and be judged (never abort), with the problem
+    RECORDED in the verdict's critique_md and score_json under the DISTINCT
+    `unjudgeable` outcome -- never folded into `skip`, which every
+    verdict-consuming call site (supervisor.py's `node_judge_per_squad`,
+    `node_judge_synthesis`, `node_plan_judge`; `best_of_n.judge_and_rank`)
+    treats as "no signal, nothing to block on."
+
+    Cross-vendor judge finding (item 1/6, CRITICAL): before this fix, this
+    scenario produced an ordinary `skip` verdict that every downstream site
+    accepted as judged -- silently advancing to synthesis and potentially
+    marking the workflow `done` despite the envelope never having been
+    evaluated.
 
     Mutation proof (restore the ValueError abort -- revert immediately):
     if `dispatch_judge` raises bare `ValueError` again instead of
@@ -215,13 +226,32 @@ def test_dispatch_judge_with_fallback_degrades_non_finite_envelope_to_recorded_s
         workflow_id=wf,
         client=client,
     )
-    assert verdict.outcome == "skip"
+    assert verdict.outcome == "unjudgeable"
     assert "constraints.budget_usd" in verdict.critique_md
-    assert verdict.score_json.get("_infra") is True
+    assert verdict.score_json.get("_unjudgeable") is True
     assert all(a.get("reason") == "non_finite_envelope" for a in attempts)
     # Never reached the client for either vendor -- both attempts refused
     # before dispatch, and that refusal is recorded per-vendor.
     assert client.calls == []
+
+
+def test_dispatch_judge_with_fallback_still_produces_ordinary_skip_for_infra_outage():
+    """Companion to the unjudgeable test above: an ordinary vendor/infra
+    failure (NOT `non_finite_envelope`) must still degrade to the honest
+    `skip` outcome exactly as before -- the new `unjudgeable` marker is
+    additive, not a replacement for the existing infra-outage handling."""
+    wf = uuid4()
+    client = _ScriptedClient({}, raises=RuntimeError("MCP unreachable"))
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=_env(),
+        rubric_id="constitution-alignment@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "skip"
+    assert verdict.score_json.get("_infra") is True
+    assert all(a.get("reason") != "non_finite_envelope" for a in attempts)
 
 
 def test_dispatch_judge_allow_nan_true_would_have_leaked_nan_into_prompt():

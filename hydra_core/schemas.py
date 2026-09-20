@@ -43,6 +43,46 @@ class Constraints(BaseModel):
     # inf_nan=False` rejects those three inputs at construction time while
     # still accepting `None` and any ordinary finite float; no other
     # constraint (e.g. non-negativity) is added.
+    #
+    # Cross-vendor judge finding (item 6/6, MEDIUM): "at construction time"
+    # is the operative limit. `allow_inf_nan=False` is a pydantic FIELD
+    # VALIDATOR, and pydantic v2 field validators run on `Model(...)` /
+    # `model_validate(...)` / `model_validate_json(...)` -- they do NOT run
+    # on `model_copy(update=...)` (an in-place field swap, no validation at
+    # all by default) or `model_construct(...)` (explicitly skips ALL
+    # validation, including this one). Both are real code paths in this
+    # codebase: `Constraints.model_construct(budget_usd=float("nan"))`
+    # succeeds silently, and so does
+    # `some_plan.model_copy(update={"constraints": <hostile>})`.
+    #
+    # Boundaries that DO revalidate a value that reached here via one of
+    # those two bypasses (so the invariant still holds end to end even
+    # though the field validator alone cannot enforce it universally):
+    #   - `hydra_core.ingest.dispatch_ingested_envelopes` (~line 510):
+    #     round-trips every caller-supplied TYPED envelope through
+    #     `type(env).model_validate(env.model_dump(mode="json"))` BEFORE it
+    #     reaches the PLAN-write / judge-serialize code below, specifically
+    #     to catch a `model_copy`/`model_construct` bypass with pydantic's
+    #     own field-naming error at the ingest boundary rather than deeper
+    #     inside a writer.
+    #   - `hydra_core.strict_json.dumps_strict` / `find_non_finite_field`
+    #     (this module's sibling): inspects the ACTUAL runtime value, not
+    #     how it was constructed, so it catches a bypassed non-finite float
+    #     regardless of provenance -- the last-resort backstop every
+    #     envelope/plan-to-JSON-text writer (the judge dispatcher, the plan
+    #     HTML/JSON artifact renderers, the MCP persistence writes) routes
+    #     through.
+    #   - `hydra_core.plan_artifact._sum_step_budgets` /
+    #     `sum_finite_budgets`: guards against a SEPARATE failure mode
+    #     (float overflow from summing two already-finite values), not
+    #     against a bypassed non-finite input, but documented alongside
+    #     since it sits on the same read path.
+    # A value that reaches a downstream consumer WITHOUT transiting any of
+    # these three boundaries (e.g. a raw dict loaded straight from an old
+    # checkpoint and handed directly to a judge call) is exactly the
+    # "legacy envelope" scenario `judge.dispatcher.dispatch_judge` treats as
+    # `unjudgeable` rather than crashing or silently degrading to `skip`
+    # (item 1/6) -- there is no field-validator boundary to catch it earlier.
     budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
     token_limit: Optional[int] = None
     deadline_ts: Optional[datetime] = None
@@ -232,7 +272,16 @@ class HITLRequest(HydraEnvelope):
                     "constitution_breach", "reflexion_override",
                     "acceptance_criteria", "lock_release_pending",
                     "mcp_disconnect", "over_budget", "envelope_ceiling",
-                    "plan_approval"]
+                    "plan_approval", "unjudgeable_envelope", "unjudgeable_plan"]
+    # `unjudgeable_envelope` / `unjudgeable_plan`: cross-vendor judge finding
+    # (item 1/6, CRITICAL) -- filed by `node_judge_per_squad`,
+    # `node_judge_synthesis`, and `node_plan_judge` (supervisor.py) when an
+    # envelope/plan failed STRICT SERIALIZATION (outcome="unjudgeable"), a
+    # genuine data defect distinct from a routed `skip` or a `policy_breach`
+    # quality verdict. `unjudgeable_plan` intentionally offers only
+    # `["abort"]` (never `acknowledge`) -- `node_plan_gate` materialises
+    # tasks on ANY non-terminal resume regardless of chosen option, so an
+    # `acknowledge` there would silently behave like `approve`.
     # `reflexion_override`: emitted by `node_judge_per_squad` when an envelope's
     # `revise` verdict cannot be retried because the Reflexion ×1 ceiling is
     # exhausted. Operator approval raises `state.reflexion_override_granted_until`

@@ -11,6 +11,42 @@ parsers reject. Two independent ``allow_nan=False`` call sites would be two
 independent places to regress (and, before this module existed, one of them
 -- the judge dispatcher -- had regressed: it used the module default
 ``allow_nan=True``). This is the one seam both route through.
+
+Cross-vendor judge finding (item 6/6, MEDIUM) -- why this module exists at
+all, not just a per-field pydantic validator: ``schemas.Constraints.
+budget_usd`` (and similar fields) already set pydantic's ``allow_inf_nan=
+False``, but that is a FIELD VALIDATOR, and pydantic v2 field validators run
+on ``Model(...)``/``model_validate(...)``/``model_validate_json(...)`` only.
+They do NOT run on ``model_copy(update=...)`` (a bare field swap) or
+``model_construct(...)`` (explicitly skips ALL validation) -- both are real,
+reachable code paths (see ``schemas.Constraints``'s own docstring for the
+concrete bypass calls and their test coverage in
+``tests/test_ingest_normalization.py``). A non-finite value that slips
+through one of those two APIs is therefore NOT caught at construction time
+at all; this module is the boundary that catches it downstream, by
+inspecting the actual runtime value rather than trusting how it was built.
+Three boundaries in this codebase revalidate/backstop such a bypass, in
+order along the data's lifecycle:
+  1. ``hydra_core.ingest.dispatch_ingested_envelopes`` -- round-trips every
+     caller-supplied typed envelope through ``model_validate(model_dump(...))``
+     at the ingest boundary, so pydantic's own field-naming error fires
+     there rather than deeper inside a writer.
+  2. This module (``find_non_finite_field`` / ``dumps_strict`` /
+     ``sanitize_non_finite`` / ``dumps_tool_response_safe``) -- the
+     last-resort backstop every envelope/plan-to-JSON-text WRITE (the judge
+     dispatcher's artifact text, the plan HTML/JSON artifact renderers, the
+     MCP persistence writes) and every JSON-RPC tool RESPONSE routes
+     through.
+  3. ``hydra_core.plan_artifact.sum_finite_budgets`` -- a related but
+     distinct guard against float OVERFLOW when summing already-finite
+     values (not a bypassed non-finite input), used by both the plan HTML
+     renderer and ``supervisor.node_plan_judge``.
+A value that reaches a consumer WITHOUT transiting any of the three above
+(e.g. a raw dict loaded straight from a pre-strict-JSON checkpoint, handed
+directly to a judge call) is exactly the "legacy envelope" scenario
+``judge.dispatcher.dispatch_judge`` treats as the DISTINCT ``unjudgeable``
+verdict outcome rather than crashing or silently degrading to ``skip``
+(item 1/6) -- there is no earlier field-validator boundary to catch it.
 """
 from __future__ import annotations
 
@@ -47,14 +83,39 @@ def find_non_finite_field(obj: Any, path: str = "$") -> str | None:
     detects a circular reference and raises before this function ever runs,
     but if this function is ever called directly on a cyclic structure (or a
     future caller reuses it that way) an unguarded stack walk would follow
-    the cycle forever. Containers are tracked by `id()` in a `seen` set so a
-    cycle is reported as an error path segment rather than looping.
+    the cycle forever.
+
+    Cross-vendor judge finding (item 4/6, MEDIUM): a container is only ever
+    circular with respect to its OWN ancestors -- a shared but acyclic
+    reference (e.g. ``{"a": child, "b": child}``, which ``json.dumps`` walks
+    fine) is not a cycle just because the same object appears twice in the
+    tree. The previous implementation tracked visited containers in one
+    `seen` set shared across the WHOLE walk, so the second occurrence of
+    `child` anywhere (even under an unrelated branch) was misreported as
+    `<circular reference>`.
+
+    Fixed by emulating recursion's call stack instead of a whole-walk
+    visited set: an explicit `on_stack` set holds only the ids of
+    containers currently "open" on the active path, mirroring what a
+    recursive DFS would have on its call stack. A container's id is added
+    when the walker descends into it and removed again once every child has
+    been fully processed (`_EXIT` sentinel entries drive this, since the
+    walk is iterative). A shared-but-not-ancestor reference is therefore
+    only ever a member of `on_stack` while ITS OWN subtree is being walked,
+    not while a sibling that happens to reference the same object is being
+    walked -- so revisiting it later reports no cycle, while a genuine
+    self-reference (the id is still open on the current path) is still
+    caught immediately. This keeps the O(1)-per-node cost the earlier fix
+    for the O(depth**2) path-copy bug (item 3/4) relies on: an id-based
+    `frozenset` copied per frame would have reintroduced that same
+    quadratic blowup for deep chains.
     """
     # Each stack frame: (value, fragment, parent_frame_or_None).
     Frame = tuple[Any, str, Any]
+    _EXIT = object()  # sentinel: pop this container id off `on_stack`
     root: Frame = (obj, "", None)
-    stack: list[Frame] = [root]
-    seen: set[int] = set()
+    stack: list[Any] = [root]
+    on_stack: set[int] = set()
 
     def _render(frame: Frame) -> str:
         segments: list[str] = []
@@ -68,7 +129,11 @@ def find_non_finite_field(obj: Any, path: str = "$") -> str | None:
         return path + "".join(segments)
 
     while stack:
-        frame = stack.pop()
+        entry = stack.pop()
+        if isinstance(entry, tuple) and len(entry) == 2 and entry[0] is _EXIT:
+            on_stack.discard(entry[1])
+            continue
+        frame = entry
         current, _frag, _parent = frame
         if isinstance(current, float) and (
             current != current or current in (float("inf"), float("-inf"))
@@ -76,9 +141,10 @@ def find_non_finite_field(obj: Any, path: str = "$") -> str | None:
             return _render(frame)
         if isinstance(current, (dict, list, tuple)):
             container_id = id(current)
-            if container_id in seen:
+            if container_id in on_stack:
                 return _render(frame) + " <circular reference>"
-            seen.add(container_id)
+            on_stack.add(container_id)
+            stack.append((_EXIT, container_id))
             if isinstance(current, dict):
                 for key, value in current.items():
                     stack.append((value, f".{key}", frame))
@@ -115,3 +181,93 @@ def dumps_strict(payload: Any, *, label: str = "payload", **kwargs: Any) -> str:
             f"{label} contains a non-finite value at {field or '<unknown field>'}; "
             "refusing to write invalid JSON"
         ) from exc
+
+
+def sanitize_non_finite(obj: Any, path: str = "$") -> tuple[Any, list[str]]:
+    """Recursively replace ``NaN``/``Infinity``/``-Infinity`` with ``None``,
+    returning ``(sanitized_copy, sanitized_field_paths)``.
+
+    Cross-vendor judge finding (item 3/6, HIGH): unlike ``dumps_strict``
+    (correct for WRITES/persistence -- see ``mcp_servers/hydra_control/
+    server.py``'s ``submit_envelopes`` staging file and
+    ``_run_submit_host_result``'s host-result staging file, which both
+    correctly REFUSE and raise), a JSON-RPC style tool RESPONSE must remain
+    valid JSON for the client no matter what: an MCP stdio client expects
+    exactly one framed reply per call, so raising instead of responding
+    would desync the transport, not just fail one call. Every sanitized
+    path is reported (not just the first, unlike ``find_non_finite_field``)
+    so the client can tell "genuinely null" apart from "was
+    Infinity/NaN, redacted here."
+
+    Recursive rather than iterative (contrast ``find_non_finite_field``):
+    this walks BOUNDED, internally-produced tool-response payloads (a
+    Hydra CLI subprocess's own JSON stdout), not the adversarial/arbitrarily
+    deep judge-facing envelope payloads `find_non_finite_field` must survive
+    -- recursion-limit risk here is negligible by construction.
+
+    Tracks only the ANCESTOR chain (not a whole-walk `seen` set) so a
+    shared-but-acyclic reference is walked normally, matching
+    ``find_non_finite_field``'s fix for the same class of bug (item 4/6); a
+    genuine cycle is left untouched here (not sanitized) since
+    ``json.dumps`` will raise ``ValueError: Circular reference detected`` on
+    it regardless -- that failure is a real transport-breaking bug, not a
+    non-finite-value cosmetic issue this function exists to paper over.
+    """
+    sanitized_paths: list[str] = []
+
+    def _walk(node: Any, cur_path: str, ancestors: frozenset) -> Any:
+        if isinstance(node, float) and (
+            node != node or node in (float("inf"), float("-inf"))
+        ):
+            sanitized_paths.append(cur_path)
+            return None
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in ancestors:
+                return node  # genuine cycle -- left alone, see docstring
+            child_ancestors = ancestors | {node_id}
+            return {
+                k: _walk(v, f"{cur_path}.{k}", child_ancestors)
+                for k, v in node.items()
+            }
+        if isinstance(node, (list, tuple)):
+            node_id = id(node)
+            if node_id in ancestors:
+                return node
+            child_ancestors = ancestors | {node_id}
+            return [
+                _walk(v, f"{cur_path}[{i}]", child_ancestors)
+                for i, v in enumerate(node)
+            ]
+        return node
+
+    result = _walk(obj, path, frozenset())
+    return result, sanitized_paths
+
+
+def dumps_tool_response_safe(payload: dict, *, label: str = "tool_response") -> str:
+    """Serialize a JSON-RPC style tool RESPONSE, guaranteed to return valid
+    JSON text -- never raise, never emit a bare ``NaN``/``Infinity`` token.
+
+    Cross-vendor judge finding (item 3/6, HIGH): tries strict serialization
+    first (the common, correct case); on failure, sanitizes every non-finite
+    value to ``None`` and adds an explicit ``_non_finite_fields_sanitized``
+    marker naming each affected field, then serializes the ALREADY-clean
+    result with plain ``json.dumps`` (never raises again -- every remaining
+    float is finite by construction). This is the distinct, deliberately
+    more lenient counterpart to ``dumps_strict``: a WRITE/persistence path
+    must refuse a non-finite value outright, but a tool RESPONSE must always
+    complete the JSON-RPC round-trip.
+    """
+    try:
+        return dumps_strict(payload, label=label)
+    except ValueError:
+        sanitized, fields = sanitize_non_finite(payload)
+        if isinstance(sanitized, dict):
+            sanitized = {**sanitized, "_non_finite_fields_sanitized": fields}
+        else:
+            sanitized = {
+                "_value": sanitized,
+                "_non_finite_fields_sanitized": fields,
+            }
+        return json.dumps(sanitized, default=str)

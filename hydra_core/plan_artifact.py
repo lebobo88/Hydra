@@ -37,7 +37,7 @@ import hashlib
 import html
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from .schemas import Plan, PlanStep
 from .strict_json import dumps_strict
@@ -242,28 +242,48 @@ def _format_budget(value: float | None) -> str:
     return f"${value:.2f}"
 
 
-def _sum_step_budgets(steps: Sequence[PlanStep]) -> tuple[float | None, bool]:
-    """Sum finite step budgets, guarding against float overflow.
+def sum_finite_budgets(values: Iterable[float | int | None]) -> tuple[float | None, bool]:
+    """Sum a sequence of already-finite budget values, guarding against
+    float OVERFLOW from combining them (not against non-finite inputs,
+    which the caller is responsible for having already rejected/filtered).
 
-    Cross-vendor judge finding (item 2/4): ``PlanStep.estimated_budget_usd``
-    rejects NaN/Infinity at construction, so every addend here is
-    individually finite and valid — but two accepted values near
-    ``sys.float_info.max`` (e.g. two steps at 1e308) still overflow a plain
-    ``sum()`` to ``inf``. That is a READ combining already-validated data,
-    not a fresh write, so the guiding principle applies: report it, never
-    raise. Returns ``(total, overflowed)``; when ``overflowed`` is True the
-    caller renders the total as unavailable instead of calling
-    ``_format_budget`` on an ``inf``.
+    Cross-vendor judge finding (item 2/6, HIGH): individually-finite,
+    individually-valid values (e.g. two ``PlanStep.estimated_budget_usd``
+    near ``sys.float_info.max``, each accepted at construction because
+    ``allow_inf_nan=False`` only rejects NaN/Infinity, not merely large
+    finite floats) can still overflow a plain running sum to ``inf``. This
+    is the ONE shared seam both `_sum_step_budgets` (typed `PlanStep`
+    sequences, used by `render_plan_html`) and
+    `supervisor.node_plan_judge` (raw dicts read from `state.plan_ref`, the
+    live path a plan actually reaches the judge/HITL gate through) route
+    through, so the two summations can never independently drift — before
+    this helper existed, `node_plan_judge` had its own unguarded
+    `estimated_total += float(v)` loop and leaked `inf` straight into
+    `plan_detail` (checkpoint/HITL/MCP-visible data), while
+    `_sum_step_budgets` alone had the overflow guard.
+
+    This is a READ combining already-validated data, not a fresh write, so
+    the guiding principle applies: report it, never raise. Returns
+    ``(total, overflowed)``; when ``overflowed`` is True the caller must
+    render/report the total as unavailable rather than emit the raw
+    ``inf``.
     """
     total = 0.0
-    for step in steps:
-        value = step.estimated_budget_usd
+    for value in values:
         if value is None:
             continue
-        total += value
+        total += float(value)
         if total != total or total in (float("inf"), float("-inf")):
             return None, True
     return total, False
+
+
+def _sum_step_budgets(steps: Sequence[PlanStep]) -> tuple[float | None, bool]:
+    """Sum finite `PlanStep.estimated_budget_usd` values via the shared
+    overflow-aware `sum_finite_budgets` helper. See its docstring for why
+    overflow (not non-finiteness -- construction already rejects that) is
+    the failure mode this guards."""
+    return sum_finite_budgets(step.estimated_budget_usd for step in steps)
 
 
 def _list_block(items: Sequence[str], empty_text: str) -> str:

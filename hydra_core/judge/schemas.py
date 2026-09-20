@@ -17,7 +17,20 @@ from pydantic import BaseModel, Field, field_validator
 from ..schemas import HydraEnvelope
 
 
-JudgeOutcome = Literal["pass", "revise", "fail", "skip"]
+JudgeOutcome = Literal["pass", "revise", "fail", "skip", "unjudgeable"]
+# "unjudgeable" (cross-vendor judge finding, item 1/6 CRITICAL) is DISTINCT
+# from a legitimately routed "skip" (`route.tier == "skip"` or no rubric ids,
+# e.g. `supervisor.py`'s `_judge_envelope` at ~line 1543 -- an ordinary,
+# intentional non-decision that stays excluded from Borda/HITL exactly as
+# before). "unjudgeable" is fabricated ONLY by `judge.dispatcher` when an
+# envelope fails strict JSON serialization (a genuine data defect -- e.g. a
+# legacy non-finite field a pre-strict-JSON checkpoint carried) and could
+# therefore never actually be evaluated by ANY vendor. A real MCP critique
+# client is never expected to emit it (see `mcp_client.py`'s response
+# validation, which still only accepts pass/revise/fail/skip). Every
+# verdict-consuming call site MUST treat "unjudgeable" as a hard block:
+# never advance to synthesis, never mark the workflow done, never offer the
+# ordinary approve gate as if real judgment occurred.
 JudgeVendor = Literal["codex", "agy", "claude"]
 JudgeTier = Literal["cross_vendor", "same_vendor", "skip"]
 

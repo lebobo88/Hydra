@@ -898,7 +898,21 @@ def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
     res_dir.mkdir(parents=True, exist_ok=True)
     safe_key = "".join(c for c in call_key if c.isalnum() or c in "-_") or "result"
     res_file = res_dir / f"hostresult-{safe_key}.json"
-    res_file.write_text(json.dumps(result), encoding="utf-8")
+    # Cross-vendor judge finding (item 3/6, HIGH): this is PERSISTENCE (a
+    # host subagent result written to disk, later re-read by `hydra
+    # submit-host-result` and folded into the checkpointed HydraState), the
+    # same category of write `submit_envelopes` above already routes through
+    # `strict_json.dumps_strict` -- a non-finite value here (e.g. a hostile
+    # or buggy host subagent reporting `cost_usd: Infinity`) must FAIL
+    # STRUCTURALLY, not silently persist a bare `NaN`/`Infinity` token a
+    # strict downstream JSON parser would reject. The caller
+    # (`workflow_submit_host_result`) already wraps this call and turns any
+    # exception into a `{"ok": False, "error": ...}` structured response.
+    from hydra_core.strict_json import dumps_strict
+    res_file.write_text(
+        dumps_strict(result, label=f"submit_host_result:{workflow_id}:{call_key}"),
+        encoding="utf-8",
+    )
     return _run_cli_json(
         ["submit-host-result", workflow_id, "--run-id", run_id,
          "--call-key", call_key, "--result", str(res_file)],
@@ -2124,7 +2138,15 @@ def _serve_with_mcp_sdk() -> bool:
         # worker thread so the loop stays responsive; also keeps the handler
         # off the loop thread so its own dispatcher._run has no running loop.
         result = await asyncio.to_thread(handlers[name], arguments)
-        return [t.TextContent(type="text", text=json.dumps(result))]
+        # Cross-vendor judge finding (item 3/6, HIGH): a tool RESPONSE must
+        # stay valid JSON for the client no matter what -- sanitize any
+        # non-finite value to `null` with an explicit marker naming the
+        # field, rather than emit invalid JSON (a bare `NaN`/`Infinity`
+        # token) or fail the response outright.
+        from hydra_core.strict_json import dumps_tool_response_safe
+        return [t.TextContent(
+            type="text", text=dumps_tool_response_safe(result, label=f"tool_response:{name}"),
+        )]
 
     async def run() -> None:
         async with stdio_server() as (r, w):
@@ -2161,7 +2183,13 @@ def _serve_bare() -> None:
         except Exception as e:
             out = {"id": msg.get("id"), "error": str(e),
                    "traceback": traceback.format_exc()}
-        sys.stdout.write(json.dumps(out) + "\n")
+        # Cross-vendor judge finding (item 3/6, HIGH): same guarantee as the
+        # real-SDK `_call_tool` path above -- a bare-stdio response must
+        # stay valid JSON no matter what. Sanitize non-finite values rather
+        # than write an invalid `NaN`/`Infinity` token or crash the loop
+        # (which would drop every subsequent request on this stdio stream).
+        from hydra_core.strict_json import dumps_tool_response_safe
+        sys.stdout.write(dumps_tool_response_safe(out, label="bare_stdio_response") + "\n")
         sys.stdout.flush()
 
 
