@@ -418,6 +418,60 @@ def test_dumps_tool_response_safe_ordinary_nesting_unaffected():
     assert not any("sanitized" in k for k in parsed)
 
 
+def test_sanitize_non_finite_reports_nan_nested_deeper_than_the_depth_bound():
+    """Cross-vendor judge finding (this round, MEDIUM): before the walk
+    became iterative, a subtree past `_MAX_SANITIZE_DEPTH` was replaced with
+    a single opaque `"<max depth exceeded>"` marker and nothing deeper was
+    ever inspected -- a genuinely poisoned (non-finite) value nested past the
+    cutoff was silently folded into that marker with NO path reported,
+    contradicting the "every substituted field is reported" guarantee.
+
+    `sanitize_non_finite` now runs an unbounded-depth scan
+    (`_find_all_non_finite_paths`) over a too-deep subtree before collapsing
+    it, so a NaN far past the old bound is still named by path -- even
+    though its individual value is not separately preserved in the output
+    (the whole subtree still collapses to the one marker)."""
+    from hydra_core.strict_json import _MAX_SANITIZE_DEPTH
+
+    depth = _MAX_SANITIZE_DEPTH + 50
+    payload: object = {"poisoned": float("nan")}
+    for _ in range(depth):
+        payload = {"n": payload}
+
+    result, fields = sanitize_non_finite({"root": payload})
+
+    # The output subtree really was collapsed (proves the depth bound still
+    # protects the OUTPUT, i.e. this isn't secretly unbounded expansion).
+    node = result["root"]
+    hops = 0
+    while isinstance(node, dict) and "n" in node:
+        node = node["n"]
+        hops += 1
+    assert node == "<max depth exceeded>"
+    assert hops < depth
+
+    # But the NaN nested well past the cutoff is still named by path.
+    assert any("poisoned" in f for f in fields), fields
+    json.dumps(result)  # the collapsed result must still be plain, valid JSON.
+
+
+def test_sanitize_non_finite_max_depth_message_unaffected_when_nothing_poisoned():
+    """Control: a deep-but-otherwise-clean subtree still gets the generic
+    `"(max depth N exceeded)"` marker message (no non-finite value exists to
+    report by path), matching the pre-existing
+    `test_dumps_tool_response_safe_deep_nesting_returns_marker_not_raise`
+    contract."""
+    from hydra_core.strict_json import _MAX_SANITIZE_DEPTH
+
+    depth = _MAX_SANITIZE_DEPTH + 50
+    payload: object = {"leaf": 1}
+    for _ in range(depth):
+        payload = {"n": payload}
+
+    _, fields = sanitize_non_finite({"root": payload})
+    assert any("max depth" in f and "exceeded" in f for f in fields), fields
+
+
 class _HostileStr:
     """An object whose own `__str__` raises -- `sanitize_non_finite` must
     never call it unguarded."""
