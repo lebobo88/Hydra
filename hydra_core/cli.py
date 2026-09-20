@@ -5134,10 +5134,14 @@ def _cmd_status(args) -> int:
             # read never mutates the checkpoint, so — like `_cmd_finalize` —
             # exit 0: the CLI call itself succeeded at reporting the
             # workflow's true (refused) state; it is not a call failure.
-            # Recovery: there is no in-place repair — the poisoned checkpoint
-            # cannot be safely re-serialized. The operator's only options are
-            # (a) abandon/replay the workflow from an earlier clean phase via
-            # `hydra replay --from-phase <phase>`, or (b) quarantine it.
+            # Recovery: `hydra replay` reads through the SAME scanning serde
+            # (verified in tests/test_replay_poisoned_state.py), so it also
+            # refuses this checkpoint by default — it is NOT a working
+            # recovery path on its own. The only way to proceed is the
+            # explicit opt-in `hydra replay --sanitize-non-finite <id>`,
+            # which substitutes every non-finite value with null, reports
+            # each substituted field, and never touches this checkpoint
+            # (only the freshly minted replay workflow is persisted).
             print(json.dumps({
                 "workflow_id": wf,
                 "status": "unjudgeable",
@@ -5146,9 +5150,12 @@ def _cmd_status(args) -> int:
                     "the stored checkpoint contains a non-finite value at "
                     f"{e.field}; refusing to display this workflow's state. "
                     "This is a data defect in previously persisted state. "
-                    "Recovery: there is no in-place repair — replay from an "
-                    "earlier clean phase with `hydra replay --from-phase "
-                    "<phase> " + wf + "`, or quarantine this workflow_id."
+                    "Recovery: there is no in-place repair, and `hydra "
+                    "replay` also refuses this checkpoint by default (same "
+                    "scan). Use `hydra replay --sanitize-non-finite " + wf +
+                    "` to replay anyway (every substituted field is "
+                    "reported; the source checkpoint is left unchanged), or "
+                    "quarantine this workflow_id and start a new one."
                 ),
             }, indent=2, default=str))
             return 0
@@ -5225,8 +5232,11 @@ def _cmd_status(args) -> int:
                 row["status"] = "unjudgeable"
                 row["field"] = e.field
                 row["detail"] = (
-                    f"non-finite value at {e.field}; recovery: replay from "
-                    "an earlier clean phase or quarantine this workflow_id"
+                    f"non-finite value at {e.field}; no in-place repair, and "
+                    "plain `hydra replay` also refuses (same scan) — use "
+                    "`hydra replay --sanitize-non-finite <id>` to replay "
+                    "anyway (every substitution reported, source checkpoint "
+                    "unchanged), or quarantine this workflow_id"
                 )
             except Exception:  # noqa: BLE001 — one bad checkpoint must not abort listing
                 pass
@@ -5285,6 +5295,48 @@ _KNOWN_PHASES = frozenset([
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_./:]{0,127}$")
 
 
+def _raw_checkpoint_channel_values(source_wf: str) -> dict | None:
+    """Read a checkpoint's ``channel_values`` WITHOUT the non-finite-scanning
+    serde (see ``state.make_checkpoint_serde``), for the sole purpose of
+    ``hydra replay --sanitize-non-finite``.
+
+    This is the ONLY sanctioned reason to bypass the scanning choke point:
+    every other reader (``build_supervisor``'s checkpointer,
+    ``hydra_memory._load_state_values``) must keep refusing by default.
+    Callers of this function are responsible for running the result through
+    ``strict_json.sanitize_non_finite`` before treating any field as trusted,
+    and MUST NOT write it back to this same ``source_wf`` thread_id — the
+    caller (``_cmd_replay``) only ever persists it under a freshly minted
+    ``replay_wf`` thread_id, leaving the source checkpoint byte-for-byte
+    unchanged, exactly like an ordinary (unpoisoned) replay already does.
+    """
+    import sqlite3
+
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from .state import BudgetLedger
+
+    cp_db = Path(
+        os.environ.get("HYDRA_CHECKPOINT_DB")
+        or str(Path.home() / ".hydra" / "checkpoints.db")
+    )
+    if not cp_db.exists():
+        return None
+    conn = sqlite3.connect(str(cp_db), check_same_thread=False)
+    try:
+        raw_serde = JsonPlusSerializer(
+            allowed_msgpack_modules=[HydraState, TaskState, BudgetLedger],
+        )
+        saver = SqliteSaver(conn, serde=raw_serde)
+        tup = saver.get_tuple({"configurable": {"thread_id": source_wf}})
+        if tup is None:
+            return None
+        return (tup.checkpoint or {}).get("channel_values") or {}
+    finally:
+        conn.close()
+
+
 def _cmd_replay(args) -> int:
     """Replay a past workflow from its LangGraph checkpoint.
 
@@ -5340,6 +5392,7 @@ def _cmd_replay(args) -> int:
         return 1
 
     live = getattr(args, "live", False)
+    sanitize = getattr(args, "sanitize_non_finite", False)
 
     # Mint a NEW workflow_id for the replay lineage
     replay_wf = uuid4()
@@ -5370,18 +5423,62 @@ def _cmd_replay(args) -> int:
 
     # Load source checkpoint
     source_config = {"configurable": {"thread_id": source_wf}}
-    snap = sup.get_state(source_config)
-    if snap is None or not snap.values:
-        print(json.dumps({
-            "source_workflow_id": source_wf,
-            "error": "checkpoint_not_found",
-            "detail": f"No checkpoint for workflow_id={source_wf!r}. "
-                      "Run `hydra status` to list known workflows.",
-        }), file=sys.stderr)
-        return 1
+    sanitized_fields: list[str] = []
+    try:
+        snap = sup.get_state(source_config)
+    except PoisonedStateError as e:
+        # Verified end-to-end (tests/test_replay_poisoned_state.py): this
+        # `get_state` call routes through the SAME scanning serde
+        # (`state.make_checkpoint_serde`) as every other checkpoint read, so
+        # replaying a poisoned checkpoint refuses here exactly the way
+        # `hydra status`/`hydra finalize` do -- it is NOT a working recovery
+        # path by default. `--sanitize-non-finite` is the only opt-in way to
+        # proceed anyway (see `_raw_checkpoint_channel_values`'s docstring for
+        # why bypassing the scanning serde is safe ONLY here: the sanitized
+        # values are used solely to seed the freshly-minted `replay_wf`
+        # thread_id below, never written back over `source_wf`).
+        if not sanitize:
+            print(json.dumps({
+                "source_workflow_id": source_wf,
+                "ok": False,
+                "status": "unjudgeable",
+                "field": e.field,
+                "detail": (
+                    "the stored checkpoint contains a non-finite value at "
+                    f"{e.field}; refusing to replay. This is a data defect "
+                    "in previously persisted state, not a defect in this "
+                    "replay call. There is no in-place repair. Retry with "
+                    "`--sanitize-non-finite` to replay anyway (every "
+                    "substituted field is reported and the source "
+                    "checkpoint is left unchanged), or start a new workflow."
+                ),
+            }, indent=2, default=str))
+            return 0
+        from .strict_json import sanitize_non_finite
+        raw_values = _raw_checkpoint_channel_values(source_wf)
+        if raw_values is None:
+            print(json.dumps({
+                "source_workflow_id": source_wf,
+                "error": "checkpoint_not_found",
+                "detail": f"No checkpoint for workflow_id={source_wf!r}. "
+                          "Run `hydra status` to list known workflows.",
+            }), file=sys.stderr)
+            return 1
+        values, sanitized_fields = sanitize_non_finite(raw_values)
+        if not isinstance(values, dict):
+            values = {}
+    else:
+        if snap is None or not snap.values:
+            print(json.dumps({
+                "source_workflow_id": source_wf,
+                "error": "checkpoint_not_found",
+                "detail": f"No checkpoint for workflow_id={source_wf!r}. "
+                          "Run `hydra status` to list known workflows.",
+            }), file=sys.stderr)
+            return 1
+        values = dict(snap.values)
 
     # Reconstruct state at the requested phase boundary
-    values: dict = dict(snap.values)
     current_phase = values.get("phase", "intake")
 
     # Reset state to the from_phase starting point:
@@ -5417,13 +5514,17 @@ def _cmd_replay(args) -> int:
         else:
             replay_initial.budget = budget
 
-    # Record the replay provenance in the trace (source id, phase, swap_model)
+    # Record the replay provenance in the trace (source id, phase, swap_model).
+    # `sanitized_fields` is non-empty ONLY when `--sanitize-non-finite` was
+    # passed AND the source checkpoint was actually poisoned -- recorded here
+    # so the sanitization is never silent, per-field, in the durable trace.
     emit(project, replay_wf, "replay_start", {
         "source_workflow_id": source_wf,
         "source_phase": current_phase,
         "from_phase": from_phase,
         "swap_model": swap_model,
         "live": live,
+        "sanitized_non_finite_fields": sanitized_fields or None,
     })
     emit(project, replay_wf, "workflow_start", {
         "goal": replay_initial.root_goal,
@@ -5460,6 +5561,7 @@ def _cmd_replay(args) -> int:
         "swap_model": swap_model,
         "live": live,
         "phase": phase,
+        "sanitized_non_finite_fields": sanitized_fields or None,
         "trace": str(trace_path(project, replay_wf)),
     }, indent=2))
     return 0
@@ -6097,6 +6199,21 @@ def main(argv: list[str] | None = None) -> int:
             "Use the live MCP dispatcher (real spend). "
             "Without --live the run is a dry reconstruct (NullDispatcher). "
             "The Cockpit bridge venom-gates --live replay."
+        ),
+    )
+    rp.add_argument(
+        "--sanitize-non-finite",
+        dest="sanitize_non_finite",
+        action="store_true",
+        help=(
+            "Opt-in recovery for a poisoned source checkpoint (a persisted "
+            "NaN/Infinity/-Infinity — see PoisonedStateError): loads the "
+            "checkpoint through a sanitizing pass that replaces every "
+            "non-finite value with null, reports every substituted field, "
+            "and proceeds. Never the default; never writes the sanitized "
+            "state back over the source checkpoint. Without this flag, "
+            "replay of a poisoned checkpoint refuses exactly like `hydra "
+            "status`/`hydra finalize` do."
         ),
     )
     rp.add_argument("--verbose", action="store_true")

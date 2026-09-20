@@ -283,9 +283,12 @@ def _tool_handlers() -> dict[str, callable]:
                     "detail": (
                         f"checkpoint contains a non-finite value at "
                         f"{st.get('field')}; refusing to display this "
-                        "workflow's state. Recovery: replay from an earlier "
-                        "clean phase or quarantine this workflow_id — there "
-                        "is no in-place repair."
+                        "workflow's state. There is no in-place repair, and "
+                        "plain `hydra replay` also refuses this checkpoint "
+                        "(same scan). Use `hydra replay "
+                        f"--sanitize-non-finite {wf}` to replay anyway "
+                        "(every substitution reported, source checkpoint "
+                        "unchanged), or quarantine this workflow_id."
                     ),
                 })
                 continue
@@ -332,9 +335,12 @@ def _tool_handlers() -> dict[str, callable]:
                 "detail": (
                     f"checkpoint contains a non-finite value at "
                     f"{st.get('field')}; refusing to display this "
-                    "workflow's state. Recovery: replay from an earlier "
-                    "clean phase or quarantine this workflow_id — there is "
-                    "no in-place repair."
+                    "workflow's state. There is no in-place repair, and "
+                    "plain `hydra replay` also refuses this checkpoint "
+                    "(same scan). Use `hydra replay "
+                    f"--sanitize-non-finite {wf}` to replay anyway (every "
+                    "substitution reported, source checkpoint unchanged), "
+                    "or quarantine this workflow_id."
                 ),
             }
         return _summarize_workflow(wf, st["values"], st["ts"])
