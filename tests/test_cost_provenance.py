@@ -21,6 +21,7 @@ redirected to .tmp-pytest/hydra-home by the session-scoped fixture).
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -279,6 +280,58 @@ class TestPricedCostResolution:
         cost, source = _priced_cost(cursor, result, label="generate")
         assert source == "unmeasured"
         assert cost == 0.0
+
+    def test_string_non_finite_cost_is_unmeasured_not_measured(self) -> None:
+        """Cross-vendor judge finding (follow-up round, HIGH): a host result
+        reporting `cost_usd` as the STRING "NaN" (ordinary, valid JSON --
+        `find_non_finite_field` correctly leaves it alone) used to be cast
+        unconditionally by `float(reported)` and forcibly labeled
+        "measured", poisoning `cursor["cost_usd"]`. It is now routed through
+        `coerce_untrusted_cost` and resolves to unmeasured, never a false
+        "measured" -- asserting the CURSOR state, not merely a return value."""
+        cursor = self._cursor()
+        cost, source = _priced_cost(cursor, {"cost_usd": "NaN"}, label="generate")
+        assert cost == 0.0
+        assert source == "unmeasured"
+        assert cursor["cost_source"] == "unmeasured"
+        assert cursor["unmeasured_count"] == 1
+        assert not math.isnan(cursor.get("cost_usd", 0.0))
+
+    def test_string_non_finite_cost_falls_through_to_token_estimate(self) -> None:
+        """A rejected (string non-finite) cost report is treated exactly
+        like a MISSING one -- if the host ALSO reported usable tokens+model,
+        that still prices as "estimated" rather than being needlessly
+        downgraded to unmeasured $0."""
+        cursor = self._cursor()
+        result = {
+            "cost_usd": "Infinity",
+            "tokens_in": 1_000_000, "tokens_out": 1_000_000,
+            "model": "claude-sonnet-5",
+        }
+        cost, source = _priced_cost(cursor, result, label="generate")
+        assert source == "estimated"
+        assert cost == pytest.approx(18.0)
+
+    def test_string_non_finite_tokens_do_not_poison_cursor_accrual(self) -> None:
+        """`tokens_in`/`tokens_out` are cast too (`_apply_generate`'s
+        `int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)`) --
+        a hostile string must not raise or silently corrupt the running
+        total; a measured cost is still recorded correctly alongside it."""
+        cursor = self._cursor()
+        result = {"cost_usd": 0.05, "tokens_in": "NaN", "tokens_out": "500"}
+        cost, source = _priced_cost(cursor, result, label="generate")
+        assert cost == pytest.approx(0.05)
+        assert source == "measured"
+
+    def test_ordinary_finite_cost_measured_control(self) -> None:
+        """The control that matters most -- this is the normal path for
+        every attended generate/judge call."""
+        cursor = self._cursor()
+        cost, source = _priced_cost(cursor, {"cost_usd": 0.42}, label="generate")
+        assert cost == pytest.approx(0.42)
+        assert source == "measured"
+        assert cursor["cost_source"] == "measured"
+        assert cursor.get("unmeasured_count", 0) == 0
 
     def test_stage_source_priority_estimated_beats_measured(self) -> None:
         # A stage where the generate call was measured but the judge call was

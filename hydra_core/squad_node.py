@@ -753,13 +753,24 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
     )
 
 
-def coerce_vendor_cost(raw: Any) -> tuple[float, str]:
-    """Coerce an UNTRUSTED vendor-reported cost value to a finite float.
+def coerce_untrusted_cost(raw: Any) -> tuple[float, str]:
+    """Coerce an UNTRUSTED cost value (from a vendor CLI, an MCP response, a
+    host-driven subagent result, or any other externally-reported figure
+    that ends up compared against a budget) to a finite float.
 
-    Every vendor cost entry point in this module (Claude CLI stdout, a
+    Renamed from `coerce_vendor_cost` (cross-vendor judge finding, follow-up
+    round, framing correction): this is no longer only a "vendor parsing"
+    helper -- it is also the cast-site guard for `host_bridge._priced_cost`
+    (the ATTENDED path's host-result cost) and `cli.py`'s
+    `_cmd_attended_submit` (the same host result, re-validated at the
+    coercion point rather than only at the earlier whole-payload scan). A
+    name scoped to one of its four call sites would mislead the next reader
+    into adding a fifth cast site with a fresh, unguarded `float(...)`.
+
+    Every cost entry point in this module (Claude CLI stdout, a
     pp_codex/pp_harness MCP response, a host-driven subagent result, a
     SquadResult artifact `supervisor._extract_squad_cost` reads) routes
-    through this ONE helper, so the next vendor added inherits the guard
+    through this ONE helper, so the next source added inherits the guard
     instead of repeating the omission.
 
     Cross-vendor judge finding (this round, HIGH): coerce FIRST, THEN check
@@ -771,6 +782,17 @@ def coerce_vendor_cost(raw: Any) -> tuple[float, str]:
     to a real non-finite number afterward. Validating the value that is
     ACTUALLY CHARGED (post-coercion) closes that gap for every input shape
     (a real float, a string, `None`, or garbage) in one place.
+
+    Framing correction (cross-vendor judge finding, follow-up round): a
+    STRING like `"NaN"` sitting in PERSISTED state (a checkpoint, a JSONL
+    row) is valid RFC 8259 JSON and is NOT itself a defect -- it round-trips
+    cleanly and `find_non_finite_field` correctly leaves it alone (widening
+    that walker to also hunt strings would produce false refusals on
+    ordinary text fields). The defect this helper closes is narrower and
+    specific: an untrusted string that BECOMES a non-finite float at a
+    `float()` CAST that feeds money or a gate decision. This helper belongs
+    at every such cast site, not at the choke point that merely persists
+    the (still-valid-JSON) string.
 
     Returns ``(cost_usd, cost_source)``: ``cost_source`` is ``"measured"``
     for a real finite number, ``"unmeasured"`` for anything missing,
@@ -788,10 +810,10 @@ def coerce_vendor_cost(raw: Any) -> tuple[float, str]:
     return value, "measured"
 
 
-def coerce_vendor_tokens(raw: Any) -> int:
+def coerce_untrusted_count(raw: Any) -> int:
     """Coerce an UNTRUSTED vendor-reported token count to a non-negative
     int, clamping anything unparseable or non-finite (including a
-    NaN/Infinity STRING -- see `coerce_vendor_cost`'s coerce-then-check
+    NaN/Infinity STRING -- see `coerce_untrusted_cost`'s coerce-then-check
     rationale) to 0 rather than raising. Tokens are informational counters
     (no downstream budget COMPARISON reads them directly), but a hostile
     value must never be able to discard an otherwise-successful result via
@@ -870,7 +892,7 @@ def _parse_claude_cli_result(
         raw_cost = obj.get("total_cost_usd")
         if raw_cost is None:
             raw_cost = obj.get("cost_usd")
-        cost, cost_source = coerce_vendor_cost(raw_cost)
+        cost, cost_source = coerce_untrusted_cost(raw_cost)
         if cost_source == "unmeasured" and raw_cost is not None:
             # Only a REPORTED-but-rejected value (as opposed to a field that
             # was simply absent) is worth a note in the record.
@@ -879,8 +901,8 @@ def _parse_claude_cli_result(
                 f"({raw_cost!r}); treated as unmeasured, not charged as $0."
             )
         usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-        tin = coerce_vendor_tokens(usage.get("input_tokens"))
-        tout = coerce_vendor_tokens(usage.get("output_tokens"))
+        tin = coerce_untrusted_count(usage.get("input_tokens"))
+        tout = coerce_untrusted_count(usage.get("output_tokens"))
         mdl = str(obj.get("model") or model)
     if returncode != 0 and stderr:
         text += f"\n[claude stderr] {stderr[-800:]}"
@@ -1560,7 +1582,7 @@ def _drive_pp_stage_loop(
         # `unmeasured_count`: bumped every time a vendor call in this stage
         # reported a missing/unparseable/non-finite cost -- so a rejected
         # report is never silently indistinguishable from a genuine $0.00
-        # (see `coerce_vendor_cost`).
+        # (see `coerce_untrusted_cost`).
         "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "unmeasured_count": 0,
     }
 
@@ -1617,15 +1639,15 @@ def _drive_pp_stage_loop(
             # the success path (and break-ing out on failure) under-charged the
             # budget ledger and weakened the 80%/100% tripwires. Hard failures
             # (timeout/transport) carry no cost fields → add 0, harmless.
-            # Coerced ONCE here (`coerce_vendor_cost`/`coerce_vendor_tokens`)
+            # Coerced ONCE here (`coerce_untrusted_cost`/`coerce_untrusted_count`)
             # and reused for every downstream use of this generate envelope's
             # cost/tokens in this iteration (the accumulator, both
             # `record_attempt` calls, and the cost-unknown trace check below)
             # -- so `gi`'s raw, vendor-controlled fields are never re-cast
             # with a bare `float()`/`int()` anywhere in this loop body.
-            _gen_cost, _gen_src = coerce_vendor_cost(gi.get("cost_usd"))
-            _gen_tin = coerce_vendor_tokens(gi.get("tokens_in"))
-            _gen_tout = coerce_vendor_tokens(gi.get("tokens_out"))
+            _gen_cost, _gen_src = coerce_untrusted_cost(gi.get("cost_usd"))
+            _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
+            _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
             out["cost_usd"] += _gen_cost
             out["tokens_in"] += _gen_tin
             out["tokens_out"] += _gen_tout
@@ -1710,7 +1732,7 @@ def _drive_pp_stage_loop(
                 "tokens_in": _gen_tin,
                 "tokens_out": _gen_tout,
                 "cost_usd": _gen_cost,
-                "wall_ms": coerce_vendor_tokens(gi.get("wall_ms")),
+                "wall_ms": coerce_untrusted_count(gi.get("wall_ms")),
                 "status": "ok",
                 "retry_index": retry_index,
                 "notes": {"candidate_index": 1},
@@ -1814,10 +1836,10 @@ def _drive_pp_stage_loop(
             # F6: critique cost counts toward the run's budget charge too.
             # Vendor-controlled (pp_agy / pp_codex / Claude) -- coerced the
             # same way as the generate cost above.
-            _crit_cost, _crit_src = coerce_vendor_cost(ci.get("cost_usd"))
+            _crit_cost, _crit_src = coerce_untrusted_cost(ci.get("cost_usd"))
             out["cost_usd"] += _crit_cost
-            out["tokens_in"] += coerce_vendor_tokens(ci.get("tokens_in"))
-            out["tokens_out"] += coerce_vendor_tokens(ci.get("tokens_out"))
+            out["tokens_in"] += coerce_untrusted_count(ci.get("tokens_in"))
+            out["tokens_out"] += coerce_untrusted_count(ci.get("tokens_out"))
             if _crit_src == "unmeasured" and ci.get("cost_usd") is not None:
                 out["unmeasured_count"] += 1
             parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
@@ -2194,9 +2216,9 @@ def _drive_best_of_loop(
             # Coerced ONCE (see the sequential drive loop's identical
             # comment) and reused for the accumulator, `record_attempt`, and
             # the cost-unknown trace check below.
-            _gen_cost, _gen_src = coerce_vendor_cost(gi.get("cost_usd"))
-            _gen_tin = coerce_vendor_tokens(gi.get("tokens_in"))
-            _gen_tout = coerce_vendor_tokens(gi.get("tokens_out"))
+            _gen_cost, _gen_src = coerce_untrusted_cost(gi.get("cost_usd"))
+            _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
+            _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
             out["cost_usd"] += _gen_cost
             out["tokens_in"] += _gen_tin
             out["tokens_out"] += _gen_tout
@@ -2313,10 +2335,10 @@ def _drive_best_of_loop(
                 jci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
                     "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
-            _jci_cost, _jci_src = coerce_vendor_cost(jci.get("cost_usd"))
+            _jci_cost, _jci_src = coerce_untrusted_cost(jci.get("cost_usd"))
             out["cost_usd"] += _jci_cost
-            out["tokens_in"] += coerce_vendor_tokens(jci.get("tokens_in"))
-            out["tokens_out"] += coerce_vendor_tokens(jci.get("tokens_out"))
+            out["tokens_in"] += coerce_untrusted_count(jci.get("tokens_in"))
+            out["tokens_out"] += coerce_untrusted_count(jci.get("tokens_out"))
             if _jci_src == "unmeasured" and jci.get("cost_usd") is not None:
                 out["unmeasured_count"] += 1
             parsed = jci.get("parsed") if isinstance(jci.get("parsed"), dict) else jci

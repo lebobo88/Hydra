@@ -81,3 +81,26 @@ def test_underscore_score_keys_ignored():
     ]
     winner, _ = borda_winner([a, b], verdicts)
     assert winner == b
+
+
+def test_string_valued_score_dimension_is_excluded_not_cast():
+    """Verification finding (cross-vendor judge, follow-up round): a judge
+    reporting a score dimension as a STRING (e.g. a hostile/buggy vendor
+    sending `"correctness": "NaN"`) is NOT cast to float here --
+    `_verdict_score`'s `isinstance(val, (int, float))` filter excludes it
+    from the sum entirely BEFORE any `float()` call, so the string-bypass
+    this thread closes elsewhere does not apply to this cast site. This is
+    a verification/regression-lock test, not a fix: `score_json` is an
+    untyped dict (pydantic does not coerce a string in an `Any`-shaped
+    field), so a hostile string genuinely reaches this function unchanged --
+    it is simply never cast. Pinned here so a future refactor of
+    `_verdict_score` that removes the isinstance guard is caught."""
+    wf = uuid4()
+    a, b = str(uuid4()), str(uuid4())
+    verdicts = [
+        # `a`'s hostile string score dimension is excluded -> only "real"=1 counts.
+        _v(a, "r@1", {"correctness": "NaN", "real": 1}, wf),
+        _v(b, "r@1", {"real": 5}, wf),
+    ]
+    winner, board = borda_winner([a, b], verdicts)
+    assert winner == b  # b's real=5 beats a's real=1; the string never inflates/poisons a's score

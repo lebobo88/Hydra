@@ -76,6 +76,62 @@ def test_attended_submit_rejects_non_finite_cost_before_any_dispatch(
     assert not cfile.exists()
 
 
+def test_attended_submit_rejects_string_non_finite_cost_before_any_dispatch(
+    tmp_path, monkeypatch
+):
+    """Cross-vendor judge finding (follow-up round, HIGH): `find_non_finite_field`
+    only recognizes an actual `float` NaN/Infinity -- a JSON STRING like
+    `"cost_usd": "NaN"` is ordinary, valid JSON and sails past that walk
+    untouched. This is the COMPLEMENTARY coercion-time check: it validates
+    the value the same way the downstream cast (`_priced_cost`'s
+    `coerce_untrusted_cost`) now does, catching the string BEFORE the
+    dispatcher is ever constructed -- same side-effect-ordering proof as
+    the real-float case above."""
+    def _must_not_be_called(*_a, **_kw):
+        raise AssertionError(
+            "_attended_live_dispatcher must never be constructed once the "
+            "--result parse has already found a string that does not "
+            "coerce to a finite number."
+        )
+
+    monkeypatch.setattr(cli_module, "_attended_live_dispatcher", _must_not_be_called)
+
+    result_file = tmp_path / "result.json"
+    result_file.write_text(json.dumps({"cost_usd": "NaN"}), encoding="utf-8")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = cli_module._cmd_attended_submit(_args(tmp_path, result_file))
+
+    assert rc == 1
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is False
+    assert "does not coerce to a finite number" in payload["error"]
+    cfile = host_bridge.cursor_path(tmp_path, "wf-1", "run-1")
+    assert not cfile.exists()
+
+
+def test_attended_submit_rejects_string_non_finite_tokens(tmp_path, monkeypatch):
+    def _must_not_be_called(*_a, **_kw):
+        raise AssertionError("dispatcher must not be constructed")
+
+    monkeypatch.setattr(cli_module, "_attended_live_dispatcher", _must_not_be_called)
+
+    result_file = tmp_path / "result.json"
+    result_file.write_text(
+        json.dumps({"cost_usd": 0.02, "tokens_in": "Infinity"}), encoding="utf-8",
+    )
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = cli_module._cmd_attended_submit(_args(tmp_path, result_file))
+
+    assert rc == 1
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is False
+    assert "does not coerce to a finite number" in payload["error"]
+
+
 def test_attended_submit_finite_cost_is_unaffected(tmp_path, monkeypatch):
     """Control: an ordinary (finite) host result is not rejected by the new
     check -- it reaches the dispatcher exactly as before."""

@@ -63,6 +63,8 @@ from .squad_node import (
     _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
+    coerce_untrusted_cost,
+    coerce_untrusted_count,
 )
 
 # Cursor schema version — bump on any incompatible shape change so a stale
@@ -1810,14 +1812,35 @@ def _priced_cost(
     dollar amount resolved on this call's estimated branch, so a caller can
     credit ``budget.estimated_usd`` with just that figure instead of the
     whole (mixed) stage total.
+
+    Cross-vendor judge finding (follow-up round, HIGH): this is the
+    ATTENDED path's exact counterpart of the headless drive loop's vendor
+    cost exposure -- ``result`` is an untrusted HOST result (the same JSON
+    file ``cli.py``'s ``_cmd_attended_submit`` reads), and this line
+    ``return float(reported), "measured"`` had no finiteness check at all,
+    let alone one applied AFTER coercion: a host reporting ``cost_usd:
+    "NaN"`` (a string -- ordinary, valid JSON, just a hostile value) was
+    cast to a real non-finite float and forcibly labeled ``"measured"``,
+    poisoning ``cursor["cost_usd"]`` (and, via `_cmd_attended_submit`'s
+    later `charge_and_gate`, `state.budget.spent_usd`) permanently. Routed
+    through ``coerce_untrusted_cost`` -- coerce first, check finiteness on
+    the coerced value -- exactly as the headless vendor paths now do. A
+    reported-but-rejected cost falls through to the same token-based
+    estimate (or ``"unmeasured"``) branch a MISSING cost already used, so a
+    still-priceable call is not needlessly downgraded to $0.
     """
     reported = result.get("cost_usd")
     if reported is not None:
-        _merge_cost_source(cursor, "measured")
-        return float(reported), "measured"
+        cost, source = coerce_untrusted_cost(reported)
+        if source == "measured":
+            _merge_cost_source(cursor, "measured")
+            return cost, "measured"
+        # Reported but rejected (non-finite after coercion, or unparseable)
+        # -- fall through to the token-based estimate below exactly as a
+        # MISSING cost field already does; never trust the raw value.
 
-    tokens_in = int(result.get("tokens_in") or 0)
-    tokens_out = int(result.get("tokens_out") or 0)
+    tokens_in = coerce_untrusted_count(result.get("tokens_in"))
+    tokens_out = coerce_untrusted_count(result.get("tokens_out"))
     model = str(result.get("model") or model_hint or cursor.get("model_tier") or "")
     if (tokens_in or tokens_out) and model:
         from .pricing import price_call

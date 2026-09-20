@@ -4170,6 +4170,51 @@ def _cmd_attended_submit(args) -> int:
                 f"--result contains a non-finite value at {bad_field}; "
                 "refusing before any ledger/cursor side effect"
             )
+        # Cross-vendor judge finding (follow-up round, HIGH): the walk above
+        # only recognizes an actual `float` NaN/Infinity -- a JSON STRING
+        # like `"cost_usd": "NaN"` is ordinary, valid JSON (not a defect in
+        # itself) and is invisible to it, yet is still coerced to a real
+        # non-finite float downstream by `host_bridge._priced_cost`'s
+        # `coerce_untrusted_cost` cast and `_apply_generate`/`_apply_judge`'s
+        # token accumulation. This check is COMPLEMENTARY, not redundant:
+        # `find_non_finite_field` catches a genuine float NaN/Infinity
+        # before any side effect; this one catches a string that only
+        # BECOMES one at the cast, by validating the value the SAME way the
+        # cast site now does, at the same coercion-first-then-check
+        # boundary, before the resume lock or `submit_host_result` (and, in
+        # turn, the ledger) is ever reached.
+        # Cross-vendor judge finding (follow-up round, HIGH): the walk above
+        # only recognizes an actual `float` NaN/Infinity -- a JSON STRING
+        # like `"cost_usd": "NaN"` is ordinary, valid JSON (not a defect in
+        # itself) and is invisible to it, yet is still coerced to a real
+        # non-finite float downstream by `host_bridge._priced_cost`'s
+        # `coerce_untrusted_cost` cast and `_apply_generate`/`_apply_judge`'s
+        # token accumulation. This check is COMPLEMENTARY, not redundant:
+        # `find_non_finite_field` catches a genuine float NaN/Infinity
+        # before any side effect; this one catches a string that only
+        # BECOMES one at the cast, by validating the value the SAME way the
+        # cast site now does, at the same coercion-first-then-check
+        # boundary, before the resume lock or `submit_host_result` (and, in
+        # turn, the ledger) is ever reached.
+        from .squad_node import coerce_untrusted_cost
+        if result.get("cost_usd") is not None:
+            _, _cost_src = coerce_untrusted_cost(result["cost_usd"])
+            if _cost_src == "unmeasured":
+                raise ValueError(
+                    f"--result.cost_usd {result['cost_usd']!r} does not coerce "
+                    "to a finite number; refusing before any ledger/cursor "
+                    "side effect"
+                )
+        for _tok_field in ("tokens_in", "tokens_out"):
+            _raw_tok = result.get(_tok_field)
+            if _raw_tok is not None:
+                _, _tok_src = coerce_untrusted_cost(_raw_tok)
+                if _tok_src == "unmeasured":
+                    raise ValueError(
+                        f"--result.{_tok_field} {_raw_tok!r} does not coerce "
+                        "to a finite number; refusing before any "
+                        "ledger/cursor side effect"
+                    )
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(_cli_json_dumps({"ok": False, "error": f"could not read --result: {e}"}),
               file=sys.stderr)

@@ -55,8 +55,8 @@ from .fleet import dispatch_fleet
 from .squad_node import (
     Dispatcher,
     SquadResult,
-    coerce_vendor_cost,
-    coerce_vendor_tokens,
+    coerce_untrusted_cost,
+    coerce_untrusted_count,
     execute_squad,
 )
 from .state import (
@@ -179,7 +179,7 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
     `start_run` response, and the headless drive loop's accumulated total,
     which is itself built from Claude/Codex/Agy reports) -- the same class
     of exposure as every other vendor cost entry in this thread. Both are
-    coerced through `squad_node.coerce_vendor_cost`/`coerce_vendor_tokens`
+    coerced through `squad_node.coerce_untrusted_cost`/`coerce_untrusted_count`
     (coerce-then-check, so a hostile JSON STRING like `"NaN"` is caught the
     same way a real non-finite float is), and the returned THIRD element,
     `cost_source`, is `"measured"` only if at least one contributing report
@@ -208,20 +208,20 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
             inner = raw
         # Prefer cost_usd; fall back to cost
         if "cost_usd" in inner:
-            c, src = coerce_vendor_cost(inner["cost_usd"])
+            c, src = coerce_untrusted_cost(inner["cost_usd"])
             usd = max(usd, c)
             any_measured = any_measured or src == "measured"
         elif "cost" in inner:
-            c, src = coerce_vendor_cost(inner["cost"])
+            c, src = coerce_untrusted_cost(inner["cost"])
             usd = max(usd, c)
             any_measured = any_measured or src == "measured"
         # Token counts
         tok_raw = 0
         if "tokens_in" in inner or "tokens_out" in inner:
-            tok_raw = (coerce_vendor_tokens(inner.get("tokens_in"))
-                       + coerce_vendor_tokens(inner.get("tokens_out")))
+            tok_raw = (coerce_untrusted_count(inner.get("tokens_in"))
+                       + coerce_untrusted_count(inner.get("tokens_out")))
         elif "tokens" in inner:
-            tok_raw = coerce_vendor_tokens(inner["tokens"])
+            tok_raw = coerce_untrusted_count(inner["tokens"])
         tokens = max(tokens, tok_raw)
 
         # F6: a DRIVEN engineering run captures the real codegen + critique cost
@@ -233,9 +233,9 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
         if isinstance(dl, dict) and (
             "cost_usd" in dl or "tokens_in" in dl or "tokens_out" in dl
         ):
-            c, src = coerce_vendor_cost(dl.get("cost_usd"))
+            c, src = coerce_untrusted_cost(dl.get("cost_usd"))
             # `dl["cost_usd"]` is the drive loop's ALREADY-coerced running
-            # total (see `squad_node.coerce_vendor_cost`'s per-candidate
+            # total (see `squad_node.coerce_untrusted_cost`'s per-candidate
             # use) -- a genuine positive amount always means real measured
             # money. But `dl["cost_usd"] == 0.0` is AMBIGUOUS on its own: it
             # is indistinguishable between "nothing was spent" and "every
@@ -248,8 +248,8 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
                 src = "unmeasured"
             usd = max(usd, c)
             any_measured = any_measured or src == "measured"
-            dl_tok = (coerce_vendor_tokens(dl.get("tokens_in"))
-                      + coerce_vendor_tokens(dl.get("tokens_out")))
+            dl_tok = (coerce_untrusted_count(dl.get("tokens_in"))
+                      + coerce_untrusted_count(dl.get("tokens_out")))
             tokens = max(tokens, dl_tok)
     cost_source = "measured" if any_measured else "unmeasured"
     return usd, tokens, cost_source

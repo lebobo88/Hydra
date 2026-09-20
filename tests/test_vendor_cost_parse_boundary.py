@@ -30,8 +30,8 @@ from hydra_core.squad_node import (
     _drive_pp_stage_loop,
     _parse_claude_cli_result,
     _run_claude_cli,
-    coerce_vendor_cost,
-    coerce_vendor_tokens,
+    coerce_untrusted_cost,
+    coerce_untrusted_count,
 )
 from hydra_core.state import BudgetLedger, HydraState
 
@@ -189,54 +189,54 @@ def test_guarded_unmeasured_cost_does_not_poison_the_budget_gate():
 # Finding A (HIGH, follow-up round): `is_non_finite_float` only recognizes an
 # actual `float` instance -- a vendor emitting the cost as a JSON STRING
 # (`"NaN"`/`"Infinity"`) bypassed a check applied to the RAW value before
-# `float()` coercion. `coerce_vendor_cost`/`coerce_vendor_tokens` (the shared
+# `float()` coercion. `coerce_untrusted_cost`/`coerce_untrusted_count` (the shared
 # helper every vendor cost entry now routes through) validate the COERCED
 # value instead, closing the gap for every input shape.
 # ---------------------------------------------------------------------------
 
-def test_coerce_vendor_cost_rejects_string_nan():
-    value, source = coerce_vendor_cost("NaN")
+def test_coerce_untrusted_cost_rejects_string_nan():
+    value, source = coerce_untrusted_cost("NaN")
     assert value == 0.0
     assert source == "unmeasured"
 
 
-def test_coerce_vendor_cost_rejects_string_infinity():
-    value, source = coerce_vendor_cost("Infinity")
+def test_coerce_untrusted_cost_rejects_string_infinity():
+    value, source = coerce_untrusted_cost("Infinity")
     assert value == 0.0
     assert source == "unmeasured"
-    value, source = coerce_vendor_cost("-Infinity")
+    value, source = coerce_untrusted_cost("-Infinity")
     assert value == 0.0
     assert source == "unmeasured"
 
 
-def test_coerce_vendor_cost_rejects_float_nan_and_inf():
+def test_coerce_untrusted_cost_rejects_float_nan_and_inf():
     """Control: the original (float) attack shape is still caught."""
-    assert coerce_vendor_cost(float("nan")) == (0.0, "unmeasured")
-    assert coerce_vendor_cost(float("inf")) == (0.0, "unmeasured")
+    assert coerce_untrusted_cost(float("nan")) == (0.0, "unmeasured")
+    assert coerce_untrusted_cost(float("inf")) == (0.0, "unmeasured")
 
 
-def test_coerce_vendor_cost_measured_control():
+def test_coerce_untrusted_cost_measured_control():
     """The control that matters most: an ordinary finite cost (as a real
     float OR a numeric string -- vendors are inconsistent about this) is
     recorded exactly as reported, with source 'measured'."""
-    assert coerce_vendor_cost(0.42) == (0.42, "measured")
-    assert coerce_vendor_cost("0.42") == (0.42, "measured")
+    assert coerce_untrusted_cost(0.42) == (0.42, "measured")
+    assert coerce_untrusted_cost("0.42") == (0.42, "measured")
 
 
-def test_coerce_vendor_cost_missing_and_garbage():
-    assert coerce_vendor_cost(None) == (0.0, "unmeasured")
-    assert coerce_vendor_cost("not-a-number") == (0.0, "unmeasured")
+def test_coerce_untrusted_cost_missing_and_garbage():
+    assert coerce_untrusted_cost(None) == (0.0, "unmeasured")
+    assert coerce_untrusted_cost("not-a-number") == (0.0, "unmeasured")
 
 
-def test_coerce_vendor_tokens_rejects_string_and_float_non_finite():
-    assert coerce_vendor_tokens("NaN") == 0
-    assert coerce_vendor_tokens(float("inf")) == 0
-    assert coerce_vendor_tokens(None) == 0
+def test_coerce_untrusted_count_rejects_string_and_float_non_finite():
+    assert coerce_untrusted_count("NaN") == 0
+    assert coerce_untrusted_count(float("inf")) == 0
+    assert coerce_untrusted_count(None) == 0
 
 
-def test_coerce_vendor_tokens_measured_control():
-    assert coerce_vendor_tokens(500) == 500
-    assert coerce_vendor_tokens("500") == 500
+def test_coerce_untrusted_count_measured_control():
+    assert coerce_untrusted_count(500) == 500
+    assert coerce_untrusted_count("500") == 500
 
 
 def test_parse_claude_cli_result_string_nan_cost_is_unmeasured_not_zero():
@@ -266,8 +266,8 @@ def test_parse_claude_cli_result_string_infinity_tokens_clamped_to_zero():
 # ---------------------------------------------------------------------------
 # Finding C: every vendor cost entry point in `_drive_pp_stage_loop` /
 # `_drive_best_of_n_stage_loop` (generate AND critique, both the single-shot
-# and best-of-N shapes) routes through the SAME `coerce_vendor_cost`/
-# `coerce_vendor_tokens` helper -- not just the Claude CLI path. This proves
+# and best-of-N shapes) routes through the SAME `coerce_untrusted_cost`/
+# `coerce_untrusted_count` helper -- not just the Claude CLI path. This proves
 # it end-to-end through the real drive loop with a scripted pp_codex
 # response (the "pp, Codex, or Agy" vendors the finding named), not just the
 # helper in isolation.
