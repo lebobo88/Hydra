@@ -599,6 +599,157 @@ def test_resolve_reported_cost_falls_back_to_fresh_coercion_with_no_upstream_ver
     assert (value, source) == (0.0, "unmeasured")
 
 
+# ---------------------------------------------------------------------------
+# The fix from the previous round turning on itself (follow-up round, HIGH):
+# an upstream `cost_source` may only WEAKEN the coerced verdict, never
+# strengthen it. `resolve_reported_cost` is applied to more than Hydra's own
+# parser output -- `_drive_generate` forwards a host-driven subagent's raw
+# result unchanged, and the critique accrual processes vendor-controlled
+# pp_agy/pp_codex/Claude dicts directly -- so `cost_source` on any of those
+# is UNTRUSTED, spoofable input from the party the provenance chain exists
+# to hold accountable.
+# ---------------------------------------------------------------------------
+
+def test_resolve_reported_cost_upstream_cannot_upgrade_a_rejected_value():
+    """The exact spoof: {"cost_usd": "NaN", "cost_source": "measured"} must
+    NOT resolve to measured -- coercion rejects the value, so the result is
+    unmeasured regardless of what upstream claims."""
+    value, source = resolve_reported_cost({"cost_usd": "NaN", "cost_source": "measured"})
+    assert source == "unmeasured"
+    assert value == 0.0
+
+
+def test_resolve_reported_cost_upstream_cannot_upgrade_an_absent_value():
+    value, source = resolve_reported_cost({"cost_source": "measured"})
+    assert source == "unmeasured"
+    assert value == 0.0
+
+
+def test_resolve_reported_cost_upstream_cannot_upgrade_a_garbage_string():
+    value, source = resolve_reported_cost(
+        {"cost_usd": "not-a-number", "cost_source": "measured"})
+    assert source == "unmeasured"
+    assert value == 0.0
+
+
+class _HostAgentSpoofDispatcher(_ScriptedDispatcherForCost):
+    """Adds `run_host_agent` so `_drive_generate` takes the HOST-DRIVEN
+    branch and forwards `host_result` to the accrual site UNCHANGED -- the
+    exact vector named in the finding: a host-driven engineer subagent's
+    raw result is vendor-controlled input, not Hydra's own parser output."""
+
+    def __init__(self, responses, host_result):
+        super().__init__(responses)
+        self._host_result = host_result
+
+    def run_host_agent(self, agent_type, prompt, *, cwd):
+        return {"status": "done", "result": self._host_result}
+
+
+def test_e2e_host_agent_spoofed_measured_with_rejected_cost_recorded_unmeasured(
+    monkeypatch,
+):
+    """END TO END through the real drive loop, via the NAMED vector: a
+    host-driven engineer subagent result claims `cost_source: "measured"`
+    alongside a rejected `cost_usd`. Must still be unmeasured on the
+    ledger -- a vendor/host cannot spoof its way past the audit."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    host_result = {
+        "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+        "cost_usd": "NaN", "cost_source": "measured",
+    }
+    disp = _HostAgentSpoofDispatcher(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None), host_result)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 1
+    assert state.budget.spent_usd == 0.0
+
+
+def test_e2e_host_agent_spoofed_measured_with_absent_cost_recorded_unmeasured(
+    monkeypatch,
+):
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    host_result = {
+        "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+        "cost_source": "measured",  # no cost_usd at all
+    }
+    disp = _HostAgentSpoofDispatcher(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None), host_result)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 1
+    assert state.budget.spent_usd == 0.0
+
+
+def test_e2e_codex_critique_spoofed_measured_with_rejected_cost_recorded_unmeasured(
+    monkeypatch,
+):
+    """The OTHER named vector: a vendor-controlled pp_codex critique
+    response claims `cost_source: "measured"` alongside a rejected cost."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: False)  # force codex generation (no cost claim)
+    responses = _claude_gen_responses(gen_result={}, critique_cost_usd=None)
+    # Codex is the generator here, so the critique must be routed SAME-vendor
+    # (pp_codex) for this scripted response set to be exercised at all -- a
+    # cross-vendor gate would send the critique to an unscripted judge and
+    # mask the thing under test behind an unrelated retry.
+    responses[("pp_harness", "gate_eligible_judges")] = {"status": "done", "result": {
+        "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+    responses[("pp_codex", "generate")] = {"status": "done", "result": {
+        "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+        "cost_usd": 0.05,
+    }}
+    responses[("pp_codex", "critique")] = {"status": "done", "result": {
+        "parsed": {"outcome": "pass", "critique_md": "c" * 90,
+                   "score": {"correctness": 9}},
+        "cost_usd": "NaN", "cost_source": "measured",
+    }}
+    disp = _ScriptedDispatcherForCost(responses)
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    # The generate call's genuine $0.05 is measured; the critique's spoof is
+    # rejected to unmeasured -- the stage still charges the real money AND
+    # records the spoofed contribution as unmeasured, auditable.
+    state = _charge_drive_loop_and_get_state(out)
+    assert out["unmeasured_count"] >= 1
+    assert state.budget.spent_usd == pytest.approx(0.05)
+
+
+def test_e2e_legitimate_downgrade_still_works_end_to_end(monkeypatch):
+    """Control: the LEGITIMATE downgrade this whole mechanism exists for --
+    `_parse_claude_cli_result` reports a coercion-acceptable `0.0` alongside
+    its own honest `cost_source: "unmeasured"` (it knows the value is a
+    fabricated placeholder) -- must still resolve to unmeasured end to end."""
+    monkeypatch.setattr("hydra_core.squad_node._claude_cli_generation_enabled",
+                        lambda _d: True)
+    monkeypatch.setattr(
+        "hydra_core.squad_node._run_claude_cli",
+        lambda prompt, *, cwd: _parse_claude_cli_result(
+            "not valid json at all", "", 0, "claude-opus-4-8",
+        ),
+    )
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(
+        _claude_gen_responses(gen_result={}, critique_cost_usd=None))
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    state = _charge_drive_loop_and_get_state(out)
+    assert state.budget.unmeasured_stages == 1
+    assert state.budget.spent_usd == 0.0
+
+
 def _claude_gen_responses(*, gen_result: dict, critique_cost_usd: float | None = 0.03) -> dict:
     """Same-vendor critique routed to codex (`required_cross_vendor=True`)
     so this exercises ONLY the generate accrual site's fix, not the

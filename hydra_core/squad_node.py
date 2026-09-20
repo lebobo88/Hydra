@@ -852,34 +852,65 @@ def coerce_untrusted_count(raw: Any) -> int:
     return n if n >= 0 else 0
 
 
+# Precedence for `resolve_reported_cost`'s upstream/coerced combination:
+# STRICTLY increasing confidence. An upstream verdict may only move the
+# final answer DOWN this scale (weaken it), never up -- see that
+# function's docstring for why an upgrade path is a spoofable hole, not a
+# convenience. Expressed as an explicit rank table (not a chain of `if`s)
+# so a future fourth source only needs an entry here; the `min()`-by-rank
+# combinator in `resolve_reported_cost` cannot silently regain an upgrade
+# path for it the way an ad hoc conditional could.
+_COST_SOURCE_RANK: dict[str, int] = {"unmeasured": 0, "estimated": 1, "measured": 2}
+
+
 def resolve_reported_cost(result: dict[str, Any]) -> tuple[float, str]:
-    """Resolve a vendor call's ``(cost_usd, cost_source)``, honoring an
-    UPSTREAM verdict when ``result`` already carries one instead of
-    RE-DERIVING it from the coerced value.
+    """Resolve a vendor call's ``(cost_usd, cost_source)``: coerce the raw
+    value FIRST, then combine with any upstream verdict by taking the
+    WEAKER (less confident) of the two -- an upstream verdict may only
+    DOWNGRADE the coercion's own answer, never upgrade it.
 
-    Cross-vendor judge finding (follow-up round, HIGH -- the SAME shape as
-    the accrual sites re-deriving "was this reported at all" on top of
-    `coerce_untrusted_cost`'s own answer, one layer further out, on the
-    PRIMARY generation path): `_parse_claude_cli_result` (and
-    `_claude_critique`, which forwards it) already determines whether a
-    Claude CLI call's cost was genuinely measured or rejected/absent, and
-    substitutes a finite `0.0` placeholder for the unmeasured case so
-    downstream arithmetic never sees a non-finite value. But
-    `coerce_untrusted_cost(0.0)` correctly returns `"measured"` -- `0.0`
-    IS a valid finite float -- so re-running that check on the ALREADY-
-    JUDGED placeholder silently overturns the parser's own `"unmeasured"`
-    verdict. This is the accrual-site fix from the previous round
-    (`coerce_untrusted_cost`'s own answer is authoritative, not re-derived
-    on top of) applied one layer further out: an UPSTREAM `cost_source` is
-    now authoritative over a fresh re-coercion the same way.
+    Cross-vendor judge finding (follow-up round, HIGH -- the fix from the
+    previous round turning on itself): that version trusted ANY recognized
+    upstream ``cost_source`` outright, coercing the raw value only for its
+    numeric VALUE. That let a vendor pair a REJECTED value with
+    ``cost_source: "measured"`` (``{"cost_usd": "NaN", "cost_source":
+    "measured"}`` -> ``(0.0, "measured")``) and suppress the unmeasured
+    audit record entirely -- the ORIGINAL defect this whole thread closes,
+    reintroduced BY the fix meant to protect the legitimate downgrade case.
+    This is not hypothetical: `resolve_reported_cost` is applied to more
+    than Hydra's own parser output -- `_drive_generate` forwards the raw
+    inner dict from a host-driven `dispatcher.run_host_agent` subagent
+    unchanged, and the critique accrual processes vendor-controlled
+    pp_agy/pp_codex/Claude critique dicts directly. ``cost_source`` on any
+    of those is therefore UNTRUSTED input from the party the provenance
+    chain exists to hold accountable, and can only ever WEAKEN the
+    verdict this function reaches on its own -- never strengthen it.
 
-    The raw value is still coerced (defensively, for VALUE only, NEVER to
-    re-derive SOURCE) when an upstream verdict exists, in case something
-    tampers with `cost_usd` independently of `cost_source`. When NO
-    upstream verdict exists at all -- the codex/agy MCP critique response
-    shape and the host-driven engineer subagent shape carry no such
-    concept -- this falls back to fresh coercion exactly as before,
-    unchanged.
+    The three cases this precedence produces:
+      - Coercion REJECTS the value (absent, non-finite, unparseable):
+        the result is `"unmeasured"` regardless of what upstream claims --
+        upstream cannot promote a rejected value to measured.
+      - Coercion ACCEPTS the value and upstream claims something WEAKER
+        (`"unmeasured"`/`"estimated"`): the upstream, weaker answer wins --
+        this is the legitimate downgrade the previous round fixed, where
+        `_parse_claude_cli_result` knows a coercion-acceptable `0.0` was
+        actually a fabricated placeholder for a rejected/absent report.
+      - Coercion accepts and upstream claims `"measured"` (or claims
+        nothing recognized at all): the result is `"measured"` -- the
+        over-correction control this round's tests pin.
+
+    `coerce_untrusted_cost` itself only ever returns `"measured"` (a real
+    finite value) or `"unmeasured"` (value forced to `0.0`) -- it never
+    produces `"estimated"` on its own, so the REJECTED-value case above is
+    exactly "coerced source is the WEAKEST rank" and needs no special
+    casing; the shared `_COST_SOURCE_RANK` table and a single `min()` over
+    it handle every combination, including a rejected value paired with
+    ANY upstream claim, uniformly.
+
+    When ``result`` carries no recognized ``cost_source`` at all (the
+    codex/agy MCP critique response shape, the host-driven engineer
+    subagent shape when it happens not to set one) this reduces to plain
+    fresh coercion, unchanged from before this function existed.
 
     Tokens have NO analogous upstream provenance to lose: no parser in
     this codebase ever emits a `tokens_in_source`/`tokens_out_source`
@@ -890,11 +921,15 @@ def resolve_reported_cost(result: dict[str, Any]) -> tuple[float, str]:
     `coerce_untrusted_count(result.get("tokens_in"))` remains correct
     as-is at every accrual site.
     """
+    coerced_value, coerced_source = coerce_untrusted_cost(result.get("cost_usd"))
     upstream_source = result.get("cost_source")
-    if upstream_source in ("measured", "estimated", "unmeasured"):
-        value, _ = coerce_untrusted_cost(result.get("cost_usd"))
-        return value, upstream_source
-    return coerce_untrusted_cost(result.get("cost_usd"))
+    if upstream_source not in _COST_SOURCE_RANK:
+        return coerced_value, coerced_source
+    final_source = min(
+        (coerced_source, upstream_source),
+        key=lambda s: _COST_SOURCE_RANK[s],
+    )
+    return coerced_value, final_source
 
 
 def _parse_claude_cli_result(
