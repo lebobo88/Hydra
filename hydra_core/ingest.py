@@ -634,7 +634,13 @@ def dispatch_ingested_envelopes(
                 html_text = render_plan_html(plan_env)
                 ref = write_repo_artifact(repo_root, f"docs/plans/{slug}.html", html_text)
                 artifact_ref = ref.model_dump(mode="json")
-            except (ArtifactStoreError, OSError) as exc:
+            except (ArtifactStoreError, OSError, ValueError, RuntimeError) as exc:
+                # Cross-vendor judge finding (item 2/4): `render_plan_html`
+                # can still raise (e.g. an individually non-finite budget
+                # that slipped past construction-time validation) even after
+                # the overflow guard above; the batch as a whole must not
+                # crash on one bad PLAN item. Report it as a structured item
+                # failure, not an uncaught exception.
                 outcome.items.append(IngestItemResult(
                     envelope_id=eid, envelope_type=etype, target=None,
                     status="failed", detail=f"plan artifact write failed: {exc}",

@@ -576,7 +576,21 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
     # (codex review item 5). The CLI's resume lock still serializes the actual
     # dispatch; this just keeps each child's input intact.
     env_path = wf_dir / f"ingest_envelopes_{uuid.uuid4().hex}.json"
-    env_path.write_text(json.dumps({"envelopes": envelopes}, indent=2), encoding="utf-8")
+    # Cross-vendor judge finding (item 4/4): this is a WRITE of a fresh
+    # payload (host-completed skill envelopes about to be dispatched), not a
+    # read of already-stored data — the guiding principle keeps writes
+    # strict. Route through the shared `strict_json.dumps_strict` helper
+    # (same seam as the judge dispatcher and plan-artifact renderer) instead
+    # of a bare `json.dumps`, so a non-finite value here raises a clear,
+    # field-naming `ValueError` instead of writing a bare `NaN`/`Infinity`
+    # token that a strict downstream JSON parser would reject. The caller
+    # (`workflow_submit_envelopes`) already wraps this call and turns any
+    # exception into an `{"ok": False, ...}` response.
+    from hydra_core.strict_json import dumps_strict
+    env_path.write_text(
+        dumps_strict({"envelopes": envelopes}, label=f"submit_envelopes:{workflow_id}", indent=2),
+        encoding="utf-8",
+    )
     log_path = wf_dir / "ingest.log"
 
     cmd = [

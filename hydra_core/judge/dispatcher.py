@@ -21,7 +21,8 @@ from .schemas import JudgeOutcome, JudgeVendor, JudgeVerdict
 
 
 JudgeErrorReason = Literal[
-    "ineligible_tier", "quota", "timeout", "tool_failed", "bad_response", "unknown"
+    "ineligible_tier", "quota", "timeout", "tool_failed", "bad_response",
+    "non_finite_envelope", "unknown",
 ]
 
 
@@ -197,7 +198,24 @@ def dispatch_judge(
     uses MCPCritiqueClient. Default is NoOpCritiqueClient (skeleton).
     """
     rubric = get_rubric(rubric_id)
-    artifact_text = _wrap_untrusted(_envelope_to_text(envelope))
+    try:
+        artifact_text = _wrap_untrusted(_envelope_to_text(envelope))
+    except ValueError as e:
+        # Cross-vendor judge finding (revise round, item 1/4): a legacy
+        # checkpoint can hold an envelope with a non-finite field (e.g. an
+        # old DEV_TASK/PRD with constraints.budget_usd = NaN) that the
+        # msgpack serde never revalidates on load. Writes stay strict --
+        # `_envelope_to_text` still refuses to emit invalid JSON -- but a
+        # READ of data already on disk must degrade gracefully rather than
+        # abort the resume. Translate to the same `JudgeDispatchError` the
+        # vendor-fallback loop already handles so the problem is RECORDED
+        # (attempts list, and ultimately the skip verdict's critique_md)
+        # instead of propagating as an unhandled `ValueError`.
+        raise JudgeDispatchError(
+            f"envelope failed strict serialization (rubric={rubric_id}): {e}",
+            vendor=judge_vendor, rubric_id=rubric_id,
+            reason="non_finite_envelope", retryable=False,
+        ) from e
     use_client = client or NoOpCritiqueClient()
 
     try:

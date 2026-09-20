@@ -324,6 +324,82 @@ class TestTask2IngestBranch:
         )
         assert all(it.status != "unknown_target" for it in outcome.items)
 
+    def test_ingest_plan_two_huge_finite_step_budgets_report_structured_failure(
+        self, packs, monkeypatch, tmp_path,
+    ):
+        """Cross-vendor judge finding (revise round, item 2/4): two
+        individually-finite `1e308` step budgets overflow the HTML renderer's
+        summed total to `inf`. Before the fix this raised `ValueError` from
+        deep inside `render_plan_html`, and the ingest PLAN branch only
+        caught `(ArtifactStoreError, OSError)` -- so the whole batch crashed
+        with an unhandled exception. The render side now degrades
+        gracefully (an "unavailable" note, not a raise) so the batch
+        succeeds end to end -- this is the READ-of-already-validated-data
+        half of the fix. The broadened ingest exception handling (below,
+        `test_ingest_plan_artifact_rendering_error_is_a_structured_failure`)
+        is the remaining defense-in-depth half, for any rendering error the
+        render-side guard doesn't itself catch.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+        state = HydraState(root_goal="x")
+        steps = [
+            {
+                "step_id": "a", "target_squad": "engineering",
+                "envelope_type": "DEV_TASK", "description": "step a",
+                "estimated_budget_usd": 1e308,
+            },
+            {
+                "step_id": "b", "target_squad": "engineering",
+                "envelope_type": "DEV_TASK", "description": "step b",
+                "depends_on": ["a"], "estimated_budget_usd": 1e308,
+            },
+        ]
+        plan = _minimal_plan_dict(state.workflow_id, steps=steps)
+        outcome = dispatch_ingested_envelopes(
+            state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
+        )
+        assert [it.status for it in outcome.items] == ["drafted"], (
+            "the plan-level total overflow must be absorbed by the "
+            "render-side guard -- the artifact still writes and drafts"
+        )
+        assert outcome.plan_patch["plan_status"] == "drafted"
+        location = outcome.plan_patch["plan_artifact_location"]
+        written = list((tmp_path / "docs" / "plans").glob("*.html"))
+        assert len(written) == 1
+        html_text = written[0].read_text(encoding="utf-8")
+        assert "unavailable" in html_text
+        assert "$nan" not in html_text and "$inf" not in html_text
+
+    def test_ingest_plan_artifact_rendering_error_is_a_structured_failure(
+        self, packs, monkeypatch, tmp_path,
+    ):
+        """Defense-in-depth half of item 2/4: even after the render-side
+        overflow guard, some other rendering error could still reach the
+        ingest PLAN branch. It must become one structured "failed"
+        `IngestItemResult`, never an unhandled exception that crashes the
+        whole ingest batch -- and it must not write `plan_status="drafted"`
+        (the barrier must not rise on a broken artifact).
+
+        Mutation proof (revert immediately): narrow the except back to
+        `(ArtifactStoreError, OSError)` and this test fails with the
+        `ValueError` propagating instead of being caught.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+        def _boom(*_a, **_k):
+            raise ValueError("simulated rendering error")
+        monkeypatch.setattr("hydra_core.plan_artifact.render_plan_html", _boom)
+
+        state = HydraState(root_goal="x")
+        plan = _minimal_plan_dict(state.workflow_id)
+        outcome = dispatch_ingested_envelopes(
+            state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
+        )
+        assert [it.status for it in outcome.items] == ["failed"]
+        assert "simulated rendering error" in outcome.items[0].detail
+        assert not outcome.plan_patch
+        assert state.plan_status == "none"
+
     def test_resubmitted_identical_plan_is_skipped_fresh_revision_is_not(
         self, packs, monkeypatch, tmp_path,
     ):

@@ -10,6 +10,7 @@ from hydra_core.judge.dispatcher import (
     MIN_CRITIQUE_CHARS,
     NoOpCritiqueClient,
     dispatch_judge,
+    dispatch_judge_with_fallback,
 )
 
 
@@ -156,6 +157,15 @@ def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
     guard can still carry a NaN/Infinity value here. `_envelope_to_text` must
     refuse before ever calling the critique client, naming the offending
     field, not silently emit the bare `NaN` token into the judge prompt.
+
+    Cross-vendor judge finding (further revise round, item 1/4): a bare
+    `ValueError` escaping `dispatch_judge` is an UNHANDLED abort at the
+    supervisor `_judge_envelope` boundary, which tolerates only
+    `JudgeDispatchError` -- exactly the regression that made a legacy
+    checkpoint's resume crash instead of degrading. The refusal must
+    therefore surface as a `JudgeDispatchError` (the type the fallback loop
+    already handles), still naming the offending field, still never
+    reaching the critique client.
     """
     wf = uuid4()
     hostile = _env()
@@ -163,7 +173,7 @@ def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
     client = _ScriptedClient({
         "outcome": "pass", "critique_md": "x" * 100, "score_json": {"a": 1},
     })
-    with pytest.raises(ValueError, match="constraints.budget_usd"):
+    with pytest.raises(JudgeDispatchError, match="constraints.budget_usd") as exc_info:
         dispatch_judge(
             envelope=hostile,
             rubric_id="constitution-alignment@1",
@@ -171,7 +181,46 @@ def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
             workflow_id=wf,
             client=client,
         )
+    assert exc_info.value.reason == "non_finite_envelope"
+    assert exc_info.value.retryable is False
     # Never reached the client -- the refusal happens before dispatch.
+    assert client.calls == []
+
+
+def test_dispatch_judge_with_fallback_degrades_non_finite_envelope_to_recorded_skip():
+    """The end-to-end resume path: `supervisor._judge_envelope` calls
+    `dispatch_judge_with_fallback`, which already converts every
+    `JudgeDispatchError` (infra/auth/quota/timeout -- and now
+    non-finite-envelope) into an honest `skip` verdict instead of
+    propagating. A legacy checkpoint envelope with a non-finite budget must
+    therefore resume and be judged (never abort), with the problem RECORDED
+    in the verdict's critique_md and score_json, not silently swallowed.
+
+    Mutation proof (restore the ValueError abort -- revert immediately):
+    if `dispatch_judge` raises bare `ValueError` again instead of
+    `JudgeDispatchError`, this call raises out of
+    `dispatch_judge_with_fallback` (which only catches `JudgeDispatchError`)
+    and the test fails with an unhandled `ValueError`.
+    """
+    wf = uuid4()
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    client = _ScriptedClient({
+        "outcome": "pass", "critique_md": "x" * 100, "score_json": {"a": 1},
+    })
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=hostile,
+        rubric_id="constitution-alignment@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "skip"
+    assert "constraints.budget_usd" in verdict.critique_md
+    assert verdict.score_json.get("_infra") is True
+    assert all(a.get("reason") == "non_finite_envelope" for a in attempts)
+    # Never reached the client for either vendor -- both attempts refused
+    # before dispatch, and that refusal is recorded per-vendor.
     assert client.calls == []
 
 

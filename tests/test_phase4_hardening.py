@@ -1115,6 +1115,53 @@ def test_detached_gate_ingest_always_allowed(
     assert out.get("ok") is True, f"expected ok=True for ingest, got: {out}"
 
 
+def test_launch_ingest_refuses_non_finite_envelope_instead_of_writing_bare_nan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cross-vendor judge finding (revise round, item 4/4): `_launch_ingest`
+    persists the host-completed envelopes with plain `json.dumps` before
+    this fix, so a non-finite value (e.g. `budget_usd: NaN`) would silently
+    write the bare `NaN` token -- valid Python-`json` output, invalid RFC
+    8259 JSON a strict downstream parser refuses. This is a WRITE of a
+    fresh payload (the guiding principle keeps writes strict), so it must
+    now route through `strict_json.dumps_strict` and refuse loudly instead.
+
+    Mutation proof (revert immediately): swap the writer back to a bare
+    `json.dumps({"envelopes": envelopes}, indent=2)` and this test fails --
+    no exception is raised and the file is written with a literal `NaN`.
+    """
+    from mcp_servers.hydra_control import server as _srv
+
+    monkeypatch.setattr(_srv, "_HYDRA_ROOT", tmp_path)
+
+    class _ShouldNotBeCalled:
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            raise AssertionError("Popen must NOT be called when the write refuses")
+
+    monkeypatch.setattr(subprocess, "Popen", _ShouldNotBeCalled)
+
+    envelopes: list[dict[str, Any]] = [
+        {"type": "DEV_TASK", "origin_squad": "garland", "id": "env-1",
+         "budget_usd": float("nan")}
+    ]
+    with pytest.raises(ValueError, match="budget_usd"):
+        _srv._launch_ingest("wf-gate-6", envelopes)
+    # No half-written payload file must remain with the bare NaN token.
+    wf_dir = tmp_path / ".hydra" / "wf-gate-6"
+    for f in wf_dir.glob("ingest_envelopes_*.json") if wf_dir.exists() else []:
+        assert "NaN" not in f.read_text(encoding="utf-8")
+
+
+def test_launch_ingest_pre_fix_bare_json_dumps_would_write_literal_nan() -> None:
+    """Mutation proof (revert immediately): shows the pre-fix behaviour --
+    plain `json.dumps` on the same payload happily writes the literal `NaN`
+    token that `dumps_strict` now refuses to emit."""
+    import json as _json
+    payload = {"envelopes": [{"id": "env-1", "budget_usd": float("nan")}]}
+    text = _json.dumps(payload, indent=2)
+    assert "NaN" in text
+
+
 # ===========================================================================
 # _FLEET_GOAL_RE unit cases (G4 routing-audit tightening)
 # ===========================================================================

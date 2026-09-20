@@ -242,6 +242,30 @@ def _format_budget(value: float | None) -> str:
     return f"${value:.2f}"
 
 
+def _sum_step_budgets(steps: Sequence[PlanStep]) -> tuple[float | None, bool]:
+    """Sum finite step budgets, guarding against float overflow.
+
+    Cross-vendor judge finding (item 2/4): ``PlanStep.estimated_budget_usd``
+    rejects NaN/Infinity at construction, so every addend here is
+    individually finite and valid — but two accepted values near
+    ``sys.float_info.max`` (e.g. two steps at 1e308) still overflow a plain
+    ``sum()`` to ``inf``. That is a READ combining already-validated data,
+    not a fresh write, so the guiding principle applies: report it, never
+    raise. Returns ``(total, overflowed)``; when ``overflowed`` is True the
+    caller renders the total as unavailable instead of calling
+    ``_format_budget`` on an ``inf``.
+    """
+    total = 0.0
+    for step in steps:
+        value = step.estimated_budget_usd
+        if value is None:
+            continue
+        total += value
+        if total != total or total in (float("inf"), float("-inf")):
+            return None, True
+    return total, False
+
+
 def _list_block(items: Sequence[str], empty_text: str) -> str:
     if not items:
         return f"<p class=\"plan-meta\">{_esc(empty_text)}</p>"
@@ -392,9 +416,7 @@ def render_plan_html(
         else:
             unassigned_figures.append(fig)
 
-    total_budget = sum(
-        s.estimated_budget_usd for s in plan.steps if s.estimated_budget_usd is not None
-    )
+    total_budget, total_overflowed = _sum_step_budgets(plan.steps)
     plan_budget_cap = plan.constraints.budget_usd
 
     parts: list[str] = []
@@ -427,7 +449,10 @@ def render_plan_html(
     parts.append(_mermaid_graph(plan.steps))
 
     parts.append("<h2>Budget Estimate</h2>")
-    total_budget_text = _format_budget(total_budget)
+    total_budget_text = (
+        "unavailable (sum of step budgets overflowed float range)"
+        if total_overflowed else _format_budget(total_budget)
+    )
     cap_text = _format_budget(plan_budget_cap) if plan_budget_cap is not None else "not set"
     parts.append(
         f"<p>Sum of per-step estimates: {_esc(total_budget_text)} &middot; "
