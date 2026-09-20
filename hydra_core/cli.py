@@ -5126,6 +5126,32 @@ def _cmd_status(args) -> int:
                         },
                     }, indent=2))
                     return 0
+        except PoisonedStateError as e:
+            # Choke-point catch (see `state.make_checkpoint_serde`): surface
+            # the SAME `unjudgeable` shape `_cmd_finalize` uses instead of
+            # falling through to the trace-view fallback below, which would
+            # tell the operator "checkpoint unavailable" and hide WHY. This
+            # read never mutates the checkpoint, so — like `_cmd_finalize` —
+            # exit 0: the CLI call itself succeeded at reporting the
+            # workflow's true (refused) state; it is not a call failure.
+            # Recovery: there is no in-place repair — the poisoned checkpoint
+            # cannot be safely re-serialized. The operator's only options are
+            # (a) abandon/replay the workflow from an earlier clean phase via
+            # `hydra replay --from-phase <phase>`, or (b) quarantine it.
+            print(json.dumps({
+                "workflow_id": wf,
+                "status": "unjudgeable",
+                "field": e.field,
+                "detail": (
+                    "the stored checkpoint contains a non-finite value at "
+                    f"{e.field}; refusing to display this workflow's state. "
+                    "This is a data defect in previously persisted state. "
+                    "Recovery: there is no in-place repair — replay from an "
+                    "earlier clean phase with `hydra replay --from-phase "
+                    "<phase> " + wf + "`, or quarantine this workflow_id."
+                ),
+            }, indent=2, default=str))
+            return 0
         except Exception:  # noqa: BLE001 — fall back to trace view
             pass
 
@@ -5191,6 +5217,17 @@ def _cmd_status(args) -> int:
                             "reason": _ph.get("reason"),
                             "gate_node": _ph.get("gate_node"),
                         }
+            except PoisonedStateError as e:
+                # Report the poisoned row explicitly rather than leaving it
+                # at phase "?" indistinguishable from an ordinary/unreadable
+                # checkpoint. Other workflows in the list are unaffected —
+                # one bad row must not abort the listing.
+                row["status"] = "unjudgeable"
+                row["field"] = e.field
+                row["detail"] = (
+                    f"non-finite value at {e.field}; recovery: replay from "
+                    "an earlier clean phase or quarantine this workflow_id"
+                )
             except Exception:  # noqa: BLE001 — one bad checkpoint must not abort listing
                 pass
         if "root_goal" not in row:

@@ -270,6 +270,25 @@ def _tool_handlers() -> dict[str, callable]:
                 continue
             if st is None:
                 continue
+            if st.get("unjudgeable"):
+                # Propagate the poisoned-checkpoint marker explicitly rather
+                # than dropping it here: `v` below would read as an empty
+                # dict, which looks like a normal/blank workflow to an
+                # operator scanning the list, not a refusal to display it.
+                out.append({
+                    "workflow_id": wf,
+                    "phase": None,
+                    "unjudgeable": True,
+                    "field": st.get("field"),
+                    "detail": (
+                        f"checkpoint contains a non-finite value at "
+                        f"{st.get('field')}; refusing to display this "
+                        "workflow's state. Recovery: replay from an earlier "
+                        "clean phase or quarantine this workflow_id — there "
+                        "is no in-place repair."
+                    ),
+                })
+                continue
             v = st["values"]
             has_gate = bool(v.get("pending_hitl"))
             phase = v.get("phase")
@@ -302,6 +321,22 @@ def _tool_handlers() -> dict[str, callable]:
                     "reason": "langgraph_unavailable"}
         if st is None:
             return {"workflow_id": wf, "error": "not_found"}
+        if st.get("unjudgeable"):
+            # `_summarize_workflow` only ever sees `st["values"]` ({} here),
+            # which would render as an ordinary-looking empty workflow.
+            # Surface the poisoned marker explicitly instead.
+            return {
+                "workflow_id": wf,
+                "unjudgeable": True,
+                "field": st.get("field"),
+                "detail": (
+                    f"checkpoint contains a non-finite value at "
+                    f"{st.get('field')}; refusing to display this "
+                    "workflow's state. Recovery: replay from an earlier "
+                    "clean phase or quarantine this workflow_id — there is "
+                    "no in-place repair."
+                ),
+            }
         return _summarize_workflow(wf, st["values"], st["ts"])
 
     def squad_list(args: dict[str, Any]) -> dict[str, Any]:
