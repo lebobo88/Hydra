@@ -351,6 +351,32 @@ def test_drive_loop_codex_string_nan_cost_recorded_as_unmeasured(monkeypatch):
     assert out["final_status"] == "complete"
 
 
+def _codex_responses_with_omitted_generate_cost():
+    """Finding Y: a vendor that OMITS `cost_usd` entirely (the common
+    case, not an exotic one -- plenty of vendors simply do not report a
+    cost) rather than reporting a rejected one."""
+    resp = _codex_responses_with_poisoned_generate_cost()
+    gen_result = dict(resp[("pp_codex", "generate")]["result"])
+    del gen_result["cost_usd"]
+    resp[("pp_codex", "generate")] = {"status": "done", "result": gen_result}
+    return resp
+
+
+def test_drive_loop_omitted_generate_cost_recorded_as_unmeasured(monkeypatch):
+    """End-to-end through the real drive loop: a vendor that never reports
+    `cost_usd` at all (not rejected -- simply absent) must ALSO bump
+    `unmeasured_count`, not just a reported-but-rejected one."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(_codex_responses_with_omitted_generate_cost())
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    assert out["unmeasured_count"] >= 1
+    assert out["finalized"] is True
+    assert out["final_status"] == "complete"
+
+
 # ---------------------------------------------------------------------------
 # Finding B: the "unmeasured" provenance must survive all the way to whatever
 # CHARGES THE LEDGER -- asserting the ledger/state (`unmeasured_stages`,

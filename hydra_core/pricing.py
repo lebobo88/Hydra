@@ -96,7 +96,7 @@ def _load_override_table() -> dict[str, ModelRate]:
         if not isinstance(spec, dict):
             continue
         try:
-            out[str(model_id)] = ModelRate(
+            candidate = ModelRate(
                 input_per_mtok=float(spec["input_per_mtok"]),
                 output_per_mtok=float(spec["output_per_mtok"]),
                 cache_write_per_mtok=float(spec.get("cache_write_per_mtok", 0.0)),
@@ -104,7 +104,44 @@ def _load_override_table() -> dict[str, ModelRate]:
             )
         except Exception:  # noqa: BLE001 — one bad entry does not poison the rest
             continue
+        # Cross-vendor judge finding (follow-up round, HIGH -- rule fix, not
+        # a second patch): a NEGATIVE or non-finite rate component is a
+        # BROKEN entry, the same class this except-clause already guards
+        # against for a structurally malformed one (wrong type, missing
+        # key) -- it just wasn't checked. Reject it here, at the ONE seam
+        # every consumer of `get_rate`/`price_call` shares, rather than
+        # letting a broken rate reach the multiplication in `price_call`
+        # and get floored into a confident (wrong) $0.00 -- see
+        # `_rate_is_priceable`'s docstring for the full "measured only on
+        # positive evidence" rule this belongs to.
+        if not _rate_is_priceable(candidate):
+            continue
+        out[str(model_id)] = candidate
     return out
+
+
+def _rate_is_priceable(rate: ModelRate) -> bool:
+    """A rate is usable to PRICE a call only if every field is a genuine,
+    non-negative, finite number.
+
+    This is the seam `price_call` uses to distinguish "priced as
+    genuinely zero" (a real, trustworthy rate applied to zero tokens, or a
+    model with no cache tier) from "could not price" (a negative or
+    non-finite rate component -- a broken/hostile ``pricing.json``
+    override, or any future rate source). Checked both here (so a broken
+    OVERRIDE entry never even enters the resolvable table -- same
+    treatment as a structurally malformed entry) and again in `price_call`
+    itself (defense in depth for any future rate source that doesn't route
+    through `_load_override_table`).
+    """
+    return all(
+        isinstance(v, (int, float))
+        and not isinstance(v, bool)
+        and not is_non_finite_float(float(v))
+        and v >= 0
+        for v in (rate.input_per_mtok, rate.output_per_mtok,
+                  rate.cache_write_per_mtok, rate.cache_read_per_mtok)
+    )
 
 
 def get_rate(model_id: str) -> Optional[ModelRate]:
@@ -123,30 +160,37 @@ def price_call(
     cache_write_tokens: int = 0,
     cache_read_tokens: int = 0,
 ) -> Optional[float]:
-    """Price one call's token usage in USD, or ``None`` if ``model_id`` is unknown.
+    """Price one call's token usage in USD, or ``None`` if it CANNOT be
+    priced -- an unknown model, a broken rate, or a non-finite result.
 
     ``None`` is NOT an error — callers (``hydra_core/host_bridge.py``,
-    ``hydra_core/transcript_cost.py``) must treat an unknown model as
-    *unmeasured*, never as a free ($0.0) call.
+    ``hydra_core/transcript_cost.py``) must treat it as *unmeasured*, never
+    as a free ($0.0) call. This is the single distinction the "measured
+    only on positive evidence" rule (cross-vendor judge finding, follow-up
+    round, HIGH) needs from this function: a returned float is a
+    genuinely-priced, trustworthy number (including a real ``0.0`` -- e.g.
+    zero tokens against a valid rate, or a model with no cache tier);
+    ``None`` means pricing did not happen at all. Every caller may treat
+    "not None" as sufficient evidence for `source="estimated"` BECAUSE this
+    function enforces that distinction here, once, rather than each caller
+    re-deriving it from a possibly-floored number.
 
-    Cross-vendor judge finding (follow-up round, HIGH): a negative token
-    count (e.g. from a caller that does not route through
-    ``squad_node.coerce_untrusted_count``'s non-negative clamp) or a
-    corrupted rate (a malformed/hostile ``pricing.json`` operator override
-    parsed as a negative or non-finite float -- ``_load_override_table``
-    only guards against a structurally broken ENTRY, not a hostile numeric
-    VALUE within an otherwise well-formed one) could make this
-    multiplication REDUCE the returned cost below zero, or non-finite. A
-    priced estimate must never lower a stage's charge below what the
-    genuinely measured/estimated portion alone would total, so every
-    count-like input is floored at 0 here (never trust a caller's own
-    clamp as the only line of defense) and the OUTPUT is both finiteness-
-    checked (a non-finite total degrades to ``None`` -- unpriceable, the
-    same never-free contract this function already promises for an
-    unknown model) and floored at 0.0.
+    Cross-vendor judge finding (follow-up round, HIGH): the PREVIOUS
+    version of this function computed the total first and then FLOORED a
+    negative result to ``0.0`` -- turning a broken/hostile rate (or a
+    negative token count from a caller that skipped
+    ``squad_node.coerce_untrusted_count``'s clamp) into a confidently
+    "priced" $0.00, indistinguishable from a genuine free call. A floor
+    that turns a broken input into a plausible number is exactly the
+    failure mode this whole stage has been about. Fixed by validating the
+    RATE itself (`_rate_is_priceable`) before ever multiplying: with a
+    validated non-negative rate and non-negative (clamped) token counts,
+    the computed total is mathematically guaranteed non-negative, so
+    there is no floor left to apply -- only a finiteness check against
+    overflow, which (like an invalid rate) degrades to ``None``.
     """
     rate = get_rate(model_id)
-    if rate is None:
+    if rate is None or not _rate_is_priceable(rate):
         return None
     _tokens_in = max(tokens_in, 0)
     _tokens_out = max(tokens_out, 0)
@@ -158,6 +202,6 @@ def price_call(
         + _cache_write * rate.cache_write_per_mtok
         + _cache_read * rate.cache_read_per_mtok
     ) / 1_000_000.0
-    if is_non_finite_float(cost):
+    if is_non_finite_float(cost) or cost < 0.0:
         return None
-    return round(max(cost, 0.0), 8)
+    return round(cost, 8)

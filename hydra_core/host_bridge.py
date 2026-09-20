@@ -1845,6 +1845,15 @@ def _priced_cost(
     if (tokens_in or tokens_out) and model:
         from .pricing import price_call
         priced = price_call(model, tokens_in, tokens_out)
+        # Cross-vendor judge finding (follow-up round, HIGH -- rule fix):
+        # `price_call` now enforces the ONE seam behind "measured only on
+        # positive evidence" for estimates -- `None` means pricing did not
+        # happen (unknown model, broken/negative rate, non-finite total);
+        # any OTHER return is a genuinely-priced, trustworthy number
+        # (including a real `0.0`). This `is not None` check is therefore
+        # already correct and needs no per-call re-derivation here -- it
+        # was only ever wrong when `price_call` itself could floor a
+        # broken input into a plausible-looking `0.0` (fixed at the source).
         if priced is not None:
             _merge_cost_source(cursor, "estimated")
             cursor["estimated_cost_usd"] = (

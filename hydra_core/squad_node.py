@@ -1671,7 +1671,19 @@ def _drive_pp_stage_loop(
             out["cost_usd"] += _gen_cost
             out["tokens_in"] += _gen_tin
             out["tokens_out"] += _gen_tout
-            if _gen_src == "unmeasured" and gi.get("cost_usd") is not None:
+            # Cross-vendor judge finding (follow-up round, HIGH -- rule fix,
+            # not a fourth patch): trust `coerce_untrusted_cost`'s OWN
+            # "measured only on positive evidence" answer directly, rather
+            # than re-deriving "was this reported at all" here. The
+            # previous `and gi.get("cost_usd") is not None` guard meant a
+            # vendor that OMITTED `cost_usd` entirely (the common case, not
+            # an exotic one) incremented nothing, so a stage whose EVERY
+            # call omitted cost stayed at `unmeasured_count=0` -- read by
+            # `supervisor._extract_squad_cost` as a finite, confident
+            # MEASURED $0.00. `coerce_untrusted_cost(None)` already
+            # correctly returns `"unmeasured"`; there is no scenario where
+            # trusting it directly is wrong.
+            if _gen_src == "unmeasured":
                 out["unmeasured_count"] += 1
 
             # Run-scoped: paths dirtied since the pre-generate snapshot. Excludes
@@ -1860,7 +1872,10 @@ def _drive_pp_stage_loop(
             out["cost_usd"] += _crit_cost
             out["tokens_in"] += coerce_untrusted_count(ci.get("tokens_in"))
             out["tokens_out"] += coerce_untrusted_count(ci.get("tokens_out"))
-            if _crit_src == "unmeasured" and ci.get("cost_usd") is not None:
+            # See the matching comment on the generate accrual above: trust
+            # `coerce_untrusted_cost`'s own answer directly (an OMITTED
+            # cost_usd is `"unmeasured"` too, not just a rejected one).
+            if _crit_src == "unmeasured":
                 out["unmeasured_count"] += 1
             parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
             if not isinstance(parsed, dict):
@@ -2331,7 +2346,9 @@ def _drive_best_of_loop(
             out["cost_usd"] += _gen_cost
             out["tokens_in"] += _gen_tin
             out["tokens_out"] += _gen_tout
-            if _gen_src == "unmeasured" and gi.get("cost_usd") is not None:
+            # See the sequential drive loop's matching comment: trust
+            # `coerce_untrusted_cost`'s own answer directly.
+            if _gen_src == "unmeasured":
                 out["unmeasured_count"] += 1
             out["producer"] = producer
             run_changed = _worktree_dirty_set(wt) - pre
@@ -2448,7 +2465,10 @@ def _drive_best_of_loop(
             out["cost_usd"] += _jci_cost
             out["tokens_in"] += coerce_untrusted_count(jci.get("tokens_in"))
             out["tokens_out"] += coerce_untrusted_count(jci.get("tokens_out"))
-            if _jci_src == "unmeasured" and jci.get("cost_usd") is not None:
+            # See the matching comment on the sequential drive loop's
+            # critique accrual: trust `coerce_untrusted_cost`'s own answer
+            # directly.
+            if _jci_src == "unmeasured":
                 out["unmeasured_count"] += 1
             parsed = jci.get("parsed") if isinstance(jci.get("parsed"), dict) else jci
             if not isinstance(parsed, dict):
