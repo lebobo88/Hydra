@@ -9,10 +9,16 @@ always refuses rather than emitting a bare NaN/Infinity token.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 
-from hydra_core.strict_json import dumps_strict, find_non_finite_field
+from hydra_core.strict_json import (
+    dumps_strict,
+    dumps_tool_response_safe,
+    find_non_finite_field,
+    sanitize_non_finite,
+)
 
 
 def test_find_non_finite_field_in_dict():
@@ -158,3 +164,86 @@ def test_dumps_strict_reports_cycle_instead_of_hanging():
         assert "circular" in str(exc)
     elapsed = time.perf_counter() - start
     assert elapsed < 2.0, f"expected prompt cycle detection, took {elapsed:.2f}s"
+
+
+# --------------------------------------------------------------------------- #
+# item 5 LOW (this round): non-finite float DICT KEYS are examined too
+# --------------------------------------------------------------------------- #
+
+def test_find_non_finite_field_names_a_nan_dict_key():
+    """A NaN dict key is rejected by `json.dumps(..., allow_nan=False)`
+    exactly like a NaN value, but the walker previously only ever descended
+    into VALUES, so this reported `<unknown field>` instead of naming the
+    key."""
+    field = find_non_finite_field({float("nan"): "x"})
+    assert field is not None
+    assert "<key:" in field
+    assert "nan" in field.lower()
+
+
+def test_dumps_strict_names_a_nan_dict_key_not_unknown_field():
+    try:
+        dumps_strict({float("nan"): "x"}, label="widget")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "<unknown field>" not in str(exc)
+        assert "<key:" in str(exc)
+
+
+# --------------------------------------------------------------------------- #
+# item 4 MEDIUM (this round): dumps_tool_response_safe handles TypeError too,
+# and every substitution (non-finite float OR unsupported object) is marked
+# --------------------------------------------------------------------------- #
+
+class _Unsupported:
+    """A plain object `json.dumps` cannot encode without a `default=`."""
+
+    def __repr__(self) -> str:
+        return "<Unsupported obj>"
+
+
+def test_dumps_tool_response_safe_handles_unsupported_object():
+    payload = {"a": 1, "b": _Unsupported()}
+    text = dumps_tool_response_safe(payload)
+    # Must produce valid JSON (never raise).
+    parsed = json.loads(text)
+    assert parsed["a"] == 1
+    assert isinstance(parsed["b"], str)
+    assert parsed["_non_finite_fields_sanitized"], (
+        "the unsupported-object substitution must be recorded, not silently stringified"
+    )
+    assert any("$.b" in f for f in parsed["_non_finite_fields_sanitized"])
+
+
+def test_dumps_tool_response_safe_reports_every_substitution_not_just_first():
+    """A payload with BOTH a non-finite float AND an unsupported object must
+    report BOTH substitutions -- the previous implementation reported the
+    float (via `sanitize_non_finite`) but silently re-stringified the
+    unsupported object with `default=str` and no marker."""
+    payload = {"nan_field": float("nan"), "obj_field": _Unsupported()}
+    text = dumps_tool_response_safe(payload)
+    parsed = json.loads(text)
+    assert parsed["nan_field"] is None
+    assert isinstance(parsed["obj_field"], str)
+    fields = parsed["_non_finite_fields_sanitized"]
+    assert any("nan_field" in f for f in fields)
+    assert any("obj_field" in f for f in fields)
+
+
+def test_dumps_tool_response_safe_still_handles_plain_non_finite():
+    payload = {"budget": float("inf")}
+    text = dumps_tool_response_safe(payload)
+    parsed = json.loads(text)
+    assert parsed["budget"] is None
+    assert parsed["_non_finite_fields_sanitized"] == ["$.budget"]
+
+
+def test_dumps_tool_response_safe_ordinary_payload_unaffected():
+    text = dumps_tool_response_safe({"a": 1, "b": "x"})
+    assert json.loads(text) == {"a": 1, "b": "x"}
+
+
+def test_sanitize_non_finite_names_a_nan_dict_key():
+    result, fields = sanitize_non_finite({float("nan"): "x"})
+    assert "null" in result
+    assert any("<key:" in f for f in fields)

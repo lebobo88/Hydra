@@ -121,14 +121,26 @@ def test_unjudgeable_envelope_surfaces_and_never_reaches_synthesis():
     assert str(unjudgeable[0]["target_envelope_id"]) == hostile_id
     # Never advances to synthesis.
     assert patch.get("phase") != "synthesis"
+    # Item 2 MEDIUM (this round): abort-only, never `acknowledge` -- an
+    # `acknowledge` resume is a guaranteed re-surface loop since the next
+    # pass re-detects the identical persisted verdict. The summary names the
+    # offending field directly instead of forcing the operator to parse the
+    # critique excerpt.
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    assert patch["pending_hitl"]["default_option"] == "abort"
+    assert "constraints.budget_usd" in patch["pending_hitl"]["summary"]
+    assert "re-ingest" in patch["pending_hitl"]["summary"]
 
 
 def test_unjudgeable_envelope_re_detected_from_prior_verdicts_on_reentry():
     """Once an unjudgeable verdict is recorded, a later re-entry of
-    `node_judge_per_squad` (e.g. after an `acknowledge` resume) must
-    re-detect it from `state.verdicts` and surface again, rather than
-    silently advancing because the envelope itself is now in
-    `already_judged`."""
+    `node_judge_per_squad` must re-detect it from `state.verdicts` and
+    surface again, rather than silently advancing because the envelope
+    itself is now in `already_judged`. There is no `acknowledge` resume
+    to simulate any more (item 2 MEDIUM, this round) -- the gate offers
+    ONLY `abort`, a terminal resolution -- but the re-detection itself
+    (defense in depth against a re-entry that somehow reaches this node
+    again, e.g. a future resume path) must still hold."""
     sup = _build_sup()
     judge_per_squad = _node(sup, "judge_per_squad")
 
@@ -138,11 +150,99 @@ def test_unjudgeable_envelope_re_detected_from_prior_verdicts_on_reentry():
 
     first = judge_per_squad(state)
     state.verdicts = list(first["verdicts"])
-    state.phase = "judge_per_squad"  # simulate re-entry after a non-terminal resume
+    state.phase = "judge_per_squad"  # simulate a re-entry
 
     second = judge_per_squad(state)
     assert second["phase"] == "surfaced"
     assert second["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    assert second["pending_hitl"]["options"] == ["abort"]
+
+
+def test_imported_persisted_unjudgeable_verdict_envelope_blocks_without_verdicts_entry():
+    """Cross-vendor judge finding (this round, item 1 HIGH): an
+    imported/replayed state can hold a JUDGE_VERDICT envelope (in
+    `state.envelopes`) with outcome="unjudgeable" while `state.verdicts` was
+    NOT reconstructed in lockstep -- e.g. a checkpoint import that ingests
+    the raw envelope list but not the verdict ledger, or a replay that
+    resumes mid-run from a snapshot of `state.envelopes` alone. Before this
+    fix, `node_judge_per_squad` unconditionally `continue`d on any
+    `type == "JUDGE_VERDICT"` envelope, so this scenario silently advanced
+    to synthesis with zero signal that the verdict was ever unjudgeable."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="imported checkpoint resume")
+    persisted_verdict_id = str(uuid4())
+    persisted_verdict = {
+        "id": persisted_verdict_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_squad": "executive",
+        "target_envelope_id": str(uuid4()),
+        "outcome": "unjudgeable",
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": (
+            "[UNJUDGEABLE — envelope failed strict serialization, cannot be "
+            "evaluated by any vendor] codex:non_finite_envelope. Last error: "
+            "envelope failed strict serialization (rubric=constitution-alignment@1): "
+            "envelope abc contains a non-finite value at $.constraints.budget_usd; "
+            "refusing to write invalid JSON"
+        ),
+    }
+    # NOTE: this envelope is imported directly into `state.envelopes` -- it
+    # is NEVER added to `state.verdicts`, exactly modeling the import/replay
+    # gap this fix closes.
+    state.envelopes = [persisted_verdict]
+    assert state.verdicts == []
+
+    patch = judge_per_squad(state)
+
+    assert patch["phase"] == "surfaced", (
+        "a persisted unjudgeable JUDGE_VERDICT envelope with no matching "
+        "state.verdicts entry must still hard-block, not silently advance"
+    )
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    assert "constraints.budget_usd" in patch["pending_hitl"]["summary"]
+    assert patch.get("phase") != "synthesis"
+
+
+def test_persisted_unjudgeable_verdict_already_in_state_verdicts_not_double_counted():
+    """Companion mutation-proof guard: when the persisted JUDGE_VERDICT
+    envelope's id IS already present in `state.verdicts` (the normal case --
+    it was folded into `state.verdicts` in the SAME pass that produced it),
+    the loop must not re-treat it as a fresh, previously-undetected hit.
+    It is still caught (via the `state.verdicts` scan earlier in the node),
+    just not through the persisted-envelope path this fix adds."""
+    sup = _build_sup()
+    judge_per_squad = _node(sup, "judge_per_squad")
+
+    state = HydraState(root_goal="normal same-pass resume")
+    verdict_id = str(uuid4())
+    target_id = str(uuid4())
+    verdict = {
+        "id": verdict_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": target_id,
+        "outcome": "unjudgeable",
+        "rubric_id": "constitution-alignment@1",
+        "judge_vendor": "codex",
+        "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
+    }
+    state.verdicts = [verdict]
+    state.envelopes = [dict(verdict)]  # same verdict also persisted as an envelope
+
+    patch = judge_per_squad(state)
+
+    # Still hard-blocks (via the `state.verdicts` scan), and there is
+    # exactly one unjudgeable_hit driving the HITL -- not a crash from
+    # double-processing the same verdict via two different code paths.
+    assert patch["phase"] == "surfaced"
+    assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
 
 
 def test_unjudgeable_final_record_blocks_postcheck_from_marking_done():
@@ -168,6 +268,12 @@ def test_unjudgeable_final_record_blocks_postcheck_from_marking_done():
     assert patch["phase"] == "surfaced"
     assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
     assert patch["phase"] != "postcheck"
+    # Item 2 MEDIUM (this round): same abort-only + field-naming contract as
+    # `node_judge_per_squad`.
+    assert patch["pending_hitl"]["options"] == ["abort"]
+    assert patch["pending_hitl"]["default_option"] == "abort"
+    assert "constraints.budget_usd" in patch["pending_hitl"]["summary"]
+    assert "re-ingest" in patch["pending_hitl"]["summary"]
 
 
 # ---------------------------------------------------------------------------

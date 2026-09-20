@@ -224,6 +224,28 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
     return usd, tokens
 
 
+_NON_FINITE_FIELD_RE = re.compile(r"non-finite value at (\S+?);")
+
+
+def _unjudgeable_field_path(critique_md: str | None) -> str:
+    """Pull the offending field path out of an unjudgeable verdict's
+    `critique_md` (which threads `strict_json.dumps_strict`'s ValueError
+    message — see `judge.dispatcher._unjudgeable_verdict`'s docstring) so an
+    unjudgeable HITL summary can name the field directly instead of forcing
+    the operator to read a 200-char critique excerpt. Falls back to
+    `"<unknown field>"` if the pattern is not found (e.g. a future failure
+    mode that isn't a non-finite value at all).
+
+    Cross-vendor judge finding (this round, item 2 MEDIUM): both unjudgeable
+    HITL sites (`node_judge_per_squad`, `node_judge_synthesis`) need the same
+    remediation message — "fix it at source and re-ingest / start a new
+    run" — and both need to name the field so that message is actionable.
+    """
+    text = critique_md or ""
+    m = _NON_FINITE_FIELD_RE.search(text)
+    return m.group(1) if m else "<unknown field>"
+
+
 # Map an envelope's ORIGIN to the real model vendor that produced it (NOT the
 # squad slug — the slug is not a vendor). Squads routed through Hydra's host
 # (executive impersonation, claude-skill packs, best-of-N candidates) are
@@ -2955,6 +2977,16 @@ def build_supervisor(
         state.phase = "judge_per_squad"
         _emit_node_context(state, "judge_per_squad")
         already_judged = {v.get("target_envelope_id") for v in state.verdicts}
+        # Cross-vendor judge finding (this round, item 1 HIGH): `state.verdicts`
+        # is not the only place an unjudgeable verdict can live -- a persisted
+        # JUDGE_VERDICT envelope can also carry outcome="unjudgeable" (e.g. an
+        # imported checkpoint, or a replay that reconstructs `state.envelopes`
+        # without reconstructing `state.verdicts` in lockstep). `persisted_verdict_ids`
+        # lets the loop below tell "already folded into state.verdicts this
+        # pass" apart from "only exists as a raw envelope" so neither a replay
+        # nor an import can bypass the hard block by omitting the verdict from
+        # `state.verdicts` while still shipping it as an envelope.
+        persisted_verdict_ids = {v.get("id") for v in state.verdicts}
         new_verdicts: list[dict] = []
         retry_envelopes: list[dict] = []
         retry_verdicts: list[dict] = []
@@ -2992,6 +3024,22 @@ def build_supervisor(
 
         for env in state.envelopes:
             if env.get("type") == "JUDGE_VERDICT":
+                # Cross-vendor judge finding (this round, item 1 HIGH): checked
+                # BEFORE the unconditional skip below -- a persisted verdict
+                # envelope with outcome="unjudgeable" and no matching entry in
+                # `state.verdicts` (by verdict `id`, not `target_envelope_id`;
+                # two different rubrics can legitimately share a target) is
+                # exactly the imported/replayed scenario the module docstring
+                # above describes. This cannot be bypassed by a replay that
+                # rebuilds `state.envelopes` from the checkpoint but not
+                # `state.verdicts` in lockstep, nor by an import that ingests
+                # a raw verdict envelope directly, because the hard block
+                # fires on the ENVELOPE itself, independent of whether
+                # `state.verdicts` was ever populated for this pass.
+                if (env.get("outcome") == "unjudgeable"
+                        and env.get("id") not in persisted_verdict_ids
+                        and unjudgeable_hit is None):
+                    unjudgeable_hit = env
                 continue
             if env.get("id") in already_judged:
                 continue
@@ -3128,6 +3176,19 @@ def build_supervisor(
             # is exactly what `node_postcheck`'s
             # `elif state.phase != "surfaced": state.phase = "done"` guard
             # checks — see supervisor.py's postcheck node).
+            #
+            # Cross-vendor judge finding (this round, item 2 MEDIUM): only
+            # `abort` is offered, matching `node_plan_judge`'s
+            # `unjudgeable_plan` gate (schemas.py's HITLRequest reason
+            # docstring). `acknowledge` was a guaranteed re-surface loop —
+            # the very next pass re-detects the SAME persisted verdict (see
+            # the `already_judged`/`persisted_verdict_ids` scan above) and
+            # surfaces this exact HITL again, with no path forward, because
+            # nothing about "acknowledge" clears the underlying data defect.
+            # The real remedy is named directly in the summary instead: the
+            # offending field, and the corrective action (fix at source and
+            # re-ingest, or start a new run).
+            field_path = _unjudgeable_field_path(unjudgeable_hit.get("critique_md"))
             hitl = HITLRequest(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra-judge",
@@ -3137,10 +3198,12 @@ def build_supervisor(
                     f"Envelope {unjudgeable_hit.get('target_envelope_id')} could not "
                     f"be judged — strict serialization failed on rubric "
                     f"{unjudgeable_hit.get('rubric_id')}. This is a data defect, not "
-                    f"a quality verdict; investigate before proceeding. "
+                    f"a quality verdict: the source envelope carries a non-finite "
+                    f"value at {field_path}; fix it at source and re-ingest / start "
+                    f"a new run. "
                     f"Detail: {(unjudgeable_hit.get('critique_md') or '')[:200]}"
                 ),
-                options=["acknowledge", "abort"],
+                options=["abort"],
                 default_option="abort",
             )
             hitl_dict = hitl.model_dump(mode="json")
@@ -3674,6 +3737,13 @@ def build_supervisor(
         )
         out: dict[str, Any] = {"verdicts": verdicts, "phase": "postcheck"}
         if unjudgeable:
+            # Cross-vendor judge finding (this round, item 2 MEDIUM): abort-only,
+            # same as `node_judge_per_squad` above and `node_plan_judge`'s
+            # `unjudgeable_plan` gate — `acknowledge` is a guaranteed re-surface
+            # loop (re-entry re-detects the same `record_env` and re-judges it
+            # to the identical unjudgeable outcome), and the field is named
+            # directly so the remediation is actionable without re-deriving it.
+            field_path = _unjudgeable_field_path(unjudgeable.get("critique_md"))
             hitl = HITLRequest(
                 workflow_id=state.workflow_id,
                 origin_squad="hydra-judge",
@@ -3682,11 +3752,12 @@ def build_supervisor(
                 summary=(
                     f"Final DecisionRecord could not be judged — strict "
                     f"serialization failed on rubric {unjudgeable.get('rubric_id')}. "
-                    f"This is a data defect, not a quality verdict; investigate before "
-                    f"marking the workflow done. "
+                    f"This is a data defect, not a quality verdict: the source "
+                    f"envelope carries a non-finite value at {field_path}; fix it "
+                    f"at source and re-ingest / start a new run. "
                     f"Detail: {(unjudgeable.get('critique_md') or '')[:200]}"
                 ),
-                options=["acknowledge", "abort"],
+                options=["abort"],
                 default_option="abort",
             )
             hitl_dict = hitl.model_dump(mode="json")

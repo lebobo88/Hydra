@@ -438,6 +438,32 @@ def test_pack_budget_usd_nan_string_is_rejected_with_explicit_error(packs) -> No
     assert not disp.calls
 
 
+def test_pack_budget_usd_oversized_int_gives_structured_error_not_a_crash(packs) -> None:
+    """Cross-vendor judge finding (this round, item 3 MEDIUM): a JSON
+    integer too large for a float to represent (e.g. from a hostile or
+    corrupted pack payload) raises ``OverflowError`` from ``float(budget)``,
+    not ``TypeError``/``ValueError`` -- the two exceptions
+    ``normalize_pack_envelope`` originally caught. This must fail ONLY the
+    offending envelope with an explicit, field-naming error, exactly like
+    the NaN-string case above, and must NOT crash the whole ingest batch."""
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    hopeless = _pack_dev_task(str(state.workflow_id), budget_usd=10 ** 400)
+    fine = _pack_dev_task(str(state.workflow_id), id=str(uuid4()))
+
+    # The oversized-int envelope is paired with an ordinary, valid one to
+    # prove the OverflowError is contained to the one bad item and does not
+    # abort the rest of the batch.
+    outcome = dispatch_ingested_envelopes(
+        state, [hopeless, fine], packs=packs, dispatcher=disp)
+
+    assert sorted(it.status for it in outcome.items) == ["done", "failed"]
+    assert outcome.rejected
+    msg = outcome.rejected[0].errors[0]["msg"]
+    assert "budget_usd" in msg
+    assert disp.calls, "the valid sibling envelope must still dispatch"
+
+
 def test_pack_budget_usd_invalid_when_constraints_budget_already_set(packs) -> None:
     """Cross-vendor judge finding (item 6, second half): when the envelope
     already carries a finite ``constraints.budget_usd``, the OLD code path

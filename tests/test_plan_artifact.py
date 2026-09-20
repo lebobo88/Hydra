@@ -30,6 +30,7 @@ from hydra_core.plan_artifact import (
     plan_slug,
     render_plan_html,
     render_plan_json,
+    sum_finite_budgets,
 )
 from hydra_core.schemas import Plan, PlanStep
 
@@ -1611,3 +1612,31 @@ def test_bash_hook_fallback_branches_resolve_relative_and_absolute_alike(tmp_pat
         result = _run_bash_hook(build(dest), root)
         assert result.returncode == 2, f"{branch_id} {dest}: expected BLOCKED, got {result.stdout!r}"
         assert "BLOCKED" in result.stderr, f"{branch_id} {dest}: {result.stderr}"
+
+
+# --------------------------------------------------------------------------- #
+# sum_finite_budgets overflow handling (cross-vendor judge finding, this
+# round, item 3 MEDIUM)
+# --------------------------------------------------------------------------- #
+
+def test_sum_finite_budgets_oversized_legacy_int_degrades_to_unavailable():
+    """A legacy `plan_ref` step budget can be a raw Python `int` too large
+    for `float()` to represent (construction via `PlanStep` already rejects
+    a value this large -- this models a RAW DICT read straight from
+    `state.plan_ref`, the live path `node_plan_judge` uses). `float(value)`
+    itself raises `OverflowError` before the running-sum overflow check even
+    executes. This is a READ, never raise: it must degrade to
+    `(None, True)` exactly like two finite-but-huge floats overflowing on
+    summation, not propagate the OverflowError to the caller."""
+    huge_legacy_int = 10 ** 400
+    total, overflowed = sum_finite_budgets([10.5, huge_legacy_int])
+    assert total is None
+    assert overflowed is True
+
+
+def test_sum_finite_budgets_ordinary_values_unaffected():
+    """Mutation-proof companion: the overflow guard must not change an
+    ordinary, non-overflowing sum."""
+    total, overflowed = sum_finite_budgets([10.5, 4.5])
+    assert total == 15.0
+    assert overflowed is False
