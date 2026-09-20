@@ -38,8 +38,14 @@ and precisely why form 2 above tracks WHICH names a `from json import`
 statement actually bound, rather than flagging every bare `dumps(`.
 
 Known limits (stated so the next reader does not over-trust this guard):
-  - Form 4's ``(function, variable)`` tracking is a single flat pass, not
-    real data-flow analysis: it does NOT follow an encoder passed as a
+  - Form 4's ``(function, variable)`` tracking handles BOTH a plain
+    ``ast.Assign`` (``encoder = json.JSONEncoder()``) and an ANNOTATED
+    ``ast.AnnAssign`` (``encoder: json.JSONEncoder = json.JSONEncoder()``)
+    -- the two are different AST node shapes (``.targets`` list vs. a
+    single ``.target``) and an earlier version of this guard tracked only
+    the former, an inaccuracy fixed alongside this limits list (cross-vendor
+    judge finding, REVISE round, MEDIUM). It is still a single flat pass,
+    not real data-flow analysis: it does NOT follow an encoder passed as a
     function argument, returned from a function, stored on `self`/an
     object attribute, or captured in a closure/comprehension. It also does
     not un-track a name that is later REASSIGNED to something else within
@@ -174,15 +180,26 @@ def _collect_bindings(tree: ast.AST, line_to_func: dict[int, str]):
 
     permissive_encoder_vars: set[tuple[str, str]] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
+        # `ast.Assign` (`x = ...`, possibly chained `a = b = ...`) and
+        # `ast.AnnAssign` (an ANNOTATED binding, `x: json.JSONEncoder =
+        # ...`) have different shapes (`.targets` list vs. a single
+        # `.target`, and `AnnAssign.value` is optional -- an annotation with
+        # no assignment carries no value at all). Both are real ways to bind
+        # a name to a constructor call, so both are tracked.
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
             continue
-        value = node.value
-        if not (isinstance(value, ast.Call) and _is_encoder_ctor_call(value)):
+        if value is None or not (isinstance(value, ast.Call) and _is_encoder_ctor_call(value)):
             continue
         if _has_allow_nan_false(value):
             continue
         func_path = line_to_func.get(node.lineno, "")
-        for target in node.targets:
+        for target in targets:
             if isinstance(target, ast.Name):
                 permissive_encoder_vars.add((func_path, target.id))
 
@@ -554,6 +571,32 @@ def test_detects_bound_encoder_encode_call():
     sites = _find_unguarded_sites_in_source(src, "fake.py")
     assert len(sites) == 1
     assert sites[0].func_path == "f"
+
+
+def test_detects_bound_encoder_via_annassign():
+    """Finding D: `encoder: json.JSONEncoder = json.JSONEncoder()` is an
+    `ast.AnnAssign` (single `.target`, not a `.targets` list) -- a
+    different AST shape from `ast.Assign` that an earlier version of this
+    guard's binding collector missed entirely."""
+    src = (
+        "import json\n"
+        "def f(payload):\n"
+        "    encoder: json.JSONEncoder = json.JSONEncoder()\n"
+        "    return encoder.encode(payload)\n"
+    )
+    sites = _find_unguarded_sites_in_source(src, "fake.py")
+    assert len(sites) == 1
+    assert sites[0].func_path == "f"
+
+
+def test_guarded_bound_encoder_via_annassign_is_not_flagged():
+    src = (
+        "import json\n"
+        "def f(payload):\n"
+        "    encoder: json.JSONEncoder = json.JSONEncoder(allow_nan=False)\n"
+        "    return encoder.encode(payload)\n"
+    )
+    assert _find_unguarded_sites_in_source(src, "fake.py") == []
 
 
 def test_guarded_bound_encoder_is_not_flagged():

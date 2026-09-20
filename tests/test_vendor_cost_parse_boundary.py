@@ -25,9 +25,13 @@ import pytest
 
 from hydra_core.governance import charge_and_gate, should_block_for_budget
 from hydra_core.squad_node import (
+    SquadResult,
     _claude_critique,
+    _drive_pp_stage_loop,
     _parse_claude_cli_result,
     _run_claude_cli,
+    coerce_vendor_cost,
+    coerce_vendor_tokens,
 )
 from hydra_core.state import BudgetLedger, HydraState
 
@@ -179,3 +183,244 @@ def test_guarded_unmeasured_cost_does_not_poison_the_budget_gate():
     assert block is True  # the exhausted-budget gate still fires correctly
     assert should_block_for_budget(state) is True
     assert state.budget.unmeasured_stages == 1
+
+
+# ---------------------------------------------------------------------------
+# Finding A (HIGH, follow-up round): `is_non_finite_float` only recognizes an
+# actual `float` instance -- a vendor emitting the cost as a JSON STRING
+# (`"NaN"`/`"Infinity"`) bypassed a check applied to the RAW value before
+# `float()` coercion. `coerce_vendor_cost`/`coerce_vendor_tokens` (the shared
+# helper every vendor cost entry now routes through) validate the COERCED
+# value instead, closing the gap for every input shape.
+# ---------------------------------------------------------------------------
+
+def test_coerce_vendor_cost_rejects_string_nan():
+    value, source = coerce_vendor_cost("NaN")
+    assert value == 0.0
+    assert source == "unmeasured"
+
+
+def test_coerce_vendor_cost_rejects_string_infinity():
+    value, source = coerce_vendor_cost("Infinity")
+    assert value == 0.0
+    assert source == "unmeasured"
+    value, source = coerce_vendor_cost("-Infinity")
+    assert value == 0.0
+    assert source == "unmeasured"
+
+
+def test_coerce_vendor_cost_rejects_float_nan_and_inf():
+    """Control: the original (float) attack shape is still caught."""
+    assert coerce_vendor_cost(float("nan")) == (0.0, "unmeasured")
+    assert coerce_vendor_cost(float("inf")) == (0.0, "unmeasured")
+
+
+def test_coerce_vendor_cost_measured_control():
+    """The control that matters most: an ordinary finite cost (as a real
+    float OR a numeric string -- vendors are inconsistent about this) is
+    recorded exactly as reported, with source 'measured'."""
+    assert coerce_vendor_cost(0.42) == (0.42, "measured")
+    assert coerce_vendor_cost("0.42") == (0.42, "measured")
+
+
+def test_coerce_vendor_cost_missing_and_garbage():
+    assert coerce_vendor_cost(None) == (0.0, "unmeasured")
+    assert coerce_vendor_cost("not-a-number") == (0.0, "unmeasured")
+
+
+def test_coerce_vendor_tokens_rejects_string_and_float_non_finite():
+    assert coerce_vendor_tokens("NaN") == 0
+    assert coerce_vendor_tokens(float("inf")) == 0
+    assert coerce_vendor_tokens(None) == 0
+
+
+def test_coerce_vendor_tokens_measured_control():
+    assert coerce_vendor_tokens(500) == 500
+    assert coerce_vendor_tokens("500") == 500
+
+
+def test_parse_claude_cli_result_string_nan_cost_is_unmeasured_not_zero():
+    """The exact bypass shape at the real parse site: a vendor stdout JSON
+    document (a perfectly valid, ordinary JSON document -- the string
+    `"NaN"` is a completely normal string value, not a bare non-standard
+    token) carrying the cost as a STRING."""
+    stdout = json.dumps({"result": "implemented the thing", "total_cost_usd": "NaN"})
+    out = _parse_claude_cli_result(stdout, "", 0, "claude-opus-4-8")
+    assert out["cost_usd"] == 0.0
+    assert out["cost_source"] == "unmeasured"
+    assert "implemented the thing" in out["text"]  # result still preserved
+
+
+def test_parse_claude_cli_result_string_infinity_tokens_clamped_to_zero():
+    stdout = json.dumps({
+        "result": "ok", "total_cost_usd": 0.02,
+        "usage": {"input_tokens": "Infinity", "output_tokens": "500"},
+    })
+    out = _parse_claude_cli_result(stdout, "", 0, "m")
+    assert out["tokens_in"] == 0
+    assert out["tokens_out"] == 500
+    assert out["cost_usd"] == 0.02
+    assert out["cost_source"] == "measured"
+
+
+# ---------------------------------------------------------------------------
+# Finding C: every vendor cost entry point in `_drive_pp_stage_loop` /
+# `_drive_best_of_n_stage_loop` (generate AND critique, both the single-shot
+# and best-of-N shapes) routes through the SAME `coerce_vendor_cost`/
+# `coerce_vendor_tokens` helper -- not just the Claude CLI path. This proves
+# it end-to-end through the real drive loop with a scripted pp_codex
+# response (the "pp, Codex, or Agy" vendors the finding named), not just the
+# helper in isolation.
+# ---------------------------------------------------------------------------
+
+def _codex_responses_with_poisoned_generate_cost():
+    return {
+        ("pp_harness", "start_stage"): {"status": "done", "result": {"stage_id": "st_T"}},
+        ("pp_harness", "gate_eligible_judges"): {"status": "done", "result": {
+            "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}},
+        ("pp_codex", "generate"): {"status": "done", "result": {
+            "text": "edited foo.py\n{\"status\": \"pass\", \"reason\": \"ok\"}",
+            "model": "codex-1",
+            # The exact bypass shape: a STRING, not a float.
+            "tokens_in": 5, "tokens_out": 7, "cost_usd": "NaN", "wall_ms": 100}},
+        ("pp_harness", "archive_artifact"): {"status": "done", "result": {"path": ".harness/x"}},
+        ("pp_harness", "record_attempt"): {"status": "done", "result": {"attempt_id": "att_T"}},
+        ("pp_codex", "critique"): {"status": "done", "result": {
+            "parsed": {"outcome": "pass", "critique_md": "c" * 90,
+                       "score": {"correctness": 9}},
+            "cost_usd": 0.03}},
+        ("pp_harness", "record_verdict"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_stage"): {"status": "done", "result": {}},
+        ("pp_harness", "finalize_run"): {"status": "done", "result": {"status": "complete"}},
+    }
+
+
+class _ScriptedDispatcherForCost:
+    """Minimal scripted dispatcher (mirrors test_drive_pp_loop.py's
+    `_ScriptedDispatcher`, duplicated here to keep this file self-contained)."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+        self.drive_pp_loop = True
+
+    def call_mcp(self, server, tool, args, *, squad_id=None):
+        self.calls.append((server, tool, args))
+        key = (server, tool)
+        if key not in self.responses:
+            return {"status": "failed", "error": f"unscripted call {key}"}
+        return self.responses[key]
+
+
+def test_drive_loop_codex_string_nan_cost_recorded_as_unmeasured(monkeypatch):
+    """End-to-end through the real drive loop: a non-Claude vendor
+    (pp_codex) reports its generate cost as the STRING "NaN". The stage
+    still completes (real generated code is not discarded), the accumulated
+    cost stays finite, and the rejection is auditable via
+    `unmeasured_count` -- never silently recorded as a measured $0.00."""
+    monkeypatch.setattr("hydra_core.squad_node._run_smoke",
+                        lambda *_a, **_k: ("pass", "stub smoke pass"))
+    disp = _ScriptedDispatcherForCost(_codex_responses_with_poisoned_generate_cost())
+    out = _drive_pp_stage_loop(
+        disp, run_id="run_T", project_path="/tmp/proj", request_text="do the thing")
+
+    assert not math.isnan(out["cost_usd"])
+    assert out["cost_usd"] == pytest.approx(0.03)  # only the critique's real cost
+    assert out["unmeasured_count"] >= 1
+    assert out["finalized"] is True
+    assert out["final_status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Finding B: the "unmeasured" provenance must survive all the way to whatever
+# CHARGES THE LEDGER -- asserting the ledger/state (`unmeasured_stages`,
+# `spent_usd`), not merely the parser's/drive-loop's return value, which is
+# what the earlier round's fix left disconnected.
+# ---------------------------------------------------------------------------
+
+def _squad_result_with_drive_loop(drive_loop: dict) -> SquadResult:
+    return SquadResult(
+        envelopes=[],
+        artifacts=[{"kind": "pp_run", "ref": "run_1",
+                    "raw": {"status": "done", "result": {"run_id": "run_1"}},
+                    "drive_loop": drive_loop}],
+        status="running",
+    )
+
+
+def test_unmeasured_stage_is_recorded_as_unmeasured_at_the_ledger(monkeypatch):
+    """End to end: a drive-loop stage whose ONLY vendor cost report was
+    rejected (never charged as a false $0.00 'measured') is charged through
+    `supervisor._extract_squad_cost` -> `charge_and_gate`, and
+    `state.budget.unmeasured_stages` -- the auditable signal -- increments.
+    Asserts the LEDGER, not `_extract_squad_cost`'s return value alone."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    drive_loop = {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                  "unmeasured_count": 1}
+    result = _squad_result_with_drive_loop(drive_loop)
+
+    usd, tokens, source = _extract_squad_cost(result)
+    assert source == "unmeasured"
+
+    state = _state(budget=10.0, spent=0.0)
+    assert state.budget.unmeasured_stages == 0
+    charge_and_gate(state, usd, tokens, source=source)
+
+    assert state.budget.spent_usd == 0.0
+    assert state.budget.unmeasured_stages == 1  # the auditable signal fired
+
+
+def test_partially_measured_stage_is_recorded_as_measured_with_real_money(monkeypatch):
+    """Control: a stage where SOME vendor call was genuinely measured is
+    charged as measured with the real dollar amount -- the rejected
+    candidate's $0.0 contribution doesn't erase the real money that WAS
+    measured elsewhere in the same stage."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    drive_loop = {"cost_usd": 0.03, "tokens_in": 10, "tokens_out": 5,
+                  "unmeasured_count": 1}  # one candidate rejected, one measured
+    result = _squad_result_with_drive_loop(drive_loop)
+
+    usd, tokens, source = _extract_squad_cost(result)
+    assert source == "measured"
+    assert usd == pytest.approx(0.03)
+
+    state = _state(budget=10.0, spent=0.0)
+    charge_and_gate(state, usd, tokens, source=source)
+    assert state.budget.spent_usd == pytest.approx(0.03)
+    assert state.budget.unmeasured_stages == 0
+
+
+def test_extract_squad_cost_rejects_string_non_finite_pp_harness_cost():
+    """Finding C: pp_harness's OWN `start_run` response (`inner["cost_usd"]`)
+    is a vendor boundary too -- a poisoned string is rejected the same way,
+    never poisoning the `max()` aggregate."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{"kind": "pp_run", "ref": "r1",
+                    "raw": {"result": {"cost_usd": "NaN", "tokens_in": 10}}}],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    assert usd == 0.0
+    assert not math.isnan(usd)
+    assert source == "unmeasured"
+
+
+def test_extract_squad_cost_finite_control_is_measured():
+    """Control: an ordinary finite pp_harness-reported cost is extracted
+    exactly as before, source 'measured'."""
+    from hydra_core.supervisor import _extract_squad_cost
+
+    result = SquadResult(
+        envelopes=[], status="running",
+        artifacts=[{"kind": "pp_run", "ref": "r1",
+                    "raw": {"result": {"cost_usd": 0.42, "tokens_in": 100,
+                                       "tokens_out": 50}}}],
+    )
+    usd, tokens, source = _extract_squad_cost(result)
+    assert usd == pytest.approx(0.42)
+    assert tokens == 150
+    assert source == "measured"

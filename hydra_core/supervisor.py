@@ -52,7 +52,13 @@ from .schemas import (
 )
 from .squad_loader import SquadPack, discover_squads
 from .fleet import dispatch_fleet
-from .squad_node import Dispatcher, SquadResult, execute_squad
+from .squad_node import (
+    Dispatcher,
+    SquadResult,
+    coerce_vendor_cost,
+    coerce_vendor_tokens,
+    execute_squad,
+)
 from .state import (
     BudgetLedger,
     HydraState,
@@ -143,7 +149,7 @@ def _resolve_forward_target(env: "Any", producer_slug: str) -> "str | None":
     return target
 
 
-def _extract_squad_cost(result: "Any") -> tuple[float, int]:
+def _extract_squad_cost(result: "Any") -> tuple[float, int, str]:
     """FS-4 — extract cost from a SquadResult.
 
     _via_mcp stores artifacts as:
@@ -163,12 +169,31 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
       - tokens_in + tokens_out (int) — preferred token counts
       - tokens    (int) — aggregate alias
 
-    Defaults to (0.0, 0) when no cost field is found; caller emits
+    Defaults to (0.0, 0, "unmeasured") when no cost field is found (or every
+    cost field found was non-finite/unparseable -- see below); caller emits
     "cost_unavailable" trace. Always call record_cost even on 0/0 so
     the ledger is monotonically updated on every squad invocation.
+
+    Cross-vendor judge finding (this round, HIGH): `inner["cost_usd"]` and
+    `drive_loop["cost_usd"]` are BOTH vendor-controlled (pp_harness's own
+    `start_run` response, and the headless drive loop's accumulated total,
+    which is itself built from Claude/Codex/Agy reports) -- the same class
+    of exposure as every other vendor cost entry in this thread. Both are
+    coerced through `squad_node.coerce_vendor_cost`/`coerce_vendor_tokens`
+    (coerce-then-check, so a hostile JSON STRING like `"NaN"` is caught the
+    same way a real non-finite float is), and the returned THIRD element,
+    `cost_source`, is `"measured"` only if at least one contributing report
+    coerced to a genuine finite value; `"unmeasured"` if NONE did -- so a
+    stage whose only cost reports were rejected is never silently charged
+    (and ledgered) as a measured $0.00. Every caller of this function must
+    forward `cost_source` to `charge_and_gate`/`charge_and_gate_repo`'s
+    `source=` parameter (never leave it at the "measured" default) so
+    `state.budget.unmeasured_stages` -- the auditable signal this whole fix
+    exists to keep truthful -- actually increments.
     """
     usd: float = 0.0
     tokens: int = 0
+    any_measured = False
     for artifact in getattr(result, "artifacts", []):
         if not isinstance(artifact, dict):
             continue
@@ -183,27 +208,20 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
             inner = raw
         # Prefer cost_usd; fall back to cost
         if "cost_usd" in inner:
-            try:
-                usd = max(usd, float(inner["cost_usd"]))
-            except (TypeError, ValueError):
-                pass
+            c, src = coerce_vendor_cost(inner["cost_usd"])
+            usd = max(usd, c)
+            any_measured = any_measured or src == "measured"
         elif "cost" in inner:
-            try:
-                usd = max(usd, float(inner["cost"]))
-            except (TypeError, ValueError):
-                pass
+            c, src = coerce_vendor_cost(inner["cost"])
+            usd = max(usd, c)
+            any_measured = any_measured or src == "measured"
         # Token counts
         tok_raw = 0
         if "tokens_in" in inner or "tokens_out" in inner:
-            try:
-                tok_raw = int(inner.get("tokens_in") or 0) + int(inner.get("tokens_out") or 0)
-            except (TypeError, ValueError):
-                tok_raw = 0
+            tok_raw = (coerce_vendor_tokens(inner.get("tokens_in"))
+                       + coerce_vendor_tokens(inner.get("tokens_out")))
         elif "tokens" in inner:
-            try:
-                tok_raw = int(inner["tokens"])
-            except (TypeError, ValueError):
-                tok_raw = 0
+            tok_raw = coerce_vendor_tokens(inner["tokens"])
         tokens = max(tokens, tok_raw)
 
         # F6: a DRIVEN engineering run captures the real codegen + critique cost
@@ -215,16 +233,26 @@ def _extract_squad_cost(result: "Any") -> tuple[float, int]:
         if isinstance(dl, dict) and (
             "cost_usd" in dl or "tokens_in" in dl or "tokens_out" in dl
         ):
-            try:
-                usd = max(usd, float(dl.get("cost_usd") or 0.0))
-            except (TypeError, ValueError):
-                pass
-            try:
-                dl_tok = int(dl.get("tokens_in") or 0) + int(dl.get("tokens_out") or 0)
-                tokens = max(tokens, dl_tok)
-            except (TypeError, ValueError):
-                pass
-    return usd, tokens
+            c, src = coerce_vendor_cost(dl.get("cost_usd"))
+            # `dl["cost_usd"]` is the drive loop's ALREADY-coerced running
+            # total (see `squad_node.coerce_vendor_cost`'s per-candidate
+            # use) -- a genuine positive amount always means real measured
+            # money. But `dl["cost_usd"] == 0.0` is AMBIGUOUS on its own: it
+            # is indistinguishable between "nothing was spent" and "every
+            # contributing vendor report was rejected as non-finite" (both
+            # sum to 0.0). `unmeasured_count` (bumped by `squad_node`'s
+            # accumulators whenever a report was rejected) resolves that
+            # ambiguity -- a $0.00 total with at least one rejected report
+            # is "unmeasured", never a false "measured $0.00".
+            if c == 0.0 and src == "measured" and (dl.get("unmeasured_count") or 0) > 0:
+                src = "unmeasured"
+            usd = max(usd, c)
+            any_measured = any_measured or src == "measured"
+            dl_tok = (coerce_vendor_tokens(dl.get("tokens_in"))
+                      + coerce_vendor_tokens(dl.get("tokens_out")))
+            tokens = max(tokens, dl_tok)
+    cost_source = "measured" if any_measured else "unmeasured"
+    return usd, tokens, cost_source
 
 
 _NON_FINITE_FIELD_RE = re.compile(r"non-finite value at (\S+?);")
@@ -1757,8 +1785,8 @@ def build_supervisor(
                 })
                 continue
             # Fix 2b: charge + gate after every best-of-N candidate.
-            _cost_usd, _cost_tok = _extract_squad_cost(result)
-            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok, source=_cost_src)
             # F34: budget_charge to eights (fail-soft; never blocks local work).
             eights.budget_charge(
                 workflow_id=str(state.workflow_id),
@@ -2253,10 +2281,11 @@ def build_supervisor(
                 # A failed paid MCP call may still have incurred spend; skipping the
                 # charge produces ledger undercount and makes the HITL budget summary
                 # inaccurate (Fix 6 gap: failed results must be charged before continue).
-                _cost_usd, _cost_tok = _extract_squad_cost(result)
+                _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
                 if pack is not None:
                     _repo_over, _block, _downgrade = charge_and_gate_repo(
-                        state, fleet_task.target_repo_id, _cost_usd, _cost_tok
+                        state, fleet_task.target_repo_id, _cost_usd, _cost_tok,
+                        source=_cost_src,
                     )
                     if _cost_usd == 0.0 and _cost_tok == 0:
                         emit_trace(judge_trace_root, state.workflow_id, "budget.cost_unavailable", {
@@ -2553,8 +2582,8 @@ def build_supervisor(
                 )
                 continue
             # Fix 2b: charge + gate via centralized helper.
-            _cost_usd, _cost_tok = _extract_squad_cost(result)
-            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+            _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+            _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok, source=_cost_src)
             # F34: budget_charge to eights (fail-soft; never blocks local work).
             eights.budget_charge(
                 workflow_id=str(state.workflow_id),
@@ -2714,8 +2743,8 @@ def build_supervisor(
                 _fwd_task.status = "failed"
                 state.error_counters[_target] = state.error_counters.get(_target, 0) + 1
                 continue
-            _fc_usd, _fc_tok = _extract_squad_cost(_fwd_result)
-            _fblock, _fdown = charge_and_gate(state, _fc_usd, _fc_tok)
+            _fc_usd, _fc_tok, _fc_src = _extract_squad_cost(_fwd_result)
+            _fblock, _fdown = charge_and_gate(state, _fc_usd, _fc_tok, source=_fc_src)
             # F34: budget_charge to eights (fail-soft; never blocks local work).
             eights.budget_charge(
                 workflow_id=str(state.workflow_id),
@@ -2903,8 +2932,8 @@ def build_supervisor(
             })
             return [], []
         # Fix 2b: charge + gate for reflexion retries.
-        _cost_usd, _cost_tok = _extract_squad_cost(result)
-        _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok)
+        _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+        _block, _downgrade = charge_and_gate(state, _cost_usd, _cost_tok, source=_cost_src)
         # F34: budget_charge to eights (fail-soft; never blocks local work).
         eights.budget_charge(
             workflow_id=str(state.workflow_id),

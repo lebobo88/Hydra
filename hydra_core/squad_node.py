@@ -753,6 +753,63 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
     )
 
 
+def coerce_vendor_cost(raw: Any) -> tuple[float, str]:
+    """Coerce an UNTRUSTED vendor-reported cost value to a finite float.
+
+    Every vendor cost entry point in this module (Claude CLI stdout, a
+    pp_codex/pp_harness MCP response, a host-driven subagent result, a
+    SquadResult artifact `supervisor._extract_squad_cost` reads) routes
+    through this ONE helper, so the next vendor added inherits the guard
+    instead of repeating the omission.
+
+    Cross-vendor judge finding (this round, HIGH): coerce FIRST, THEN check
+    finiteness on the COERCED value -- checking `is_non_finite_float` on the
+    RAW value before casting (the previous shape of this fix) missed a
+    hostile JSON STRING like `"NaN"`/`"Infinity"`: `is_non_finite_float`
+    only recognizes an actual `float` instance, so a string sails past that
+    check, and `float("NaN")` / `float("Infinity")` still happily convert it
+    to a real non-finite number afterward. Validating the value that is
+    ACTUALLY CHARGED (post-coercion) closes that gap for every input shape
+    (a real float, a string, `None`, or garbage) in one place.
+
+    Returns ``(cost_usd, cost_source)``: ``cost_source`` is ``"measured"``
+    for a real finite number, ``"unmeasured"`` for anything missing,
+    unparseable, or non-finite after coercion -- a rejected report is never
+    silently indistinguishable from a genuine free call.
+    """
+    if raw is None:
+        return 0.0, "unmeasured"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, "unmeasured"
+    if is_non_finite_float(value):
+        return 0.0, "unmeasured"
+    return value, "measured"
+
+
+def coerce_vendor_tokens(raw: Any) -> int:
+    """Coerce an UNTRUSTED vendor-reported token count to a non-negative
+    int, clamping anything unparseable or non-finite (including a
+    NaN/Infinity STRING -- see `coerce_vendor_cost`'s coerce-then-check
+    rationale) to 0 rather than raising. Tokens are informational counters
+    (no downstream budget COMPARISON reads them directly), but a hostile
+    value must never be able to discard an otherwise-successful result via
+    an unrelated exception handler."""
+    if raw is None:
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if is_non_finite_float(value):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _parse_claude_cli_result(
     stdout: str, stderr: str, returncode: int, model: str,
 ) -> dict[str, Any]:
@@ -813,21 +870,17 @@ def _parse_claude_cli_result(
         raw_cost = obj.get("total_cost_usd")
         if raw_cost is None:
             raw_cost = obj.get("cost_usd")
-        if raw_cost is None:
-            cost, cost_source = 0.0, "unmeasured"
-        elif is_non_finite_float(raw_cost):
-            cost, cost_source = 0.0, "unmeasured"
+        cost, cost_source = coerce_vendor_cost(raw_cost)
+        if cost_source == "unmeasured" and raw_cost is not None:
+            # Only a REPORTED-but-rejected value (as opposed to a field that
+            # was simply absent) is worth a note in the record.
             text += (
                 "\n[hydra] vendor CLI reported a non-finite cost_usd "
                 f"({raw_cost!r}); treated as unmeasured, not charged as $0."
             )
-        else:
-            cost, cost_source = float(raw_cost), "measured"
         usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-        raw_tin = usage.get("input_tokens")
-        raw_tout = usage.get("output_tokens")
-        tin = 0 if raw_tin is None or is_non_finite_float(raw_tin) else int(raw_tin)
-        tout = 0 if raw_tout is None or is_non_finite_float(raw_tout) else int(raw_tout)
+        tin = coerce_vendor_tokens(usage.get("input_tokens"))
+        tout = coerce_vendor_tokens(usage.get("output_tokens"))
         mdl = str(obj.get("model") or model)
     if returncode != 0 and stderr:
         text += f"\n[claude stderr] {stderr[-800:]}"
@@ -1504,7 +1557,11 @@ def _drive_pp_stage_loop(
         # SquadResult artifact so _extract_squad_cost can charge the budget ledger
         # (start_run only SCAFFOLDS at cost 0 — reading cost from it left the 80%
         # downgrade + 100% HITL tripwires dead for all engineering work).
-        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+        # `unmeasured_count`: bumped every time a vendor call in this stage
+        # reported a missing/unparseable/non-finite cost -- so a rejected
+        # report is never silently indistinguishable from a genuine $0.00
+        # (see `coerce_vendor_cost`).
+        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "unmeasured_count": 0,
     }
 
     def _trace(kind: str, payload: dict[str, Any]) -> None:
@@ -1560,9 +1617,20 @@ def _drive_pp_stage_loop(
             # the success path (and break-ing out on failure) under-charged the
             # budget ledger and weakened the 80%/100% tripwires. Hard failures
             # (timeout/transport) carry no cost fields → add 0, harmless.
-            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(gi.get("tokens_in") or 0)
-            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            # Coerced ONCE here (`coerce_vendor_cost`/`coerce_vendor_tokens`)
+            # and reused for every downstream use of this generate envelope's
+            # cost/tokens in this iteration (the accumulator, both
+            # `record_attempt` calls, and the cost-unknown trace check below)
+            # -- so `gi`'s raw, vendor-controlled fields are never re-cast
+            # with a bare `float()`/`int()` anywhere in this loop body.
+            _gen_cost, _gen_src = coerce_vendor_cost(gi.get("cost_usd"))
+            _gen_tin = coerce_vendor_tokens(gi.get("tokens_in"))
+            _gen_tout = coerce_vendor_tokens(gi.get("tokens_out"))
+            out["cost_usd"] += _gen_cost
+            out["tokens_in"] += _gen_tin
+            out["tokens_out"] += _gen_tout
+            if _gen_src == "unmeasured" and gi.get("cost_usd") is not None:
+                out["unmeasured_count"] += 1
 
             # Run-scoped: paths dirtied since the pre-generate snapshot. Excludes
             # any files that were already modified before this run started.
@@ -1604,9 +1672,9 @@ def _drive_pp_stage_loop(
                         # A soft-block/empty failure can still be a token-consuming
                         # generate (esp. the Claude CLI path); record its real spend
                         # so the pp ledger matches the budget charge accrued above.
-                        "tokens_in": int(gi.get("tokens_in") or 0),
-                        "tokens_out": int(gi.get("tokens_out") or 0),
-                        "cost_usd": float(gi.get("cost_usd") or 0.0),
+                        "tokens_in": _gen_tin,
+                        "tokens_out": _gen_tout,
+                        "cost_usd": _gen_cost,
                         "status": fail_status, "retry_index": retry_index,
                         "notes": {"candidate_index": 1},
                         **({"parent_attempt_id": attempt_id} if attempt_id else {}),
@@ -1617,8 +1685,7 @@ def _drive_pp_stage_loop(
                 # MU14: if the failure carries no cost/token info (typical for
                 # subprocess.TimeoutExpired or CLI launch failures), emit a trace
                 # so the unaccounted spend is visible. Never fabricate numbers.
-                if float(gi.get("cost_usd") or 0.0) == 0.0 \
-                        and int(gi.get("tokens_in") or 0) == 0:
+                if _gen_cost == 0.0 and _gen_tin == 0:
                     _trace("budget.cost_unknown_timeout",
                            {"candidate": 1, "retry": retry_index})
                 break
@@ -1640,10 +1707,10 @@ def _drive_pp_stage_loop(
                 "producer": producer,
                 "agent_type": "engineer",  # F29
                 "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
-                "tokens_in": int(gi.get("tokens_in") or 0),
-                "tokens_out": int(gi.get("tokens_out") or 0),
-                "cost_usd": float(gi.get("cost_usd") or 0.0),
-                "wall_ms": int(gi.get("wall_ms") or 0),
+                "tokens_in": _gen_tin,
+                "tokens_out": _gen_tout,
+                "cost_usd": _gen_cost,
+                "wall_ms": coerce_vendor_tokens(gi.get("wall_ms")),
                 "status": "ok",
                 "retry_index": retry_index,
                 "notes": {"candidate_index": 1},
@@ -1745,9 +1812,14 @@ def _drive_pp_stage_loop(
             degraded = required_cross and not cross_vendor
 
             # F6: critique cost counts toward the run's budget charge too.
-            out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(ci.get("tokens_in") or 0)
-            out["tokens_out"] += int(ci.get("tokens_out") or 0)
+            # Vendor-controlled (pp_agy / pp_codex / Claude) -- coerced the
+            # same way as the generate cost above.
+            _crit_cost, _crit_src = coerce_vendor_cost(ci.get("cost_usd"))
+            out["cost_usd"] += _crit_cost
+            out["tokens_in"] += coerce_vendor_tokens(ci.get("tokens_in"))
+            out["tokens_out"] += coerce_vendor_tokens(ci.get("tokens_out"))
+            if _crit_src == "unmeasured" and ci.get("cost_usd") is not None:
+                out["unmeasured_count"] += 1
             parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
             if not isinstance(parsed, dict):
                 parsed = {}
@@ -2034,7 +2106,10 @@ def _drive_best_of_loop(
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
+        # `unmeasured_count`: see the sequential drive loop's `out` dict --
+        # same rejected-report auditability signal.
         "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "best_of_n": n,
+        "unmeasured_count": 0,
         "smoke_excluded_candidates": [],
     }
 
@@ -2116,9 +2191,17 @@ def _drive_best_of_loop(
                 model_tier=model_tier, sq=sq)
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
-            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(gi.get("tokens_in") or 0)
-            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            # Coerced ONCE (see the sequential drive loop's identical
+            # comment) and reused for the accumulator, `record_attempt`, and
+            # the cost-unknown trace check below.
+            _gen_cost, _gen_src = coerce_vendor_cost(gi.get("cost_usd"))
+            _gen_tin = coerce_vendor_tokens(gi.get("tokens_in"))
+            _gen_tout = coerce_vendor_tokens(gi.get("tokens_out"))
+            out["cost_usd"] += _gen_cost
+            out["tokens_in"] += _gen_tin
+            out["tokens_out"] += _gen_tout
+            if _gen_src == "unmeasured" and gi.get("cost_usd") is not None:
+                out["unmeasured_count"] += 1
             out["producer"] = producer
             run_changed = _worktree_dirty_set(wt) - pre
             wrote = bool(run_changed)
@@ -2140,9 +2223,9 @@ def _drive_best_of_loop(
                 att = cm("pp_harness", "record_attempt", {
                     "stage_id": stage_id, "producer": producer,
                     "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
-                    "tokens_in": int(gi.get("tokens_in") or 0),
-                    "tokens_out": int(gi.get("tokens_out") or 0),
-                    "cost_usd": float(gi.get("cost_usd") or 0.0),
+                    "tokens_in": _gen_tin,
+                    "tokens_out": _gen_tout,
+                    "cost_usd": _gen_cost,
                     "status": "error" if gen_fail else "ok",
                     **({"attempt_slot_id": slot} if slot else {}),
                     "notes": {"candidate_index": ci_idx},
@@ -2153,8 +2236,7 @@ def _drive_best_of_loop(
             if gen_fail:
                 # MU14: emit trace when timeout/launch failure carries no cost.
                 # Don't fabricate token numbers.
-                if float(gi.get("cost_usd") or 0.0) == 0.0 \
-                        and int(gi.get("tokens_in") or 0) == 0:
+                if _gen_cost == 0.0 and _gen_tin == 0:
                     _trace("budget.cost_unknown_timeout", {"candidate": ci_idx})
                 scored.append({"ci": ci_idx, "att": att_id, "outcome": "fail",
                                "rank": -1.0, "smoke": "skipped", "critique": gen_fail})
@@ -2231,9 +2313,12 @@ def _drive_best_of_loop(
                 jci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
                     "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
-            out["cost_usd"] += float(jci.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(jci.get("tokens_in") or 0)
-            out["tokens_out"] += int(jci.get("tokens_out") or 0)
+            _jci_cost, _jci_src = coerce_vendor_cost(jci.get("cost_usd"))
+            out["cost_usd"] += _jci_cost
+            out["tokens_in"] += coerce_vendor_tokens(jci.get("tokens_in"))
+            out["tokens_out"] += coerce_vendor_tokens(jci.get("tokens_out"))
+            if _jci_src == "unmeasured" and jci.get("cost_usd") is not None:
+                out["unmeasured_count"] += 1
             parsed = jci.get("parsed") if isinstance(jci.get("parsed"), dict) else jci
             if not isinstance(parsed, dict):
                 parsed = {}
