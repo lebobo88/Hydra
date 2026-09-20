@@ -47,6 +47,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r"langchain_core.
 from .squad_loader import discover_squads
 from .state import (
     HydraState,
+    PoisonedStateError,
     TaskState,
     plan_barrier_active,
     plan_deps_satisfied,
@@ -4510,6 +4511,25 @@ def _cmd_finalize(args) -> int:
         }
         print(json.dumps(payload, indent=2, default=str))
         return 0 if record_id else 1
+    except PoisonedStateError as e:
+        # Choke-point catch (see `state.make_checkpoint_serde`): the
+        # checkpoint this workflow already holds — before any attended
+        # result is even materialized — carries a non-finite value
+        # somewhere in `verdicts`/`envelopes`/`artifacts`/`plan_ref`/
+        # `attended_results`/etc. Surface the SAME `unjudgeable` shape the
+        # rest of the codebase uses and never touch the checkpoint.
+        print(json.dumps({
+            "ok": False, "status": "unjudgeable", "workflow_id": wf,
+            "field": e.field,
+            "detail": (
+                "the stored checkpoint contains a non-finite value at "
+                f"{e.field}; refusing to resume/finalize this workflow. "
+                "This is a data defect in previously persisted state, not "
+                "a defect in this finalize call — repair or quarantine the "
+                "checkpoint before retrying."
+            ),
+        }, indent=2, default=str))
+        return 0
     finally:
         _release_resume_lock(lock_fd, lock_path)
 
@@ -6175,7 +6195,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "repo":
         return _cmd_repo(args)
 
-    return {
+    dispatch = {
         "doctor": _cmd_doctor,
         "verify": _cmd_verify,
         "squads": _cmd_squads,
@@ -6205,7 +6225,28 @@ def main(argv: list[str] | None = None) -> int:
         "gateway-remove-old-backends": _cmd_gateway_remove_old_backends,
         "gateway-rollback": _cmd_gateway_rollback,
         "gateway-setup": _cmd_gateway_setup,
-    }[args.cmd](args)
+    }
+    try:
+        return dispatch[args.cmd](args)
+    except PoisonedStateError as e:
+        # Defense-in-depth catch-all (see `state.make_checkpoint_serde` and
+        # `_cmd_finalize`'s dedicated handler above): every OTHER command
+        # that touches a checkpoint (`step`, `submit-host-result`, `status`,
+        # `budget`, `resume`, ...) routes through this single dispatch call,
+        # so one handler here covers all of them without editing each command
+        # individually — the choke point itself already did the only work
+        # that matters (refusing to deserialize); this just keeps the CLI's
+        # exit contract (`ok: false` JSON, not a bare traceback) uniform.
+        print(json.dumps({
+            "ok": False, "status": "unjudgeable",
+            "workflow_id": getattr(args, "workflow_id", None),
+            "field": e.field,
+            "detail": (
+                "the stored checkpoint contains a non-finite value at "
+                f"{e.field}; refusing to read/advance this workflow."
+            ),
+        }, indent=2, default=str))
+        return 0
 
 
 if __name__ == "__main__":                                                  # pragma: no cover

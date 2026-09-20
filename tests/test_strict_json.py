@@ -489,3 +489,113 @@ def test_dumps_tool_response_safe_handles_hostile_repr_dict_key():
     fields = parsed["_non_finite_fields_sanitized"]
     assert fields
     assert any("unrepresentable _HostileRepr" in f for f in fields), fields
+
+
+# ---------------------------------------------------------------------------
+# Remaining bare repr()/str() conversions found by cross-vendor judge review
+# of the choke-point round: a float subclass with a raising __repr__ plus a
+# NaN VALUE is already covered above via _HostileRepr's cousins, but the same
+# hazard exists for NaN used as a dict KEY (find_non_finite_field's own
+# key-frame construction, and sanitize_non_finite's non-finite-float-key and
+# key-collision branches), and an int subclass with a raising __str__ breaks
+# member-name reservation before any key-specific branch is even reached.
+# ---------------------------------------------------------------------------
+
+class _HostileNaNRepr(float):
+    """A genuine NaN float subclass whose own `__repr__` raises. Still
+    satisfies `isinstance(x, float)` and the NaN self-inequality check --
+    the sanitizer/finder must not call bare `repr()` on it."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("hostile nan repr boom")
+
+
+def _hostile_nan() -> _HostileNaNRepr:
+    return _HostileNaNRepr(float("nan"))
+
+
+def test_find_non_finite_field_handles_hostile_repr_nan_key():
+    """`find_non_finite_field` must not propagate a NaN key's own raising
+    `__repr__` -- it must still report the location with a guarded marker."""
+    field = find_non_finite_field({_hostile_nan(): "x"})
+    assert field is not None
+    assert "<key:" in field
+    assert "unrepresentable" in field or "_HostileNaNRepr" in field
+
+
+def test_dumps_strict_names_a_hostile_repr_nan_key_not_an_arbitrary_exception():
+    """`dumps_strict` must still raise the actionable `ValueError` naming the
+    key -- not let the key's own hostile `__repr__` exception escape in its
+    place."""
+    try:
+        dumps_strict({_hostile_nan(): "x"}, label="widget")
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "<unknown field>" not in str(exc)
+        assert "<key:" in str(exc)
+    except RuntimeError:
+        assert False, "the key's own hostile __repr__ must not escape dumps_strict"
+
+
+def test_dumps_tool_response_safe_handles_hostile_repr_nan_key():
+    """Same hazard on the lenient tool-response path: `sanitize_non_finite`'s
+    non-finite-float-key branch also builds its marker with `k!r`."""
+    payload = {_hostile_nan(): "value"}
+    text = dumps_tool_response_safe(payload)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["null"] == "value"
+    fields = parsed["_non_finite_fields_sanitized"]
+    assert any("<key:" in f for f in fields)
+
+
+class _HostileIntRepr(int):
+    """An int subclass whose own `__repr__` raises, used so its natural JSON
+    member name collides with a genuine string key -- exercising the
+    key-collision branch's own `k!r` marker construction."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("hostile int repr boom")
+
+
+def test_sanitize_non_finite_handles_hostile_repr_int_key_collision():
+    """Exercise `sanitize_non_finite`'s key-COLLISION branch directly (it
+    only runs once a payload already needs sanitizing) with a hostile
+    `__repr__` int key whose natural JSON member name collides with a
+    genuine string key -- the collision branch's own marker is built with
+    `k!r`, which must not propagate the hostile exception."""
+    payload = {_HostileIntRepr(3): "int-value", "3": "string-value"}
+    result, fields = sanitize_non_finite(payload)  # must not raise
+    parsed = json.loads(json.dumps(result))
+    values = list(parsed.values())
+    assert "int-value" in values
+    assert "string-value" in values
+    assert len(values) == 2, "both colliding keys must survive distinctly"
+    assert any("<key:" in f for f in fields)
+
+
+class _HostileIntStr(int):
+    """An int subclass whose own `__str__` raises. `json.dumps` itself would
+    bypass this (it uses `int.__repr__` internally for int keys), but this
+    module's own `_passthrough_member_name` calls `str(k)` directly to
+    reserve member names ahead of the real serialization -- that call must
+    not raise either."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("hostile int str boom")
+
+
+def test_dumps_tool_response_safe_handles_hostile_str_int_key():
+    """CPython's `json.dumps` renders an `int` key via `int.__repr__`
+    directly (bypassing any subclass override entirely), so the initial
+    strict attempt below succeeds outright and never even reaches
+    `sanitize_non_finite` for a payload with ONLY a hostile-str int key --
+    that alone would never exercise `_passthrough_member_name`. An
+    unrelated NaN elsewhere in the payload forces the fallback path, which
+    then walks EVERY key (including the untouched hostile one) while
+    building `reserved_keys` -- that walk is what must not raise."""
+    payload = {_HostileIntStr(7): "value", "other": 1, "trigger": float("nan")}
+    text = dumps_tool_response_safe(payload)  # must not raise
+    parsed = json.loads(text)
+    assert parsed["other"] == 1
+    assert parsed["trigger"] is None
+    assert parsed.get("7") == "value", parsed

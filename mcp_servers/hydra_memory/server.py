@@ -93,16 +93,31 @@ def _checkpoint_thread_ids(conn, cap: int = _SCAN_CAP) -> list[str]:
 
 
 def _load_state_values(workflow_id: str) -> dict[str, Any] | None:
-    """Latest checkpoint channel_values for a workflow (read-only), or None."""
+    """Latest checkpoint channel_values for a workflow (read-only), or None.
+
+    Choke-point note (see `hydra_core.state.make_checkpoint_serde`): this is
+    one of the exactly two `SqliteSaver` construction sites in the codebase,
+    so `saver.get_tuple(...)` below routes through the SAME non-finite scan
+    `build_supervisor`'s checkpointer does. A poisoned checkpoint raises
+    `PoisonedStateError` here too; this read-only surface degrades to an
+    explicit `{"unjudgeable": True, "field": ...}` marker instead of either
+    crashing the MCP call or (worse) silently displaying counts derived from
+    poisoned data as if they were trustworthy.
+    """
     conn = _open_checkpoints_ro()
     if conn is None:
         return None
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
-        from hydra_core.state import make_checkpoint_serde  # MU3: shared serde helper
+        from hydra_core.state import (  # MU3: shared serde helper
+            PoisonedStateError, make_checkpoint_serde,
+        )
         _serde = make_checkpoint_serde()
         saver = SqliteSaver(conn, serde=_serde) if _serde is not None else SqliteSaver(conn)
-        tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
+        try:
+            tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
+        except PoisonedStateError as e:
+            return {"values": {}, "ts": None, "unjudgeable": True, "field": e.field}
         if tup is None:
             return None
         cp = tup.checkpoint or {}

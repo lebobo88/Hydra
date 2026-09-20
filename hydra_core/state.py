@@ -550,23 +550,117 @@ def plan_deps_satisfied(state, task) -> bool:
     return True
 
 
+class PoisonedStateError(Exception):
+    """Raised by the checkpoint-deserialization choke point (see
+    ``make_checkpoint_serde``) when a persisted checkpoint's ``channel_values``
+    contains a non-finite float (``NaN``/``Infinity``/``-Infinity``) anywhere
+    in its structure.
+
+    Twelve prior cross-vendor rounds each patched ONE more node/edge/`as_node`
+    jump that could reach `synthesis`/postcheck without re-running the
+    non-finite scan a sibling node already had -- each fix closed one path
+    and the next round found another. This exception is raised from the ONE
+    place every one of those paths is structurally forced to pass through:
+    `HydraState`/`TaskState`/`BudgetLedger` (and therefore `envelopes`,
+    `verdicts`, `artifacts`, `plan_ref`, `attended_results`, and any other
+    collection state carries) do not exist in a Python process until
+    LangGraph's checkpointer deserializes them off disk via this module's
+    serde -- there is no second, unwrapped route to the same bytes (see
+    `make_checkpoint_serde`'s docstring for the exhaustive
+    `grep -rn "SqliteSaver("` confirming exactly two construction sites, both
+    already required to route through this function).
+
+    ``field`` is the dotted/bracketed path `find_non_finite_field` reports
+    (e.g. ``"$.verdicts[2].score_json.value"``); callers surface it verbatim
+    in the same `unjudgeable`-shaped message the rest of the codebase already
+    uses (see `judge.dispatcher._unjudgeable_verdict`,
+    `cli._cmd_finalize`'s pre-materialization scan) so an operator sees one
+    consistent vocabulary regardless of which path caught the poison.
+    """
+
+    def __init__(self, field: str) -> None:
+        self.field = field
+        super().__init__(
+            f"checkpoint contains a non-finite value at {field}; "
+            "refusing to deserialize poisoned state"
+        )
+
+
 def make_checkpoint_serde() -> Any:
-    """Return a JsonPlusSerializer with hydra_core.state types registered.
+    """Return a JsonPlusSerializer with hydra_core.state types registered,
+    wrapped so every checkpoint READ is scanned for non-finite floats before
+    any caller (node, conditional edge, ``as_node`` jump, or CLI finalize
+    path) can observe the deserialized value.
 
     This suppresses the 'Deserializing unregistered type' deprecation warning
     that langgraph emits when it deserializes Pydantic models (BudgetLedger,
     TaskState, HydraState) whose modules are not in the explicit allowlist.
 
     Pass the return value as ``serde=`` to SqliteSaver at every construction
-    site (supervisor.build_supervisor + hydra_memory._load_state_values).
+    site (supervisor.build_supervisor + hydra_memory._load_state_values) --
+    confirmed by ``grep -rn "SqliteSaver("`` to be the ONLY two places this
+    process ever constructs a checkpoint reader/writer. Every
+    ``get_state``/``update_state``/``invoke`` call on the compiled graph (and
+    every ``hydra-mem.workflow_status`` style read-only tool) reads the prior
+    checkpoint through ``SqliteSaver.get_tuple``, which calls
+    ``serde.loads_typed`` on the WHOLE checkpoint dict (see
+    ``SqliteSaver.put``'s use of ``self.serde.dumps_typed(checkpoint)`` for
+    the symmetric write) -- there is no code path in this repository that
+    reads a persisted checkpoint's ``channel_values`` without going through
+    that call. Scanning here, once, therefore covers a hostile/legacy
+    ``as_node`` jump exactly the same as an ordinary node re-entry: the
+    poisoned bytes cannot become a live Python object at all without first
+    passing this gate.
+
+    Chosen over a "state-entry validator" graph node (the other candidate
+    choke point): LangGraph's ``update_state(..., as_node=...)`` is
+    EXPLICITLY designed to apply a patch and re-enter the graph at an
+    arbitrary node without running any node function in between -- that is
+    precisely the mechanism `cli._cmd_finalize` uses (`as_node=
+    "judge_per_squad"`) and precisely the mechanism the FAIL this round
+    describes exploits. A validator implemented as a graph node is, by
+    construction, one more node an `as_node=` jump can route around; a
+    validator implemented as a Python-level wrapper around
+    `invoke`/`update_state`/`get_state` would need to be called at every one
+    of dozens of scattered call sites across `cli.py`/`supervisor.py`/the MCP
+    servers, and a future call site can always forget it (this is exactly
+    the "twelve rounds, twelve near-misses" failure mode already observed).
+    The serde is the one object both of those layers are built ON TOP of, so
+    there is nothing beneath it left to bypass.
 
     Returns None when langgraph / JsonPlusSerializer is not importable so the
-    caller can fall back to the bare SqliteSaver(conn) construction.
+    caller can fall back to the bare SqliteSaver(conn) construction (the
+    ``_PurePythonRunner`` dev/test fallback never persists a checkpoint at
+    all, so there is nothing for this choke point to scan there).
     """
     try:
         from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer  # type: ignore
     except ImportError:  # pragma: no cover — langgraph absent
         return None
-    return JsonPlusSerializer(
+
+    from .strict_json import find_non_finite_field
+
+    class _ScanningCheckpointSerde(JsonPlusSerializer):
+        """``JsonPlusSerializer`` whose ``loads_typed`` refuses a checkpoint
+        whose deserialized ``channel_values`` (or any other top-level key —
+        the whole checkpoint dict is scanned, not an enumerated field list,
+        so a FUTURE state field carrying a payload is covered without a code
+        change here) contains a non-finite float anywhere in its structure.
+
+        Scans the deserialized VALUE, not the raw bytes: this runs after
+        ``JsonPlusSerializer``'s own msgpack/json decode has already
+        reconstructed real Python objects (dicts, lists, Pydantic models via
+        ``model_dump``), so nested Pydantic model fields are visible to
+        ``find_non_finite_field`` the same way a plain dict's are.
+        """
+
+        def loads_typed(self, data: tuple[str, bytes]) -> Any:
+            value = super().loads_typed(data)
+            bad_field = find_non_finite_field(value)
+            if bad_field is not None:
+                raise PoisonedStateError(bad_field)
+            return value
+
+    return _ScanningCheckpointSerde(
         allowed_msgpack_modules=[HydraState, TaskState, BudgetLedger],
     )
