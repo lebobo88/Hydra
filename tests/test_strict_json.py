@@ -267,6 +267,54 @@ def test_sanitize_non_finite_key_collision_keeps_both_values_distinct():
     assert any("<key:" in f for f in fields)
 
 
+def test_sanitize_non_finite_key_collision_none_vs_nan_survives_json_roundtrip():
+    """Cross-vendor judge finding (this round, item 1 MEDIUM): uniqueness
+    must be checked against the JSON MEMBER NAME a key serializes to, not
+    the Python key object. `None` -> `"null"`, so a dict with BOTH a
+    genuine `None` key and a NaN key (which also sanitizes toward `"null"`)
+    must keep both values distinct through an actual `json.dumps`/
+    `json.loads` round trip -- not just as a Python dict in memory."""
+    payload = {None: "original", float("nan"): "replacement"}
+    result, fields = sanitize_non_finite(payload)
+    assert len(result) == 2, "both values must survive sanitization itself"
+    text = json.dumps(result)
+    parsed = json.loads(text)
+    assert len(parsed) == 2, (
+        "sanitized keys must not collide once serialized to real JSON "
+        "member names -- a naive fix can pass in-memory but still emit "
+        "two members named \"null\""
+    )
+    assert "original" in parsed.values()
+    assert "replacement" in parsed.values()
+    assert any("<key:" in f for f in fields)
+
+
+def test_sanitize_non_finite_key_collision_true_vs_string_true():
+    """`True` serializes to the JSON member name `"true"`; a dict with both
+    a genuine `True` key and a literal `"true"` string key must keep both
+    values distinct through a real JSON round trip."""
+    payload = {True: "bool-key", "true": "string-key"}
+    result, fields = sanitize_non_finite(payload)
+    assert len(result) == 2
+    parsed = json.loads(json.dumps(result))
+    assert len(parsed) == 2, "True and \"true\" must not collide once serialized"
+    assert "bool-key" in parsed.values()
+    assert "string-key" in parsed.values()
+
+
+def test_sanitize_non_finite_key_collision_int_vs_string_digit():
+    """The int key `3` serializes to the JSON member name `"3"`; a dict
+    with both `3` and the literal string `"3"` as keys must keep both
+    values distinct through a real JSON round trip."""
+    payload = {3: "int-key", "3": "string-key"}
+    result, fields = sanitize_non_finite(payload)
+    assert len(result) == 2
+    parsed = json.loads(json.dumps(result))
+    assert len(parsed) == 2, "3 and \"3\" must not collide once serialized"
+    assert "int-key" in parsed.values()
+    assert "string-key" in parsed.values()
+
+
 def test_dumps_tool_response_safe_marker_does_not_overwrite_caller_field():
     """A caller-authored `_non_finite_fields_sanitized` field must survive
     untouched; the sanitizer's own marker lands under a different name."""

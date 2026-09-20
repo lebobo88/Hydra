@@ -353,40 +353,65 @@ def test_nested_payload_outcome_unjudgeable_still_blocks():
     assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
 
 
-def test_genuinely_matching_verdict_not_double_counted_via_id_and_outcome():
-    """Companion to the id-collision fix: a persisted envelope that IS the
-    same record (same id AND same outcome) already folded into
-    `state.verdicts` must still hard-block (via the `state.verdicts` scan)
-    without the envelope-scan path re-processing it as a second, distinct
-    hit."""
+def test_id_match_with_differing_outcome_still_hard_blocks_via_envelope_scan():
+    """Isolates the envelope-scan's `already_folded` predicate (supervisor.py
+    ``already_folded = matched is not None and _verdict_outcome(matched) ==
+    env_outcome``) from the earlier `state.verdicts` scan.
+
+    Cross-vendor judge finding (this round, item 2 LOW): the previous version
+    of this test put a genuinely-matching (same id AND same outcome
+    "unjudgeable") record in `state.verdicts`. But the `state.verdicts` scan
+    (lines ~3044-3046) runs BEFORE the envelope loop and unconditionally sets
+    `unjudgeable_hit` from ANY `outcome == "unjudgeable"` entry in
+    `state.verdicts`, regardless of whether a matching envelope exists. So
+    that test passed even with the id-and-outcome match check deleted
+    entirely -- the earlier scan already supplied the block, and the
+    envelope-scan's own predicate was never exercised at all.
+
+    Here, `state.verdicts` holds a record with the SAME id as the envelope
+    but outcome="pass" -- which cannot itself trip the `state.verdicts` scan
+    (only `outcome == "unjudgeable"` does). The envelope carries
+    outcome="unjudgeable" under that same id. Because the outcomes differ,
+    `already_folded` must evaluate False (an id match alone is NOT proof of
+    "the same record"), so the block must come from the envelope scan --
+    the only remaining signal available to this state.
+    """
     sup = _build_sup()
     judge_per_squad = _node(sup, "judge_per_squad")
 
-    state = HydraState(root_goal="genuine match resume")
-    verdict_id = str(uuid4())
-    target_id = str(uuid4())
-    verdict = {
-        "id": verdict_id,
+    state = HydraState(root_goal="id match, differing outcome resume")
+    shared_id = str(uuid4())
+    non_unjudgeable_verdict = {
+        "id": shared_id,
         "type": "JUDGE_VERDICT",
         "workflow_id": str(state.workflow_id),
         "origin_squad": "hydra-judge",
-        "target_envelope_id": target_id,
+        "target_envelope_id": str(uuid4()),
+        "outcome": "pass",
+        "rubric_id": "owasp-asvs-l1@1",
+    }
+    unjudgeable_envelope_same_id = {
+        "id": shared_id,
+        "type": "JUDGE_VERDICT",
+        "workflow_id": str(state.workflow_id),
+        "origin_squad": "hydra-judge",
+        "target_envelope_id": str(uuid4()),
         "outcome": "unjudgeable",
         "rubric_id": "constitution-alignment@1",
         "judge_vendor": "codex",
         "critique_md": "non-finite value at $.constraints.budget_usd; refusing to write invalid JSON",
     }
-    state.verdicts = [verdict]
-    state.envelopes = [dict(verdict)]  # exact same record, also persisted as an envelope
+    state.verdicts = [non_unjudgeable_verdict]
+    state.envelopes = [unjudgeable_envelope_same_id]
 
     patch = judge_per_squad(state)
 
-    assert patch["phase"] == "surfaced"
+    assert patch["phase"] == "surfaced", (
+        "an id match with a DIFFERING outcome must never suppress a genuine "
+        "unjudgeable hit -- the block must come from the envelope scan since "
+        "state.verdicts alone (outcome='pass') cannot trigger it"
+    )
     assert patch["pending_hitl"]["reason"] == "unjudgeable_envelope"
-    # Exactly one unjudgeable verdict drives the HITL (the state.verdicts
-    # scan's hit), not a second one manufactured by the envelope scan.
-    unjudgeable_verdicts = [v for v in patch["verdicts"] if v.get("outcome") == "unjudgeable"]
-    assert len(unjudgeable_verdicts) <= 1
 
 
 def test_unjudgeable_final_record_blocks_postcheck_from_marking_done():
