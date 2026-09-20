@@ -729,7 +729,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
                 "budget": {
                     "type": "number",
-                    "description": "Budget cap in USD (optional).",
+                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
                 },
                 "workflow_id": {
                     "type": "string",
@@ -772,7 +772,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
                 "budget": {
                     "type": "number",
-                    "description": "Budget cap in USD (optional).",
+                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
                 },
                 "workflow_id": {
                     "type": "string",
