@@ -89,6 +89,8 @@ def _build_sup(disp=None):
         project_root=HYDRA_ROOT,
         dispatcher=disp or _StubDispatcher(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
 
 

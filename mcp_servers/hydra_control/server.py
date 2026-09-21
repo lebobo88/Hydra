@@ -5,19 +5,47 @@ C5 eights-audit (2026-06-07): added hydra.cockpit.audit tool.
 
 Tools:
   - hydra.control.ping       — no-arg liveness probe (AgentMesh healthProbe)
-  - hydra.workflow.resume    — resolve a pending HITL gate by launching a
-                               DETACHED `hydra resume` CLI subprocess
+  - hydra.workflow.resume    — resolve a pending HITL gate. Two transports,
+                               chosen by HYDRA_ALLOW_DETACHED (see below):
+                               a DETACHED `hydra resume --live` CLI subprocess,
+                               or (the normal interactive-session case) a
+                               SYNCHRONOUS in-process `hydra resume --gate-only`
+                               that resolves the gate and returns WITHOUT ever
+                               re-entering the compiled graph.
   - hydra.cockpit.audit      — file a 'cockpit_write' eights audit envelope
                                for every cockpit write action (spool-safe)
 
-Why detached: a LangGraph continuation is long-running (squad dispatch,
-judging, synthesis) and cannot complete synchronously inside an MCP tool
-call without blocking stdio and blowing the caller's per-call timeout. The
-tool therefore validates, launches, and returns immediately with
-{ok, launched: true, pid, log}; progress is observable via
-hydra-mem.workflow_status and the workflow's trace.jsonl. The CLI itself is
-idempotent — resuming a workflow whose gate is already cleared is a no-op —
-so a retried launch never double-applies.
+Why detached (automation path, HYDRA_ALLOW_DETACHED=1): a LangGraph
+continuation is long-running (squad dispatch, judging, synthesis) and cannot
+complete synchronously inside an MCP tool call without blocking stdio and
+blowing the caller's per-call timeout. The tool therefore validates,
+launches, and returns immediately with {ok, launched: true, pid, log};
+progress is observable via hydra-mem.workflow_status and the workflow's
+trace.jsonl. The CLI itself is idempotent — resuming a workflow whose gate is
+already cleared is a no-op — so a retried launch never double-applies.
+
+Why gate-only, not detached (attended/interactive path, the default):
+launching ANY detached subprocess from an interactive session is refused by
+`_detached_allowed()` regardless of tool — resume must not be an exception.
+RESOLVE-GATE-ONLY (EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7 path K follow-up)
+resolves the gate synchronously and in-band (`_run_cli_json`, never `--live`)
+via `hydra resume --gate-only`, which mints+verifies the operator capability
+for EVERY action that can mutate checkpoint state or the spool (refusing
+before touching anything if the identity is unknown or the token is
+degraded — cross-vendor finding 2: this now covers `reject`, which was
+historically exempt), applies the per-action state patch, prunes the spool,
+and returns WITHOUT calling `sup.invoke` — no node_dispatch, no squad of any
+kind runs. The attended host's own step/submit loop continues the workflow
+from its cursor; the result JSON says explicitly `graph_reentered: false`
+(an ADDITIVE field, not part of a byte-for-byte-identical body — see
+cross-vendor finding 5).
+
+Exception: `recover-stalled-stage` is NOT a gate resolution at all -- it is
+a LIVE operation (a real `MCPStdioDispatcher` that can replay a pp verdict,
+run smoke/finalization, and merge code). It is refused outright on this
+attended route, before `_run_cli_json` is ever called (cross-vendor finding
+1); only the DETACHED route (`hydra resume --live --action
+recover-stalled-stage`, requires `HYDRA_ALLOW_DETACHED=1`) may run it.
 
 This server is intentionally SEPARATE from hydra_memory: hydra_memory is a
 read-only surface that AgentMesh's read/stitch federation clients may call;
@@ -54,12 +82,21 @@ _HYDRA_ROOT = Path(os.environ.get("HYDRA_ROOT") or _HERE.parents[2])
 from hydra_core.proc import no_window_creationflags  # noqa: E402 — needs sys.path.insert above
 
 _RESUME_ACTIONS = ("approve", "reject", "modify-budget", "force-dispatch",
-                   "change-squads", "recover-stalled-stage")
+                   "change-squads", "recover-stalled-stage", "modify-plan")
 
 # workflow_id is used as a subprocess argument — restrict to UUID-ish tokens
 # so a malicious payload can never smuggle flags or shell metacharacters.
 _WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$")
 _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
+
+# P5c: `--modify-plan`'s critique reference. A file path or a
+# `repo:artifact:<path>` MemoryRef key -- both need `/` (and, on Windows,
+# `\` and `:`), which `_OPTION_RE` deliberately excludes. The critique TEXT
+# itself never travels through this field (or through `option`) -- only a
+# reference the CLI reads on its own side (`hydra_core.cli._read_plan_
+# critique`). No leading `-` (argparse-flag confusion), no shell
+# metacharacters, generous length (a real repo path can be long).
+_CRITIQUE_REF_RE = re.compile(r"^(?!-)[A-Za-z0-9 ,._:/\\-]{1,4096}$")
 
 # C5: audit — cockpit write actions that may appear in hydra.cockpit.audit calls.
 # This is informational/validation; we do not restrict the action field to this set
@@ -67,7 +104,7 @@ _OPTION_RE = re.compile(r"^[A-Za-z0-9 ,._\-]{0,200}$")
 _COCKPIT_WRITE_ACTIONS = frozenset({
     "launch", "approve", "reject", "modify-budget",
     "force-dispatch", "change-squads", "recover-stalled-stage",
-    "replay", "tag_memory",
+    "modify-plan", "replay", "tag_memory",
 })
 
 # ---------------------------------------------------------------------------
@@ -146,6 +183,21 @@ _ENVELOPE_EXTRA_FIELDS: dict[str, frozenset[str]] = {
     "VOC_REPORT": frozenset({
         "period", "coverage", "themes", "escalation_patterns",
         "delight_signals", "recommendations",
+    }),
+    # P5b: without this entry, every PLAN-specific field is silently
+    # stripped at this MCP boundary before the envelope ever reaches
+    # `hydra_core.ingest.dispatch_ingested_envelopes`'s PLAN branch, and
+    # validation then fails downstream with a misleading "missing required
+    # field" instead of the real "field stripped at intake" cause. Derived
+    # from `hydra_core.schemas.Plan`'s own fields minus the base
+    # `HydraEnvelope` fields and `_RESERVED_ENVELOPE_KEYS` (hand-typed here,
+    # like every other entry in this dict, but pinned to the model by
+    # `tests/test_p5b_plan_lifecycle.py::test_plan_extra_fields_match_model`
+    # so the two cannot drift apart silently).
+    "PLAN": frozenset({
+        "rigor", "goal_restatement", "summary", "steps", "non_goals",
+        "open_questions", "risks", "artifact_path", "plan_revision",
+        "supersedes", "authored_by", "dissents",
     }),
 }
 
@@ -331,11 +383,117 @@ def _normalize_and_validate_envelopes(
     return normalized, rejected
 
 
-def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[str, Any]:
-    # Detached gate: resume is automation-only. No fleet exemption — a resume
-    # call carries no fleet goal string, so fleet detection is not applicable.
+# Cross-vendor finding 4: the attended gate-only route never dispatches --
+# it mints/verifies an operator capability, patches the checkpoint, and
+# prunes the spool, all in-process on `_NullDispatcher` with no subprocess or
+# network call of its own. That is a sub-second operation in the normal
+# case. This constant is used ONLY by the gate-only transport below --
+# every other `_run_cli_json` call in this module keeps its own, larger
+# timeout (plan/step/submit/finalize).
+#
+# Cross-vendor finding 1a: the ONE piece of live I/O this route does perform
+# is the bounded gate-only TheEights round trip
+# (`hydra_core.cli._resolve_eights_hitl_gate_only_bounded`), capped at
+# HYDRA_GATE_ONLY_EIGHTS_TIMEOUT_S=8s by default -- deliberately far below
+# this process's own kill timeout so that inner deadline always wins and
+# reports "unavailable" rather than being cut off mid-call. Raised from 30s
+# to 45s here so the arithmetic has real margin even on a slow/cold Windows
+# host: 8s (inner eights deadline) + ~1s (identity precheck, checkpoint
+# patch, spool prune, JSON encode -- the only other work on this path) +
+# ~36s margin for Python/module cold start = 45s.
+_RESUME_TIMEOUT_S = int(os.environ.get("HYDRA_RESUME_TIMEOUT_S", "45"))
+
+
+def _run_resume_attended(workflow_id: str, action: str, option: str | None,
+                         critique_ref: str | None = None) -> dict[str, Any]:
+    """Resolve a paused workflow's HITL gate SYNCHRONOUSLY and in-band, via
+    the non-detaching `_run_cli_json` transport — the attended counterpart to
+    `_launch_resume`.
+
+    EIGHTS-RECORD-OUTCOME-RCA-2026-09-16 §7 path K [D]: when detached launch
+    is not allowed (the normal interactive-session case), a resume must never
+    spawn `hydra resume --live` (a DETACHED, long-running process the
+    interactive session's `_detached_allowed()` gate exists specifically to
+    refuse). Instead this runs `python -m hydra_core.cli resume <id> --action
+    <action> --gate-only [--option ...] [--critique-ref ...]` WITHOUT `--live`,
+    short-lived and in-process on `_NullDispatcher`.
+
+    RESOLVE-GATE-ONLY (operator decision A): EXCEPT for `recover-stalled-
+    stage`, which is refused outright below before any subprocess runs
+    (cross-vendor finding 1: it is a live operation, not a gate resolution --
+    see the refusal block immediately after this docstring), this ALWAYS
+    passes `--gate-only`. The CLI's gate_only mode resolves the gate
+    (lock, operator-capability mint+verify — REFUSING before any state change
+    if the operator identity is unknown or the minted capability is degraded,
+    decision B — spool prune, per-action state patch clearing pending_hitl and
+    recording the resolution) and returns WITHOUT EVER calling `sup.invoke`:
+    no node_dispatch, no squad of any kind runs, not even on the stub
+    `_NullDispatcher`. This is deliberately NOT the same guarantee as E2-22's
+    non-live deferral filter (which still applies to node_dispatch generally
+    and is untouched) — gate-only is a stronger, explicit guarantee that
+    graph execution never happens on this transport at all. Operator
+    decision 2: once the gate clears locally, TheEights' matching pending
+    ticket is resolved NOW, via a dedicated narrow live client
+    (`hydra_core.cli._resolve_eights_hitl_gate_only` /
+    `hydra_core.eights.attestation.GateOnlyHitlClient` — one list + one
+    resolve call, never `replay_pending`/`replay_pending_async`, never a
+    spool write on failure). The CLI result reports `eights_resolution:
+    "resolved"` on success or `"unavailable"` (with a reason) when TheEights
+    cannot be reached — never a hardcoded "deferred". The host's existing
+    step/submit loop (hydra.workflow.step / hydra.workflow.submit_host_result)
+    then continues the workflow from its cursor exactly as if it had never
+    paused — the CLI result JSON says so explicitly
+    (`graph_reentered: false`, a `note` naming `hydra.workflow.step`).
+    """
+    # Cross-vendor finding 1 (CRITICAL): recover-stalled-stage is a LIVE
+    # operation (`_attended_live_dispatcher` -> `MCPStdioDispatcher` ->
+    # `host_bridge.recover_stalled_stage`, which can replay a pp verdict,
+    # run smoke/finalization, and merge code) -- exactly what the attended
+    # gate-only route (operator decision A) promises never to run. Refuse it
+    # HERE, before any subprocess is ever spawned, rather than relying solely
+    # on the CLI's own `--gate-only` refusal (hydra_core.cli
+    # `_cmd_resume_locked`, defence in depth). The DETACHED route (`hydra
+    # resume --live --action recover-stalled-stage`, requires
+    # HYDRA_ALLOW_DETACHED=1) is the only route that may run this recovery.
+    if action == "recover-stalled-stage":
+        return {
+            "ok": False,
+            "error": "recovery_is_live_operation",
+            "workflow_id": workflow_id,
+            "action": action,
+            "message": (
+                "recover-stalled-stage can replay a pp verdict and run live "
+                "squad/engineering work (smoke, finalize, merge); it is "
+                "refused on the attended resume route. Set "
+                "HYDRA_ALLOW_DETACHED=1 to use the detached `hydra resume "
+                "--live --action recover-stalled-stage` route instead. "
+                "Nothing was changed."
+            ),
+        }
+
+    cli_args = ["resume", workflow_id, "--action", action, "--gate-only"]
+    if option:
+        cli_args.extend(["--option", option])
+    if critique_ref:
+        cli_args.extend(["--critique-ref", critique_ref])
+    result = _run_cli_json(cli_args, timeout_s=_RESUME_TIMEOUT_S,
+                           err_label="resume", workflow_id=workflow_id)
+    if "ok" not in result:
+        # _run_cli_json's own error shapes (timeout/failed/unparseable) don't
+        # set "ok" — normalise so every caller can key off it uniformly.
+        result = {"ok": False, **result}
+    return result
+
+
+def _launch_resume(workflow_id: str, action: str, option: str | None,
+                   critique_ref: str | None = None) -> dict[str, Any]:
+    # Detached gate: resume is automation-only in an interactive session.
+    # When detached launch is not allowed, route through the non-detaching,
+    # in-band `_run_resume_attended` transport instead of refusing outright
+    # (RCA path K) — this NEVER spawns `hydra resume --live`.
     if not _detached_allowed():
-        return _detached_refusal("resume")
+        return _run_resume_attended(workflow_id, action, option,
+                                    critique_ref=critique_ref)
 
     log_dir = _HYDRA_ROOT / ".hydra" / workflow_id
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -349,6 +507,8 @@ def _launch_resume(workflow_id: str, action: str, option: str | None) -> dict[st
     ]
     if option:
         cmd.extend(["--option", option])
+    if critique_ref:
+        cmd.extend(["--critique-ref", critique_ref])
 
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", str(_HYDRA_ROOT))
@@ -416,7 +576,21 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
     # (codex review item 5). The CLI's resume lock still serializes the actual
     # dispatch; this just keeps each child's input intact.
     env_path = wf_dir / f"ingest_envelopes_{uuid.uuid4().hex}.json"
-    env_path.write_text(json.dumps({"envelopes": envelopes}, indent=2), encoding="utf-8")
+    # Cross-vendor judge finding (item 4/4): this is a WRITE of a fresh
+    # payload (host-completed skill envelopes about to be dispatched), not a
+    # read of already-stored data — the guiding principle keeps writes
+    # strict. Route through the shared `strict_json.dumps_strict` helper
+    # (same seam as the judge dispatcher and plan-artifact renderer) instead
+    # of a bare `json.dumps`, so a non-finite value here raises a clear,
+    # field-naming `ValueError` instead of writing a bare `NaN`/`Infinity`
+    # token that a strict downstream JSON parser would reject. The caller
+    # (`workflow_submit_envelopes`) already wraps this call and turns any
+    # exception into an `{"ok": False, ...}` response.
+    from hydra_core.strict_json import dumps_strict
+    env_path.write_text(
+        dumps_strict({"envelopes": envelopes}, label=f"submit_envelopes:{workflow_id}", indent=2),
+        encoding="utf-8",
+    )
     log_path = wf_dir / "ingest.log"
 
     cmd = [
@@ -624,6 +798,35 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
                     "janitor sweep_stale_worktrees reap it once terminal)"
                 ),
             ]
+        if err_label == "resume":
+            # Operator decision D: a timed-out (gate_only) resume must tell
+            # the caller how to discover state before retrying, and whether a
+            # retry is safe.
+            _tout["retry_guidance"] = (
+                f"read state first via hydra.workflow.step({workflow_id!r}) or "
+                "`hydra status` before retrying the resume — the gate may "
+                "already be resolved (a retry against an already-cleared gate "
+                "is a documented no-op, reason=no_pending_gate)."
+            )
+            # Safe: gate-only never re-enters the graph (no sup.invoke), and
+            # `_acquire_resume_lock` reclaims by OWNER LIVENESS, not
+            # wall-clock — subprocess.run kills the timed-out child on
+            # TimeoutExpired, so its PID goes dead immediately and the lock is
+            # reclaimed on the very next attempt rather than staying stuck.
+            # A retry after a partial gate-only resume (killed mid-mint, or
+            # even mid-patch) is therefore safe: it either re-runs the small
+            # gate-only sequence from scratch, or — if the patch had already
+            # landed — observes pending_hitl already cleared and reports
+            # `no_pending_gate` rather than re-mutating anything. Cross-
+            # vendor finding 3: this claim depends on the `no_pending_gate`
+            # path also reconciling the spool, since the checkpoint patch is
+            # written before the spool prune (a kill in between would
+            # otherwise strand a spooled HITL request for an already-
+            # resolved gate forever). `_cmd_resume_locked`'s no-pending
+            # branch now idempotently prunes the last resolved gate's
+            # spooled entry on every gate-only call, so this is true, not
+            # just true for the checkpoint half of the operation.
+            _tout["retry_after_partial_gate_only_is_safe"] = True
         return _tout
     if proc.returncode != 0:
         return {"ok": False, "error": f"{err_label}_failed", "workflow_id": workflow_id,
@@ -645,6 +848,7 @@ def _run_cli_json(cli_args: list[str], *, timeout_s: int,
 
 def _run_plan(goal: str, *, squad: str | None, budget: float | None,
               workflow_id: str | None, risk: str | None = None,
+              rigor: str | None = None,
               repo: str | None = None, repos: str | None = None,
               repo_subpath: str | None = None) -> dict[str, Any]:
     """Run `hydra plan` SYNCHRONOUSLY and return the planner state IN-BAND.
@@ -665,6 +869,8 @@ def _run_plan(goal: str, *, squad: str | None, budget: float | None,
         cli_args.extend(["--budget", str(budget)])
     if risk is not None:
         cli_args.extend(["--risk", risk])
+    if rigor is not None:
+        cli_args.extend(["--rigor", rigor])
     if repo:
         cli_args.extend(["--repo", repo])
     if repos:
@@ -692,7 +898,21 @@ def _run_submit_host_result(workflow_id: str, run_id: str, call_key: str,
     res_dir.mkdir(parents=True, exist_ok=True)
     safe_key = "".join(c for c in call_key if c.isalnum() or c in "-_") or "result"
     res_file = res_dir / f"hostresult-{safe_key}.json"
-    res_file.write_text(json.dumps(result), encoding="utf-8")
+    # Cross-vendor judge finding (item 3/6, HIGH): this is PERSISTENCE (a
+    # host subagent result written to disk, later re-read by `hydra
+    # submit-host-result` and folded into the checkpointed HydraState), the
+    # same category of write `submit_envelopes` above already routes through
+    # `strict_json.dumps_strict` -- a non-finite value here (e.g. a hostile
+    # or buggy host subagent reporting `cost_usd: Infinity`) must FAIL
+    # STRUCTURALLY, not silently persist a bare `NaN`/`Infinity` token a
+    # strict downstream JSON parser would reject. The caller
+    # (`workflow_submit_host_result`) already wraps this call and turns any
+    # exception into a `{"ok": False, "error": ...}` structured response.
+    from hydra_core.strict_json import dumps_strict
+    res_file.write_text(
+        dumps_strict(result, label=f"submit_host_result:{workflow_id}:{call_key}"),
+        encoding="utf-8",
+    )
     return _run_cli_json(
         ["submit-host-result", workflow_id, "--run-id", run_id,
          "--call-key", call_key, "--result", str(res_file)],
@@ -750,6 +970,10 @@ def _tool_handlers() -> dict[str, Any]:
         action = str(args.get("action") or "")
         option = args.get("option")
         option = str(option) if option not in (None, "") else None
+        # P5c: `--modify-plan`'s critique carried as a file path / MemoryRef
+        # key, NEVER as `option` — see `_CRITIQUE_REF_RE`'s comment above.
+        critique_ref = args.get("critique_ref")
+        critique_ref = str(critique_ref) if critique_ref not in (None, "") else None
 
         if not _WORKFLOW_ID_RE.match(workflow_id):
             return {"ok": False, "error": "invalid_workflow_id"}
@@ -758,8 +982,17 @@ def _tool_handlers() -> dict[str, Any]:
                     "valid": list(_RESUME_ACTIONS)}
         if option is not None and not _OPTION_RE.match(option):
             return {"ok": False, "error": "invalid_option"}
+        if critique_ref is not None and not _CRITIQUE_REF_RE.match(critique_ref):
+            return {"ok": False, "error": "invalid_critique_ref"}
 
         try:
+            # Pass critique_ref only when actually present: keeps the call
+            # shape identical to the pre-P5c 3-positional-arg form for every
+            # non-modify-plan action, so a test double (or any other caller)
+            # written against `_launch_resume(workflow_id, action, option)`
+            # is unaffected by this additive parameter.
+            if critique_ref is not None:
+                return _launch_resume(workflow_id, action, option, critique_ref=critique_ref)
             return _launch_resume(workflow_id, action, option)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("resume launch failed")
@@ -863,6 +1096,8 @@ def _tool_handlers() -> dict[str, Any]:
             return {"ok": False, "launched": False, "error": f"launch_failed: {e}"}
 
     _RISK_VALUES = frozenset({"low", "medium", "high"})
+    # P3: operator override of node_planner's computed plan_rigor (plan-only).
+    _RIGOR_VALUES = frozenset({"trivial", "standard", "major"})
     # Repo/repos/subpath: loose transport-level shape only (comma/dash/underscore
     # tokens). The allow-list check happens once, at Hydra intake, regardless of
     # whether the id arrived via goal text or this structured param (WS1-B) —
@@ -912,6 +1147,18 @@ def _tool_handlers() -> dict[str, Any]:
             budget = float(budget) if budget not in (None, "") else None
         except (TypeError, ValueError):
             return {"ok": False, "error": "budget must be numeric"}
+        if budget is not None:
+            # Cross-vendor judge finding (this round, CRITICAL): a bare
+            # `float(...)` accepts "nan"/"inf" -- the same shared validator
+            # used by the CLI `--budget` flags and `hydra budget --set`
+            # (see `strict_json.reject_non_finite`'s docstring) so a
+            # non-finite budget cannot slip into a fresh workflow launched
+            # from the MCP surface either.
+            from hydra_core.strict_json import reject_non_finite
+            try:
+                reject_non_finite(budget, flag="budget")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
         workflow_id = args.get("workflow_id")
         workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
         if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
@@ -954,6 +1201,13 @@ def _tool_handlers() -> dict[str, Any]:
             budget = float(budget) if budget not in (None, "") else None
         except (TypeError, ValueError):
             return {"ok": False, "error": "budget must be numeric"}
+        if budget is not None:
+            # See the matching guard in `workflow_run` above.
+            from hydra_core.strict_json import reject_non_finite
+            try:
+                reject_non_finite(budget, flag="budget")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
         workflow_id = args.get("workflow_id")
         workflow_id = str(workflow_id) if workflow_id not in (None, "") else None
         if workflow_id is not None and not _WORKFLOW_ID_RE.match(workflow_id):
@@ -963,12 +1217,18 @@ def _tool_handlers() -> dict[str, Any]:
         risk = str(risk) if risk not in (None, "") else None
         if risk is not None and risk not in _RISK_VALUES:
             return {"ok": False, "error": f"invalid_risk (must be low|medium|high, got {risk!r})"}
+        # P3: rigor param — operator override of the computed plan_rigor (optional).
+        rigor = args.get("rigor")
+        rigor = str(rigor) if rigor not in (None, "") else None
+        if rigor is not None and rigor not in _RIGOR_VALUES:
+            return {"ok": False,
+                    "error": f"invalid_rigor (must be trivial|standard|major, got {rigor!r})"}
         _repo_err, _repo_params = _extract_repo_params(args)
         if _repo_err is not None:
             return _repo_err
         try:
             return _run_plan(goal, squad=squad, budget=budget, workflow_id=workflow_id,
-                             risk=risk, **_repo_params)
+                             risk=risk, rigor=rigor, **_repo_params)
         except Exception as e:  # noqa: BLE001 — surfaced, never silent
             logger.exception("plan failed")
             return {"ok": False, "error": f"plan_failed: {e}"}
@@ -1337,6 +1597,17 @@ def _tool_handlers() -> dict[str, Any]:
                 set_budget = float(set_budget_raw)
             except (TypeError, ValueError):
                 return {"ok": False, "error": "set_budget must be numeric"}
+            # Cross-vendor judge finding (this round, CRITICAL): this check
+            # was non-negative only, so `set_budget: "nan"`/`"inf"` reached
+            # the `hydra budget --set` CLI mutation below unrejected. Same
+            # shared validator as the CLI `--budget` flags and
+            # `hydra budget --set` itself (see
+            # `strict_json.reject_non_finite`'s docstring).
+            from hydra_core.strict_json import reject_non_finite
+            try:
+                reject_non_finite(set_budget, flag="set_budget")
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
             if set_budget < 0:
                 return {"ok": False, "error": "set_budget must be non-negative"}
 
@@ -1390,16 +1661,51 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "hydra.workflow.resume": {
         "description": (
-            "Resolve a pending HITL gate: launches a DETACHED `hydra resume` "
-            "CLI subprocess and returns immediately ({ok, launched, pid, log}). "
-            "Idempotent at the CLI layer — no pending gate means no-op. "
-            "WRITE tool: only reachable via meshd's sanctioned write path."),
+            "Resolve a pending HITL gate. Transport depends on "
+            "HYDRA_ALLOW_DETACHED: with the gate set (automation), launches a "
+            "DETACHED `hydra resume --live` CLI subprocess and returns "
+            "immediately ({ok, launched, pid, log}). Without it (the normal "
+            "interactive session), runs `hydra resume --gate-only` "
+            "SYNCHRONOUSLY in-process and returns the resolved gate's result "
+            "in the same call ({ok, resumed: false, gate_only: true, "
+            "graph_reentered: false, phase, pending_hitl, ...}) — the gate "
+            "clears (lock, operator-capability mint+verify, spool prune, "
+            "state patch) but the compiled graph is NEVER re-entered (no "
+            "sup.invoke, no node_dispatch, no squad runs); the caller's "
+            "existing step/submit loop continues the workflow from its "
+            "cursor. Refuses with {ok: false, error: "
+            "\"operator_identity_required\"} before touching any state if "
+            "the operator identity is unknown or the minted capability is "
+            "degraded -- this check covers EVERY action that can mutate "
+            "checkpoint state or the spool, including 'reject' (not just "
+            "'approve'/'force-dispatch'/'modify-budget'/'change-squads'/"
+            "'modify-plan'). action='recover-stalled-stage' is the ONE "
+            "exception: it is a LIVE operation (can replay a pp verdict, "
+            "run smoke/finalize, and merge code), so it is refused outright "
+            "on this attended route ({ok: false, error: "
+            "\"recovery_is_live_operation\"}) before any subprocess runs; "
+            "only the detached `hydra resume --live --action "
+            "recover-stalled-stage` route (HYDRA_ALLOW_DETACHED=1) may run "
+            "it. Idempotent at the CLI layer — no pending gate means "
+            "no-op, and a retry after an interrupted gate-only resume "
+            "reconciles any stale spooled HITL request for the "
+            "already-resolved gate. WRITE tool: only reachable via meshd's "
+            "sanctioned write path."),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "workflow_id": {"type": "string"},
                 "action": {"type": "string", "enum": list(_RESUME_ACTIONS)},
                 "option": {"type": "string"},
+                "critique_ref": {
+                    "type": "string",
+                    "description": (
+                        "modify-plan only: a file path or repo:artifact:<path> "
+                        "MemoryRef key naming the operator's revision critique. "
+                        "The critique text itself must never be passed via "
+                        "'option' -- that field is character- and length-bounded."
+                    ),
+                },
             },
             "required": ["workflow_id", "action"],
         },
@@ -1418,7 +1724,7 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "goal": {"type": "string"},
                 "squad": {"type": "string",
                           "description": "Comma-separated squad slugs to force-select (optional)."},
-                "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
+                "budget": {"type": "number", "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected."},
                 "workflow_id": {"type": "string",
                                 "description": "Pre-allocated workflow id (optional)."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
@@ -1454,11 +1760,16 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "goal": {"type": "string"},
                 "squad": {"type": "string",
                           "description": "Comma-separated squad slugs to force-select (optional)."},
-                "budget": {"type": "number", "description": "Budget cap in USD (optional)."},
+                "budget": {"type": "number", "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected."},
                 "workflow_id": {"type": "string",
                                 "description": "Pre-allocated workflow id (optional)."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
                          "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional)."},
+                "rigor": {"type": "string", "enum": ["trivial", "standard", "major"],
+                          "description": ("Operator override of node_planner's computed plan_rigor, "
+                                         "forwarded as --rigor to the CLI (optional). Wins over the "
+                                         "computed value; a downgrade from the computed value is "
+                                         "recorded as a hitl_history event.")},
                 "repo": {"type": "string",
                          "description": ("Single allow-listed repo id for engineering targeting "
                                         "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
@@ -1812,7 +2123,8 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "description": (
                         "New budget_usd ceiling to write into the checkpoint. "
                         "Requires workflow_id. Triggers M3 capability verification. "
-                        "Must be non-negative."
+                        "Must be a finite, non-negative number (NaN/Infinity are "
+                        "rejected)."
                     ),
                 },
             },
@@ -1857,7 +2169,15 @@ def _serve_with_mcp_sdk() -> bool:
         # worker thread so the loop stays responsive; also keeps the handler
         # off the loop thread so its own dispatcher._run has no running loop.
         result = await asyncio.to_thread(handlers[name], arguments)
-        return [t.TextContent(type="text", text=json.dumps(result))]
+        # Cross-vendor judge finding (item 3/6, HIGH): a tool RESPONSE must
+        # stay valid JSON for the client no matter what -- sanitize any
+        # non-finite value to `null` with an explicit marker naming the
+        # field, rather than emit invalid JSON (a bare `NaN`/`Infinity`
+        # token) or fail the response outright.
+        from hydra_core.strict_json import dumps_tool_response_safe
+        return [t.TextContent(
+            type="text", text=dumps_tool_response_safe(result, label=f"tool_response:{name}"),
+        )]
 
     async def run() -> None:
         async with stdio_server() as (r, w):
@@ -1894,7 +2214,13 @@ def _serve_bare() -> None:
         except Exception as e:
             out = {"id": msg.get("id"), "error": str(e),
                    "traceback": traceback.format_exc()}
-        sys.stdout.write(json.dumps(out) + "\n")
+        # Cross-vendor judge finding (item 3/6, HIGH): same guarantee as the
+        # real-SDK `_call_tool` path above -- a bare-stdio response must
+        # stay valid JSON no matter what. Sanitize non-finite values rather
+        # than write an invalid `NaN`/`Infinity` token or crash the loop
+        # (which would drop every subsequent request on this stdio stream).
+        from hydra_core.strict_json import dumps_tool_response_safe
+        sys.stdout.write(dumps_tool_response_safe(out, label="bare_stdio_response") + "\n")
         sys.stdout.flush()
 
 

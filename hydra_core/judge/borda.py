@@ -15,11 +15,23 @@ from .schemas import JudgeVerdict
 
 
 def _verdict_score(v: JudgeVerdict) -> float:
-    """Sum of numeric score dimensions (ignoring underscore-prefixed metadata)."""
+    """Sum of numeric score dimensions (ignoring underscore-prefixed metadata).
+
+    Cross-vendor judge finding (follow-up round, HIGH): `score_json` is the
+    judge model's own UNTRUSTED response with arbitrary keys -- a hostile
+    or buggy judge can add a non-underscore-prefixed BOOLEAN dimension
+    (e.g. `"looks_good": True`). `bool` is an `int` subclass in Python, so
+    `isinstance(val, (int, float))` alone lets it through, and `float(True)
+    == 1.0` inflates the sum exactly like a real score point -- the same
+    class of exposure `squad_node._rank_key` already guards against via its
+    own `not isinstance(v, bool)` check, mirrored here.
+    """
     return sum(
         float(val)
         for k, val in (v.score_json or {}).items()
-        if not k.startswith("_") and isinstance(val, (int, float))
+        if not k.startswith("_")
+        and isinstance(val, (int, float))
+        and not isinstance(val, bool)
     )
 
 

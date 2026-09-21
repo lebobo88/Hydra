@@ -46,6 +46,7 @@ from .schemas import (
 )
 from .squad_loader import SquadPack
 from .state import HydraState, TaskState
+from .strict_json import dumps_strict, is_non_finite_float
 from .tool_scope import build_tool_scope_directive
 from .version import DoubleSpawnRefused, SquadDeprecated
 
@@ -752,6 +753,195 @@ def _augment_with_critique(base_prompt: str, critique_md: str) -> str:
     )
 
 
+def coerce_untrusted_cost(raw: Any) -> tuple[float, str]:
+    """Coerce an UNTRUSTED cost value (from a vendor CLI, an MCP response, a
+    host-driven subagent result, or any other externally-reported figure
+    that ends up compared against a budget) to a finite float.
+
+    Renamed from `coerce_vendor_cost` (cross-vendor judge finding, follow-up
+    round, framing correction): this is no longer only a "vendor parsing"
+    helper -- it is also the cast-site guard for `host_bridge._priced_cost`
+    (the ATTENDED path's host-result cost) and `cli.py`'s
+    `_cmd_attended_submit` (the same host result, re-validated at the
+    coercion point rather than only at the earlier whole-payload scan). A
+    name scoped to one of its four call sites would mislead the next reader
+    into adding a fifth cast site with a fresh, unguarded `float(...)`.
+
+    Every cost entry point in this module (Claude CLI stdout, a
+    pp_codex/pp_harness MCP response, a host-driven subagent result, a
+    SquadResult artifact `supervisor._extract_squad_cost` reads) routes
+    through this ONE helper, so the next source added inherits the guard
+    instead of repeating the omission.
+
+    Cross-vendor judge finding (this round, HIGH): coerce FIRST, THEN check
+    finiteness on the COERCED value -- checking `is_non_finite_float` on the
+    RAW value before casting (the previous shape of this fix) missed a
+    hostile JSON STRING like `"NaN"`/`"Infinity"`: `is_non_finite_float`
+    only recognizes an actual `float` instance, so a string sails past that
+    check, and `float("NaN")` / `float("Infinity")` still happily convert it
+    to a real non-finite number afterward. Validating the value that is
+    ACTUALLY CHARGED (post-coercion) closes that gap for every input shape
+    (a real float, a string, `None`, or garbage) in one place.
+
+    Framing correction (cross-vendor judge finding, follow-up round): a
+    STRING like `"NaN"` sitting in PERSISTED state (a checkpoint, a JSONL
+    row) is valid RFC 8259 JSON and is NOT itself a defect -- it round-trips
+    cleanly and `find_non_finite_field` correctly leaves it alone (widening
+    that walker to also hunt strings would produce false refusals on
+    ordinary text fields). The defect this helper closes is narrower and
+    specific: an untrusted string that BECOMES a non-finite float at a
+    `float()` CAST that feeds money or a gate decision. This helper belongs
+    at every such cast site, not at the choke point that merely persists
+    the (still-valid-JSON) string.
+
+    Returns ``(cost_usd, cost_source)``: ``cost_source`` is ``"measured"``
+    for a real finite number, ``"unmeasured"`` for anything missing,
+    unparseable, or non-finite after coercion -- a rejected report is never
+    silently indistinguishable from a genuine free call.
+    """
+    value, ok = _coerce_finite_float(raw)
+    return value, ("measured" if ok else "unmeasured")
+
+
+def _coerce_finite_float(raw: Any) -> tuple[float, bool]:
+    """Shared coercion primitive behind `coerce_untrusted_cost` and
+    `coerce_untrusted_count`: coerce FIRST, then check finiteness on the
+    COERCED value. Returns ``(value, ok)`` -- ``ok`` is ``False`` for
+    anything missing, unparseable, or non-finite after coercion (value is
+    then ``0.0``), so a caller that needs to REJECT a submission (rather
+    than clamp/relabel it) can do so without borrowing `coerce_untrusted_cost`'s
+    cost-specific ``"measured"``/``"unmeasured"`` labeling for a field that
+    isn't a dollar amount (e.g. `cli.py`'s `_cmd_attended_submit` preflight
+    validates `tokens_in`/`tokens_out` -- a COUNT, not a cost -- through
+    this primitive directly, cross-vendor judge finding, follow-up round,
+    HIGH: using the cost-labeled wrapper there was the wrong helper for the
+    field type)."""
+    if raw is None:
+        return 0.0, False
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, False
+    if is_non_finite_float(value):
+        return 0.0, False
+    return value, True
+
+
+def coerce_untrusted_count(raw: Any) -> int:
+    """Coerce an UNTRUSTED vendor-reported token count to a non-negative
+    int, clamping anything unparseable, non-finite (including a
+    NaN/Infinity STRING -- see `coerce_untrusted_cost`'s coerce-then-check
+    rationale), OR NEGATIVE to 0 rather than raising or passing the
+    negative value through. Tokens are informational counters in most
+    callers, but `host_bridge._priced_cost` feeds them into
+    `pricing.price_call`'s multiplication -- cross-vendor judge finding
+    (follow-up round, HIGH): this docstring already PROMISED a
+    non-negative clamp but the implementation never enforced it, so a
+    vendor reporting a negative token count could REDUCE a stage's priced
+    cost below what the actually-measured portion alone would charge. A
+    hostile value must never be able to discard an otherwise-successful
+    result via an unrelated exception handler, nor lower a charge by going
+    negative."""
+    value, ok = _coerce_finite_float(raw)
+    if not ok:
+        return 0
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return n if n >= 0 else 0
+
+
+# Precedence for `resolve_reported_cost`'s upstream/coerced combination:
+# STRICTLY increasing confidence. An upstream verdict may only move the
+# final answer DOWN this scale (weaken it), never up -- see that
+# function's docstring for why an upgrade path is a spoofable hole, not a
+# convenience. Expressed as an explicit rank table (not a chain of `if`s)
+# so a future fourth source only needs an entry here; the `min()`-by-rank
+# combinator in `resolve_reported_cost` cannot silently regain an upgrade
+# path for it the way an ad hoc conditional could.
+_COST_SOURCE_RANK: dict[str, int] = {"unmeasured": 0, "estimated": 1, "measured": 2}
+
+
+def resolve_reported_cost(result: dict[str, Any]) -> tuple[float, str]:
+    """Resolve a vendor call's ``(cost_usd, cost_source)``: coerce the raw
+    value FIRST, then combine with any upstream verdict by taking the
+    WEAKER (less confident) of the two -- an upstream verdict may only
+    DOWNGRADE the coercion's own answer, never upgrade it.
+
+    Cross-vendor judge finding (follow-up round, HIGH -- the fix from the
+    previous round turning on itself): that version trusted ANY recognized
+    upstream ``cost_source`` outright, coercing the raw value only for its
+    numeric VALUE. That let a vendor pair a REJECTED value with
+    ``cost_source: "measured"`` (``{"cost_usd": "NaN", "cost_source":
+    "measured"}`` -> ``(0.0, "measured")``) and suppress the unmeasured
+    audit record entirely -- the ORIGINAL defect this whole thread closes,
+    reintroduced BY the fix meant to protect the legitimate downgrade case.
+    This is not hypothetical: `resolve_reported_cost` is applied to more
+    than Hydra's own parser output -- `_drive_generate` forwards the raw
+    inner dict from a host-driven `dispatcher.run_host_agent` subagent
+    unchanged, and the critique accrual processes vendor-controlled
+    pp_agy/pp_codex/Claude critique dicts directly. ``cost_source`` on any
+    of those is therefore UNTRUSTED input from the party the provenance
+    chain exists to hold accountable, and can only ever WEAKEN the
+    verdict this function reaches on its own -- never strengthen it.
+
+    The three cases this precedence produces:
+      - Coercion REJECTS the value (absent, non-finite, unparseable):
+        the result is `"unmeasured"` regardless of what upstream claims --
+        upstream cannot promote a rejected value to measured.
+      - Coercion ACCEPTS the value and upstream claims something WEAKER
+        (`"unmeasured"`/`"estimated"`): the upstream, weaker answer wins --
+        this is the legitimate downgrade the previous round fixed, where
+        `_parse_claude_cli_result` knows a coercion-acceptable `0.0` was
+        actually a fabricated placeholder for a rejected/absent report.
+      - Coercion accepts and upstream claims `"measured"` (or claims
+        nothing recognized at all): the result is `"measured"` -- the
+        over-correction control this round's tests pin.
+
+    `coerce_untrusted_cost` itself only ever returns `"measured"` (a real
+    finite value) or `"unmeasured"` (value forced to `0.0`) -- it never
+    produces `"estimated"` on its own, so the REJECTED-value case above is
+    exactly "coerced source is the WEAKEST rank" and needs no special
+    casing; the shared `_COST_SOURCE_RANK` table and a single `min()` over
+    it handle every combination, including a rejected value paired with
+    ANY upstream claim, uniformly.
+
+    When ``result`` carries no recognized ``cost_source`` at all (the
+    codex/agy MCP critique response shape, the host-driven engineer
+    subagent shape when it happens not to set one) this reduces to plain
+    fresh coercion, unchanged from before this function existed.
+
+    Tokens have NO analogous upstream provenance to lose: no parser in
+    this codebase ever emits a `tokens_in_source`/`tokens_out_source`
+    verdict (tokens are plain informational counters, clamped by
+    `coerce_untrusted_count` directly from the raw field at every site,
+    with no "was this measured" concept ever attached to them upstream) --
+    so there is nothing here for tokens to re-derive over, and
+    `coerce_untrusted_count(result.get("tokens_in"))` remains correct
+    as-is at every accrual site.
+    """
+    coerced_value, coerced_source = coerce_untrusted_cost(result.get("cost_usd"))
+    upstream_source = result.get("cost_source")
+    # `upstream_source not in _COST_SOURCE_RANK` below is a dict-key
+    # membership test, which HASHES `upstream_source` -- an unhashable
+    # vendor-supplied value (a dict or list, e.g. a vendor sending a JSON
+    # object for `cost_source`) would raise TypeError before the fallback
+    # ever runs, turning a would-be degrade-to-coerced case into a crashed
+    # drive loop. Require `str` explicitly first: anything not a string
+    # (unhashable or not) falls back to the coerced verdict exactly like an
+    # unrecognized string does, and this check alone is sufficient because
+    # `bool`/`int`/`None` are already hashable and already fall back
+    # correctly via the membership test.
+    if not isinstance(upstream_source, str) or upstream_source not in _COST_SOURCE_RANK:
+        return coerced_value, coerced_source
+    final_source = min(
+        (coerced_source, upstream_source),
+        key=lambda s: _COST_SOURCE_RANK[s],
+    )
+    return coerced_value, final_source
+
+
 def _parse_claude_cli_result(
     stdout: str, stderr: str, returncode: int, model: str,
 ) -> dict[str, Any]:
@@ -762,9 +952,44 @@ def _parse_claude_cli_result(
     ``total_cost_usd`` and ``usage.{input,output}_tokens``. Real model id + spend
     flow into the budget ledger so the 80%/100% tripwires stay live. Degrade to
     raw stdout (cost 0 — budget blind on this attempt) when the output isn't JSON.
+
+    Cross-vendor judge finding (this round, CRITICAL): ``total_cost_usd`` /
+    ``usage.{input,output}_tokens`` come from the vendor CLI's OWN stdout --
+    an untrusted trust boundary, the same class of exposure
+    ``strict_json.reject_non_finite`` closes for an operator-supplied
+    ``--budget`` value. A NaN cost makes every later budget COMPARISON fail
+    open (``x < nan`` is always ``False``, so the block/downgrade gates
+    never fire); an Infinity cost disables the cap outright. Reachable in
+    ordinary operation -- it is whatever the CLI happens to print, not
+    something Hydra controls.
+
+    Unlike an operator-supplied flag, this is NOT input we can simply
+    refuse: the subprocess has already RUN by the time this parses its
+    output (real money may already be spent, and ``text`` carries the real
+    completed work -- the engineer's file edits already happened as side
+    effects). Discarding the whole result over an untrustworthy cost figure
+    would be strictly worse than the poisoned number itself. Instead, a
+    non-finite reported cost is treated exactly like a MISSING one:
+    ``cost_usd=0.0`` with ``cost_source="unmeasured"`` -- the same concept
+    ``host_bridge._priced_cost`` already uses for a host that reports no
+    cost at all -- so nothing downstream ever compares a NaN/Infinity to a
+    budget cap, yet the call is never silently indistinguishable from a
+    genuine free call (``cost_source`` tells them apart, and ``text`` notes
+    the rejection for the record) or thrown away.
+
+    ``usage.input_tokens``/``usage.output_tokens`` get the same treatment
+    (clamped to 0 rather than fed to ``int()``, which would otherwise raise
+    ``ValueError``/``OverflowError`` on a NaN/Infinity token count and
+    discard this ENTIRE result -- including the real ``text`` -- via the
+    caller's unrelated broad exception handler). Tokens are informational
+    counters in this module (no downstream budget COMPARISON reads them
+    directly, unlike ``cost_usd``), but a hostile value must not be able to
+    destroy an otherwise-successful generation's output as a side effect of
+    an unrelated field.
     """
     text = stdout or "(claude returned no output)"
     cost = 0.0
+    cost_source = "unmeasured"
     tin = tout = 0
     mdl = model
     try:
@@ -774,14 +999,24 @@ def _parse_claude_cli_result(
     if isinstance(obj, dict):
         text = str(obj.get("result") or obj.get("text") or stdout
                    or "(claude returned no output)")
-        cost = float(obj.get("total_cost_usd") or obj.get("cost_usd") or 0.0)
+        raw_cost = obj.get("total_cost_usd")
+        if raw_cost is None:
+            raw_cost = obj.get("cost_usd")
+        cost, cost_source = coerce_untrusted_cost(raw_cost)
+        if cost_source == "unmeasured" and raw_cost is not None:
+            # Only a REPORTED-but-rejected value (as opposed to a field that
+            # was simply absent) is worth a note in the record.
+            text += (
+                "\n[hydra] vendor CLI reported a non-finite cost_usd "
+                f"({raw_cost!r}); treated as unmeasured, not charged as $0."
+            )
         usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
-        tin = int(usage.get("input_tokens") or 0)
-        tout = int(usage.get("output_tokens") or 0)
+        tin = coerce_untrusted_count(usage.get("input_tokens"))
+        tout = coerce_untrusted_count(usage.get("output_tokens"))
         mdl = str(obj.get("model") or model)
     if returncode != 0 and stderr:
         text += f"\n[claude stderr] {stderr[-800:]}"
-    return {"text": text, "model": mdl, "cost_usd": cost,
+    return {"text": text, "model": mdl, "cost_usd": cost, "cost_source": cost_source,
             "tokens_in": tin, "tokens_out": tout,
             "status": "done" if returncode == 0 else "error"}
 
@@ -859,7 +1094,8 @@ def _run_claude_cli(
         return _parse_claude_cli_result(res.stdout, res.stderr, res.returncode, mdl)
     except Exception as e:  # noqa: BLE001 — never crash the loop on a CLI hiccup
         return {"text": f"[claude-cli error] {e!r}", "model": mdl,
-                "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+                "cost_usd": 0.0, "cost_source": "unmeasured",
+                "tokens_in": 0, "tokens_out": 0,
                 "status": "error"}
 
 
@@ -885,8 +1121,15 @@ def _claude_critique(artifact_text: str, rubric_md: str, cwd: str) -> dict[str, 
         parsed = json.loads(s)
     except Exception:  # noqa: BLE001 — degrade to revise on unparseable judge output
         parsed = {"outcome": "revise", "critique_md": raw[:1000], "score": {}}
+    # `res["cost_usd"]` already passed through `_parse_claude_cli_result`'s
+    # (or `_run_claude_cli`'s exception-fallback) non-finite guard -- it is
+    # never NaN/Infinity here. `cost_source` is propagated (defaulting to
+    # the min-trust "unmeasured", never a false "measured") rather than
+    # dropped, so a caller can still tell a genuinely-measured cost from an
+    # unmeasured/rejected one after this re-wrap.
     return {"parsed": parsed, "model": res.get("model") or "claude-sonnet-4-6",
             "cost_usd": float(res.get("cost_usd") or 0.0),
+            "cost_source": res.get("cost_source") or "unmeasured",
             "tokens_in": int(res.get("tokens_in") or 0),
             "tokens_out": int(res.get("tokens_out") or 0)}
 
@@ -1018,6 +1261,17 @@ _ENVELOPE_TYPE_TO_KIND = {
     "ARCH_RFC": "design",
     "DEV_TASK": "code",
     "HANDOFF": "code",
+    # P5b: a PLAN is a decomposition artifact, same shape of judgment as a
+    # PRD -- without this a PLAN judged through this path would be graded
+    # code_style against the wrong rubric. Reuses "spec" rather than
+    # inventing a "plan" pp gate type: the pp GateType union is
+    # hand-duplicated in four places and start_stage does not validate it,
+    # so a half-migrated new gate type would be silently lossy. In practice
+    # node_plan_judge (supervisor.py) scores a PLAN directly against
+    # "plan-decomposition-quality@1" and never routes through this map --
+    # this entry exists for the offline/ingest-adjacent callers that do
+    # resolve a gate_type from an envelope's `type`.
+    "PLAN": "spec",
 }
 
 
@@ -1435,7 +1689,11 @@ def _drive_pp_stage_loop(
         # SquadResult artifact so _extract_squad_cost can charge the budget ledger
         # (start_run only SCAFFOLDS at cost 0 — reading cost from it left the 80%
         # downgrade + 100% HITL tripwires dead for all engineering work).
-        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0,
+        # `unmeasured_count`: bumped every time a vendor call in this stage
+        # reported a missing/unparseable/non-finite cost -- so a rejected
+        # report is never silently indistinguishable from a genuine $0.00
+        # (see `coerce_untrusted_cost`).
+        "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "unmeasured_count": 0,
     }
 
     def _trace(kind: str, payload: dict[str, Any]) -> None:
@@ -1491,9 +1749,36 @@ def _drive_pp_stage_loop(
             # the success path (and break-ing out on failure) under-charged the
             # budget ledger and weakened the 80%/100% tripwires. Hard failures
             # (timeout/transport) carry no cost fields → add 0, harmless.
-            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(gi.get("tokens_in") or 0)
-            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            # Resolved ONCE here (`resolve_reported_cost`/`coerce_untrusted_count`)
+            # and reused for every downstream use of this generate envelope's
+            # cost/tokens in this iteration (the accumulator, both
+            # `record_attempt` calls, and the cost-unknown trace check below)
+            # -- so `gi`'s raw, vendor-controlled fields are never re-cast
+            # with a bare `float()`/`int()` anywhere in this loop body.
+            # `resolve_reported_cost` (not a bare `coerce_untrusted_cost`)
+            # because `gi` may already carry an UPSTREAM `cost_source` from
+            # `_parse_claude_cli_result` -- see that function's docstring
+            # for why re-coercing an already-judged value is wrong.
+            _gen_cost, _gen_src = resolve_reported_cost(gi)
+            _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
+            _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
+            out["cost_usd"] += _gen_cost
+            out["tokens_in"] += _gen_tin
+            out["tokens_out"] += _gen_tout
+            # Cross-vendor judge finding (follow-up round, HIGH -- rule fix,
+            # not a fourth patch): trust `coerce_untrusted_cost`'s OWN
+            # "measured only on positive evidence" answer directly, rather
+            # than re-deriving "was this reported at all" here. The
+            # previous `and gi.get("cost_usd") is not None` guard meant a
+            # vendor that OMITTED `cost_usd` entirely (the common case, not
+            # an exotic one) incremented nothing, so a stage whose EVERY
+            # call omitted cost stayed at `unmeasured_count=0` -- read by
+            # `supervisor._extract_squad_cost` as a finite, confident
+            # MEASURED $0.00. `coerce_untrusted_cost(None)` already
+            # correctly returns `"unmeasured"`; there is no scenario where
+            # trusting it directly is wrong.
+            if _gen_src == "unmeasured":
+                out["unmeasured_count"] += 1
 
             # Run-scoped: paths dirtied since the pre-generate snapshot. Excludes
             # any files that were already modified before this run started.
@@ -1535,9 +1820,9 @@ def _drive_pp_stage_loop(
                         # A soft-block/empty failure can still be a token-consuming
                         # generate (esp. the Claude CLI path); record its real spend
                         # so the pp ledger matches the budget charge accrued above.
-                        "tokens_in": int(gi.get("tokens_in") or 0),
-                        "tokens_out": int(gi.get("tokens_out") or 0),
-                        "cost_usd": float(gi.get("cost_usd") or 0.0),
+                        "tokens_in": _gen_tin,
+                        "tokens_out": _gen_tout,
+                        "cost_usd": _gen_cost,
                         "status": fail_status, "retry_index": retry_index,
                         "notes": {"candidate_index": 1},
                         **({"parent_attempt_id": attempt_id} if attempt_id else {}),
@@ -1548,8 +1833,7 @@ def _drive_pp_stage_loop(
                 # MU14: if the failure carries no cost/token info (typical for
                 # subprocess.TimeoutExpired or CLI launch failures), emit a trace
                 # so the unaccounted spend is visible. Never fabricate numbers.
-                if float(gi.get("cost_usd") or 0.0) == 0.0 \
-                        and int(gi.get("tokens_in") or 0) == 0:
+                if _gen_cost == 0.0 and _gen_tin == 0:
                     _trace("budget.cost_unknown_timeout",
                            {"candidate": 1, "retry": retry_index})
                 break
@@ -1571,10 +1855,10 @@ def _drive_pp_stage_loop(
                 "producer": producer,
                 "agent_type": "engineer",  # F29
                 "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
-                "tokens_in": int(gi.get("tokens_in") or 0),
-                "tokens_out": int(gi.get("tokens_out") or 0),
-                "cost_usd": float(gi.get("cost_usd") or 0.0),
-                "wall_ms": int(gi.get("wall_ms") or 0),
+                "tokens_in": _gen_tin,
+                "tokens_out": _gen_tout,
+                "cost_usd": _gen_cost,
+                "wall_ms": coerce_untrusted_count(gi.get("wall_ms")),
                 "status": "ok",
                 "retry_index": retry_index,
                 "notes": {"candidate_index": 1},
@@ -1676,9 +1960,20 @@ def _drive_pp_stage_loop(
             degraded = required_cross and not cross_vendor
 
             # F6: critique cost counts toward the run's budget charge too.
-            out["cost_usd"] += float(ci.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(ci.get("tokens_in") or 0)
-            out["tokens_out"] += int(ci.get("tokens_out") or 0)
+            # Vendor-controlled (pp_agy / pp_codex / Claude) -- resolved the
+            # same way as the generate cost above (`ci` carries an upstream
+            # `cost_source` when the judge is `_claude_critique`; the
+            # codex/agy MCP critique shape carries none and falls back to
+            # fresh coercion).
+            _crit_cost, _crit_src = resolve_reported_cost(ci)
+            out["cost_usd"] += _crit_cost
+            out["tokens_in"] += coerce_untrusted_count(ci.get("tokens_in"))
+            out["tokens_out"] += coerce_untrusted_count(ci.get("tokens_out"))
+            # See the matching comment on the generate accrual above: trust
+            # `coerce_untrusted_cost`'s own answer directly (an OMITTED
+            # cost_usd is `"unmeasured"` too, not just a rejected one).
+            if _crit_src == "unmeasured":
+                out["unmeasured_count"] += 1
             parsed = ci.get("parsed") if isinstance(ci.get("parsed"), dict) else ci
             if not isinstance(parsed, dict):
                 parsed = {}
@@ -1912,17 +2207,106 @@ def _best_of_n() -> int | None:
     return n if 2 <= n <= 8 else None
 
 
+# Safety BOUND (not a scale assumption) on any single rubric dimension's
+# contribution to `_rank_key`'s mean -- rubrics are documented as 0-1 or
+# 0-10, but nothing upstream enforces that on an untrusted judge response.
+# Clamping every dimension into this range BEFORE averaging is what makes
+# the outcome (*1000) / smoke (+100) terms dominate ABSOLUTELY, for any
+# input (see `_rank_key`'s docstring, cross-vendor judge finding, follow-up
+# round, HIGH): with an unbounded mean, a sufficiently negative score could
+# make a "pass" lose to a "revise", and an unbounded positive score could
+# already only reach `min(mean, 999)` -- bounded above, but NOT below.
+_SCORE_DIM_FLOOR = 0.0
+_SCORE_DIM_CEIL = 10.0
+
+
 def _rank_key(outcome: str, score: dict[str, Any], smoke_status: str) -> float:
     """Scalar rank for a best-of candidate. Verdict DOMINATES absolutely (scaled
     by 1000 so it outranks any rubric scale), then smoke-pass, then mean rubric
     score. A `fail` can never outrank a `revise`/`pass` regardless of score
-    magnitude (rubrics may be 0-1 or 0-10). Booleans (e.g. _cross_vendor) are
-    excluded from the mean."""
+    magnitude (rubrics may be 0-1 or 0-10; this is proven for ANY numeric
+    input below, not just that documented range). Booleans (e.g.
+    _cross_vendor) and non-numeric metadata fields (e.g. `_judge_tier`,
+    `_rubric_id`) are excluded from the mean entirely -- they were never a
+    scoring attempt.
+
+    Cross-vendor judge finding (follow-up round, HIGH -- the ORIGINAL defect
+    class of this whole thread, found on a path nothing else covered): a
+    GENUINE float NaN/Infinity dimension (the judge model's own untrusted
+    response -- `judge.dispatcher.dispatch_judge` refuses to even construct
+    a `JudgeVerdict` carrying one via `find_non_finite_field`, but THIS
+    module's independent best-of-N loop never routes its `score` dict
+    through that or any other guard) poisons the ranking key that
+    `sorted(eligible, key=lambda s: s["rank"], reverse=True)` uses to pick
+    which candidate's CODE gets merged.
+
+    Two DISTINCT bugs, both fixed here (cross-vendor judge finding,
+    follow-up round, HIGH, both items):
+
+    1. An EARLIER version of this fix simply EXCLUDED a non-finite
+       dimension from the mean, the same treatment the isinstance filter
+       gives a genuinely non-numeric value. That was wrong: excluding a bad
+       dimension RAISES the mean of the remainder (`{0.9, NaN}` excluded ->
+       mean 0.9, versus `{0.9, 0.3}` -> mean 0.6), so a candidate whose
+       WORST dimension happened to come back non-finite could rank BETTER
+       than one that was honestly scored low on that same dimension --
+       "a candidate benefits from its worst dimension being unusable".
+       Fixed by COUNTING a non-finite dimension AGAINST the candidate at
+       the score FLOOR (`_SCORE_DIM_FLOOR`) instead of dropping it: it is
+       still included in the mean's denominator, exactly like a genuine
+       floor-value score would be. A poisoned dimension can therefore only
+       ever hurt a candidate's rank, never help it -- this is the "ranking
+       basis that cannot be gamed by omission" the finding asked for,
+       chosen over refusing the whole candidate for the same reason the
+       earlier (also-correct) reasoning gave: outcome and smoke still
+       dominate this rank (see point 2), so a candidate should not be
+       thrown out entirely over one bad rubric field.
+       A non-numeric/bool value is still EXCLUDED, not floored: it was
+       never a scoring attempt (Hydra's own bookkeeping fields like
+       `_cross_vendor`/`_judge_tier`/`_rubric_id` live in this same dict),
+       and floor-penalizing every candidate identically for its own
+       metadata would be nonsensical, not a defect being closed.
+
+    2. The "outcome/smoke dominate absolutely" claim was FALSE as
+       previously written: `min(mean, 999)` bounds the mean ABOVE but not
+       BELOW, so an unbounded negative score (nothing rejects a judge
+       reporting a negative rubric value) could drag a "pass" (`2000 +
+       mean`) below a "revise" (`1000 + mean'`), and an all-unusable
+       candidate's neutral `mean=0.0` could outrank a genuinely-scored
+       candidate with a valid negative mean. Fixed by clamping every
+       INDIVIDUAL dimension into `[_SCORE_DIM_FLOOR, _SCORE_DIM_CEIL]`
+       before averaging (not clamping the mean after the fact, which would
+       let one wildly out-of-range dimension still skew the average of the
+       others): the resulting mean is therefore ALWAYS in `[0, 10]`,
+       dwarfed by the `*1000`/`+100` terms for any input whatsoever --
+       verified below and in the accompanying test suite for negative,
+       huge, and poisoned inputs together.
+
+    A candidate left with NO scoring attempt at all (every value absent,
+    non-numeric, or bool) contributes `mean = 0.0` -- the pre-existing
+    NEUTRAL default, identical to a dimension floored for being non-finite,
+    so it is never distinguishable from "scored the floor on everything".
+    """
     base = {"pass": 2, "revise": 1, "fail": 0}.get(outcome, 0)
-    nums = [float(v) for v in (score or {}).values()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)]
-    mean = (sum(nums) / len(nums)) if nums else 0.0
-    return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + min(mean, 999.0)
+    dims: list[float] = []
+    for v in (score or {}).values():
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue  # not a scoring attempt: metadata, string, dict, bool, ...
+        fv = float(v)
+        if is_non_finite_float(fv):
+            # Reported but unusable: counts AGAINST the candidate at the
+            # floor (included in the mean), never simply dropped -- see
+            # point 1 above.
+            dims.append(_SCORE_DIM_FLOOR)
+        else:
+            dims.append(min(max(fv, _SCORE_DIM_FLOOR), _SCORE_DIM_CEIL))
+    mean = (sum(dims) / len(dims)) if dims else 0.0
+    # Redundant with the per-dimension clamp above by construction (mean of
+    # values in [0, 10] is itself in [0, 10]) -- kept as an explicit,
+    # self-documenting invariant at the return site rather than relying
+    # solely on the loop above never changing.
+    mean = min(max(mean, _SCORE_DIM_FLOOR), 999.0)
+    return base * 1000.0 + (100.0 if smoke_status == "pass" else 0.0) + mean
 
 
 def _drive_best_of_loop(
@@ -1965,7 +2349,10 @@ def _drive_best_of_loop(
         "attempt_id": None, "critique": "", "error": None, "finalized": False,
         "wrote_changes": False, "smoke_status": "skipped", "smoke_reason": "",
         "harvest_sha": None, "harvest_error": None, "changed_paths": [],
+        # `unmeasured_count`: see the sequential drive loop's `out` dict --
+        # same rejected-report auditability signal.
         "cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "best_of_n": n,
+        "unmeasured_count": 0,
         "smoke_excluded_candidates": [],
     }
 
@@ -2047,9 +2434,19 @@ def _drive_best_of_loop(
                 model_tier=model_tier, sq=sq)
             gi = _pp_inner(gen)
             gen_text = str(gi.get("text") or "")
-            out["cost_usd"] += float(gi.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(gi.get("tokens_in") or 0)
-            out["tokens_out"] += int(gi.get("tokens_out") or 0)
+            # Resolved ONCE (see the sequential drive loop's identical
+            # comment) and reused for the accumulator, `record_attempt`, and
+            # the cost-unknown trace check below.
+            _gen_cost, _gen_src = resolve_reported_cost(gi)
+            _gen_tin = coerce_untrusted_count(gi.get("tokens_in"))
+            _gen_tout = coerce_untrusted_count(gi.get("tokens_out"))
+            out["cost_usd"] += _gen_cost
+            out["tokens_in"] += _gen_tin
+            out["tokens_out"] += _gen_tout
+            # See the sequential drive loop's matching comment: trust
+            # `coerce_untrusted_cost`'s own answer directly.
+            if _gen_src == "unmeasured":
+                out["unmeasured_count"] += 1
             out["producer"] = producer
             run_changed = _worktree_dirty_set(wt) - pre
             wrote = bool(run_changed)
@@ -2071,9 +2468,9 @@ def _drive_best_of_loop(
                 att = cm("pp_harness", "record_attempt", {
                     "stage_id": stage_id, "producer": producer,
                     "model_id": str(gi.get("model") or model_tier or f"{producer}-default"),
-                    "tokens_in": int(gi.get("tokens_in") or 0),
-                    "tokens_out": int(gi.get("tokens_out") or 0),
-                    "cost_usd": float(gi.get("cost_usd") or 0.0),
+                    "tokens_in": _gen_tin,
+                    "tokens_out": _gen_tout,
+                    "cost_usd": _gen_cost,
                     "status": "error" if gen_fail else "ok",
                     **({"attempt_slot_id": slot} if slot else {}),
                     "notes": {"candidate_index": ci_idx},
@@ -2084,8 +2481,7 @@ def _drive_best_of_loop(
             if gen_fail:
                 # MU14: emit trace when timeout/launch failure carries no cost.
                 # Don't fabricate token numbers.
-                if float(gi.get("cost_usd") or 0.0) == 0.0 \
-                        and int(gi.get("tokens_in") or 0) == 0:
+                if _gen_cost == 0.0 and _gen_tin == 0:
                     _trace("budget.cost_unknown_timeout", {"candidate": ci_idx})
                 scored.append({"ci": ci_idx, "att": att_id, "outcome": "fail",
                                "rank": -1.0, "smoke": "skipped", "critique": gen_fail})
@@ -2162,9 +2558,15 @@ def _drive_best_of_loop(
                 jci = _pp_inner(cm(_critique_server, "critique", {
                     "artifact_text": judge_text, "rubric_md": rubric_body,
                     "cwd": wt, "timeout_ms": _judge_timeout_ms()}, squad_id=sq))
-            out["cost_usd"] += float(jci.get("cost_usd") or 0.0)
-            out["tokens_in"] += int(jci.get("tokens_in") or 0)
-            out["tokens_out"] += int(jci.get("tokens_out") or 0)
+            _jci_cost, _jci_src = resolve_reported_cost(jci)
+            out["cost_usd"] += _jci_cost
+            out["tokens_in"] += coerce_untrusted_count(jci.get("tokens_in"))
+            out["tokens_out"] += coerce_untrusted_count(jci.get("tokens_out"))
+            # See the matching comment on the sequential drive loop's
+            # critique accrual: trust `coerce_untrusted_cost`'s own answer
+            # directly.
+            if _jci_src == "unmeasured":
+                out["unmeasured_count"] += 1
             parsed = jci.get("parsed") if isinstance(jci.get("parsed"), dict) else jci
             if not isinstance(parsed, dict):
                 parsed = {}
@@ -2900,7 +3302,18 @@ def _ensure_jest_excludes(cfg_path: Path) -> bool:
             return False
         target["testPathIgnorePatterns"] = existing
         try:
-            cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            # Strict: `data` is the operator's OWN package.json/jest.config
+            # parsed whole and about to be rewritten whole. If some
+            # unrelated field in it is non-finite we refuse to write it back
+            # rather than silently substitute a null into a file we don't
+            # own the schema of -- the existing broad `except Exception`
+            # here already treats that refusal exactly like any other
+            # write failure (skip this run's edit, leave the file
+            # untouched, `changed` state is simply not persisted).
+            cfg_path.write_text(
+                dumps_strict(data, label=f"jest config at {cfg_path}", indent=2) + "\n",
+                encoding="utf-8",
+            )
         except Exception:  # noqa: BLE001
             return False
         return True
@@ -3871,6 +4284,16 @@ def _resolve_skill_shim(slug: str) -> dict[str, str] | None:
 _DELEGATION_EMIT_TYPES: frozenset[str] = frozenset({
     "PRD", "DEV_TASK", "ARCH_RFC",
     "CREATIVE_BRIEF", "SHOT_LIST", "ASSET_JOB", "HANDOFF",
+    # P5b: a claude-skill orchestrator (e.g. the planning pack, run
+    # attended) may emit a PLAN for the host to feed back in. This protects
+    # `_extract_emitted_envelopes` below, which is called from the two
+    # in-graph forwarding sweep sites in this module (squad_node.py:3781,
+    # :4103) -- NOT the attended CLI path: `_cmd_attended_submit`
+    # (cli.py:2886) reads `res["emitted_envelopes"]` directly and hands it
+    # straight to `hydra_core.ingest.dispatch_ingested_envelopes`, bypassing
+    # this allow-list entirely. Added on both paths anyway so a PLAN is never
+    # silently dropped regardless of which leg produced it.
+    "PLAN",
 })
 
 

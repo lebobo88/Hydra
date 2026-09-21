@@ -703,9 +703,19 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                         "force-dispatch",
                         "change-squads",
                         "recover-stalled-stage",
+                        "modify-plan",
                     ],
                 },
                 "option": {"type": "string"},
+                "critique_ref": {
+                    "type": "string",
+                    "description": (
+                        "modify-plan only: a file path or repo:artifact:<path> "
+                        "MemoryRef key naming the operator's revision critique. "
+                        "The critique text itself must never be passed via "
+                        "'option' -- that field is character- and length-bounded."
+                    ),
+                },
             },
             "required": ["workflow_id", "action"],
         },
@@ -719,7 +729,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
                 "budget": {
                     "type": "number",
-                    "description": "Budget cap in USD (optional).",
+                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
                 },
                 "workflow_id": {
                     "type": "string",
@@ -762,7 +772,7 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                 },
                 "budget": {
                     "type": "number",
-                    "description": "Budget cap in USD (optional).",
+                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
                 },
                 "workflow_id": {
                     "type": "string",
@@ -772,6 +782,16 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
+                },
+                "rigor": {
+                    "type": "string",
+                    "enum": ["trivial", "standard", "major"],
+                    "description": (
+                        "Operator override of node_planner's computed plan_rigor, "
+                        "forwarded as --rigor to the CLI (optional). Wins over the "
+                        "computed value; a downgrade from the computed value is "
+                        "recorded as a hitl_history event."
+                    ),
                 },
                 "repo": {
                     "type": "string",

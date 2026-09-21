@@ -18,10 +18,12 @@ from uuid import UUID, uuid4
 
 from .registry import get_rubric
 from .schemas import JudgeOutcome, JudgeVendor, JudgeVerdict
+from ..strict_json import find_non_finite_field
 
 
 JudgeErrorReason = Literal[
-    "ineligible_tier", "quota", "timeout", "tool_failed", "bad_response", "unknown"
+    "ineligible_tier", "quota", "timeout", "tool_failed", "bad_response",
+    "non_finite_envelope", "unknown",
 ]
 
 
@@ -138,9 +140,22 @@ def _wrap_untrusted(text: str) -> str:
 
 
 def _envelope_to_text(envelope: dict[str, Any]) -> str:
-    """Serialize an envelope dict as compact JSON for the judge to inspect."""
-    import json
-    return json.dumps(envelope, indent=2, default=str, sort_keys=True)
+    """Serialize an envelope dict as strict JSON for the judge to inspect.
+
+    Cross-vendor judge finding (b1baf30 revise round, item 1/2): this is the
+    live path a PLAN reaches the judge through (`state.plan_ref`, a
+    `model_dump(mode="json")` dict, not a `Plan` instance) -- the standalone
+    `plan_artifact.render_plan_json` backstop never runs on it. Routes
+    through the shared `strict_json.dumps_strict` (``allow_nan=False``) so a
+    non-finite value anywhere in the envelope raises a clear, field-naming
+    error here instead of emitting the bare ``NaN``/``Infinity`` token into
+    the judge prompt (valid Python-`json` output, invalid RFC 8259 JSON).
+    """
+    from ..strict_json import dumps_strict
+    return dumps_strict(
+        envelope, label=f"envelope {envelope.get('id', '?')}",
+        indent=2, default=str, sort_keys=True,
+    )
 
 
 def _apply_pragmatic_pass_guard(
@@ -184,7 +199,24 @@ def dispatch_judge(
     uses MCPCritiqueClient. Default is NoOpCritiqueClient (skeleton).
     """
     rubric = get_rubric(rubric_id)
-    artifact_text = _wrap_untrusted(_envelope_to_text(envelope))
+    try:
+        artifact_text = _wrap_untrusted(_envelope_to_text(envelope))
+    except ValueError as e:
+        # Cross-vendor judge finding (revise round, item 1/4): a legacy
+        # checkpoint can hold an envelope with a non-finite field (e.g. an
+        # old DEV_TASK/PRD with constraints.budget_usd = NaN) that the
+        # msgpack serde never revalidates on load. Writes stay strict --
+        # `_envelope_to_text` still refuses to emit invalid JSON -- but a
+        # READ of data already on disk must degrade gracefully rather than
+        # abort the resume. Translate to the same `JudgeDispatchError` the
+        # vendor-fallback loop already handles so the problem is RECORDED
+        # (attempts list, and ultimately the skip verdict's critique_md)
+        # instead of propagating as an unhandled `ValueError`.
+        raise JudgeDispatchError(
+            f"envelope failed strict serialization (rubric={rubric_id}): {e}",
+            vendor=judge_vendor, rubric_id=rubric_id,
+            reason="non_finite_envelope", retryable=False,
+        ) from e
     use_client = client or NoOpCritiqueClient()
 
     try:
@@ -203,13 +235,28 @@ def dispatch_judge(
 
     outcome, critique, scores = _apply_pragmatic_pass_guard(raw)
 
+    # Cross-vendor judge finding (this round, item 1 CRITICAL): `raw` (and
+    # therefore `scores`) is the JUDGE MODEL'S OWN untrusted response --
+    # nothing upstream constrains `score_json` to finite values the way
+    # `_envelope_to_text` constrains the envelope being judged. A verdict
+    # built from a NaN/Infinity score is itself state (`HydraState.verdicts`)
+    # that best-of-N ranks on (`borda_winner`) and that the per-squad scan
+    # would otherwise wave through with a normal "pass"/"revise" outcome --
+    # unlike a non-finite ENVELOPE, a non-finite VERDICT was never checked by
+    # any existing guard. Refuse to persist it: raise the SAME
+    # `JudgeDispatchError(reason="non_finite_envelope")` a non-finite
+    # envelope raises, so `dispatch_judge_with_fallback`'s existing
+    # all-vendors-failed check (below) folds it into the same `unjudgeable`
+    # outcome instead of a fabricated `pass`/`revise`/`fail`. Checked on the
+    # fully-built payload (not just `scores`) so a future field added to
+    # `JudgeVerdict` gets the same guarantee without a second call site.
     target_id = envelope.get("id")
     if isinstance(target_id, str):
         target_id = UUID(target_id)
     elif target_id is None:
         target_id = uuid4()
 
-    return JudgeVerdict(
+    verdict = JudgeVerdict(
         workflow_id=workflow_id,
         origin_squad="hydra-judge",
         target_squad=envelope.get("origin_squad"),
@@ -223,6 +270,22 @@ def dispatch_judge(
         retry_index=retry_index,
         parent_verdict_id=parent_verdict_id,
     )
+    # `mode="python"`, not `mode="json"`: pydantic's JSON-mode serializer
+    # silently coerces a non-finite float to `null` (JSON has no NaN/Inf
+    # literal), which would make this scan always find nothing -- the exact
+    # bug this guard exists to prevent, just moved one line earlier. The
+    # python-mode dump preserves the raw `float("nan")`/`inf` value so
+    # `find_non_finite_field` can actually see it.
+    bad_field = find_non_finite_field(verdict.model_dump(mode="python"))
+    if bad_field is not None:
+        raise JudgeDispatchError(
+            f"verdict payload contains a non-finite value at {bad_field} "
+            f"(vendor={judge_vendor}, rubric={rubric_id}); refusing to "
+            "persist a non-finite verdict",
+            vendor=judge_vendor, rubric_id=rubric_id,
+            reason="non_finite_envelope", retryable=False,
+        )
+    return verdict
 
 
 def _skip_verdict(
@@ -264,6 +327,62 @@ def _skip_verdict(
             f"{reasons}. Last error: {last_error}"
         ),
         score_json={"_error": True, "_infra": True, "_judge_attempts": attempts},
+        retry_index=retry_index,
+        parent_verdict_id=parent_verdict_id,
+    )
+
+
+def _unjudgeable_verdict(
+    *,
+    envelope: dict[str, Any],
+    rubric_id: str,
+    judge_vendor: JudgeVendor,
+    generator_vendor: str,
+    workflow_id: UUID,
+    attempts: list[dict[str, Any]],
+    last_error: Exception | None,
+    retry_index: int = 0,
+    parent_verdict_id: UUID | None = None,
+) -> JudgeVerdict:
+    """Build an ``unjudgeable`` verdict for an envelope that failed STRICT
+    SERIALIZATION (``reason="non_finite_envelope"``), distinct from
+    :func:`_skip_verdict`'s honest ``skip``.
+
+    Cross-vendor judge finding (item 1/6, CRITICAL): a serialization failure
+    is a genuine DATA DEFECT (e.g. a legacy non-finite field a
+    pre-strict-JSON checkpoint carried) -- every preferred vendor fails
+    IDENTICALLY because the failure happens before any vendor's client is
+    even invoked (`_wrap_untrusted(_envelope_to_text(envelope))` raises in
+    `dispatch_judge` before `use_client.critique(...)` runs). This is NOT a
+    transient infra outage the way an unreachable vendor or an expired tier
+    is, so it must not be folded into `skip` (which every downstream site
+    treats as "no signal, but nothing to block on either"). Names the
+    offending field (from the `JudgeDispatchError` message, which itself
+    threads through `find_non_finite_field`) so the surfaced HITL/trace is
+    actionable without the operator re-deriving it.
+    """
+    target_id = envelope.get("id")
+    if isinstance(target_id, str):
+        target_id = UUID(target_id)
+    elif target_id is None:
+        target_id = uuid4()
+    reasons = "; ".join(
+        f"{a.get('vendor')}:{a.get('reason', '?')}" for a in attempts if not a.get("ok")
+    )
+    return JudgeVerdict(
+        workflow_id=workflow_id,
+        origin_squad="hydra-judge",
+        target_squad=envelope.get("origin_squad"),
+        target_envelope_id=target_id,
+        outcome="unjudgeable",
+        rubric_id=rubric_id,
+        judge_vendor=judge_vendor,
+        generator_vendor=generator_vendor,
+        critique_md=(
+            "[UNJUDGEABLE — envelope failed strict serialization, cannot be "
+            f"evaluated by any vendor] {reasons}. Last error: {last_error}"
+        ),
+        score_json={"_error": True, "_unjudgeable": True, "_judge_attempts": attempts},
         retry_index=retry_index,
         parent_verdict_id=parent_verdict_id,
     )
@@ -324,6 +443,32 @@ def dispatch_judge_with_fallback(
             })
             last_error = e
             continue
+    # Cross-vendor judge finding (item 1/6, CRITICAL): every attempt failing
+    # with `reason="non_finite_envelope"` means the envelope itself could not
+    # be serialized -- deterministic across ALL vendors (the failure happens
+    # before any vendor's client is invoked), not a per-vendor infra outage.
+    # Return the distinct `unjudgeable` outcome instead of folding it into
+    # `skip`, so every downstream consumer can tell "genuinely nothing to
+    # judge" (skip) apart from "should have been judged but the data is
+    # broken" (unjudgeable) and block on the latter.
+    if attempts and all(
+        (not a.get("ok")) and a.get("reason") == "non_finite_envelope"
+        for a in attempts
+    ):
+        return (
+            _unjudgeable_verdict(
+                envelope=envelope,
+                rubric_id=rubric_id,
+                judge_vendor=vendors[0],
+                generator_vendor=generator_vendor,
+                workflow_id=workflow_id,
+                attempts=attempts,
+                last_error=last_error,
+                retry_index=retry_index,
+                parent_verdict_id=parent_verdict_id,
+            ),
+            attempts,
+        )
     return (
         _skip_verdict(
             envelope=envelope,

@@ -358,6 +358,133 @@ def test_normalize_for_ingest_strips_marker_and_emits_once() -> None:
     assert events == []
 
 
+def _bare_plan(**overrides) -> "Plan":
+    from hydra_core.schemas import Plan
+    base = dict(
+        origin_squad="planning",
+        workflow_id=uuid4(),
+        rigor="trivial",
+        goal_restatement="ship it",
+        summary="ship it",
+    )
+    base.update(overrides)
+    return Plan(**base)
+
+
+def test_model_copy_bypassed_plan_rejected_at_ingest(packs) -> None:
+    """Cross-vendor judge finding (b1baf30 revise round, item 1a/4): a caller
+    that hands `dispatch_ingested_envelopes` an already-typed `Plan` built
+    via `model_copy(update=...)` (which skips field validation) must still
+    be caught here -- the revalidation round-trip through `model_validate`
+    -- with a clear, field-naming error, not silently pass through to the
+    HTML/JSON writers holding a non-finite budget.
+    """
+    from hydra_core.schemas import Constraints
+
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    plan = _bare_plan(workflow_id=state.workflow_id)
+    hostile = plan.model_copy(
+        update={"constraints": Constraints.model_construct(budget_usd=float("nan"))}
+    )
+
+    outcome = dispatch_ingested_envelopes(
+        state, [hostile], packs=packs, dispatcher=disp)
+
+    assert [it.status for it in outcome.items] == ["failed"]
+    assert outcome.rejected
+    assert any("budget_usd" in e["field"] for e in outcome.rejected[0].errors)
+    assert not disp.calls
+
+
+def test_model_construct_bypassed_plan_rejected_at_ingest(packs) -> None:
+    """Same bypass, via `model_construct` (skips validation entirely,
+    including the DAG validator) rather than `model_copy`."""
+    from hydra_core.schemas import Constraints
+
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    plan = _bare_plan(workflow_id=state.workflow_id)
+    hostile = plan.model_construct(
+        **{**plan.__dict__, "constraints": Constraints.model_construct(budget_usd=float("inf"))}
+    )
+
+    outcome = dispatch_ingested_envelopes(
+        state, [hostile], packs=packs, dispatcher=disp)
+
+    assert [it.status for it in outcome.items] == ["failed"]
+    assert outcome.rejected
+    assert any("budget_usd" in e["field"] for e in outcome.rejected[0].errors)
+    assert not disp.calls
+
+
+def test_pack_budget_usd_nan_string_is_rejected_with_explicit_error(packs) -> None:
+    """Cross-vendor judge finding (item 6): a pack-supplied ``budget_usd:
+    "nan"`` converts cleanly via ``float()`` -- it must NOT be silently
+    folded into ``constraints.budget_usd`` (surfacing only much later, as a
+    generic pydantic error) nor silently dropped anywhere. It must fail this
+    envelope with an explicit, field-naming error."""
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    hopeless = _pack_dev_task(str(state.workflow_id), budget_usd="nan")
+
+    outcome = dispatch_ingested_envelopes(
+        state, [hopeless], packs=packs, dispatcher=disp)
+
+    assert [it.status for it in outcome.items] == ["failed"]
+    assert outcome.rejected
+    msg = outcome.rejected[0].errors[0]["msg"]
+    assert "budget_usd" in msg and "non-finite" in msg
+    assert not disp.calls
+
+
+def test_pack_budget_usd_oversized_int_gives_structured_error_not_a_crash(packs) -> None:
+    """Cross-vendor judge finding (this round, item 3 MEDIUM): a JSON
+    integer too large for a float to represent (e.g. from a hostile or
+    corrupted pack payload) raises ``OverflowError`` from ``float(budget)``,
+    not ``TypeError``/``ValueError`` -- the two exceptions
+    ``normalize_pack_envelope`` originally caught. This must fail ONLY the
+    offending envelope with an explicit, field-naming error, exactly like
+    the NaN-string case above, and must NOT crash the whole ingest batch."""
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    hopeless = _pack_dev_task(str(state.workflow_id), budget_usd=10 ** 400)
+    fine = _pack_dev_task(str(state.workflow_id), id=str(uuid4()))
+
+    # The oversized-int envelope is paired with an ordinary, valid one to
+    # prove the OverflowError is contained to the one bad item and does not
+    # abort the rest of the batch.
+    outcome = dispatch_ingested_envelopes(
+        state, [hopeless, fine], packs=packs, dispatcher=disp)
+
+    assert sorted(it.status for it in outcome.items) == ["done", "failed"]
+    assert outcome.rejected
+    msg = outcome.rejected[0].errors[0]["msg"]
+    assert "budget_usd" in msg
+    assert disp.calls, "the valid sibling envelope must still dispatch"
+
+
+def test_pack_budget_usd_invalid_when_constraints_budget_already_set(packs) -> None:
+    """Cross-vendor judge finding (item 6, second half): when the envelope
+    already carries a finite ``constraints.budget_usd``, the OLD code path
+    silently copied the invalid pack ``budget_usd`` into ``instructions``
+    with no validation at all. It must now fail loudly instead."""
+    state = HydraState(root_goal="x")
+    disp = _ScriptedDispatcher(_happy_responses("pass"), drive=True)
+    hopeless = _pack_dev_task(
+        str(state.workflow_id), budget_usd="Infinity",
+        constraints={"budget_usd": 25.0},
+    )
+
+    outcome = dispatch_ingested_envelopes(
+        state, [hopeless], packs=packs, dispatcher=disp)
+
+    assert [it.status for it in outcome.items] == ["failed"]
+    assert outcome.rejected
+    assert "budget_usd" in outcome.rejected[0].errors[0]["msg"]
+    assert not disp.calls
+
+
 def test_ingest_dedups_id_less_envelopes_by_normalized_id(packs) -> None:
     """Without id normalization two id-less envelopes both bypass `processed`.
     After it, the same dict submitted twice carries the same normalized id and

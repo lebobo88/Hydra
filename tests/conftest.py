@@ -143,3 +143,17 @@ def _hermetic_hydra_env(request, monkeypatch):
     monkeypatch.delenv("HYDRA_CLAUDE_ENGINEER", raising=False)
     monkeypatch.delenv("HYDRA_DISABLE_CLAUDE_ENGINEER", raising=False)
     monkeypatch.delenv("HYDRA_BEST_OF_N", raising=False)
+    # P5b: HYDRA_PLAN_PHASE now ships ON by default (unset == on; "0" is the
+    # only disable spelling -- see _plan_phase_enabled's docstring). This is
+    # no longer a blanket pin forcing a particular value across the suite --
+    # it is the same leaked-env hygiene as HYDRA_CLAUDE_ENGINEER/
+    # HYDRA_BEST_OF_N above: clearing whatever the operator's own shell
+    # happens to have set so every test run exercises the actual SHIPPING
+    # default (unset -> on) reproducibly, instead of silently inheriting
+    # whatever a developer's local `export HYDRA_PLAN_PHASE=0` left behind.
+    # Tests that need legacy (flag-off) behaviour opt out explicitly via
+    # ``monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")``; tests that need no
+    # attended host at all pass ``force_trivial_plan_rigor=True`` to
+    # ``build_supervisor`` instead (the same signal every hostless production
+    # caller must set -- see cli.py's `_cmd_run`/`_cmd_replay`).
+    monkeypatch.delenv("HYDRA_PLAN_PHASE", raising=False)

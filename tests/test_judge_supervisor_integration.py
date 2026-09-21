@@ -76,6 +76,8 @@ def test_supervisor_runs_judge_nodes_and_emits_verdicts(tmp_path):
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="approve the Q3 capital allocation plan")
     final = _invoke(runner, state)
@@ -109,6 +111,8 @@ def test_supervisor_skips_judge_when_pp_verdict_present(tmp_path):
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     # WS1-E: engineering dispatch requires an explicit, resolved target repo
     # -- this test's concern is judge-skip-on-pp-verdict, not repo-targeting,
@@ -138,6 +142,8 @@ def test_supervisor_hitl_escalation_on_synthesis_constitution_fail():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="run a normal workflow")
     final = _invoke(runner, state)

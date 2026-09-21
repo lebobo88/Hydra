@@ -231,6 +231,8 @@ class TestSupervisorStatusCoercion:
             project_root=HYDRA_ROOT,
             dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
+            # P5b hostless-path audit: one-shot invoke, no attended host.
+            force_trivial_plan_rigor=True,
         )
         assert isinstance(runner, _PurePythonRunner)
 

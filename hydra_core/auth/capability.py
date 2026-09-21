@@ -98,7 +98,15 @@ def _canonical_body(token_dict: dict) -> bytes:
     - ensure_ascii=True (default)     -> no encoding ambiguity
     """
     body = {k: v for k, v in token_dict.items() if k != _SIG_FIELD}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    # A non-finite float silently substituted here would change the bytes
+    # actually signed vs. the bytes a caller believes they signed -- refuse
+    # rather than sanitize (see strict_json module docstring: a silently
+    # substituted field inside a signed token is worse than a refused mint).
+    from hydra_core.strict_json import dumps_strict
+    return dumps_strict(
+        body, label="capability_token_canonical_body",
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
 
 
 def _compute_sig(canonical: bytes, key_bytes: bytes) -> str:
@@ -319,7 +327,14 @@ def _verify_capability_inner(
     # Note: json round-trip of plain types is identity, so the canonical signing
     # bytes and the HMAC verification are unchanged for legitimate tokens.
     try:
-        token = json.loads(json.dumps(token))
+        # Strict, not sanitize: this normalized `token` is what
+        # `_canonical_body` later signs/compares (see verify below) -- a
+        # non-finite float silently coerced to `null` here would let a
+        # tampered field pass normalization unnoticed instead of failing
+        # closed. `dumps_strict` raises, caught by this same `except`
+        # clause, exactly like any other malformed token.
+        from hydra_core.strict_json import dumps_strict
+        token = json.loads(dumps_strict(token, label="capability_token_normalize"))
     except Exception:
         return _fail("token is not plain-JSON-serializable")
 
@@ -489,7 +504,14 @@ def _verify_operator_capability_inner(
     # Normalizing here as well so the operator-specific checks below (v, actor_id
     # sentinel) also operate on plain builtins, not subclasses.
     try:
-        token = json.loads(json.dumps(token))
+        # Strict, not sanitize: this normalized `token` is what
+        # `_canonical_body` later signs/compares (see verify below) -- a
+        # non-finite float silently coerced to `null` here would let a
+        # tampered field pass normalization unnoticed instead of failing
+        # closed. `dumps_strict` raises, caught by this same `except`
+        # clause, exactly like any other malformed token.
+        from hydra_core.strict_json import dumps_strict
+        token = json.loads(dumps_strict(token, label="capability_token_normalize"))
     except Exception:
         return _fail("token is not plain-JSON-serializable")
 

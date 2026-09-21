@@ -222,7 +222,19 @@ def _main() -> None:
     # Write the token JSON object to stdout — the hook reads this.
     # Compact separators: no extra whitespace, unambiguous single-line output.
     # This is the ONLY thing written to stdout.
-    sys.stdout.write(json.dumps(token, separators=(",", ":")) + "\n")
+    #
+    # Strict, not sanitize: `token` is already a SIGNED capability token
+    # (see mint_caller_capability -> mint_capability -> _canonical_body).
+    # A silently substituted field here would export a token whose exported
+    # JSON no longer matches what was actually signed -- refuse instead
+    # (an uncaught ValueError here prints nothing to stdout and exits
+    # non-zero via Python's default unhandled-exception path, matching this
+    # module's documented fail-closed contract: "prints NOTHING to stdout ...
+    # on failure").
+    from hydra_core.strict_json import dumps_strict
+    sys.stdout.write(
+        dumps_strict(token, label="mint_for_tool_token", separators=(",", ":")) + "\n"
+    )
     sys.stdout.flush()
     sys.exit(0)
 

@@ -37,6 +37,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from ..strict_json import dumps_tool_response_safe
+
 
 DEFAULT_SPOOL_ROOT = Path.home() / ".hydra" / "eights-pending"
 DEFAULT_DEAD_LETTER_ROOT = Path.home() / ".hydra" / "eights-pending-dead"
@@ -80,7 +82,19 @@ class SpooledCall:
     reason: str = ""
 
     def to_json(self) -> str:
-        return json.dumps(
+        # Sanitize, not strict: `args` is an arbitrary daemon-call payload
+        # (attestation/proposal/hitl args) that this spool must be able to
+        # persist and re-read regardless of content -- `_maybe_spool`
+        # swallows any write exception ("spool write must never crash
+        # dispatch"), so a strict refusal here would silently DROP the
+        # call with no trace, and a write that somehow produced invalid
+        # JSON would leave a row `from_json` can never parse back (a
+        # corrupt file `replay()` skips forever without ever reaching the
+        # TTL/`max_attempts` dead-letter check, i.e. a stuck spool -- the
+        # exact failure mode this module's docstring cites). Sanitizing
+        # guarantees the row is always written and always re-readable;
+        # `dumps_tool_response_safe` records which fields were substituted.
+        return dumps_tool_response_safe(
             {
                 "id": self.id,
                 "tool": self.tool,
@@ -90,9 +104,7 @@ class SpooledCall:
                 "workflow_id": self.workflow_id,
                 "reason": self.reason,
             },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+            label=f"spooled_call:{self.tool}",
         )
 
     @classmethod

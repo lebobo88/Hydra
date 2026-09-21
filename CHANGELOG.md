@@ -8,6 +8,143 @@ public-API boundary.
 
 ## [Unreleased]
 
+### Changed — the plan phase now ships ON by default
+
+`HYDRA_PLAN_PHASE` flips from default-off to default-on: unset, empty, or any
+value other than the literal string `"0"` means on. `"0"` is the one
+documented disable spelling (the kill switch), chosen deliberately over an
+unset-means-off convention so that forgetting to set the variable cannot
+silently regress an operator (or a stale CI job) back to the legacy
+sight-unseen precedence below — the safe direction requires an explicit,
+positive act to opt out, not to opt in.
+
+**This re-activates the §6 stand-down as the live default, not merely as an
+opt-in feature**: a high-risk workflow (a P0/P1 task, or any squad declaring a
+`hitl_required` gate) with non-trivial `plan_rigor` now reaches `plan_gate`
+(`reason="plan_approval"`) instead of the old sight-unseen `approval` gate
+(`reason="high_risk"`/`"acceptance_criteria"`) *by default*, everywhere. The
+old precedence is preserved byte-for-byte only for `trivial` rigor, for
+checkpoints predating the feature, and for any workflow that explicitly opts
+out with `HYDRA_PLAN_PHASE=0` — see
+`tests/test_ws9_tier_acceptance.py`'s frozen-precedence tests (opted out) and
+`TestSection6PlanGateStandDownPositive` (the new default proven positively).
+
+**Hostless-path guard, fixed as a prerequisite of this flip, not a
+follow-up**: `hydra replay` (`_cmd_replay`) builds a fresh `workflow_id` and
+drives it through `node_intake` → `node_planner` with no attended host on the
+other end (it exists specifically to run as a detached Cockpit subprocess,
+live or not) — without `force_trivial_plan_rigor=True` at its
+`build_supervisor(...)` call, replaying any non-trivial-rigor workflow would
+seed a real planning task, defer it to a host that will never come, and park
+the replay at `phase="planning"` forever. This is now guarded and proven with
+a paired mutation test (`tests/test_replay_hostless_plan_phase.py`).
+`force_trivial_plan_rigor` remains an explicit **opt-in** signal, not an
+opt-out from a declared "has a host" flag — any future hostless caller of
+`build_supervisor` that forgets to set it will deadlock silently at
+`phase="planning"` rather than fail loudly. That asymmetry is a known sharp
+edge in the current shape of the guard (recorded here and in
+`ARCHITECTURE.md` §2a); restructuring it to fail-closed instead of fail-open
+was judged out of scope for this commit.
+
+### Added — the plan phase, behind `HYDRA_PLAN_PHASE` (default OFF, now ON — see above)
+
+Hydra could route, govern, budget, judge and replay, but it had no plan. It had
+a task list: `node_planner` synthesised one task per selected squad whose
+description was the operator's goal verbatim, and the approval gate asked the
+operator to bless a squad list they could not see. The plan phase gives that
+decision an artifact.
+
+A `PLAN` envelope with typed, acyclic, per-step decomposition; a `planning`
+squad pack whose three heads author, critique and scribe it; a barrier that
+holds every other task until the plan resolves; a cross-vendor judged
+`plan_gate` where the operator approves, rejects, or requests a revision
+against the rendered plan; and the plan itself written to `docs/plans/` as a
+tracked artifact so `git diff` is the review surface.
+
+Everything above ships active by default now (see "the plan phase now ships ON
+by default" above) and is inert only when the flag is explicitly disabled with
+`HYDRA_PLAN_PHASE=0`. The flag gates *writers* of `plan_status` and never
+readers — turning it off mid-flight therefore cannot release a barrier over
+unplanned work.
+
+### Changed — the pre-dispatch approval gate stands down when a plan is coming
+
+**This is a declared behaviour change, not a no-op, and it is recorded here
+rather than left to be discovered.**
+
+`_task_is_high_risk` inspects every task in the workflow, so a P0/P1 task — or
+any squad declaring a `hitl_required` gate — used to raise the one-line,
+sight-unseen `approval` gate *before* any plan existed, on exactly the
+high-risk workflows that most need one. Leaving it in place would have
+double-gated the same decision and trained operators to rubber-stamp the first
+of two prompts.
+
+When the plan phase is active and rigor is not `trivial`, the `high_risk`
+driver stands down and `plan_gate` becomes the single, *informed* approval.
+`budget_exhausted` is deliberately excluded from the stand-down — an
+over-budget workflow still stops at `approval` with `reason="over_budget"`,
+because budget is not a risk signal that a plan can inform.
+
+The previous precedence is preserved byte-for-byte for `trivial` rigor, for
+checkpoints predating the feature, and for any workflow that explicitly
+disables the flag with `HYDRA_PLAN_PHASE=0` — it is no longer every existing
+workflow by default (see "the plan phase now ships ON by default" above).
+
+### Changed — `hydra run`'s default result can now park at `phase="planning"`, and says so explicitly
+
+A cross-vendor judge flagged the default `hydra run` (no `--live`, no
+`--no-checkpoint`) as an unguarded hostless deadlock, same shape as the
+replay bug above. That finding was refuted: this path checkpoints (compiled
+LangGraph graph, `thread_id=str(workflow_id)`), so a non-terminal `phase` is
+resumable via `hydra step <workflow_id>` — it is this repo's mandated
+attended flow (`run` → `step` → `submit-host-result`), not a hostless one,
+and `_cmd_replay`'s throwaway `replay_wf` (no command ever targets it) is
+what made replay a genuine deadlock and this is not.
+
+The refutation surfaced a real, smaller gap: before this flip, `hydra run` on
+a typical goal usually completed in one call; now a non-trivial goal commonly
+parks at `phase="planning"` awaiting the attended planning cursor, and the
+JSON result gave no explicit signal of that — a caller had to infer "parked
+vs. done" from `phase` alone. `_cmd_run`'s printed result now carries
+`"parked": true/false` and an explicit `"next_action"` naming the exact
+command to continue (`hydra step <workflow_id>`, or `hydra resume
+<workflow_id> --action ...` when a real `pending_hitl` gate is pending
+instead). Proven end-to-end, not merely asserted, by
+`tests/test_run_park_resumability.py::test_default_run_parks_resumably_and_step_picks_it_up`
+— it drives `hydra step` against the exact `workflow_id` `hydra run` printed
+and confirms it genuinely resumes the parked planning task.
+
+### Changed — `hydra replay` refuses a workflow that raised a plan, rather than reproducing something else
+
+A cross-vendor judge finding (HIGH): `hydra replay` reconstructs a source
+workflow's `root_goal`, `selected_squads`, repo-targeting, and budget only —
+it never carries forward the approved `PLAN` envelope or the `PlanStep` tasks
+materialised from it. Replaying a workflow that had actually raised a plan
+would therefore silently regenerate a different, legacy generic task set and
+skip the planning leg entirely — replay's contract is deterministic
+re-execution, and that divergence would have been invisible.
+
+`hydra replay` now refuses loudly instead
+(`status="replay_refused_planned_workflow"`) whenever the source checkpoint's
+`plan_status` is anything other than `"none"`/absent — chosen because it is
+the one field `node_planner`/`node_plan_judge`/`node_plan_gate` advance
+together through the entire lifecycle (`authoring` → `drafted` → `judged` →
+`approved`, or → `rejected`), so it already implies a plan was raised at
+every stage without needing a second signal. A trivial-rigor source workflow
+(`plan_status` stayed `"none"`) replays exactly as before. Carrying the plan
+itself through replay is deferred as future work, not attempted in this
+commit. See `tests/test_replay_hostless_plan_phase.py` (refusal parametrised
+over every `plan_status` lifecycle value, plus the unchanged-trivial
+counterpart and the paired mutation proof).
+
+### Added — `policy_override` is now actually emitted
+
+`--force-dispatch` has been documented in two runbooks as logging a
+`policy_override` event, with the operator owning the risk. The engine emitted
+nothing, anywhere. Force-dispatching past *any* gate — budget, high-risk,
+constitution — left no trace. It now emits for every force-dispatch, and the
+emit is not contingent on any side effect succeeding.
+
 ### Added — Hydra's own register (plugin 0.1.7)
 
 - New primary agents `plugins/hydra/agents/hydra.md` (cathedral register) and

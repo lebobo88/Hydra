@@ -863,7 +863,11 @@ def main() -> None:
             except (asyncio.CancelledError, Exception) as exc:
                 logger.error("meta-tool %s failed: %s", name, exc, exc_info=True)
                 result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
-            return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+            from hydra_core.strict_json import dumps_tool_response_safe
+            return [t.TextContent(
+                type="text",
+                text=dumps_tool_response_safe(result, label=f"tool_response:{name}"),
+            )]
 
         # P1.4: guard the backend-routed calls the same way the meta-tool branch
         # above is guarded. pool.call_tool contains its own timeouts/errors into
@@ -880,14 +884,22 @@ def main() -> None:
                 # so numeric/boolean params survive even if a caller sent a string.
                 arguments = _coerce_args_to_schema(arguments, _tool_schemas.get(name))
                 result = await pool.call_tool(backend_server, backend_tool, arguments)
-                return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+                from hydra_core.strict_json import dumps_tool_response_safe
+                return [t.TextContent(
+                    type="text",
+                    text=dumps_tool_response_safe(result, label=f"tool_response:{name}"),
+                )]
 
             # Fallback for dynamically-discovered tools not in the static catalog
             if "__" in name:
                 parts = name.split("__", 1)
                 if len(parts) == 2:
                     result = await pool.call_tool(parts[0], parts[1], arguments)
-                    return [t.TextContent(type="text", text=json.dumps(result, default=str))]
+                    from hydra_core.strict_json import dumps_tool_response_safe
+                    return [t.TextContent(
+                        type="text",
+                        text=dumps_tool_response_safe(result, label=f"tool_response:{name}"),
+                    )]
         except (asyncio.CancelledError, Exception) as exc:
             logger.error("gateway call_tool %s failed: %s", name, exc, exc_info=True)
             return [t.TextContent(type="text", text=json.dumps({

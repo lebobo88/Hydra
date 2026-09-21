@@ -89,6 +89,8 @@ def test_reflexion_retry_on_revise_triggers_second_dispatch():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="quick budget refresh, low stakes")
     final = _invoke(sup, state)
@@ -118,6 +120,8 @@ def test_per_squad_hitl_on_high_severity_fail():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="something flagged for constitutional review")
     final = _invoke(sup, state)
@@ -150,6 +154,8 @@ def test_synthesis_preserves_dissents_and_marks_unsealed_on_conflict():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     # MU9a: healthcare is a stub — excluded from automatic routing.  Use explicit
     # selection (the sanctioned --squad path) so this test exercises the real
@@ -218,6 +224,8 @@ def test_reflexion_ceiling_exhausted_emits_override_hitl():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     # Goal phrased so the router picks 'healthcare' (best_of_n=0 AND
     # `enabled` in policy.yaml). Both conditions matter: best_of_n=0 puts us
@@ -262,6 +270,8 @@ def test_native_pack_defers_instead_of_headless_best_of_n():
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="strategic OKR refresh", selected_squads=["executive"])
     final = _invoke(sup, state)
@@ -297,6 +307,8 @@ def test_best_of_n_falls_back_when_insufficient_candidates(monkeypatch):
         dispatcher=_StubDispatcher(),
         critique_client=client,
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="strategic OKR refresh")
     final = _invoke(sup, state)

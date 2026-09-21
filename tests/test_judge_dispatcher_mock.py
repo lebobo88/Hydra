@@ -10,6 +10,7 @@ from hydra_core.judge.dispatcher import (
     MIN_CRITIQUE_CHARS,
     NoOpCritiqueClient,
     dispatch_judge,
+    dispatch_judge_with_fallback,
 )
 
 
@@ -146,3 +147,172 @@ def test_unknown_rubric_raises():
             workflow_id=wf,
             client=NoOpCritiqueClient(),
         )
+
+
+def test_dispatch_judge_refuses_to_serialize_non_finite_envelope():
+    """Cross-vendor judge finding (b1baf30 revise round, item 1/2): the live
+    PLAN-judging path hands a `model_dump(mode="json")` dict (e.g.
+    `state.plan_ref`) straight to `dispatch_judge`, not a validated `Plan`
+    instance -- so a legacy plan that predates the non-finite-budget schema
+    guard can still carry a NaN/Infinity value here. `_envelope_to_text` must
+    refuse before ever calling the critique client, naming the offending
+    field, not silently emit the bare `NaN` token into the judge prompt.
+
+    Cross-vendor judge finding (further revise round, item 1/4): a bare
+    `ValueError` escaping `dispatch_judge` is an UNHANDLED abort at the
+    supervisor `_judge_envelope` boundary, which tolerates only
+    `JudgeDispatchError` -- exactly the regression that made a legacy
+    checkpoint's resume crash instead of degrading. The refusal must
+    therefore surface as a `JudgeDispatchError` (the type the fallback loop
+    already handles), still naming the offending field, still never
+    reaching the critique client.
+    """
+    wf = uuid4()
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    client = _ScriptedClient({
+        "outcome": "pass", "critique_md": "x" * 100, "score_json": {"a": 1},
+    })
+    with pytest.raises(JudgeDispatchError, match="constraints.budget_usd") as exc_info:
+        dispatch_judge(
+            envelope=hostile,
+            rubric_id="constitution-alignment@1",
+            judge_vendor="agy",
+            workflow_id=wf,
+            client=client,
+        )
+    assert exc_info.value.reason == "non_finite_envelope"
+    assert exc_info.value.retryable is False
+    # Never reached the client -- the refusal happens before dispatch.
+    assert client.calls == []
+
+
+def test_dispatch_judge_with_fallback_degrades_non_finite_envelope_to_recorded_unjudgeable():
+    """The end-to-end resume path: `supervisor._judge_envelope` calls
+    `dispatch_judge_with_fallback`, which converts every `JudgeDispatchError`
+    (infra/auth/quota/timeout) into an honest `skip` verdict -- EXCEPT a
+    non-finite-envelope failure, which is a genuine DATA DEFECT (deterministic
+    across every vendor, since it happens before any client is invoked), not
+    a transient outage. A legacy checkpoint envelope with a non-finite budget
+    must therefore resume and be judged (never abort), with the problem
+    RECORDED in the verdict's critique_md and score_json under the DISTINCT
+    `unjudgeable` outcome -- never folded into `skip`, which every
+    verdict-consuming call site (supervisor.py's `node_judge_per_squad`,
+    `node_judge_synthesis`, `node_plan_judge`; `best_of_n.judge_and_rank`)
+    treats as "no signal, nothing to block on."
+
+    Cross-vendor judge finding (item 1/6, CRITICAL): before this fix, this
+    scenario produced an ordinary `skip` verdict that every downstream site
+    accepted as judged -- silently advancing to synthesis and potentially
+    marking the workflow `done` despite the envelope never having been
+    evaluated.
+
+    Mutation proof (restore the ValueError abort -- revert immediately):
+    if `dispatch_judge` raises bare `ValueError` again instead of
+    `JudgeDispatchError`, this call raises out of
+    `dispatch_judge_with_fallback` (which only catches `JudgeDispatchError`)
+    and the test fails with an unhandled `ValueError`.
+    """
+    wf = uuid4()
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    client = _ScriptedClient({
+        "outcome": "pass", "critique_md": "x" * 100, "score_json": {"a": 1},
+    })
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=hostile,
+        rubric_id="constitution-alignment@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "unjudgeable"
+    assert "constraints.budget_usd" in verdict.critique_md
+    assert verdict.score_json.get("_unjudgeable") is True
+    assert all(a.get("reason") == "non_finite_envelope" for a in attempts)
+    # Never reached the client for either vendor -- both attempts refused
+    # before dispatch, and that refusal is recorded per-vendor.
+    assert client.calls == []
+
+
+def test_dispatch_judge_with_fallback_still_produces_ordinary_skip_for_infra_outage():
+    """Companion to the unjudgeable test above: an ordinary vendor/infra
+    failure (NOT `non_finite_envelope`) must still degrade to the honest
+    `skip` outcome exactly as before -- the new `unjudgeable` marker is
+    additive, not a replacement for the existing infra-outage handling."""
+    wf = uuid4()
+    client = _ScriptedClient({}, raises=RuntimeError("MCP unreachable"))
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=_env(),
+        rubric_id="constitution-alignment@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "skip"
+    assert verdict.score_json.get("_infra") is True
+    assert all(a.get("reason") != "non_finite_envelope" for a in attempts)
+
+
+def test_dispatch_judge_refuses_non_finite_score_json_at_record_time():
+    """Cross-vendor judge finding (this round, item 1 CRITICAL): a VERDICT
+    can itself carry non-finite data -- the judge model's own `score_json`
+    response is untrusted, and nothing upstream of `dispatch_judge`
+    constrains it to finite values the way `_envelope_to_text` constrains
+    the envelope being judged. A NaN score must be refused at construction,
+    surfacing as the same `unjudgeable`-shaped `JudgeDispatchError` a
+    non-finite ENVELOPE raises, with the offending field named."""
+    wf = uuid4()
+    client = _ScriptedClient({
+        "outcome": "pass",
+        "critique_md": "Solid memo. " * 20,
+        "score_json": {"objective_clarity": float("nan")},
+    })
+    with pytest.raises(JudgeDispatchError) as exc_info:
+        dispatch_judge(
+            envelope=_env(),
+            rubric_id="board-decision-quality@1",
+            judge_vendor="agy",
+            workflow_id=wf,
+            client=client,
+        )
+    err = exc_info.value
+    assert err.reason == "non_finite_envelope"
+    assert not err.retryable
+    assert "score_json.objective_clarity" in str(err)
+
+
+def test_dispatch_judge_with_fallback_surfaces_unjudgeable_for_non_finite_verdict():
+    """The fallback loop's existing all-vendors-failed check (keyed on
+    `reason=="non_finite_envelope"`) folds a non-finite VERDICT into the
+    same `unjudgeable` outcome a non-finite ENVELOPE gets -- never a
+    fabricated `pass`."""
+    wf = uuid4()
+    client = _ScriptedClient({
+        "outcome": "pass",
+        "critique_md": "Solid memo. " * 20,
+        "score_json": {"objective_clarity": float("inf")},
+    })
+    verdict, attempts = dispatch_judge_with_fallback(
+        envelope=_env(),
+        rubric_id="board-decision-quality@1",
+        judge_vendors=["agy", "codex"],
+        workflow_id=wf,
+        client=client,
+    )
+    assert verdict.outcome == "unjudgeable"
+    assert "score_json.objective_clarity" in verdict.critique_md
+    assert client.calls, "both vendors were genuinely attempted, not skipped"
+
+
+def test_dispatch_judge_allow_nan_true_would_have_leaked_nan_into_prompt():
+    """Mutation proof (revert immediately): show plain `json.dumps` (the
+    pre-fix behaviour, before `_envelope_to_text` routed through
+    `strict_json.dumps_strict`) would have silently written the literal
+    `NaN` token into the judge-facing artifact text instead of refusing.
+    """
+    import json as _json
+    hostile = _env()
+    hostile["constraints"] = {"budget_usd": float("nan")}
+    text = _json.dumps(hostile, indent=2, default=str, sort_keys=True)
+    assert "NaN" in text

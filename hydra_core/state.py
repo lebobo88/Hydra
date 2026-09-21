@@ -5,6 +5,7 @@ for collections (tasks, messages, artifacts) and replace-by-default for scalars.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Optional
 from uuid import UUID, uuid4
@@ -167,6 +168,31 @@ class TaskState(BaseModel):
     # default / auto-detect.  Preserved across planner rebuilds and retries.
     pp_team: Optional[str] = None
     pp_profile: Optional[str] = None
+    # P0 planning substrate: task_ids this task depends on, and the Plan
+    # step / revision it was materialized from (None = task predates
+    # planning, or was created outside a Plan). P1 (plan_deps_satisfied,
+    # below) reads ``depends_on`` to gate attended task selection, and it
+    # does so UNCONDITIONALLY -- not only while a plan barrier is active
+    # (see the call site in cli.py for why). This is a no-op for existing
+    # workflows only because nothing in the codebase populates
+    # ``depends_on`` yet; the moment a planner starts setting it, dependency
+    # ordering takes effect.
+    depends_on: list[str] = Field(default_factory=list)
+    plan_step_id: Optional[str] = None
+    plan_revision: int = 0
+    # P5c: `--modify-plan` seeds a fresh "planning" task carrying the
+    # operator's revision critique instead of a plan STEP -- this task has
+    # no `plan_step_id`. `plan_critique` is the critique's full, untruncated
+    # text (read from the `--critique-ref` file/MemoryRef by
+    # `hydra_core.cli._read_plan_critique`, never routed through the
+    # `_OPTION_RE`-bounded `--option` string). `supersedes_plan_envelope_id`
+    # names the prior `Plan.id` this revision replaces, mirroring
+    # `hydra_core.schemas.Plan.supersedes` (a UUID there; a str here since a
+    # TaskState is not itself an envelope and need not round-trip through
+    # envelope validation). Both additive-only Optional fields -- an
+    # existing checkpoint loads fine with both None.
+    plan_critique: Optional[str] = None
+    supersedes_plan_envelope_id: Optional[str] = None
 
 
 class HydraState(BaseModel):
@@ -194,6 +220,14 @@ class HydraState(BaseModel):
     # "goal_text_inferred" (MU5 conservative cue-based inference), or None
     # when no target has resolved.
     target_repo_source: Optional[str] = None
+    # P3 plan-triage substrate: the operator's `--risk`/`risk=` hint (CLI
+    # `hydra run --risk` / `hydra plan --risk`, or the hydra.workflow.plan
+    # / hydra.workflow.launch MCP `risk` param). Previously recorded only on
+    # the workflow_start/workflow_plan trace event with a comment noting
+    # "there is no dedicated HydraState risk field yet" (see cli.py); this is
+    # that field. Defaults to "medium" so a workflow with no operator hint
+    # triages the same as before this field existed.
+    risk_tolerance: Literal["low", "medium", "high"] = "medium"
     phase: Literal[
         "intake", "planning", "approval", "dispatch",
         "executing", "judge_per_squad", "synthesis", "judge_synthesis",
@@ -337,6 +371,33 @@ class HydraState(BaseModel):
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
 
+    # P0 planning substrate. Plain replace-by-default fields, no reducers: a
+    # planning re-run REPLACES the prior plan snapshot rather than
+    # accumulating history. P1 (plan_barrier_active, below) now reads
+    # ``plan_status`` to gate dispatch while a plan is
+    # authoring/drafted/judged/rejected; it is a no-op for existing
+    # workflows only because nothing yet drives ``plan_status`` away from
+    # its default "none".
+    plan_status: Literal[
+        "none", "skipped", "authoring", "drafted", "judged",
+        "approved", "rejected", "bypassed",
+    ] = "none"
+    plan_rigor: Optional[str] = None
+    plan_rigor_source: Optional[str] = None
+    # P3: operator override input (pre-seeded the way --squad pre-seeds
+    # selected_squads, via `hydra plan --rigor` / hydra.workflow.plan
+    # rigor=). node_planner reads this once to set plan_rigor/plan_rigor_source
+    # ("operator_flag") instead of the computed triage value, and records a
+    # hitl_history downgrade event when the override is stricter-to-looser
+    # than the computed rigor. Left populated afterwards (an input value, not
+    # a derived one) so replay reproduces the same override.
+    plan_rigor_override: Optional[Literal["trivial", "standard", "major"]] = None
+    plan_envelope_id: Optional[UUID] = None
+    plan_ref: Optional[dict[str, Any]] = None
+    plan_revision: int = 0
+    plan_approved_at: Optional[datetime] = None
+    plan_artifact_location: Optional[str] = None
+
     def bump_iteration(self) -> None:
         self.iteration_count += 1
 
@@ -359,23 +420,247 @@ class HydraState(BaseModel):
         return False, None
 
 
+# P1 plan-barrier predicates, defined ONCE here and imported everywhere else —
+# a divergent second definition is the documented trap from the
+# worktree-relocation incident.
+#
+# P5b: the flag gates WRITERS, not READERS -- deliberately. There are exactly
+# TWO places in the engine that write `plan_status` while deciding whether the
+# plan phase is even active -- i.e. that can move it OFF its default "none":
+# `node_planner`'s `_plan_gate_active` check in supervisor.py (seeds
+# "authoring"), and the ingest PLAN branch in `hydra_core/ingest.py` (seeds
+# "drafted", gated on `_plan_phase_enabled()`). Both MUST be flag-gated --
+# that is the entire safety argument this asymmetry rests on. Everything
+# downstream of them (`node_plan_judge`/`node_plan_gate`, which write
+# "judged"/"approved") writes unconditionally, but only ever runs because one
+# of the two gated writers above already moved `plan_status` off "none" --
+# an ungated writer anywhere in that pair would transitively make "judged"/
+# "approved" reachable with the flag off too. (A prior revision of this
+# branch shipped the ingest writer ungated; a cross-vendor judge caught it
+# before merge -- see `test_p5b_plan_lifecycle.py::TestTask1AllowLists`'s
+# flag-off refusal test.) `plan_barrier_active` and `plan_deps_satisfied`
+# below, and every caller of them (the four selectors in cli.py,
+# node_dispatch's sequential loop, `after_dispatch`), read `plan_status`
+# UNCONDITIONALLY -- with no `HYDRA_PLAN_PHASE` check anywhere in the read
+# path. This is intentional, not an oversight: it means flipping the flag OFF
+# mid-flight can never release the barrier and let unplanned work dispatch
+# out from under an in-progress plan -- the barrier, once raised, only ever
+# comes down through the plan's own lifecycle (approved/rejected/bypassed),
+# never through an environment variable. Reading this the other way around
+# -- "the flag being off should make the barrier inert everywhere, including
+# here" -- gets the safety direction backwards; see
+# `test_p5b_plan_lifecycle.py`'s locked-in regression tests for the property
+# this asymmetry buys.
+#
+# P5c adds TWO more writers, both in `hydra_core/cli.py`'s resume handler,
+# and both scoped to `gate_node == "plan_gate"` rather than written
+# unconditionally -- unlike the two seeding writers above, these run inside
+# a handler (the resume/reject path) that also serves EVERY OTHER gate in
+# the engine, so an unscoped write here would raise or move the barrier from
+# an action that has nothing to do with planning:
+#   * `--force-dispatch` past `plan_gate` writes `plan_status="bypassed"`.
+#     `"bypassed"` is deliberately NOT a member of `_PLAN_BARRIER_STATES` --
+#     it cannot raise the barrier by construction, so this write is safe even
+#     if the scoping were ever dropped by accident. It is still scoped, so
+#     the next reader does not have to re-derive that safety argument.
+#   * `--reject` at `plan_gate` writes `plan_status="rejected"`, which IS a
+#     barrier member -- unlike `bypassed`, an unscoped write here WOULD raise
+#     the barrier from an ordinary rejection of ANY gate (budget, high_risk,
+#     constitution, ...), with `HYDRA_PLAN_PHASE` off and no flag-gated code
+#     anywhere able to ever clear it. This is exactly the total-dispatch-
+#     freeze class of bug the flag exists to prevent, reachable from a
+#     routine operator reject -- the scoping to `plan_gate` is load-bearing,
+#     not cosmetic. See `tests/test_p5c_plan_operator_surfaces.py`.
+_PLAN_BARRIER_STATES = frozenset({"authoring", "drafted", "judged", "rejected"})
+
+
+def plan_max_revisions() -> int:
+    """HYDRA_PLAN_MAX_REVISIONS -- the `--modify-plan` revision ceiling.
+
+    Default 2. Shared by `node_plan_judge` (supervisor.py, which reads it to
+    decide what options the plan_gate advertises) and `hydra_core.cli`'s
+    `--modify-plan` handler (which enforces it before seeding another
+    revision) so the ceiling is defined exactly once -- see
+    `plan_revision_ceiling_reached` below for why a hand-duplicated second
+    copy of the comparison itself would be worse than a hand-duplicated env
+    read.
+    """
+    raw = os.environ.get("HYDRA_PLAN_MAX_REVISIONS", "")
+    if not raw:
+        return 2
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    return value if value > 0 else 2
+
+
+def plan_revision_ceiling_reached(plan_revision: int, max_revisions: int) -> bool:
+    """True once the operator has used every `--modify-plan` revision the
+    ceiling allows.
+
+    `plan_revision` starts at 1 for the first authored plan (the initial
+    draft is not itself a "revision"); each `--modify-plan` call increments
+    it by one, so the number of revisions actually consumed is
+    ``plan_revision - 1``. Defined ONCE here -- both `node_plan_judge` (to
+    decide whether the gate offers `modify-plan` at all) and the CLI's
+    `--modify-plan` handler (to refuse a request that would exceed the
+    ceiling) call this instead of re-deriving the comparison, so the two
+    can never drift the way a prior phase's hand-duplicated decision did
+    (see `_ingest_item_should_release_claim`'s docstring in cli.py for that
+    history).
+    """
+    return max(0, plan_revision - 1) >= max_revisions
+
+
+def plan_barrier_active(state) -> bool:
+    """True while a plan is mid-authoring/judging/rejected and dispatch should
+    hold non-planning work. ``getattr`` with a "none" default so a checkpoint
+    written before this field existed is never blocked."""
+    return str(getattr(state, "plan_status", "none") or "none") in _PLAN_BARRIER_STATES
+
+
+def plan_deps_satisfied(state, task) -> bool:
+    """True when every task_id in ``task.depends_on`` has been driven to a
+    genuinely-done outcome.
+
+    Empty ``depends_on`` is always satisfied. A dependency is satisfied when
+    its id appears in ``state.attended_done_task_ids`` (attended cursors that
+    finalized with final_status="complete" — see HydraState.attended_done_task_ids)
+    or when the corresponding TaskState has ``status == "done"`` (in-graph
+    dispatch path). Deliberately NOT attended_completed_task_ids: that list
+    also includes "surfaced" and "aborted" outcomes, and releasing a dependent
+    onto a surfaced upstream is the E2-23 bug in a new costume.
+    """
+    deps = list(getattr(task, "depends_on", None) or [])
+    if not deps:
+        return True
+    done_ids = set(getattr(state, "attended_done_task_ids", None) or [])
+    status_by_id = {
+        str(t.task_id): getattr(t, "status", None)
+        for t in getattr(state, "tasks", None) or []
+    }
+    for dep in deps:
+        dep = str(dep)
+        if dep in done_ids:
+            continue
+        if status_by_id.get(dep) == "done":
+            continue
+        return False
+    return True
+
+
+class PoisonedStateError(Exception):
+    """Raised by the checkpoint-deserialization choke point (see
+    ``make_checkpoint_serde``) when a persisted checkpoint's ``channel_values``
+    contains a non-finite float (``NaN``/``Infinity``/``-Infinity``) anywhere
+    in its structure.
+
+    Twelve prior cross-vendor rounds each patched ONE more node/edge/`as_node`
+    jump that could reach `synthesis`/postcheck without re-running the
+    non-finite scan a sibling node already had -- each fix closed one path
+    and the next round found another. This exception is raised from the ONE
+    place every one of those paths is structurally forced to pass through:
+    `HydraState`/`TaskState`/`BudgetLedger` (and therefore `envelopes`,
+    `verdicts`, `artifacts`, `plan_ref`, `attended_results`, and any other
+    collection state carries) do not exist in a Python process until
+    LangGraph's checkpointer deserializes them off disk via this module's
+    serde -- there is no second, unwrapped route to the same bytes (see
+    `make_checkpoint_serde`'s docstring for the exhaustive
+    `grep -rn "SqliteSaver("` confirming exactly two construction sites, both
+    already required to route through this function).
+
+    ``field`` is the dotted/bracketed path `find_non_finite_field` reports
+    (e.g. ``"$.verdicts[2].score_json.value"``); callers surface it verbatim
+    in the same `unjudgeable`-shaped message the rest of the codebase already
+    uses (see `judge.dispatcher._unjudgeable_verdict`,
+    `cli._cmd_finalize`'s pre-materialization scan) so an operator sees one
+    consistent vocabulary regardless of which path caught the poison.
+    """
+
+    def __init__(self, field: str) -> None:
+        self.field = field
+        super().__init__(
+            f"checkpoint contains a non-finite value at {field}; "
+            "refusing to deserialize poisoned state"
+        )
+
+
 def make_checkpoint_serde() -> Any:
-    """Return a JsonPlusSerializer with hydra_core.state types registered.
+    """Return a JsonPlusSerializer with hydra_core.state types registered,
+    wrapped so every checkpoint READ is scanned for non-finite floats before
+    any caller (node, conditional edge, ``as_node`` jump, or CLI finalize
+    path) can observe the deserialized value.
 
     This suppresses the 'Deserializing unregistered type' deprecation warning
     that langgraph emits when it deserializes Pydantic models (BudgetLedger,
     TaskState, HydraState) whose modules are not in the explicit allowlist.
 
     Pass the return value as ``serde=`` to SqliteSaver at every construction
-    site (supervisor.build_supervisor + hydra_memory._load_state_values).
+    site (supervisor.build_supervisor + hydra_memory._load_state_values) --
+    confirmed by ``grep -rn "SqliteSaver("`` to be the ONLY two places this
+    process ever constructs a checkpoint reader/writer. Every
+    ``get_state``/``update_state``/``invoke`` call on the compiled graph (and
+    every ``hydra-mem.workflow_status`` style read-only tool) reads the prior
+    checkpoint through ``SqliteSaver.get_tuple``, which calls
+    ``serde.loads_typed`` on the WHOLE checkpoint dict (see
+    ``SqliteSaver.put``'s use of ``self.serde.dumps_typed(checkpoint)`` for
+    the symmetric write) -- there is no code path in this repository that
+    reads a persisted checkpoint's ``channel_values`` without going through
+    that call. Scanning here, once, therefore covers a hostile/legacy
+    ``as_node`` jump exactly the same as an ordinary node re-entry: the
+    poisoned bytes cannot become a live Python object at all without first
+    passing this gate.
+
+    Chosen over a "state-entry validator" graph node (the other candidate
+    choke point): LangGraph's ``update_state(..., as_node=...)`` is
+    EXPLICITLY designed to apply a patch and re-enter the graph at an
+    arbitrary node without running any node function in between -- that is
+    precisely the mechanism `cli._cmd_finalize` uses (`as_node=
+    "judge_per_squad"`) and precisely the mechanism the FAIL this round
+    describes exploits. A validator implemented as a graph node is, by
+    construction, one more node an `as_node=` jump can route around; a
+    validator implemented as a Python-level wrapper around
+    `invoke`/`update_state`/`get_state` would need to be called at every one
+    of dozens of scattered call sites across `cli.py`/`supervisor.py`/the MCP
+    servers, and a future call site can always forget it (this is exactly
+    the "twelve rounds, twelve near-misses" failure mode already observed).
+    The serde is the one object both of those layers are built ON TOP of, so
+    there is nothing beneath it left to bypass.
 
     Returns None when langgraph / JsonPlusSerializer is not importable so the
-    caller can fall back to the bare SqliteSaver(conn) construction.
+    caller can fall back to the bare SqliteSaver(conn) construction (the
+    ``_PurePythonRunner`` dev/test fallback never persists a checkpoint at
+    all, so there is nothing for this choke point to scan there).
     """
     try:
         from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer  # type: ignore
     except ImportError:  # pragma: no cover — langgraph absent
         return None
-    return JsonPlusSerializer(
+
+    from .strict_json import find_non_finite_field
+
+    class _ScanningCheckpointSerde(JsonPlusSerializer):
+        """``JsonPlusSerializer`` whose ``loads_typed`` refuses a checkpoint
+        whose deserialized ``channel_values`` (or any other top-level key —
+        the whole checkpoint dict is scanned, not an enumerated field list,
+        so a FUTURE state field carrying a payload is covered without a code
+        change here) contains a non-finite float anywhere in its structure.
+
+        Scans the deserialized VALUE, not the raw bytes: this runs after
+        ``JsonPlusSerializer``'s own msgpack/json decode has already
+        reconstructed real Python objects (dicts, lists, Pydantic models via
+        ``model_dump``), so nested Pydantic model fields are visible to
+        ``find_non_finite_field`` the same way a plain dict's are.
+        """
+
+        def loads_typed(self, data: tuple[str, bytes]) -> Any:
+            value = super().loads_typed(data)
+            bad_field = find_non_finite_field(value)
+            if bad_field is not None:
+                raise PoisonedStateError(bad_field)
+            return value
+
+    return _ScanningCheckpointSerde(
         allowed_msgpack_modules=[HydraState, TaskState, BudgetLedger],
     )

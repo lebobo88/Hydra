@@ -183,6 +183,23 @@ def cell_of(name_or_aspect: str) -> Cell | None:
     return None
 
 
+def to_eights_cell(cell: Cell) -> str:
+    """The documented inverse of `cell_of`: Hydra trigram slug -> TheEights
+    English slug (e.g. "qian" -> "vision").
+
+    Hydra's own vocabulary uses the I Ching trigram slugs ("qian", "kun", ...);
+    TheEights' memory substrate uses the English aspect slugs ("vision",
+    "context", ...). The two are 1:1. `cell_of` already normalizes an inbound
+    string of either flavor (or the trigram glyph, or the Chinese/quality
+    name) down to the canonical `Cell`; this is the missing outbound
+    direction, needed whenever Hydra hands a cell tag to a TheEights MCP call.
+
+    Derived from `CELL_SPECS` (never hand-duplicated) so it cannot drift from
+    the single source of truth.
+    """
+    return CELL_SPECS[cell].name.lower()
+
+
 def validate_cells(cells: list[str]) -> list[Cell]:
     """Normalize and validate a list of cell-ish strings. Drops anything that
     can't resolve. Used by the classifier and by MCP boundary tagging."""

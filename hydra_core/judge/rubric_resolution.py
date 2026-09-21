@@ -59,6 +59,9 @@ DEFAULT_RUBRIC_BY_GATE_TYPE: dict[str, str] = {
     "code_style": CODE_RUBRIC_BASE,
     "lint_class": CODE_RUBRIC_BASE,
     "docs_polish": CODE_RUBRIC_BASE,
+    # P0 planning substrate: unversioned base id, resolved to the highest
+    # registered @N at call time (see resolve_rubric_id).
+    "plan": "plan-decomposition-quality",
 }
 
 _VERSIONED_RE = re.compile(r"@\d+$")

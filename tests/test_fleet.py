@@ -1118,8 +1118,8 @@ class TestFix6AllResultsChargedBeforeHitl:
         _fleet_any_block = False
         for result in fleet_results:
             from hydra_core.supervisor import _extract_squad_cost  # noqa: PLC0415
-            _cost_usd, _cost_tok = _extract_squad_cost(result)
-            _block, _ = charge_and_gate(s, _cost_usd, _cost_tok)
+            _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+            _block, _ = charge_and_gate(s, _cost_usd, _cost_tok, source=_cost_src)
             if _block:
                 _fleet_any_block = True
             # Continue charging even after first block -- do NOT return early.
@@ -1158,8 +1158,8 @@ class TestFix6AllResultsChargedBeforeHitl:
         from hydra_core.supervisor import _extract_squad_cost
         spent_at_hitl_buggy = None
         for result in fleet_results:
-            _cost_usd, _cost_tok = _extract_squad_cost(result)
-            _block, _ = charge_and_gate(s, _cost_usd, _cost_tok)
+            _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+            _block, _ = charge_and_gate(s, _cost_usd, _cost_tok, source=_cost_src)
             if _block:
                 spent_at_hitl_buggy = s.budget.spent_usd
                 break  # buggy early return
@@ -1207,8 +1207,8 @@ class TestFix6AllResultsChargedBeforeHitl:
 
         # Simulate the fixed pass-1 loop: charge BEFORE status-gate.
         for result in [ok_result, failed_result]:
-            _cost_usd, _cost_tok = _extract_squad_cost(result)
-            charge_and_gate(s, _cost_usd, _cost_tok)
+            _cost_usd, _cost_tok, _cost_src = _extract_squad_cost(result)
+            charge_and_gate(s, _cost_usd, _cost_tok, source=_cost_src)
             # (In the real loop the 'failed' branch continues after charging;
             # here we just verify charging happens.)
 

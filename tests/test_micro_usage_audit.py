@@ -39,7 +39,14 @@ def _start_paused_workflow(tmp_path, monkeypatch) -> str:
     wf = uuid4()
     initial = HydraState(workflow_id=wf, root_goal="MU7 test goal: bare interrupt resume")
     initial.selected_squads = ["executive"]
-    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher())
+    sup = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_NullDispatcher(),
+        # P5b hostless-path audit: fresh thread_id, one-shot invoke, no
+        # attended host -- this module's point is the legacy `approval` gate,
+        # so force plan_rigor trivial (mirrors cli.py's --live/
+        # --no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
+    )
     sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
     return str(wf)
 
@@ -483,7 +490,12 @@ def test_mu15_completed_workflow_resumes_to_non_surfaced(tmp_path, monkeypatch, 
     # WS1-E: engineering dispatch requires an explicit, resolved target repo.
     initial.target_repo_id = "hydra"
     sup_plan = build_supervisor(
-        project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True
+        project_root=REPO_ROOT, dispatcher=_NullDispatcher(), plan_only=True,
+        # P5b hostless-path audit: this test's concern is MU15 attended-
+        # complete governance, not the plan phase's own seeded planning
+        # task -- force plan_rigor trivial so exactly one (engineering)
+        # task is synthesised, matching this test's assumption below.
+        force_trivial_plan_rigor=True,
     )
     config = {"configurable": {"thread_id": str(wf)}}
     sup_plan.invoke(initial, config=config)

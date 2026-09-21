@@ -84,6 +84,123 @@ Conditional edges from `postcheck` route to `done`, back to `dispatch`
 (if a missed dependency was discovered), or to `surfaced` (a terminal
 state meaning "human must intervene").
 
+### 2a. The plan phase (`HYDRA_PLAN_PHASE`, default ON)
+
+Two further nodes, `plan_judge` and `plan_gate`, sit on a loop **through**
+dispatch rather than before it. That placement is forced: the attended cursor
+machinery a plan must be authored through is reachable only from dispatch, so a
+pre-dispatch leg could not author anything without fabricating it.
+
+| Phase | Node | Purpose |
+|---|---|---|
+| `dispatch` | `plan_judge` | Reached when `plan_status == "drafted"`. Judges the `PLAN` against `plan-decomposition-quality@1`, computes the budget estimate and the revision ceiling, and files the gate pre-interrupt. |
+| `dispatch` | `plan_gate` | `interrupt_before` checkpoint, `reason="plan_approval"`. On approval writes `plan_status="approved"` and materialises one `TaskState` per `PlanStep` — here, on approval only. |
+
+The **plan barrier** is what makes this binding. While `plan_status` is one of
+`authoring`, `drafted`, `judged` or `rejected`, `node_dispatch` holds every task
+whose `owner_squad` is not `planning`, the fleet predicate is suppressed, and
+the attended selectors will not pick a non-planning task. This is enforced in
+four selectors plus the ingest path, because a barrier enforced in three of five
+places is not a barrier.
+
+**Default and kill switch.** The plan phase ships ON: `HYDRA_PLAN_PHASE` is
+read as on unless it is set to the literal string `"0"` — unset, empty, or any
+other value all mean on. This is deliberately fail-*safe* in the opposite
+direction of a typical feature flag: an operator (or a stale CI job) that
+forgets to export anything gets the plan phase, not the legacy sight-unseen
+approval path, because forgetting to set a flag should never silently regress
+safety-relevant precedence. `"0"` is the one documented disable spelling — the
+kill switch for an environment that cannot yet support it (see "hostless
+production paths" below).
+
+**§6 stand-down.** When the plan gate is active (flag on, non-trivial
+`plan_rigor`) `node_planner`'s `requires_human_approval` no longer folds in
+`high_risk`/`needs_ac_hitl` directly — those sight-unseen reasons stand down
+in favour of the plan gate itself (`reason="plan_approval"`,
+`gate_node="plan_gate"`) as the one informed approval. This is a declared
+behaviour change, not an oversight: a high-risk workflow now reaches
+`plan_gate`, never `approval`, once it has a plan rigor above trivial. See
+`tests/test_ws9_tier_acceptance.py::TestSection6PlanGateStandDownPositive` for
+the positive proof and `CHANGELOG.md` for the operator-facing note.
+`budget_exhausted` is deliberately excluded from the stand-down: a funded,
+over-budget workflow still gates at `approval` (`reason="over_budget"`)
+regardless of the plan phase.
+
+**Hostless production paths.** Any caller that drives a *fresh* `workflow_id`
+through `node_intake` → `node_planner` with no attended host on the other end
+to resolve a deferred `owner_squad="planning"` task must pass
+`force_trivial_plan_rigor=True` to `build_supervisor(...)` — this forces
+`plan_rigor="trivial"` regardless of triage, so no planning task is ever
+seeded and the legacy in-graph behaviour is preserved. `cli.py`'s `_cmd_run`
+sets it for the detached `--live` path and for `--no-checkpoint`; `_cmd_replay`
+sets it unconditionally (it is *always* a detached-subprocess replay per its
+own docstring, live or not — see the fix and its mutation proof in
+`tests/test_replay_hostless_plan_phase.py`). This is an explicit **opt-in**,
+not an opt-out: a new hostless entry point that forgets to set it deadlocks
+silently at `phase="planning"` rather than failing loudly. That is a known
+sharp edge in the current shape of the guard — the safer design would have
+callers declare that they *have* a host (opt-in to the dangerous case)
+instead of declaring that they don't, but restructuring that is out of scope
+for this flip; treat every new caller of `build_supervisor` that drives a
+fresh thread id as a checklist item against this section.
+
+`hydra run`'s default path (no `--live`, no `--no-checkpoint`) is deliberately
+**not** on this checklist and does **not** set `force_trivial_plan_rigor` — it
+is the attended entry point this repo mandates (`run` → `step` →
+`submit-host-result`), not a hostless one. It uses the compiled LangGraph
+graph with `thread_id=str(workflow_id)`, so a checkpoint always exists; a
+non-terminal `phase` in its printed result is resumable, not abandoned, via
+`hydra step <workflow_id>`. This is nonetheless a real, previously-
+undocumented behaviour change: before the plan phase shipped on, most goals
+reached a terminal phase inside this one call; now a non-trivial goal commonly
+parks at `phase="planning"`. `_cmd_run`'s JSON output makes this explicit —
+`"parked": true` and a `"next_action"` field naming the exact `hydra step
+<workflow_id>` (or `hydra resume <workflow_id> --action ...` when a real
+`pending_hitl` gate is pending instead) — rather than leaving the caller to
+infer it from `phase` alone. See
+`tests/test_run_park_resumability.py::test_default_run_parks_resumably_and_step_picks_it_up`
+for the end-to-end proof that `hydra step` genuinely resumes the parked
+workflow, not merely that the JSON claims it will.
+
+**Replay cannot reproduce a plan.** `hydra replay` reconstructs a source
+workflow's `root_goal`, `selected_squads`, repo-targeting, and budget only —
+never the approved `PLAN` envelope or its materialised `PlanStep` tasks.
+Replaying a source workflow that raised a plan (its `plan_status` advanced
+past `"none"`, at any lifecycle stage) would otherwise silently regenerate a
+different, legacy generic task set and skip the planning leg entirely —
+turning replay's deterministic-reproduction contract silently divergent.
+`_cmd_replay` refuses loudly instead (`status="replay_refused_planned_workflow"`)
+whenever the source checkpoint's `plan_status` is anything other than
+`"none"`/absent; a trivial-rigor source workflow (`plan_status` stayed
+`"none"`) replays exactly as before. Carrying the plan itself through replay
+is future work, not attempted here — see
+`tests/test_replay_hostless_plan_phase.py::test_replay_of_planned_workflow_is_refused`
+for the proof (parametrised over every `plan_status` lifecycle value) and its
+paired mutation test.
+
+Two further properties are worth stating because both are load-bearing and
+neither is obvious:
+
+- **The flag gates writers, not readers.** Every reader of `plan_status` is
+  unconditional; only the writers check `HYDRA_PLAN_PHASE`. With the flag off
+  nothing can move the status off `"none"`, so the barrier can never rise — and
+  turning the flag off mid-flight therefore cannot release a barrier over work
+  that was never planned. Reading it the other way round gets the safety
+  direction backwards.
+- **Steps are materialised on approval, never at draft.** `HydraState.tasks`
+  carries an append reducer, so nothing can remove a task once appended.
+  Materialising at draft time would leave a rejected or superseded revision's
+  steps selectable permanently. Materialisation is additionally idempotent per
+  step at the current `plan_revision`, because `plan_gate` can execute more than
+  once — `hydra replay` re-invokes the graph against a snapshot that already
+  holds the first materialisation.
+
+The plan itself is a `PLAN` envelope, validated at construction (duplicate,
+self-referential, dangling and cyclic step dependencies are all refused), and
+rendered to `docs/plans/plan-<slug>.html` through `write_repo_artifact` — the
+only repo-bound writer, fenced to an allow-listed subtree. It is tracked, so
+`git diff` is the review surface. No graph node ever runs `git commit`.
+
 Checkpointing uses `SqliteSaver(thread_id=workflow_id)` so long-running
 campaigns survive a restart. `/hydra:resume` re-enters at the last
 persisted node; `/hydra:replay` reconstructs deterministically from the

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .eights import Cell
 
@@ -37,7 +37,53 @@ class MemoryRef(BaseModel):
 
 
 class Constraints(BaseModel):
-    budget_usd: Optional[float] = None
+    # AgentSmith's checkPlan validator (X2) requires strict RFC 8259 JSON —
+    # NaN/Infinity/-Infinity are not valid JSON tokens even though Python's
+    # `json` module accepts them by default (`allow_nan=True`). `allow_
+    # inf_nan=False` rejects those three inputs at construction time while
+    # still accepting `None` and any ordinary finite float; no other
+    # constraint (e.g. non-negativity) is added.
+    #
+    # Cross-vendor judge finding (item 6/6, MEDIUM): "at construction time"
+    # is the operative limit. `allow_inf_nan=False` is a pydantic FIELD
+    # VALIDATOR, and pydantic v2 field validators run on `Model(...)` /
+    # `model_validate(...)` / `model_validate_json(...)` -- they do NOT run
+    # on `model_copy(update=...)` (an in-place field swap, no validation at
+    # all by default) or `model_construct(...)` (explicitly skips ALL
+    # validation, including this one). Both are real code paths in this
+    # codebase: `Constraints.model_construct(budget_usd=float("nan"))`
+    # succeeds silently, and so does
+    # `some_plan.model_copy(update={"constraints": <hostile>})`.
+    #
+    # Boundaries that DO revalidate a value that reached here via one of
+    # those two bypasses (so the invariant still holds end to end even
+    # though the field validator alone cannot enforce it universally):
+    #   - `hydra_core.ingest.dispatch_ingested_envelopes` (~line 510):
+    #     round-trips every caller-supplied TYPED envelope through
+    #     `type(env).model_validate(env.model_dump(mode="json"))` BEFORE it
+    #     reaches the PLAN-write / judge-serialize code below, specifically
+    #     to catch a `model_copy`/`model_construct` bypass with pydantic's
+    #     own field-naming error at the ingest boundary rather than deeper
+    #     inside a writer.
+    #   - `hydra_core.strict_json.dumps_strict` / `find_non_finite_field`
+    #     (this module's sibling): inspects the ACTUAL runtime value, not
+    #     how it was constructed, so it catches a bypassed non-finite float
+    #     regardless of provenance -- the last-resort backstop every
+    #     envelope/plan-to-JSON-text writer (the judge dispatcher, the plan
+    #     HTML/JSON artifact renderers, the MCP persistence writes) routes
+    #     through.
+    #   - `hydra_core.plan_artifact._sum_step_budgets` /
+    #     `sum_finite_budgets`: guards against a SEPARATE failure mode
+    #     (float overflow from summing two already-finite values), not
+    #     against a bypassed non-finite input, but documented alongside
+    #     since it sits on the same read path.
+    # A value that reaches a downstream consumer WITHOUT transiting any of
+    # these three boundaries (e.g. a raw dict loaded straight from an old
+    # checkpoint and handed directly to a judge call) is exactly the
+    # "legacy envelope" scenario `judge.dispatcher.dispatch_judge` treats as
+    # `unjudgeable` rather than crashing or silently degrading to `skip`
+    # (item 1/6) -- there is no field-validator boundary to catch it earlier.
+    budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
     token_limit: Optional[int] = None
     deadline_ts: Optional[datetime] = None
     risk_tolerance: Literal["low", "medium", "high"] = "medium"
@@ -225,7 +271,17 @@ class HITLRequest(HydraEnvelope):
                     "campaign_signoff", "schema_conflict", "loop_ceiling",
                     "constitution_breach", "reflexion_override",
                     "acceptance_criteria", "lock_release_pending",
-                    "mcp_disconnect", "over_budget", "envelope_ceiling"]
+                    "mcp_disconnect", "over_budget", "envelope_ceiling",
+                    "plan_approval", "unjudgeable_envelope", "unjudgeable_plan"]
+    # `unjudgeable_envelope` / `unjudgeable_plan`: cross-vendor judge finding
+    # (item 1/6, CRITICAL) -- filed by `node_judge_per_squad`,
+    # `node_judge_synthesis`, and `node_plan_judge` (supervisor.py) when an
+    # envelope/plan failed STRICT SERIALIZATION (outcome="unjudgeable"), a
+    # genuine data defect distinct from a routed `skip` or a `policy_breach`
+    # quality verdict. `unjudgeable_plan` intentionally offers only
+    # `["abort"]` (never `acknowledge`) -- `node_plan_gate` materialises
+    # tasks on ANY non-terminal resume regardless of chosen option, so an
+    # `acknowledge` there would silently behave like `approve`.
     # `reflexion_override`: emitted by `node_judge_per_squad` when an envelope's
     # `revise` verdict cannot be retried because the Reflexion ×1 ceiling is
     # exhausted. Operator approval raises `state.reflexion_override_granted_until`
@@ -256,6 +312,138 @@ class Handoff(HydraEnvelope):
     granted_memory_scopes: list[str] = Field(default_factory=list)
     payload_envelope_id: UUID  # the actual artifact being handed off
     expires_at: Optional[datetime] = None
+
+
+# ---------- planning ----------
+
+class PlanStep(BaseModel):
+    """One decomposed unit of work inside a `Plan`.
+
+    `step_id` is a readable slug (e.g. "wire-auth-middleware"), NOT a UUID —
+    steps must stay stable across plan revisions so markdown diffs between
+    `plan_revision`s line up on the same identifiers.
+    """
+    step_id: str
+    target_squad: str
+    envelope_type: str
+    description: str
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)  # other step_ids
+    priority: Literal["P0", "P1", "P2", "P3"] = "P2"
+    model_tier: Optional[str] = None
+    target_repo_id: Optional[str] = None
+    target_repo_subpath: Optional[str] = None
+    # See Constraints.budget_usd above — same strict-JSON rationale.
+    estimated_budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
+    taxonomy_section: Optional[str] = None
+    rationale: Optional[str] = None
+
+    @field_validator("envelope_type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        # NOTE: SCHEMA_REGISTRY is defined further down in this module.
+        # Pydantic validators run at CALL time (not import time), so this
+        # module-level name resolves fine by the time any PlanStep is
+        # constructed. Do NOT snapshot the registry into a frozenset here —
+        # "JUDGE_VERDICT" is registered lazily via `_register_judge_verdict`
+        # after package init, and a snapshot taken now would miss it.
+        if v not in SCHEMA_REGISTRY:
+            raise ValueError(
+                f"Unknown envelope_type: {v!r}. Known: {list(SCHEMA_REGISTRY)}"
+            )
+        return v
+
+
+class Plan(HydraEnvelope):
+    """A decomposition of a goal into dependency-ordered `PlanStep`s.
+
+    Cyclic or dangling dependencies are rejected at construction time — a
+    cyclic plan cannot enter the system, because `validate_envelope` is
+    nothing more than a registry lookup + `model_validate`.
+    """
+    type: Literal["PLAN"] = "PLAN"
+    rigor: Literal["trivial", "standard", "major"]
+    goal_restatement: str
+    # REQUIRED: TheEights' `extractSummary` probes `objective|summary|
+    # description|goal` in that order when minting a semantic memory row.
+    # A Plan without `summary` gets no semantic memory row at all.
+    summary: str
+    steps: list[PlanStep] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    artifact_path: Optional[str] = None
+    # P5b: >= 1, never 0 or negative. This value gets copied verbatim onto
+    # every TaskState materialised from this plan's steps (node_plan_gate),
+    # and the four attended-selectors filter stale work with
+    # `getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision`
+    # -- a leading truthiness test that treats 0 as "not a plan step at all"
+    # (TaskState.plan_revision's own default). An unconstrained Plan let
+    # plan_revision=0 through construction, which would stamp every step task
+    # 0 and make that truthiness test exempt a superseded revision's steps
+    # FOREVER -- the exact append-only stale-task bug the whole "materialise
+    # on approval only" design exists to close, reachable through a
+    # perfectly valid envelope. A negative value is a different failure: it
+    # is truthy and can never equal state.plan_revision, so every step would
+    # be filtered permanently and the operator's approval would silently
+    # dispatch nothing. Neither failure raises anywhere else in the pipeline
+    # -- this is the one place that can catch it, at construction.
+    plan_revision: int = Field(default=1, ge=1)
+    supersedes: Optional[UUID] = None
+    authored_by: list[str] = Field(default_factory=list)
+    dissents: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_dag(self) -> "Plan":
+        seen: set[str] = set()
+        for step in self.steps:
+            if step.step_id in seen:
+                raise ValueError(
+                    f"Duplicate step_id in Plan: {step.step_id!r}"
+                )
+            seen.add(step.step_id)
+
+        known_ids = seen
+        for step in self.steps:
+            if step.step_id in step.depends_on:
+                raise ValueError(
+                    f"Step {step.step_id!r} depends on itself"
+                )
+            for dep in step.depends_on:
+                if dep not in known_ids:
+                    raise ValueError(
+                        f"Step {step.step_id!r} depends on unknown step_id "
+                        f"{dep!r} (dangling dependency)"
+                    )
+
+        # Kahn's algorithm: repeatedly drain nodes with in-degree 0. Any node
+        # left over once the queue is exhausted is part of a cycle.
+        in_degree: dict[str, int] = {step.step_id: 0 for step in self.steps}
+        dependents: dict[str, list[str]] = {step.step_id: [] for step in self.steps}
+        for step in self.steps:
+            for dep in step.depends_on:
+                in_degree[step.step_id] += 1
+                dependents[dep].append(step.step_id)
+
+        queue = [sid for sid, deg in in_degree.items() if deg == 0]
+        drained: set[str] = set()
+        while queue:
+            sid = queue.pop()
+            drained.add(sid)
+            for nxt in dependents[sid]:
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    queue.append(nxt)
+
+        remaining = known_ids - drained
+        if remaining:
+            # Removing this validator (or the Kahn drain above) makes a
+            # cyclic Plan, e.g. steps a->b->a, construct without error —
+            # that is exactly the property this test proves.
+            raise ValueError(
+                f"Cyclic dependency detected among steps: {sorted(remaining)}"
+            )
+        return self
 
 
 # ---------- customer-support squad (Xenia) ----------
@@ -370,6 +558,7 @@ AnyEnvelope = (
     CSuiteDecisionPacket | PRD | ArchRFC | DevTask
     | CreativeBrief | ShotList | AssetJob
     | HITLRequest | DecisionRecord | Handoff
+    | Plan
     | SupportTicket | PortableContext | VocReport
 )
 
@@ -385,6 +574,7 @@ SCHEMA_REGISTRY: dict[str, type[HydraEnvelope]] = {
     "HITL_REQUEST": HITLRequest,
     "DECISION_RECORD": DecisionRecord,
     "HANDOFF": Handoff,
+    "PLAN": Plan,
     "SUPPORT_TICKET": SupportTicket,
     "PORTABLE_CONTEXT": PortableContext,
     "VOC_REPORT": VocReport,

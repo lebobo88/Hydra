@@ -27,6 +27,20 @@ class NoRankableVerdictsError(RuntimeError):
     review (judge_unavailable). Raised only when there are >=2 candidates."""
 
 
+class UnjudgeableEnvelopeError(RuntimeError):
+    """At least one candidate's envelope failed strict serialization
+    (outcome ``unjudgeable``) — a genuine data defect, not an infra outage.
+
+    Cross-vendor judge finding (item 1/6, CRITICAL): unlike ``skip``, this is
+    not "no signal available this time," it is "this candidate cannot ever
+    be evaluated as it stands." Folding it into the ``rankable`` exclusion
+    the way ``skip`` is excluded would silently rank around a broken
+    candidate as if it had simply lost a vendor coin-flip. Raised before
+    Borda ranking runs so the caller escalates rather than anointing a
+    winner from a pool that may include unevaluated, defective candidates.
+    """
+
+
 @dataclass
 class BestOfNOutcome:
     winner_envelope: dict[str, Any]
@@ -74,6 +88,15 @@ def judge_and_rank(
                 client=client,
             )
             verdicts.append(v)
+
+    unjudgeable = [v for v in verdicts if v.outcome == "unjudgeable"]
+    if unjudgeable:
+        raise UnjudgeableEnvelopeError(
+            f"{len(unjudgeable)} of {len(verdicts)} verdict(s) unjudgeable "
+            "(envelope failed strict serialization) — cannot rank a winner "
+            f"from a pool with defective candidates: "
+            f"{[str(v.target_envelope_id) for v in unjudgeable]}"
+        )
 
     rankable = [v for v in verdicts if v.outcome != "skip"]
     if not rankable and len(candidates) >= 2:

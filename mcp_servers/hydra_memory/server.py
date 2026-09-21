@@ -93,16 +93,31 @@ def _checkpoint_thread_ids(conn, cap: int = _SCAN_CAP) -> list[str]:
 
 
 def _load_state_values(workflow_id: str) -> dict[str, Any] | None:
-    """Latest checkpoint channel_values for a workflow (read-only), or None."""
+    """Latest checkpoint channel_values for a workflow (read-only), or None.
+
+    Choke-point note (see `hydra_core.state.make_checkpoint_serde`): this is
+    one of the exactly two `SqliteSaver` construction sites in the codebase,
+    so `saver.get_tuple(...)` below routes through the SAME non-finite scan
+    `build_supervisor`'s checkpointer does. A poisoned checkpoint raises
+    `PoisonedStateError` here too; this read-only surface degrades to an
+    explicit `{"unjudgeable": True, "field": ...}` marker instead of either
+    crashing the MCP call or (worse) silently displaying counts derived from
+    poisoned data as if they were trustworthy.
+    """
     conn = _open_checkpoints_ro()
     if conn is None:
         return None
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
-        from hydra_core.state import make_checkpoint_serde  # MU3: shared serde helper
+        from hydra_core.state import (  # MU3: shared serde helper
+            PoisonedStateError, make_checkpoint_serde,
+        )
         _serde = make_checkpoint_serde()
         saver = SqliteSaver(conn, serde=_serde) if _serde is not None else SqliteSaver(conn)
-        tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
+        try:
+            tup = saver.get_tuple({"configurable": {"thread_id": str(workflow_id)}})
+        except PoisonedStateError as e:
+            return {"values": {}, "ts": None, "unjudgeable": True, "field": e.field}
         if tup is None:
             return None
         cp = tup.checkpoint or {}
@@ -255,6 +270,28 @@ def _tool_handlers() -> dict[str, callable]:
                 continue
             if st is None:
                 continue
+            if st.get("unjudgeable"):
+                # Propagate the poisoned-checkpoint marker explicitly rather
+                # than dropping it here: `v` below would read as an empty
+                # dict, which looks like a normal/blank workflow to an
+                # operator scanning the list, not a refusal to display it.
+                out.append({
+                    "workflow_id": wf,
+                    "phase": None,
+                    "unjudgeable": True,
+                    "field": st.get("field"),
+                    "detail": (
+                        f"checkpoint contains a non-finite value at "
+                        f"{st.get('field')}; refusing to display this "
+                        "workflow's state. There is no in-place repair, and "
+                        "plain `hydra replay` also refuses this checkpoint "
+                        "(same scan). Use `hydra replay "
+                        f"--sanitize-non-finite {wf}` to replay anyway "
+                        "(every substitution reported, source checkpoint "
+                        "unchanged), or quarantine this workflow_id."
+                    ),
+                })
+                continue
             v = st["values"]
             has_gate = bool(v.get("pending_hitl"))
             phase = v.get("phase")
@@ -287,6 +324,25 @@ def _tool_handlers() -> dict[str, callable]:
                     "reason": "langgraph_unavailable"}
         if st is None:
             return {"workflow_id": wf, "error": "not_found"}
+        if st.get("unjudgeable"):
+            # `_summarize_workflow` only ever sees `st["values"]` ({} here),
+            # which would render as an ordinary-looking empty workflow.
+            # Surface the poisoned marker explicitly instead.
+            return {
+                "workflow_id": wf,
+                "unjudgeable": True,
+                "field": st.get("field"),
+                "detail": (
+                    f"checkpoint contains a non-finite value at "
+                    f"{st.get('field')}; refusing to display this "
+                    "workflow's state. There is no in-place repair, and "
+                    "plain `hydra replay` also refuses this checkpoint "
+                    "(same scan). Use `hydra replay "
+                    f"--sanitize-non-finite {wf}` to replay anyway (every "
+                    "substitution reported, source checkpoint unchanged), "
+                    "or quarantine this workflow_id."
+                ),
+            }
         return _summarize_workflow(wf, st["values"], st["ts"])
 
     def squad_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -678,7 +734,17 @@ def _serve_with_mcp_sdk() -> bool:
         if name not in handlers:
             raise ValueError(f"unknown tool: {name}")
         result = handlers[name](arguments)
-        return [t.TextContent(type="text", text=json.dumps(result))]
+        # Cross-vendor judge finding (this round, item 4 MEDIUM): a bare
+        # `json.dumps(result)` used the plain `allow_nan=True` default (a
+        # bare `NaN`/`Infinity` token reaches the client, invalid RFC 8259
+        # JSON) and had NO fallback for an unsupported object at all -- that
+        # would raise TypeError straight out of this handler and crash the
+        # whole tool call instead of degrading gracefully. Route through the
+        # shared strict-then-sanitize-with-marker helper, same contract as
+        # every other MCP server's tool RESPONSE path.
+        from hydra_core.strict_json import dumps_tool_response_safe
+        text = dumps_tool_response_safe(result, label=f"tool_response:{name}")
+        return [t.TextContent(type="text", text=text)]
 
     import asyncio
 
@@ -717,7 +783,10 @@ def _serve_bare() -> None:
         except Exception as e:
             out = {"id": msg.get("id"), "error": str(e),
                    "traceback": traceback.format_exc()}
-        sys.stdout.write(json.dumps(out) + "\n")
+        # Cross-vendor judge finding (this round, item 4 MEDIUM): same fix
+        # as the MCP-SDK path above, for the bare-stdio fallback transport.
+        from hydra_core.strict_json import dumps_tool_response_safe
+        sys.stdout.write(dumps_tool_response_safe(out, label="hydra_memory_bare_response") + "\n")
         sys.stdout.flush()
 
 

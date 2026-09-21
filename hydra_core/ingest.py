@@ -45,13 +45,15 @@ from uuid import UUID, uuid4
 from .governance import charge_and_gate, redact_for_squad_boundary
 from .schemas import HydraEnvelope, validate_envelope
 from .squad_node import execute_squad
-from .state import HydraState, TaskState
+from .state import HydraState, TaskState, plan_barrier_active
+from .strict_json import dumps_strict
 # Reuse the in-graph routing + cost helpers so ingest and node_dispatch stay in
 # lockstep. supervisor's langgraph import is guarded (pure-python fallback), so
 # importing these module-level helpers is safe even without langgraph.
 from .supervisor import (
     _FORWARD_TARGET_BY_TYPE,
     _extract_squad_cost,
+    _plan_phase_enabled,
     _resolve_forward_target,
 )
 
@@ -255,18 +257,48 @@ def normalize_pack_envelope(env: dict) -> dict:
 
     budget = out.pop("budget_usd", None)
     if budget is not None:
-        constraints = dict(out.get("constraints") or {})
-        folded = False
-        if constraints.get("budget_usd") is None:
-            try:
-                constraints["budget_usd"] = float(budget)
+        # Cross-vendor judge finding (b1baf30 revise round, item 6): `float()`
+        # happily converts "nan"/"inf"/"-inf" strings, so a non-finite pack
+        # budget used to be silently folded into constraints.budget_usd (only
+        # to be rejected much later, at `Constraints` construction, with a
+        # generic pydantic message that never names this pack field) -- or,
+        # when a finite constraints budget already existed, silently copied
+        # verbatim into `instructions` with NO validation at all. Surface an
+        # explicit, field-naming error for either shape instead of doing
+        # either of those.
+        try:
+            budget_value = float(budget)
+        except (TypeError, ValueError, OverflowError) as exc:
+            # Cross-vendor judge finding (this round, item 3 MEDIUM): a JSON
+            # integer too large for a float (e.g. budget_usd=10**400) raises
+            # OverflowError, not TypeError/ValueError -- the two exceptions
+            # this branch originally caught. Uncaught, that OverflowError
+            # propagated out of `normalize_pack_envelope` and aborted the
+            # whole ingest batch instead of degrading this one field with a
+            # named, structured error the same way an unconvertible string
+            # or object already does.
+            out["_budget_conversion_error"] = (
+                f"pack envelope budget_usd={budget!r} could not be converted "
+                f"to a float: {exc}"
+            )
+            budget_value = None
+        if budget_value is not None and (
+            budget_value != budget_value
+            or budget_value in (float("inf"), float("-inf"))
+        ):
+            out["_budget_conversion_error"] = (
+                f"pack envelope budget_usd={budget!r} is non-finite "
+                "(NaN/Infinity); refusing to fold into constraints.budget_usd"
+            )
+            budget_value = None
+        if budget_value is not None:
+            constraints = dict(out.get("constraints") or {})
+            if constraints.get("budget_usd") is None:
+                constraints["budget_usd"] = budget_value
                 out["constraints"] = constraints
                 defaulted.append("constraints.budget_usd<-budget_usd")
-                folded = True
-            except (TypeError, ValueError):
-                folded = False
-        if not folded:
-            tail_lines.append(f"budget_usd: {budget}")
+            else:
+                tail_lines.append(f"budget_usd: {budget_value}")
     if title:
         out.pop("title", None)
         tail_lines.insert(0, f"Title: {title}")
@@ -303,10 +335,22 @@ def normalize_for_ingest(env: dict,
     Idempotent: normalizing an already-normalized envelope defaults nothing and
     emits nothing, which is what lets the CLI normalize once for dedup and still
     pass the dict through ``dispatch_ingested_envelopes``.
+
+    Raises ``ValueError`` if ``normalize_pack_envelope`` could not convert a
+    pack-supplied ``budget_usd`` to a finite float (item 6, b1baf30 revise
+    round): ``normalize_pack_envelope`` itself never raises (its own
+    docstring's contract), so this is the seam that turns its
+    ``_budget_conversion_error`` marker into an explicit, actionable failure
+    instead of letting the bad value flow on to `validate_envelope`'s generic
+    (and, for the "already had a budget" shape, previously nonexistent)
+    error.
     """
     if not isinstance(env, dict):
         return env
     out = normalize_pack_envelope(env)
+    budget_error = out.pop("_budget_conversion_error", None)
+    if budget_error:
+        raise ValueError(budget_error)
     fields_defaulted = out.pop("_normalized_fields", None)
     if fields_defaulted and emit_fn is not None:
         try:
@@ -341,7 +385,7 @@ class IngestItemResult:
     envelope_id: str
     envelope_type: str | None
     target: str | None
-    status: str          # done | failed | surfaced | running | skipped_duplicate | deferred_to_host | unknown_target
+    status: str          # done | failed | surfaced | running | skipped_duplicate | deferred_to_host | unknown_target | drafted | plan_phase_disabled
     run_id: str | None = None
     detail: str = ""
     # E2-34: structured pydantic errors for a `failed` validation item, so the
@@ -361,6 +405,15 @@ class IngestOutcome:
     # the loop stops and the wrapper surfaces an over_budget HITL.
     budget_downgrade: bool = False
     over_budget: bool = False
+    # P5b Task 3: the HydraState patch a PLAN item produced (plan_status=
+    # "drafted" + plan_envelope_id/plan_ref/plan_artifact_location/
+    # plan_revision), or empty when this call ingested no PLAN. This module
+    # never calls build_supervisor/update_state/invoke itself (see the module
+    # docstring) -- the CLI wrapper (`_cmd_attended_submit`) reads this field
+    # to drive the graph re-entry idiom (`sup.update_state(..., as_node=
+    # "dispatch")` + a bounded `invoke(None)` loop) that gets a drafted plan
+    # to `plan_judge`/`plan_gate`.
+    plan_patch: dict[str, Any] = field(default_factory=dict)
 
     @property
     def dispatched_ids(self) -> list[str]:
@@ -418,6 +471,13 @@ def dispatch_ingested_envelopes(
         is itself a claude-skill squad, so it cannot run headlessly — those
         items are returned with ``status="deferred_to_host"`` for the host to run
         as a follow-up skill, never silently dropped.
+      * ``PLAN`` (P5b) -> not forwarded at all, and gated on
+        ``HYDRA_PLAN_PHASE``: with the flag off, refused with
+        ``status="plan_phase_disabled"`` (never silently dropped, never
+        forwarded). With the flag on, written as a repo artifact via
+        ``write_repo_artifact`` and returned with ``status="drafted"`` plus
+        ``IngestOutcome.plan_patch`` — the caller re-enters the graph so
+        ``node_plan_judge``/``node_plan_gate`` consume it, never a squad.
 
     Dedup: an envelope whose id is already a ``TaskState.envelope_id`` or in
     ``already_ingested`` (the ledger) is skipped (``skipped_duplicate``). Within
@@ -442,12 +502,35 @@ def dispatch_ingested_envelopes(
         # goes through normalize_pack_envelope, which supplies the required
         # fields the prose contract never documented (owner/branch) and folds
         # pack-only keys into real schema fields.
-        normalized = normalize_for_ingest(raw, _emit) if isinstance(raw, dict) else raw
+        normalized: dict | HydraEnvelope = raw
         try:
-            env = (normalized if isinstance(normalized, HydraEnvelope)
-                   else validate_envelope(dict(normalized)))
+            if isinstance(raw, dict):
+                normalized = normalize_for_ingest(raw, _emit)
+            if isinstance(normalized, HydraEnvelope):
+                # Cross-vendor judge finding (b1baf30 revise round, item 1a):
+                # a caller-supplied TYPED envelope can reach this function via
+                # `Plan.model_copy(update=...)` or `model_construct`, both of
+                # which skip field validators (e.g. `allow_inf_nan=False` on
+                # a budget). Round-trip through `model_validate` so the SAME
+                # constructor-only bypass that would otherwise reach the
+                # PLAN-write / judge-serialize code below is caught HERE,
+                # with pydantic's own field-naming error, instead of at
+                # whichever downstream strict-JSON writer happens to notice.
+                env = type(normalized).model_validate(
+                    normalized.model_dump(mode="json")
+                )
+            else:
+                env = validate_envelope(dict(normalized))
         except Exception as exc:  # noqa: BLE001 — bad envelope is an item failure, not a crash
-            bad = normalized if isinstance(normalized, dict) else {}
+            if isinstance(normalized, dict):
+                bad = normalized
+            elif isinstance(normalized, HydraEnvelope):
+                try:
+                    bad = normalized.model_dump(mode="json")
+                except Exception:  # noqa: BLE001 — best-effort id/type for the report
+                    bad = {}
+            else:
+                bad = {}
             errors = validation_error_details(exc)
             outcome.items.append(IngestItemResult(
                 envelope_id=str(bad.get("id", "?")),
@@ -465,6 +548,25 @@ def dispatch_ingested_envelopes(
         eid = str(env.id)
         etype = getattr(env, "type", None)
 
+        # P1: while a plan barrier is active, every non-PLAN envelope is HELD
+        # rather than dispatched — this function calls execute_squad directly,
+        # bypassing node_dispatch's barrier check entirely, so it is a real
+        # bypass if left unguarded. Held items are visible in the result (not
+        # silently dropped) so the host can re-ingest them once the plan
+        # clears. No filesystem/lock/checkpoint I/O added — plan_barrier_active
+        # only reads state.plan_status. No-op while plan_status == "none".
+        if etype != "PLAN" and plan_barrier_active(state):
+            outcome.items.append(IngestItemResult(
+                envelope_id=eid, envelope_type=etype, target=None,
+                status="deferred_to_host",
+                detail=f"plan_barrier_active (plan_status={state.plan_status!r}); "
+                       "held pending plan resolution, re-ingest after the barrier clears",
+            ))
+            _emit("ingest.held_for_plan_barrier", {
+                "envelope_id": eid, "type": etype, "plan_status": state.plan_status,
+            })
+            continue
+
         if eid in seen_existing:
             outcome.items.append(IngestItemResult(
                 envelope_id=eid, envelope_type=etype, target=None,
@@ -473,6 +575,121 @@ def dispatch_ingested_envelopes(
             _emit("ingest.skip_duplicate", {"envelope_id": eid, "type": etype})
             continue
         seen_existing.add(eid)
+
+        # P5b Task 2: a PLAN is not forwarded to a squad -- it is consumed by
+        # the graph itself (node_plan_judge / node_plan_gate). This branch
+        # MUST sit here: after the dedup check above (so a resubmitted
+        # identical PLAN id is `skipped_duplicate` and a revision with a
+        # fresh envelope id still processes) and before
+        # `_resolve_forward_target` (so PLAN never needs -- and never gets --
+        # an entry in `_FORWARD_TARGET_BY_TYPE`; see that map's own comment).
+        #
+        # `validate_envelope`, above, already ran `Plan._validate_dag`
+        # (cyclic/dangling step-dependency rejection) as part of constructing
+        # `env` -- not re-implemented here. `write_repo_artifact` is the ONLY
+        # repo writer this module uses: `write_native_artifact` resolves
+        # against the planning pack's own non-tracked output root and its
+        # suffix allow-list has no `.html`, so it cannot hold the rendered
+        # plan. This branch does NOT call `execute_squad` and does NOT
+        # materialise step tasks -- that happens in `node_plan_gate`, ON
+        # APPROVAL ONLY (Task 4; `tasks` is append-only, so materialising
+        # here would leave a rejected/superseded revision's steps selectable
+        # forever).
+        if etype == "PLAN":
+            # Cross-vendor judge finding (P5b revise round): this branch is
+            # the SECOND writer of `plan_status` in the engine, alongside
+            # `node_planner`'s `_plan_gate_active` check (the one the Task 0
+            # comment in state.py names). The reader/writer asymmetry Task 0
+            # documents is only safe BECAUSE every writer that can move
+            # `plan_status` off "none" is itself flag-gated -- with the flag
+            # off, nothing can ever raise the barrier, so unconditional
+            # readers are safe. An ungated write here would break that
+            # invariant transitively: it is also what makes "judged"/
+            # "approved" safe, since those only run because something already
+            # moved the status off "none". Task 1 made PLAN submittable
+            # through the MCP verb and the emitted_envelopes path with the
+            # flag OFF (those allow-lists carry no flag check of their own),
+            # so without this gate a PLAN would raise the barrier and hold
+            # every non-planning task pending a resolution no flag-gated code
+            # will ever drive -- the exact stall HYDRA_PLAN_PHASE exists to
+            # prevent. Refuse LOUDLY (a real item status, not a silent drop)
+            # rather than falling through to `_resolve_forward_target` (which
+            # would misreport this as `unknown_target`) or to a bare `failed`.
+            if not _plan_phase_enabled():
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="plan_phase_disabled",
+                    detail=(
+                        "HYDRA_PLAN_PHASE is off; PLAN envelopes are refused, "
+                        "not silently dropped or forwarded"
+                    ),
+                ))
+                _emit("ingest.plan_phase_disabled", {"envelope_id": eid, "type": etype})
+                continue
+
+            from .artifact_store import ArtifactStoreError, write_repo_artifact
+            from .plan_artifact import plan_slug, render_plan_html
+
+            plan_env = env  # SCHEMA_REGISTRY["PLAN"] -> Plan; already validated
+            repo_root = getattr(dispatcher, "project_root", None)
+            try:
+                if repo_root is None:
+                    raise ArtifactStoreError(
+                        "dispatcher has no project_root; cannot write the plan artifact"
+                    )
+                slug = plan_slug(
+                    getattr(plan_env, "goal_restatement", "") or "", plan_env.workflow_id
+                )
+                html_text = render_plan_html(plan_env)
+                ref = write_repo_artifact(repo_root, f"docs/plans/{slug}.html", html_text)
+                artifact_ref = ref.model_dump(mode="json")
+            except (ArtifactStoreError, OSError, ValueError) as exc:
+                # Cross-vendor judge finding (item 2/4): `render_plan_html`
+                # can still raise (e.g. an individually non-finite budget
+                # that slipped past construction-time validation) even after
+                # the overflow guard above; the batch as a whole must not
+                # crash on one bad PLAN item. Report it as a structured item
+                # failure, not an uncaught exception.
+                #
+                # Cross-vendor judge finding (item 5/6, MEDIUM): this except
+                # clause previously ALSO caught bare `RuntimeError`, which is
+                # not a documented failure mode of anything called in this
+                # `try` block -- `render_plan_html`/`plan_slug` raise
+                # `ValueError` (`PlanFigureError` is a `ValueError` subclass)
+                # for a malformed/non-finite plan, `write_repo_artifact`
+                # raises only `ArtifactStoreError` (also a `ValueError`
+                # subclass) or lets a genuine `OSError` propagate from disk
+                # I/O. Catching `RuntimeError` too widely would silently
+                # relabel an UNRELATED engine bug (e.g. a dict-mutated-
+                # during-iteration `RuntimeError` from code this block
+                # happens to call transitively) as an ordinary "user input"
+                # plan-artifact failure instead of surfacing it as the
+                # defect it actually is.
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="failed", detail=f"plan artifact write failed: {exc}",
+                    errors=[{"field": "", "msg": str(exc)}],
+                ))
+                _emit("ingest.plan_artifact_failed", {"envelope_id": eid, "error": str(exc)})
+                continue
+
+            outcome.plan_patch = {
+                "plan_status": "drafted",
+                "plan_envelope_id": str(plan_env.id),
+                "plan_ref": plan_env.model_dump(mode="json"),
+                "plan_artifact_location": artifact_ref.get("key"),
+                "plan_revision": plan_env.plan_revision,
+            }
+            outcome.items.append(IngestItemResult(
+                envelope_id=eid, envelope_type=etype, target=None,
+                status="drafted",
+                detail="plan materialised as a repo artifact; awaiting plan_judge/plan_gate",
+            ))
+            _emit("ingest.plan_drafted", {
+                "envelope_id": eid, "artifact": artifact_ref,
+                "revision": plan_env.plan_revision,
+            })
+            continue
 
         target = _resolve_forward_target(env, getattr(env, "origin_squad", "") or "")
         if target is None or target not in _FORWARD_TARGET_BY_TYPE.values():
@@ -548,8 +765,8 @@ def dispatch_ingested_envelopes(
         # Charge + gate through the SAME helper node_dispatch uses, so ingested
         # engineering honours the 80% downgrade tripwire and the >= 100% block —
         # not a budget-blind side door (codex review item 3).
-        cost_usd, cost_tok = _extract_squad_cost(result)
-        block, downgrade = charge_and_gate(state, cost_usd, cost_tok)
+        cost_usd, cost_tok, cost_src = _extract_squad_cost(result)
+        block, downgrade = charge_and_gate(state, cost_usd, cost_tok, source=cost_src)
         # F34: budget_charge to eights (fail-soft; never blocks local work).
         try:
             from .eights.attestation import EightsAttestor as _EightsAttestor
@@ -639,7 +856,16 @@ def load_ingested_ids(project_root: Path, workflow_id: str) -> set[str]:
 def _write_ledger(project_root: Path, workflow_id: str, ids: set[str]) -> None:
     p = ingest_ledger_path(project_root, workflow_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"ingested_ids": sorted(ids)}, indent=2), encoding="utf-8")
+    # Strict: `load_ingested_ids` reads this back to decide the exactly-once
+    # dispatch set (which envelope ids have already been ingested for this
+    # workflow) -- the ledger this whole module exists to make correct
+    # across retries/crashes. Every id is already coerced to `str` before
+    # this call, so this can never actually trip, but the guard keeps the
+    # invariant explicit rather than relying on caller discipline.
+    p.write_text(
+        dumps_strict({"ingested_ids": sorted(ids)}, label=f"ingest ledger for {workflow_id}", indent=2),
+        encoding="utf-8",
+    )
 
 
 def claim_ingested_ids(project_root: Path, workflow_id: str, ids: Iterable[str]) -> set[str]:

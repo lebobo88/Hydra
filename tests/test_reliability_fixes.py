@@ -515,10 +515,11 @@ class TestExtractSquadCostInnerUnwrap:
             },
         }
         result = self._make_squad_result(outer)
-        usd, tokens = _extract_squad_cost(result)
+        usd, tokens, source = _extract_squad_cost(result)
 
         assert usd == pytest.approx(0.42)
         assert tokens == 1500
+        assert source == "measured"
 
     def test_cost_alias_from_inner_result(self):
         """pp versions using 'cost' alias instead of 'cost_usd'."""
@@ -530,10 +531,11 @@ class TestExtractSquadCostInnerUnwrap:
             "result": {"cost": 0.10, "tokens": 800},
         }
         result = self._make_squad_result(outer)
-        usd, tokens = _extract_squad_cost(result)
+        usd, tokens, source = _extract_squad_cost(result)
 
         assert usd == pytest.approx(0.10)
         assert tokens == 800
+        assert source == "measured"
 
     def test_no_cost_fields_returns_zeros(self):
         """No cost field → (0.0, 0), not an error."""
@@ -541,10 +543,11 @@ class TestExtractSquadCostInnerUnwrap:
 
         outer = {"status": "done", "tool": "start_run", "result": {"run_id": "r"}}
         result = self._make_squad_result(outer)
-        usd, tokens = _extract_squad_cost(result)
+        usd, tokens, source = _extract_squad_cost(result)
 
         assert usd == 0.0
         assert tokens == 0
+        assert source == "unmeasured"
 
     def test_old_flat_raw_still_works(self):
         """Test stubs that put cost fields at the top of raw (raw == inner case)."""
@@ -553,10 +556,11 @@ class TestExtractSquadCostInnerUnwrap:
         # raw has no "result" key — inner = raw itself
         outer = {"cost_usd": 0.05, "tokens_in": 200, "tokens_out": 100}
         result = self._make_squad_result(outer)
-        usd, tokens = _extract_squad_cost(result)
+        usd, tokens, source = _extract_squad_cost(result)
 
         assert usd == pytest.approx(0.05)
         assert tokens == 300
+        assert source == "measured"
 
     def test_charged_to_state_correctly(self):
         """End-to-end: extracted cost is charged to the budget ledger."""
@@ -568,11 +572,11 @@ class TestExtractSquadCostInnerUnwrap:
             "result": {"cost_usd": 1.23, "tokens_in": 400, "tokens_out": 200},
         }
         result = self._make_squad_result(outer)
-        usd, tokens = _extract_squad_cost(result)
+        usd, tokens, source = _extract_squad_cost(result)
 
         s = _fresh_state()
         s.budget.budget_usd = 100.0
-        block, _ = charge_and_gate(s, usd, tokens)
+        block, _ = charge_and_gate(s, usd, tokens, source=source)
 
         assert s.budget.spent_usd == pytest.approx(1.23)
         assert s.budget.spent_tokens == 600
@@ -1487,6 +1491,8 @@ class TestJudgePerSquadHaltsOnSurfaced:
             project_root=HYDRA_ROOT,
             dispatcher=_NullDisp(),
             force_pure_python=True,
+            # P5b hostless-path audit: one-shot invoke, no attended host.
+            force_trivial_plan_rigor=True,
         )
 
         # A normal (non-surfaced) state starting at dispatch should reach

@@ -1,0 +1,100 @@
+name: "Planning — Forge Crown plan gate"
+version: 1.0.0
+deprecated_after: null
+description: >
+  The planning squad decomposes a routed goal into a typed PLAN artifact
+  before any downstream squad is dispatched: Pyrrha (plan-author) decomposes,
+  Momus (plan-critic) blesses or revises, Theseus (plan-scribe) renders the
+  artifact through write_repo_artifact. P4 of the planning-phase build:
+  the pack is discovered and its heads/agents/skill exist, but nothing in the
+  engine seeds a planning task, selects this squad, or authors a plan yet
+  (that is P5). This file and its containment guards exist so the pack is
+  inert-by-default the moment it becomes real.
+
+# entrypoint is claude-native, not agent-impersonation or claude-skill, and
+# this choice is LOAD-BEARING. node_dispatch (hydra_core/squad_node.py)
+# defers a claude-native pack UNCONDITIONALLY to the attended host cursor
+# ("native Claude Code squad requires an attended host cursor",
+# host_pickup_pending=True) -- there is no non-hosted code path for it at
+# all. agent-impersonation and claude-skill packs are deferred to the host
+# ONLY when live dispatch is true; under a test harness, a null dispatcher,
+# or any run where live_execution is false, they instead fall through to
+# the LEGACY IN-GRAPH path and a supervisor LLM turn would have to
+# improvise the squad's output -- i.e. fabricate a plan. A plan is the frame
+# every downstream task and every HITL gate reads; a fabricated one is the
+# single worst artifact this engine could silently produce. claude-native
+# is the only entrypoint that cannot do that: it fails into "deferred to
+# host" instead of fabricating.
+entrypoint: claude-native
+
+accepts: [C_SUITE_DECISION_PACKET, HANDOFF]
+emits: [PLAN, HITL_REQUEST, DECISION_RECORD]
+
+# best_of_n is deliberately 0, not left to default only:
+#   - On the attended path, best-of-N returns host-pickup placeholders, not
+#     real candidates, so "best of N plans" would just be N copies of the
+#     same deferral.
+#   - Triple-judging a plan spends real generator + judge cost before a
+#     single unit of the work the plan describes exists. A plan is cheap to
+#     redo; it is not worth best-of-N money.
+best_of_n: 0
+
+# NOTE: deliberately NO `industries` key. The planning squad must never be
+# reachable by the deterministic industry-overlap boost in
+# hydra_core.router.classify_intent (which iterates every pack's industries
+# unconditionally) -- see squads/planning/README-containment for the fuller
+# picture, or hydra_core/router.py's RESERVED_META_SQUADS denylist, which is
+# the actual enforcement. Omitting `industries` is defense-in-depth, not the
+# primary guard: the denylist is what actually keeps this slug out of
+# automatic and LLM-fallback selection, and out of --squad / `squad`
+# force-selection.
+
+agents:
+  - slug: plan-author
+    mythic: Pyrrha
+    role: "Plan Author"
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: plugins/hydra/agents/plan-author.md
+    hitl_trigger: false
+    notes: "Decomposes the routed goal into a typed PLAN. Never authors a plan whose steps have no testable success statement."
+
+  - slug: plan-critic
+    mythic: Momus
+    role: "Plan Critic"
+    authority: gatekeeper
+    model_tier: opus
+    agent_file: plugins/hydra/agents/plan-critic.md
+    hitl_trigger: false
+    notes: "Blesses or revises the draft plan. Never blesses a plan whose steps have no owner or no acceptance criterion."
+
+  - slug: plan-scribe
+    mythic: Theseus
+    role: "Plan Scribe"
+    authority: execute
+    model_tier: sonnet
+    agent_file: plugins/hydra/agents/plan-scribe.md
+    hitl_trigger: false
+    notes: "Renders the approved PLAN envelope to disk. Never writes a plan file that disagrees with the envelope it came from."
+
+# Every gate below sets hitl_required: false EXPLICITLY -- do not omit it and
+# do not add a gate without it. _task_is_high_risk (hydra_core/supervisor.py)
+# checks `any(g.hitl_required for g in pack.gates)` for EVERY task in the
+# FULL task set, not just the selected squads -- one gate here with
+# hitl_required left at its true default would silently convert every
+# planned Hydra workflow to requires_human_approval=True, reason="high_risk",
+# rewriting the frozen precedence tests/test_ws9_tier_acceptance.py polices.
+# This mechanism is live today: hitl_required: true already appears in
+# customer-support, executive, and garland. See
+# tests/test_planning_squad_containment.py::test_no_planning_gate_declares_hitl_required.
+gates:
+  - rubric_id: plan-decomposition-testable
+    hitl_required: false
+    when: always
+  - rubric_id: plan-critic-owner-and-acceptance
+    hitl_required: false
+    when: always
+
+invoke:
+  command_hint: "/hydra:drive"
+  output_dir: ".hydra/{workflow_id}/plan"

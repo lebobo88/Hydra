@@ -222,6 +222,57 @@ def test_materialize_skips_tasks_that_already_have_envelopes() -> None:
     assert envelopes == [] and artifacts == []
 
 
+def test_finalize_refuses_non_finite_envelope_before_synthesis(hermetic, monkeypatch) -> None:
+    """Cross-vendor judge finding (this round, item 2 HIGH): `_cmd_finalize`
+    injects materialized envelopes/artifacts via
+    `sup.update_state(config, patch, as_node="judge_per_squad")`, whose
+    conditional edge routes straight to `synthesis` WITHOUT ever running
+    `node_judge_per_squad` -- so the non-finite scan added there never
+    executes for attended results. A non-finite value reaching this point
+    (e.g. a corrupted attended-result payload) must be refused HERE, before
+    the checkpoint mutation, rather than reaching `synthesis`."""
+    wf, _tasks = _seed_workflow()
+
+    real_materialize = cli._materialize_attended_results
+
+    def _poisoned_materialize(state):
+        envelopes, artifacts = real_materialize(state)
+        assert envelopes, "expected the ordinary materializer to build envelopes"
+        envelopes[0] = {**envelopes[0], "_poisoned_score": float("nan")}
+        return envelopes, artifacts
+
+    monkeypatch.setattr(cli, "_materialize_attended_results", _poisoned_materialize)
+
+    rc, payload = _finalize(wf)
+
+    assert rc == 0
+    assert payload["ok"] is False
+    assert payload["status"] == "unjudgeable"
+    assert "_poisoned_score" in payload["field"]
+
+    # Never reached synthesis: no DECISION_RECORD, not finalized.
+    from hydra_core.supervisor import build_supervisor
+    sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+    snap = sup.get_state({"configurable": {"thread_id": wf}})
+    state = HydraState.model_validate(snap.values)
+    assert state.attended_finalized_record_id is None
+    assert not [e for e in state.envelopes if e.get("type") == "DECISION_RECORD"]
+    assert state.phase == "synthesis", "checkpoint must be untouched by the refused patch"
+
+
+def test_finalize_with_clean_envelopes_still_completes_normally(hermetic) -> None:
+    """Control for the refusal test above: ordinary, finite attended results
+    must still finalize exactly as before -- the new scan must not false-
+    positive on legitimate data."""
+    wf, _tasks = _seed_workflow()
+    rc, payload = _finalize(wf)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["status"] == "finalized"
+    assert payload["phase"] == "done"
+
+
 def test_step_reports_ready_to_finalize_alias() -> None:
     """`step` keeps `no_pending_task` as a compatibility field alongside the new
     `ready_to_finalize` status."""

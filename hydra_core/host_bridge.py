@@ -47,6 +47,7 @@ from .judge_vendor import (
     _judge_vendor_chain,
 )
 from .proc import run_text
+from .strict_json import dumps_strict
 from .squad_node import (
     Dispatcher,
     _augment_with_critique,
@@ -62,6 +63,8 @@ from .squad_node import (
     _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
+    coerce_untrusted_cost,
+    coerce_untrusted_count,
 )
 
 # Cursor schema version — bump on any incompatible shape change so a stale
@@ -1477,7 +1480,17 @@ def save_cursor(path: str | Path, cursor: dict[str, Any]) -> None:
     # Atomic-ish write: temp + replace so a crash mid-write never leaves a
     # truncated cursor that would wedge the workflow.
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(cursor, indent=2, default=str), encoding="utf-8")
+    # Strict: the engine reads this back via `load_cursor` to drive the
+    # attended stage state machine (budget/cost fields, verdict scores,
+    # retry counts). A non-finite value silently swapped to `null` here
+    # is not a display defect -- it is a stage-machine decision made on a
+    # wrong value (the same "budget comparison fails open on NaN" class of
+    # bug `strict_json.reject_non_finite` guards at the CLI boundary).
+    # Refuse rather than persist a poisoned cursor.
+    tmp.write_text(
+        dumps_strict(cursor, label=f"attended cursor at {p}", indent=2, default=str),
+        encoding="utf-8",
+    )
     os.replace(tmp, p)
 
 
@@ -1598,7 +1611,16 @@ def _capture_baseline_failures(
             if _cache_file is not None:
                 try:
                     _cache_file.parent.mkdir(parents=True, exist_ok=True)
-                    _cache_file.write_text(_json.dumps(failing), encoding="utf-8")
+                    # Strict: read back by `_json.loads` above and used to
+                    # skip re-running the whole baseline suite; `failing` is
+                    # a list of test-id strings so this can never actually
+                    # trip, but guarding it keeps the enforcement test from
+                    # needing an allow-list entry for a genuinely read-back
+                    # value.
+                    _cache_file.write_text(
+                        dumps_strict(failing, label=f"baseline cache for {_sha}"),
+                        encoding="utf-8",
+                    )
                 except Exception:  # noqa: BLE001 — cache write is best-effort
                     pass
             # Return the first successful (or empty) result — empty is valid
@@ -1790,18 +1812,48 @@ def _priced_cost(
     dollar amount resolved on this call's estimated branch, so a caller can
     credit ``budget.estimated_usd`` with just that figure instead of the
     whole (mixed) stage total.
+
+    Cross-vendor judge finding (follow-up round, HIGH): this is the
+    ATTENDED path's exact counterpart of the headless drive loop's vendor
+    cost exposure -- ``result`` is an untrusted HOST result (the same JSON
+    file ``cli.py``'s ``_cmd_attended_submit`` reads), and this line
+    ``return float(reported), "measured"`` had no finiteness check at all,
+    let alone one applied AFTER coercion: a host reporting ``cost_usd:
+    "NaN"`` (a string -- ordinary, valid JSON, just a hostile value) was
+    cast to a real non-finite float and forcibly labeled ``"measured"``,
+    poisoning ``cursor["cost_usd"]`` (and, via `_cmd_attended_submit`'s
+    later `charge_and_gate`, `state.budget.spent_usd`) permanently. Routed
+    through ``coerce_untrusted_cost`` -- coerce first, check finiteness on
+    the coerced value -- exactly as the headless vendor paths now do. A
+    reported-but-rejected cost falls through to the same token-based
+    estimate (or ``"unmeasured"``) branch a MISSING cost already used, so a
+    still-priceable call is not needlessly downgraded to $0.
     """
     reported = result.get("cost_usd")
     if reported is not None:
-        _merge_cost_source(cursor, "measured")
-        return float(reported), "measured"
+        cost, source = coerce_untrusted_cost(reported)
+        if source == "measured":
+            _merge_cost_source(cursor, "measured")
+            return cost, "measured"
+        # Reported but rejected (non-finite after coercion, or unparseable)
+        # -- fall through to the token-based estimate below exactly as a
+        # MISSING cost field already does; never trust the raw value.
 
-    tokens_in = int(result.get("tokens_in") or 0)
-    tokens_out = int(result.get("tokens_out") or 0)
+    tokens_in = coerce_untrusted_count(result.get("tokens_in"))
+    tokens_out = coerce_untrusted_count(result.get("tokens_out"))
     model = str(result.get("model") or model_hint or cursor.get("model_tier") or "")
     if (tokens_in or tokens_out) and model:
         from .pricing import price_call
         priced = price_call(model, tokens_in, tokens_out)
+        # Cross-vendor judge finding (follow-up round, HIGH -- rule fix):
+        # `price_call` now enforces the ONE seam behind "measured only on
+        # positive evidence" for estimates -- `None` means pricing did not
+        # happen (unknown model, broken/negative rate, non-finite total);
+        # any OTHER return is a genuinely-priced, trustworthy number
+        # (including a real `0.0`). This `is not None` check is therefore
+        # already correct and needs no per-call re-derivation here -- it
+        # was only ever wrong when `price_call` itself could floor a
+        # broken input into a plausible-looking `0.0` (fixed at the source).
         if priced is not None:
             _merge_cost_source(cursor, "estimated")
             cursor["estimated_cost_usd"] = (
@@ -1983,8 +2035,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     # source="unmeasured" ($0.0, logged, non-blocking).
     _gen_cost, _gen_source = _priced_cost(cursor, result, label="generate")
     cursor["cost_usd"] = float(cursor["cost_usd"]) + _gen_cost
-    cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
-    cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+    cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
+    cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
 
     pre_dirty = set(cursor.get("pre_dirty") or [])
     run_changed = _worktree_dirty_set(work_path) - pre_dirty
@@ -2019,8 +2071,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
                 cm("pp_harness", "record_attempt", {
                     "stage_id": stage_id, "producer": producer, "model_id": model_id,
                     "agent_type": "engineer",   # F29
-                    "tokens_in": int(result.get("tokens_in") or 0),
-                    "tokens_out": int(result.get("tokens_out") or 0),
+                    "tokens_in": coerce_untrusted_count(result.get("tokens_in")),
+                    "tokens_out": coerce_untrusted_count(result.get("tokens_out")),
                     "cost_usd": _gen_cost,
                     "status": "error", "retry_index": gen_idx,
                     "notes": {"candidate_index": 1},
@@ -2061,8 +2113,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
             cm("pp_harness", "record_attempt", {
                 "stage_id": stage_id, "producer": producer, "model_id": model_id,
                 "agent_type": "engineer",   # F29 — accepted optional; strict rejects 'general-purpose'
-                "tokens_in": int(result.get("tokens_in") or 0),
-                "tokens_out": int(result.get("tokens_out") or 0),
+                "tokens_in": coerce_untrusted_count(result.get("tokens_in")),
+                "tokens_out": coerce_untrusted_count(result.get("tokens_out")),
                 "cost_usd": _gen_cost,
                 "status": "ok", "retry_index": gen_idx,
                 "notes": {"candidate_index": 1},
@@ -2360,8 +2412,8 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             model_hint=str(result.get("judge_model_id") or "") or None,
         )
         cursor["cost_usd"] = float(cursor["cost_usd"]) + _judge_cost
-        cursor["tokens_in"] = int(cursor["tokens_in"]) + int(result.get("tokens_in") or 0)
-        cursor["tokens_out"] = int(cursor["tokens_out"]) + int(result.get("tokens_out") or 0)
+        cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
+        cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
         if call_key is not None:
             cursor["judge_cost_applied_for"] = call_key
 
@@ -3147,9 +3199,9 @@ def _apply_squad_result(
     _squad_cost, _squad_cost_source = _priced_cost(cursor, result, label="squad_result")
     cursor["cost_usd"] = float(cursor.get("cost_usd") or 0.0) + _squad_cost
     cursor["tokens_in"] = (int(cursor.get("tokens_in") or 0)
-                           + int(result.get("tokens_in") or 0))
+                           + coerce_untrusted_count(result.get("tokens_in")))
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
-                            + int(result.get("tokens_out") or 0))
+                            + coerce_untrusted_count(result.get("tokens_out")))
     cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
     # Native pack results may delegate typed work to another squad.  Keep the
     # raw list in the cursor so the CLI can validate/redact/ingest it under the

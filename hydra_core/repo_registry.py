@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hydra_core.proc import no_window_creationflags
+from hydra_core.strict_json import dumps_strict
 
 # ---------------------------------------------------------------------------
 # Allow-list: repo_id -> directory NAME (or forward-slash-separated relative
@@ -424,7 +425,16 @@ def _atomic_write_repos_json(data: dict[str, str]) -> None:
     tmp_path = Path(tmp_path_str)
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
+            # Strict, via `dumps_strict` (there is no file-object `dump`
+            # variant in `strict_json`, and this module must not widen its
+            # contract): `data` (repo_id -> path) is read back and resolved
+            # through `repo_registry.py`'s allow-list + base-escape guard to
+            # pick the working directory an engineering dispatch writes
+            # into. A silently substituted value here is a wrong dispatch
+            # target, not a display defect -- exactly the "silent mis-target
+            # this registry exists to prevent" the docstring above already
+            # calls out for a torn read.
+            f.write(dumps_strict(data, label="repos.json", indent=2, sort_keys=True))
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp_path), str(repos_path))

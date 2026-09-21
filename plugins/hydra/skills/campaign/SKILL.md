@@ -1,5 +1,5 @@
 ---
-description: "Multi-squad campaign template: routes executive + creative + engineering in one workflow with explicit dependency wiring."
+description: "Multi-squad campaign template: routes executive + creative + engineering in one workflow with explicit dependency wiring. With the plan phase on, a campaign's dependency chain becomes a judged PLAN with real depends_on rather than prose."
 argument-hint: "<campaign goal> [--launch-date YYYY-MM-DD] [--budget <usd>] [--repos id,id,...]"
 model: opus
 disable-model-invocation: true
@@ -19,6 +19,17 @@ executive (strategy + pricing + comms approval)
 ```
 
 Use this when a campaign explicitly needs creative AND engineering AND executive coordination. For single-squad work, prefer `/hydra:run`.
+
+**With the plan phase on, a campaign is exactly the shape that benefits most.**
+A campaign is multi-squad by definition, so triage rates it `major`: the plan is
+authored, cross-vendor judged, and gated. Its pre-wired executive → creative →
+engineering chain stops being prose in this template and becomes `depends_on`
+on real `TaskState`s, enforced by the engine — a dependent task is not
+selectable until its upstream reaches `attended_done_task_ids`, and a chain
+that can never complete surfaces as `blocked_on_failed_dependency` instead of
+silently reporting `ready_to_finalize` with half the campaign undone. Note the
+campaign's pre-seeded tasks are held behind the plan barrier like any others
+until the plan is approved.
 
 **Engineering in a campaign routes through the deterministic engine, never raw `Agent({subagent_type: "engineer"})` fan-out and never your own Write.** Hybrid model (see `/hydra:run` § Hybrid execution model): you run the claude-skill legs in-host (executive framing, garland creative, rlm-gaming game design) and capture their emitted envelopes; the **engineering leg is dispatched deterministically in Python** — either by `hydra.workflow.launch` (a direct engineering goal) or by `hydra.workflow.submit_envelopes` (engineering envelopes a host-run skill emitted). Each engineering subsystem then runs a full pp-harness stage cycle (`start_stage → archive_artifact → record_attempt → record_verdict → finalize_stage → finalize_run`) with cross-vendor judges, and best-of-N when the squad's `invoke.mode` is `pp_best_of`. See `plugins/hydra/agents/hydra-supervisor.md` § Engineering Execution Contract and Hard Rule #9 in `AGENTS.md`.
 

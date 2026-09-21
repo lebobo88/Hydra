@@ -96,6 +96,11 @@ def test_live_engine_defers_nonmcp_and_dispatches_engineering():
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: this test drives the graph to completion
+        # in one shot with no attended host -- force plan_rigor trivial so
+        # a real planning task is never seeded (mirrors cli.py's --live/
+        # --no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
     )
     # Force-select a claude-skill squad + the mcp engineering squad.
     # WS1-E: engineering dispatch requires an explicit, resolved target repo
@@ -148,6 +153,11 @@ def test_stub_dispatcher_defers_native_pack_without_legacy_shim_call():
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: this test drives the graph to completion
+        # in one shot with no attended host -- force plan_rigor trivial so
+        # a real planning task is never seeded (mirrors cli.py's --live/
+        # --no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="build the feature",
                        selected_squads=["garland"])

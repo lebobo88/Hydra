@@ -66,6 +66,10 @@ def _run(squads: list[str], dispatcher) -> HydraState:
         project_root=HYDRA_ROOT,
         dispatcher=dispatcher,
         force_pure_python=True,
+        # P5b hostless-path audit: this helper drives the graph to completion
+        # in one shot with no attended host -- force plan_rigor trivial
+        # (mirrors cli.py's --live/--no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(
         root_goal="ship the widget",

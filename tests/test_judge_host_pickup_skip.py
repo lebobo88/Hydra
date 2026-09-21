@@ -57,6 +57,8 @@ def test_executive_host_pickup_skipped_by_per_squad_judge():
         dispatcher=_HostPickupDispatcher(),
         critique_client=_FailIfCalledClient(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="quick strategic refresh")
     final = sup.invoke(state)
