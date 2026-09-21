@@ -5529,10 +5529,27 @@ def _replay_plan_evidence(values: dict) -> tuple[bool, str | None, bool]:
     """
     plan_status = values.get("plan_status")
     tasks = values.get("tasks") or []
-    has_plan_step_task = any(
-        isinstance(t, dict) and t.get("plan_step_id")
-        for t in tasks
-    )
+
+    def _task_plan_step_id(t: Any) -> Any:
+        # Shape-defensive, deliberately: `values["tasks"]` is NOT guaranteed
+        # to be a list of plain dicts. `make_checkpoint_serde`'s JsonPlus
+        # serializer registers `TaskState` (and `HydraState`, `BudgetLedger`)
+        # as msgpack-tagged types, so a REAL checkpoint read -- via either
+        # `sup.get_state(...).values` or the raw
+        # `_read_raw_checkpoint_for_sanitize` path above -- restores actual
+        # `TaskState` Pydantic objects here, not dicts. `node_plan_gate`
+        # (supervisor.py) appends `TaskState(...)` instances too, never
+        # dicts. This mirrors the existing dual-shape handling a few lines
+        # below in `_cmd_replay` for `values.get("budget")`
+        # (`isinstance(budget, dict)` vs. else-it's-already-a-BudgetLedger)
+        # -- the same checkpoint can hand back either shape depending on the
+        # read path, and this predicate must be correct against both, not
+        # just the one a hand-built test dict happens to use.
+        if isinstance(t, dict):
+            return t.get("plan_step_id")
+        return getattr(t, "plan_step_id", None)
+
+    has_plan_step_task = any(_task_plan_step_id(t) for t in tasks)
     plan_status_signal = plan_status not in (None, "none")
     return (plan_status_signal or has_plan_step_task, plan_status, has_plan_step_task)
 

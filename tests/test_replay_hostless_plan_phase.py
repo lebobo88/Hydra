@@ -228,12 +228,23 @@ def test_replay_of_trivial_workflow_still_works_unchanged(hermetic):
 # is the extracted, independently-testable predicate `_cmd_replay` calls;
 # these are unit tests against it directly (no full checkpoint needed) so
 # every edge case is provable without checkpoint-plumbing overhead.
+#
+# SHAPE, called out explicitly per test: `values["tasks"]` is NOT guaranteed
+# to be a list of plain dicts. `make_checkpoint_serde`'s JsonPlus serializer
+# registers `TaskState` as a msgpack-tagged type, so a REAL checkpoint read
+# (either `sup.get_state(...).values` or the raw
+# `_read_raw_checkpoint_for_sanitize` path in `_cmd_replay`) restores actual
+# `TaskState` Pydantic OBJECTS here, not dicts -- and `node_plan_gate`
+# (supervisor.py) only ever appends `TaskState(...)` instances, never dicts.
+# A test built entirely from dict-shaped tasks proves the predicate against
+# a shape production never actually hands it. Every scenario below is
+# therefore covered under BOTH shapes.
 # ---------------------------------------------------------------------------
 
-def test_plan_step_id_task_alone_triggers_refusal_even_with_plan_status_none():
+def test_plan_step_id_task_alone_triggers_refusal_even_with_plan_status_none_dict_shape():
     """FINDING A: the exact gap -- plan_status reads "none" (or is entirely
     missing) but a task carries a durable plan_step_id. This must refuse;
-    plan_status alone would have silently let it through."""
+    plan_status alone would have silently let it through. SHAPE: dict task."""
     from hydra_core.cli import _replay_plan_evidence
 
     values = {
@@ -248,9 +259,32 @@ def test_plan_step_id_task_alone_triggers_refusal_even_with_plan_status_none():
     assert has_plan_step_task is True
 
 
-def test_plan_status_absent_and_plan_step_id_task_present_still_refuses():
+def test_plan_step_id_task_alone_triggers_refusal_even_with_plan_status_none_taskstate_shape():
+    """Same gap, SHAPE: a real `TaskState` Pydantic OBJECT -- the shape a
+    real checkpoint restores and the shape `node_plan_gate` actually
+    appends. This is the exact case the coordinator's follow-up finding
+    named: the dict-only predicate silently passed this through because it
+    never recognised `plan_step_id` on an object attribute."""
+    from hydra_core.cli import _replay_plan_evidence
+    from hydra_core.state import TaskState
+
+    values = {
+        "plan_status": "none",
+        "tasks": [
+            TaskState(owner_squad="engineering", description="x",
+                      plan_step_id="step-a", status="done"),
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is True
+    assert plan_status == "none"
+    assert has_plan_step_task is True
+
+
+def test_plan_status_absent_and_plan_step_id_task_present_still_refuses_dict_shape():
     """Same gap, but plan_status key is entirely ABSENT (not merely "none") --
-    dict.get returns None, which must not be mistaken for "no evidence"."""
+    dict.get returns None, which must not be mistaken for "no evidence".
+    SHAPE: dict task."""
     from hydra_core.cli import _replay_plan_evidence
 
     values = {
@@ -264,10 +298,27 @@ def test_plan_status_absent_and_plan_step_id_task_present_still_refuses():
     assert has_plan_step_task is True
 
 
-def test_false_refusal_check_trivial_workflow_has_neither_signal():
+def test_plan_status_absent_and_plan_step_id_task_present_still_refuses_taskstate_shape():
+    """Same gap and same absent-plan_status wrinkle, SHAPE: `TaskState`
+    object."""
+    from hydra_core.cli import _replay_plan_evidence
+    from hydra_core.state import TaskState
+
+    values = {
+        "tasks": [
+            TaskState(owner_squad="engineering", description="x", plan_step_id="step-a"),
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is True
+    assert plan_status is None
+    assert has_plan_step_task is True
+
+
+def test_false_refusal_check_trivial_workflow_has_neither_signal_dict_shape():
     """The other direction, which matters just as much: a genuinely
     trivial-rigor workflow (plan_status "none", generic synthesised tasks
-    with no plan_step_id) must NOT be refused."""
+    with no plan_step_id) must NOT be refused. SHAPE: dict tasks."""
     from hydra_core.cli import _replay_plan_evidence
 
     values = {
@@ -283,6 +334,27 @@ def test_false_refusal_check_trivial_workflow_has_neither_signal():
     assert has_plan_step_task is False
 
 
+def test_false_refusal_check_trivial_workflow_has_neither_signal_taskstate_shape():
+    """Same false-refusal check, SHAPE: real `TaskState` objects -- exactly
+    what node_planner's own synthesised (non-plan) tasks are and what a real
+    replayed checkpoint restores. A trivial-rigor workflow must not be
+    refused under this shape either."""
+    from hydra_core.cli import _replay_plan_evidence
+    from hydra_core.state import TaskState
+
+    values = {
+        "plan_status": "none",
+        "tasks": [
+            TaskState(owner_squad="engineering", description="x", status="done"),
+            TaskState(owner_squad="executive", description="y", status="surfaced",
+                      plan_step_id=None),
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is False
+    assert has_plan_step_task is False
+
+
 def test_edge_case_aborted_before_plan_status_ever_advanced_does_not_refuse():
     """Coordinator's edge case 1: a workflow aborted/surfaced BEFORE
     plan_status ever left "none" (no plan was ever raised -- e.g. rejected
@@ -291,7 +363,9 @@ def test_edge_case_aborted_before_plan_status_ever_advanced_does_not_refuse():
     is correct -- there is no planning leg to lose because none was ever
     raised. `plan_step_id` is set at exactly one call site in the whole
     engine (node_plan_gate, gated on approval), so it cannot exist here
-    either."""
+    either. SHAPE: dict task (the signal under test is plan_status, not the
+    per-task shape; the two shape-focused tests above already cover the
+    plan_step_id side under both shapes)."""
     from hydra_core.cli import _replay_plan_evidence
 
     values = {
@@ -314,7 +388,9 @@ def test_edge_case_legacy_checkpoint_missing_plan_status_key_does_not_refuse():
     introduction). VERDICT: replays, and that is correct -- the concept did
     not exist yet, so there is nothing to lose fidelity on. `values` here
     deliberately carries no "plan_status" key whatsoever, only the fields a
-    real pre-P5a checkpoint would have had."""
+    real pre-P5a checkpoint would have had. SHAPE: dict task (same rationale
+    as the edge case above -- the plan_step_id shape axis is covered
+    separately)."""
     from hydra_core.cli import _replay_plan_evidence
 
     values = {
