@@ -84,7 +84,7 @@ Conditional edges from `postcheck` route to `done`, back to `dispatch`
 (if a missed dependency was discovered), or to `surfaced` (a terminal
 state meaning "human must intervene").
 
-### 2a. The plan phase (`HYDRA_PLAN_PHASE`, default OFF)
+### 2a. The plan phase (`HYDRA_PLAN_PHASE`, default ON)
 
 Two further nodes, `plan_judge` and `plan_gate`, sit on a loop **through**
 dispatch rather than before it. That placement is forced: the attended cursor
@@ -103,8 +103,49 @@ the attended selectors will not pick a non-planning task. This is enforced in
 four selectors plus the ingest path, because a barrier enforced in three of five
 places is not a barrier.
 
-Two properties are worth stating because both are load-bearing and neither is
-obvious:
+**Default and kill switch.** The plan phase ships ON: `HYDRA_PLAN_PHASE` is
+read as on unless it is set to the literal string `"0"` — unset, empty, or any
+other value all mean on. This is deliberately fail-*safe* in the opposite
+direction of a typical feature flag: an operator (or a stale CI job) that
+forgets to export anything gets the plan phase, not the legacy sight-unseen
+approval path, because forgetting to set a flag should never silently regress
+safety-relevant precedence. `"0"` is the one documented disable spelling — the
+kill switch for an environment that cannot yet support it (see "hostless
+production paths" below).
+
+**§6 stand-down.** When the plan gate is active (flag on, non-trivial
+`plan_rigor`) `node_planner`'s `requires_human_approval` no longer folds in
+`high_risk`/`needs_ac_hitl` directly — those sight-unseen reasons stand down
+in favour of the plan gate itself (`reason="plan_approval"`,
+`gate_node="plan_gate"`) as the one informed approval. This is a declared
+behaviour change, not an oversight: a high-risk workflow now reaches
+`plan_gate`, never `approval`, once it has a plan rigor above trivial. See
+`tests/test_ws9_tier_acceptance.py::TestSection6PlanGateStandDownPositive` for
+the positive proof and `CHANGELOG.md` for the operator-facing note.
+`budget_exhausted` is deliberately excluded from the stand-down: a funded,
+over-budget workflow still gates at `approval` (`reason="over_budget"`)
+regardless of the plan phase.
+
+**Hostless production paths.** Any caller that drives a *fresh* `workflow_id`
+through `node_intake` → `node_planner` with no attended host on the other end
+to resolve a deferred `owner_squad="planning"` task must pass
+`force_trivial_plan_rigor=True` to `build_supervisor(...)` — this forces
+`plan_rigor="trivial"` regardless of triage, so no planning task is ever
+seeded and the legacy in-graph behaviour is preserved. `cli.py`'s `_cmd_run`
+sets it for the detached `--live` path and for `--no-checkpoint`; `_cmd_replay`
+sets it unconditionally (it is *always* a detached-subprocess replay per its
+own docstring, live or not — see the fix and its mutation proof in
+`tests/test_replay_hostless_plan_phase.py`). This is an explicit **opt-in**,
+not an opt-out: a new hostless entry point that forgets to set it deadlocks
+silently at `phase="planning"` rather than failing loudly. That is a known
+sharp edge in the current shape of the guard — the safer design would have
+callers declare that they *have* a host (opt-in to the dangerous case)
+instead of declaring that they don't, but restructuring that is out of scope
+for this flip; treat every new caller of `build_supervisor` that drives a
+fresh thread id as a checklist item against this section.
+
+Two further properties are worth stating because both are load-bearing and
+neither is obvious:
 
 - **The flag gates writers, not readers.** Every reader of `plan_status` is
   unconditional; only the writers check `HYDRA_PLAN_PHASE`. With the flag off

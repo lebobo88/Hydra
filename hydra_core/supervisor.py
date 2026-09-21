@@ -85,15 +85,20 @@ except ImportError:                                                        # pra
 
 
 def _plan_phase_enabled() -> bool:
-    """HYDRA_PLAN_PHASE feature flag. Default OFF.
+    """HYDRA_PLAN_PHASE feature flag. Default ON (P5b flip).
 
-    P5a (graph topology + planner seeding for the planning phase) ships behind
-    this flag so every existing workflow/checkpoint is unaffected until P5b
-    (ingest PLAN materialisation, CLI --rigor/--modify-plan surfaces, flag
-    default flip) lands. ``tests/conftest.py`` pins this env var off for the
-    whole suite; plan-phase tests opt in explicitly via monkeypatch.
+    P5a/P5b (graph topology + planner seeding + ingest PLAN materialisation +
+    CLI --rigor/--modify-plan surfaces) now ship ON by default: the plan
+    phase is the standard path unless explicitly disabled. Disable spelling
+    is "0" (mirrors the disable value tests already use for opt-out; "0" is
+    unambiguous and cannot be produced by an accidental truthy string the way
+    an empty-string or "false"-vs-"False" convention could). Any other value,
+    INCLUDING AN UNSET/EMPTY VAR, means on -- the flag must be explicitly and
+    deliberately disabled, not silently defaulted off by an unset shell
+    variable, so an operator (or a stale CI job) cannot accidentally regress
+    to legacy behaviour just by forgetting to export something.
     """
-    return os.environ.get("HYDRA_PLAN_PHASE") == "1"
+    return os.environ.get("HYDRA_PLAN_PHASE") != "0"
 
 
 # RC1 — delegation routing: which squad consumes each emitted envelope type

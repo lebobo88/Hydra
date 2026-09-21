@@ -48,7 +48,16 @@ def _start_paused_workflow(tmp_path, monkeypatch) -> str:
     # executive squad declares hitl_required gates → planner sets
     # requires_human_approval → graph interrupts before `approval`.
     initial.selected_squads = ["executive"]
-    sup = build_supervisor(project_root=REPO_ROOT, dispatcher=_NullDispatcher())
+    sup = build_supervisor(
+        project_root=REPO_ROOT, dispatcher=_NullDispatcher(),
+        # P5b hostless-path audit: this helper drives a fresh thread_id to
+        # completion in one shot with no attended host to resolve a
+        # deferred planning task, and this module's whole point is the
+        # LEGACY sight-unseen `approval` gate -- force plan_rigor trivial so
+        # node_planner never stands it down for the plan gate (mirrors
+        # cli.py's --live/--no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
+    )
     sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
     return str(wf)
 

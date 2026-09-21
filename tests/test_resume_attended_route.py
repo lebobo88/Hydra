@@ -266,7 +266,14 @@ def _start_paused_attended_workflow(
     initial = HydraState(workflow_id=wf, root_goal="resume-attended-route test goal")
     initial.selected_squads = selected_squads or ["executive", "engineering"]
     initial.target_repo_id = "hydra"
-    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    sup = build_supervisor(
+        project_root=project, dispatcher=_CliNullDispatcher(),
+        # P5b hostless-path audit: fresh thread_id, one-shot invoke, no
+        # attended host -- this module's point is the legacy `approval`
+        # gate, so force plan_rigor trivial (mirrors cli.py's --live/
+        # --no-checkpoint precedent).
+        force_trivial_plan_rigor=True,
+    )
     sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
     return project, str(wf)
 
@@ -576,7 +583,12 @@ def _start_paused_attended_workflow_at(
     initial = HydraState(workflow_id=wf, root_goal="resume-attended-route test goal")
     initial.selected_squads = selected_squads or ["executive", "engineering"]
     initial.target_repo_id = "hydra"
-    sup = build_supervisor(project_root=project, dispatcher=_CliNullDispatcher())
+    sup = build_supervisor(
+        project_root=project, dispatcher=_CliNullDispatcher(),
+        # P5b hostless-path audit: fresh thread_id, one-shot invoke, no
+        # attended host.
+        force_trivial_plan_rigor=True,
+    )
     sup.invoke(initial, config={"configurable": {"thread_id": str(wf)}})
     return str(wf)
 

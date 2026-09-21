@@ -1491,6 +1491,8 @@ class TestJudgePerSquadHaltsOnSurfaced:
             project_root=HYDRA_ROOT,
             dispatcher=_NullDisp(),
             force_pure_python=True,
+            # P5b hostless-path audit: one-shot invoke, no attended host.
+            force_trivial_plan_rigor=True,
         )
 
         # A normal (non-surfaced) state starting at dispatch should reach

@@ -87,6 +87,8 @@ def test_stub_squad_surfaces_in_graph_with_live_dispatcher() -> None:
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
 
     # Force-select a stub squad (healthcare is stub in this worktree).

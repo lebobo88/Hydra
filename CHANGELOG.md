@@ -8,7 +8,45 @@ public-API boundary.
 
 ## [Unreleased]
 
-### Added — the plan phase, behind `HYDRA_PLAN_PHASE` (default OFF)
+### Changed — the plan phase now ships ON by default
+
+`HYDRA_PLAN_PHASE` flips from default-off to default-on: unset, empty, or any
+value other than the literal string `"0"` means on. `"0"` is the one
+documented disable spelling (the kill switch), chosen deliberately over an
+unset-means-off convention so that forgetting to set the variable cannot
+silently regress an operator (or a stale CI job) back to the legacy
+sight-unseen precedence below — the safe direction requires an explicit,
+positive act to opt out, not to opt in.
+
+**This re-activates the §6 stand-down as the live default, not merely as an
+opt-in feature**: a high-risk workflow (a P0/P1 task, or any squad declaring a
+`hitl_required` gate) with non-trivial `plan_rigor` now reaches `plan_gate`
+(`reason="plan_approval"`) instead of the old sight-unseen `approval` gate
+(`reason="high_risk"`/`"acceptance_criteria"`) *by default*, everywhere. The
+old precedence is preserved byte-for-byte only for `trivial` rigor, for
+checkpoints predating the feature, and for any workflow that explicitly opts
+out with `HYDRA_PLAN_PHASE=0` — see
+`tests/test_ws9_tier_acceptance.py`'s frozen-precedence tests (opted out) and
+`TestSection6PlanGateStandDownPositive` (the new default proven positively).
+
+**Hostless-path guard, fixed as a prerequisite of this flip, not a
+follow-up**: `hydra replay` (`_cmd_replay`) builds a fresh `workflow_id` and
+drives it through `node_intake` → `node_planner` with no attended host on the
+other end (it exists specifically to run as a detached Cockpit subprocess,
+live or not) — without `force_trivial_plan_rigor=True` at its
+`build_supervisor(...)` call, replaying any non-trivial-rigor workflow would
+seed a real planning task, defer it to a host that will never come, and park
+the replay at `phase="planning"` forever. This is now guarded and proven with
+a paired mutation test (`tests/test_replay_hostless_plan_phase.py`).
+`force_trivial_plan_rigor` remains an explicit **opt-in** signal, not an
+opt-out from a declared "has a host" flag — any future hostless caller of
+`build_supervisor` that forgets to set it will deadlock silently at
+`phase="planning"` rather than fail loudly. That asymmetry is a known sharp
+edge in the current shape of the guard (recorded here and in
+`ARCHITECTURE.md` §2a); restructuring it to fail-closed instead of fail-open
+was judged out of scope for this commit.
+
+### Added — the plan phase, behind `HYDRA_PLAN_PHASE` (default OFF, now ON — see above)
 
 Hydra could route, govern, budget, judge and replay, but it had no plan. It had
 a task list: `node_planner` synthesised one task per selected squad whose

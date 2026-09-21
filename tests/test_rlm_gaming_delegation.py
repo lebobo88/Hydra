@@ -219,7 +219,10 @@ def test_dispatch_forwards_dev_task_to_engineering(monkeypatch, tmp_path) -> Non
     repo_path = _hermetic_repo(monkeypatch, tmp_path)
     disp = _SkillToEngDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     assert isinstance(runner, _PurePythonRunner)
 
     initial = HydraState(root_goal="Build the fog-of-war system",
@@ -261,7 +264,10 @@ def test_dispatch_forwards_repo_subpath_to_engineering(monkeypatch, tmp_path) ->
 
     disp = _SubdirDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     initial = HydraState(root_goal="Build the voxel sandbox",
                          selected_squads=["rlm-gaming"])
     runner.invoke(initial, stop_before="judge_per_squad")
@@ -291,7 +297,10 @@ def test_forwarded_envelope_is_redacted_before_engineering(monkeypatch, tmp_path
 
     disp = _DirtyDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     initial = HydraState(root_goal="Build fog of war",
                          selected_squads=["rlm-gaming"])
     runner.invoke(initial, stop_before="judge_per_squad")
@@ -326,7 +335,10 @@ def test_forwarding_sweep_budget_block_surfaces(monkeypatch, tmp_path) -> None:
 
     disp = _CostlyDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     initial = HydraState(root_goal="Build the economy system",
                          selected_squads=["rlm-gaming"])
     initial.budget.budget_usd = 1.0  # tiny → the 999 forward cost blocks
@@ -356,7 +368,10 @@ def test_rlm_gaming_skill_receives_delegation_priming(monkeypatch) -> None:
 
     disp = _CapturingDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     initial = HydraState(root_goal="Plan a vertical slice",
                          selected_squads=["rlm-gaming"])
     runner.invoke(initial, stop_before="judge_per_squad")
@@ -388,7 +403,10 @@ def test_no_emitted_envelopes_means_no_forward(monkeypatch) -> None:
 
     disp = _NoEmitDispatcher()
     runner = build_supervisor(project_root=HYDRA_ROOT, dispatcher=disp,
-                              force_pure_python=True)
+                              force_pure_python=True,
+                              # P5b hostless-path audit: one-shot invoke, no
+                              # attended host.
+                              force_trivial_plan_rigor=True)
     initial = HydraState(root_goal="Design a roguelike loop",
                          selected_squads=["rlm-gaming"])
     final = runner.invoke(initial, stop_before="judge_per_squad")

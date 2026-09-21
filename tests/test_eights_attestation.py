@@ -215,6 +215,8 @@ def test_supervisor_calls_eights_envelope_record():
         dispatcher=d,
         critique_client=_PassClient(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(root_goal="quick refresh")
     sup.invoke(state)

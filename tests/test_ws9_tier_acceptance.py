@@ -398,8 +398,9 @@ class TestTaskModelTierPropagation:
 # PART 2: acceptance-criteria pre-flight HITL
 # ===========================================================================
 
-def _build_planner(packs_dict: dict):
-    """Extract node_planner from build_supervisor via pure-python runner."""
+def _build_node(packs_dict: dict, node_name: str):
+    """Extract a named node function from build_supervisor via the
+    pure-python runner (shared by _build_planner and the §6 plan_gate test)."""
     from unittest.mock import MagicMock, patch
     from hydra_core import supervisor as sup_module
 
@@ -420,9 +421,14 @@ def _build_planner(packs_dict: dict):
                return_value={"sent": 0, "failed": 0, "skipped": 0}):
         runner = sup_module.build_supervisor(dispatcher=disp, force_pure_python=True)
 
-    planner_fn = dict(runner.steps).get("planner")
-    assert planner_fn is not None, "planner node not found"
-    return planner_fn
+    fn = dict(runner.steps).get(node_name)
+    assert fn is not None, f"{node_name} node not found"
+    return fn
+
+
+def _build_planner(packs_dict: dict):
+    """Extract node_planner from build_supervisor via pure-python runner."""
+    return _build_node(packs_dict, "planner")
 
 
 def _hi_risk_packs():
@@ -522,13 +528,20 @@ class TestAcceptanceCriteriaGate:
 
     # -- Fix 4: gate fires on ANY qualifying-missing --
 
-    def test_any_qualifying_missing_fires_gate(self):
+    def test_any_qualifying_missing_fires_gate(self, monkeypatch):
         """Fix 4: two qualifying tasks where ONE lacks criteria -> gate FIRES.
 
         WS9 regression fix: both squads are high_risk (hitl_required=True), so
         reason='high_risk' wins the frozen contract.  The summary must mention
         missing criteria.
+
+        P5b: this is the frozen PRE-PLAN-PHASE precedence contract -- the plan
+        gate's §6 stand-down (see test_high_risk_workflow_reaches_plan_gate_
+        not_approval_default_on below) intentionally supersedes this reason
+        when the plan phase is on. Opt out explicitly since the flag now
+        ships on by default.
         """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         from hydra_core.squad_loader import SquadPack, GateSpec
 
@@ -576,8 +589,14 @@ class TestAcceptanceCriteriaGate:
 
     # -- Fix 5: major (P0/P1) tasks qualify regardless of squad risk level --
 
-    def test_p0_task_missing_criteria_gates(self):
-        """Fix 5: P0 priority (major) + no criteria -> gate fires even on low-risk squad."""
+    def test_p0_task_missing_criteria_gates(self, monkeypatch):
+        """Fix 5: P0 priority (major) + no criteria -> gate fires even on low-risk squad.
+
+        P5b: frozen pre-plan-phase precedence -- both the high_risk AND the AC
+        gate stand down when the plan gate is active, so this needs an
+        explicit opt-out now that the flag ships on by default.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
@@ -601,8 +620,13 @@ class TestAcceptanceCriteriaGate:
         )
         assert out.get("requires_human_approval") is True
 
-    def test_p1_task_missing_criteria_gates(self):
-        """Fix 5: P1 priority + no criteria -> gate fires."""
+    def test_p1_task_missing_criteria_gates(self, monkeypatch):
+        """Fix 5: P1 priority + no criteria -> gate fires.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out (see
+        test_p0_task_missing_criteria_gates above for why).
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_lo_risk_packs())
 
@@ -649,12 +673,15 @@ class TestAcceptanceCriteriaGate:
 
     # -- Standard coverage --
 
-    def test_high_risk_no_criteria_triggers_ac_hitl(self):
+    def test_high_risk_no_criteria_triggers_ac_hitl(self, monkeypatch):
         """High-risk squad + fresh tasks (no pre-seeded criteria) -> HITL fires.
 
         WS9 regression fix: when the gate is high_risk, the frozen-contract
         reason='high_risk' wins.  Missing-criteria info surfaces in the summary.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
         """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState
         planner = _build_planner(_hi_risk_packs())
 
@@ -948,14 +975,17 @@ class TestFixBExecutiveBranchPreservation:
     non-executive tasks that the AC gate needs to evaluate.
     """
 
-    def test_exec_branch_p0_task_missing_criteria_fires_ac_gate(self):
+    def test_exec_branch_p0_task_missing_criteria_fires_ac_gate(self, monkeypatch):
         """Fix B: executive squad selected + pre-seeded P0 engineering task
         with no criteria -> HITL gate FIRES (task is not discarded).
 
         WS9 regression fix: _exec_packs() has hitl_required=True for both
         executive and engineering, so reason='high_risk' wins the frozen
         contract.  The summary must mention missing criteria.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
         """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_exec_packs())
 
@@ -1088,9 +1118,13 @@ class TestFixBExecutiveBranchPreservation:
 class TestFix1MultiTaskPerSquad:
     """Fix 1: two+ pre-seeded tasks sharing a squad must all survive into new_tasks."""
 
-    def test_two_same_squad_tasks_p0_missing_fires_gate(self):
+    def test_two_same_squad_tasks_p0_missing_fires_gate(self, monkeypatch):
         """Two pre-seeded engineering tasks: P0 missing criteria + P2 with criteria.
-        The P0 must NOT be dropped; the AC gate must FIRE."""
+        The P0 must NOT be dropped; the AC gate must FIRE.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_hi_risk_packs())
 
@@ -1309,9 +1343,13 @@ def _exec_packs():
 class TestFix1ExecutiveNoCollapse:
     """Round-5: two pre-seeded executive tasks must both survive; no collapse."""
 
-    def test_two_exec_tasks_p0_missing_criteria_gate_fires(self):
+    def test_two_exec_tasks_p0_missing_criteria_gate_fires(self, monkeypatch):
         """Two pre-seeded executive tasks. P0 has no criteria.
-        Both must appear in rebuilt tasks; AC gate must fire."""
+        Both must appear in rebuilt tasks; AC gate must fire.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
         planner = _build_planner(_exec_packs())
 
@@ -1808,14 +1846,17 @@ class TestRound7AcGateOutsideSelectedSquads:
     NOT in selected_squads, as long as that squad has an hitl_required gate
     in packs.  Non-blanket: low-risk P2/P3 outside selected_squads stays silent."""
 
-    def test_hi_risk_outside_selected_missing_criteria_fires(self):
+    def test_hi_risk_outside_selected_missing_criteria_fires(self, monkeypatch):
         """Pre-seeded task: owner_squad='security' (high-risk, NOT in selected_squads).
         No acceptance_criteria.  HITL gate must FIRE.
 
         WS9 regression fix: both 'security' and synthesised 'engineering' tasks have
         hitl_required=True (squad_gate_high_risk=True), so reason='high_risk' wins the
         frozen contract.  The summary must mention missing acceptance criteria.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
         """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
 
         # packs includes both 'engineering' (selected) and 'security' (not selected).
@@ -1936,10 +1977,14 @@ class TestRound7AcGateOutsideSelectedSquads:
 class TestRound8HolisticPlanner:
     """Covers the two new issues fixed in round-8 plus a no-duplication invariant."""
 
-    def test_hi_risk_outside_selected_with_criteria_triggers_high_risk_hitl(self):
+    def test_hi_risk_outside_selected_with_criteria_triggers_high_risk_hitl(self, monkeypatch):
         """A pre-seeded high-risk task outside selected_squads WITH valid criteria
         must set requires_human_approval=True (high_risk HITL reason, not AC gate).
-        This verifies the shared _task_is_high_risk helper drives both gates."""
+        This verifies the shared _task_is_high_risk helper drives both gates.
+
+        P5b: frozen pre-plan-phase precedence; explicit opt-out.
+        """
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         from hydra_core.state import HydraState, TaskState
 
         # packs: engineering is lo-risk (selected), security is hi-risk (not selected).
@@ -2191,3 +2236,101 @@ class TestRound9DispatchDedup:
             f"Three distinct tasks must each dispatch exactly once; "
             f"got {len(dispatch_calls)} calls"
         )
+
+
+# ===========================================================================
+# PART 3: §6 stand-down positive proof (P5b flip)
+# ===========================================================================
+
+class TestSection6PlanGateStandDownPositive:
+    """The paired positive half of the §6 stand-down: TestAcceptanceCriteriaGate
+    and friends (above) prove the OLD sight-unseen precedence still holds
+    exactly when an operator explicitly opts out (HYDRA_PLAN_PHASE=0). This
+    class proves the NEW precedence with the plan phase at its shipping
+    default (no env var set at all): a high-risk workflow's approval signal
+    is stood down at node_planner (reason='high_risk'/'acceptance_criteria'
+    never fires, gate_node='approval' never fires) and instead the workflow
+    is routed onto the plan-authoring path that terminates at node_plan_judge
+    filing gate_node='plan_gate' (reason='plan_approval') -- never 'approval'.
+    Without this test, the §6 stand-down was only ever proven by absence (the
+    old reason not firing), never by the new one actually firing."""
+
+    def test_high_risk_workflow_reaches_plan_gate_not_approval_default_on(self):
+        import os
+        assert "HYDRA_PLAN_PHASE" not in os.environ, (
+            "this test exercises the shipping default; it must not set the flag"
+        )
+        from hydra_core.state import HydraState, TaskState
+
+        packs = _hi_risk_packs()
+        planner = _build_planner(packs)
+
+        # Same shape as TestAcceptanceCriteriaGate.test_high_risk_no_criteria_
+        # triggers_ac_hitl's frozen-precedence twin, minus the opt-out: a
+        # high-risk squad with a fresh, criterion-less task -- the OLD
+        # precedence would have set reason='acceptance_criteria' or
+        # 'high_risk' and gate_node='approval' directly out of node_planner.
+        state = HydraState(
+            workflow_id=uuid4(),
+            root_goal="rewrite the entire payment system",
+            selected_squads=["engineering"],
+            target_repo_id="hydra",
+        )
+        out = _run_planner(planner, state)
+
+        # --- Step 1: node_planner stands down, does NOT gate on 'approval'. ---
+        assert out["requires_human_approval"] is False, (
+            "high_risk must stand down at node_planner when the plan gate is "
+            f"active; requires_human_approval={out['requires_human_approval']!r}"
+        )
+        assert out["phase"] == "dispatch", (
+            f"planner must route to 'dispatch', not 'approval'; got {out['phase']!r}"
+        )
+        assert "pending_hitl" not in out, (
+            f"no HITL gate is filed by node_planner under the plan gate; "
+            f"got pending_hitl={out.get('pending_hitl')!r}"
+        )
+        assert out.get("plan_status") == "authoring", (
+            f"the plan gate must be raised (plan_status='authoring'); "
+            f"got {out.get('plan_status')!r}"
+        )
+        planning_tasks = [t for t in out["tasks"] if t.owner_squad == "planning"]
+        assert len(planning_tasks) == 1, (
+            "a real planning task must be seeded for this non-trivial-rigor "
+            f"high-risk workflow; tasks={[t.owner_squad for t in out['tasks']]}"
+        )
+
+        # --- Step 2: the plan is authored and submitted (simulating the
+        # attended planning cursor) -- plan_status advances to 'drafted'. ---
+        merged_tasks = list(state.tasks) + list(out["tasks"])
+        drafted_state = HydraState(
+            workflow_id=state.workflow_id,
+            root_goal=state.root_goal,
+            selected_squads=state.selected_squads,
+            target_repo_id=state.target_repo_id,
+            tasks=merged_tasks,
+            plan_status="drafted",
+            plan_rigor=out["plan_rigor"],
+            plan_revision=1,
+        )
+
+        plan_judge = _build_node(packs, "plan_judge")
+        from unittest.mock import patch
+        with patch("hydra_core.eights.attestation.EightsAttestor.hitl_request",
+                   return_value=None):
+            judged = plan_judge(drafted_state)
+
+        # --- Step 3: the REAL gate that fires is plan_gate, never approval. ---
+        assert judged["plan_status"] == "judged", judged
+        hitl = judged.get("pending_hitl") or {}
+        assert hitl.get("gate_node") == "plan_gate", (
+            f"the high-risk workflow's gate must be 'plan_gate', not "
+            f"'approval'; got gate_node={hitl.get('gate_node')!r}"
+        )
+        assert hitl.get("reason") == "plan_approval", (
+            f"the gate's reason must be 'plan_approval' (the plan judge's "
+            f"own reason), never the frozen 'high_risk'/'acceptance_criteria' "
+            f"contract those reasons name; got reason={hitl.get('reason')!r}"
+        )
+        assert hitl.get("gate_node") != "approval"
+        assert hitl.get("reason") not in ("high_risk", "acceptance_criteria")

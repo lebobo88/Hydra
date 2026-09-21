@@ -38,8 +38,8 @@ LangGraph builds with `interrupt_before=["approval", "synthesis"]`. Additional a
 
 | Gate | Reason codes |
 |---|---|
-| approval (planning → dispatch) | `budget_approval`, `high_risk`, `policy_breach`, `campaign_signoff` |
-| plan_gate (dispatch → dispatch) | `plan_approval` — only when `HYDRA_PLAN_PHASE` is on and rigor is not `trivial` |
+| approval (planning → dispatch) | `budget_approval`, `high_risk`, `acceptance_criteria`, `over_budget`, `policy_breach`, `campaign_signoff` — `high_risk`/`acceptance_criteria` fire here only when the plan gate is NOT active (rigor `trivial`, a checkpoint predating the plan phase, or `HYDRA_PLAN_PHASE=0`); `over_budget` always fires here regardless (§6 stand-down deliberately excludes budget exhaustion) |
+| plan_gate (dispatch → dispatch) | `plan_approval` — the DEFAULT for a high-risk/AC-qualifying workflow now that `HYDRA_PLAN_PHASE` ships on: fires whenever rigor is not `trivial` and the flag is not explicitly disabled with `HYDRA_PLAN_PHASE=0` |
 | synthesis (dispatch → postcheck) | `schema_conflict`, `dissent_unresolved` |
 | postcheck (postcheck → done) | `loop_ceiling`, `budget_approval`, `prod_deploy` |
 

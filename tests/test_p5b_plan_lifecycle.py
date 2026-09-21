@@ -1,9 +1,10 @@
 """P5b: complete the plan lifecycle -- authoring -> drafted -> judged ->
 approved.
 
-Ships behind HYDRA_PLAN_PHASE, which STAYS default OFF this phase (asserted
-directly by Task 0's tests below). tests/conftest.py pins the flag off for
-the whole suite.
+HYDRA_PLAN_PHASE now ships ON by default (the flip this phase always named
+as its final task). Every "flag off" test below opts out explicitly via
+``monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")`` to keep proving the legacy
+precedence; tests/conftest.py no longer pins the flag for the whole suite.
 
 Task map (see the P5b brief):
   0. The flag gates WRITERS, not READERS -- locked in by TestTask0Asymmetry.
@@ -87,8 +88,10 @@ def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None):
 # =========================================================================== #
 
 class TestTask0Asymmetry:
-    """HYDRA_PLAN_PHASE is OFF for this whole module (conftest pins it) --
-    every test below proves the READ side of plan_status is unconditional."""
+    """P5b: HYDRA_PLAN_PHASE now ships ON by default; every flag-off test
+    below opts out explicitly (monkeypatch.setenv(..., "0")) so it continues
+    to prove the READ side of plan_status is unconditional regardless of the
+    flag's write-side default."""
 
     def _runner(self, monkeypatch):
         from hydra_core.supervisor import build_supervisor, _PurePythonRunner
@@ -114,6 +117,8 @@ class TestTask0Asymmetry:
         the read side never checks HYDRA_PLAN_PHASE. Removing the asymmetry
         (e.g. gating plan_judge's step-skip on the flag) would leave
         plan_status=='drafted' and fail this assertion."""
+        # P5b: the flag ships ON by default now -- explicit opt-out.
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         import os
         assert os.environ.get("HYDRA_PLAN_PHASE") != "1"
         runner = self._runner(monkeypatch)
@@ -131,6 +136,8 @@ class TestTask0Asymmetry:
         """Counterpart: plan_status='none' (the default, matching every
         pre-P5a workflow) must NEVER be routed into plan_judge/plan_gate --
         it stays 'none' through to the end of the run."""
+        # P5b: the flag ships ON by default now -- explicit opt-out.
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         import os
         assert os.environ.get("HYDRA_PLAN_PHASE") != "1"
         runner = self._runner(monkeypatch)
@@ -267,6 +274,8 @@ class TestTask2IngestBranch:
         refused with an explicit, visible status — never silently dropped,
         and never allowed to write plan_status="drafted" and raise the
         barrier with no flag-gated code able to ever clear it."""
+        # P5b: the flag ships ON by default now -- explicit opt-out.
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         import os
         assert os.environ.get("HYDRA_PLAN_PHASE") != "1"
 
@@ -478,11 +487,13 @@ class TestTask2IngestBranch:
         )
         assert outcome.items[0].status == "drafted"
 
-    def test_flag_off_refusal_survives_even_mid_authoring_barrier(self, packs, tmp_path):
+    def test_flag_off_refusal_survives_even_mid_authoring_barrier(self, packs, tmp_path,
+                                                                    monkeypatch):
         """Counterpart to the exemption test above: the barrier exemption
         (etype != "PLAN") is not itself the gate. With the flag off, a PLAN
         submitted while a plan is already "authoring" is STILL refused, not
         let through because it is exempt from the (separate) barrier check."""
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         state = HydraState(root_goal="x", plan_status="authoring")
         plan = _minimal_plan_dict(state.workflow_id)
         outcome = dispatch_ingested_envelopes(
@@ -730,12 +741,15 @@ class TestReviseRoundClaimRelease:
         assert _ingest_item_should_release_claim(item) is expected
 
     def test_plan_refused_with_flag_off_can_be_resubmitted_once_flag_is_on(
-        self, packs, tmp_path,
+        self, packs, tmp_path, monkeypatch,
     ):
         """The property that actually matters: not merely that release_fn
         was called, but that the SAME envelope id, refused while the flag
         was off, dispatches successfully once the flag is on -- exactly the
         operator action of flipping HYDRA_PLAN_PHASE and resubmitting."""
+        # P5b: the flag ships ON by default now -- start from the explicit
+        # OFF state this test's first half needs.
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
         state = HydraState(root_goal="x")
         plan = _minimal_plan_dict(state.workflow_id)
         eid = plan["id"]
@@ -839,6 +853,10 @@ class TestReviseRoundIngestPathParity:
 
         plan = _minimal_plan_dict(wf)
         args = type("Args", (), {"live": False, "verbose": False})()
+
+        # P5b: the flag ships ON by default now -- start from the explicit
+        # OFF state this test's first half needs.
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
 
         # --- Flag OFF: refused via the REAL hydra-ingest code path. ---
         rc1 = _cmd_ingest_locked(args, tmp_path, wf_str, [dict(plan)])
@@ -1142,6 +1160,10 @@ class TestTask4Materialisation:
         runner = build_supervisor(
             project_root=HYDRA_ROOT, dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
+            # P5b hostless-path audit: this test's concern is the stale-
+            # revision skip, not plan-phase seeding -- one-shot invoke, no
+            # attended host.
+            force_trivial_plan_rigor=True,
         )
         assert isinstance(runner, _PurePythonRunner)
 

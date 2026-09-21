@@ -58,6 +58,8 @@ class TestNodeDispatchBarrier:
         runner = build_supervisor(
             project_root=HYDRA_ROOT, dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
+            # P5b hostless-path audit: one-shot invoke, no attended host.
+            force_trivial_plan_rigor=True,
         )
         assert isinstance(runner, _PurePythonRunner)
 
@@ -95,6 +97,8 @@ class TestNodeDispatchBarrier:
         runner = build_supervisor(
             project_root=HYDRA_ROOT, dispatcher=_OfflineDispatcher(),
             force_pure_python=True,
+            # P5b hostless-path audit: one-shot invoke, no attended host.
+            force_trivial_plan_rigor=True,
         )
         state = HydraState(
             root_goal="test", selected_squads=["engineering"],
@@ -127,6 +131,8 @@ def test_fleet_never_engages_under_active_barrier(monkeypatch):
     runner = build_supervisor(
         project_root=HYDRA_ROOT, dispatcher=_OfflineDispatcher(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
     state = HydraState(
         root_goal="test", selected_squads=["engineering"],

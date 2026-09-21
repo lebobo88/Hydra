@@ -63,14 +63,17 @@ def _state(goal=LONG_GOAL, selected_squads=("engineering",), **kw):
 # ---------------------------------------------------------------------------
 
 def test_flag_off_no_planning_task_seeded(monkeypatch):
-    monkeypatch.delenv("HYDRA_PLAN_PHASE", raising=False)
+    # P5b: the flag now ships ON by default (unset == on), so asserting
+    # legacy flag-off behaviour requires an explicit opt-out.
+    monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
     patch = _planner_fn()(_state())
     assert "planning" not in {t.owner_squad for t in patch["tasks"]}
     assert "plan_status" not in patch
 
 
 def test_flag_off_high_risk_still_gates_approval_reason_and_node(monkeypatch):
-    monkeypatch.delenv("HYDRA_PLAN_PHASE", raising=False)
+    # P5b: explicit opt-out (see test_flag_off_no_planning_task_seeded above).
+    monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
     state = _state(tasks=[TaskState(owner_squad="engineering", description="x", priority="P0",
                                      acceptance_criteria=["done"])])
     patch = _planner_fn()(state)

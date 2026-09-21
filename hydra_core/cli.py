@@ -5540,6 +5540,20 @@ def _cmd_replay(args) -> int:
         project_root=project,
         dispatcher=dispatcher,
         critique_client=critique_client,
+        # P5a/hostless-path audit: replay ALWAYS mints a brand-new thread_id
+        # (`replay_wf` above) and invokes it fresh through node_intake ->
+        # node_planner -- regardless of `--from-phase` or `--live`, neither of
+        # which changes the graph's fixed entry point. Per this function's own
+        # docstring, replay exists precisely so "the Cockpit bridge can launch
+        # it as a fixed-argv detached subprocess" -- there is never an
+        # attended host on the other end to resolve a deferred planning task.
+        # Without this flag, a non-trivial-rigor replay seeds a real
+        # owner_squad="planning" task, defers it to a host that will never
+        # come, and the graph parks at phase="planning" forever. Mirrors
+        # `_cmd_run`'s `--live`/`--no-checkpoint` precedent (line ~724) --
+        # ANY new hostless entry point that calls `sup.invoke()` on a fresh
+        # thread_id must set this the same way.
+        force_trivial_plan_rigor=True,
     )
 
     if isinstance(sup, _PurePythonRunner):

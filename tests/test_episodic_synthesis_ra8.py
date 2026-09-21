@@ -99,6 +99,8 @@ def test_synthesis_persists_decision_record_and_artifacts(
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
 
     wf_id = uuid4()
@@ -168,6 +170,8 @@ def test_synthesis_persists_one_row_per_artifact_memoryref(
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
 
     wf_id = uuid4()
@@ -239,6 +243,8 @@ def test_synthesis_episodic_fail_soft(monkeypatch) -> None:
         dispatcher=disp,
         critique_client=_StubCritique(),
         force_pure_python=True,
+        # P5b hostless-path audit: one-shot invoke, no attended host.
+        force_trivial_plan_rigor=True,
     )
 
     state = HydraState(

@@ -12,12 +12,21 @@ is now in place: `node_planner` seeds a planning task, the plan barrier holds
 every other task until the plan resolves, and `node_plan_judge` /
 `node_plan_gate` carry it from drafted through judged to approved.
 
-**It is gated behind `HYDRA_PLAN_PHASE`, which is default OFF.** With the flag
-off nothing seeds a planning task and no plan is authored — the engine behaves
-exactly as it did before this feature. The flag gates *writers* of
-`plan_status`, never readers; that asymmetry is deliberate and is what stops
-turning the flag off mid-flight from releasing a barrier over unplanned work.
-See the `_PLAN_BARRIER_STATES` comment in `hydra_core/state.py`.
+**This is the engine's default path now: `HYDRA_PLAN_PHASE` ships ON.** Every
+workflow whose triaged `plan_rigor` is not `trivial` seeds a planning task and
+authors a plan through this squad's contract unless the operator explicitly
+disables it with `HYDRA_PLAN_PHASE=0` (the one documented kill switch — unset,
+empty, or any other value all mean on). With the flag disabled nothing seeds a
+planning task and no plan is authored — the engine behaves exactly as it did
+before this feature; that legacy path still exists for environments that
+cannot yet support an attended planning cursor (see "hostless production
+paths" in `ARCHITECTURE.md` §2a — anything that drives a fresh workflow
+through the graph with no attended host must pass
+`force_trivial_plan_rigor=True` at `build_supervisor(...)` instead of
+disabling the flag wholesale). The flag gates *writers* of `plan_status`,
+never readers; that asymmetry is deliberate and is what stops turning the flag
+off mid-flight from releasing a barrier over unplanned work. See the
+`_PLAN_BARRIER_STATES` comment in `hydra_core/state.py`.
 
 Unchanged, and the reason this skill exists: do not treat any of this as
 license to hand-author a plan artifact inline — from this skill, from
