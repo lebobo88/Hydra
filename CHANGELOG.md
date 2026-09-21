@@ -61,9 +61,11 @@ holds every other task until the plan resolves; a cross-vendor judged
 against the rendered plan; and the plan itself written to `docs/plans/` as a
 tracked artifact so `git diff` is the review surface.
 
-Everything above is inert while the flag is off, which is its default. The flag
-gates *writers* of `plan_status` and never readers — turning it off mid-flight
-therefore cannot release a barrier over unplanned work.
+Everything above ships active by default now (see "the plan phase now ships ON
+by default" above) and is inert only when the flag is explicitly disabled with
+`HYDRA_PLAN_PHASE=0`. The flag gates *writers* of `plan_status` and never
+readers — turning it off mid-flight therefore cannot release a barrier over
+unplanned work.
 
 ### Changed — the pre-dispatch approval gate stands down when a plan is coming
 
@@ -84,8 +86,56 @@ over-budget workflow still stops at `approval` with `reason="over_budget"`,
 because budget is not a risk signal that a plan can inform.
 
 The previous precedence is preserved byte-for-byte for `trivial` rigor, for
-checkpoints predating the feature, and whenever the flag is off — which is
-every existing workflow today.
+checkpoints predating the feature, and for any workflow that explicitly
+disables the flag with `HYDRA_PLAN_PHASE=0` — it is no longer every existing
+workflow by default (see "the plan phase now ships ON by default" above).
+
+### Changed — `hydra run`'s default result can now park at `phase="planning"`, and says so explicitly
+
+A cross-vendor judge flagged the default `hydra run` (no `--live`, no
+`--no-checkpoint`) as an unguarded hostless deadlock, same shape as the
+replay bug above. That finding was refuted: this path checkpoints (compiled
+LangGraph graph, `thread_id=str(workflow_id)`), so a non-terminal `phase` is
+resumable via `hydra step <workflow_id>` — it is this repo's mandated
+attended flow (`run` → `step` → `submit-host-result`), not a hostless one,
+and `_cmd_replay`'s throwaway `replay_wf` (no command ever targets it) is
+what made replay a genuine deadlock and this is not.
+
+The refutation surfaced a real, smaller gap: before this flip, `hydra run` on
+a typical goal usually completed in one call; now a non-trivial goal commonly
+parks at `phase="planning"` awaiting the attended planning cursor, and the
+JSON result gave no explicit signal of that — a caller had to infer "parked
+vs. done" from `phase` alone. `_cmd_run`'s printed result now carries
+`"parked": true/false` and an explicit `"next_action"` naming the exact
+command to continue (`hydra step <workflow_id>`, or `hydra resume
+<workflow_id> --action ...` when a real `pending_hitl` gate is pending
+instead). Proven end-to-end, not merely asserted, by
+`tests/test_run_park_resumability.py::test_default_run_parks_resumably_and_step_picks_it_up`
+— it drives `hydra step` against the exact `workflow_id` `hydra run` printed
+and confirms it genuinely resumes the parked planning task.
+
+### Changed — `hydra replay` refuses a workflow that raised a plan, rather than reproducing something else
+
+A cross-vendor judge finding (HIGH): `hydra replay` reconstructs a source
+workflow's `root_goal`, `selected_squads`, repo-targeting, and budget only —
+it never carries forward the approved `PLAN` envelope or the `PlanStep` tasks
+materialised from it. Replaying a workflow that had actually raised a plan
+would therefore silently regenerate a different, legacy generic task set and
+skip the planning leg entirely — replay's contract is deterministic
+re-execution, and that divergence would have been invisible.
+
+`hydra replay` now refuses loudly instead
+(`status="replay_refused_planned_workflow"`) whenever the source checkpoint's
+`plan_status` is anything other than `"none"`/absent — chosen because it is
+the one field `node_planner`/`node_plan_judge`/`node_plan_gate` advance
+together through the entire lifecycle (`authoring` → `drafted` → `judged` →
+`approved`, or → `rejected`), so it already implies a plan was raised at
+every stage without needing a second signal. A trivial-rigor source workflow
+(`plan_status` stayed `"none"`) replays exactly as before. Carrying the plan
+itself through replay is deferred as future work, not attempted in this
+commit. See `tests/test_replay_hostless_plan_phase.py` (refusal parametrised
+over every `plan_status` lifecycle value, plus the unchanged-trivial
+counterpart and the paired mutation proof).
 
 ### Added — `policy_override` is now actually emitted
 

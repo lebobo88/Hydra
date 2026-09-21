@@ -144,6 +144,40 @@ instead of declaring that they don't, but restructuring that is out of scope
 for this flip; treat every new caller of `build_supervisor` that drives a
 fresh thread id as a checklist item against this section.
 
+`hydra run`'s default path (no `--live`, no `--no-checkpoint`) is deliberately
+**not** on this checklist and does **not** set `force_trivial_plan_rigor` — it
+is the attended entry point this repo mandates (`run` → `step` →
+`submit-host-result`), not a hostless one. It uses the compiled LangGraph
+graph with `thread_id=str(workflow_id)`, so a checkpoint always exists; a
+non-terminal `phase` in its printed result is resumable, not abandoned, via
+`hydra step <workflow_id>`. This is nonetheless a real, previously-
+undocumented behaviour change: before the plan phase shipped on, most goals
+reached a terminal phase inside this one call; now a non-trivial goal commonly
+parks at `phase="planning"`. `_cmd_run`'s JSON output makes this explicit —
+`"parked": true` and a `"next_action"` field naming the exact `hydra step
+<workflow_id>` (or `hydra resume <workflow_id> --action ...` when a real
+`pending_hitl` gate is pending instead) — rather than leaving the caller to
+infer it from `phase` alone. See
+`tests/test_run_park_resumability.py::test_default_run_parks_resumably_and_step_picks_it_up`
+for the end-to-end proof that `hydra step` genuinely resumes the parked
+workflow, not merely that the JSON claims it will.
+
+**Replay cannot reproduce a plan.** `hydra replay` reconstructs a source
+workflow's `root_goal`, `selected_squads`, repo-targeting, and budget only —
+never the approved `PLAN` envelope or its materialised `PlanStep` tasks.
+Replaying a source workflow that raised a plan (its `plan_status` advanced
+past `"none"`, at any lifecycle stage) would otherwise silently regenerate a
+different, legacy generic task set and skip the planning leg entirely —
+turning replay's deterministic-reproduction contract silently divergent.
+`_cmd_replay` refuses loudly instead (`status="replay_refused_planned_workflow"`)
+whenever the source checkpoint's `plan_status` is anything other than
+`"none"`/absent; a trivial-rigor source workflow (`plan_status` stayed
+`"none"`) replays exactly as before. Carrying the plan itself through replay
+is future work, not attempted here — see
+`tests/test_replay_hostless_plan_phase.py::test_replay_of_planned_workflow_is_refused`
+for the proof (parametrised over every `plan_status` lifecycle value) and its
+paired mutation test.
+
 Two further properties are worth stating because both are load-bearing and
 neither is obvious:
 

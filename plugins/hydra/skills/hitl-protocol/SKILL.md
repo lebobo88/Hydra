@@ -34,13 +34,16 @@ Operator surfaces:
 
 ## Gate Placement in the Supervisor Graph
 
-LangGraph builds with `interrupt_before=["approval", "synthesis"]`. Additional ad-hoc gates fire from inside `dispatch` when a squad emits a `HITL_REQUEST`.
+LangGraph builds with `interrupt_before=["approval", "hitl_gate_dispatch", "hitl_gate_judge", "synthesis", "judge_synthesis", "plan_gate"]` (`build_supervisor` in `hydra_core/supervisor.py`; `plan_only` additionally interrupts before `"dispatch"`). `hitl_gate_dispatch`/`hitl_gate_judge` are F9's re-entry gates: dispatch/judge surface a resumable HITL there instead of falling straight through to postcheck/halt, and resuming clears the gate and re-enters the originating node. `judge_synthesis` pauses so a synthesis-stage judge verdict is reviewable before postcheck. Additional ad-hoc gates fire from inside `dispatch` when a squad emits a `HITL_REQUEST`.
 
 | Gate | Reason codes |
 |---|---|
 | approval (planning → dispatch) | `budget_approval`, `high_risk`, `acceptance_criteria`, `over_budget`, `policy_breach`, `campaign_signoff` — `high_risk`/`acceptance_criteria` fire here only when the plan gate is NOT active (rigor `trivial`, a checkpoint predating the plan phase, or `HYDRA_PLAN_PHASE=0`); `over_budget` always fires here regardless (§6 stand-down deliberately excludes budget exhaustion) |
 | plan_gate (dispatch → dispatch) | `plan_approval` — the DEFAULT for a high-risk/AC-qualifying workflow now that `HYDRA_PLAN_PHASE` ships on: fires whenever rigor is not `trivial` and the flag is not explicitly disabled with `HYDRA_PLAN_PHASE=0` |
+| hitl_gate_dispatch (dispatch → dispatch) | any `HITL_REQUEST` a squad emits mid-dispatch (`hitl_return_node="dispatch"`); resuming clears the gate and re-enters dispatch |
+| hitl_gate_judge (judge → judge) | any `HITL_REQUEST` a per-squad judge emits (`hitl_return_node="judge_per_squad"`); resuming clears the gate and re-enters judging |
 | synthesis (dispatch → postcheck) | `schema_conflict`, `dissent_unresolved` |
+| judge_synthesis (synthesis → postcheck) | a synthesis-stage cross-vendor judge verdict pending review before postcheck |
 | postcheck (postcheck → done) | `loop_ceiling`, `budget_approval`, `prod_deploy` |
 
 ## Render Format

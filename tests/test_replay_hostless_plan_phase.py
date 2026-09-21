@@ -71,6 +71,31 @@ def hermetic(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _seed_planned_source_workflow(*, plan_status: str = "approved") -> str:
+    """A source checkpoint whose workflow ACTUALLY raised a plan
+    (`plan_status` advanced past "none"). Replaying this must be refused --
+    see test_replay_of_planned_workflow_is_refused below."""
+    from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+    from hydra_core.state import BudgetLedger
+
+    wf = uuid4()
+    state = HydraState(
+        workflow_id=wf,
+        root_goal="replay hostless plan-phase regression: planned workflow",
+        selected_squads=["engineering"],
+        target_repo_id="hydra",
+        budget=BudgetLedger(budget_usd=50.0, spent_usd=0.0),
+        phase="dispatch",
+        plan_status=plan_status,
+        plan_rigor="standard",
+    )
+    sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+    assert not isinstance(sup, _PurePythonRunner), "langgraph required for this test"
+    config = {"configurable": {"thread_id": str(wf)}}
+    sup.update_state(config, state.model_dump(mode="json"), as_node="judge_per_squad")
+    return str(wf)
+
+
 def _seed_source_workflow() -> str:
     """A source checkpoint whose (root_goal, selected_squads, budget) triage
     to NON-TRIVIAL plan_rigor once replayed fresh: budget_usd=50 alone is
@@ -157,3 +182,39 @@ def test_replay_of_nontrivial_goal_does_not_deadlock(hermetic):
         f"engineering task never dispatched; tasks="
         f"{[(t.owner_squad, t.status) for t in replayed.tasks]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-vendor finding (HIGH): replay of a workflow that raised a plan must
+# refuse loudly rather than silently regenerate a different task set.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("plan_status", ["authoring", "drafted", "judged", "approved", "rejected"])
+def test_replay_of_planned_workflow_is_refused(hermetic, plan_status):
+    """Any source workflow whose plan_status advanced past "none" -- at ANY
+    stage of the lifecycle -- is refused, not silently replayed with a
+    regenerated (and therefore divergent) task set."""
+    wf = _seed_planned_source_workflow(plan_status=plan_status)
+
+    rc, payload = _replay(wf, live=False)
+
+    assert rc == 0, payload
+    assert payload.get("ok") is False, payload
+    assert payload.get("status") == "replay_refused_planned_workflow", payload
+    assert payload.get("plan_status") == plan_status, payload
+    assert "replay_workflow_id" not in payload, (
+        "a refused replay must never mint/persist a replay lineage"
+    )
+
+
+def test_replay_of_trivial_workflow_still_works_unchanged(hermetic):
+    """Counterpart: a source workflow whose plan_status stayed "none" (it
+    never raised a plan) is unaffected by the refusal -- replays exactly as
+    test_replay_of_nontrivial_goal_does_not_deadlock already proves."""
+    wf = _seed_source_workflow()  # plan_status defaults to "none"
+
+    rc, payload = _replay(wf, live=False)
+
+    assert rc == 0, payload
+    assert payload.get("status") != "replay_refused_planned_workflow", payload
+    assert "replay_workflow_id" in payload, payload

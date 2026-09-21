@@ -734,11 +734,40 @@ def _cmd_run(args) -> int:
             config={"configurable": {"thread_id": str(workflow_id)}},
         )
         final = HydraState.model_validate(final_state_dict) if isinstance(final_state_dict, dict) else final_state_dict
+    # Cross-vendor judge finding (P5b flip, refuted-with-caveat): a default
+    # `hydra run` (no --live, no --no-checkpoint) is the attended entry
+    # point -- it checkpoints (compiled LangGraph graph, thread_id=
+    # str(workflow_id)), so a non-terminal `phase` here is RESUMABLE, not
+    # abandoned. Before the plan phase shipped on by default, most goals
+    # reached a terminal phase in this single call; now a non-trivial goal
+    # commonly parks at phase="planning" awaiting the attended planning
+    # cursor. That is a real, previously-undocumented behaviour change for
+    # anything scripting against this command's output -- make the next
+    # action explicit rather than inferable from `phase` alone. See
+    # ARCHITECTURE.md §2a and CHANGELOG.md for the declared change, and
+    # test_default_run_parks_resumably_and_step_picks_it_up in
+    # tests/test_run_park_resumability.py for the proof that `hydra step`
+    # genuinely resumes what this prints.
+    _final_phase = getattr(final, "phase", "?")
+    _terminal = _final_phase in ("done", "surfaced")
+    _parked = not _terminal
+    _next_action = None
+    if _parked:
+        if getattr(final, "pending_hitl", None):
+            _next_action = (
+                f"hydra resume {workflow_id} --action approve "
+                "(see pending_hitl.options for the full set of valid actions)"
+            )
+        else:
+            _next_action = f"hydra step {workflow_id}"
     print(_cli_json_dumps({
         "workflow_id": str(workflow_id),
-        "phase": getattr(final, "phase", "?"),
+        "phase": _final_phase,
+        "parked": _parked,
+        "next_action": _next_action,
         "selected_squads": getattr(final, "selected_squads", []),
         "tasks": [{"squad": t.owner_squad, "status": t.status} for t in getattr(final, "tasks", [])],
+        "pending_hitl": getattr(final, "pending_hitl", None),
         "trace": str(trace_path(project, workflow_id)),
     }, indent=2))
     return 0
@@ -5667,6 +5696,42 @@ def _cmd_replay(args) -> int:
             }), file=sys.stderr)
             return 1
         values = dict(snap.values)
+
+    # P5b (cross-vendor finding, HIGH): replay reconstructs only root_goal /
+    # selected_squads / repo-targeting / budget below -- never the approved
+    # PLAN envelope or its materialized PlanStep tasks. A source workflow
+    # that raised a non-trivial plan would silently regenerate legacy
+    # generic tasks and skip the planning leg entirely if replayed anyway --
+    # a deterministic-replay contract turning silently divergent is exactly
+    # the failure mode this whole feature exists to avoid. Refuse loudly
+    # instead. Signal chosen: `plan_status`. It is the ONE field
+    # node_planner / node_plan_judge / node_plan_gate advance together
+    # through the entire lifecycle (authoring -> drafted -> judged ->
+    # approved, or -> rejected), so a value other than "none" (or absent, on
+    # a checkpoint predating the plan phase) already implies both that a
+    # PLAN was authored AND -- once "approved" -- that tasks carry
+    # `plan_step_id`. One signal covers every stage; a trivial-rigor source
+    # workflow (plan_status stays "none") replays exactly as before.
+    _source_plan_status = values.get("plan_status")
+    if _source_plan_status not in (None, "none"):
+        print(_cli_json_dumps({
+            "source_workflow_id": source_wf,
+            "ok": False,
+            "status": "replay_refused_planned_workflow",
+            "plan_status": _source_plan_status,
+            "detail": (
+                f"the source workflow raised a plan (plan_status="
+                f"{_source_plan_status!r}) -- `hydra replay` cannot "
+                "reproduce the planning leg: it reconstructs only "
+                "root_goal/selected_squads/repo-targeting/budget, never the "
+                "approved PLAN envelope or its materialized PlanStep tasks. "
+                "Replaying it anyway would silently regenerate a different "
+                "(legacy generic) task set instead of the plan that "
+                "actually ran. There is no supported way to replay this "
+                "workflow deterministically today."
+            ),
+        }, indent=2))
+        return 0
 
     # Reconstruct state at the requested phase boundary
     current_phase = values.get("phase", "intake")
