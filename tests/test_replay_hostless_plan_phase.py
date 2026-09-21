@@ -218,3 +218,115 @@ def test_replay_of_trivial_workflow_still_works_unchanged(hermetic):
     assert rc == 0, payload
     assert payload.get("status") != "replay_refused_planned_workflow", payload
     assert "replay_workflow_id" in payload, payload
+
+
+# ---------------------------------------------------------------------------
+# Cross-vendor judge finding A (HIGH): the refusal signal was incomplete --
+# `plan_status` alone misses a source workflow whose plan WAS materialized
+# (durable `plan_step_id` tasks exist) but whose `plan_status` reads "none"
+# or is absent on this particular checkpoint snapshot. `_replay_plan_evidence`
+# is the extracted, independently-testable predicate `_cmd_replay` calls;
+# these are unit tests against it directly (no full checkpoint needed) so
+# every edge case is provable without checkpoint-plumbing overhead.
+# ---------------------------------------------------------------------------
+
+def test_plan_step_id_task_alone_triggers_refusal_even_with_plan_status_none():
+    """FINDING A: the exact gap -- plan_status reads "none" (or is entirely
+    missing) but a task carries a durable plan_step_id. This must refuse;
+    plan_status alone would have silently let it through."""
+    from hydra_core.cli import _replay_plan_evidence
+
+    values = {
+        "plan_status": "none",
+        "tasks": [
+            {"owner_squad": "engineering", "plan_step_id": "step-a", "status": "done"},
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is True
+    assert plan_status == "none"
+    assert has_plan_step_task is True
+
+
+def test_plan_status_absent_and_plan_step_id_task_present_still_refuses():
+    """Same gap, but plan_status key is entirely ABSENT (not merely "none") --
+    dict.get returns None, which must not be mistaken for "no evidence"."""
+    from hydra_core.cli import _replay_plan_evidence
+
+    values = {
+        "tasks": [
+            {"owner_squad": "engineering", "plan_step_id": "step-a"},
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is True
+    assert plan_status is None
+    assert has_plan_step_task is True
+
+
+def test_false_refusal_check_trivial_workflow_has_neither_signal():
+    """The other direction, which matters just as much: a genuinely
+    trivial-rigor workflow (plan_status "none", generic synthesised tasks
+    with no plan_step_id) must NOT be refused."""
+    from hydra_core.cli import _replay_plan_evidence
+
+    values = {
+        "plan_status": "none",
+        "tasks": [
+            {"owner_squad": "engineering", "status": "done"},
+            {"owner_squad": "executive", "status": "surfaced", "plan_step_id": None},
+            {"owner_squad": "garland", "status": "pending", "plan_step_id": ""},
+        ],
+    }
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is False
+    assert has_plan_step_task is False
+
+
+def test_edge_case_aborted_before_plan_status_ever_advanced_does_not_refuse():
+    """Coordinator's edge case 1: a workflow aborted/surfaced BEFORE
+    plan_status ever left "none" (no plan was ever raised -- e.g. rejected
+    at the ordinary approval gate, or surfaced during intake, well before
+    node_planner's plan-gate seeding could fire). VERDICT: replays, and that
+    is correct -- there is no planning leg to lose because none was ever
+    raised. `plan_step_id` is set at exactly one call site in the whole
+    engine (node_plan_gate, gated on approval), so it cannot exist here
+    either."""
+    from hydra_core.cli import _replay_plan_evidence
+
+    values = {
+        "phase": "surfaced",
+        "plan_status": "none",
+        "pending_hitl": None,
+        "hitl_history": [{"event": "reject", "reason": "high_risk"}],
+        "tasks": [{"owner_squad": "executive", "status": "surfaced"}],
+    }
+    should_refuse, _plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is False, (
+        "an abort/surface before any plan was raised must not be refused"
+    )
+    assert has_plan_step_task is False
+
+
+def test_edge_case_legacy_checkpoint_missing_plan_status_key_does_not_refuse():
+    """Coordinator's edge case 2: a LEGACY pre-plan-phase checkpoint where
+    the `plan_status` key never existed at all (predates the field's
+    introduction). VERDICT: replays, and that is correct -- the concept did
+    not exist yet, so there is nothing to lose fidelity on. `values` here
+    deliberately carries no "plan_status" key whatsoever, only the fields a
+    real pre-P5a checkpoint would have had."""
+    from hydra_core.cli import _replay_plan_evidence
+
+    values = {
+        "phase": "done",
+        "root_goal": "legacy pre-plan-phase workflow",
+        "selected_squads": ["engineering"],
+        "tasks": [{"owner_squad": "engineering", "status": "done"}],
+    }
+    assert "plan_status" not in values
+    should_refuse, plan_status, has_plan_step_task = _replay_plan_evidence(values)
+    assert should_refuse is False, (
+        "a legacy checkpoint predating plan_status must not be refused"
+    )
+    assert plan_status is None
+    assert has_plan_step_task is False

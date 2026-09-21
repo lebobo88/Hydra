@@ -101,10 +101,13 @@ def test_default_run_parks_resumably_and_step_picks_it_up(hermetic):
     wf = payload["workflow_id"]
     assert payload["next_action"] == f"hydra step {wf}", payload
 
-    # Resumability, proven: `hydra step` on the SAME workflow_id must find
-    # the checkpoint and make progress -- not "not_found" (which would mean
-    # the printed workflow_id and the checkpoint disagree) and not the
-    # generic langgraph-unavailable refusal.
+    # Resumability, proven POSITIVELY -- not merely "no error string
+    # appeared" (a MEDIUM cross-vendor finding on an earlier draft of this
+    # test: absence of two error substrings would pass for many non-
+    # resuming responses too). `hydra step` on the SAME workflow_id must
+    # actually open the parked planning task's attended cursor: rc == 0, a
+    # real `host_action` is present, its agent is the plan-author, and the
+    # cursor is opened against the EXACT workflow_id `hydra run` printed.
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         step_rc = cli.main(["--project", str(HYDRA_ROOT), "step", wf])
@@ -112,5 +115,21 @@ def test_default_run_parks_resumably_and_step_picks_it_up(hermetic):
     start = step_out.index("{")
     step_payload = json.loads(step_out[start:])
 
-    assert step_payload.get("error") != "not_found", step_payload
+    assert step_rc == 0, step_payload
+    assert step_payload.get("ok") is True, step_payload
+    assert step_payload.get("workflow_id") == wf, (
+        f"hydra step opened a DIFFERENT workflow than the one hydra run "
+        f"printed; step targeted {step_payload.get('workflow_id')!r}, "
+        f"expected {wf!r}: {step_payload}"
+    )
+    host_action = step_payload.get("host_action")
+    assert isinstance(host_action, dict) and host_action, (
+        f"hydra step must open a real host_action for the parked planning "
+        f"task, not merely avoid an error string: {step_payload}"
+    )
+    assert host_action.get("agent_type") == "hydra:plan-author", (
+        f"the parked task is the seeded 'planning' task -- its host_action "
+        f"must name the plan-author agent, not something else: {host_action}"
+    )
+    assert step_payload.get("squad_slug") == "planning", step_payload
     assert "langgraph unavailable" not in json.dumps(step_payload), step_payload

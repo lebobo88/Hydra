@@ -5493,6 +5493,50 @@ _KNOWN_PHASES = frozenset([
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_./:]{0,127}$")
 
 
+def _replay_plan_evidence(values: dict) -> tuple[bool, str | None, bool]:
+    """Whether a source checkpoint's raw channel `values` carry evidence a
+    plan was raised -- `hydra replay` cannot reproduce the planning leg (see
+    `_cmd_replay`'s refusal below), so this is the ONE place that decides it.
+
+    Returns ``(should_refuse, plan_status, has_plan_step_task)``.
+
+    TWO independent signals, because neither alone covers every lifecycle
+    stage:
+
+    1. ``plan_status`` not in (None, "none") -- the field node_planner /
+       node_plan_judge / node_plan_gate advance together through
+       authoring -> drafted -> judged -> approved (or -> rejected). This is
+       absent (``None``) on a checkpoint written before the plan phase
+       existed at all -- treated identically to "none", not as evidence:
+       there is nothing to lose fidelity on because the concept did not
+       exist yet.
+    2. any task carrying a non-empty ``plan_step_id`` -- set ONLY by
+       ``node_plan_gate`` materialising a PlanStep on approval, so its
+       presence is durable, permanent evidence a plan was approved and
+       dispatched from, REGARDLESS of what ``plan_status`` reads on this
+       particular snapshot (e.g. a later, unrelated abort/surface path that
+       does not itself touch ``plan_status``). ``state.tasks`` is
+       append-only, so once a ``plan_step_id`` task exists it is never
+       removed.
+
+    A trivial-rigor workflow triggers NEITHER signal: ``plan_status`` never
+    leaves "none" and node_planner's own synthesised tasks never set
+    ``plan_step_id`` (verified: it is written at exactly one call site in
+    the whole engine, inside ``node_plan_gate``) -- so it is never falsely
+    refused. A workflow aborted/surfaced BEFORE ``plan_status`` ever left
+    "none" (no plan was ever raised) is likewise correctly NOT refused --
+    there is no planning leg to lose.
+    """
+    plan_status = values.get("plan_status")
+    tasks = values.get("tasks") or []
+    has_plan_step_task = any(
+        isinstance(t, dict) and t.get("plan_step_id")
+        for t in tasks
+    )
+    plan_status_signal = plan_status not in (None, "none")
+    return (plan_status_signal or has_plan_step_task, plan_status, has_plan_step_task)
+
+
 def _cmd_replay(args) -> int:
     """Replay a past workflow from its LangGraph checkpoint.
 
@@ -5704,27 +5748,23 @@ def _cmd_replay(args) -> int:
     # generic tasks and skip the planning leg entirely if replayed anyway --
     # a deterministic-replay contract turning silently divergent is exactly
     # the failure mode this whole feature exists to avoid. Refuse loudly
-    # instead. Signal chosen: `plan_status`. It is the ONE field
-    # node_planner / node_plan_judge / node_plan_gate advance together
-    # through the entire lifecycle (authoring -> drafted -> judged ->
-    # approved, or -> rejected), so a value other than "none" (or absent, on
-    # a checkpoint predating the plan phase) already implies both that a
-    # PLAN was authored AND -- once "approved" -- that tasks carry
-    # `plan_step_id`. One signal covers every stage; a trivial-rigor source
-    # workflow (plan_status stays "none") replays exactly as before.
-    _source_plan_status = values.get("plan_status")
-    if _source_plan_status not in (None, "none"):
+    # instead. See `_replay_plan_evidence`'s docstring for the two
+    # independent signals and why each edge case does or does not refuse.
+    _should_refuse, _source_plan_status, _has_plan_step_task = _replay_plan_evidence(values)
+    if _should_refuse:
         print(_cli_json_dumps({
             "source_workflow_id": source_wf,
             "ok": False,
             "status": "replay_refused_planned_workflow",
             "plan_status": _source_plan_status,
+            "has_plan_step_task": _has_plan_step_task,
             "detail": (
                 f"the source workflow raised a plan (plan_status="
-                f"{_source_plan_status!r}) -- `hydra replay` cannot "
-                "reproduce the planning leg: it reconstructs only "
-                "root_goal/selected_squads/repo-targeting/budget, never the "
-                "approved PLAN envelope or its materialized PlanStep tasks. "
+                f"{_source_plan_status!r}, plan_step_id tasks present="
+                f"{_has_plan_step_task}) -- `hydra replay` cannot reproduce "
+                "the planning leg: it reconstructs only root_goal/"
+                "selected_squads/repo-targeting/budget, never the approved "
+                "PLAN envelope or its materialized PlanStep tasks. "
                 "Replaying it anyway would silently regenerate a different "
                 "(legacy generic) task set instead of the plan that "
                 "actually ran. There is no supported way to replay this "
