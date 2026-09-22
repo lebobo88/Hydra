@@ -3022,6 +3022,7 @@ def begin_squad_stage(
     priority: str | None = None,
     acceptance_criteria: Sequence[str] | None = None,
     action_extras: dict[str, Any] | None = None,
+    attempt: int = 0,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -3037,8 +3038,15 @@ def begin_squad_stage(
     E2-28: ``host_action.prompt`` is the full context-bearing prompt built by
     ``_build_squad_prompt``; the bare planner task label stays available as
     ``host_action.task_description``.
+
+    Hydra#69 defect C: ``attempt`` (default 0, unchanged for every existing
+    caller) is folded into ``call_key`` so a re-issued cursor for the SAME
+    task_id (e.g. a ``planning`` task whose PLAN was rejected and the task
+    stays open) never reuses the prior attempt's call_key -- a late/duplicate
+    submit under the stale key is refused by `submit_host_result`'s call_key
+    match instead of silently matching the new cursor.
     """
-    call_key = f"squad-{task_id}-0"
+    call_key = f"squad-{task_id}-{int(attempt)}"
     prompt = _build_squad_prompt(
         workflow_id=workflow_id,
         task_id=task_id,
@@ -3070,6 +3078,7 @@ def begin_squad_stage(
         "final_status": None,
         "error": None,
         "finalized": False,
+        "attempt": int(attempt),
         "pending_action": {
             "call_key": call_key,
             "agent_type": lead_agent,
@@ -3649,6 +3658,18 @@ def submit_host_result(
         # Duplicate / out-of-order submit — do not re-apply (exactly-once).
         out = _step_result(cursor, cursor_file)
         out["ignored"] = f"call_key {call_key!r} != expected {expected_key!r}"
+        # Hydra#69 defect C: a squad cursor's call_key carries the attempt
+        # number (``squad-{task_id}-{attempt}``, see begin_squad_stage). A
+        # mismatch on a squad-shaped call_key is very likely a stale
+        # response from an EARLIER (rejected) attempt racing a freshly
+        # re-issued cursor -- flag it structurally so a caller can
+        # distinguish "stale attempt" from any other call_key mismatch
+        # instead of parsing the free-text `ignored` string.
+        if (isinstance(call_key, str) and isinstance(expected_key, str)
+                and call_key.rsplit("-", 1)[:-1] == expected_key.rsplit("-", 1)[:-1]
+                and call_key != expected_key):
+            out["stale_attempt"] = True
+            out["error_code"] = "stale_attempt"
         return out
 
     if state == "await_generate":

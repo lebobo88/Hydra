@@ -627,10 +627,76 @@ def dispatch_ingested_envelopes(
                 _emit("ingest.plan_phase_disabled", {"envelope_id": eid, "type": etype})
                 continue
 
+            plan_env = env  # SCHEMA_REGISTRY["PLAN"] -> Plan; already validated
+
+            # Hydra#69 defect G: `validate_envelope` only proves the PLAN is a
+            # well-FORMED envelope -- it says nothing about whether this PLAN
+            # is the one the engine is actually waiting for. Before this
+            # check, `plan_patch["plan_revision"]` below adopted whatever
+            # revision the submitted envelope carried AS-IS, so a resubmit
+            # with the schema default (`plan_revision=1`, `Plan` field
+            # default) could roll `state.plan_revision` BACKWARD over an
+            # already-advanced modify-plan revision, or a PLAN authored for a
+            # DIFFERENT workflow could be adopted here by workflow_id
+            # accident.
+            #
+            # Expected revision rule: `node_planner`'s FIRST authoring pass
+            # never touches `state.plan_revision` (it stays at the model
+            # default, 0) while `plan_status` becomes "authoring" -- so a
+            # first draft expects revision 1. `--modify-plan` (cli.py) bumps
+            # `state.plan_revision` to the NEW revision it is about to author
+            # BEFORE re-entering the graph (`_reenter_graph_after_dispatch`
+            # applies `{"plan_revision": _modify_plan_new_revision, ...}`
+            # atomically with `plan_status="authoring"`), so by the time a
+            # revised PLAN reaches this branch `state.plan_revision` already
+            # names the exact revision being authored. One rule covers both:
+            # `state.plan_revision` when non-zero (revised authoring),
+            # else 1 (first draft, the 0 default never having been advanced).
+            _expected_revision = state.plan_revision if state.plan_revision else 1
+            _plan_validation_errors: list[dict[str, Any]] = []
+            if str(plan_env.workflow_id) != str(state.workflow_id):
+                _plan_validation_errors.append({
+                    "field": "workflow_id",
+                    "msg": (f"PLAN workflow_id {str(plan_env.workflow_id)!r} does not "
+                            f"match this workflow ({str(state.workflow_id)!r})"),
+                })
+            if plan_env.plan_revision != _expected_revision:
+                _plan_validation_errors.append({
+                    "field": "plan_revision",
+                    "msg": (f"PLAN plan_revision {plan_env.plan_revision!r} does not "
+                            f"match the expected revision {_expected_revision!r} for "
+                            "the revision currently being authored "
+                            f"(state.plan_revision={state.plan_revision!r})"),
+                })
+            elif _expected_revision > 1:
+                # Only meaningful once we know the revision itself is right —
+                # a revision-mismatched PLAN already fails above without a
+                # confusing second "supersedes" complaint layered on top.
+                _expected_supersedes = (
+                    str(state.plan_envelope_id) if state.plan_envelope_id else None)
+                _submitted_supersedes = (
+                    str(plan_env.supersedes) if plan_env.supersedes else None)
+                if _submitted_supersedes != _expected_supersedes:
+                    _plan_validation_errors.append({
+                        "field": "supersedes",
+                        "msg": (f"PLAN supersedes {_submitted_supersedes!r} does not "
+                                f"name the prior plan envelope "
+                                f"({_expected_supersedes!r})"),
+                    })
+            if _plan_validation_errors:
+                _detail = ("PLAN rejected: state validation failed ("
+                           + "; ".join(e["msg"] for e in _plan_validation_errors) + ")")
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="failed", detail=_detail, errors=_plan_validation_errors,
+                ))
+                _emit("ingest.plan_state_mismatch", {
+                    "envelope_id": eid, "errors": _plan_validation_errors,
+                })
+                continue
+
             from .artifact_store import ArtifactStoreError, write_repo_artifact
             from .plan_artifact import plan_slug, render_plan_html
-
-            plan_env = env  # SCHEMA_REGISTRY["PLAN"] -> Plan; already validated
             repo_root = getattr(dispatcher, "project_root", None)
             try:
                 if repo_root is None:
