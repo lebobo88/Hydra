@@ -56,9 +56,9 @@ from .state import (
     PoisonedStateError,
     TaskState,
     plan_barrier_active,
-    plan_deps_satisfied,
     plan_max_revisions,
     plan_revision_ceiling_reached,
+    task_eligible_for_dispatch,
 )
 from .telemetry import emit, trace_path
 
@@ -2348,6 +2348,18 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 budget.model_dump(mode="json") if hasattr(budget, "model_dump") else {})
             b["budget_usd"] = new_budget_usd
             patch["budget"] = b
+            # Hydra#69 defect A part 3: modify-budget at plan_gate must NOT
+            # clear the gate -- the plan itself still needs a genuine
+            # approve. Without this, `patch["pending_hitl"] = None` (set
+            # unconditionally above) would clear the gate; under
+            # `--gate-only` that leaves plan_status="judged" (a barrier
+            # state) with no pending_hitl and nothing selectable -- the same
+            # wedge as an un-materialised approve. Re-file the SAME HITL
+            # request so a subsequent `hydra attended step` still reports
+            # `awaiting_plan_approval` instead of falling through to the
+            # wedge terminal.
+            if resolution.get("gate_node") == "plan_gate":
+                patch["pending_hitl"] = dict(pending) if isinstance(pending, dict) else pending
         except (TypeError, ValueError) as e:
             detail = str(e) if "finite number" in str(e) else (
                 f"modify-budget needs a numeric --option, got {option!r}"
@@ -2503,6 +2515,13 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # plan_gate for exactly that reason. Still scoped here too, so a
             # force-dispatch past a DIFFERENT gate never touches plan_status.
             patch["plan_status"] = "bypassed"
+            # Hydra#69 defect B/H: explicit no-op write -- a force-dispatch
+            # bypass must not supersede the whole-goal placeholder task(s);
+            # they are exactly what "dispatch proceeded without plan
+            # approval" means the workflow still runs. Explicit (not an
+            # omitted key) so a PRIOR approve/supersede on an earlier
+            # revision can never leak through as a stale value here.
+            patch["plan_superseded_task_ids"] = []
             _bypass_note = {
                 "event": "plan_gate_bypassed",
                 "workflow_id": wf,
@@ -2516,7 +2535,57 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 f"resolved_at={resolution['resolved_at']})",
             )
 
-    sup.update_state(config, patch)
+    # Hydra#69 defect A (primary): under `--gate-only`, this function returns
+    # (below) WITHOUT ever calling `sup.invoke` -- so `node_plan_gate` (which
+    # only runs when the graph is actually re-entered) never materialises the
+    # approved plan's PlanSteps into TaskStates, and `plan_status` stays
+    # "judged" (a barrier state) forever. Compute the SAME patch
+    # `materialise_plan_steps` (supervisor.py) produces and fold it into
+    # THIS SAME `sup.update_state` call below -- gate-clear and
+    # materialisation land in ONE atomic checkpoint write, under the resume
+    # lock already held by `_cmd_resume`, so there is no crash window
+    # between "gate cleared" and "tasks materialised". This runs on BOTH the
+    # gate_only and non-gate_only route: the non-gate_only route still calls
+    # `sup.invoke` further down, which re-runs `node_plan_gate` -- but that
+    # function (and this one) are idempotent per-step (existing_by_step_id
+    # already covers every task this call just created), so materialising
+    # here AND letting the graph materialise again is safe, not a double-run.
+    _plan_materialised_task_ids: list[str] = []
+    if action == "approve" and resolution.get("gate_node") == "plan_gate":
+        from .supervisor import materialise_plan_steps
+        _pre_state = HydraState.model_validate(values)
+        _materialised_patch = materialise_plan_steps(_pre_state)
+        patch.update(_materialised_patch)
+        _plan_materialised_task_ids = [
+            str(t.task_id) for t in (_materialised_patch.get("tasks") or [])
+        ]
+        # Stamp provenance onto the resolution record BEFORE it's persisted
+        # -- `patch["hitl_history"]` already references this SAME dict, so
+        # mutating it here mutates what gets written to the checkpoint.
+        resolution["plan_envelope_id"] = (
+            str(values.get("plan_envelope_id")) if values.get("plan_envelope_id") else None
+        )
+        resolution["plan_revision"] = values.get("plan_revision")
+
+    if gate_only and action == "approve" and resolution.get("gate_node") == "plan_gate":
+        # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
+        # the generic (node-context-less) write below. `postcheck`'s only
+        # outgoing edge is `after_postcheck` -> END unconditionally, so this
+        # forces the checkpoint's `next` to `()` -- no later `sup.invoke`
+        # (a different gate's resume, a replay, an operator mistake) can
+        # ever pick up `plan_gate`'s static `add_edge("plan_gate",
+        # "dispatch")` and run `node_dispatch` headlessly out from under the
+        # attended host's own step/submit cursor. Asserted, not just hoped:
+        # a future graph-wiring change that breaks this invariant must fail
+        # loudly here, not silently reopen the headless-dispatch hole.
+        sup.update_state(config, patch, as_node="postcheck")
+        _plan_gate_next = tuple(getattr(sup.get_state(config), "next", None) or ())
+        assert _plan_gate_next == (), (
+            "plan_gate gate-only approve must leave next==() so no later "
+            f"invoke can run dispatch headless; got {_plan_gate_next!r}"
+        )
+    else:
+        sup.update_state(config, patch)
 
     # C3: prevent a later spool replay from filing a ticket for this
     # now-resolved gate (late-spool orphan reconciliation, gate-identity-keyed).
@@ -2698,6 +2767,12 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         _post_snap = sup.get_state(config)
         _post_values = _post_snap.values if _post_snap is not None and _post_snap.values else {}
         _post_phase = _post_values.get("phase", values.get("phase"))
+        _plan_out: dict = {}
+        if resolution.get("gate_node") == "plan_gate":
+            # Hydra#69 defect A: surface the materialisation outcome
+            # directly, not just the generic phase/pending_hitl fields.
+            _plan_out["plan_status"] = _post_values.get("plan_status")
+            _plan_out["materialised_task_ids"] = _plan_materialised_task_ids
         print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,
@@ -2710,6 +2785,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "gate_node": resolution.get("gate_node"),
             "pending_hitl": _post_values.get("pending_hitl"),
             **_eights_resolution_fields(gate_only, _eights_gate_only),
+            **_plan_out,
             "note": (
                 "gate resolved without re-entering the graph — call "
                 "hydra.workflow.step to continue"
@@ -2721,6 +2797,12 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     phase = final_dict.get("phase") if isinstance(final_dict, dict) else getattr(final_dict, "phase", "?")
     _resulting_pending = (final_dict.get("pending_hitl")
                           if isinstance(final_dict, dict) else None)
+    _plan_out2: dict = {}
+    if resolution.get("gate_node") == "plan_gate":
+        _final_plan_status = (final_dict.get("plan_status")
+                              if isinstance(final_dict, dict) else None)
+        _plan_out2["plan_status"] = _final_plan_status
+        _plan_out2["materialised_task_ids"] = _plan_materialised_task_ids
     print(_cli_json_dumps({
         "workflow_id": wf,
         "ok": True,
@@ -2731,6 +2813,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "gate_node": resolution.get("gate_node"),
         "pending_hitl": _resulting_pending,
         "trace": str(trace_path(project, wf)),
+        **_plan_out2,
     }, indent=2))
     return 0
 
@@ -3062,19 +3145,22 @@ def _next_attended_task(state: HydraState, packs: dict):
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
-        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
-            continue
         if barrier and t.owner_squad != "planning":
             continue
-        # Deliberately unconditional (NOT `if barrier and not
-        # plan_deps_satisfied(...)`): approval sets plan_status="approved",
-        # which is intentionally not a barrier state, so a barrier-conditional
-        # check would stop honoring an approved plan's step dependencies the
-        # instant the plan was approved -- destroying the DAG ordering this
-        # feature exists to provide. Do not "fix" this into a barrier-gated
-        # check; empty `depends_on` (today's default for every task) always
-        # satisfies, so this stays a no-op until a planner populates it.
-        if not plan_deps_satisfied(state, t):
+        # Hydra#69 defect F: one shared predicate — stale-revision,
+        # explicitly-superseded (the revision-0 whole-goal placeholder case
+        # a stale-revision-only check missed), and unmet
+        # plan_deps_satisfied. Deliberately unconditional on `barrier` (NOT
+        # `if barrier and not task_eligible_for_dispatch(...)`): approval
+        # sets plan_status="approved", which is intentionally not a barrier
+        # state, so a barrier-conditional check would stop honoring an
+        # approved plan's step dependencies (and supersession) the instant
+        # the plan was approved -- destroying the DAG ordering this feature
+        # exists to provide. Do not "fix" this into a barrier-gated check;
+        # empty `depends_on` and an empty `plan_superseded_task_ids` (today's
+        # defaults) always satisfy, so this stays a no-op until a planner
+        # populates them.
+        if not task_eligible_for_dispatch(state, t):
             continue
         if t.owner_squad == "engineering":
             return t, "engineering", None
@@ -3092,19 +3178,27 @@ def _attended_task_gate_type(task, state: HydraState) -> str | None:
     (PRD/ARCH_RFC/DEV_TASK/HANDOFF via ``squad_node._gate_type_for_envelope``)
     rather than a hardcoded literal.
 
-    ``TaskState`` itself carries no envelope type, only ``envelope_id``; the
-    triggering envelope's raw dict (with its real ``type``) lives in
-    ``state.envelopes``. Returns ``None`` (falls through to host_bridge's
-    documented code_style DEFAULT) when the task has no envelope_id or no
-    matching envelope is found — e.g. a planner-synthesised default task with
-    no originating PRD/ARCH_RFC/DEV_TASK envelope.
+    Hydra#69 defect E: a task materialised from a ``PlanStep`` by
+    ``materialise_plan_steps`` has no ``envelope_id`` at all (it was never
+    triggered by an envelope — it came from a ``Plan``), so this function
+    used to always fall through to ``None`` for every plan-step task; the
+    step's own ``envelope_type`` (now copied onto ``TaskState.envelope_type``)
+    is checked FIRST. Only when that is absent does this fall back to the
+    older behaviour: scanning ``state.envelopes`` for the triggering
+    envelope's raw dict (with its real ``type``) by ``task.envelope_id``.
+    Returns ``None`` (falls through to host_bridge's documented code_style
+    DEFAULT) when neither is available — e.g. a planner-synthesised default
+    task with no originating PRD/ARCH_RFC/DEV_TASK envelope or PlanStep.
     """
+    from .squad_node import _gate_type_for_envelope
+    _task_env_type = getattr(task, "envelope_type", None)
+    if _task_env_type:
+        return _gate_type_for_envelope(_task_env_type)
     eid = str(getattr(task, "envelope_id", "") or "")
     if not eid:
         return None
     for env in getattr(state, "envelopes", None) or []:
         if isinstance(env, dict) and str(env.get("id") or "") == eid:
-            from .squad_node import _gate_type_for_envelope
             return _gate_type_for_envelope(env.get("type"))
     return None
 
@@ -3233,17 +3327,22 @@ def _next_stub_attended_task(state: HydraState, packs: dict):
     planning task — this selector is consulted BEFORE ``_next_attended_task``
     in ``_cmd_attended_step``, so without this guard a pre-seeded stub task
     ordered ahead of the planning task would be driven regardless of
-    ``plan_status``. A stale-revision stub task (superseded by a replan) is
-    also skipped. Both are no-ops while ``plan_status == "none"``.
+    ``plan_status``. Both are no-ops while ``plan_status == "none"``.
+
+    Hydra#69 defect F: also honours ``task_eligible_for_dispatch`` (stale
+    revision, explicit supersession, AND unmet ``depends_on``) — the
+    previous version only checked stale revision, so a stub task whose
+    ``depends_on`` was not yet satisfied could jump ahead of an unfinished
+    upstream dependency.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
     barrier = plan_barrier_active(state)
     for t in getattr(state, "tasks", []):
         if str(t.task_id) in done:
             continue
-        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
-            continue
         if barrier and t.owner_squad != "planning":
+            continue
+        if not task_eligible_for_dispatch(state, t):
             continue
         pack = packs.get(t.owner_squad)
         if pack is not None and getattr(pack, "entrypoint", None) == "stub":
@@ -3447,6 +3546,17 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
     superseded plan's step tasks would sit "pending" forever and block
     finalize (``tasks_pending``) even though no selector will ever dispatch
     them again. No-op while nothing sets a non-zero ``plan_revision``.
+
+    Hydra#69 defect B/F: a task whose id is in ``plan_superseded_task_ids``
+    (the revision-0 whole-goal placeholder case a stale-revision-only check
+    missed) is excluded the same way — via ``task_eligible_for_dispatch``.
+    A task excluded only because ``plan_deps_satisfied`` is False stays safe
+    to drop here too: its unmet dependency is itself either done (in which
+    case it is not in this list any more) or itself still "pending" (in
+    which case IT keeps finalize blocked) — a dangling dependency on no
+    task at all cannot occur (``Plan._validate_dag`` rejects it at
+    construction), so at least one task in an unresolved dependency chain
+    always stays in this list.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
     pending: list[str] = []
@@ -3456,7 +3566,7 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
             continue
         if t.status in ("done", "failed", "cancelled"):
             continue
-        if getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision:
+        if not task_eligible_for_dispatch(state, t):
             continue
         pending.append(tid)
     return pending
@@ -3690,6 +3800,19 @@ def _cmd_attended_step(args) -> int:
                 }, indent=2), file=sys.stderr)
                 return 1
             request_text = task.description or state.root_goal
+            # Hydra#69 defect E: a task materialised from a PlanStep carries
+            # the step's acceptance criteria (materialise_plan_steps in
+            # supervisor.py) — fold it into the request text the attended
+            # engineer subagent actually reads. Previously the AC lived only
+            # on TaskState.acceptance_criteria, which no code ever surfaced
+            # into the request an engineer sees.
+            _task_ac = [c for c in (getattr(task, "acceptance_criteria", None) or [])
+                        if isinstance(c, str) and c.strip()]
+            if _task_ac:
+                request_text = (
+                    f"{request_text}\n\nAcceptance criteria:\n"
+                    + "\n".join(f"- {c}" for c in _task_ac)
+                )
 
             # F27: preflight — verify ALL THREE agent files exist before
             # staging host_actions that reference them.  If any is absent,
@@ -3891,16 +4014,57 @@ def _cmd_attended_step(args) -> int:
                               "workflow_id": wf}, indent=2, default=str))
             return 0
 
+        # Hydra#69 defect A part 4: plan_approved_not_materialised /
+        # plan_gate_unresolved — the plan barrier is active, no gate is
+        # pending (checked above), and neither the engineering/squad
+        # selector nor the stub selector found anything to drive (both ran
+        # above without returning). Two ways this happens:
+        #   * The gate WAS approved this revision (hitl_history carries an
+        #     approve at plan_gate for state.plan_revision) but the approval
+        #     never materialised the plan's TaskStates — the exact
+        #     --gate-only wedge this issue fixes for the *normal* path, kept
+        #     here as a loud diagnostic for any surviving edge case rather
+        #     than silently falling through to a misleading
+        #     ready_to_finalize/tasks_pending loop.
+        #   * The gate was never approved at all for this revision (e.g. a
+        #     checkpoint hand-edited or replayed into "judged" with no
+        #     pending_hitl) — genuinely unresolved, not a materialisation bug.
+        # No automatic repair either way — the operator must act.
+        if plan_barrier_active(state):
+            _approved_this_revision = any(
+                isinstance(h, dict)
+                and h.get("resolution") == "approve"
+                and h.get("gate_node") == "plan_gate"
+                and h.get("plan_revision") == state.plan_revision
+                for h in (getattr(state, "hitl_history", []) or [])
+            )
+            _wedge_status = (
+                "plan_approved_not_materialised" if _approved_this_revision
+                else "plan_gate_unresolved"
+            )
+            print(_cli_json_dumps({"ok": False, "status": _wedge_status,
+                              "plan_revision": state.plan_revision,
+                              "workflow_id": wf}, indent=2, default=str))
+            return 0
+
         # P1: blocked_on_failed_dependency — at least one not-done task has
         # unsatisfied dependencies and nothing else is selectable. Without
         # this distinct terminal, the host would see ready_to_finalize, call
         # finalize, get tasks_pending back, and silently drop half a plan.
         # No-op unless a task carries a depends_on that never resolves.
+        #
+        # Hydra#69 defect F: a task that is stale-revision/superseded is
+        # excluded from this candidate set BEFORE the eligibility check —
+        # such a task is permanently resolved (never dispatches again), not
+        # "blocked"; only an unmet `depends_on` counts as blocked here.
+        _superseded_ids = set(getattr(state, "plan_superseded_task_ids", None) or [])
         _blocked_deps = [
             str(t.task_id) for t in getattr(state, "tasks", [])
             if getattr(t, "status", None) not in ("done", "failed", "cancelled")
             and str(t.task_id) not in set(getattr(state, "attended_completed_task_ids", []) or [])
-            and not plan_deps_satisfied(state, t)
+            and str(t.task_id) not in _superseded_ids
+            and not (getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision)
+            and not task_eligible_for_dispatch(state, t)
         ]
         if _blocked_deps:
             print(_cli_json_dumps({"ok": True, "status": "blocked_on_failed_dependency",

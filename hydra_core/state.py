@@ -193,6 +193,16 @@ class TaskState(BaseModel):
     # existing checkpoint loads fine with both None.
     plan_critique: Optional[str] = None
     supersedes_plan_envelope_id: Optional[str] = None
+    # Hydra#69 defect E: the PlanStep's own `envelope_type` (PRD/ARCH_RFC/
+    # DEV_TASK/...), copied onto the materialised TaskState so
+    # `_attended_task_gate_type` / the attended engineering `start_run` call
+    # (hydra_core.cli, `_start_run_args["hydra_envelope_type"]`) can see the
+    # real gate type instead of always reading `getattr(task,
+    # "envelope_type", None)` as None -- the field never existed on TaskState
+    # before this, so that getattr's default was the only value ever
+    # produced. None for tasks that predate planning or were not
+    # materialised from a PlanStep.
+    envelope_type: Optional[str] = None
 
 
 class HydraState(BaseModel):
@@ -397,6 +407,28 @@ class HydraState(BaseModel):
     plan_revision: int = 0
     plan_approved_at: Optional[datetime] = None
     plan_artifact_location: Optional[str] = None
+    # Hydra#69 defect B: task_ids of the whole-goal TaskStates `node_planner`
+    # synthesises in the SAME pass it seeds the "planning" task (while the
+    # plan gate is active). These placeholders exist only so a plan-active
+    # workflow still has *a* task per selected squad on record; once the
+    # plan is approved, `materialise_plan_steps` supersedes them with the
+    # plan's real per-step tasks. Replace-by-default (not `_append`): a
+    # revision bump does not create new placeholders, so this stays the
+    # ids from the FIRST planner pass for the life of the workflow. Explicit
+    # write on every `node_planner` pass (including `[]` when the plan gate
+    # is not active) — see the LangGraph LastValue-clear note above.
+    plan_placeholder_task_ids: list[str] = Field(default_factory=list)
+    # Hydra#69 defect B: task_ids the plan's approval superseded (today,
+    # always a copy of `plan_placeholder_task_ids` at the moment
+    # `materialise_plan_steps` approves the plan). Replace-by-default so a
+    # later revision (or a defensive re-write) can update it without
+    # duplicating. `task_eligible_for_dispatch` below excludes any task_id
+    # in this set from ever being selected/dispatched again — this is what
+    # stops the whole-goal placeholder task (materialised at
+    # `plan_revision=0`, which the OLDER stale-revision-only filter did not
+    # catch because 0 is falsy) from dispatching after the plan's real step
+    # tasks take over.
+    plan_superseded_task_ids: list[str] = Field(default_factory=list)
 
     def bump_iteration(self) -> None:
         self.iteration_count += 1
@@ -548,6 +580,45 @@ def plan_deps_satisfied(state, task) -> bool:
             continue
         return False
     return True
+
+
+def task_eligible_for_dispatch(state, task) -> bool:
+    """Hydra#69 defect F: the ONE dispatch-eligibility predicate, used by
+    every reader that decides whether a task may still be selected/
+    dispatched: ``_next_attended_task``, ``_next_stub_attended_task``,
+    ``_attended_pending_task_ids``, the ``_blocked_deps`` list in
+    ``hydra_core.cli``'s attended ``step``, ``node_dispatch``'s sequential
+    loop, and the fleet candidate list (all in ``supervisor.py`` /
+    ``cli.py``). A prior generation of this logic was hand-duplicated at
+    each call site as ``getattr(t, "plan_revision", 0) and t.plan_revision
+    != state.plan_revision`` — a stale-revision-only check that silently
+    exempted ``plan_revision == 0`` (the ``TaskState`` default, and what
+    every pre-plan-phase whole-goal placeholder task carries) from ever
+    being excluded. Combines three independent reasons a task is not
+    eligible:
+
+    1. Explicitly superseded — its id is in ``state.plan_superseded_task_ids``
+       (set by ``materialise_plan_steps`` on plan approval; covers the
+       revision-0 placeholder case the old check missed).
+    2. Stale revision — it carries a non-zero ``plan_revision`` that does not
+       match the current ``state.plan_revision`` (a step task from a
+       superseded plan revision).
+    3. Blocked on an unmet dependency — ``plan_deps_satisfied`` is False.
+
+    A task excluded here is not necessarily "done" or "failed"; it may
+    simply not be selectable *yet* (case 3) or *ever again* (cases 1-2).
+    Callers that need to distinguish "still pending, but blocked" from
+    "resolved, stop counting it at all" read ``plan_deps_satisfied``
+    directly instead — see ``_attended_pending_task_ids``'s docstring.
+    """
+    tid = str(getattr(task, "task_id", ""))
+    superseded = set(getattr(state, "plan_superseded_task_ids", None) or [])
+    if tid in superseded:
+        return False
+    plan_rev = getattr(task, "plan_revision", 0)
+    if plan_rev and plan_rev != getattr(state, "plan_revision", 0):
+        return False
+    return plan_deps_satisfied(state, task)
 
 
 class PoisonedStateError(Exception):
