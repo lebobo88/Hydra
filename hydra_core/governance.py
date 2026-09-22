@@ -299,6 +299,14 @@ def enforce_governance(
             surfaced=True,
             reason=f"over budget (${state.budget.spent_usd:.2f} > ${state.budget.budget_usd:.2f})",
         )
+    # Hydra#69 defect F review: a superseded/stale-revision task (e.g. the
+    # whole-goal placeholder `materialise_plan_steps` supersedes on plan
+    # approval) sits at `status == "pending"` forever, not "failed" —
+    # `_KNOWN_GOOD` below already admits "pending" unconditionally, so this
+    # governance pass never counts it as blocking. Nothing to exclude here:
+    # only `_attended_pending_task_ids` / `_blocked_deps` (hydra_core.cli)
+    # decide whether a superseded task blocks `finalize`, via
+    # `task_eligible_for_dispatch` (state.py).
     failed = [t for t in state.tasks if t.status == "failed"]
     if failed:
         return GovernanceVerdict(

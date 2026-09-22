@@ -62,3 +62,16 @@ def test_attended_task_gate_type_unresolvable_envelope_id_returns_none():
     task = TaskState(owner_squad="engineering", description="do it",
                      envelope_id=uuid4())
     assert cli._attended_task_gate_type(task, state) is None
+
+
+def test_attended_task_gate_type_prefers_plan_step_envelope_type():
+    """Hydra#69 defect E: a task materialised from a PlanStep has NO
+    envelope_id at all (it was never triggered by an envelope) -- its own
+    `TaskState.envelope_type` (materialise_plan_steps copies it from the
+    PlanStep) must be used directly instead of always falling through to
+    None."""
+    state = HydraState(root_goal="t")
+    task = TaskState(owner_squad="engineering", description="do it",
+                     plan_step_id="a", plan_revision=1, envelope_type="ARCH_RFC")
+    assert task.envelope_id is None
+    assert cli._attended_task_gate_type(task, state) == "design"

@@ -822,3 +822,254 @@ class TestServerResumeSurface:
         assert "--critique-ref" in captured["cmd"]
         idx = captured["cmd"].index("--critique-ref")
         assert captured["cmd"][idx + 1] == "docs/plans/note.txt"
+
+
+# =========================================================================== #
+# Hydra#69 defect A (primary): --gate-only approve at plan_gate must
+# materialise the plan's TaskStates in the SAME sup.update_state call that
+# clears the gate -- cli.py:2688-2718 used to return before sup.invoke, so
+# node_plan_gate never ran and the checkpoint wedged at plan_status="judged"
+# forever. Also covers the modify-budget re-file (A part 3) and the
+# distinct `attended step` wedge terminals (A part 4).
+# =========================================================================== #
+
+_OPERATOR_ENV = {"HYDRA_OPERATOR_ID": "lebobo88", "HYDRA_OPERATOR_KEY": "test-key-material"}
+
+
+def _set_known_operator(monkeypatch) -> None:
+    for k, v in _OPERATOR_ENV.items():
+        monkeypatch.setenv(k, v)
+
+
+def _plan_gate_values(wf: str, *, plan_revision: int = 1) -> tuple[dict, str]:
+    plan = {
+        "id": str(uuid4()), "type": "PLAN", "origin_squad": "planning",
+        "target_squad": "hydra", "workflow_id": wf, "rigor": "standard",
+        "goal_restatement": "ship it", "summary": "ship it",
+        "plan_revision": plan_revision,
+        "steps": [
+            {"step_id": "a", "target_squad": "engineering",
+             "envelope_type": "DEV_TASK", "description": "wire it",
+             "depends_on": [], "acceptance_criteria": ["it works"]},
+        ],
+    }
+    placeholder_id = str(uuid4())
+    pending = {"workflow_id": wf, "reason": "plan_approval", "gate_node": "plan_gate"}
+    values = {
+        "workflow_id": wf, "root_goal": "ship it", "phase": "approval",
+        "pending_hitl": pending, "plan_status": "judged",
+        "plan_revision": plan_revision, "plan_ref": plan,
+        "plan_envelope_id": plan["id"],
+        "plan_placeholder_task_ids": [placeholder_id],
+        "plan_superseded_task_ids": [],
+        "tasks": [{
+            "task_id": placeholder_id, "owner_squad": "engineering",
+            "description": "ship it", "status": "pending", "priority": "P2",
+            "retries": 0, "depends_on": [], "plan_revision": 0,
+        }],
+        "hitl_history": [],
+        "budget": {"budget_usd": 10.0, "spent_usd": 0.0},
+    }
+    return values, placeholder_id
+
+
+class TestDefectAGateOnlyMaterialisation:
+    def test_gate_only_approve_materialises_tasks_and_never_reopens_dispatch(
+        self, monkeypatch, tmp_path,
+    ):
+        _set_known_operator(monkeypatch)
+        wf = str(uuid4())
+        values, placeholder_id = _plan_gate_values(wf)
+        sup = _SimpleFakeSup(values["pending_hitl"], values)
+        _patch_common(monkeypatch, sup)
+
+        args = _resume_args(tmp_path, wf, "approve")
+        args.gate_only = True
+        rc = _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+        assert rc == 0
+
+        # The write must be a pure checkpoint mutation with as_node=
+        # "postcheck" -- so a later sup.invoke() can never pick up
+        # plan_gate's static add_edge("plan_gate", "dispatch") edge and run
+        # node_dispatch headlessly.
+        assert sup.updates, "expected at least one update_state call"
+        _last_patch, _last_as_node = sup.updates[-1]
+        assert _last_as_node == "postcheck"
+        assert sup.invoked == 0, "gate-only must never call sup.invoke"
+
+        assert sup._values.get("plan_status") == "approved"
+        assert sup._values.get("plan_superseded_task_ids") == [placeholder_id]
+        materialised = _last_patch.get("tasks") or []
+        assert len(materialised) == 1
+        step_task = materialised[0]
+        assert step_task.plan_step_id == "a"
+        assert step_task.plan_revision == 1
+        assert step_task.acceptance_criteria == ["it works"]
+        assert step_task.envelope_type == "DEV_TASK"
+
+        # Provenance stamped onto the hitl_history resolution record.
+        last_resolution = sup._values["hitl_history"][-1]
+        assert last_resolution["plan_revision"] == 1
+        assert last_resolution.get("plan_envelope_id")
+
+    def test_gate_only_approve_output_reports_plan_status_and_materialised_ids(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        _set_known_operator(monkeypatch)
+        wf = str(uuid4())
+        values, _placeholder_id = _plan_gate_values(wf)
+        sup = _SimpleFakeSup(values["pending_hitl"], values)
+        _patch_common(monkeypatch, sup)
+
+        args = _resume_args(tmp_path, wf, "approve")
+        args.gate_only = True
+        rc = _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0, out
+        assert out["plan_status"] == "approved"
+        assert out["materialised_task_ids"], out
+        assert out["gate_only"] is True
+        assert out["graph_reentered"] is False
+
+    def test_double_approve_is_idempotent(self, monkeypatch, tmp_path):
+        """A retried gate-only approve (the SAME gate resolved twice) must
+        not double-materialise the step task."""
+        _set_known_operator(monkeypatch)
+        wf = str(uuid4())
+        values, _placeholder_id = _plan_gate_values(wf)
+        sup = _SimpleFakeSup(values["pending_hitl"], values)
+        _patch_common(monkeypatch, sup)
+
+        args = _resume_args(tmp_path, wf, "approve")
+        args.gate_only = True
+        rc1 = _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+        assert rc1 == 0
+        first_tasks = list(sup._values.get("tasks") or [])
+        assert len(first_tasks) == 1
+
+        # Simulate the checkpoint carrying the materialised task forward
+        # (a real checkpoint's `tasks` channel is append-only) and re-raise
+        # the SAME gate, exactly as a retried gate-only approve would see it.
+        sup._values["tasks"] = list(values["tasks"]) + [
+            {
+                "task_id": str(first_tasks[0].task_id),
+                "owner_squad": first_tasks[0].owner_squad,
+                "description": first_tasks[0].description,
+                "status": "pending", "priority": "P2", "retries": 0,
+                "depends_on": [], "plan_step_id": "a", "plan_revision": 1,
+            }
+        ]
+        sup._values["pending_hitl"] = values["pending_hitl"]
+        sup._values["plan_status"] = "judged"
+
+        rc2 = _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+        assert rc2 == 0
+        _second_patch, _ = sup.updates[-1]
+        assert "tasks" not in _second_patch, (
+            "a retried approve against a checkpoint that already carries "
+            "this revision's step task must not re-materialise it"
+        )
+
+
+class TestDefectAModifyBudgetRefilesGate:
+    def test_modify_budget_at_plan_gate_does_not_clear_gate(self, monkeypatch, tmp_path):
+        _set_known_operator(monkeypatch)
+        wf = str(uuid4())
+        values, _placeholder_id = _plan_gate_values(wf)
+        sup = _SimpleFakeSup(values["pending_hitl"], values)
+        _patch_common(monkeypatch, sup)
+
+        args = _resume_args(tmp_path, wf, "modify-budget", option="99.0")
+        args.gate_only = True
+        rc = _cmd_resume_locked(args, tmp_path, wf, "modify-budget", "99.0")
+        assert rc == 0
+        assert sup._values.get("pending_hitl") is not None, (
+            "modify-budget at plan_gate must re-file the gate -- the plan "
+            "still needs a genuine approve"
+        )
+        assert sup._values["pending_hitl"].get("gate_node") == "plan_gate"
+        assert sup._values.get("plan_status") == "judged", (
+            "modify-budget must not itself approve the plan"
+        )
+        assert sup._values["budget"]["budget_usd"] == 99.0
+
+
+class TestDefectAAttendedStepWedgeTerminals:
+    """A checkpoint hand-constructed in the exact wedge shape (barrier
+    active, no gate pending, nothing selectable) must surface a distinct,
+    honest terminal instead of silently falling through to
+    ready_to_finalize/tasks_pending."""
+
+    def _wedge_values(self, wf: str, *, approved_history: bool) -> dict:
+        history = []
+        if approved_history:
+            history = [{
+                "resolution": "approve", "gate_node": "plan_gate",
+                "plan_revision": 1,
+            }]
+        return {
+            "workflow_id": wf, "root_goal": "x", "phase": "dispatch",
+            "plan_status": "judged", "plan_revision": 1, "pending_hitl": None,
+            "tasks": [], "hitl_history": history,
+            "attended_completed_task_ids": [],
+            "plan_placeholder_task_ids": [], "plan_superseded_task_ids": [],
+        }
+
+    class _AttendedFakeSup:
+        def __init__(self, values):
+            self.values = dict(values)
+
+        def get_state(self, config):
+            outer = self
+
+            class _Snap:
+                values = outer.values
+                next = ()
+
+            return _Snap()
+
+        def update_state(self, config, patch, as_node=None):
+            self.values.update(patch)
+
+        def invoke(self, *a, **k):
+            raise AssertionError("must not invoke on the wedge terminal path")
+
+    class _NopDispatcher:
+        live_execution = True
+
+        def call_mcp(self, server, tool, args, **_kw):
+            return {"status": "done", "result": {}}
+
+        def set_squad_packs(self, packs):
+            pass
+
+    def _step(self, tmp_path, wf, values, monkeypatch, capsys):
+        from hydra_core.cli import _cmd_attended_step
+        sup = self._AttendedFakeSup(values)
+        monkeypatch.setattr("hydra_core.cli._attended_live_dispatcher",
+                            lambda *a, **k: self._NopDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: sup)
+        monkeypatch.setattr("hydra_core.squad_loader.discover_squads",
+                            lambda *a, **k: {})
+        rc = _cmd_attended_step(argparse.Namespace(
+            project=str(tmp_path), workflow_id=wf, verbose=False))
+        out = capsys.readouterr().out
+        assert rc == 0, f"attended step failed: {out[:400]}"
+        return json.loads(out)
+
+    def test_unresolved_gate_reports_plan_gate_unresolved(self, monkeypatch, tmp_path, capsys):
+        wf = str(uuid4())
+        values = self._wedge_values(wf, approved_history=False)
+        out = self._step(tmp_path, wf, values, monkeypatch, capsys)
+        assert out["status"] == "plan_gate_unresolved"
+        assert out["ok"] is False
+
+    def test_approved_but_never_materialised_reports_distinct_status(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        wf = str(uuid4())
+        values = self._wedge_values(wf, approved_history=True)
+        out = self._step(tmp_path, wf, values, monkeypatch, capsys)
+        assert out["status"] == "plan_approved_not_materialised"
+        assert out["ok"] is False
