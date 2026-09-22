@@ -68,8 +68,9 @@ def _stub_pack(slug: str) -> SquadPack:
     return SquadPack(slug=slug, name=slug, description=slug, entrypoint="stub")
 
 
-def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None):
-    return {
+def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None,
+                        supersedes=None):
+    d = {
         "id": str(plan_id or uuid4()),
         "type": "PLAN",
         "origin_squad": "planning",
@@ -81,6 +82,9 @@ def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None):
         "plan_revision": revision,
         "steps": steps or [],
     }
+    if supersedes is not None:
+        d["supersedes"] = str(supersedes)
+    return d
 
 
 # =========================================================================== #
@@ -465,8 +469,18 @@ class TestTask2IngestBranch:
         assert again.items[0].status == "skipped_duplicate"
         assert not again.plan_patch
 
-        # A revision with a FRESH envelope id is not suppressed.
-        revised = _minimal_plan_dict(state.workflow_id, revision=2)
+        # A revision with a FRESH envelope id is not suppressed. Hydra#69
+        # defect G: a real `--modify-plan` re-entry bumps state.plan_revision
+        # to the NEW revision (and stamps plan_envelope_id to the prior
+        # plan's id) BEFORE the revised PLAN is ever authored/submitted
+        # (mirrors `_cmd_resume_locked`'s modify-plan branch) -- the revised
+        # PLAN must carry that same expected revision and name the prior
+        # plan as its `supersedes`, or the state-validation check this
+        # defect adds refuses it.
+        state.plan_revision = 2
+        state.plan_envelope_id = plan["id"]
+        revised = _minimal_plan_dict(
+            state.workflow_id, revision=2, supersedes=plan["id"])
         third = dispatch_ingested_envelopes(
             state, [revised], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
             already_ingested={plan["id"]},
