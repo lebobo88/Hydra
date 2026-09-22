@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json as _json
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -332,6 +333,19 @@ def _write_result(tmp_path, name, payload):
     return p
 
 
+def _task_status(values: dict, task_id: str) -> Any:
+    """Reads a task's persisted `TaskState.status` back out of a checkpoint
+    `values` dict -- shape-defensive like `_cmd_replay`/`_task_plan_step_id`
+    (cli.py), since `values["tasks"]` may hold either plain dicts (as here,
+    a hand-seeded `model_dump(mode="json")` fixture) or real `TaskState`
+    Pydantic instances depending on the read path."""
+    for t in values.get("tasks") or []:
+        tid = t.get("task_id") if isinstance(t, dict) else getattr(t, "task_id", None)
+        if str(tid) == str(task_id):
+            return t.get("status") if isinstance(t, dict) else getattr(t, "status", None)
+    raise AssertionError(f"task {task_id} not found in checkpoint tasks")
+
+
 class TestAttendedPlanRejectionDefectC:
     """MUTATION PROOF for this whole class: revert the `is_planning_task`
     split in `_cmd_attended_submit` (cli.py) back to writing
@@ -369,6 +383,8 @@ class TestAttendedPlanRejectionDefectC:
             r.get("task_id") == task_id for r in (values.get("attended_results") or [])
         )
         assert values.get("plan_submit_attempts", {}).get(task_id) == 1
+        # Left OPEN also at the state layer: TaskState.status is untouched.
+        assert _task_status(values, task_id) == "pending"
 
         # The NEXT step re-issues a fresh cursor with an incremented attempt
         # number in its call_key -- never the same key as the rejected one.
@@ -500,6 +516,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
         assert task_id not in (values.get("attended_done_task_ids") or [])
 
         step2 = _step(capsys, wf_id)
@@ -542,6 +559,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
 
         step2 = _step(capsys, wf_id)
         assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
@@ -567,6 +585,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
 
         step2 = _step(capsys, wf_id)
         assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
@@ -607,6 +626,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
 
         step2 = _step(capsys, wf_id)
         assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
@@ -666,6 +686,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
 
         step2 = _step(capsys, wf_id)
         assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
@@ -731,6 +752,7 @@ class TestAttendedPlanRejectionDefectC:
 
         values = fake_sup.get_state({}).values
         assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
         assert task_id not in (values.get("attended_done_task_ids") or [])
 
         step2 = _step(capsys, wf_id)
