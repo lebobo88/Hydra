@@ -381,6 +381,18 @@ class HydraState(BaseModel):
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
 
+    # Hydra#69 defect C: per-task attempt counter for a ``planning``-owned
+    # attended squad cursor. ``_cmd_attended_submit`` increments the entry for
+    # a task_id each time its emitted PLAN is rejected (missing/invalid PLAN,
+    # HYDRA_PLAN_PHASE disabled, artifact write failure, graph re-entry
+    # failure) instead of writing the task attended-complete. The next
+    # `_cmd_attended_step` re-issue reads this to mint
+    # ``call_key = f"squad-{task_id}-{attempt}"`` (host_bridge.begin_squad_stage)
+    # so a late response from a rejected attempt can never match the newly
+    # issued cursor's call_key. `_merge_dict` reducer so an out-of-graph
+    # `update_state` can grow it key-by-key like `error_counters`.
+    plan_submit_attempts: Annotated[dict[str, int], _merge_dict] = Field(default_factory=dict)
+
     # P0 planning substrate. Plain replace-by-default fields, no reducers: a
     # planning re-run REPLACES the prior plan snapshot rather than
     # accumulating history. P1 (plan_barrier_active, below) now reads
