@@ -474,6 +474,268 @@ class TestAttendedPlanRejectionDefectC:
         assert step_after == 0, out_after
         assert out_after.get("state") != "await_squad_agent"
 
+    def test_invalid_plan_schema_failure_leaves_task_open_and_reissues_cursor(
+        self, plan_task_fixture, tmp_path, capsys,
+    ):
+        """MUTATION PROOF: revert the acceptance predicate so a `failed` PLAN
+        item is still treated as accepted (or revert the C fix generally) and
+        this fails -- the task would wrongly become attended-complete despite
+        the PLAN failing schema validation."""
+        wf_id, task_id, fake_sup, charge_calls = plan_task_fixture
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+        assert call_key_0 == f"squad-{task_id}-0"
+
+        bad_plan = _plan_dict(wf_id)
+        bad_plan["rigor"] = "not-a-real-rigor"  # fails Literal[...] validation
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [bad_plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "invalid_plan", payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert task_id not in (values.get("attended_done_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
+    def test_invalid_plan_normalization_failure_is_invalid_not_missing(
+        self, plan_task_fixture, tmp_path, capsys, monkeypatch,
+    ):
+        """Cross-vendor judge finding (this round): a normalization-failure
+        record used to omit `envelope_type`, so `_classify_plan_rejection`
+        (which matches outcomes on `envelope_type == "PLAN"`) fell through
+        to `missing_plan` instead of `invalid_plan`. MUTATION PROOF: drop the
+        `"envelope_type": raw.get("type")` key this fix adds to the
+        normalization-failure record in `_cmd_attended_submit` and this test
+        fails (reason flips back to `missing_plan`)."""
+        wf_id, task_id, fake_sup, charge_calls = plan_task_fixture
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        from hydra_core import ingest as ingest_mod
+        real_normalize = ingest_mod.normalize_for_ingest
+
+        def _raise_for_plan(raw, emit_fn=None):
+            if isinstance(raw, dict) and raw.get("type") == "PLAN":
+                raise ValueError("synthetic normalization failure")
+            return real_normalize(raw, emit_fn)
+
+        monkeypatch.setattr(ingest_mod, "normalize_for_ingest", _raise_for_plan)
+
+        plan = _plan_dict(wf_id)
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "invalid_plan", payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
+    def test_plan_phase_disabled_leaves_task_open_and_reissues_cursor(
+        self, plan_task_fixture, tmp_path, capsys, monkeypatch,
+    ):
+        wf_id, task_id, fake_sup, charge_calls = plan_task_fixture
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "0")
+        plan = _plan_dict(wf_id)
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "plan_phase_disabled", payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
+    def test_artifact_write_failure_leaves_task_open_and_reissues_cursor(
+        self, plan_task_fixture, tmp_path, capsys, monkeypatch,
+    ):
+        wf_id, task_id, fake_sup, charge_calls = plan_task_fixture
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        # Strip the dispatcher's project_root so `write_repo_artifact` can
+        # never be reached -- `dispatch_ingested_envelopes` reports that as
+        # `ArtifactStoreError("dispatcher has no project_root...")`, a real
+        # "plan artifact write failed" item, not a synthetic one.
+        class _NoRootDispatcher:
+            project_root = None
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _NoRootDispatcher())
+
+        plan = _plan_dict(wf_id)
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "artifact_write_failed", payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
+    def test_reentry_exception_leaves_task_open_and_reissues_cursor(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """MUTATION PROOF for the whole re-entry family: revert
+        `_apply_plan_reentry` to treat any non-raising
+        `_reenter_graph_after_dispatch` call as success and this fails."""
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task])
+
+        class _RaisingReentryFakeSup(_StatefulFakeSup):
+            def update_state(self, config, patch, as_node=None):
+                if as_node == "dispatch":
+                    raise RuntimeError("checkpoint write failed")
+                super().update_state(config, patch, as_node=as_node)
+
+        fake_sup = _RaisingReentryFakeSup(state.model_dump(mode="json"))
+
+        class _FakeDispatcher:
+            project_root = tmp_path
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (False, False),
+        )
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+        wf_id = str(wf)
+        task_id = str(task.task_id)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        plan = _plan_dict(wf_id)
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "plan_reentry_failed", payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
+    def test_reentry_non_target_next_leaves_task_open_and_reissues_cursor(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """Cross-vendor judge finding (this round, HIGH): the bounded
+        re-entry loop can exhaust `max_iterations` with `next` parked at
+        something OTHER than `plan_gate` without ever raising --
+        `_apply_plan_reentry` used to report that as success. MUTATION
+        PROOF: revert the `tuple(parked_at) != target_next` check added to
+        `_apply_plan_reentry` and this test fails (status would be something
+        other than `plan_rejected`/`plan_reentry_failed`, and the task would
+        wrongly complete)."""
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task])
+
+        class _StuckFakeSup(_StatefulFakeSup):
+            """Never reaches plan_gate -- simulates a routing bug so the
+            bounded loop exhausts without ever raising."""
+            def get_state(self, config):
+                return _Snap(dict(self._values), ("await_host",))
+
+        fake_sup = _StuckFakeSup(state.model_dump(mode="json"))
+
+        class _FakeDispatcher:
+            project_root = tmp_path
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (False, False),
+        )
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+        wf_id = str(wf)
+        task_id = str(task.task_id)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        plan = _plan_dict(wf_id)
+        result_path = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.02, "tokens_in": 1, "tokens_out": 1,
+            "emitted_envelopes": [plan],
+        })
+        rc, payload = _submit(capsys, wf_id, task_id, call_key_0, result_path)
+        assert rc == 0
+        assert payload["status"] == "plan_rejected", payload
+        assert payload["plan_rejection"]["reason"] == "plan_reentry_failed", payload
+        assert "await_host" in payload["plan_rejection"]["detail"], payload
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert task_id not in (values.get("attended_done_task_ids") or [])
+
+        step2 = _step(capsys, wf_id)
+        assert step2["host_action"]["call_key"] == f"squad-{task_id}-1"
+
     def test_duplicate_replay_of_accepted_plan_is_idempotent(
         self, plan_task_fixture, tmp_path, capsys,
     ):
