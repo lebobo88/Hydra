@@ -2942,6 +2942,69 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     })
 
 
+def _field_required_marker(field: Any) -> str:
+    """Return "required" / "optional" for a pydantic v2 ``FieldInfo``."""
+    try:
+        return "required" if field.is_required() else "optional"
+    except Exception:  # noqa: BLE001 — defensive; never let doc-gen crash a prompt
+        return "optional"
+
+
+def _field_type_label(field: Any) -> str:
+    ann = getattr(field, "annotation", None)
+    label = getattr(ann, "__name__", None)
+    return label or str(ann)
+
+
+def _plan_envelope_schema_doc() -> str:
+    """D1: render the ``## Required output: PLAN envelope`` prompt section
+    straight from the live pydantic models (`hydra_core.schemas.Plan` /
+    `PlanStep`) so the plan-author prompt can never drift from the schema the
+    validator actually enforces -- the root cause of "every first draft was
+    rejected" (authors emitted step fields id/title/success that don't exist
+    on `PlanStep`).
+
+    Uses ``model_fields`` (schema introspection), never a hand-copied field
+    list.
+    """
+    from . import schemas as _schemas
+
+    plan_fields = _schemas.Plan.model_fields
+    step_fields = _schemas.PlanStep.model_fields
+    allowed_types = sorted(_schemas.SCHEMA_REGISTRY.keys())
+
+    lines = ["## Required output: PLAN envelope", ""]
+    lines.append(
+        "Return exactly one PLAN envelope (type=\"PLAN\") inside the submit "
+        "result's `emitted_envelopes` list. The field list below is generated "
+        "at runtime from `hydra_core.schemas.Plan` / `PlanStep` -- it cannot "
+        "drift from what the validator accepts."
+    )
+    lines.append("")
+    lines.append("### Plan fields (including inherited envelope fields)")
+    for name, field in plan_fields.items():
+        if name == "steps":
+            continue  # documented separately below
+        lines.append(
+            f"- `{name}` ({_field_type_label(field)}, {_field_required_marker(field)})"
+        )
+    lines.append(
+        "- `steps` (list[PlanStep], required) -- see \"PlanStep fields\" below"
+    )
+    lines.append("")
+    lines.append("### PlanStep fields (each entry in `steps`)")
+    for name, field in step_fields.items():
+        lines.append(
+            f"- `{name}` ({_field_type_label(field)}, {_field_required_marker(field)})"
+        )
+    lines.append("")
+    lines.append(
+        "### Allowed PlanStep.envelope_type values\n"
+        + ", ".join(allowed_types)
+    )
+    return "\n".join(lines)
+
+
 def _build_squad_prompt(
     *,
     workflow_id: str,
@@ -2956,6 +3019,9 @@ def _build_squad_prompt(
     risk: str | None = None,
     priority: str | None = None,
     acceptance_criteria: Sequence[str] | None = None,
+    plan_revision: int | None = None,
+    plan_critique: str | None = None,
+    supersedes_plan_envelope_id: str | None = None,
 ) -> str:
     """E2-28: build the non-engineering squad host_action prompt.
 
@@ -2966,6 +3032,12 @@ def _build_squad_prompt(
     ``upstream_refs`` carries MemoryRef handles / envelope ids of prior completed
     work ONLY — never raw upstream artifact content, which must not cross a squad
     boundary un-redacted (AGENTS.md hard rule 3).
+
+    D1 (Hydra#69 part 3): ``plan_revision`` / ``plan_critique`` /
+    ``supersedes_plan_envelope_id`` are ONLY consumed when
+    ``squad_slug == "planning"`` -- every other squad's prompt is byte-for-byte
+    unchanged by their presence (they default to ``None`` and are simply never
+    read outside the planning branch below).
     """
     _none = "(none)"
     refs = [str(r).strip() for r in (upstream_refs or []) if str(r).strip()]
@@ -3000,6 +3072,23 @@ def _build_squad_prompt(
         "acceptance_criteria: " + (_none if not crit else ""),
     ]
     lines.extend(f"- {c}" for c in crit)
+
+    # D1 (Hydra#69 part 3): planning-only section, schema-generated.
+    if squad_slug == "planning":
+        lines.append("")
+        lines.append(_plan_envelope_schema_doc())
+        lines.append("")
+        _expected_revision = int(plan_revision) if plan_revision else 1
+        lines.append(f"expected plan_revision: {_expected_revision}")
+        if _expected_revision > 1:
+            lines.append(
+                f"supersedes: {supersedes_plan_envelope_id or _none} "
+                "(the prior plan envelope id -- set `Plan.supersedes` to this value)"
+            )
+            lines.append("")
+            lines.append("### Prior revision critique")
+            lines.append((plan_critique or "").strip() or _none)
+
     return "\n".join(lines)
 
 
@@ -3023,6 +3112,9 @@ def begin_squad_stage(
     acceptance_criteria: Sequence[str] | None = None,
     action_extras: dict[str, Any] | None = None,
     attempt: int = 0,
+    plan_revision: int | None = None,
+    plan_critique: str | None = None,
+    supersedes_plan_envelope_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -3060,6 +3152,9 @@ def begin_squad_stage(
         risk=risk,
         priority=priority,
         acceptance_criteria=acceptance_criteria,
+        plan_revision=plan_revision,
+        plan_critique=plan_critique,
+        supersedes_plan_envelope_id=supersedes_plan_envelope_id,
     )
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,

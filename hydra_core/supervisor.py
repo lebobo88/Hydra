@@ -47,6 +47,7 @@ from .schemas import (
     DecisionRecord,
     HITLRequest,
     HydraEnvelope,
+    Plan,
     ProposedTask,
     validate_envelope,
 )
@@ -100,6 +101,28 @@ def _plan_phase_enabled() -> bool:
     to legacy behaviour just by forgetting to export something.
     """
     return os.environ.get("HYDRA_PLAN_PHASE") != "0"
+
+
+# D3 (Hydra#69 part 3): plan-gate verdict critique max length before
+# `plan_detail["verdict_critique"]` is cut with a trailing marker. Keeps
+# `plan_detail`'s JSON size bounded (checkpoint/trace/MCP-visible) the same
+# way every other truncated field in this module is, while still giving the
+# operator/downstream renderers real critique text instead of nothing.
+_PLAN_CRITIQUE_MAX_CHARS = 2000
+_PLAN_CRITIQUE_TRUNCATION_MARKER = "\n...[truncated]"
+
+
+def _truncate_plan_critique(critique_md: Any) -> Optional[str]:
+    """D3: bound `verdict_critique` for `plan_detail`. Never returns a
+    non-string (strict-JSON safety) -- `None` in, `None` out.
+    """
+    if not isinstance(critique_md, str) or not critique_md:
+        return None
+    if len(critique_md) <= _PLAN_CRITIQUE_MAX_CHARS:
+        return critique_md
+    cut_at = _PLAN_CRITIQUE_MAX_CHARS - len(_PLAN_CRITIQUE_TRUNCATION_MARKER)
+    cut_at = max(0, cut_at)
+    return critique_md[:cut_at] + _PLAN_CRITIQUE_TRUNCATION_MARKER
 
 
 # RC1 — delegation routing: which squad consumes each emitted envelope type
@@ -4447,6 +4470,15 @@ def build_supervisor(
             "remaining_budget_usd": remaining_budget,
             "over_plan_budget": over_plan_budget,
             "verdict_outcome": verdict_dict.get("outcome"),
+            # D3 (Hydra#69 part 3): the critique text previously lived ONLY in
+            # `state.verdicts` -- the plan gate render (approve/SKILL.md) and
+            # any MCP/checkpoint consumer of `plan_detail` alone never saw
+            # WHY the judge reached its outcome. Truncated (not the raw,
+            # unbounded critique_md) to keep plan_detail's JSON size bounded
+            # the same way every other trace/checkpoint field is; a trailing
+            # marker makes a cut visible instead of silently swallowing text.
+            "verdict_critique": _truncate_plan_critique(verdict_dict.get("critique_md")),
+            "verdict_plan_revision": state.plan_revision,
             "step_count": len(plan_steps),
             "max_revisions": max_revisions,
             "revisions_used": max(0, state.plan_revision - 1),
@@ -4470,6 +4502,66 @@ def build_supervisor(
                 for s in plan_steps if isinstance(s, dict)
             ],
         }
+
+        # D4 (Hydra#69 part 3): the plan HTML is rendered ONCE at ingest
+        # (`hydra_core.ingest.dispatch_ingested_envelopes`'s PLAN branch),
+        # BEFORE this node ever runs -- so the artifact on disk always says
+        # "No verdict recorded yet." even after a real verdict exists. Node
+        # functions here ARE inside `build_supervisor`'s closure over
+        # `dispatcher`/`project_root` (the same two values the ingest PLAN
+        # branch uses), so writing a repo artifact from this graph node is
+        # not architecturally disallowed -- re-render through the SAME
+        # `render_plan_html` + `write_repo_artifact` path ingest uses (no
+        # second writer), reusing `plan_ref` (the same dict the judge above
+        # was handed) to reconstruct the `Plan` model. Fail-soft: a re-render
+        # failure must never break the gate -- only a trace event marks it.
+        try:
+            if plan_ref and state.plan_artifact_location and str(
+                state.plan_artifact_location
+            ).startswith("repo:artifact:"):
+                from .artifact_store import (
+                    ArtifactStoreError,
+                    resolve_repo_artifact_path,
+                    write_repo_artifact,
+                )
+                from .plan_artifact import (
+                    extract_governance_section,
+                    render_plan_html,
+                )
+
+                _relpath = str(state.plan_artifact_location)[len("repo:artifact:"):]
+                _repo_root = getattr(dispatcher, "project_root", None) or project_root
+                if _repo_root is None:
+                    raise ArtifactStoreError(
+                        "no project_root available; cannot re-render the plan artifact"
+                    )
+                _plan_model_for_render = Plan.model_validate(plan_ref)
+                _judge_verdict_text = (
+                    f"outcome={verdict_dict.get('outcome') or 'unknown'}; "
+                    f"judge_vendor={judge_vendor}; plan_revision={state.plan_revision}. "
+                    + (plan_detail.get("verdict_critique") or "")
+                ).strip()
+                _existing_path = resolve_repo_artifact_path(_repo_root, _relpath)
+                _existing_html = (
+                    _existing_path.read_text(encoding="utf-8")
+                    if _existing_path.is_file() else ""
+                )
+                _governance_section = extract_governance_section(_existing_html)
+                _rerendered = render_plan_html(
+                    _plan_model_for_render, judge_verdict=_judge_verdict_text,
+                )
+                if _governance_section:
+                    _rerendered = _rerendered.rstrip("\n") + "\n" + _governance_section + "\n"
+                write_repo_artifact(_repo_root, _relpath, _rerendered)
+                emit_trace(judge_trace_root, state.workflow_id, "plan_judge.artifact_rerendered", {
+                    "plan_artifact_location": state.plan_artifact_location,
+                    "plan_revision": state.plan_revision,
+                })
+        except Exception as exc:  # noqa: BLE001 — fail-soft: never break the gate
+            emit_trace(judge_trace_root, state.workflow_id, "plan_judge.artifact_rerender_failed", {
+                "plan_artifact_location": state.plan_artifact_location,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
         # Cross-vendor judge finding (item 2/6, HIGH): never format `None`
         # (the overflow sentinel) as a dollar amount -- report "unavailable"
