@@ -472,9 +472,42 @@ def materialise_plan_steps(
     if not approved_resolution:
         if state.phase == "surfaced" or state.plan_status == "rejected":
             return {}
+        # Hydra#69 round 5 follow-up: the latest plan_gate entry must be
+        # evidence for THIS revision, not merely the latest plan_gate entry
+        # of any age. An approve recorded against an older `plan_revision`
+        # (e.g. the operator approved revision 1, then the planner produced
+        # a revised, as-yet-unapproved revision 2) must never authorise
+        # materialising a newer revision's steps -- that would silently
+        # promote an unreviewed plan using stale consent. So: scan
+        # `hitl_history` in reverse for the latest plan_gate entry whose own
+        # `plan_revision` equals `state.plan_revision` exactly.
+        #
+        # Legacy-entry policy: entries written before this stamp existed
+        # carry no `plan_revision` key at all. Treat a legacy (unstamped)
+        # entry as evidence ONLY when `state.plan_revision <= 1` AND no
+        # entry in the whole history carries an explicit `plan_revision` --
+        # i.e. this checkpoint predates revisioning entirely and is still on
+        # its first (only) plan. The instant any entry in the history is
+        # revision-stamped, the checkpoint is revision-aware and an
+        # unstamped entry can no longer be trusted to mean "revision 1"; it
+        # is treated as not-evidence and materialisation is refused. This
+        # keeps the legacy fallback narrowly scoped to genuinely pre-
+        # revisioning checkpoints instead of silently laundering a stale
+        # approval on a mixed-history checkpoint.
+        _history = state.hitl_history or []
+        _any_stamped = any(
+            isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+            and e.get("plan_revision") is not None
+            for e in _history
+        )
+        _legacy_ok = state.plan_revision <= 1 and not _any_stamped
         _latest_plan_gate_entry = next(
-            (e for e in reversed(state.hitl_history or [])
-             if isinstance(e, dict) and e.get("gate_node") == "plan_gate"),
+            (e for e in reversed(_history)
+             if isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+             and (
+                 e.get("plan_revision") == state.plan_revision
+                 or (e.get("plan_revision") is None and _legacy_ok)
+             )),
             None,
         )
         if (_latest_plan_gate_entry is None

@@ -1104,7 +1104,7 @@ class TestTask4Materialisation:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=2,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 2}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (2 here)
         )
         state.tasks.append(stale_a)
 

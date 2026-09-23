@@ -2331,6 +2331,26 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Hydra#69 round 5 follow-up (gap b): stamp `plan_revision` (and
+    # `plan_envelope_id` where known) onto EVERY hitl_history entry that
+    # resolves a plan_gate -- approve, abort (action="approve",
+    # option="abort"), reject, modify-plan, modify-budget, force-dispatch.
+    # `materialise_plan_steps`'s evidence lookup (supervisor.py) now filters
+    # "the latest plan_gate resolution for the CURRENT plan_revision" so an
+    # approve recorded against an older revision can never authorise
+    # materialising a newer, unapproved revision; that filter only works if
+    # every plan_gate entry -- not just the approve that happens to
+    # materialise -- carries its revision. Stamped once, here, from the
+    # PRE-patch `values` snapshot: that snapshot's `plan_revision` is the
+    # revision this resolution is actually deciding (the checkpoint has not
+    # been patched yet).
+    if resolution.get("gate_node") == "plan_gate":
+        resolution["plan_revision"] = values.get("plan_revision")
+        resolution["plan_envelope_id"] = (
+            str(values.get("plan_envelope_id"))
+            if values.get("plan_envelope_id") else None
+        )
+
     # WS-AUTH run-A / cross-vendor finding 2 (RESOLVE-GATE-ONLY): mint +
     # verify an operator-capability token before this function's FIRST state
     # mutation (`sup.update_state(config, patch)` below). Historically this
@@ -2663,13 +2683,10 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         _plan_materialised_task_ids = [
             str(t.task_id) for t in (_materialised_patch.get("tasks") or [])
         ]
-        # Stamp provenance onto the resolution record BEFORE it's persisted
-        # -- `patch["hitl_history"]` already references this SAME dict, so
-        # mutating it here mutates what gets written to the checkpoint.
-        resolution["plan_envelope_id"] = (
-            str(values.get("plan_envelope_id")) if values.get("plan_envelope_id") else None
-        )
-        resolution["plan_revision"] = values.get("plan_revision")
+        # (gap b): `plan_envelope_id`/`plan_revision` are already stamped on
+        # `resolution` immediately after it was built, above -- no need to
+        # repeat that write here; this branch's own concern is materialising
+        # the approved steps.
 
     # Hydra#69 follow-up defect 1 (abort atomicity): fold the terminal park
     # (phase="surfaced", and plan_status="rejected" for a plan_gate reject)

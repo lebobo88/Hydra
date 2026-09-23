@@ -292,6 +292,134 @@ class TestDefect1cMaterialiseRequiresApproveEvidence:
         assert patch == {}
 
 
+class TestDefect1cApproveEvidenceMustMatchPlanRevision:
+    """Round 5 follow-up (gap a): the latest `plan_gate` approve in
+    `hitl_history` is only valid evidence for materialisation when it was
+    recorded against the SAME `plan_revision` the state is currently on. An
+    approve recorded against an OLDER revision (e.g. the operator approved
+    revision 1, the planner then authored an unapproved revision 2) must
+    never authorise materialising a newer revision's steps -- that would
+    silently promote an unreviewed plan using stale consent."""
+
+    def test_stale_revision_approve_refuses_materialisation(self):
+        """A revision-2 state whose ONLY plan_gate approve is stamped
+        plan_revision=1 must be a no-op: no tasks, no plan_status flip."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        state = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=2,
+            plan_ref=_plan_ref(), pending_hitl=None,
+            hitl_history=[{
+                "gate_node": "plan_gate", "resolution": "approve",
+                "option": None, "plan_revision": 1,
+            }],
+        )
+        patch = materialise_plan_steps(state)
+        assert patch == {}, (
+            f"an older-revision approve must never authorise a newer "
+            f"revision's materialisation: {patch}"
+        )
+        assert not state.tasks
+        assert state.plan_status == "judged"
+
+    def test_matching_revision_approve_materialises(self):
+        """The counterpart: a revision-2 approve stamped plan_revision=2
+        DOES materialise revision 2's steps."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        state = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=2,
+            plan_ref=_plan_ref(), pending_hitl=None,
+            hitl_history=[{
+                "gate_node": "plan_gate", "resolution": "approve",
+                "option": None, "plan_revision": 2,
+            }],
+        )
+        patch = materialise_plan_steps(state)
+        assert patch.get("plan_status") == "approved"
+        step_tasks = [t for t in (patch.get("tasks") or [])
+                      if getattr(t, "plan_step_id", None) == "step-1"]
+        assert step_tasks, f"matching-revision approve must materialise: {patch}"
+
+    def test_legacy_unstamped_approve_accepted_only_at_revision_one(self):
+        """Legacy policy: an entry with no `plan_revision` key at all (a
+        checkpoint written before this stamp existed) is accepted as
+        evidence ONLY when `state.plan_revision <= 1` and no OTHER
+        plan_gate entry in the history carries an explicit `plan_revision`
+        -- i.e. this checkpoint genuinely predates revisioning. At
+        `plan_revision == 1` the legacy entry materialises; the identical
+        history replayed against `plan_revision == 2` must refuse."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        legacy_history = [{
+            "gate_node": "plan_gate", "resolution": "approve", "option": None,
+        }]
+
+        state_rev1 = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=1,
+            plan_ref=_plan_ref(), pending_hitl=None,
+            hitl_history=list(legacy_history),
+        )
+        patch_rev1 = materialise_plan_steps(state_rev1)
+        assert patch_rev1.get("plan_status") == "approved", (
+            f"legacy unstamped approve at revision 1 must be accepted: {patch_rev1}"
+        )
+
+        state_rev2 = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=2,
+            plan_ref=_plan_ref(), pending_hitl=None,
+            hitl_history=list(legacy_history),
+        )
+        patch_rev2 = materialise_plan_steps(state_rev2)
+        assert patch_rev2 == {}, (
+            f"legacy unstamped approve must NOT authorise revision 2: {patch_rev2}"
+        )
+
+    def test_real_resume_approve_stamps_plan_revision_on_hitl_history(self):
+        """A real `hydra resume --action approve` through `_cmd_resume`
+        (which drives `_cmd_resume_locked`) must itself stamp
+        `plan_revision` onto the hitl_history entry it writes -- this is
+        what a LATER call to `materialise_plan_steps` reads as evidence."""
+        wf, sup, config = _seed_plan_gate_workflow()
+        rc, body = _resume(HYDRA_ROOT, wf, "approve", None)
+        assert rc == 0, body
+        values = sup.get_state(config).values
+        hist = values.get("hitl_history") or []
+        assert hist, "resume approve must append a hitl_history entry"
+        last = hist[-1]
+        assert last.get("gate_node") == "plan_gate"
+        assert last.get("resolution") == "approve"
+        assert last.get("plan_revision") == 1, (
+            f"real resume approve must stamp plan_revision on its "
+            f"hitl_history entry: {last!r}"
+        )
+
+    def test_real_resume_reject_stamps_plan_revision_on_hitl_history(self):
+        """Gap (b)'s audit: `reject` (and, by the same code path, abort,
+        modify-budget, force-dispatch) must stamp `plan_revision` too, not
+        only the `approve` path that already stamped it for the
+        materialise-provenance write. Proven directly against `reject` here
+        since it is the plainest gate_node=='plan_gate' non-approve action
+        that reaches the shared, single-write `patch["hitl_history"]`
+        path."""
+        wf, sup, config = _seed_plan_gate_workflow()
+        rc, body = _resume(HYDRA_ROOT, wf, "reject", None)
+        assert rc == 0, body
+        values = sup.get_state(config).values
+        hist = values.get("hitl_history") or []
+        assert hist, "resume reject must append a hitl_history entry"
+        last = hist[-1]
+        assert last.get("gate_node") == "plan_gate"
+        assert last.get("resolution") == "reject"
+        assert last.get("plan_revision") == 1, (
+            f"real resume reject must stamp plan_revision on its "
+            f"hitl_history entry: {last!r}"
+        )
+
+
 # =========================================================================== #
 # Defect 2 (HIGH) -- checkpoint-write failure during a terminal
 # `_cmd_attended_submit` repairs on retry instead of becoming a false
