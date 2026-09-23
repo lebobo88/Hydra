@@ -689,6 +689,39 @@ def dispatch_ingested_envelopes(
                 _expected_supersedes = (
                     str(state.plan_supersedes_expected)
                     if getattr(state, "plan_supersedes_expected", None) else None)
+                if _expected_supersedes is None:
+                    # Hydra#69 round 5 defect 3 (MED): a checkpoint created
+                    # before `plan_supersedes_expected` existed on HydraState
+                    # (or restored from a pre-fix snapshot) leaves the field
+                    # at its `Optional[str]` default, None -- comparing
+                    # directly against it above would reject EVERY revision
+                    # >1 PLAN outright, even one correctly naming its true
+                    # predecessor. Derive the expectation instead, in order:
+                    #   1. the current revision's own planning TaskState's
+                    #      `supersedes_plan_envelope_id` (stamped when
+                    #      `--modify-plan` created it -- see cli.py's
+                    #      `_modify_plan_task` construction);
+                    #   2. a recorded modify-plan transition in
+                    #      `hitl_history` naming the same revision.
+                    # Deliberately NEVER `state.plan_envelope_id` -- see the
+                    # comment above this block on why that mutable field
+                    # (overwritten by this same branch's own `plan_patch` as
+                    # soon as ANY candidate PLAN is drafted, even one whose
+                    # subsequent graph re-entry fails) is unsafe here.
+                    for _t in (getattr(state, "tasks", None) or []):
+                        if (getattr(_t, "owner_squad", None) == "planning"
+                                and getattr(_t, "plan_revision", None) == state.plan_revision
+                                and getattr(_t, "supersedes_plan_envelope_id", None)):
+                            _expected_supersedes = str(_t.supersedes_plan_envelope_id)
+                            break
+                    if _expected_supersedes is None:
+                        for _entry in reversed(state.hitl_history or []):
+                            if (isinstance(_entry, dict)
+                                    and _entry.get("event") == "plan_modify_requested"
+                                    and _entry.get("plan_revision") == state.plan_revision
+                                    and _entry.get("prior_plan_envelope_id")):
+                                _expected_supersedes = str(_entry["prior_plan_envelope_id"])
+                                break
                 _submitted_supersedes = (
                     str(plan_env.supersedes) if plan_env.supersedes else None)
                 if _submitted_supersedes != _expected_supersedes:
