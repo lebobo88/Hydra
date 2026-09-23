@@ -364,7 +364,9 @@ def _resolve_generator_vendor(env: dict) -> str:
     return "claude"
 
 
-def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
+def materialise_plan_steps(
+    state: HydraState, *, approved_resolution: bool = False
+) -> dict[str, Any]:
     """Hydra#69 defect A/B/E/H: the ONE decision function that turns an
     approved plan's `PlanStep`s into `TaskState`s. `node_plan_gate` (below)
     is a thin wrapper around this pure function — it is the in-graph caller,
@@ -409,6 +411,30 @@ def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
     again — this is what stops the placeholder (materialised at
     `plan_revision=0`, invisible to a revision-only stale check) from
     dispatching once the plan's real step tasks take over.
+
+    Hydra#69 follow-up defect 2 (revision): this function itself must refuse
+    to materialise while a `plan_gate` `pending_hitl` is STILL OPEN on the
+    given `state`, unless the caller explicitly proves an approval happened
+    via `approved_resolution=True`. Previously the only guard here rejected
+    a DIFFERENT open gate (`gate_node not in (None, "plan_gate")`) and
+    silently treated an open `plan_gate` itself as "fine, proceed" — so any
+    caller that reached this function with the gate still pending (not just
+    the one legitimate `cli.py` approve path) would approve+materialise
+    regardless of what action was actually requested. `cli.py`'s
+    `--gate-only` approve handler is the ONLY caller that legitimately hands
+    this function a state whose `pending_hitl` is still the open `plan_gate`
+    dict (it calls this against `_pre_state`, the PRE-patch checkpoint
+    snapshot, precisely because the post-patch view with the gate cleared
+    and the approve resolution appended doesn't exist as a real checkpoint
+    row yet) — and it does so only after confirming `action == "approve"`
+    and `option != "abort"`, so it passes `approved_resolution=True`
+    explicitly. `node_plan_gate` (the in-graph wrapper below) never needs to
+    pass it: by construction the graph only re-enters `plan_gate` after
+    `cli.py`'s resume handler has ALREADY written `pending_hitl=None` via
+    `sup.update_state` in the same atomic patch that appends the approve
+    resolution — every real graph invocation of this node therefore already
+    sees a cleared gate and materialises via the `cur is None` path below,
+    the same as it always has.
     """
     # H: a bypassed plan is not an approval — never touch it here.
     if state.plan_status == "bypassed":
@@ -417,6 +443,13 @@ def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
     cur = state.pending_hitl
     if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
         return {"phase": "approval"}
+    if isinstance(cur, dict) and cur.get("gate_node") == "plan_gate" and not approved_resolution:
+        # Defect 2: an open plan_gate with no proven approval is a no-op,
+        # not an implicit approve. Return {} (not {"phase": "approval"}) —
+        # this is indistinguishable, from the checkpoint's point of view,
+        # from never having been called at all: no tasks, no plan_status
+        # flip, no pending_hitl mutation, no placeholder supersession.
+        return {}
 
     plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
     valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]

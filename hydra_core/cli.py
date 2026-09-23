@@ -2615,7 +2615,16 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             and resolution.get("gate_node") == "plan_gate"):
         from .supervisor import materialise_plan_steps
         _pre_state = HydraState.model_validate(values)
-        _materialised_patch = materialise_plan_steps(_pre_state)
+        # Defect 2 (revision): _pre_state's pending_hitl is still the open
+        # plan_gate dict (this is the PRE-patch snapshot) -- the guard
+        # inside materialise_plan_steps now refuses to proceed on an open
+        # plan_gate unless the caller proves an approval. This branch has
+        # already confirmed `action == "approve" and not _plan_terminal_
+        # option and resolution.get("gate_node") == "plan_gate"` above, so
+        # the explicit flag is safe here and nowhere else in this module.
+        _materialised_patch = materialise_plan_steps(
+            _pre_state, approved_resolution=True
+        )
         patch.update(_materialised_patch)
         _plan_materialised_task_ids = [
             str(t.task_id) for t in (_materialised_patch.get("tasks") or [])

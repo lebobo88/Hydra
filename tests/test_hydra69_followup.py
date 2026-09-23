@@ -162,6 +162,101 @@ class TestFix1AbortDoesNotMaterialise:
 
 
 # =========================================================================== #
+# Fix 2 revision (HIGH) -- materialise_plan_steps itself refuses to run while
+# a plan_gate pending_hitl is still open, absent an explicit approval signal.
+# =========================================================================== #
+
+class TestFix2MaterialiseRefusesOpenGate:
+    def test_open_plan_gate_without_approval_is_a_no_op(self):
+        """The core of the revision: an open plan_gate `pending_hitl`, handed
+        to `materialise_plan_steps` with NO `approved_resolution` flag, must
+        produce a completely empty patch -- no tasks, no plan_status flip, no
+        pending_hitl mutation, no placeholder supersession."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        state = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=1,
+            plan_ref=_plan_ref(), plan_placeholder_task_ids=["ph-1"],
+            pending_hitl=_plan_pending("wf-guard"),
+        )
+        patch = materialise_plan_steps(state)
+        assert patch == {}, f"expected a pure no-op patch, got {patch}"
+
+    def test_open_plan_gate_with_explicit_approval_does_materialise(self):
+        """Counterpart: the SAME open-gate state, but with
+        `approved_resolution=True` (what `cli.py`'s `--gate-only` approve
+        handler passes after confirming action=='approve'), DOES
+        materialise -- proving the guard is a refusal of an UNPROVEN
+        approval, not of every open-gate call."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        state = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=1,
+            plan_ref=_plan_ref(), plan_placeholder_task_ids=["ph-1"],
+            pending_hitl=_plan_pending("wf-guard"),
+        )
+        patch = materialise_plan_steps(state, approved_resolution=True)
+        assert patch.get("plan_status") == "approved"
+        assert patch.get("pending_hitl") is None
+        step_tasks = [t for t in (patch.get("tasks") or [])
+                      if getattr(t, "plan_step_id", None) == "step-1"]
+        assert step_tasks, "an explicit approval must materialise the step task"
+        assert patch.get("plan_superseded_task_ids") == ["ph-1"]
+
+    def test_cleared_gate_materialises_without_the_flag(self):
+        """The `node_plan_gate` graph route: by the time the graph re-enters
+        `plan_gate`, `pending_hitl` is already cleared (the resume handler
+        wrote `pending_hitl=None` in the SAME atomic patch that recorded the
+        approve resolution, before `sup.invoke` ever ran) -- so the default
+        `approved_resolution=False` must still materialise when the gate is
+        already closed."""
+        from hydra_core.state import HydraState
+        from hydra_core.supervisor import materialise_plan_steps
+
+        state = HydraState(
+            root_goal="x", plan_status="judged", plan_revision=1,
+            plan_ref=_plan_ref(), plan_placeholder_task_ids=["ph-1"],
+            pending_hitl=None,
+        )
+        patch = materialise_plan_steps(state)
+        assert patch.get("plan_status") == "approved"
+        step_tasks = [t for t in (patch.get("tasks") or [])
+                      if getattr(t, "plan_step_id", None) == "step-1"]
+        assert step_tasks
+
+    def test_full_resume_approve_path_still_materialises_end_to_end(
+        self, monkeypatch, tmp_path,
+    ):
+        """Re-run (unchanged) of the existing approve-path behaviour through
+        the ACTUAL `_cmd_resume_locked` CLI entry point, proving the new
+        guard did not regress the legitimate `--gate-only` approve flow this
+        suite already pins in `TestFix1AbortDoesNotMaterialise`."""
+        monkeypatch.setenv("HYDRA_OPERATOR_ID", "lebobo88")
+        monkeypatch.setenv("HYDRA_OPERATOR_KEY", "test-key-material")
+        wf = str(uuid4())
+        pending = _plan_pending(wf)
+        values = {
+            "pending_hitl": pending, "phase": "approval",
+            "plan_status": "judged", "plan_ref": _plan_ref(), "plan_revision": 1,
+            "tasks": [], "plan_placeholder_task_ids": [],
+        }
+        sup = _SimpleFakeSup(pending, values)
+        _patch_common(monkeypatch, sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        args = _resume_args(tmp_path, wf, "approve", gate_only=True)
+        from hydra_core.cli import _cmd_resume_locked
+        ret = _cmd_resume_locked(args, tmp_path, wf, "approve", None)
+        assert ret == 0
+        assert sup._values.get("plan_status") == "approved"
+        step_tasks = [t for t in sup._values.get("tasks", [])
+                      if getattr(t, "plan_step_id", None) == "step-1"]
+        assert step_tasks, "gate-only approve must still materialise via the real CLI path"
+
+
+# =========================================================================== #
 # Fix 2 (HIGH) -- modify-budget at plan_gate never approves/dispatches
 # =========================================================================== #
 
@@ -566,30 +661,61 @@ class TestFix5PlaceholderSurvivesReplay:
 # =========================================================================== #
 
 class TestFix6AcceptanceCriteriaEnvelopeTypeCarried:
-    def test_build_payload_carries_ac_and_envelope_type(self):
-        from hydra_core.schemas import CSuiteDecisionPacket
+    def test_node_dispatch_build_payload_carries_ac_and_envelope_type(self):
+        """Drives the REAL `node_dispatch` closure (the actual supervisor
+        code path -- `_build_payload` is a private closure inside it, never
+        called directly by any other module) through the pure-Python runner,
+        with a capturing fake dispatcher standing in for the pp MCP boundary
+        (the lowest external boundary this path crosses). Asserts the
+        captured `start_run` payload -- the thing `_via_mcp` actually sends
+        downstream -- carries `acceptance_criteria` folded into
+        `request_text` and `hydra_envelope_type`, proving `_build_payload`'s
+        `CSuiteDecisionPacket` really did carry both fields end to end,
+        not just that a hand-built packet with the same field names would."""
+        from unittest.mock import MagicMock
+        from hydra_core.supervisor import build_supervisor
         from hydra_core.state import HydraState, TaskState
 
-        s = HydraState(root_goal="x")
-        s.target_repo_id = "hydra"
+        captured: list[dict] = []
+
+        def _call_mcp(server, tool, args, squad_id=None, **_kw):
+            if tool == "start_run":
+                captured.append(dict(args))
+                return {"status": "done", "result": {"run_id": "run-fix6"}}
+            return {"status": "done", "result": {}}
+
+        dispatcher = MagicMock()
+        dispatcher._tool_tracker = None
+        dispatcher.live_execution = False
+        # This is the in-graph (detached) mcp path node_dispatch's own defer
+        # guard reserves for a scripted pp dispatcher opting explicitly into
+        # offline dispatch (supervisor.py's `_offline_mcp_ok` check) — a
+        # non-live dispatcher without it is deferred to the host instead
+        # (the attended engineering route this test does NOT exercise).
+        dispatcher.allow_offline_mcp_dispatch = True
+        dispatcher.call_mcp.side_effect = _call_mcp
+
+        runner = build_supervisor(
+            project_root=REPO_ROOT, dispatcher=dispatcher, force_pure_python=True,
+        )
+        node_dispatch = dict(runner.steps)["dispatch"]
+
         task = TaskState(
             owner_squad="engineering", description="ship it",
             acceptance_criteria=["passes tests", "docs updated"],
             envelope_type="DEV_TASK", plan_step_id="step-1",
         )
-        # Mirrors supervisor.py's `_build_payload` exactly (same fields, same
-        # precedence) -- this is the real schema now, not a hand-duplicated
-        # subset.
-        payload = CSuiteDecisionPacket(
-            workflow_id=s.workflow_id, origin_squad="hydra",
-            target_squad=task.owner_squad, origin="BOARDROOM",
-            objective=task.description,
-            target_repo_id=task.target_repo_id if task.target_repo_id is not None else s.target_repo_id,
-            acceptance_criteria=list(task.acceptance_criteria or []) or None,
-            envelope_type=task.envelope_type,
-        )
-        assert payload.acceptance_criteria == ["passes tests", "docs updated"]
-        assert payload.envelope_type == "DEV_TASK"
+        state = HydraState(root_goal="x", tasks=[task])
+        state.target_repo_id = "hydra"
+
+        node_dispatch(state)
+
+        assert captured, "node_dispatch never reached start_run via _build_payload/_via_mcp"
+        req = captured[0]["request_text"]
+        assert "Acceptance criteria:" in req
+        assert "passes tests" in req
+        assert "docs updated" in req
+        assert captured[0].get("hydra_envelope_type") == "DEV_TASK"
 
     def test_via_mcp_folds_acceptance_criteria_into_request_text(self):
         from hydra_core.schemas import CSuiteDecisionPacket
@@ -670,11 +796,50 @@ langgraph = pytest.importorskip("langgraph")
 
 
 class _E2EDispatcher:
-    """Non-live stub: no MCP transport, real graph edges only."""
+    """The ONE stubbed boundary in this e2e test: the pp_harness MCP
+    transport (the external pair-programmer process Hydra talks to for
+    engineering stages). Everything else the test drives is a REAL Hydra
+    function -- `hydra plan`'s compiled graph (`_cmd_plan`), the real
+    attended cursor step/submit round-trip (`_cmd_attended_step` /
+    `_cmd_attended_submit`), the real gate-only resume handler
+    (`_cmd_resume_locked`), and the real finalize path (`_cmd_finalize`).
+    `live_execution=False` keeps `_claude_cli_generation_enabled` and the
+    fleet path off; `required_cross_vendor=False` lets a single
+    same-vendor "claude" judge verdict finalize without a second, distinct
+    judge producer (this test is not exercising cross-vendor judge routing,
+    which `tests/test_phase4_hardening.py` already covers end to end)."""
 
     live_execution = False
 
+    def __init__(self, project_root: Path | None = None):
+        self.calls: list[tuple[str, str, dict]] = []
+        # `dispatch_ingested_envelopes` (the real PLAN-ingest path
+        # `_cmd_attended_submit` drives) writes the plan artifact via
+        # `dispatcher.project_root` -- a real `MCPStdioDispatcher` always
+        # carries this; a bare stub without it produces a genuine
+        # "artifact_write_failed" plan rejection.
+        self.project_root = project_root
+
     def call_mcp(self, server, tool, args, *, squad_id=None):
+        self.calls.append((server, tool, dict(args)))
+        if tool == "start_run":
+            return {"status": "done", "result": {"run_id": "run-e2e-1"}}
+        if tool == "start_stage":
+            return {"status": "done", "result": {"stage_id": "stage-e2e-1"}}
+        if tool == "record_attempt":
+            return {"status": "done", "result": {"attempt_id": "att-e2e-1"}}
+        if tool == "gate_eligible_judges":
+            return {"status": "done", "result": {
+                "required_cross_vendor": False,
+                "rubric_id": "rfc-2119-normative"}}
+        if tool == "get_stage_finalize_readiness":
+            return {"status": "done", "result": {"can_pass": True}}
+        if tool == "finalize_run":
+            return {"status": "done", "result": {
+                "effective_status": "complete", "downgraded": False}}
+        # archive_artifact / record_verdict / record_smoke_status /
+        # finalize_stage / ensure_agents_md — no assertion needs their
+        # payload shape, just a well-formed "done" envelope.
         return {"status": "done", "result": {"ok": True}}
 
     def set_squad_packs(self, packs):
@@ -686,19 +851,58 @@ def _hermetic_e2e_project(tmp_path, monkeypatch) -> Path:
     project = tmp_path / "proj"
     project.mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO_ROOT / "CONSTITUTION.md", project / "CONSTITUTION.md")
+    # F27 preflight (cli.py `_cmd_attended_step`): the real engineering
+    # branch refuses to open a stage without these three agent stubs on
+    # disk under the target project. Copied from the real plugin assets so
+    # the real preflight check runs (not bypassed).
+    agents_src = REPO_ROOT / "plugins" / "hydra" / "agents"
+    agents_dst = project / "plugins" / "hydra" / "agents"
+    agents_dst.mkdir(parents=True, exist_ok=True)
+    for name in ("engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"):
+        shutil.copy(agents_src / name, agents_dst / name)
     from hydra_core.squad_loader import discover_squads as _real_discover_squads
     monkeypatch.setattr("hydra_core.cli.discover_squads",
                         lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
     monkeypatch.setattr("hydra_core.supervisor.discover_squads",
                         lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
+    # `_cmd_attended_step`'s engineering branch does a LOCAL
+    # `from .squad_loader import discover_squads as _discover` (cli.py),
+    # which reads `hydra_core.squad_loader.discover_squads` fresh at call
+    # time -- unaffected by the two module-attribute patches above. Patch
+    # the source function itself so every call site (including that local
+    # import) resolves squads against the real repo root instead of the
+    # disposable, squads/-less tmp `project`.
+    monkeypatch.setattr("hydra_core.squad_loader.discover_squads",
+                        lambda *_a, **_k: _real_discover_squads(REPO_ROOT))
     return project
 
 
 def test_e2e_plan_to_decision_record_real_checkpointer(monkeypatch, tmp_path):
+    """Drives the REAL sequence end to end: `hydra plan` (real compiled
+    graph, real node_planner/node_intake) -> real attended step opens the
+    planning task's cursor -> real attended submit ingests a schema-valid
+    PLAN through the SAME `dispatch_ingested_envelopes`/`_apply_plan_
+    reentry` call site production code uses -> parks at plan_gate -> real
+    gate-only approve (`_cmd_resume_locked`) -> real attended step opens
+    the materialised step-1 engineering cursor -> real attended submit for
+    BOTH the engineer generate result and the judge verdict, through
+    `host_bridge`'s real stage state machine -> real `_cmd_finalize`
+    reaches a DECISION_RECORD.
+
+    Two boundaries are stubbed, both at the lowest external edge Hydra
+    crosses, never inside Hydra's own step/submit/resume/finalize logic:
+    (1) `_E2EDispatcher` stands in for the pp_harness MCP transport (see
+    its own docstring); (2) `resolve_repo_project_path` is redirected to a
+    disposable, non-git tmp directory instead of the real "hydra" checkout
+    so `host_bridge.begin_stage`'s worktree isolation cleanly no-ops
+    (mirrors `tests/test_host_bridge.py`'s own bare-tmp_path pattern)
+    rather than cutting a real git worktree against this repo."""
     from hydra_core import cli as hydra_cli
-    from hydra_core.cli import _apply_plan_reentry, _cmd_resume_locked, _next_attended_task
-    from hydra_core.ingest import dispatch_ingested_envelopes, normalize_for_ingest
-    from hydra_core.squad_loader import discover_squads
+    from hydra_core import host_bridge
+    from hydra_core.cli import (
+        _cmd_attended_step, _cmd_attended_submit, _cmd_finalize,
+        _cmd_plan, _cmd_resume_locked,
+    )
     from hydra_core.state import HydraState
     from hydra_core.supervisor import build_supervisor, _PurePythonRunner
 
@@ -712,29 +916,69 @@ def test_e2e_plan_to_decision_record_real_checkpointer(monkeypatch, tmp_path):
         "hydra_core.governance.enforce_constitution",
         lambda *_a, **_k: type("V", (), {"aligned": True, "rationale": ""})(),
     )
+    # Smoke always passes -- the disposable target_repo below has no real
+    # build/test command; mirrors test_host_bridge.py / test_phase4_
+    # hardening.py's own `_smoke_passes` fixture pattern.
+    monkeypatch.setattr(host_bridge, "_run_smoke",
+                        lambda *a, **k: ("pass", "fixture smoke pass"))
 
     project = _hermetic_e2e_project(tmp_path, monkeypatch)
-    wf = uuid4()
-    config = {"configurable": {"thread_id": str(wf)}}
 
-    sup = build_supervisor(project_root=project, dispatcher=_E2EDispatcher())
+    target_repo = tmp_path / "target_repo"
+    target_repo.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("hydra_core.repo_registry.resolve_repo_project_path",
+                        lambda *_a, **_k: target_repo)
+
+    fake_dispatcher = _E2EDispatcher(project_root=project)
+    monkeypatch.setattr(hydra_cli, "_attended_live_dispatcher",
+                        lambda *_a, **_kw: fake_dispatcher)
+
+    # 1. Real `hydra plan`: intake -> node_planner, halts before dispatch.
+    #    --rigor=standard forces a plan-gated run (plan_rigor_override wins
+    #    over triage) so this test's plan-gate assertions do not depend on
+    #    the goal text's computed complexity.
+    plan_args = argparse.Namespace(
+        project=str(project), goal="ship the e2e regression",
+        squad="engineering", budget=None, repo="hydra", repos=None,
+        subdir=None, workflow_id_override=None, risk=None, rigor="standard",
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_plan(plan_args)
+    plan_out = json.loads(buf.getvalue())
+    assert rc == 0, plan_out
+    wf = plan_out["workflow_id"]
+    config = {"configurable": {"thread_id": wf}}
+
+    sup = build_supervisor(project_root=project, dispatcher=fake_dispatcher)
     if isinstance(sup, _PurePythonRunner):
         pytest.skip("compiled graph unavailable")
 
-    # 1. Seed the checkpoint as if node_planner had just run: a "planning"
-    #    task on record, plan_status="authoring".
-    seed_state = HydraState(
-        workflow_id=wf, root_goal="ship the e2e regression",
-        selected_squads=["engineering"], target_repo_id="hydra",
-        plan_status="authoring", plan_revision=1,
-    )
-    sup.update_state(config, seed_state.model_dump(mode="json"))
+    state = HydraState.model_validate(sup.get_state(config).values)
+    planning_tasks = [t for t in state.tasks if t.owner_squad == "planning"]
+    assert planning_tasks, f"hydra plan did not seed a planning task: {plan_out}"
+    planning_task = planning_tasks[0]
 
-    # 2. Submit a valid PLAN with one engineering step -> parks at plan_gate.
-    packs = discover_squads(REPO_ROOT)
+    # 2. Real attended step: opens the planning task's squad cursor
+    #    (claude-native entrypoint -- always host-attended).
+    step_args = argparse.Namespace(project=str(project), workflow_id=wf, verbose=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_attended_step(step_args)
+    step_out = json.loads(buf.getvalue())
+    assert rc == 0, step_out
+    cursor_file = Path(step_out["cursor_path"])
+    cursor = json.loads(cursor_file.read_text(encoding="utf-8"))
+    call_key = cursor["pending_action"]["call_key"]
+    assert call_key == f"squad-{planning_task.task_id}-0", cursor
+
+    # 3. Real attended submit: emit a schema-valid PLAN through the SAME
+    #    ingest/plan-reentry call site `_cmd_attended_submit` runs for every
+    #    native-pack result in production (dispatch_ingested_envelopes ->
+    #    _apply_plan_reentry) -- not a hand-invoked shortcut around it.
     raw_plan = {
         "id": str(uuid4()), "type": "PLAN", "origin_squad": "planning",
-        "target_squad": "hydra", "workflow_id": str(wf), "rigor": "standard",
+        "target_squad": "hydra", "workflow_id": wf, "rigor": "standard",
         "goal_restatement": "ship the e2e regression", "summary": "ship it",
         "plan_revision": 1,
         "steps": [{
@@ -744,65 +988,94 @@ def test_e2e_plan_to_decision_record_real_checkpointer(monkeypatch, tmp_path):
             "target_repo_id": "hydra",
         }],
     }
-    norm = normalize_for_ingest(raw_plan, lambda *_a, **_k: None)
-    state = HydraState.model_validate(sup.get_state(config).values)
-
-    class _IngestDispatcher:
-        project_root = project
-
-    outcome = dispatch_ingested_envelopes(
-        state, [norm], packs=packs, dispatcher=_IngestDispatcher(),
-        already_ingested=set(), emit_fn=lambda *_a, **_k: None,
+    plan_result_path = tmp_path / "plan_result.json"
+    plan_result_path.write_text(json.dumps({
+        "status": "complete", "emitted_envelopes": [raw_plan],
+    }), encoding="utf-8")
+    plan_submit_args = argparse.Namespace(
+        project=str(project), workflow_id=wf, run_id=str(planning_task.task_id),
+        call_key=call_key, result=str(plan_result_path), verbose=False,
     )
-    assert outcome.plan_patch, f"PLAN was not accepted: {[vars(i) for i in outcome.items]}"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_attended_submit(plan_submit_args)
+    plan_submit_out = json.loads(buf.getvalue())
+    assert rc == 0, plan_submit_out
+    assert plan_submit_out.get("ok") is True, plan_submit_out
+    assert plan_submit_out.get("status") not in ("plan_reentry_failed",), plan_submit_out
 
-    res: dict = {}
-    _apply_plan_reentry(
-        sup, config, project, str(wf), dict(outcome.plan_patch), raw_plan["id"], res,
-        emit_fn=lambda *a, **k: None, release_fn=lambda *a, **k: None,
-    )
-    assert res.get("status") != "plan_reentry_failed", res
     parked = getattr(sup.get_state(config), "next", None)
     assert tuple(parked) == ("plan_gate",), f"expected to park at plan_gate, got {parked}"
 
-    # 3. Gate-only approve -> materialises the step task.
-    args = argparse.Namespace(
-        project=str(project), workflow_id=str(wf), action="approve", option=None,
+    # 4. Real gate-only approve.
+    resume_args = argparse.Namespace(
+        project=str(project), workflow_id=wf, action="approve", option=None,
         live=False, verbose=False, operator="tester@example.com",
         critique_ref=None, gate_only=True,
     )
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        rc = _cmd_resume_locked(args, project, str(wf), "approve", None)
-    assert rc == 0
-    out = json.loads(buf.getvalue())
-    assert out.get("plan_status") == "approved", out
+        rc = _cmd_resume_locked(resume_args, project, wf, "approve", None)
+    resume_out = json.loads(buf.getvalue())
+    assert rc == 0, resume_out
+    assert resume_out.get("plan_status") == "approved", resume_out
 
     state = HydraState.model_validate(sup.get_state(config).values)
     step_tasks = [t for t in state.tasks if getattr(t, "plan_step_id", None) == "step-1"]
     assert len(step_tasks) == 1, f"expected exactly one materialised step task, got {state.tasks}"
     step_task = step_tasks[0]
 
-    # 4. Step returns an engineering host_action for step 1.
-    sel_task, sel_kind, _sel_pack = _next_attended_task(state, packs)
-    assert sel_kind == "engineering", f"expected engineering, got {sel_kind}"
-    assert str(sel_task.task_id) == str(step_task.task_id)
+    # 5. Real attended step: engineer host_action for step 1.
+    step_args2 = argparse.Namespace(project=str(project), workflow_id=wf, verbose=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_attended_step(step_args2)
+    step2_out = json.loads(buf.getvalue())
+    assert rc == 0, step2_out
+    assert step2_out["host_action"]["agent_type"] == "engineer", step2_out
+    assert step2_out["task_id"] == str(step_task.task_id), step2_out
+    gen_run_id = step2_out["run_id"]
 
-    # 5. Mark the step attended-complete (mirrors what _cmd_attended_submit
-    #    persists into the checkpoint on a real "complete" submit).
-    state.attended_completed_task_ids = [str(step_task.task_id)]
-    state.attended_done_task_ids = [str(step_task.task_id)]
-    state.attended_results = [{
-        "task_id": str(step_task.task_id), "owner_squad": "engineering",
-        "run_id": "run-1", "status": "complete", "final_status": "complete",
-        "summary": "shipped", "cost_usd": 0.1,
-    }]
-    state.phase = "synthesis"
-    sup.update_state(config, state.model_dump(mode="json"), as_node="judge_per_squad")
+    # 6. Real attended submit for the engineer's generate result, through
+    #    host_bridge's real stage state machine (await_generate ->
+    #    await_judge), with a fake RESULT PAYLOAD standing in for what a
+    #    real host `engineer` subagent would report (text/cost/tokens).
+    gen_result_path = tmp_path / "gen_result.json"
+    gen_result_path.write_text(json.dumps({
+        "status": "complete", "text": "implemented the change",
+        "cost_usd": 0.1, "tokens_in": 100, "tokens_out": 50,
+        "model": "claude-sonnet-5",
+    }), encoding="utf-8")
+    gen_submit_args = argparse.Namespace(
+        project=str(project), workflow_id=wf, run_id=str(gen_run_id),
+        call_key="generate-0", result=str(gen_result_path), verbose=False,
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_attended_submit(gen_submit_args)
+    gen_out = json.loads(buf.getvalue())
+    assert rc == 0, gen_out
+    assert gen_out.get("state") == "await_judge", gen_out
+    judge_call_key = gen_out["host_action"]["call_key"]
 
-    # 6. Finalize reaches a real DECISION_RECORD, not tasks_pending.
-    monkeypatch.setattr(hydra_cli, "_attended_live_dispatcher",
-                        lambda *_a, **_kw: _E2EDispatcher())
+    # 7. Real attended submit for the judge verdict -> stage finalizes.
+    judge_result_path = tmp_path / "judge_result.json"
+    judge_result_path.write_text(json.dumps({
+        "status": "complete", "outcome": "pass", "critique_md": "looks good",
+        "judge_producer": "claude", "cost_usd": 0.05,
+    }), encoding="utf-8")
+    judge_submit_args = argparse.Namespace(
+        project=str(project), workflow_id=wf, run_id=str(gen_run_id),
+        call_key=judge_call_key, result=str(judge_result_path), verbose=False,
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _cmd_attended_submit(judge_submit_args)
+    judge_out = json.loads(buf.getvalue())
+    assert rc == 0, judge_out
+    assert judge_out.get("status") == "complete", judge_out
+
+    # 8. Real finalize -> a real DECISION_RECORD, not tasks_pending.
     from hydra_core import memory as _mem
     episodic_db = tmp_path / "episodic.db"
     _orig_append = _mem.append_episodic
@@ -814,10 +1087,10 @@ def test_e2e_plan_to_decision_record_real_checkpointer(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_mem, "append_episodic", _patched_append)
 
-    fin_args = argparse.Namespace(project=str(project), workflow_id=str(wf), verbose=False)
+    fin_args = argparse.Namespace(project=str(project), workflow_id=wf, verbose=False)
     buf2 = io.StringIO()
     with contextlib.redirect_stdout(buf2):
-        rc2 = hydra_cli._cmd_finalize(fin_args)
+        rc2 = _cmd_finalize(fin_args)
     fin_out = json.loads(buf2.getvalue())
     assert rc2 == 0, fin_out
     assert fin_out.get("status") != "tasks_pending", fin_out
