@@ -653,6 +653,77 @@ def plan_revision_ceiling_reached(plan_revision: int, max_revisions: int) -> boo
     return max(0, plan_revision - 1) >= max_revisions
 
 
+def workflow_terminal_resolution(
+    values: dict, snap_next: "tuple | list | set" = (),
+) -> dict | None:
+    """Hydra#69 round 6 remaining-gap fix: the ONE predicate deciding whether
+    a checkpoint's workflow has already been terminally resolved (aborted, or
+    rejected at any gate) -- and therefore may never be continued, re-entered,
+    or finalized by ANY caller.
+
+    Primary source of truth is the durable ``HydraState.terminal_resolution``
+    field, written atomically in the single ``as_node="postcheck"`` checkpoint
+    write for every abort/reject at any gate (including the bare-interrupt
+    reject/abort paths). Returned as-is when present -- independent of
+    ``snap_next``, since a terminal workflow is terminal whether or not the
+    graph happens to still show a pending next node.
+
+    Falls back to a LEGACY-ONLY reconstruction, used only when ``values``
+    carries no durable ``terminal_resolution`` (a checkpoint written before
+    that field existed, or one that has never had a terminal resolution
+    recorded on it at all): scans ``hitl_history`` for the latest entry that
+    actually records a resolution (has a ``"resolution"`` key at all --
+    skipping past trailing non-resolution notes like the ``plan_gate_bypassed``
+    force-dispatch marker or a governance note, which must never mask a real
+    terminal decision underneath them), and treats it as terminal only if its
+    ``gate_node`` matches a node the graph is CURRENTLY parked at
+    (``snap_next``) and -- for ``plan_gate`` -- its ``plan_revision`` matches
+    the checkpoint's current ``plan_revision`` (a resolution only ever binds
+    to the exact gate occurrence it actually resolved). Returns ``None`` for a
+    genuine bare interrupt with no terminal history at the parked gate at all
+    (the MU7 case: graph paused before synthesis/judge_synthesis, never
+    resolved) -- callers must still allow that to continue.
+
+    This is the SINGLE implementation of both checks; every caller (resume,
+    attended-step, finalize, and any future entry point that can advance a
+    workflow) must consult this helper rather than re-deriving either the
+    durable read or the legacy scan, so they can never drift apart the way a
+    hand-duplicated predicate did before (see `plan_revision_ceiling_reached`
+    above for the same rationale).
+    """
+    terminal = values.get("terminal_resolution")
+    if isinstance(terminal, dict):
+        return terminal
+    hitl_history = values.get("hitl_history") or []
+    if not snap_next or not hitl_history:
+        return None
+    parked_at = set(snap_next)
+    current_plan_revision = values.get("plan_revision")
+    last: dict | None = None
+    for entry in reversed(hitl_history):
+        if not isinstance(entry, dict):
+            continue
+        if "resolution" not in entry:
+            # Legacy-path masking fix: a non-resolution note appended AFTER
+            # the real terminal decision must never be mistaken for "the
+            # latest entry" -- skip past it to find the actual resolution.
+            continue
+        last = entry
+        break
+    if last is None:
+        return None
+    if last.get("gate_node") not in parked_at:
+        return None
+    if last.get("gate_node") == "plan_gate":
+        # Instance identity: a plan_gate resolution only binds to the exact
+        # plan_revision it was recorded against.
+        if last.get("plan_revision") != current_plan_revision:
+            return None
+    if last.get("resolution") == "reject" or last.get("option") == "abort":
+        return last
+    return None
+
+
 def plan_gate_approve_evidence(state) -> dict | None:
     """Hydra#69 round 6 defect 4 (LOW): the ONE predicate deciding whether
     `hitl_history` proves a genuine (non-abort) `plan_gate` approve for

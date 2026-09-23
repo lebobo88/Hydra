@@ -62,6 +62,7 @@ from .state import (
     fold_acceptance_criteria_into_request_text,
     task_eligible_for_dispatch,
     task_retired,
+    workflow_terminal_resolution,
 )
 from .telemetry import emit, trace_path
 
@@ -621,6 +622,15 @@ def _cmd_repo(args) -> int:
 
 
 def _cmd_run(args) -> int:
+    # Remaining-gap audit (round 6 follow-up): `hydra run` / `hydra.workflow.
+    # launch` (detached launch/continue) always constructs a FRESH in-memory
+    # `HydraState(workflow_id=workflow_id, ...)` below and invokes the graph
+    # from a clean intake -- it never loads or continues an EXISTING
+    # checkpoint's state, so it cannot re-open a terminal workflow's prior
+    # progress. `--workflow-id` colliding with an existing (terminal or
+    # non-terminal) checkpoint's thread_id is pre-existing, undefined
+    # behaviour unrelated to `terminal_resolution` specifically (the Cockpit
+    # bridge always pre-allocates a FRESH uuid4()); out of scope for this fix.
     project = Path(args.project) if args.project else Path.cwd()
     # WS1 retry (finding 1): --repo and --repos are mutually exclusive on the
     # CLI transport too. The MCP transport already rejects this combination
@@ -1968,44 +1978,19 @@ def _bare_interrupt_terminal_resolution(
       - the latest entry genuinely IS a terminal resolution for the exact
         gate instance the checkpoint is parked at -> this returns that
         entry, and the caller refuses to continue.
+
+    Remaining-gap fix (round 6 follow-up): the actual scan now lives ONCE in
+    `state.workflow_terminal_resolution` -- every caller that can advance a
+    workflow (`_cmd_resume_locked`, `_cmd_attended_step`, `_cmd_finalize`)
+    consults that single implementation instead of each re-deriving it. This
+    function is kept as a thin, signature-compatible wrapper (hitl_history/
+    snap_next/current_plan_revision, rather than a `values` dict) for its
+    existing call sites and unit tests; it never re-implements the scan.
     """
-    if not snap_next or not hitl_history:
-        return None
-    parked_at = set(snap_next)
-    last: dict | None = None
-    for entry in reversed(hitl_history):
-        if not isinstance(entry, dict):
-            continue
-        if "resolution" not in entry:
-            # Legacy-path masking fix: a non-resolution note appended AFTER
-            # the real terminal decision (the `plan_gate_bypassed` force-
-            # dispatch marker, a governance note -- see
-            # `_append_plan_governance_note`) must never be mistaken for
-            # "the latest entry". Only an entry that actually records a
-            # resolution (has a "resolution" key at all, even if its value
-            # is a non-terminal "approve") is eligible to be treated as
-            # THE latest resolution this scan reasons about; skip past
-            # anything else to find it, exactly the way a genuine later
-            # approve/reject CYCLE (a real hitl_history entry) is already
-            # allowed to shadow an older terminal one.
-            continue
-        last = entry
-        break
-    if last is None:
-        return None
-    if last.get("gate_node") not in parked_at:
-        return None
-    if last.get("gate_node") == "plan_gate":
-        # Instance identity: a plan_gate resolution only binds to the exact
-        # plan_revision it was recorded against (mirrors
-        # `materialise_plan_steps`'s own "latest resolution for the CURRENT
-        # plan_revision" filter — see the round 5 follow-up comment on the
-        # `resolution["plan_revision"]` stamp in `_cmd_resume_locked`).
-        if last.get("plan_revision") != current_plan_revision:
-            return None
-    if last.get("resolution") == "reject" or last.get("option") == "abort":
-        return last
-    return None
+    return workflow_terminal_resolution(
+        {"hitl_history": hitl_history, "plan_revision": current_plan_revision},
+        snap_next,
+    )
 
 
 def _cmd_resume(args) -> int:
@@ -2256,18 +2241,15 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # mask this field the way scanning `hitl_history` alone could).
         # `None` here means either "genuinely never terminal" or "a legacy
         # checkpoint written before this field existed" -- both fall back to
-        # `_bare_interrupt_terminal_resolution`'s hitl_history scan, which is
+        # `workflow_terminal_resolution`'s hitl_history scan, which is
         # the ONLY durable signal a legacy checkpoint carries. A genuine
         # bare interrupt with no terminal resolution recorded either way
         # (MU7: paused before synthesis/judge_synthesis, never resolved)
-        # returns None here and falls through unaffected.
-        _state_terminal_resolution = values.get("terminal_resolution")
-        if isinstance(_state_terminal_resolution, dict):
-            _terminal_hist_entry = _state_terminal_resolution
-        else:
-            _terminal_hist_entry = _bare_interrupt_terminal_resolution(
-                values.get("hitl_history") or [], _snap_next,
-                current_plan_revision=values.get("plan_revision"))
+        # returns None here and falls through unaffected. Remaining-gap fix
+        # (round 6 follow-up): this is now the SAME shared helper
+        # `_cmd_attended_step`/`_cmd_finalize` consult, so all three entry
+        # points can never drift apart on what counts as terminal.
+        _terminal_hist_entry = workflow_terminal_resolution(values, _snap_next)
         if _snap_next and _terminal_hist_entry is not None:
             emit(project, wf, "hitl_resumed", {
                 "action": action,
@@ -4215,6 +4197,34 @@ def _cmd_attended_step(args) -> int:
             return 1
         state = HydraState.model_validate(snap.values)
 
+        # Remaining-gap fix (round 6 follow-up): a workflow whose
+        # `terminal_resolution` is durably set (or, for a legacy checkpoint,
+        # whose `hitl_history` records a terminal reject/abort at the parked
+        # gate) was operator-aborted or -rejected and must never be advanced
+        # by ANY caller -- including `hydra step`, which otherwise selects
+        # and dispatches the next attended task (opening a cursor / pp run /
+        # worktree) with no awareness of that resolution at all. Checked
+        # BEFORE `_run_first_step_dispatch_pass` (which can itself re-enter
+        # the graph) and before task selection, so a terminal workflow opens
+        # nothing. This takes precedence over `ready_to_finalize` and the
+        # plan terminals below -- a terminal resolution is definitionally
+        # more final than either. Uses the SAME helper `_cmd_resume_locked`
+        # and `_cmd_finalize` consult, so the three can never drift apart on
+        # what counts as terminal. A merely SURFACED (not terminal) workflow
+        # -- e.g. a stage a judge surfaced for operator review, with no
+        # operator abort/reject recorded -- is unaffected: the helper returns
+        # `None` for it and `hydra step` proceeds exactly as before.
+        _terminal = workflow_terminal_resolution(
+            snap.values, getattr(snap, "next", ()) or ())
+        if _terminal is not None:
+            print(_cli_json_dumps({
+                "ok": False,
+                "status": "workflow_terminal",
+                "workflow_id": wf,
+                "terminal_resolution": _terminal,
+            }, indent=2, default=str))
+            return 0
+
         # E2-32: no-approval workflows have no `approve` caller to leave the
         # plan_only dispatch interrupt — run that same pass here, once.
         if _run_first_step_dispatch_pass(sup, config, project, wf, snap, state):
@@ -4574,6 +4584,14 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     recovered stage is charged exactly once: ``already_charged`` (read off the
     cursor's persisted ``charged`` flag) gates the charge exactly as it does
     for a normal retried submit.
+
+    Remaining-gap audit (round 6 follow-up): same reasoning as `_cmd_
+    attended_submit` -- this reconciles an already-open, stranded CURSOR
+    (opened before the workflow could have become terminal, since `_cmd_
+    attended_step` now refuses to open one once `workflow_terminal_
+    resolution` is non-None) and never calls `sup.invoke`; it only patches
+    the checkpoint with the already-incurred cost/outcome. No `workflow_
+    terminal_resolution` guard needed.
     """
     from . import host_bridge
     if not option:
@@ -4876,7 +4894,21 @@ def _cmd_attended_submit(args) -> int:
     """Feed a host subagent's result back into an attended stage and advance it
     one step. On stage completion, charge the accrued cost on the checkpointed
     HydraState budget (keeping the 80%/100% tripwires live) and record the task
-    outcome — so attended execution is never budget-blind."""
+    outcome — so attended execution is never budget-blind.
+
+    Remaining-gap audit (round 6 follow-up): does NOT need a `workflow_
+    terminal_resolution` guard. This command only advances a CURSOR that
+    `_cmd_attended_step` already opened before the resume lock, and
+    `_cmd_attended_step` now refuses to open any new cursor once `workflow_
+    terminal_resolution` returns non-None -- so a cursor can only ever exist
+    here for a stage begun while the workflow was still non-terminal. It also
+    never calls `sup.invoke` (no graph re-entry) -- only `sup.update_state`
+    checkpoint patches recording the ALREADY-INCURRED cost/outcome of that
+    cursor (budget charge, `attended_completed_task_ids`, `attended_results`)
+    -- the same real-money bookkeeping the accepted item-1/item-2 charge-vs-
+    reconciliation split requires regardless of whether the workflow became
+    terminal, via a different gate, while the cursor was in flight. It never
+    selects or dispatches a NEW task."""
     from . import host_bridge
     from .governance import charge_and_gate, should_block_for_budget, should_downgrade_model
     project = Path(args.project) if args.project else Path.cwd()
@@ -5675,12 +5707,36 @@ def _cmd_finalize(args) -> int:
             return 1
 
         # Idempotent: a second call never re-synthesizes (that would duplicate
-        # the episodic rows RA-8 writes inside node_synthesis).
+        # the episodic rows RA-8 writes inside node_synthesis). Checked
+        # BEFORE the terminal-resolution guard below: a workflow finalized
+        # BEFORE it became terminal (it cannot become terminal afterwards --
+        # a finalized workflow has no pending gate left to abort/reject) must
+        # keep returning its already_finalized result unaffected.
         if state.attended_finalized_record_id:
             print(_cli_json_dumps({
                 "ok": True, "status": "already_finalized", "workflow_id": wf,
                 "decision_record_id": state.attended_finalized_record_id,
                 "phase": state.phase,
+            }, indent=2, default=str))
+            return 0
+
+        # Remaining-gap fix (round 6 follow-up): a workflow whose
+        # `terminal_resolution` is durably set (or, for a legacy checkpoint,
+        # whose `hitl_history` records a terminal reject/abort at the parked
+        # gate) was operator-aborted or -rejected and must never be
+        # finalized -- `_cmd_finalize` otherwise writes `phase="synthesis"`
+        # and re-enters the graph via `sup.update_state`/`sup.invoke` with no
+        # awareness of that resolution at all. Same shared helper
+        # `_cmd_resume_locked`/`_cmd_attended_step` consult, so all three can
+        # never drift apart on what counts as terminal.
+        _terminal = workflow_terminal_resolution(
+            snap.values, getattr(snap, "next", ()) or ())
+        if _terminal is not None:
+            print(_cli_json_dumps({
+                "ok": False,
+                "status": "workflow_terminal",
+                "workflow_id": wf,
+                "terminal_resolution": _terminal,
             }, indent=2, default=str))
             return 0
 
@@ -6668,6 +6724,14 @@ def _cmd_replay(args) -> int:
 
     Idempotency: a replay always produces a distinct new lineage; the source
     checkpoint is read-only and never mutated.
+
+    Remaining-gap audit (round 6 follow-up): does NOT need a `workflow_
+    terminal_resolution` guard. Replay never resumes or re-enters the SOURCE
+    workflow's own thread_id -- it mints a brand-new `replay_wf` and invokes
+    the graph fresh from `--from-phase` on that new id, leaving the source
+    checkpoint (and its `terminal_resolution`, if any) untouched. Replaying a
+    terminal source is a legitimate, explicit operator action (regression /
+    cost-study), not an accidental re-open of the terminal workflow itself.
     """
     project = Path(args.project) if args.project else Path.cwd()
     source_wf = str(args.workflow_id)
