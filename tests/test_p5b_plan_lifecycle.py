@@ -479,6 +479,10 @@ class TestTask2IngestBranch:
         # defect adds refuses it.
         state.plan_revision = 2
         state.plan_envelope_id = plan["id"]
+        # Hydra#69 follow-up defect 3: validated against
+        # `plan_supersedes_expected` now, not `plan_envelope_id` -- see that
+        # field's docstring (state.py).
+        state.plan_supersedes_expected = plan["id"]
         revised = _minimal_plan_dict(
             state.workflow_id, revision=2, supersedes=plan["id"])
         third = dispatch_ingested_envelopes(

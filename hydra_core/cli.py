@@ -58,7 +58,9 @@ from .state import (
     plan_barrier_active,
     plan_max_revisions,
     plan_revision_ceiling_reached,
+    fold_acceptance_criteria_into_request_text,
     task_eligible_for_dispatch,
+    task_retired,
 )
 from .telemetry import emit, trace_path
 
@@ -2367,6 +2369,49 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             print(_cli_json_dumps({"error": detail}), file=sys.stderr)
             return 1
 
+        # Hydra#69 follow-up defect 2 (HIGH): modify-budget at plan_gate must
+        # NEVER approve or dispatch -- it only updates the budget ceiling and
+        # re-files the SAME pending gate (see the re-file above). Previously
+        # this fell through to the shared tail: the gate_only route stopped
+        # short (never called sup.invoke), so the re-filed gate survived, but
+        # the DETACHED (non-gate_only) route continued to
+        # `sup.invoke(None, config=config)`, which resumes the graph past the
+        # `plan_gate` interrupt and runs `node_plan_gate` -> materialise_plan_
+        # steps with a pending_hitl that (from materialise_plan_steps's point
+        # of view) belongs to "plan_gate" -- indistinguishable from a genuine
+        # approve. Return HERE, on BOTH routes, before any of the shared
+        # force-dispatch / materialise / spool-prune / eights-ticket-resolve /
+        # sup.invoke machinery below runs. The gate's external TheEights
+        # ticket and spool entry are deliberately left untouched -- the gate
+        # is NOT resolved, only its budget context changed.
+        if resolution.get("gate_node") == "plan_gate":
+            sup.update_state(config, patch)
+            _post_snap = sup.get_state(config)
+            _post_values = _post_snap.values if _post_snap is not None and _post_snap.values else {}
+            emit(project, wf, "hitl_budget_modified_at_plan_gate", {
+                "action": action,
+                "gate_node": "plan_gate",
+                "new_budget_usd": new_budget_usd,
+            })
+            print(_cli_json_dumps({
+                "workflow_id": wf,
+                "ok": True,
+                "resumed": False,
+                "gate_only": gate_only,
+                "graph_reentered": False,
+                "action": action,
+                "phase": _post_values.get("phase", values.get("phase")),
+                "status": _post_values.get("phase", values.get("phase")),
+                "gate_node": "plan_gate",
+                "pending_hitl": _post_values.get("pending_hitl"),
+                "plan_status": _post_values.get("plan_status"),
+                "budget": _post_values.get("budget"),
+                "note": ("budget updated; plan_gate stays pending -- an "
+                         "explicit --action approve is still required to "
+                         "materialise the plan"),
+            }, indent=2))
+            return 0
+
     # P5c Task 2: --modify-plan. Validated and prepared here (alongside the
     # other per-action patch blocks); the actual graph re-entry happens
     # further down, in its own early-return branch next to reject/abort --
@@ -2550,8 +2595,24 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # function (and this one) are idempotent per-step (existing_by_step_id
     # already covers every task this call just created), so materialising
     # here AND letting the graph materialise again is safe, not a double-run.
+    # Hydra#69 follow-up defect 1 (HIGH): `option == "abort"` is a LEGITIMATE
+    # combination with `action == "approve"` -- the plan_gate's own
+    # revision_ceiling_reached / unjudgeable_plan branches advertise
+    # `options=["approve", "abort"]` with abort as the DEFAULT, so an
+    # operator (or a script driving the default option) genuinely resumes
+    # with action="approve", option="abort". The terminal decision below
+    # (`_terminal_resolution`, computed later for spool/eights-ticket
+    # scoping) must be decided HERE, BEFORE materialisation, not after: an
+    # abort must park atomically (phase="surfaced") without ever writing
+    # plan_status="approved" or creating step tasks, and without releasing
+    # the plan barrier ("judged" stays a _PLAN_BARRIER_STATES member). The
+    # `option == "abort"` handler further below only ever wrote
+    # phase="surfaced" -- by the time it ran, this block (when unguarded)
+    # had already materialised tasks and approved the plan.
+    _plan_terminal_option = option == "abort"
     _plan_materialised_task_ids: list[str] = []
-    if action == "approve" and resolution.get("gate_node") == "plan_gate":
+    if (action == "approve" and not _plan_terminal_option
+            and resolution.get("gate_node") == "plan_gate"):
         from .supervisor import materialise_plan_steps
         _pre_state = HydraState.model_validate(values)
         _materialised_patch = materialise_plan_steps(_pre_state)
@@ -2567,7 +2628,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         )
         resolution["plan_revision"] = values.get("plan_revision")
 
-    if gate_only and action == "approve" and resolution.get("gate_node") == "plan_gate":
+    if (gate_only and action == "approve" and not _plan_terminal_option
+            and resolution.get("gate_node") == "plan_gate"):
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
         # the generic (node-context-less) write below. `postcheck`'s only
         # outgoing edge is `after_postcheck` -> END unconditionally, so this
@@ -2722,6 +2784,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "plan_status": "authoring",
             "plan_revision": _modify_plan_new_revision,
             "tasks": [_modify_plan_task],
+            # Hydra#69 follow-up defect 3: stamp the expected predecessor
+            # HERE, once, when the revision is opened -- never overwritten by
+            # a later (possibly failed-then-retried) re-entry. See
+            # `plan_supersedes_expected`'s docstring (state.py).
+            "plan_supersedes_expected": (
+                str(_modify_plan_prior_envelope_id)
+                if _modify_plan_prior_envelope_id else None
+            ),
+            # Hydra#69 follow-up defect 5: explicit write, not an omission —
+            # a revision transition must carry the CURRENT
+            # `plan_superseded_task_ids` value forward unchanged (whatever
+            # `materialise_plan_steps` has already superseded stays
+            # superseded across a revision bump; nothing here is newly
+            # superseded by opening a revision). Mirrors `node_planner`'s
+            # identical LastValue-clear rationale — an omitted key on this
+            # `sup.update_state(..., as_node="dispatch")` patch would ALSO
+            # retain the prior value implicitly, but writing it explicitly
+            # keeps the invariant visible at every writer, not just readers.
+            "plan_superseded_task_ids": list(
+                values.get("plan_superseded_task_ids") or []
+            ),
         }, gate_only=gate_only)
         emit(project, wf, "plan_modify_requested", {
             "prior_plan_envelope_id": (
@@ -3549,14 +3632,20 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
 
     Hydra#69 defect B/F: a task whose id is in ``plan_superseded_task_ids``
     (the revision-0 whole-goal placeholder case a stale-revision-only check
-    missed) is excluded the same way — via ``task_eligible_for_dispatch``.
-    A task excluded only because ``plan_deps_satisfied`` is False stays safe
-    to drop here too: its unmet dependency is itself either done (in which
-    case it is not in this list any more) or itself still "pending" (in
-    which case IT keeps finalize blocked) — a dangling dependency on no
-    task at all cannot occur (``Plan._validate_dag`` rejects it at
-    construction), so at least one task in an unresolved dependency chain
-    always stays in this list.
+    missed) is excluded the same way — via ``task_retired``.
+
+    Hydra#69 follow-up defect 4 (HIGH): this used to filter with
+    ``task_eligible_for_dispatch``, which ALSO excludes a task that is
+    merely dependency-blocked (``plan_deps_satisfied`` is False) — not
+    retired, just not selectable yet. With an upstream A attended-completed
+    but only "surfaced" (not attended-DONE — see ``plan_deps_satisfied``'s
+    deliberate exclusion of that case) and downstream B depending on A,
+    that filter dropped B too, so this returned ``[]`` and
+    ``hydra finalize`` proceeded straight to synthesis with B never having
+    run. Use ``task_retired`` here instead — it excludes ONLY the two
+    genuinely-permanent cases (superseded, stale revision); a
+    dependency-blocked task stays in this list, exactly like the comment
+    below already promised.
     """
     done = set(getattr(state, "attended_completed_task_ids", []) or [])
     pending: list[str] = []
@@ -3566,7 +3655,7 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
             continue
         if t.status in ("done", "failed", "cancelled"):
             continue
-        if not task_eligible_for_dispatch(state, t):
+        if task_retired(state, t):
             continue
         pending.append(tid)
     return pending
@@ -3806,13 +3895,8 @@ def _cmd_attended_step(args) -> int:
             # engineer subagent actually reads. Previously the AC lived only
             # on TaskState.acceptance_criteria, which no code ever surfaced
             # into the request an engineer sees.
-            _task_ac = [c for c in (getattr(task, "acceptance_criteria", None) or [])
-                        if isinstance(c, str) and c.strip()]
-            if _task_ac:
-                request_text = (
-                    f"{request_text}\n\nAcceptance criteria:\n"
-                    + "\n".join(f"- {c}" for c in _task_ac)
-                )
+            request_text = fold_acceptance_criteria_into_request_text(
+                request_text, getattr(task, "acceptance_criteria", None))
 
             # F27: preflight — verify ALL THREE agent files exist before
             # staging host_actions that reference them.  If any is absent,
@@ -4091,13 +4175,16 @@ def _cmd_attended_step(args) -> int:
         # excluded from this candidate set BEFORE the eligibility check —
         # such a task is permanently resolved (never dispatches again), not
         # "blocked"; only an unmet `depends_on` counts as blocked here.
-        _superseded_ids = set(getattr(state, "plan_superseded_task_ids", None) or [])
         _blocked_deps = [
             str(t.task_id) for t in getattr(state, "tasks", [])
             if getattr(t, "status", None) not in ("done", "failed", "cancelled")
             and str(t.task_id) not in set(getattr(state, "attended_completed_task_ids", []) or [])
-            and str(t.task_id) not in _superseded_ids
-            and not (getattr(t, "plan_revision", 0) and t.plan_revision != state.plan_revision)
+            # Hydra#69 follow-up defect 4: use the shared `task_retired`
+            # predicate (state.py) for the "permanently resolved" exclusion
+            # instead of hand-duplicating the superseded/stale-revision
+            # checks here — the SAME two conditions `_attended_pending_
+            # task_ids` now uses for its own accounting.
+            and not task_retired(state, t)
             and not task_eligible_for_dispatch(state, t)
         ]
         if _blocked_deps:
@@ -4537,6 +4624,15 @@ def _cmd_attended_submit(args) -> int:
             return 1
         res = host_bridge.submit_host_result(
             dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result)
+        # Hydra#69 follow-up defect 3 (HIGH, part 2): every checkpoint write
+        # below this point was fallible but only ever emitted telemetry on
+        # failure -- the final response still reported `ok: True`, so a
+        # caller had no way to know the cursor's outcome (budget charge,
+        # attended_completed_task_ids, attended_results, plan_submit_attempts,
+        # ...) never actually reached the LangGraph checkpoint. Collect every
+        # such failure here and downgrade the final response instead of
+        # silently reporting success.
+        _persist_errors: list[str] = []
 
         # On terminal: charge budget on the authoritative HydraState ledger and
         # record the task outcome into the checkpoint.
@@ -4683,6 +4779,7 @@ def _cmd_attended_submit(args) -> int:
                             })
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                            _persist_errors.append(str(e))
                     else:
                         # Budget/open-run bookkeeping is unconditional — the
                         # host attempt genuinely spent cost regardless of
@@ -4702,6 +4799,7 @@ def _cmd_attended_submit(args) -> int:
                             })
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                            _persist_errors.append(str(e))
 
                     # A native pack may emit typed work for a sibling squad.
                     # Route it through the same boundary validation, redaction,
@@ -4820,6 +4918,7 @@ def _cmd_attended_submit(args) -> int:
                             except Exception as exc:  # noqa: BLE001
                                 emit(project, wf, "attended.emitted_persist_failed",
                                      {"error": str(exc)})
+                                _persist_errors.append(str(exc))
                             if outcome.plan_patch:
                                 plan_reentry_patch = dict(outcome.plan_patch)
                                 # Tracked separately from `processed`/the
@@ -4882,6 +4981,7 @@ def _cmd_attended_submit(args) -> int:
                                 })
                             except Exception as e:  # noqa: BLE001
                                 emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                                _persist_errors.append(str(e))
                         else:
                             _rejection = _classify_plan_rejection(
                                 emitted, outcomes if "outcomes" in locals() else [], res)
@@ -4901,6 +5001,7 @@ def _cmd_attended_submit(args) -> int:
                             except Exception as e:  # noqa: BLE001
                                 emit(project, wf, "attended.persist_failed",
                                      {"error": str(e)})
+                                _persist_errors.append(str(e))
                             emit(project, wf, "attended.plan_rejected", {
                                 "task_id": str(tid),
                                 "reason": _rejection.get("reason"),
@@ -4910,6 +5011,21 @@ def _cmd_attended_submit(args) -> int:
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
                                               "status": res.get("status")})
+        # Hydra#69 follow-up defect 3 (part 2): never report `ok: True` when
+        # one or more checkpoint writes above failed -- the cursor-side
+        # outcome (host_bridge.submit_host_result) succeeded, but the
+        # authoritative HydraState checkpoint may be missing the budget
+        # charge, the completion record, or the plan re-entry -- a caller
+        # that only checks `ok` must be told the checkpoint is not
+        # trustworthy, not silently handed a happy-path response.
+        if _persist_errors:
+            print(_cli_json_dumps({
+                "ok": False,
+                "error": "checkpoint_persist_failed",
+                "checkpoint_persist_errors": _persist_errors,
+                **res,
+            }, indent=2, default=str))
+            return 1
         print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
         return 0
     finally:
