@@ -4585,13 +4585,25 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     cursor's persisted ``charged`` flag) gates the charge exactly as it does
     for a normal retried submit.
 
-    Remaining-gap audit (round 6 follow-up): same reasoning as `_cmd_
-    attended_submit` -- this reconciles an already-open, stranded CURSOR
-    (opened before the workflow could have become terminal, since `_cmd_
-    attended_step` now refuses to open one once `workflow_terminal_
-    resolution` is non-None) and never calls `sup.invoke`; it only patches
-    the checkpoint with the already-incurred cost/outcome. No `workflow_
-    terminal_resolution` guard needed.
+    Remaining-gap audit (round 6 follow-up, CORRECTED -- a cross-vendor judge
+    found the original version of this comment wrong): this DOES need a
+    `workflow_terminal_resolution` guard. `_cmd_attended_step` only refuses
+    to open a NEW cursor once the workflow is terminal -- it does nothing
+    about a cursor that was already stranded (`stalled_infra`/`surfaced`)
+    from BEFORE the workflow went terminal through a *different* gate.
+    `host_bridge.recover_stalled_stage` can still call `_finalize(...,
+    passed=passed)` (which, for the `stalled_infra` shape, merges the
+    worktree back on a pass) and, for a `surfaced` cursor, calls
+    `_merge_branch_back` directly -- both land preserved work into the
+    target repo, which is exactly "continuing" a terminal workflow. The
+    checkpoint's terminal status is read FIRST, before recovery runs, and
+    threaded down as `workflow_terminal=True` so recovery can still
+    reconcile the pp ledger (record_verdict/finalize_stage/finalize_run
+    bookkeeping for spend that already happened) and this call's
+    already-incurred cost is still charged exactly once, but the merge
+    itself is refused and the branch is preserved for manual operator
+    pickup instead -- mirroring `_cmd_attended_submit`'s pre-submit terminal
+    read exactly.
     """
     from . import host_bridge
     if not option:
@@ -4607,7 +4619,20 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
               file=sys.stderr)
         return 1
 
-    res = host_bridge.recover_stalled_stage(dispatcher, cursor_file=cfile)
+    from .supervisor import build_supervisor as _pre_bs, _PurePythonRunner as _pre_ppr
+    _pre_terminal = None
+    _pre_sup = _pre_bs(project_root=project, dispatcher=dispatcher)
+    if not isinstance(_pre_sup, _pre_ppr):
+        _pre_config = {"configurable": {"thread_id": wf}}
+        _pre_snap = _pre_sup.get_state(_pre_config)
+        if _pre_snap is not None and _pre_snap.values:
+            _pre_terminal = workflow_terminal_resolution(
+                _pre_snap.values, getattr(_pre_snap, "next", ()) or ())
+
+    res = host_bridge.recover_stalled_stage(
+        dispatcher, cursor_file=cfile, workflow_terminal=_pre_terminal is not None)
+    if _pre_terminal is not None:
+        res["workflow_terminal"] = _pre_terminal
     if not res.get("ok", True):
         print(_cli_json_dumps(res, indent=2, default=str), file=sys.stderr)
         return 1

@@ -1455,6 +1455,57 @@ def test_recover_stalled_stage_via_resume_action(tmp_path):
     assert disp.count("finalize_run") == 1
 
 
+def test_recover_stalled_stage_workflow_terminal_stalled_infra_refuses_merge(tmp_path):
+    """Hydra#69 round 6 remaining-gap fix: `recover-stalled-stage` must never
+    continue a terminal workflow. A `stalled_infra` cursor that WOULD pass
+    (worktree still present, verdict already pass) reaches
+    `host_bridge.recover_stalled_stage` with `workflow_terminal=True` (the
+    caller having already read this from the authoritative checkpoint) --
+    the pp-ledger bookkeeping for the already-incurred attempt/verdict still
+    runs exactly once, but the worktree merge-back is refused and the branch
+    is preserved for manual operator pickup instead of landing in the repo."""
+    from pathlib import Path
+    _init_repo(tmp_path)
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-rec-term", run_id="run-rec-term",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+    Path(wt, "feature.py").write_text("print('hi')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-run-rec-term-stage-1-att-1-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
+    assert res["state"] == "stalled_infra"
+    assert Path(wt).exists()
+
+    disp.recover()
+    rec = host_bridge.recover_stalled_stage(
+        disp, cursor_file=res["cursor_path"], workflow_terminal=True)
+
+    assert rec["ok"] is True
+    assert rec["workflow_terminal"] is True
+    # Never merged -- the workflow was already terminal, so recovery must
+    # refuse to land code even though the underlying stage would have passed.
+    assert rec["merge"]["merged"] is False
+    assert not (tmp_path / "feature.py").exists(), (
+        "recovery must never land code once the workflow is terminal"
+    )
+    assert rec.get("preserved_branch") or rec.get("merge", {}).get("error"), (
+        "the branch must be preserved / the refusal explained, not silently "
+        "discarded"
+    )
+    # The pp-ledger bookkeeping for the already-incurred attempt/verdict
+    # still ran exactly once (real spend already happened).
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    assert rec["cost_usd"] == pytest.approx(0.05)
+
+
 def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path):
     """The pre-fix shape: a cursor already finalized 'surfaced' with a
     preserved_branch and no verdict_recorded_for (the worktree is gone, but
@@ -1523,6 +1574,99 @@ def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path
     # skipping charge_and_gate, but recover_stalled_stage itself never touches
     # budget -- confirm the flag survives untouched.
     assert rec["already_charged"] is True
+
+
+def test_recover_stalled_stage_workflow_terminal_surfaced_never_calls_merge_branch_back(
+    tmp_path, monkeypatch,
+):
+    """Hydra#69 round 6 remaining-gap fix: the legacy 'surfaced' recovery
+    shape merges directly from a preserved branch via `_merge_branch_back` --
+    once the workflow is terminal, that call must never happen at all (not
+    just refuse after running). Assert on the function object itself so a
+    regression that re-introduces an unconditional call is caught even if
+    `_merge_branch_back`'s own internals later change to look like a no-op
+    success."""
+    _init_repo(tmp_path)
+    branch = "attended/legacy-run-terminal"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature_terminal.py").write_text(
+        "print('legacy terminal')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    called = {"merge_branch_back": 0}
+    real_merge = host_bridge._merge_branch_back
+
+    def _tripwire(*a, **kw):
+        called["merge_branch_back"] += 1
+        return real_merge(*a, **kw)
+
+    monkeypatch.setattr(host_bridge, "_merge_branch_back", _tripwire)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy-term" / "attended" / "run_legacy_term.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy-term",
+        "run_id": "run_legacy_term",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": False,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-terminal-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(
+        disp, cursor_file=cfile, workflow_terminal=True)
+
+    assert called["merge_branch_back"] == 0, (
+        "_merge_branch_back must never be called once the workflow is terminal"
+    )
+    assert rec["ok"] is True
+    assert rec["workflow_terminal"] is True
+    assert rec["merge"]["merged"] is False
+    assert rec["merge"]["error"] == "workflow_terminal"
+    assert not (tmp_path / "legacy_feature_terminal.py").exists(), (
+        "the branch's work must never land in repo_root once terminal"
+    )
+    # The branch itself is untouched (recovery never ran a merge against it),
+    # so it is still exactly as recoverable as before this call.
+    chk = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=tmp_path,
+                         capture_output=True, text=True)
+    assert chk.returncode == 0, "the preserved branch must survive a terminal refusal"
+    # The pp-ledger reconciliation (record_verdict for the already-incurred
+    # attempt) still ran exactly once.
+    assert disp.count("record_verdict") == 1
 
 
 def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_path, monkeypatch):

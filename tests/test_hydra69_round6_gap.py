@@ -414,3 +414,134 @@ class TestLegacyStaleRejectAtDifferentGateOccurrenceIsNotRefused:
             f"a stale reject bound to an OLDER plan_revision must never "
             f"refuse `finalize` for a fresh, never-resolved occurrence: {body}"
         )
+
+
+# =========================================================================== #
+# Remaining gap (authoritative, this round): `recover-stalled-stage` could
+# still continue/re-open a terminal workflow -- `_cmd_recover_stalled_stage`
+# never consulted `workflow_terminal_resolution` before dispatching to
+# `host_bridge.recover_stalled_stage`, which can call `_finalize(...,
+# passed=passed)` (merging a worktree on a pass) or, for a surfaced cursor,
+# `_merge_branch_back` directly. These tests prove the CLI wiring: the
+# checkpoint's terminal status is read FIRST and threaded into
+# `host_bridge.recover_stalled_stage` as `workflow_terminal=`, and the
+# already-incurred cost is still charged exactly once even when refused.
+# The actual merge-refusal behaviour inside `host_bridge.recover_stalled_
+# stage` itself is proven separately in `tests/test_host_bridge.py`
+# (`test_recover_stalled_stage_workflow_terminal_stalled_infra_refuses_merge`
+# / `test_recover_stalled_stage_workflow_terminal_surfaced_never_calls_
+# merge_branch_back`).
+# =========================================================================== #
+
+class TestRemainingGapRecoverStalledStageRefusesTerminalWorkflow:
+    def _seed_cursor(self, wf, run_id):
+        from hydra_core import host_bridge
+        cfile = host_bridge.cursor_path(HYDRA_ROOT, wf, run_id)
+        cfile.parent.mkdir(parents=True, exist_ok=True)
+        host_bridge.save_cursor(cfile, {
+            "schema": host_bridge.CURSOR_SCHEMA, "kind": "engineering",
+            "workflow_id": wf, "run_id": run_id, "state": "stalled_infra",
+        })
+        return cfile
+
+    def _recover(self, monkeypatch, wf, run_id, *, spy_result, seen):
+        from hydra_core import host_bridge
+
+        def _fake_recover(dispatcher, *, cursor_file, workflow_terminal=False):
+            seen.append(workflow_terminal)
+            return dict(spy_result)
+
+        monkeypatch.setattr(host_bridge, "recover_stalled_stage", _fake_recover)
+        args = argparse.Namespace(project=str(HYDRA_ROOT), workflow_id=wf, verbose=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = cli._cmd_recover_stalled_stage(args, HYDRA_ROOT, wf, run_id)
+        out = buf.getvalue()
+        start = out.index("{")
+        return rc, json.loads(out[start:])
+
+    def test_recover_threads_workflow_terminal_true_and_charges_cost_once(
+        self, hermetic, monkeypatch,
+    ):
+        task = TaskState(owner_squad="engineering", description="ship the feature")
+        wf, sup, config = _seed_durable_terminal_workflow(
+            action="reject", option=None, tasks=[task])
+        run_id = "run-recover-terminal-1"
+        cfile = self._seed_cursor(wf, run_id)
+        try:
+            seen: list[bool] = []
+            rc, body = self._recover(monkeypatch, wf, run_id, spy_result={
+                "ok": True, "status": "surfaced", "state": "surfaced",
+                "run_id": run_id, "stage_id": "stage-1", "task_id": str(task.task_id),
+                "squad_slug": "engineering", "cost_usd": 0.35,
+                "tokens_in": 10, "tokens_out": 5, "cost_source": "measured",
+                "merge": {"merged": False, "error": "workflow_terminal"},
+                "already_charged": False,
+            }, seen=seen)
+
+            assert rc == 0, body
+            assert seen == [True], (
+                "the CLI must read the checkpoint's terminal status BEFORE "
+                "calling host_bridge.recover_stalled_stage and thread it "
+                f"through as workflow_terminal=True; saw {seen!r}"
+            )
+            assert body["ok"] is True
+            assert body["workflow_terminal"]["action"] == "reject"
+            assert body["merge"]["merged"] is False
+            assert body["merge"]["error"] == "workflow_terminal"
+
+            values = sup.get_state(config).values
+            spent = float((values.get("budget") or {}).get("spent_usd") or 0.0)
+            assert spent == pytest.approx(0.35), (
+                "the already-incurred cost of this recovery call must still "
+                f"be charged exactly once; spent_usd={spent!r}"
+            )
+
+            # A second identical recovery call (e.g. a retried operator
+            # invocation) must never re-charge -- idempotency is unaffected
+            # by the terminal refusal.
+            seen2: list[bool] = []
+            rc2, body2 = self._recover(monkeypatch, wf, run_id, spy_result={
+                "ok": True, "status": "surfaced", "state": "surfaced",
+                "run_id": run_id, "stage_id": "stage-1", "task_id": str(task.task_id),
+                "squad_slug": "engineering", "cost_usd": 0.35,
+                "tokens_in": 10, "tokens_out": 5, "cost_source": "measured",
+                "merge": {"merged": False, "error": "workflow_terminal"},
+                "already_charged": True,
+            }, seen=seen2)
+            assert rc2 == 0, body2
+            values2 = sup.get_state(config).values
+            spent2 = float((values2.get("budget") or {}).get("spent_usd") or 0.0)
+            assert spent2 == pytest.approx(0.35), (
+                "a retried recovery call must never double-charge"
+            )
+        finally:
+            import shutil
+            shutil.rmtree(cfile.parent.parent, ignore_errors=True)
+
+    def test_recover_threads_workflow_terminal_false_for_non_terminal_workflow(
+        self, hermetic, monkeypatch,
+    ):
+        task = TaskState(owner_squad="engineering", description="ship the feature")
+        wf, sup, config = _seed_non_terminal_workflow(tasks=[task])
+        run_id = "run-recover-nonterminal-1"
+        cfile = self._seed_cursor(wf, run_id)
+        try:
+            seen: list[bool] = []
+            rc, body = self._recover(monkeypatch, wf, run_id, spy_result={
+                "ok": True, "status": "complete", "state": "complete",
+                "run_id": run_id, "stage_id": "stage-1", "task_id": str(task.task_id),
+                "squad_slug": "engineering", "cost_usd": 0.20,
+                "tokens_in": 10, "tokens_out": 5, "cost_source": "measured",
+                "merge": {"merged": True}, "already_charged": False,
+            }, seen=seen)
+
+            assert rc == 0, body
+            assert seen == [False], (
+                f"a non-terminal workflow must pass workflow_terminal=False "
+                f"(recovery behaviour byte-for-byte unchanged); saw {seen!r}"
+            )
+            assert "workflow_terminal" not in body
+        finally:
+            import shutil
+            shutil.rmtree(cfile.parent.parent, ignore_errors=True)

@@ -3450,7 +3450,8 @@ def _apply_squad_result(
 
 
 def recover_stalled_stage(dispatcher: Dispatcher, *,
-                          cursor_file: str | Path) -> dict[str, Any]:
+                          cursor_file: str | Path,
+                          workflow_terminal: bool = False) -> dict[str, Any]:
     """W2-4: sanctioned recovery for an engineering stage stranded by a
     transport-shaped pp-ledger failure.
 
@@ -3498,6 +3499,22 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     only way that can happen for the pre-fix "surfaced" shape, since its
     original submit charged on the downgraded outcome before this fix existed)
     is never charged a second time.
+
+    Round 6 gap fix: ``workflow_terminal=True`` means the caller already
+    determined -- from the authoritative HydraState checkpoint -- that this
+    workflow has a durable ``terminal_resolution``. Recovery MUST still be
+    able to reconcile the pp ledger for cost/verdict bookkeeping that already
+    happened (exactly once, same as ``submit_host_result``), but it must
+    never CONTINUE a terminal workflow by landing code: for the
+    ``stalled_infra`` shape this threads straight into ``_finalize``, which
+    already refuses the worktree merge-back when ``workflow_terminal`` is
+    set; for the ``surfaced`` shape it refuses to call ``_merge_branch_back``
+    at all (the merge itself is the one side effect that lands preserved
+    work into the target repo) and instead reports
+    ``merge={"merged": False, "error": "workflow_terminal"}`` while the
+    branch stays preserved (untouched, uncommitted-nothing-lost) for manual
+    operator pickup, exactly like the existing "merge failed" branch already
+    does for other merge refusals.
     """
     cm = dispatcher.call_mcp
     cursor = load_cursor(cursor_file)
@@ -3596,11 +3613,15 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             passed = smoke_status == "pass"
         _trace(cursor, "attended.recovery.resuming_finalize", {
             "stage_id": stage_id, "outcome": outcome, "passed": passed,
+            "workflow_terminal": workflow_terminal,
         })
-        _finalize(dispatcher, cursor, passed=passed, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = True
+        if workflow_terminal:
+            out["workflow_terminal"] = True
         return out
 
     # state == "surfaced": worktree is gone; merge directly from the
@@ -3608,17 +3629,35 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     # above), then best-effort re-finalize.
     repo_root = cursor.get("repo_root") or cursor.get("project_path")
     branch = recovery_branch
-    merge = _merge_branch_back(repo_root, branch)
+    if workflow_terminal:
+        # Round 6 gap fix: never call `_merge_branch_back` once the workflow
+        # is terminal -- that call is the one side effect here that would
+        # actually land preserved work into `repo_root`. The branch (already
+        # resolved above, either `preserved_branch` or the existing
+        # `cursor["branch"]`) stays exactly as it was -- nothing further to
+        # preserve, since recovery never touched it -- for manual operator
+        # pickup instead.
+        merge = {"merged": False, "error": "workflow_terminal"}
+    else:
+        merge = _merge_branch_back(repo_root, branch)
     cursor["merge"] = merge
     _trace(cursor, "attended.recovery.merge", {
         "stage_id": stage_id, "branch": branch, "merged": merge.get("merged"),
-        "error": merge.get("error"),
+        "error": merge.get("error"), "workflow_terminal": workflow_terminal,
     })
     if not merge.get("merged"):
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = False
-        if merge.get("error") == "already_merged":
+        if workflow_terminal:
+            out["ok"] = True
+            out["workflow_terminal"] = True
+            out["error"] = (
+                "recovery refused to merge: workflow is terminal "
+                f"(branch {branch!r} preserved in {repo_root} for manual "
+                "operator pickup)"
+            )
+        elif merge.get("error") == "already_merged":
             # State-shaped, not failure-shaped: the branch's work is
             # ALREADY present in repo_root (git reported "Already up to
             # date." -- no new commit was needed or created). That is not
