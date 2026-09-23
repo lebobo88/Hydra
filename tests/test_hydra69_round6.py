@@ -954,3 +954,185 @@ class TestFollowupDefect2TerminalHistoryGateInstanceIdentity:
             f"a fresh, unresolved plan_gate occurrence at a bumped revision "
             f"must not be blocked by an older revision's stale reject: {body}"
         )
+
+
+# =========================================================================== #
+# Item 3 REDESIGN (round 6, this drop): every abort/reject at ANY gate
+# durably records `HydraState.terminal_resolution` in the SAME
+# `as_node="postcheck"` write, and the bare-interrupt branch consults that
+# field directly -- instead of scanning `hitl_history` -- so a LATER
+# non-resolution note appended to `hitl_history` (e.g. `plan_gate_bypassed`)
+# can never mask an earlier terminal reject/abort. `_bare_interrupt_terminal_
+# resolution` (the old hitl_history scan) is now a fallback used ONLY when
+# `terminal_resolution` reads back `None` (a legacy checkpoint, or a
+# checkpoint that has never had a terminal resolution recorded on it).
+# =========================================================================== #
+
+def _seed_bare_interrupt_workflow():
+    """Seed a REAL LangGraph checkpoint parked at the `approval` interrupt
+    with NO `pending_hitl` at all -- a bare interrupt, mirroring the MU7
+    shape but for the terminal-abort/reject-at-a-bare-interrupt paths this
+    test class covers."""
+    from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+    wf = uuid4()
+    state = HydraState(
+        workflow_id=wf, root_goal="round 6 item 3 bare-interrupt repro",
+        phase="approval", pending_hitl=None, tasks=[], requires_human_approval=True,
+    )
+    sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+    assert not isinstance(sup, _PurePythonRunner), "langgraph required for this test"
+    config = {"configurable": {"thread_id": str(wf)}}
+    sup.update_state(config, state.model_dump(mode="json"), as_node="planner")
+    snap = sup.get_state(config)
+    assert tuple(snap.next) == ("approval",), (
+        f"fixture must park at a bare interrupt before 'approval'; got next={snap.next!r}"
+    )
+    return str(wf), sup, config
+
+
+class TestItem3TerminalResolutionField:
+    def test_bare_interrupt_reject_writes_single_terminal_resolution(self, hermetic):
+        """Required test (3): a bare-interrupt reject must fold its park into
+        ONE `as_node="postcheck"` write that leaves `next == ()` and records
+        `terminal_resolution` -- not the old generic, node-context-less
+        `{"phase": "surfaced"}` write."""
+        wf, sup, config = _seed_bare_interrupt_workflow()
+
+        rc, body = _resume(HYDRA_ROOT, wf, "reject", None)
+        assert rc == 0, body
+        snap = sup.get_state(config)
+        assert tuple(snap.next) == (), (
+            "a bare-interrupt reject must force next==() via as_node=postcheck"
+        )
+        term = snap.values.get("terminal_resolution")
+        assert term is not None, (
+            "a bare-interrupt reject must durably record terminal_resolution, "
+            "not just report 'surfaced' for this one response"
+        )
+        assert term.get("action") == "reject"
+        assert term.get("gate_node") is None
+        assert term.get("hitl_request_id") is None
+        assert term.get("resolved_at")
+
+        # A later, DIFFERENT-action retry must still never continue the graph.
+        rc2, body2 = _resume(HYDRA_ROOT, wf, "approve", None)
+        assert rc2 == 0, body2
+        assert body2.get("resumed") is False
+        assert not body2.get("continued_bare_interrupt"), (
+            f"a retry after a durably recorded bare-interrupt reject must "
+            f"never continue the graph: {body2}"
+        )
+
+    def test_bare_interrupt_abort_writes_single_terminal_resolution(self, hermetic):
+        """First-time bare-interrupt abort (no prior durable terminal record
+        for this parked gate) must ALSO write terminal_resolution, not just
+        report 'already terminal' without ever persisting it -- reverting
+        this fix leaves a later plain '--action approve' retry free to
+        continue the graph."""
+        wf, sup, config = _seed_bare_interrupt_workflow()
+
+        rc, body = _resume(HYDRA_ROOT, wf, "approve", "abort")
+        assert rc == 0, body
+        snap = sup.get_state(config)
+        assert tuple(snap.next) == ()
+        term = snap.values.get("terminal_resolution")
+        assert term is not None
+        assert term.get("action") == "approve"
+        assert term.get("option") == "abort"
+        assert term.get("resolved_at")
+
+        rc2, body2 = _resume(HYDRA_ROOT, wf, "approve", None)
+        assert rc2 == 0, body2
+        assert not body2.get("continued_bare_interrupt"), (
+            f"a plain approve retry after a first-time bare-interrupt abort "
+            f"must never continue the graph: {body2}"
+        )
+
+    def test_appended_non_resolution_note_cannot_mask_terminal_resolution(self, hermetic):
+        """Required test (2): a terminal reject followed by an APPENDED
+        non-resolution note in `hitl_history` (mirrors `plan_gate_bypassed`/
+        governance notes -- no "resolution" key at all) must not un-terminate
+        the workflow. The durable `terminal_resolution` field, not the
+        latest `hitl_history` entry, is authoritative: reverting to a pure
+        hitl_history scan (this test's proven property) would let the note
+        mask the true reject and wrongly continue the graph."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        wf = uuid4()
+        state = HydraState(
+            workflow_id=wf, root_goal="round 6 item 3 masking-note repro",
+            phase="approval", pending_hitl=None, tasks=[], requires_human_approval=True,
+            terminal_resolution={
+                "gate_node": "approval", "hitl_request_id": None,
+                "action": "reject", "option": None, "plan_revision": None,
+                "resolved_at": "2026-09-23T00:00:00+00:00",
+            },
+            hitl_history=[
+                {"gate_node": "approval", "resolution": "reject", "option": None},
+                # A LATER, non-resolution note -- no "resolution" key, and
+                # (as the real `plan_gate_bypassed` marker does) no
+                # "gate_node" match either. A pure hitl_history scan that
+                # only ever inspects the LATEST entry would see THIS note,
+                # not the reject above it, and wrongly conclude there is no
+                # terminal resolution for the parked gate.
+                {"event": "some_later_note", "note": "unrelated bookkeeping"},
+            ],
+        )
+        sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+        assert not isinstance(sup, _PurePythonRunner)
+        config = {"configurable": {"thread_id": str(wf)}}
+        sup.update_state(config, state.model_dump(mode="json"), as_node="planner")
+        assert tuple(sup.get_state(config).next) == ("approval",)
+
+        rc, body = _resume(HYDRA_ROOT, str(wf), "approve", None)
+        assert rc == 0, body
+        values = sup.get_state(config).values
+        assert not values.get("tasks"), (
+            f"a durably recorded terminal_resolution must refuse a plain "
+            f"approve retry even when a later, non-resolution hitl_history "
+            f"note would mask it under a pure history scan: {body}"
+        )
+        assert body.get("resumed") is False
+        assert body.get("graph_reentered") is False
+
+    def test_two_gates_terminal_resolution_identifies_later_gate(self, hermetic):
+        """Required test (6): an earlier gate resolved normally (a genuine
+        approve, already in `hitl_history`), and a LATER, DIFFERENT gate
+        currently pending is then aborted -- `terminal_resolution` must
+        identify the LATER gate's own `hitl_request_id`/`gate_node`, never
+        the earlier approved gate's."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        wf = uuid4()
+        pending_b = {
+            "id": "gate-b-id", "workflow_id": str(wf), "reason": "reflexion_override",
+            "gate_node": "judge_per_squad", "options": ["approve", "abort"],
+        }
+        state = HydraState(
+            workflow_id=wf, root_goal="round 6 item 3 two-gate repro",
+            phase="approval", pending_hitl=pending_b, tasks=[],
+            hitl_history=[{
+                "id": "gate-a-id", "gate_node": "approval",
+                "resolution": "approve", "option": None,
+            }],
+        )
+        sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+        assert not isinstance(sup, _PurePythonRunner)
+        config = {"configurable": {"thread_id": str(wf)}}
+        sup.update_state(config, state.model_dump(mode="json"), as_node="planner")
+
+        rc, body = _resume(HYDRA_ROOT, str(wf), "approve", "abort")
+        assert rc == 0, body
+        values = sup.get_state(config).values
+        term = values.get("terminal_resolution")
+        assert term is not None
+        assert term.get("gate_node") == "judge_per_squad", (
+            f"terminal_resolution must identify the LATER (currently "
+            f"pending) gate, not the earlier approved one: {term}"
+        )
+        assert term.get("hitl_request_id") == "gate-b-id", (
+            f"terminal_resolution's hitl_request_id must be the LATER gate's "
+            f"own id, never the earlier approved gate's 'gate-a-id': {term}"
+        )
+        assert tuple(sup.get_state(config).next) == ()

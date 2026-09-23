@@ -430,6 +430,47 @@ class HydraState(BaseModel):
     attended_charge_applied: Annotated[dict[str, dict], _merge_dict] = Field(
         default_factory=dict)
 
+    # Hydra#69 round 6 item 3 (redesign): the durable record of the ONE
+    # terminal (abort, or reject at any gate) resolution that ended this
+    # workflow, if any -- {gate_node, hitl_request_id, action, option,
+    # plan_revision, resolved_at}. Written in the SAME single
+    # `as_node="postcheck"` checkpoint write (`cli.py`'s `_cmd_resume_
+    # locked`) that also clears `pending_hitl` / parks `phase="surfaced"`
+    # for EVERY abort/reject at ANY gate, including the bare-interrupt
+    # reject/abort paths (a bare interrupt has no `pending_hitl` dict, so
+    # `gate_node`/`hitl_request_id` are `None` there).
+    #
+    # `hitl_request_id` is the resolved gate's own envelope `id` when the
+    # gate was filed via `HITLRequest` (most gates); a handful of ad-hoc
+    # `pending_hitl` dicts built directly in `supervisor.py` (e.g. the
+    # `intake` bad-`--repo`-arg gates) never carried an `id` at all -- for
+    # those this is `None` and `gate_node` (plus, for `plan_gate`,
+    # `plan_revision`) remains the identity a consumer keys on.
+    #
+    # The bare-interrupt resume branch consults THIS field directly instead
+    # of scanning `hitl_history` -- a later non-resolution note appended to
+    # `hitl_history` (e.g. the `plan_gate_bypassed` force-dispatch marker, a
+    # `plan_governance_note_failed` trace-adjacent note) can therefore never
+    # mask an earlier terminal reject the way a "read only the latest
+    # `hitl_history` entry" scan could. `None` while this workflow has never
+    # had a terminal resolution recorded on THIS field -- which is also true
+    # of a checkpoint written before this field existed (the Pydantic
+    # default, matching every other additive field). That legacy gap -- and the case of
+    # a checkpoint that genuinely predates this fix -- is covered by
+    # `cli._bare_interrupt_terminal_resolution`, kept as a
+    # `hitl_history`-scanning FALLBACK used ONLY when this field reads back
+    # `None`.
+    #
+    # Never silently cleared: once set, a workflow stays terminal for the
+    # rest of its life. No write path in this engine re-opens a terminal
+    # workflow (grepped: nothing re-sets `pending_hitl` to a fresh gate, and
+    # `plan_status`/`phase` never move off their terminal values, after a
+    # terminal write) -- if a future change legitimately needs to, it must
+    # explicitly write `terminal_resolution=None` in that same patch (plain
+    # `LastValue` channel, no reducer: `update_state` must write the FULL
+    # intended value or the channel keeps whatever it already held).
+    terminal_resolution: Optional[dict[str, Any]] = None
+
     # P0 planning substrate. Plain replace-by-default fields, no reducers: a
     # planning re-run REPLACES the prior plan snapshot rather than
     # accumulating history. P1 (plan_barrier_active, below) now reads

@@ -1892,7 +1892,32 @@ def _precheck_operator_identity_gate_only(args) -> dict | None:
 def _bare_interrupt_terminal_resolution(
     hitl_history: list, snap_next: tuple, current_plan_revision: object = None,
 ) -> dict | None:
-    """Hydra#69 round 6 defect 3 (MED), follow-up (cross-vendor, HIGH): the
+    """Round 6 item 3 REDESIGN: this is now a LEGACY-ONLY fallback.
+
+    The primary source of truth for "is this workflow already terminal" is
+    the durable `HydraState.terminal_resolution` field, consulted directly
+    by the bare-interrupt branch in `_cmd_resume_locked` -- written
+    atomically, in the SAME `as_node="postcheck"` checkpoint write, for
+    EVERY abort/reject at any gate (including the bare-interrupt reject/
+    abort paths themselves). That field can never be masked by a LATER
+    non-resolution note appended to `hitl_history` (e.g. the
+    `plan_gate_bypassed` force-dispatch marker), because it is a separate,
+    independently-written field, not derived from `hitl_history` at read
+    time.
+
+    This function is now called ONLY as a fallback when `state.terminal_
+    resolution` reads back `None` -- i.e. a checkpoint written before this
+    field existed (a genuine legacy checkpoint) or a checkpoint that has
+    never had a terminal resolution recorded on it at all. It reconstructs
+    the same decision by scanning `hitl_history` the way the engine did
+    before `terminal_resolution` existed, keeping the known limitation that
+    a later NON-resolution note in `hitl_history` could, in principle, sit
+    "on top of" the real latest resolution entry for a checkpoint this old
+    -- `hitl_history` is genuinely the only durable source available for a
+    legacy checkpoint, so this scan is a best-effort reconstruction, not a
+    guarantee equal to `terminal_resolution` itself.
+
+    Hydra#69 round 6 defect 3 (MED), follow-up (cross-vendor, HIGH): the
     durable `hitl_history` entry, if any, that records a TERMINAL resolution
     (``resolution == "reject"``, or an ``approve`` carrying
     ``option == "abort"``) for the SAME INSTANCE of the gate the graph's
@@ -2201,15 +2226,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # (no pending_hitl but graph paused before synthesis/judge_synthesis)
         # from a genuinely terminal state (snap.next empty).
         _snap_next = getattr(snap, "next", ()) or ()
-        # Hydra#69 round 6 defect 3 (MED): the durable hitl_history is the
-        # authority on whether the gate the graph is parked at was ALREADY
-        # terminally resolved -- independent of what action/option THIS call
-        # carries. A genuine bare interrupt with no terminal history for the
-        # parked gate (MU7: paused before synthesis/judge_synthesis, never
-        # resolved) returns None here and falls through unaffected.
-        _terminal_hist_entry = _bare_interrupt_terminal_resolution(
-            values.get("hitl_history") or [], _snap_next,
-            current_plan_revision=values.get("plan_revision"))
+        # Round 6 item 3 REDESIGN: `HydraState.terminal_resolution` is now
+        # the primary authority on whether the gate the graph is parked at
+        # was ALREADY terminally resolved -- independent of what
+        # action/option THIS call carries, and independent of anything
+        # appended to `hitl_history` AFTER the terminal write (a later
+        # non-resolution note there, e.g. `plan_gate_bypassed`, can never
+        # mask this field the way scanning `hitl_history` alone could).
+        # `None` here means either "genuinely never terminal" or "a legacy
+        # checkpoint written before this field existed" -- both fall back to
+        # `_bare_interrupt_terminal_resolution`'s hitl_history scan, which is
+        # the ONLY durable signal a legacy checkpoint carries. A genuine
+        # bare interrupt with no terminal resolution recorded either way
+        # (MU7: paused before synthesis/judge_synthesis, never resolved)
+        # returns None here and falls through unaffected.
+        _state_terminal_resolution = values.get("terminal_resolution")
+        if isinstance(_state_terminal_resolution, dict):
+            _terminal_hist_entry = _state_terminal_resolution
+        else:
+            _terminal_hist_entry = _bare_interrupt_terminal_resolution(
+                values.get("hitl_history") or [], _snap_next,
+                current_plan_revision=values.get("plan_revision"))
         if _snap_next and _terminal_hist_entry is not None:
             emit(project, wf, "hitl_resumed", {
                 "action": action,
@@ -2217,7 +2254,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 "gate_node": _terminal_hist_entry.get("gate_node"),
                 "bare_interrupt": list(_snap_next),
                 "gate_only": gate_only,
-                "note": ("durable hitl_history records a terminal "
+                "note": ("durable terminal_resolution (or, for a legacy "
+                         "checkpoint, hitl_history) records a terminal "
                          "resolution for the parked gate; graph not "
                          "re-entered"),
             })
@@ -2248,13 +2286,48 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # continue-branch so a repeated abort can never be misread as a
         # genuine approve just because `action` happens to be "approve".
         if _snap_next and option == "abort":
+            # Round 6 item 3 REDESIGN: this branch used to only ever REPORT
+            # "already terminal (abort)" -- it never wrote anything, on the
+            # (implicit) assumption this was always a REPEAT of a terminal
+            # write made elsewhere. That assumption is false the FIRST time a
+            # bare interrupt is aborted (no `terminal_hist_entry` match
+            # above, because nothing has recorded a terminal resolution for
+            # this parked gate yet): without a durable write here, a LATER
+            # retry with a different action/option (e.g. plain `--action
+            # approve`, no option) would fall through to the "continue the
+            # graph" branch below and wrongly resume. Fold the SAME single
+            # `as_node="postcheck"` terminal write every other abort/reject
+            # path uses into this branch too, recording `terminal_resolution`
+            # -- idempotent: a genuine repeat lands back in the durable-
+            # terminal-resolution branch above instead, via the freshly
+            # written field, and never reaches here at all.
+            from datetime import datetime, timezone
+            _bare_term_resolved_at = datetime.now(timezone.utc).isoformat()
+            _bare_terminal_resolution = {
+                "gate_node": None,
+                "hitl_request_id": None,
+                "action": action,
+                "option": option,
+                "plan_revision": values.get("plan_revision"),
+                "resolved_at": _bare_term_resolved_at,
+            }
+            sup.update_state(
+                config,
+                {"phase": "surfaced", "terminal_resolution": _bare_terminal_resolution},
+                as_node="postcheck",
+            )
+            _bare_abort_next = tuple(getattr(sup.get_state(config), "next", None) or ())
+            assert _bare_abort_next == (), (
+                "bare-interrupt abort must leave next==() so no later invoke "
+                f"can run the next node headless; got {_bare_abort_next!r}"
+            )
             emit(project, wf, "hitl_resumed", {
                 "action": action,
                 "option": option,
                 "gate_node": None,
                 "bare_interrupt": list(_snap_next),
                 "gate_only": gate_only,
-                "note": "repeated abort observed at bare interrupt; graph not re-entered",
+                "note": "bare-interrupt abort parked terminally (postcheck write)",
             })
             print(_cli_json_dumps({
                 "workflow_id": wf,
@@ -2266,8 +2339,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 "option": option,
                 "interrupted_before": list(_snap_next),
                 "gate_node": None,
-                "phase": values.get("phase"),
-                "status": values.get("phase"),
+                "phase": "surfaced",
+                "status": "surfaced",
                 "pending_hitl": None,
                 "note": ("already terminal (abort); graph not re-entered"),
             }))
@@ -2364,7 +2437,36 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # ONCE, at the top of this function (finding 1) -- a refusal
             # there already returned before this branch could ever be
             # reached, so there is nothing further to verify here.
-            sup.update_state(config, {"phase": "surfaced"})
+            #
+            # Round 6 item 3 REDESIGN: this used to be a generic, node-
+            # context-less `sup.update_state(config, {"phase": "surfaced"})`
+            # -- it left `next` wherever the checkpoint was interrupted and
+            # recorded nothing durable a later resume could key on, so a
+            # different retry (e.g. a plain `--action approve`) could
+            # silently continue the graph past a workflow this branch had
+            # already, honestly, reported as terminal. Fold this into the
+            # SAME single `as_node="postcheck"` terminal write every other
+            # abort/reject path now uses, recording `terminal_resolution`.
+            from datetime import datetime, timezone
+            _bare_reject_resolved_at = datetime.now(timezone.utc).isoformat()
+            _bare_reject_terminal_resolution = {
+                "gate_node": None,
+                "hitl_request_id": None,
+                "action": action,
+                "option": option,
+                "plan_revision": values.get("plan_revision"),
+                "resolved_at": _bare_reject_resolved_at,
+            }
+            sup.update_state(
+                config,
+                {"phase": "surfaced", "terminal_resolution": _bare_reject_terminal_resolution},
+                as_node="postcheck",
+            )
+            _bare_reject_next = tuple(getattr(sup.get_state(config), "next", None) or ())
+            assert _bare_reject_next == (), (
+                "bare-interrupt reject must leave next==() so no later invoke "
+                f"can run the next node headless; got {_bare_reject_next!r}"
+            )
             print(_cli_json_dumps({
                 "workflow_id": wf,
                 "ok": True,
@@ -2819,6 +2921,24 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         patch["phase"] = "surfaced"
         if action == "reject" and resolution.get("gate_node") == "plan_gate":
             patch["plan_status"] = "rejected"
+        # Round 6 item 3 REDESIGN: record the durable, replace-channel
+        # `terminal_resolution` in this SAME patch -- the one atomic write
+        # below (as_node="postcheck") -- for EVERY abort/reject at ANY gate.
+        # `hitl_request_id` is `resolution.get("id")`: `resolution` already
+        # spreads the resolved `pending_hitl` dict's own keys (above), so
+        # this is the resolved gate's envelope `id` when it was filed via
+        # `HITLRequest` (most gates) and `None` for the handful of ad-hoc
+        # `pending_hitl` dicts built without one (e.g. some `intake` gates)
+        # -- `gate_node` (plus `plan_revision` for `plan_gate`) is that
+        # occurrence's identity either way.
+        patch["terminal_resolution"] = {
+            "gate_node": resolution.get("gate_node"),
+            "hitl_request_id": resolution.get("id"),
+            "action": action,
+            "option": option,
+            "plan_revision": resolution.get("plan_revision"),
+            "resolved_at": resolution["resolved_at"],
+        }
 
     # Hydra#69 round 5 defect 1a / round 6 defect 3: a TERMINAL resolution
     # (abort, or reject) at ANY gate -- not just plan_gate -- must ALSO force
