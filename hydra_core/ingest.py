@@ -672,8 +672,23 @@ def dispatch_ingested_envelopes(
                 # Only meaningful once we know the revision itself is right —
                 # a revision-mismatched PLAN already fails above without a
                 # confusing second "supersedes" complaint layered on top.
+                # Hydra#69 follow-up defect 3 (HIGH): validate against the
+                # independently-persisted `plan_supersedes_expected` (set
+                # ONCE by `--modify-plan` when it opens this revision), not
+                # `state.plan_envelope_id`. The latter is overwritten by
+                # THIS SAME branch's own `outcome.plan_patch` (below) as soon
+                # as a candidate PLAN is drafted -- including a candidate
+                # whose SUBSEQUENT graph re-entry (plan_judge) then fails.
+                # A failed re-entry left `state.plan_envelope_id` pointing at
+                # the failed attempt's own envelope id, so a correctly
+                # addressed resubmission (naming the TRUE predecessor, the
+                # prior revision's envelope id) was rejected as a
+                # `supersedes` mismatch. `plan_supersedes_expected` is never
+                # touched by that write, so it survives any number of failed
+                # attempts unchanged.
                 _expected_supersedes = (
-                    str(state.plan_envelope_id) if state.plan_envelope_id else None)
+                    str(state.plan_supersedes_expected)
+                    if getattr(state, "plan_supersedes_expected", None) else None)
                 _submitted_supersedes = (
                     str(plan_env.supersedes) if plan_env.supersedes else None)
                 if _submitted_supersedes != _expected_supersedes:

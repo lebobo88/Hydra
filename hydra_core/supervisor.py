@@ -364,7 +364,9 @@ def _resolve_generator_vendor(env: dict) -> str:
     return "claude"
 
 
-def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
+def materialise_plan_steps(
+    state: HydraState, *, approved_resolution: bool = False
+) -> dict[str, Any]:
     """Hydra#69 defect A/B/E/H: the ONE decision function that turns an
     approved plan's `PlanStep`s into `TaskState`s. `node_plan_gate` (below)
     is a thin wrapper around this pure function — it is the in-graph caller,
@@ -409,6 +411,30 @@ def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
     again — this is what stops the placeholder (materialised at
     `plan_revision=0`, invisible to a revision-only stale check) from
     dispatching once the plan's real step tasks take over.
+
+    Hydra#69 follow-up defect 2 (revision): this function itself must refuse
+    to materialise while a `plan_gate` `pending_hitl` is STILL OPEN on the
+    given `state`, unless the caller explicitly proves an approval happened
+    via `approved_resolution=True`. Previously the only guard here rejected
+    a DIFFERENT open gate (`gate_node not in (None, "plan_gate")`) and
+    silently treated an open `plan_gate` itself as "fine, proceed" — so any
+    caller that reached this function with the gate still pending (not just
+    the one legitimate `cli.py` approve path) would approve+materialise
+    regardless of what action was actually requested. `cli.py`'s
+    `--gate-only` approve handler is the ONLY caller that legitimately hands
+    this function a state whose `pending_hitl` is still the open `plan_gate`
+    dict (it calls this against `_pre_state`, the PRE-patch checkpoint
+    snapshot, precisely because the post-patch view with the gate cleared
+    and the approve resolution appended doesn't exist as a real checkpoint
+    row yet) — and it does so only after confirming `action == "approve"`
+    and `option != "abort"`, so it passes `approved_resolution=True`
+    explicitly. `node_plan_gate` (the in-graph wrapper below) never needs to
+    pass it: by construction the graph only re-enters `plan_gate` after
+    `cli.py`'s resume handler has ALREADY written `pending_hitl=None` via
+    `sup.update_state` in the same atomic patch that appends the approve
+    resolution — every real graph invocation of this node therefore already
+    sees a cleared gate and materialises via the `cur is None` path below,
+    the same as it always has.
     """
     # H: a bypassed plan is not an approval — never touch it here.
     if state.plan_status == "bypassed":
@@ -417,6 +443,13 @@ def materialise_plan_steps(state: HydraState) -> dict[str, Any]:
     cur = state.pending_hitl
     if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
         return {"phase": "approval"}
+    if isinstance(cur, dict) and cur.get("gate_node") == "plan_gate" and not approved_resolution:
+        # Defect 2: an open plan_gate with no proven approval is a no-op,
+        # not an implicit approve. Return {} (not {"phase": "approval"}) —
+        # this is indistinguishable, from the checkpoint's point of view,
+        # from never having been called at all: no tasks, no plan_status
+        # flip, no pending_hitl mutation, no placeholder supersession.
+        return {}
 
     plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
     valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]
@@ -1673,8 +1706,30 @@ def build_supervisor(
             # key on a LangGraph patch RETAINS the prior channel value
             # instead of clearing it (LastValue-clear trap), which would
             # leave a stale placeholder list from an earlier pass in place.
+            #
+            # Hydra#69 follow-up defect 5 (MED): a SECOND `node_planner`
+            # pass over the SAME checkpoint (a replay, or any re-invoke that
+            # re-runs this node rather than advancing past it) synthesises
+            # NOTHING new when every selected squad — including "planning"
+            # itself — is already in `pre_seeded_squads` from the first
+            # pass, so `_whole_goal_placeholder_ids` is `[]` on that second
+            # pass even though `_plan_gate_active` is still True. Writing
+            # `[]` here unconditionally (the LastValue-clear rule taken too
+            # literally) wiped out the FIRST pass's real placeholder ids,
+            # so a later approval's `materialise_plan_steps` had nothing
+            # left to supersede and the whole-goal placeholder kept
+            # dispatching alongside the plan's real step tasks. Only write
+            # a NEW value when this pass actually synthesised placeholders;
+            # otherwise explicitly carry the existing channel value forward
+            # (still an explicit write, not an omission — this is NOT the
+            # LastValue-clear trap, because the "intended value" on a no-op
+            # pass IS whatever was already recorded, not empty).
             "plan_placeholder_task_ids": (
-                _whole_goal_placeholder_ids if _plan_gate_active else []
+                [] if not _plan_gate_active
+                else (
+                    _whole_goal_placeholder_ids if _whole_goal_placeholder_ids
+                    else list(getattr(state, "plan_placeholder_task_ids", None) or [])
+                )
             ),
         }
         if _new_hitl_history:
@@ -2314,6 +2369,13 @@ def build_supervisor(
                 model_tier=getattr(task, "model_tier", None),
                 pp_team=getattr(task, "pp_team", None),
                 pp_profile=getattr(task, "pp_profile", None),
+                # Hydra#69 follow-up defect 6: same fields the attended
+                # request text folds in (cli.py, defect E) — carried through
+                # here so the detached/fleet leg gets them too.
+                acceptance_criteria=list(
+                    getattr(task, "acceptance_criteria", None) or []
+                ) or None,
+                envelope_type=getattr(task, "envelope_type", None),
             )
 
         # WS8 Fix 5: build EVERY pending task's payload EXACTLY ONCE, up-front,
@@ -4708,6 +4770,21 @@ def build_supervisor(
         docstring for the full rationale (idempotency, defect H's bypass
         no-op, defect E's acceptance_criteria/envelope_type propagation,
         defect B's placeholder supersession).
+
+        Hydra#69 follow-up defect 2 (HIGH): the real closure for "a detached
+        `--action modify-budget` at plan_gate must never reach dispatch" is
+        in `cli.py`'s resume handler -- `modify-budget` at plan_gate now
+        RETURNS before ever calling `sup.invoke` (on both the gate_only and
+        detached routes), so this node is never reached with a re-filed,
+        still-open gate. That guard lives at the CALL SITE, not here: this
+        node (and `materialise_plan_steps`) is also called directly by
+        `cli.py`'s own `--gate-only` approve path with the ORIGINAL
+        (pre-resolution) `pending_hitl` dict still attached to `state`
+        (`_pre_state` is the pre-patch snapshot) -- refusing here on
+        `isinstance(state.pending_hitl, dict)` would refuse every genuine
+        approval too, not just a re-filed one. See `materialise_plan_steps`'s
+        own docstring for the (deliberately narrower) other-gate guard it
+        keeps.
         """
         return materialise_plan_steps(state)
 

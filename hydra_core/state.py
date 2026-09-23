@@ -415,6 +415,24 @@ class HydraState(BaseModel):
     # a derived one) so replay reproduces the same override.
     plan_rigor_override: Optional[Literal["trivial", "standard", "major"]] = None
     plan_envelope_id: Optional[UUID] = None
+    # Hydra#69 follow-up defect 3 (HIGH): the predecessor envelope id a
+    # REVISION's authoring PLAN must name in its `supersedes` field, set
+    # ONCE by `--modify-plan` when it opens the new revision (cli.py) and
+    # NEVER overwritten by anything else -- in particular not by
+    # `_reenter_graph_after_dispatch`'s `plan_envelope_id` write (ingest.py's
+    # `outcome.plan_patch`), which happens BEFORE the revision's PLAN is
+    # actually judged and can therefore be checkpointed even when the
+    # subsequent graph re-entry (plan_judge) then fails. Before this field
+    # existed, `ingest.py` validated a revision's `supersedes` against
+    # `state.plan_envelope_id` directly -- which a failed re-entry attempt
+    # had already advanced to the FAILED attempt's own new envelope id,
+    # rejecting the operator's correctly-addressed resubmission (which still
+    # names the true predecessor, revision-1's envelope id) as a
+    # `supersedes` mismatch. Explicit write, not an omission, when
+    # `--modify-plan` opens a revision; retained (never cleared) across a
+    # failed or retried re-entry so the expectation survives exactly as many
+    # attempts as it takes to land.
+    plan_supersedes_expected: Optional[str] = None
     plan_ref: Optional[dict[str, Any]] = None
     plan_revision: int = 0
     plan_approved_at: Optional[datetime] = None
@@ -631,6 +649,64 @@ def task_eligible_for_dispatch(state, task) -> bool:
     if plan_rev and plan_rev != getattr(state, "plan_revision", 0):
         return False
     return plan_deps_satisfied(state, task)
+
+
+def task_retired(state, task) -> bool:
+    """Hydra#69 follow-up defect 4 (HIGH): the ``task_eligible_for_dispatch``
+    exclusion reasons split into two very different fates that finalize-time
+    accounting must NOT collapse into one another:
+
+    * cases 1-2 of ``task_eligible_for_dispatch`` (explicitly superseded, or
+      a stale ``plan_revision``) mean the task will NEVER dispatch again —
+      it is RETIRED, and correctly excluded from a "still pending" count.
+    * case 3 (an unmet dependency — ``plan_deps_satisfied`` is False) means
+      the task is simply not selectable YET; it is still genuinely pending
+      and unfinished work.
+
+    ``_attended_pending_task_ids`` used to filter with
+    ``task_eligible_for_dispatch`` alone, which conflated the two: a task B
+    blocked on an unfinished (surfaced, not attended-done) upstream A was
+    excluded from "pending" exactly like a retired task, so
+    ``_attended_pending_task_ids`` returned ``[]`` and ``hydra finalize``
+    proceeded straight to synthesis with B never having run at all. Use
+    THIS predicate for "has this task left the pool for good" accounting
+    (finalize's pending/blocked reporting); keep
+    ``task_eligible_for_dispatch`` for "may this task be selected right
+    now" (dispatch selection).
+    """
+    tid = str(getattr(task, "task_id", ""))
+    superseded = set(getattr(state, "plan_superseded_task_ids", None) or [])
+    if tid in superseded:
+        return True
+    plan_rev = getattr(task, "plan_revision", 0)
+    if plan_rev and plan_rev != getattr(state, "plan_revision", 0):
+        return True
+    return False
+
+
+def fold_acceptance_criteria_into_request_text(
+    request_text: str, acceptance_criteria: list[str] | None,
+) -> str:
+    """Hydra#69 follow-up defect 6 (MED): the ONE place acceptance criteria
+    get folded into an engineering request's text — used by BOTH the
+    attended host request builder (``cli.py``'s ``_cmd_attended_step``) and
+    the detached/fleet dispatch payload (``squad_node._via_mcp``, fed by
+    ``supervisor.py``'s shared ``_build_payload``). Before this helper
+    existed, only the attended path folded ``TaskState.acceptance_criteria``
+    into the text an engineer actually reads (Hydra#69 defect E) — a
+    detached or fleet-dispatched plan-step task silently dropped its
+    acceptance criteria on the floor, because ``_build_payload`` only ever
+    set ``objective=task.description`` on the shared ``CSuiteDecisionPacket``.
+    Both callers now build the SAME text from the SAME two inputs instead of
+    hand-duplicating the formatting.
+    """
+    ac = [c for c in (acceptance_criteria or []) if isinstance(c, str) and c.strip()]
+    if not ac:
+        return request_text
+    return (
+        f"{request_text}\n\nAcceptance criteria:\n"
+        + "\n".join(f"- {c}" for c in ac)
+    )
 
 
 class PoisonedStateError(Exception):

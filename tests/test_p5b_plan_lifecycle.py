@@ -479,6 +479,10 @@ class TestTask2IngestBranch:
         # defect adds refuses it.
         state.plan_revision = 2
         state.plan_envelope_id = plan["id"]
+        # Hydra#69 follow-up defect 3: validated against
+        # `plan_supersedes_expected` now, not `plan_envelope_id` -- see that
+        # field's docstring (state.py).
+        state.plan_supersedes_expected = plan["id"]
         revised = _minimal_plan_dict(
             state.workflow_id, revision=2, supersedes=plan["id"])
         third = dispatch_ingested_envelopes(
@@ -983,7 +987,7 @@ class TestTask4Materialisation:
         ])
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         patch = node_plan_gate(state)
         assert patch["plan_status"] == "approved"
@@ -998,7 +1002,7 @@ class TestTask4Materialisation:
         node_plan_gate = _plan_gate_fn()
         state = HydraState(
             root_goal="x", plan_status="judged", plan_revision=1,
-            pending_hitl={"gate_node": "plan_gate"},
+            pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         patch = node_plan_gate(state)
         assert "tasks" not in patch
@@ -1028,7 +1032,7 @@ class TestTask4Materialisation:
         plan = self._two_step_plan(wf)
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         first_patch = node_plan_gate(state)
         assert len(first_patch["tasks"]) == 2
@@ -1068,7 +1072,7 @@ class TestTask4Materialisation:
         )
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         state.tasks.append(existing_a)
 
@@ -1095,7 +1099,7 @@ class TestTask4Materialisation:
         )
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=2,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         state.tasks.append(stale_a)
 
@@ -1228,7 +1232,7 @@ class TestDefectEAcceptanceCriteriaEnvelopeType:
         ])
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         patch = materialise_plan_steps(state)
         task = patch["tasks"][0]
@@ -1243,7 +1247,7 @@ class TestDefectEAcceptanceCriteriaEnvelopeType:
         ])
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
         )
         patch = materialise_plan_steps(state)
         assert patch["tasks"][0].acceptance_criteria is None
@@ -1299,7 +1303,7 @@ class TestDefectBPlaceholderSupersession:
         placeholder = TaskState(owner_squad="engineering", description="whole-goal placeholder")
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
             plan_placeholder_task_ids=[str(placeholder.task_id)],
         )
         patch = materialise_plan_steps(state)
