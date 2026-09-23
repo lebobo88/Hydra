@@ -3681,11 +3681,20 @@ def _via_mcp(
                 ),
             )
 
-    args = {
-        "request_text": getattr(inbound, "instructions", None)
+    from .state import fold_acceptance_criteria_into_request_text
+    _raw_objective_text = (
+        getattr(inbound, "instructions", None)
         or getattr(inbound, "summary", None)
         or getattr(inbound, "objective", "")
-        or str(inbound.model_dump()),
+        or str(inbound.model_dump())
+    )
+    # Hydra#69 follow-up defect 6: fold the dispatched task's own
+    # `acceptance_criteria` into the request text, the SAME way the attended
+    # request builder does (cli.py, defect E) — carried onto the shared
+    # `CSuiteDecisionPacket` by `_build_payload` (supervisor.py).
+    args = {
+        "request_text": fold_acceptance_criteria_into_request_text(
+            _raw_objective_text, getattr(inbound, "acceptance_criteria", None)),
         "project_path": project_path,
         "mode": "single" if mode == "pp_run" else ("team" if mode == "pp_team" else "single"),
     }
@@ -3715,7 +3724,15 @@ def _via_mcp(
     _hctx_origin = getattr(inbound, "origin_squad", None)
     if _hctx_origin:
         args["hydra_origin_squad"] = str(_hctx_origin)
-    _hctx_type = getattr(inbound, "type", None)
+    # Hydra#69 follow-up defect 6: a plan-step task's OWN envelope_type
+    # (PRD/ARCH_RFC/DEV_TASK — propagated onto the packet by `_build_payload`
+    # as `inbound.envelope_type`, the same field cli.py's attended path
+    # reads via `getattr(task, "envelope_type", None)`) wins over the
+    # packet's own literal `type` ("C_SUITE_DECISION_PACKET" — that names
+    # the ENVELOPE WRAPPER, not the work item's originating stage, and was
+    # never a meaningful `hydra_envelope_type` value for the attended path
+    # either).
+    _hctx_type = getattr(inbound, "envelope_type", None) or getattr(inbound, "type", None)
     if _hctx_type:
         args["hydra_envelope_type"] = str(_hctx_type)
     # WS9: record effective tier in rationale for observability.

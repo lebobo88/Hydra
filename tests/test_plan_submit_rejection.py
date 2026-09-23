@@ -175,7 +175,8 @@ class TestIngestPlanStateValidationDefectG:
     def test_wrong_supersedes_is_rejected(self, packs, monkeypatch, tmp_path):
         monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
         prior_id = uuid4()
-        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=prior_id)
+        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=prior_id,
+                            plan_supersedes_expected=str(prior_id))
         plan = _plan_dict(state.workflow_id, revision=2, supersedes=uuid4())  # wrong prior id
         outcome = dispatch_ingested_envelopes(
             state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
@@ -188,7 +189,13 @@ class TestIngestPlanStateValidationDefectG:
     def test_correct_revision_and_supersedes_is_accepted(self, packs, monkeypatch, tmp_path):
         monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
         prior_id = uuid4()
-        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=prior_id)
+        # Hydra#69 follow-up defect 3: validated against
+        # `plan_supersedes_expected` (set by --modify-plan when it opens a
+        # revision), not `state.plan_envelope_id` — see that field's
+        # docstring (state.py) for why the two can diverge after a failed
+        # re-entry.
+        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=prior_id,
+                            plan_supersedes_expected=str(prior_id))
         plan = _plan_dict(state.workflow_id, revision=2, supersedes=prior_id)
         outcome = dispatch_ingested_envelopes(
             state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
@@ -200,7 +207,8 @@ class TestIngestPlanStateValidationDefectG:
         """expected revision > 1 but the submitted PLAN has no `supersedes`
         at all -- must fail, not silently pass."""
         monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
-        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=uuid4())
+        state = HydraState(root_goal="x", plan_revision=2, plan_envelope_id=uuid4(),
+                            plan_supersedes_expected=str(uuid4()))
         plan = _plan_dict(state.workflow_id, revision=2)  # no supersedes
         outcome = dispatch_ingested_envelopes(
             state, [plan], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
