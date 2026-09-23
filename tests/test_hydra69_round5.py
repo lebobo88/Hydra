@@ -217,6 +217,7 @@ class TestDefect1bBareInterruptAbortNeverContinuesGraph:
             # isolating layer (b) as the guard that actually stops THIS call.
             hitl_history=[{
                 "gate_node": "plan_gate", "resolution": "approve", "option": None,
+                "plan_revision": 1,
             }],
         )
         sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
@@ -256,6 +257,7 @@ class TestDefect1cMaterialiseRequiresApproveEvidence:
             plan_ref=_plan_ref(), pending_hitl=None,
             hitl_history=[{
                 "gate_node": "plan_gate", "resolution": "approve", "option": "abort",
+                "plan_revision": 1,
             }],
         )
         patch = materialise_plan_steps(state)
@@ -355,6 +357,7 @@ class TestDefect1cApproveEvidenceMustMatchPlanRevision:
         from hydra_core.supervisor import materialise_plan_steps
 
         legacy_history = [{
+            # deliberately unstamped: exercises legacy policy
             "gate_node": "plan_gate", "resolution": "approve", "option": None,
         }]
 

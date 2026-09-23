@@ -988,7 +988,7 @@ class TestTask4Materialisation:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = node_plan_gate(state)
         assert patch["plan_status"] == "approved"
@@ -1004,7 +1004,7 @@ class TestTask4Materialisation:
         state = HydraState(
             root_goal="x", plan_status="judged", plan_revision=1,
             pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = node_plan_gate(state)
         assert "tasks" not in patch
@@ -1035,7 +1035,7 @@ class TestTask4Materialisation:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         first_patch = node_plan_gate(state)
         assert len(first_patch["tasks"]) == 2
@@ -1076,7 +1076,7 @@ class TestTask4Materialisation:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         state.tasks.append(existing_a)
 
@@ -1238,7 +1238,7 @@ class TestDefectEAcceptanceCriteriaEnvelopeType:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = materialise_plan_steps(state)
         task = patch["tasks"][0]
@@ -1254,7 +1254,7 @@ class TestDefectEAcceptanceCriteriaEnvelopeType:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = materialise_plan_steps(state)
         assert patch["tasks"][0].acceptance_criteria is None
@@ -1311,7 +1311,7 @@ class TestDefectBPlaceholderSupersession:
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
             plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
             plan_placeholder_task_ids=[str(placeholder.task_id)],
         )
         patch = materialise_plan_steps(state)

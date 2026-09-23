@@ -388,7 +388,7 @@ class TestFix2MaterialiseRefusesOpenGate:
             # resolution to hitl_history -- this is the affirmative approval
             # evidence materialise_plan_steps now requires before treating
             # an already-cleared gate as a genuine approve.
-            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None}],
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],
         )
         patch = materialise_plan_steps(state)
         assert patch.get("plan_status") == "approved"
