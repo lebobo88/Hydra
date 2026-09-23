@@ -68,6 +68,41 @@ def test_planning_prompt_field_list_tracks_schema_additions(monkeypatch):
     assert "`totally_new_marker_field`" in doc
 
 
+def test_plan_field_requiredness_in_prompt_matches_model_fields_is_required():
+    """Revision fix (defect 1): the rendered requiredness of EVERY `Plan`
+    field, including `steps`, must equal `model_fields[name].is_required()`
+    -- a prior revision hand-copied a `steps` line hardcoding "required"
+    even though `steps: list[PlanStep] = Field(default_factory=list)` is
+    optional per the schema itself."""
+    doc = host_bridge._plan_envelope_schema_doc()
+    for name, field in schemas.Plan.model_fields.items():
+        expected = "required" if field.is_required() else "optional"
+        needle = f"`{name}` ({host_bridge._field_type_label(field)}, {expected})"
+        assert needle in doc, (
+            f"Plan field {name!r} should render as {expected!r} "
+            f"(is_required()={field.is_required()}), not found: {needle!r} in doc"
+        )
+    # `steps` specifically: default_factory=list => NOT required.
+    assert schemas.Plan.model_fields["steps"].is_required() is False
+    assert "`steps` (list[PlanStep], optional)" in doc
+
+
+def test_plan_field_requiredness_tracks_schema_mutation(monkeypatch):
+    """Mutation proof: if the doc-gen helper stopped reading
+    `field.is_required()` per-field (e.g. reverted to hardcoding "required"
+    for `steps`), making `steps` genuinely required upstream would not
+    change the rendered marker. Force `steps` required via a throwaway
+    subclass and confirm the doc reflects it."""
+    import hydra_core.schemas as _schemas
+
+    class _PlanWithRequiredSteps(_schemas.Plan):
+        steps: list[_schemas.PlanStep]  # no default => required
+
+    monkeypatch.setattr(_schemas, "Plan", _PlanWithRequiredSteps)
+    doc = host_bridge._plan_envelope_schema_doc()
+    assert "`steps` (list[PlanStep], required)" in doc
+
+
 def test_non_planning_squad_prompt_byte_for_byte_unchanged():
     """A non-planning squad's prompt must not change AT ALL when the new
     plan_revision/plan_critique/supersedes_plan_envelope_id kwargs are
@@ -407,6 +442,72 @@ def test_node_plan_judge_rerender_failure_is_fail_soft(tmp_path, monkeypatch):
     patch = plan_judge(state)
     assert patch["pending_hitl"]["reason"] == "plan_approval"
     assert patch["pending_hitl"]["plan_detail"]["verdict_outcome"] == "revise"
+
+
+def test_node_plan_judge_rerender_refuses_to_overwrite_a_newer_revision(tmp_path):
+    """Revision fix (defect 2): the artifact path is deterministic from
+    goal+workflow_id ALONE (`plan_slug`), shared across every revision. A
+    checkpoint replay of `node_plan_judge` holding a STALE (older-revision)
+    state snapshot must not clobber a NEWER revision's artifact already on
+    disk with older content."""
+    sup = _build_sup(tmp_path)
+    plan_judge = _node(sup, "plan_judge")
+
+    workflow_id = uuid4()
+
+    # Revision 1: write the initial (unjudged) artifact, then judge it --
+    # this writes a revision=1 verdict into the artifact.
+    state_r1 = HydraState(
+        root_goal="ship the widget", budget=BudgetLedger(budget_usd=100.0),
+        workflow_id=workflow_id,
+    )
+    state_r1.plan_status = "drafted"
+    state_r1.plan_revision = 1
+    plan_ref_r1 = _basic_plan_ref(state_r1)
+    plan_ref_r1["plan_revision"] = 1
+    state_r1.plan_ref = plan_ref_r1
+    state_r1.plan_artifact_location = _write_initial_plan_artifact(tmp_path, plan_ref_r1)
+    plan_judge(state_r1)
+
+    from hydra_core.artifact_store import resolve_repo_artifact_path
+    relpath = state_r1.plan_artifact_location[len("repo:artifact:"):]
+    after_r1 = resolve_repo_artifact_path(tmp_path, relpath).read_text(encoding="utf-8")
+    assert "plan_revision=1" in after_r1
+
+    # Revision 2: a real revise cycle writes a NEW (unjudged) artifact at the
+    # SAME deterministic path, and a real judge pass records its own
+    # revision=2 verdict.
+    state_r2 = HydraState(
+        root_goal="ship the widget", budget=BudgetLedger(budget_usd=100.0),
+        workflow_id=workflow_id,
+    )
+    state_r2.plan_status = "drafted"
+    state_r2.plan_revision = 2
+    plan_ref_r2 = _basic_plan_ref(state_r2)
+    plan_ref_r2["plan_revision"] = 2
+    state_r2.plan_ref = plan_ref_r2
+    state_r2.plan_artifact_location = _write_initial_plan_artifact(tmp_path, plan_ref_r2)
+    assert state_r2.plan_artifact_location == state_r1.plan_artifact_location, (
+        "the artifact path must be the SAME across revisions for this to be "
+        "a real ordering hazard"
+    )
+    plan_judge(state_r2)
+    after_r2 = resolve_repo_artifact_path(tmp_path, relpath).read_text(encoding="utf-8")
+    assert "plan_revision=2" in after_r2
+
+    # A replay re-invokes node_plan_judge holding the STALE revision-1
+    # snapshot (same plan_ref/plan_revision/plan_artifact_location as the
+    # first call above) AFTER revision 2's artifact is already on disk.
+    # This must NOT overwrite revision 2's artifact with revision-1 content.
+    plan_judge(state_r1)
+    after_stale_replay = resolve_repo_artifact_path(tmp_path, relpath).read_text(
+        encoding="utf-8"
+    )
+    assert "plan_revision=2" in after_stale_replay, (
+        "a stale (older-revision) verdict re-render must not clobber the "
+        "newer revision's artifact"
+    )
+    assert after_stale_replay == after_r2
 
 
 def test_node_plan_judge_no_artifact_location_skips_rerender_quietly(tmp_path):

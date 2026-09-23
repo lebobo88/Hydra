@@ -47,6 +47,7 @@ __all__ = [
     "PlanFigureError",
     "append_governance_note",
     "extract_governance_section",
+    "extract_plan_provenance",
     "plan_slug",
     "render_plan_html",
     "render_plan_json",
@@ -601,6 +602,36 @@ def extract_governance_section(html_text: str) -> str | None:
     if not match:
         return None
     return match.group(0)
+
+
+_PROVENANCE_REVISION_RE = re.compile(r"<li>plan_revision: (\d+)</li>")
+_PROVENANCE_ENVELOPE_ID_RE = re.compile(r"<li>plan envelope id: ([^<]*)</li>")
+
+
+def extract_plan_provenance(html_text: str) -> tuple[int | None, str | None]:
+    """Return ``(plan_revision, envelope_id)`` already embedded in the
+    ``<h2>Provenance</h2>`` section `render_plan_html` unconditionally emits
+    (see its ``plan_revision:``/``plan envelope id:`` list items), or
+    ``(None, None)`` when ``html_text`` has no such section (e.g. the
+    artifact has never been rendered yet).
+
+    Hydra#69 part 3 revision (stale-write guard): `node_plan_judge`'s verdict
+    re-render shares one deterministic artifact path across every revision
+    of a plan (`plan_slug` hashes only the goal + workflow_id, never the
+    revision -- see its docstring). A checkpoint replay can re-invoke
+    `node_plan_judge` holding an OLDER `state` snapshot (stale revision,
+    stale `plan_ref`) AFTER a newer revision has already been authored and
+    its artifact written to that same path. Without comparing the
+    revision/envelope id already on disk against the one about to be
+    rendered, that stale replay would silently clobber the newer artifact
+    with older content. This helper is the read side of that guard; the
+    write side lives in `hydra_core.supervisor.node_plan_judge`.
+    """
+    rev_match = _PROVENANCE_REVISION_RE.search(html_text)
+    id_match = _PROVENANCE_ENVELOPE_ID_RE.search(html_text)
+    revision = int(rev_match.group(1)) if rev_match else None
+    envelope_id = html.unescape(id_match.group(1)) if id_match else None
+    return revision, envelope_id
 
 
 # ---------------------------------------------------------------------------

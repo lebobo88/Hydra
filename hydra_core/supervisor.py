@@ -4526,6 +4526,7 @@ def build_supervisor(
                 )
                 from .plan_artifact import (
                     extract_governance_section,
+                    extract_plan_provenance,
                     render_plan_html,
                 )
 
@@ -4536,27 +4537,76 @@ def build_supervisor(
                         "no project_root available; cannot re-render the plan artifact"
                     )
                 _plan_model_for_render = Plan.model_validate(plan_ref)
-                _judge_verdict_text = (
-                    f"outcome={verdict_dict.get('outcome') or 'unknown'}; "
-                    f"judge_vendor={judge_vendor}; plan_revision={state.plan_revision}. "
-                    + (plan_detail.get("verdict_critique") or "")
-                ).strip()
                 _existing_path = resolve_repo_artifact_path(_repo_root, _relpath)
                 _existing_html = (
                     _existing_path.read_text(encoding="utf-8")
                     if _existing_path.is_file() else ""
                 )
-                _governance_section = extract_governance_section(_existing_html)
-                _rerendered = render_plan_html(
-                    _plan_model_for_render, judge_verdict=_judge_verdict_text,
+
+                # Stale-write guard (cross-vendor judge revision finding
+                # #2): (a) the verdict was computed against THIS state's
+                # `plan_ref`, so its own plan_revision must match
+                # `state.plan_revision` -- a mismatch means `plan_ref` and
+                # `state.plan_revision` have drifted apart (should never
+                # happen, but a stale write is exactly the failure mode this
+                # guard exists to catch, so refuse rather than assume). (b)
+                # the artifact path is deterministic from goal+workflow_id
+                # ALONE (see `plan_slug`), shared across every revision -- a
+                # checkpoint replay invoking this node with an OLDER `state`
+                # snapshot after a NEWER revision's artifact already exists
+                # on disk must not clobber it. `extract_plan_provenance`
+                # reads the revision/envelope id the CURRENT on-disk artifact
+                # already carries (every `render_plan_html` call emits both,
+                # from the very first ingest-time write) and this render is
+                # only allowed to proceed when the artifact on disk is not
+                # already at or past the revision this render carries.
+                _on_disk_revision, _on_disk_envelope_id = extract_plan_provenance(_existing_html)
+                _render_is_stale = (
+                    _plan_model_for_render.plan_revision != state.plan_revision
+                ) or (
+                    _on_disk_revision is not None
+                    and (
+                        _on_disk_revision > _plan_model_for_render.plan_revision
+                        or (
+                            _on_disk_revision == _plan_model_for_render.plan_revision
+                            and _on_disk_envelope_id is not None
+                            and _on_disk_envelope_id != str(_plan_model_for_render.id)
+                        )
+                    )
                 )
-                if _governance_section:
-                    _rerendered = _rerendered.rstrip("\n") + "\n" + _governance_section + "\n"
-                write_repo_artifact(_repo_root, _relpath, _rerendered)
-                emit_trace(judge_trace_root, state.workflow_id, "plan_judge.artifact_rerendered", {
-                    "plan_artifact_location": state.plan_artifact_location,
-                    "plan_revision": state.plan_revision,
-                })
+                if _render_is_stale:
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "plan_judge.artifact_rerender_skipped_stale", {
+                            "plan_artifact_location": state.plan_artifact_location,
+                            "verdict_plan_revision": state.plan_revision,
+                            "plan_ref_revision": _plan_model_for_render.plan_revision,
+                            "on_disk_revision": _on_disk_revision,
+                            "on_disk_envelope_id": _on_disk_envelope_id,
+                        },
+                    )
+                else:
+                    _judge_verdict_text = (
+                        f"outcome={verdict_dict.get('outcome') or 'unknown'}; "
+                        f"judge_vendor={judge_vendor}; plan_revision={state.plan_revision}. "
+                        + (plan_detail.get("verdict_critique") or "")
+                    ).strip()
+                    _governance_section = extract_governance_section(_existing_html)
+                    _rerendered = render_plan_html(
+                        _plan_model_for_render, judge_verdict=_judge_verdict_text,
+                    )
+                    if _governance_section:
+                        _rerendered = (
+                            _rerendered.rstrip("\n") + "\n" + _governance_section + "\n"
+                        )
+                    write_repo_artifact(_repo_root, _relpath, _rerendered)
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "plan_judge.artifact_rerendered", {
+                            "plan_artifact_location": state.plan_artifact_location,
+                            "plan_revision": state.plan_revision,
+                        },
+                    )
         except Exception as exc:  # noqa: BLE001 — fail-soft: never break the gate
             emit_trace(judge_trace_root, state.workflow_id, "plan_judge.artifact_rerender_failed", {
                 "plan_artifact_location": state.plan_artifact_location,

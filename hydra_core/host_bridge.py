@@ -2951,7 +2951,26 @@ def _field_required_marker(field: Any) -> str:
 
 
 def _field_type_label(field: Any) -> str:
+    """Render a `FieldInfo.annotation` as a readable type label.
+
+    A parameterised generic (e.g. `list[PlanStep]`) has `__name__ == "list"`
+    on the CPython versions this repo supports -- using it unguarded (as an
+    earlier revision did) silently drops the type argument for every such
+    field, `steps` included. `typing.get_args`/`get_origin` recover the
+    argument(s) so `steps` renders as `list[PlanStep]` from the schema
+    itself, the same as every other field, rather than needing a
+    hand-written special case.
+    """
+    import typing
+
     ann = getattr(field, "annotation", None)
+    origin = typing.get_origin(ann)
+    if origin is not None:
+        args = typing.get_args(ann)
+        if args:
+            arg_labels = ", ".join(getattr(a, "__name__", str(a)) for a in args)
+            origin_label = getattr(origin, "__name__", str(origin))
+            return f"{origin_label}[{arg_labels}]"
     label = getattr(ann, "__name__", None)
     return label or str(ann)
 
@@ -2983,14 +3002,11 @@ def _plan_envelope_schema_doc() -> str:
     lines.append("")
     lines.append("### Plan fields (including inherited envelope fields)")
     for name, field in plan_fields.items():
-        if name == "steps":
-            continue  # documented separately below
-        lines.append(
-            f"- `{name}` ({_field_type_label(field)}, {_field_required_marker(field)})"
+        marker = _field_required_marker(field)
+        suffix = (
+            " -- see \"PlanStep fields\" below" if name == "steps" else ""
         )
-    lines.append(
-        "- `steps` (list[PlanStep], required) -- see \"PlanStep fields\" below"
-    )
+        lines.append(f"- `{name}` ({_field_type_label(field)}, {marker}){suffix}")
     lines.append("")
     lines.append("### PlanStep fields (each entry in `steps`)")
     for name, field in step_fields.items():
