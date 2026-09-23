@@ -4896,19 +4896,40 @@ def _cmd_attended_submit(args) -> int:
     HydraState budget (keeping the 80%/100% tripwires live) and record the task
     outcome — so attended execution is never budget-blind.
 
-    Remaining-gap audit (round 6 follow-up): does NOT need a `workflow_
-    terminal_resolution` guard. This command only advances a CURSOR that
-    `_cmd_attended_step` already opened before the resume lock, and
-    `_cmd_attended_step` now refuses to open any new cursor once `workflow_
-    terminal_resolution` returns non-None -- so a cursor can only ever exist
-    here for a stage begun while the workflow was still non-terminal. It also
-    never calls `sup.invoke` (no graph re-entry) -- only `sup.update_state`
-    checkpoint patches recording the ALREADY-INCURRED cost/outcome of that
-    cursor (budget charge, `attended_completed_task_ids`, `attended_results`)
-    -- the same real-money bookkeeping the accepted item-1/item-2 charge-vs-
-    reconciliation split requires regardless of whether the workflow became
-    terminal, via a different gate, while the cursor was in flight. It never
-    selects or dispatches a NEW task."""
+    Remaining-gap audit (round 6 follow-up, CORRECTED -- a cross-vendor judge
+    found the original version of this comment wrong): this command DOES need
+    a `workflow_terminal_resolution` guard, even though it only ever advances
+    a CURSOR that `_cmd_attended_step` already opened before the resume lock
+    (and `_cmd_attended_step` refuses to open any NEW cursor once the
+    workflow is terminal). A cursor opened while the workflow was still
+    non-terminal can still go terminal itself, right here, via a submit that
+    lands AFTER the workflow became terminal through a DIFFERENT gate --  and
+    a terminal pp stage's own completion is not harmless bookkeeping:
+      * a `planning`-owned cursor's completion IS graph re-entry --
+        `_apply_plan_reentry` below calls `sup.invoke`/`sup.update_state` to
+        apply the PLAN's `plan_patch`, and the ingest loop above it can
+        `dispatch_ingested_envelopes` a brand-new task from any emitted
+        delegation envelope. Both are refused below (guarded on
+        `workflow_terminal_resolution(snap.values, snap.next)`, computed
+        fresh from the checkpoint both BEFORE calling
+        `host_bridge.submit_host_result` and again once the post-submit
+        checkpoint state is read) -- the loop still runs far enough to record
+        THIS call's already-incurred cost, but never claims/dispatches an
+        envelope or re-enters the graph once terminal.
+      * an `engineering`-owned cursor's own terminal transition happens
+        INSIDE `host_bridge.submit_host_result` (via `_apply_judge` ->
+        `_finalize`), before this function's own checkpoint read even runs --
+        a passing judge verdict there merges the candidate worktree into the
+        target repo, which is itself "continuing" a terminal workflow. The
+        pre-submit checkpoint read above passes `workflow_terminal=True` into
+        `submit_host_result` so `_finalize` still records the pp-ledger
+        verdict (real spend already happened) but refuses the merge and
+        preserves the branch for manual pickup instead.
+    In both cases: budget/attended_results bookkeeping for the ALREADY-
+    INCURRED cost of this call is still recorded (idempotency and
+    exactly-once charging are unaffected by workflow-terminal status -- see
+    the accepted item-1/item-2 charge-vs-reconciliation split); only the
+    forward-looking side effects (dispatch, re-entry, merge) are refused."""
     from . import host_bridge
     from .governance import charge_and_gate, should_block_for_budget, should_downgrade_model
     project = Path(args.project) if args.project else Path.cwd()
@@ -5011,8 +5032,38 @@ def _cmd_attended_submit(args) -> int:
             print(_cli_json_dumps({"ok": False, "error": "cursor_not_found",
                               "detail": str(cfile)}), file=sys.stderr)
             return 1
+        # Round 6 gap fix (engineering merge-back): a cursor opened BEFORE the
+        # workflow became terminal can still be driven to a terminal pp stage
+        # right here -- and `host_bridge.submit_host_result` (via
+        # `_apply_judge` -> `_finalize`) merges the candidate worktree into
+        # the repo on a passing finalize BEFORE this function ever reaches
+        # its own post-submit terminal check below. Read the checkpoint's
+        # terminal status FIRST, before `submit_host_result` runs, and pass
+        # it down so `_finalize` can still record the pp ledger bookkeeping
+        # (record_attempt/record_verdict already ran, or run inside this same
+        # call, for the already-incurred attempt) while refusing the merge
+        # itself and preserving the branch/worktree for the operator instead
+        # of silently continuing a terminal workflow.
+        from .supervisor import build_supervisor as _pre_bs, _PurePythonRunner as _pre_ppr
+        _pre_terminal = None
+        _pre_sup = _pre_bs(project_root=project, dispatcher=dispatcher)
+        if not isinstance(_pre_sup, _pre_ppr):
+            _pre_config = {"configurable": {"thread_id": wf}}
+            _pre_snap = _pre_sup.get_state(_pre_config)
+            if _pre_snap is not None and _pre_snap.values:
+                _pre_terminal = workflow_terminal_resolution(
+                    _pre_snap.values, getattr(_pre_snap, "next", ()) or ())
         res = host_bridge.submit_host_result(
-            dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result)
+            dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result,
+            workflow_terminal=_pre_terminal is not None)
+        # Surface the terminal resolution on the response even though `status`
+        # itself stays the cursor's own terminal state (e.g. "surfaced") --
+        # overriding `status` here would skip the charge/bookkeeping block
+        # below (gated on `res.get("status") in (...)`) and leave this call's
+        # already-incurred spend unrecorded, which is exactly the double-
+        # charge/never-charge failure mode this fix must not introduce.
+        if _pre_terminal is not None:
+            res["workflow_terminal"] = _pre_terminal
         # Hydra#69 round 6 defect 2 (HIGH): a terminal cursor refused this
         # call_key structurally — it does not match the call_key that
         # actually produced the cursor's terminal transition. Never charge,
@@ -5210,6 +5261,19 @@ def _cmd_attended_submit(args) -> int:
                 snap = sup.get_state(config)
                 if snap is not None and snap.values:
                     state = HydraState.model_validate(snap.values)
+                    # Round 6 gap fix (stale-cursor submit): re-derive terminal
+                    # status from the CURRENT checkpoint (may have gone
+                    # terminal via a different gate while this cursor was in
+                    # flight, or was already terminal at the pre-submit check
+                    # above -- re-read here rather than trust that snapshot,
+                    # since this is the checkpoint state every write below
+                    # actually applies against). Gates the ingest/dispatch and
+                    # PLAN re-entry blocks further down (never the cost/
+                    # bookkeeping writes immediately below, which record the
+                    # ALREADY-INCURRED spend regardless of workflow terminal
+                    # status -- see `_cmd_attended_submit`'s docstring).
+                    _terminal = workflow_terminal_resolution(
+                        snap.values, getattr(snap, "next", ()) or ())
                     cost = float(res.get("cost_usd") or 0.0)
                     toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
                     # B8: see the recover-stalled-stage twin above — an
@@ -5379,12 +5443,35 @@ def _cmd_attended_submit(args) -> int:
                     # the attended-host gap without creating an ungoverned
                     # direct Agent fan-out.
                     emitted = res.get("emitted_envelopes") or []
+                    # Round 6 gap fix (stale-cursor submit, cross-vendor
+                    # finding): a cursor opened before the workflow became
+                    # terminal reaches here with `emitted`/`is_planning_task`
+                    # exactly as before -- but dispatching those envelopes
+                    # (claim + `dispatch_ingested_envelopes`, which can itself
+                    # dispatch a new task) or re-entering the graph for a PLAN
+                    # (`_apply_plan_reentry` below) would CONTINUE a workflow
+                    # the operator already aborted/rejected elsewhere. Refuse
+                    # both here; the cost/bookkeeping write above already
+                    # recorded this call's already-incurred spend exactly
+                    # once, independent of this gate.
+                    if _terminal is not None:
+                        if emitted or is_planning_task:
+                            res["ingest"] = []
+                            res["status"] = "workflow_terminal"
+                            res["workflow_terminal"] = _terminal
+                            emit(project, wf, "attended.submit_terminal_refused", {
+                                "run_id": str(args.run_id),
+                                "call_key": str(args.call_key),
+                                "task_id": str(tid) if tid is not None else None,
+                                "emitted_count": len(emitted),
+                                "is_planning_task": is_planning_task,
+                            })
                     # Hydra#69 defect C: for a `planning` task the ingest loop
                     # must run even with an EMPTY `emitted` list — that is
                     # itself the "missing PLAN" rejection case, and the
                     # acceptance check right after this block needs to run
                     # regardless of whether anything was emitted.
-                    if emitted or is_planning_task:
+                    elif emitted or is_planning_task:
                         from .ingest import (
                             claim_ingested_ids,
                             dispatch_ingested_envelopes,
@@ -5528,7 +5615,14 @@ def _cmd_attended_submit(args) -> int:
                     # covers every rejection kind the brief enumerates
                     # (missing PLAN, schema-invalid PLAN, phase disabled,
                     # artifact write failure, re-entry failure) uniformly.
-                    if is_planning_task:
+                    # Round 6 gap fix: `_terminal is not None` short-circuited
+                    # the ingest block above (no `plan_reentry_patch`/
+                    # `outcomes` were ever computed this call, and `res` was
+                    # already set to the `workflow_terminal` refusal above) —
+                    # never run this acceptance/rejection decision in that
+                    # case, it would otherwise misclassify the refusal as an
+                    # ordinary `plan_rejected` and bump the attempt counter.
+                    if is_planning_task and _terminal is None:
                         # Hydra#69 round 6 defect 1 (repair-retry corollary):
                         # a repair retry (the completion write below failed
                         # on a PRIOR call, after the PLAN itself was already

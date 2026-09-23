@@ -350,3 +350,67 @@ class TestWorkflowTerminalResolutionHelperUnit:
         never resolved) must return None, not be misread as terminal."""
         values = {"hitl_history": [], "plan_revision": 0}
         assert workflow_terminal_resolution(values, ("judge_synthesis",)) is None
+
+
+class TestLegacyStaleRejectAtDifferentGateOccurrenceIsNotRefused:
+    """Cross-vendor follow-up (b): a legacy checkpoint (no durable
+    `terminal_resolution` field) whose latest `hitl_history` resolution is an
+    OLD reject of `plan_gate` at revision 1 must not block a FRESH,
+    never-resolved occurrence of `plan_gate` at revision 2 -- proven already
+    at the unit level (`workflow_terminal_resolution`) and through
+    `_cmd_resume`, but never through `_cmd_attended_step`/`_cmd_finalize`
+    directly. Both consult the SAME shared helper, so this closes the gap in
+    coverage rather than testing new production behaviour."""
+
+    def _seed(self):
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        wf = uuid4()
+        plan_ref = {
+            "steps": [{
+                "step_id": "step-1", "target_squad": "engineering",
+                "description": "do the thing", "priority": "P2",
+                "acceptance_criteria": ["it works"], "envelope_type": "DEV_TASK",
+            }],
+        }
+        state = HydraState(
+            workflow_id=wf, root_goal="round 6 gap legacy stale-reject-new-revision repro",
+            phase="approval", plan_status="judged", plan_ref=plan_ref,
+            plan_revision=2, pending_hitl=None, tasks=[],
+            hitl_history=[{
+                "gate_node": "plan_gate", "resolution": "reject",
+                "option": None, "plan_revision": 1,
+            }],
+        )
+        sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+        assert not isinstance(sup, _PurePythonRunner), "langgraph required for this test"
+        config = {"configurable": {"thread_id": str(wf)}}
+        sup.update_state(config, state.model_dump(mode="json"), as_node="plan_judge")
+        snap = sup.get_state(config)
+        assert tuple(snap.next) == ("plan_gate",), (
+            f"fixture must park at plan_gate; got next={snap.next!r}"
+        )
+        assert snap.values.get("terminal_resolution") is None, (
+            "this fixture must exercise the LEGACY fallback, not the durable field"
+        )
+        return str(wf), sup, config
+
+    def test_step_not_refused_for_stale_reject_at_different_plan_revision(self, hermetic):
+        wf, sup, config = self._seed()
+
+        rc, body = _step(wf)
+        assert rc == 0, body
+        assert body.get("status") != "workflow_terminal", (
+            f"a stale reject bound to an OLDER plan_revision must never "
+            f"refuse a fresh, never-resolved occurrence: {body}"
+        )
+
+    def test_finalize_not_refused_for_stale_reject_at_different_plan_revision(self, hermetic):
+        wf, sup, config = self._seed()
+
+        rc, body = _finalize(wf)
+        assert rc == 0, body
+        assert body.get("status") != "workflow_terminal", (
+            f"a stale reject bound to an OLDER plan_revision must never "
+            f"refuse `finalize` for a fresh, never-resolved occurrence: {body}"
+        )

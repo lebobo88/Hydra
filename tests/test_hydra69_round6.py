@@ -1186,3 +1186,160 @@ class TestItem3TerminalResolutionField:
         )
         assert body.get("resumed") is False
         assert body.get("graph_reentered") is False
+
+
+# =========================================================================== #
+# Remaining-gap cross-vendor finding (this round): a cursor opened BEFORE the
+# workflow became terminal must never dispatch a new task or re-enter the
+# graph once submitted AFTER the workflow went terminal via a DIFFERENT gate.
+# `_cmd_attended_submit` still records the already-incurred cost of the call
+# exactly once, but refuses the PLAN re-entry / emitted-envelope dispatch.
+# =========================================================================== #
+
+class TestRemainingGapStaleCursorSubmitAfterTerminal:
+    def _plan_task_setup(self, monkeypatch, tmp_path):
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task])
+        fake_sup = _StatefulFakeSup(state.model_dump(mode="json"))
+
+        class _FakeDispatcher:
+            project_root = tmp_path
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        charge_calls: list[float] = []
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (charge_calls.append(cost), (False, False))[1],
+        )
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+        return str(wf), str(task.task_id), fake_sup, charge_calls
+
+    def _mark_terminal(self, fake_sup):
+        """Simulate the workflow going terminal (a DIFFERENT gate aborted or
+        rejected it) while this cursor is still in flight -- the same shape
+        `state.HydraState.terminal_resolution` carries after a real
+        `as_node='postcheck'` write."""
+        fake_sup._values["terminal_resolution"] = {
+            "gate_node": "approval", "hitl_request_id": None,
+            "action": "reject", "option": None, "plan_revision": None,
+            "resolved_at": "2026-09-23T00:00:00+00:00",
+        }
+
+    def test_stale_plan_submit_after_terminal_never_reenters_graph(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        wf_id, task_id, fake_sup, charge_calls = self._plan_task_setup(monkeypatch, tmp_path)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        self._mark_terminal(fake_sup)
+
+        plan = _plan_dict(wf_id)
+        r0 = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.10, "tokens_in": 5, "tokens_out": 5,
+            "emitted_envelopes": [plan],
+        })
+        rc, body = _submit(capsys, wf_id, task_id, call_key_0, r0)
+        assert rc == 0, body
+        assert body.get("status") == "workflow_terminal", body
+        assert body.get("workflow_terminal", {}).get("action") == "reject"
+
+        values = fake_sup._values
+        # The PLAN must never have been re-entered into the graph.
+        assert values.get("plan_status") in (None, "none"), (
+            f"a stale-cursor PLAN submit after terminal must never re-enter "
+            f"the graph: plan_status={values.get('plan_status')!r}"
+        )
+        assert not values.get("plan_envelope_id")
+        assert task_id not in (values.get("attended_completed_task_ids") or []), (
+            "a refused stale-cursor PLAN submit must never be marked complete"
+        )
+        # The already-incurred cost of THIS call is still charged, exactly once.
+        assert charge_calls == [0.10]
+
+        # A second identical submit must never re-charge either (idempotency
+        # is unaffected by the terminal refusal).
+        rc2, body2 = _submit(capsys, wf_id, task_id, call_key_0, r0)
+        assert rc2 == 0, body2
+        assert charge_calls == [0.10]
+
+    def test_stale_emitted_delegation_envelope_after_terminal_is_not_dispatched(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """The engineering-task twin: a non-planning cursor whose host result
+        carries `emitted_envelopes` (a native pack delegating typed work to a
+        sibling squad) must never claim/dispatch that envelope once the
+        workflow is terminal."""
+        task = TaskState(owner_squad="customer-support", description="handle the ticket")
+        wf = uuid4()
+        state = HydraState(root_goal="x", workflow_id=wf, tasks=[task])
+        fake_sup = _StatefulFakeSup(state.model_dump(mode="json"))
+        task_id = str(task.task_id)
+
+        host_bridge.begin_squad_stage(
+            workflow_id=str(wf), task_id=task_id, squad_slug="customer-support",
+            entrypoint="claude-skill", lead_agent="general-purpose",
+            pack_cwd=str(tmp_path), request_text="handle the ticket",
+            project_root=tmp_path,
+        )
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeAttendedDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        # Real `charge_and_gate` here (unlike the PLAN test above) so the
+        # budget assertion below observes the actual ledger mutation, the
+        # same way `test_cli_submit_refuses_stale_call_key_without_charging_
+        # or_marking` does for its squad-cursor charge assertion.
+
+        self._mark_terminal(fake_sup)
+
+        delegated = {
+            "id": str(uuid4()), "type": "DEV_TASK", "origin_squad": "customer-support",
+            "target_squad": "engineering", "workflow_id": str(wf),
+            "rigor": "standard", "goal_restatement": "fix it",
+            "summary": "fix it", "description": "fix it",
+            "acceptance_criteria": ["it works"],
+        }
+        call_key = f"squad-{task_id}-0"
+        result_path = tmp_path / "result.json"
+        result_path.write_text(json.dumps({
+            "text": "resolved the ticket", "cost_usd": 0.25,
+            "tokens_in": 10, "tokens_out": 5,
+            "emitted_envelopes": [delegated],
+        }), encoding="utf-8")
+
+        rc, body = _submit(capsys, str(wf), task_id, call_key, result_path, project=tmp_path)
+        assert rc == 0, body
+        assert body.get("status") == "workflow_terminal", body
+
+        values = fake_sup._values
+        # No NEW task/envelope was dispatched from the emitted delegation --
+        # `tasks` still holds only the ORIGINAL customer-support task this
+        # fixture seeded, never a second (engineering) task materialised
+        # from the delegation envelope.
+        assert len(values.get("tasks") or []) == 1, (
+            f"a stale-cursor delegation envelope must never be dispatched "
+            f"once the workflow is terminal: tasks={values.get('tasks')!r}"
+        )
+        assert not values.get("envelopes")
+        # The already-incurred cost of THIS call is still charged, exactly once.
+        assert float((values.get("budget") or {}).get("spent_usd") or 0.0) == pytest.approx(0.25)
+
+        # A second identical submit must never re-charge (idempotency is
+        # unaffected by the terminal refusal).
+        rc2, body2 = _submit(capsys, str(wf), task_id, call_key, result_path, project=tmp_path)
+        assert rc2 == 0, body2
+        assert float((fake_sup._values.get("budget") or {}).get("spent_usd") or 0.0) == \
+            pytest.approx(0.25)

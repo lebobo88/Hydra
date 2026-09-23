@@ -2027,13 +2027,21 @@ def begin_stage(
 
 
 def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
-                    result: dict[str, Any]) -> None:
+                    result: dict[str, Any], *,
+                    workflow_terminal: bool = False) -> None:
     """await_generate -> await_judge (or terminal on generate failure).
 
     The host's ``engineer`` subagent already wrote files in cwd; ``result`` is
     its summary + spend. We attribute the run-scoped diff, archive + record the
     attempt, route the judge via pp's ``gate_eligible_judges``, and stage the
     judge host-action.
+
+    ``workflow_terminal``: threaded through to ``_finalize`` on the
+    generate-failure terminal paths below -- see ``submit_host_result``'s
+    docstring. A generate FAILURE never reaches the merge branch of
+    ``_finalize`` (``passed=False`` there unconditionally), so this only
+    affects the ``merge`` error label reported to the operator, not any
+    dispatch/re-entry behaviour.
     """
     cm = dispatcher.call_mcp
     work_path = cursor.get("work_path") or cursor["project_path"]
@@ -2095,7 +2103,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         except Exception:  # noqa: BLE001
             pass
         # Generation failed; finalize as surfaced (no judge).
-        _finalize(dispatcher, cursor, passed=False, gen_failed=True)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=True,
+                 workflow_terminal=workflow_terminal)
         return
 
     # Successful generate: archive the producer summary + record the attempt.
@@ -2138,7 +2147,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         # record_attempt RPC failed — surface the stage immediately rather than
         # crashing. The engineer's work is generated but cannot be tracked.
         cursor["error"] = f"record_attempt RPC failed: {_ra_exc!r}"
-        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         return
 
     # Judge routing — honour pp's gate_eligible_judges (cross- vs same-vendor)
@@ -2259,8 +2269,17 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any],
                  *, cursor_file: "str | Path | None" = None,
-                 call_key: str | None = None) -> dict[str, Any] | None:
+                 call_key: str | None = None,
+                 workflow_terminal: bool = False) -> dict[str, Any] | None:
     """await_judge -> terminal (or back to await_generate for Reflexion x1).
+
+    ``workflow_terminal`` (round 6 gap fix): see ``submit_host_result``'s
+    docstring. Threaded through to every ``_finalize`` call below so a
+    PASSING verdict on a stale cursor still records the ledger verdict
+    (already happened via ``record_verdict`` above, before ``_finalize`` is
+    ever reached) but never merges the candidate worktree back into the
+    repo -- merging is itself the "continue a terminal workflow" act this
+    fix refuses.
 
     F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
     the stage to surfaced (never proceeds to finalize_run complete).
@@ -2343,7 +2362,8 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             "stage_id": stage_id, "call_key": call_key,
             "chain": chain, "reason": result.get("reason"),
         })
-        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         return None
 
     cm = dispatcher.call_mcp
@@ -2827,11 +2847,13 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 cursor["outcome"] = "surfaced"
                 cursor["error"] = f"pp readiness: not ready (next_action={na})"
 
-    _finalize(dispatcher, cursor, passed=passed, gen_failed=False)
+    _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
+             workflow_terminal=workflow_terminal)
 
 
 def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
-              passed: bool, gen_failed: bool) -> None:
+              passed: bool, gen_failed: bool,
+              workflow_terminal: bool = False) -> None:
     """Finalize the stage + run and set the terminal cursor state. Mirrors the
     headless loop's downgrade-honouring finalize_run handling.
 
@@ -2843,6 +2865,15 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     was finalized 'complete' and only the cursor reflected the merge failure).
     F30: abort/error reason is included in summary_md (FinalizeRunSchema strips
     standalone `reason` / `project_path` keys).
+
+    Round 6 gap fix: ``workflow_terminal=True`` means the caller already
+    determined -- from the authoritative HydraState checkpoint -- that this
+    workflow has a durable ``terminal_resolution``. ``finalize_stage`` above
+    still runs unconditionally (pp ledger bookkeeping for the already-
+    incurred attempt/verdict, exactly once); the merge-back below is what
+    gets refused: it is the one side effect that would actually CONTINUE a
+    terminal workflow (landing code in the target repo). The branch is
+    preserved (committed, never merged) for manual operator pickup instead.
     """
     cm = dispatcher.call_mcp
     stage_id = cursor["stage_id"]
@@ -2881,7 +2912,7 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     repo_root = cursor.get("repo_root")
     branch = cursor.get("branch")
     if worktree_path and repo_root and branch:
-        if passed:
+        if passed and not workflow_terminal:
             merge = _merge_worktree_back(repo_root, worktree_path, branch)
             cursor["merge"] = merge
             if not merge.get("merged"):
@@ -2901,14 +2932,27 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
                        {"branch": branch, "run_id": run_id,
                         "via": "merge_helper_commit"})
         else:
-            cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
+            # Round 6 gap fix: a workflow-terminal finalize is refused the
+            # merge unconditionally, even though this attempt/verdict itself
+            # PASSED -- landing code now would continue a workflow the
+            # operator already aborted/rejected elsewhere. Reported error is
+            # distinct from the ordinary "never even attempted a merge"
+            # non-complete case so the operator can tell the two apart.
+            if workflow_terminal:
+                cursor["merge"] = {"merged": False, "error": "workflow_terminal"}
+                if passed:
+                    passed = False
+                    cursor["outcome"] = "workflow_terminal"
+            else:
+                cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
             # MU12: commit any engineer changes to the attended branch BEFORE
             # removing the worktree so the operator can pick them up.  The
             # complete path is handled by _merge_worktree_back above; this
             # preserves work on non-complete outcomes (smoke-fail, judge-fail,
-            # generate-fail).
-            _preserve_non_complete_work(cursor, worktree_path, branch, run_id,
-                                        final_status="surfaced")
+            # generate-fail, or a workflow-terminal refusal).
+            _preserve_non_complete_work(
+                cursor, worktree_path, branch, run_id,
+                final_status=("workflow_terminal" if workflow_terminal else "surfaced"))
         _remove_worktree(repo_root, worktree_path)
 
     # F30: build summary_md that embeds any error/abort reason.
@@ -3784,6 +3828,7 @@ def submit_host_result(
     cursor_file: str | Path,
     call_key: str,
     result: dict[str, Any],
+    workflow_terminal: bool = False,
 ) -> dict[str, Any]:
     """Feed a host subagent's result back in and advance the cursor by exactly
     one transition. Idempotent on a stale/duplicate ``call_key`` (returns the
@@ -3793,6 +3838,17 @@ def submit_host_result(
     Handles both ``kind="engineering"`` (the default pp stage flow) and the
     lightweight ``kind="squad"`` cursors created by ``begin_squad_stage`` for
     non-engineering tasks (claude-skill / agent-impersonation).
+
+    ``workflow_terminal`` (round 6 gap fix): True when the CALLER already
+    determined -- from the authoritative HydraState checkpoint, BEFORE this
+    function runs -- that the workflow has a durable ``terminal_resolution``
+    (see ``hydra_core.state.workflow_terminal_resolution``). Threaded through
+    to ``_apply_generate``/``_apply_judge`` -> ``_finalize`` so a passing
+    finalize on a stale cursor still records the already-incurred pp ledger
+    attempt/verdict (real spend already happened) but refuses to merge the
+    candidate worktree into the repo -- merging would continue a terminal
+    workflow. Never itself re-reads the checkpoint; this module has no
+    supervisor/graph access, only the cursor sidecar.
     """
     cursor = load_cursor(cursor_file)
     state = cursor.get("state")
@@ -3839,7 +3895,7 @@ def submit_host_result(
         return out
 
     if state == "await_generate":
-        _apply_generate(dispatcher, cursor, result)
+        _apply_generate(dispatcher, cursor, result, workflow_terminal=workflow_terminal)
     elif state in ("await_judge", "stalled_infra"):
         # W2-3: "stalled_infra" is a non-terminal hold state entered when a
         # transport-shaped record_verdict failure would otherwise have been
@@ -3854,7 +3910,8 @@ def submit_host_result(
         # pending_action/call_key, so the host corrects the label and
         # resubmits under the SAME call_key rather than losing the stage.
         _judge_err = _apply_judge(dispatcher, cursor, result,
-                                  cursor_file=cursor_file, call_key=call_key)
+                                  cursor_file=cursor_file, call_key=call_key,
+                                  workflow_terminal=workflow_terminal)
         if _judge_err is not None:
             save_cursor(cursor_file, cursor)
             out = _step_result(cursor, cursor_file)
