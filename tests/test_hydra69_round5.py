@@ -479,15 +479,18 @@ class _StatefulFakeSup:
 
 class _FlakyOnceSup(_StatefulFakeSup):
     """Fails the FIRST checkpoint write that carries the budget-charge
-    reconciliation marker (Hydra#69 round 5 defect 2's primary write) with a
-    simulated persistence error, then behaves normally on every later call."""
+    marker (Hydra#69 round 6 defect 1 renamed this to
+    ``attended_charge_applied`` -- CHARGE evidence, separate from the
+    ``attended_checkpoint_reconciled`` FULL-reconciliation marker, which is
+    now written last) with a simulated persistence error, then behaves
+    normally on every later call."""
 
     def __init__(self, initial_values: dict):
         super().__init__(initial_values)
         self._armed = True
 
     def update_state(self, config, patch, as_node=None):
-        if self._armed and "attended_checkpoint_reconciled" in patch:
+        if self._armed and "attended_charge_applied" in patch:
             self._armed = False
             raise RuntimeError("simulated checkpoint persistence failure")
         super().update_state(config, patch, as_node=as_node)
