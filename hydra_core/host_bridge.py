@@ -3031,7 +3031,17 @@ def _plan_envelope_schema_doc() -> str:
     # `hydra_core.schemas.Plan`.
     plan_schema = _schemas.Plan.model_json_schema()
     lines.append("### Plan JSON Schema (generated from hydra_core.schemas.Plan)")
-    lines.append(json.dumps(plan_schema, separators=(",", ":")))
+    # Static schema data (no operator-controlled floats can reach this), but
+    # `dumps_strict` is still the right choice over a bare `json.dumps`: it
+    # refuses a non-finite float / circular reference outright rather than
+    # emitting invalid RFC 8259 JSON, and keeps this call inside the same
+    # enforced boundary every other serialization site in this module uses
+    # (see `tests/test_json_dumps_enforcement.py`). `sort_keys=True` makes
+    # the embedded schema deterministic across pydantic dict-ordering
+    # variance, not just compact.
+    lines.append(dumps_strict(
+        plan_schema, label="plan_schema", separators=(",", ":"), sort_keys=True,
+    ))
     return "\n".join(lines)
 
 
