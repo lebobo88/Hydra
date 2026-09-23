@@ -451,6 +451,70 @@ def materialise_plan_steps(
         # flip, no pending_hitl mutation, no placeholder supersession.
         return {}
 
+    # Hydra#69 round 5 defect 1c: `cur is None` is reachable from TWO very
+    # different histories -- (1) the genuine post-approve graph re-entry
+    # (cli.py already wrote pending_hitl=None + the approve resolution in
+    # ONE atomic patch, `sup.invoke` now re-runs `node_plan_gate` against
+    # that already-cleared state), and (2) a terminal abort/reject that ALSO
+    # cleared pending_hitl in its own atomic park write (defect 1a/1b), where
+    # a stale/duplicate resume later reaches this function with `cur is
+    # None` too. `approved_resolution=True` (cli.py's own `--gate-only`
+    # approve caller, passing the PRE-patch snapshot whose `pending_hitl` is
+    # still the open dict) already proves case (1) explicitly and skips this
+    # block entirely. Every OTHER caller -- specifically `node_plan_gate`
+    # itself, called with no `approved_resolution` argument on every real
+    # graph re-entry -- must prove case (1) here, from durable state, before
+    # materialising: an already-parked workflow (phase=="surfaced") or an
+    # explicitly rejected plan (plan_status=="rejected") is refused
+    # immediately; otherwise the latest plan_gate entry recorded in
+    # `hitl_history` must itself be a genuine approve (not an abort) for the
+    # gate to have legitimately cleared.
+    if not approved_resolution:
+        if state.phase == "surfaced" or state.plan_status == "rejected":
+            return {}
+        # Hydra#69 round 5 follow-up: the latest plan_gate entry must be
+        # evidence for THIS revision, not merely the latest plan_gate entry
+        # of any age. An approve recorded against an older `plan_revision`
+        # (e.g. the operator approved revision 1, then the planner produced
+        # a revised, as-yet-unapproved revision 2) must never authorise
+        # materialising a newer revision's steps -- that would silently
+        # promote an unreviewed plan using stale consent. So: scan
+        # `hitl_history` in reverse for the latest plan_gate entry whose own
+        # `plan_revision` equals `state.plan_revision` exactly.
+        #
+        # Legacy-entry policy: entries written before this stamp existed
+        # carry no `plan_revision` key at all. Treat a legacy (unstamped)
+        # entry as evidence ONLY when `state.plan_revision <= 1` AND no
+        # entry in the whole history carries an explicit `plan_revision` --
+        # i.e. this checkpoint predates revisioning entirely and is still on
+        # its first (only) plan. The instant any entry in the history is
+        # revision-stamped, the checkpoint is revision-aware and an
+        # unstamped entry can no longer be trusted to mean "revision 1"; it
+        # is treated as not-evidence and materialisation is refused. This
+        # keeps the legacy fallback narrowly scoped to genuinely pre-
+        # revisioning checkpoints instead of silently laundering a stale
+        # approval on a mixed-history checkpoint.
+        _history = state.hitl_history or []
+        _any_stamped = any(
+            isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+            and e.get("plan_revision") is not None
+            for e in _history
+        )
+        _legacy_ok = state.plan_revision <= 1 and not _any_stamped
+        _latest_plan_gate_entry = next(
+            (e for e in reversed(_history)
+             if isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+             and (
+                 e.get("plan_revision") == state.plan_revision
+                 or (e.get("plan_revision") is None and _legacy_ok)
+             )),
+            None,
+        )
+        if (_latest_plan_gate_entry is None
+                or _latest_plan_gate_entry.get("resolution") != "approve"
+                or _latest_plan_gate_entry.get("option") == "abort"):
+            return {}
+
     plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
     valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]
 
@@ -2002,6 +2066,29 @@ def build_supervisor(
             })
         return out
 
+    def _decision_packet_task_fields(task: Any) -> dict[str, Any]:
+        """Hydra#69 round 5 defect 4: the SINGLE source for the fields every
+        `CSuiteDecisionPacket` constructed for a `TaskState` must carry.
+
+        Previously only `node_dispatch`'s sequential-loop `_build_payload`
+        threaded `acceptance_criteria`/`envelope_type` onto the packet
+        (Hydra#69 follow-up defect 6) — `_dispatch_best_of_n`'s per-candidate
+        packet and `_reflexion_retry`'s retry packet each hand-built their
+        own `CSuiteDecisionPacket` with neither field, so a best-of-N
+        candidate or a reflexion retry silently reverted to the DEFAULT
+        judge gate/rubric instead of the task's own acceptance criteria and
+        envelope type. Every `CSuiteDecisionPacket` constructor for a task
+        (`_build_payload`, `_dispatch_best_of_n`, `_reflexion_retry`) now
+        spreads this helper's output into its own packet instead of
+        hand-duplicating the field derivation a second/third time.
+        """
+        return {
+            "acceptance_criteria": (
+                list(getattr(task, "acceptance_criteria", None) or []) or None
+            ),
+            "envelope_type": getattr(task, "envelope_type", None),
+        }
+
     def _dispatch_best_of_n(
         state: HydraState,
         pack,
@@ -2044,6 +2131,9 @@ def build_supervisor(
                 target_repo_id=state.target_repo_id,
                 target_repo_subpath=getattr(task, "target_repo_subpath", None) or state.target_repo_subpath,
                 model_tier=getattr(task, "model_tier", None),
+                # Hydra#69 round 5 defect 4: single shared source — see
+                # `_decision_packet_task_fields`'s docstring.
+                **_decision_packet_task_fields(task),
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -2369,13 +2459,12 @@ def build_supervisor(
                 model_tier=getattr(task, "model_tier", None),
                 pp_team=getattr(task, "pp_team", None),
                 pp_profile=getattr(task, "pp_profile", None),
-                # Hydra#69 follow-up defect 6: same fields the attended
-                # request text folds in (cli.py, defect E) — carried through
-                # here so the detached/fleet leg gets them too.
-                acceptance_criteria=list(
-                    getattr(task, "acceptance_criteria", None) or []
-                ) or None,
-                envelope_type=getattr(task, "envelope_type", None),
+                # Hydra#69 follow-up defect 6 / round 5 defect 4: same fields
+                # the attended request text folds in (cli.py, defect E) —
+                # carried through here (via the single shared helper) so the
+                # detached/fleet leg, best-of-N candidates, and reflexion
+                # retries all get them too.
+                **_decision_packet_task_fields(task),
             )
 
         # WS8 Fix 5: build EVERY pending task's payload EXACTLY ONCE, up-front,
@@ -3204,6 +3293,11 @@ def build_supervisor(
                 getattr(_retry_task, "target_repo_subpath", None) or state.target_repo_subpath
             ),
             model_tier=_retry_model_tier,
+            # Hydra#69 round 5 defect 4: single shared source — see
+            # `_decision_packet_task_fields`'s docstring. `_retry_task` may
+            # be None (legacy-envelope fallback exhausted); the helper
+            # tolerates that via `getattr(None, ..., None)`.
+            **_decision_packet_task_fields(_retry_task),
         )
 
         try:

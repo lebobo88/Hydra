@@ -2127,6 +2127,40 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # (no pending_hitl but graph paused before synthesis/judge_synthesis)
         # from a genuinely terminal state (snap.next empty).
         _snap_next = getattr(snap, "next", ()) or ()
+        # Hydra#69 round 5 defect 1b (defense in depth): `option == "abort"`
+        # is a terminal decision no matter what `action` carries it (the
+        # plan_gate's own revision_ceiling_reached/unjudgeable_plan branches
+        # advertise it as `action="approve", option="abort"`) -- it must
+        # NEVER fall into the "continue the graph" branch below, even on an
+        # older checkpoint written before defect 1a's `as_node="postcheck"`
+        # fix left `next` truthy. Checked BEFORE the approve/force-dispatch
+        # continue-branch so a repeated abort can never be misread as a
+        # genuine approve just because `action` happens to be "approve".
+        if _snap_next and option == "abort":
+            emit(project, wf, "hitl_resumed", {
+                "action": action,
+                "option": option,
+                "gate_node": None,
+                "bare_interrupt": list(_snap_next),
+                "gate_only": gate_only,
+                "note": "repeated abort observed at bare interrupt; graph not re-entered",
+            })
+            print(_cli_json_dumps({
+                "workflow_id": wf,
+                "ok": True,
+                "resumed": False,
+                "gate_only": gate_only,
+                "graph_reentered": False,
+                "action": action,
+                "option": option,
+                "interrupted_before": list(_snap_next),
+                "gate_node": None,
+                "phase": values.get("phase"),
+                "status": values.get("phase"),
+                "pending_hitl": None,
+                "note": ("already terminal (abort); graph not re-entered"),
+            }))
+            return 0
         if _snap_next and action in ("approve", "force-dispatch"):
             # Bare interrupt + approve/force-dispatch: continue the graph --
             # UNLESS gate_only, in which case there is nothing to clear (no
@@ -2296,6 +2330,26 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         "option": option,
         "resolved_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # Hydra#69 round 5 follow-up (gap b): stamp `plan_revision` (and
+    # `plan_envelope_id` where known) onto EVERY hitl_history entry that
+    # resolves a plan_gate -- approve, abort (action="approve",
+    # option="abort"), reject, modify-plan, modify-budget, force-dispatch.
+    # `materialise_plan_steps`'s evidence lookup (supervisor.py) now filters
+    # "the latest plan_gate resolution for the CURRENT plan_revision" so an
+    # approve recorded against an older revision can never authorise
+    # materialising a newer, unapproved revision; that filter only works if
+    # every plan_gate entry -- not just the approve that happens to
+    # materialise -- carries its revision. Stamped once, here, from the
+    # PRE-patch `values` snapshot: that snapshot's `plan_revision` is the
+    # revision this resolution is actually deciding (the checkpoint has not
+    # been patched yet).
+    if resolution.get("gate_node") == "plan_gate":
+        resolution["plan_revision"] = values.get("plan_revision")
+        resolution["plan_envelope_id"] = (
+            str(values.get("plan_envelope_id"))
+            if values.get("plan_envelope_id") else None
+        )
 
     # WS-AUTH run-A / cross-vendor finding 2 (RESOLVE-GATE-ONLY): mint +
     # verify an operator-capability token before this function's FIRST state
@@ -2629,13 +2683,10 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         _plan_materialised_task_ids = [
             str(t.task_id) for t in (_materialised_patch.get("tasks") or [])
         ]
-        # Stamp provenance onto the resolution record BEFORE it's persisted
-        # -- `patch["hitl_history"]` already references this SAME dict, so
-        # mutating it here mutates what gets written to the checkpoint.
-        resolution["plan_envelope_id"] = (
-            str(values.get("plan_envelope_id")) if values.get("plan_envelope_id") else None
-        )
-        resolution["plan_revision"] = values.get("plan_revision")
+        # (gap b): `plan_envelope_id`/`plan_revision` are already stamped on
+        # `resolution` immediately after it was built, above -- no need to
+        # repeat that write here; this branch's own concern is materialising
+        # the approved steps.
 
     # Hydra#69 follow-up defect 1 (abort atomicity): fold the terminal park
     # (phase="surfaced", and plan_status="rejected" for a plan_gate reject)
@@ -2658,8 +2709,29 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         if action == "reject" and resolution.get("gate_node") == "plan_gate":
             patch["plan_status"] = "rejected"
 
+    # Hydra#69 round 5 defect 1a: a TERMINAL plan_gate resolution (abort, or
+    # reject) must ALSO force the checkpoint's `next` to `()` via
+    # `as_node="postcheck"` -- not just the gate_only approve case above.
+    # Previously only the gate_only-approve branch used `as_node="postcheck"`;
+    # a terminal abort/reject (on EITHER the gate_only or the detached route
+    # -- both return early below without ever calling `sup.invoke`) fell
+    # through to the generic node-context-less write, which leaves `next`
+    # exactly where the checkpoint was interrupted (`("plan_gate",)`). A
+    # repeated, non-gate-only `hydra resume --action approve --option abort`
+    # (or `--action reject`) then finds no `pending_hitl` and takes the
+    # bare-interrupt "continue the graph" branch further up this function,
+    # which resumes STRAIGHT INTO `node_plan_gate` -> `materialise_plan_
+    # steps` and approves + materialises a plan that was already terminally
+    # parked. Folding the terminal case into the SAME `as_node="postcheck"`
+    # write closes that hole at the source: no later `sup.invoke` can ever
+    # pick up `plan_gate`'s static `add_edge("plan_gate", "dispatch")` for a
+    # workflow this function already parked as terminal.
+    _plan_gate_terminal = (
+        resolution.get("gate_node") == "plan_gate"
+        and (_plan_terminal_option or action == "reject")
+    )
     if (gate_only and action == "approve" and not _plan_terminal_option
-            and resolution.get("gate_node") == "plan_gate"):
+            and resolution.get("gate_node") == "plan_gate") or _plan_gate_terminal:
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
         # the generic (node-context-less) write below. `postcheck`'s only
         # outgoing edge is `after_postcheck` -> END unconditionally, so this
@@ -2673,8 +2745,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         sup.update_state(config, patch, as_node="postcheck")
         _plan_gate_next = tuple(getattr(sup.get_state(config), "next", None) or ())
         assert _plan_gate_next == (), (
-            "plan_gate gate-only approve must leave next==() so no later "
-            f"invoke can run dispatch headless; got {_plan_gate_next!r}"
+            "plan_gate gate-only approve/terminal must leave next==() so no "
+            f"later invoke can run dispatch headless; got {_plan_gate_next!r}"
         )
     else:
         sup.update_state(config, patch)
@@ -4671,26 +4743,67 @@ def _cmd_attended_submit(args) -> int:
         # spent real money, so it must charge like any other terminal outcome.
         if res.get("status") in ("complete", "complete_unpersisted",
                                  "surfaced", "aborted"):
-            if res.get("already_charged"):
-                # Idempotent re-submit: cursor was already charged on the first
-                # terminal submit.  Return the cached result without re-billing.
-                emit(project, wf, "attended.submit",
+            _already_charged = bool(res.get("already_charged"))
+            # Hydra#69 round 5 defect 2 (HIGH): keyed per call, not per
+            # cursor — a repeated submit against the SAME call_key must
+            # reconcile the SAME checkpoint writes, never a different call's.
+            _recon_key = f"{args.run_id}:{args.call_key}"
+            if _already_charged:
+                # Idempotent re-submit candidate: the cursor sidecar says
+                # this call was already charged on a prior terminal submit.
+                # That flag alone is NOT proof the checkpoint write actually
+                # landed (the crash-ordering rationale below explicitly
+                # accepts a window where mark_charged succeeds but the
+                # LangGraph checkpoint write after it fails) — check the
+                # checkpoint-side reconciliation marker before trusting it.
+                from .supervisor import build_supervisor as _recon_bs, _PurePythonRunner as _recon_ppr
+                _recon_sup = _recon_bs(project_root=project, dispatcher=dispatcher)
+                _reconciled = True
+                if not isinstance(_recon_sup, _recon_ppr):
+                    _recon_snap = _recon_sup.get_state({"configurable": {"thread_id": wf}})
+                    _recon_values = (
+                        _recon_snap.values
+                        if _recon_snap is not None and _recon_snap.values else {}
+                    )
+                    _reconciled = bool(
+                        (_recon_values.get("attended_checkpoint_reconciled") or {})
+                        .get(_recon_key)
+                    )
+                if _reconciled:
+                    # Genuinely done: cursor charged AND the checkpoint
+                    # write for this exact call already landed. Return the
+                    # cached result without re-billing or repeating writes.
+                    emit(project, wf, "attended.submit",
+                         {"run_id": str(args.run_id), "call_key": str(args.call_key),
+                          "status": res.get("status"), "already_charged": True})
+                    print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
+                    return 0
+                # Else: repair path. The cursor is already charged (never
+                # re-charge it), but the checkpoint writes below never
+                # landed — fall through and redo them. Every write in the
+                # block below is idempotent (membership-checked task-id
+                # lists, upsert-by-task_id results, a merge-dict reducer for
+                # the marker itself), so redoing them exactly reproduces the
+                # outcome the original terminal submit should have left.
+                emit(project, wf, "attended.checkpoint_reconcile_retry",
                      {"run_id": str(args.run_id), "call_key": str(args.call_key),
-                      "status": res.get("status"), "already_charged": True})
-                print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
-                return 0
-            # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
-            # budget write to the LangGraph checkpoint so that a crash between
-            # here and the checkpoint persist is an under-charge (acceptable) rather
-            # than a double-charge (unsafe).  Crash-ordering rationale:
-            #   1. mark_charged(cfile)          ← cursor sidecar flagged first
-            #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
-            #   3. sup.update_state(...)         ← checkpoint persisted
-            # If the process dies after (1) but before (3), the retry sees
-            # already_charged=True and skips the charge → under-charge.
-            # The opposite order (charge then mark) would re-charge on that crash
-            # → double-charge, which burns real spend twice.
-            host_bridge.mark_charged(cfile)
+                      "status": res.get("status")})
+            else:
+                # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
+                # budget write to the LangGraph checkpoint so that a crash between
+                # here and the checkpoint persist is an under-charge (acceptable) rather
+                # than a double-charge (unsafe).  Crash-ordering rationale:
+                #   1. mark_charged(cfile)          ← cursor sidecar flagged first
+                #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
+                #   3. sup.update_state(...)         ← checkpoint persisted (with the
+                #                                       reconciliation marker for this
+                #                                       call folded into the SAME patch)
+                # If the process dies after (1) but before (3), the retry sees
+                # already_charged=True but an UNSET reconciliation marker, and repairs
+                # the checkpoint writes above instead of silently under-charging.
+                # The opposite order (charge then mark) would re-charge on that crash
+                # → double-charge, which burns real spend twice.
+                host_bridge.mark_charged(cfile)
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
             # The host returns the native pack artifact as text. Persist it only
@@ -4806,6 +4919,12 @@ def _cmd_attended_submit(args) -> int:
                                 "open_pp_runs": open_runs,
                                 "budget": state.budget.model_dump(mode="json"),
                                 "budget_downgrade_active": bool(downgrade),
+                                # Hydra#69 round 5 defect 2: folded into the
+                                # SAME atomic write as the budget charge —
+                                # if this call raises, neither the marker
+                                # nor the charge lands, and a retry repairs
+                                # both together (never a torn half-state).
+                                "attended_checkpoint_reconciled": {_recon_key: True},
                             })
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})
@@ -4826,6 +4945,10 @@ def _cmd_attended_submit(args) -> int:
                                 "open_pp_runs": open_runs,
                                 "budget": state.budget.model_dump(mode="json"),
                                 "budget_downgrade_active": bool(downgrade),
+                                # Hydra#69 round 5 defect 2: see the sibling
+                                # non-planning write above — same atomicity
+                                # rationale, planning-task branch.
+                                "attended_checkpoint_reconciled": {_recon_key: True},
                             })
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})

@@ -393,6 +393,23 @@ class HydraState(BaseModel):
     # `update_state` can grow it key-by-key like `error_counters`.
     plan_submit_attempts: Annotated[dict[str, int], _merge_dict] = Field(default_factory=dict)
 
+    # Hydra#69 round 5 defect 2 (HIGH): keyed by ``f"{run_id}:{call_key}"``,
+    # set to ``True`` in the SAME ``sup.update_state`` patch that persists
+    # the ``budget`` charge for a terminal ``_cmd_attended_submit`` call
+    # (cli.py). The cursor-side ``host_bridge.mark_charged`` flag alone only
+    # proves the sidecar file was updated -- it says nothing about whether
+    # the CHECKPOINT write that should have landed alongside it (budget,
+    # attended_completed_task_ids/attended_done_task_ids, attended_results,
+    # plan_submit_attempts) actually persisted. A retried submit against an
+    # already-``charged`` cursor now checks THIS marker, not just the cursor
+    # flag, before treating the checkpoint as reconciled: an unset marker
+    # means the earlier checkpoint write never landed and the retry must
+    # repair it (without re-charging the budget, since the cursor already
+    # reports ``already_charged``). `_merge_dict` reducer so concurrent
+    # per-call reconciliation writes never clobber each other's keys.
+    attended_checkpoint_reconciled: Annotated[dict[str, bool], _merge_dict] = Field(
+        default_factory=dict)
+
     # P0 planning substrate. Plain replace-by-default fields, no reducers: a
     # planning re-run REPLACES the prior plan snapshot rather than
     # accumulating history. P1 (plan_barrier_active, below) now reads
