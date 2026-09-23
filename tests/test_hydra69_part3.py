@@ -109,6 +109,87 @@ def test_planning_revision_1_prompt_omits_supersedes_section():
     assert "supersedes:" not in prompt
 
 
+class _FakeSupForStep:
+    """Mirrors `test_p5c_plan_operator_surfaces.py`'s `_AttendedFakeSup`: a
+    minimal `sup` stand-in whose `get_state` returns a fixed checkpoint
+    snapshot with `next=()` (so `_run_first_step_dispatch_pass` is a no-op)."""
+
+    def __init__(self, values: dict):
+        self.values = dict(values)
+
+    def get_state(self, config):
+        outer = self
+
+        class _Snap:
+            values = outer.values
+            next = ()
+
+        return _Snap()
+
+    def update_state(self, config, patch, as_node=None):
+        self.values.update(patch)
+
+    def invoke(self, *a, **k):
+        raise AssertionError("must not invoke the graph in this test")
+
+
+class _NopStepDispatcher:
+    live_execution = True
+
+    def call_mcp(self, server, tool, args, **_kw):
+        return {"status": "done", "result": {}}
+
+    def set_squad_packs(self, packs):
+        pass
+
+
+def test_cli_attended_step_threads_plan_revision_critique_supersedes(
+    tmp_path, monkeypatch,
+):
+    """D1: the ACTUAL `hydra_core.cli` attended-step call site (not just
+    `begin_squad_stage` called directly) must thread the planning task's own
+    `plan_revision`/`plan_critique`/`supersedes_plan_envelope_id` into the
+    host_action prompt. Uses the real `squads/planning/squad.yaml` pack
+    (entrypoint `claude-native`) via real `discover_squads` against the repo
+    root, with the graph itself faked out."""
+    from hydra_core.cli import _cmd_attended_step
+    import argparse
+
+    task = TaskState(
+        owner_squad="planning",
+        description="Revise the plan",
+        plan_revision=2,
+        plan_critique="tighten the acceptance criteria",
+        supersedes_plan_envelope_id="prior-envelope-id",
+    )
+    state = HydraState(root_goal="ship the widget", tasks=[task], plan_revision=2)
+    values = state.model_dump(mode="json")
+
+    sup = _FakeSupForStep(values)
+    monkeypatch.setattr("hydra_core.cli._attended_live_dispatcher",
+                        lambda *a, **k: _NopStepDispatcher())
+    monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                        lambda **k: sup)
+
+    rc = _cmd_attended_step(argparse.Namespace(
+        project=str(HYDRA_ROOT), workflow_id=str(state.workflow_id), verbose=False))
+    assert rc == 0
+
+    import json as _json
+    cfile = HYDRA_ROOT / ".hydra" / str(state.workflow_id) / "attended" / \
+        f"{task.task_id}.json"
+    assert cfile.is_file(), f"expected cursor at {cfile}"
+    try:
+        cursor = _json.loads(cfile.read_text(encoding="utf-8"))
+        prompt = cursor["pending_action"]["prompt"]
+        assert "expected plan_revision: 2" in prompt
+        assert "supersedes: prior-envelope-id" in prompt
+        assert "tighten the acceptance criteria" in prompt
+    finally:
+        import shutil
+        shutil.rmtree(HYDRA_ROOT / ".hydra" / str(state.workflow_id), ignore_errors=True)
+
+
 def test_begin_squad_stage_threads_plan_revision_into_prompt(tmp_path):
     res = host_bridge.begin_squad_stage(
         workflow_id="wf-5", task_id="task-5", squad_slug="planning",
