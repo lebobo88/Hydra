@@ -1136,3 +1136,53 @@ class TestItem3TerminalResolutionField:
             f"own id, never the earlier approved gate's 'gate-a-id': {term}"
         )
         assert tuple(sup.get_state(config).next) == ()
+
+    def test_legacy_fallback_skips_trailing_non_resolution_note_to_find_reject(
+        self, hermetic,
+    ):
+        """Legacy-path required test: `terminal_resolution` is ABSENT (a
+        checkpoint that predates this field / never had it written), and
+        `hitl_history` carries a genuine terminal reject for the parked
+        `plan_gate` occurrence followed by a LATER non-resolution note
+        (mirrors the real `plan_gate_bypassed` force-dispatch marker -- no
+        "resolution" key at all). `_bare_interrupt_terminal_resolution`'s
+        legacy scan must skip that note and find the true reject underneath
+        it, not be masked by it -- reverting the skip-non-resolution-entries
+        fix makes this wrongly continue the graph."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        wf = uuid4()
+        state = HydraState(
+            workflow_id=wf, root_goal="round 6 item 3 legacy masking-note repro",
+            phase="approval", plan_status="judged", plan_ref=_plan_ref(),
+            plan_revision=1, pending_hitl=None, tasks=[],
+            hitl_history=[
+                {"gate_node": "plan_gate", "resolution": "reject",
+                 "option": None, "plan_revision": 1},
+                # A LATER, non-resolution note -- no "resolution" key at
+                # all, exactly the shape `_bypass_note` (cli.py's
+                # force-dispatch handler) writes.
+                {"event": "plan_gate_bypassed", "workflow_id": str(wf),
+                 "note": "dispatch proceeded without plan approval (force-dispatch)",
+                 "resolved_at": "2026-09-23T00:00:00+00:00"},
+            ],
+        )
+        sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+        assert not isinstance(sup, _PurePythonRunner), "langgraph required for this test"
+        config = {"configurable": {"thread_id": str(wf)}}
+        sup.update_state(config, state.model_dump(mode="json"), as_node="plan_judge")
+        assert tuple(sup.get_state(config).next) == ("plan_gate",)
+        assert sup.get_state(config).values.get("terminal_resolution") is None, (
+            "this test must exercise the LEGACY fallback, not the new field"
+        )
+
+        rc, body = _resume(HYDRA_ROOT, str(wf), "approve", None)
+        assert rc == 0, body
+        values = sup.get_state(config).values
+        assert not values.get("tasks"), (
+            f"the legacy hitl_history fallback must skip a trailing non-"
+            f"resolution note and still find the true reject underneath "
+            f"it, refusing to continue: {body}"
+        )
+        assert body.get("resumed") is False
+        assert body.get("graph_reentered") is False

@@ -1910,12 +1910,13 @@ def _bare_interrupt_terminal_resolution(
     field existed (a genuine legacy checkpoint) or a checkpoint that has
     never had a terminal resolution recorded on it at all. It reconstructs
     the same decision by scanning `hitl_history` the way the engine did
-    before `terminal_resolution` existed, keeping the known limitation that
-    a later NON-resolution note in `hitl_history` could, in principle, sit
-    "on top of" the real latest resolution entry for a checkpoint this old
-    -- `hitl_history` is genuinely the only durable source available for a
-    legacy checkpoint, so this scan is a best-effort reconstruction, not a
-    guarantee equal to `terminal_resolution` itself.
+    before `terminal_resolution` existed -- `hitl_history` is genuinely the
+    only durable source available for a legacy checkpoint. This scan skips
+    past any entry with no `"resolution"` key at all (a note/event, not a
+    resolution) to find the latest entry that IS a resolution, so a
+    trailing non-resolution note appended after a genuine terminal
+    reject/abort (the same `plan_gate_bypassed`/governance-note shape
+    `terminal_resolution` itself is immune to) cannot mask it here either.
 
     Hydra#69 round 6 defect 3 (MED), follow-up (cross-vendor, HIGH): the
     durable `hitl_history` entry, if any, that records a TERMINAL resolution
@@ -1936,8 +1937,14 @@ def _bare_interrupt_terminal_resolution(
     judge_synthesis, never resolved) — that must still be allowed to
     continue.
 
-    Only the LAST entry in `hitl_history` overall is ever consulted — NOT
-    the last entry whose ``gate_node`` happens to match. Skipping past
+    Only the LAST entry in `hitl_history` overall THAT ACTUALLY RECORDS A
+    RESOLUTION (has a `"resolution"` key at all) is ever consulted — NOT the
+    last entry whose ``gate_node`` happens to match, and NOT a trailing
+    NON-resolution note (this-drop fix: e.g. the `plan_gate_bypassed`
+    force-dispatch marker, or a governance note -- see
+    `_append_plan_governance_note`) appended after the real resolution,
+    which is skipped over rather than mistaken for "the latest entry" and
+    masking the genuine terminal reject underneath it. Skipping past
     intervening entries for a DIFFERENT (or the SAME) gate_node to find an
     older match was the follow-up bug: a durable reject of `plan_gate`
     revision 1, followed by a legitimate new revision-2 cycle that has not
@@ -1945,7 +1952,7 @@ def _bare_interrupt_terminal_resolution(
     only "plan_gate" entry in history — the old skip-and-match search
     wrongly bound that stale rejection to the brand-new, never-resolved
     occurrence of the same-named gate and refused it. Anchoring on the
-    single latest entry, plus (for `plan_gate`) an explicit
+    single latest RESOLUTION entry, plus (for `plan_gate`) an explicit
     `plan_revision` instance check against the checkpoint's CURRENT
     `plan_revision`, ensures a terminal resolution only ever blocks the
     exact gate occurrence it actually resolved:
@@ -1967,8 +1974,22 @@ def _bare_interrupt_terminal_resolution(
     parked_at = set(snap_next)
     last: dict | None = None
     for entry in reversed(hitl_history):
-        if isinstance(entry, dict):
-            last = entry
+        if not isinstance(entry, dict):
+            continue
+        if "resolution" not in entry:
+            # Legacy-path masking fix: a non-resolution note appended AFTER
+            # the real terminal decision (the `plan_gate_bypassed` force-
+            # dispatch marker, a governance note -- see
+            # `_append_plan_governance_note`) must never be mistaken for
+            # "the latest entry". Only an entry that actually records a
+            # resolution (has a "resolution" key at all, even if its value
+            # is a non-terminal "approve") is eligible to be treated as
+            # THE latest resolution this scan reasons about; skip past
+            # anything else to find it, exactly the way a genuine later
+            # approve/reject CYCLE (a real hitl_history entry) is already
+            # allowed to shadow an older terminal one.
+            continue
+        last = entry
         break
     if last is None:
         return None
