@@ -46,6 +46,8 @@ __all__ = [
     "PlanFigure",
     "PlanFigureError",
     "append_governance_note",
+    "extract_governance_section",
+    "extract_plan_provenance",
     "plan_slug",
     "render_plan_html",
     "render_plan_json",
@@ -544,12 +546,17 @@ def append_governance_note(html_text: str, note: str) -> str:
     """Append a governance note (e.g. a force-dispatch plan-gate bypass) to a
     rendered plan artifact's HTML, in place.
 
-    A plan artifact is written once by the ingest PLAN branch
-    (`render_plan_html`) and never re-rendered from the `Plan` model
-    afterward -- a governance event that happens AFTER the artifact exists
-    (an operator force-dispatching past `plan_gate`, for instance) has no
-    `Plan` to re-render, only the HTML text already on disk. This function
-    edits that text directly rather than requiring a `Plan` object.
+    The plan artifact is first written by the ingest PLAN branch
+    (`render_plan_html`) and, since D4 (Hydra#69 part 3), re-rendered from the
+    `Plan` model again by `node_plan_judge` (`hydra_core.supervisor`) once the
+    judge produces a verdict -- but a governance event (an operator
+    force-dispatching past `plan_gate`, for instance) can ALSO happen at a
+    point that has no `Plan` model in hand, only the HTML text already on
+    disk. This function edits that text directly rather than requiring a
+    `Plan` object, so it stays the single append path for both callers; a
+    verdict re-render calls `extract_governance_section` on the pre-existing
+    HTML first and re-appends the extracted section verbatim so a note this
+    function wrote is never silently dropped by a later re-render.
 
     If a "Governance Notes" section already exists (from a prior note), the
     new note is appended as another ``<li>`` inside that SAME section's
@@ -575,6 +582,56 @@ def append_governance_note(html_text: str, note: str) -> str:
         "</ul>\n"
     )
     return html_text.rstrip("\n") + "\n" + section
+
+
+def extract_governance_section(html_text: str) -> str | None:
+    """D4 (Hydra#69 part 3): return the full ``<h2>Governance Notes</h2>``
+    section (heading + ``<ul>...</ul>``) already present in ``html_text``, or
+    ``None`` when no governance note has ever been appended.
+
+    `render_plan_html` never emits a "Governance Notes" heading itself (it is
+    added lazily, ONLY on the first `append_governance_note` call) -- so a
+    fresh `render_plan_html(...)` call always omits it, and a naive
+    "re-render the artifact after judging" would silently drop any note a
+    prior `append_governance_note` call had recorded. A verdict re-render
+    (`node_plan_judge`) calls this against the artifact's pre-re-render HTML
+    and re-appends the returned section verbatim onto the freshly rendered
+    text so the note survives.
+    """
+    match = _GOVERNANCE_NOTES_RE.search(html_text)
+    if not match:
+        return None
+    return match.group(0)
+
+
+_PROVENANCE_REVISION_RE = re.compile(r"<li>plan_revision: (\d+)</li>")
+_PROVENANCE_ENVELOPE_ID_RE = re.compile(r"<li>plan envelope id: ([^<]*)</li>")
+
+
+def extract_plan_provenance(html_text: str) -> tuple[int | None, str | None]:
+    """Return ``(plan_revision, envelope_id)`` already embedded in the
+    ``<h2>Provenance</h2>`` section `render_plan_html` unconditionally emits
+    (see its ``plan_revision:``/``plan envelope id:`` list items), or
+    ``(None, None)`` when ``html_text`` has no such section (e.g. the
+    artifact has never been rendered yet).
+
+    Hydra#69 part 3 revision (stale-write guard): `node_plan_judge`'s verdict
+    re-render shares one deterministic artifact path across every revision
+    of a plan (`plan_slug` hashes only the goal + workflow_id, never the
+    revision -- see its docstring). A checkpoint replay can re-invoke
+    `node_plan_judge` holding an OLDER `state` snapshot (stale revision,
+    stale `plan_ref`) AFTER a newer revision has already been authored and
+    its artifact written to that same path. Without comparing the
+    revision/envelope id already on disk against the one about to be
+    rendered, that stale replay would silently clobber the newer artifact
+    with older content. This helper is the read side of that guard; the
+    write side lives in `hydra_core.supervisor.node_plan_judge`.
+    """
+    rev_match = _PROVENANCE_REVISION_RE.search(html_text)
+    id_match = _PROVENANCE_ENVELOPE_ID_RE.search(html_text)
+    revision = int(rev_match.group(1)) if rev_match else None
+    envelope_id = html.unescape(id_match.group(1)) if id_match else None
+    return revision, envelope_id
 
 
 # ---------------------------------------------------------------------------

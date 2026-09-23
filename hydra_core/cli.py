@@ -3983,10 +3983,25 @@ def _cmd_attended_step(args) -> int:
             # cursor's call_key. Every other squad task keeps attempt=0
             # (today's `squad-{task_id}-0` behaviour, unchanged).
             _attempt = 0
+            _plan_revision = None
+            _plan_critique = None
+            _plan_supersedes = None
             if ne_task.owner_squad == "planning":
                 _attempt = int(
                     (getattr(state, "plan_submit_attempts", {}) or {}).get(task_id, 0)
                 )
+                # D1 (Hydra#69 part 3): thread the planning task's own
+                # plan_revision / plan_critique / supersedes_plan_envelope_id
+                # (set on a modify-plan re-issue task -- see cli.py's
+                # `_modify_plan_task` construction) into the host_action
+                # prompt so a revision >1 draft names the expected revision,
+                # `supersedes`, and the prior critique. A task_revision of 0
+                # (the TaskState default -- the INITIAL planning task, which
+                # is never stamped with a revision) means "author revision 1".
+                _task_revision = getattr(ne_task, "plan_revision", 0) or 0
+                _plan_revision = _task_revision if _task_revision else 1
+                _plan_critique = getattr(ne_task, "plan_critique", None)
+                _plan_supersedes = getattr(ne_task, "supersedes_plan_envelope_id", None)
 
             res = host_bridge.begin_squad_stage(
                 action_extras=action_extras,
@@ -4009,6 +4024,9 @@ def _cmd_attended_step(args) -> int:
                 priority=getattr(ne_task, "priority", None),
                 acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
                 attempt=_attempt,
+                plan_revision=_plan_revision,
+                plan_critique=_plan_critique,
+                supersedes_plan_envelope_id=_plan_supersedes,
             )
             emit(project, wf, "attended.step", {
                 "run_id": task_id,
