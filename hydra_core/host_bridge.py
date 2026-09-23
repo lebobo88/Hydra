@@ -3018,6 +3018,20 @@ def _plan_envelope_schema_doc() -> str:
         "### Allowed PlanStep.envelope_type values\n"
         + ", ".join(allowed_types)
     )
+    lines.append("")
+    # Hydra#69 round 5 defect 5 (LOW): the field-list rendering above is
+    # useful prose, but it is a SUMMARY derived from `model_fields` -- it
+    # drops constraints (min/max length, enum bounds, `$defs` nesting) that
+    # only the generated JSON Schema actually carries. Emit
+    # `Plan.model_json_schema()` verbatim (compact JSON, no manual field
+    # re-description) alongside the prose list so an author has both a
+    # human-readable summary AND the exact machine contract the validator
+    # enforces, in the SAME generated-from-the-model fashion as the summary
+    # above -- never a hand-copied schema that could drift from
+    # `hydra_core.schemas.Plan`.
+    plan_schema = _schemas.Plan.model_json_schema()
+    lines.append("### Plan JSON Schema (generated from hydra_core.schemas.Plan)")
+    lines.append(json.dumps(plan_schema, separators=(",", ":")))
     return "\n".join(lines)
 
 
