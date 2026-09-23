@@ -1890,11 +1890,12 @@ def _precheck_operator_identity_gate_only(args) -> dict | None:
 
 
 def _bare_interrupt_terminal_resolution(
-    hitl_history: list, snap_next: tuple,
+    hitl_history: list, snap_next: tuple, current_plan_revision: object = None,
 ) -> dict | None:
-    """Hydra#69 round 6 defect 3 (MED): the durable `hitl_history` entry, if
-    any, that records a TERMINAL resolution (``resolution == "reject"``, or
-    an ``approve`` carrying ``option == "abort"``) for the gate the graph's
+    """Hydra#69 round 6 defect 3 (MED), follow-up (cross-vendor, HIGH): the
+    durable `hitl_history` entry, if any, that records a TERMINAL resolution
+    (``resolution == "reject"``, or an ``approve`` carrying
+    ``option == "abort"``) for the SAME INSTANCE of the gate the graph's
     checkpoint is CURRENTLY parked at (``snap_next``).
 
     Used by the bare-interrupt branch (no ``pending_hitl``, but ``next`` is
@@ -1910,24 +1911,54 @@ def _bare_interrupt_terminal_resolution(
     judge_synthesis, never resolved) — that must still be allowed to
     continue.
 
-    Only the LAST `hitl_history` entry for the parked gate is authoritative
-    (mirrors `materialise_plan_steps`'s own "latest resolution wins" policy):
-    if the parked gate's most recent resolution was a genuine (non-abort)
-    approve, this returns ``None`` even if an EARLIER entry for the same
-    gate happened to be terminal (e.g. a legitimate modify-budget/re-approve
-    cycle at the same gate_node).
+    Only the LAST entry in `hitl_history` overall is ever consulted — NOT
+    the last entry whose ``gate_node`` happens to match. Skipping past
+    intervening entries for a DIFFERENT (or the SAME) gate_node to find an
+    older match was the follow-up bug: a durable reject of `plan_gate`
+    revision 1, followed by a legitimate new revision-2 cycle that has not
+    yet recorded ANY hitl_history entry, left the revision-1 reject as the
+    only "plan_gate" entry in history — the old skip-and-match search
+    wrongly bound that stale rejection to the brand-new, never-resolved
+    occurrence of the same-named gate and refused it. Anchoring on the
+    single latest entry, plus (for `plan_gate`) an explicit
+    `plan_revision` instance check against the checkpoint's CURRENT
+    `plan_revision`, ensures a terminal resolution only ever blocks the
+    exact gate occurrence it actually resolved:
+      - an earlier reject of gate X, followed by a later legitimate
+        approve/resolution cycle (same or different gate) -> the latest
+        entry is that later, non-terminal (or different-gate) resolution,
+        so this returns ``None`` and the new occurrence proceeds;
+      - an earlier reject of `plan_gate` at revision N, with no later
+        history entry at all, but the checkpoint has since moved on to
+        revision N+1 (a fresh, unresolved plan_gate occurrence) -> the
+        revision mismatch means the stale reject does not apply here
+        either, so this returns ``None``;
+      - the latest entry genuinely IS a terminal resolution for the exact
+        gate instance the checkpoint is parked at -> this returns that
+        entry, and the caller refuses to continue.
     """
     if not snap_next or not hitl_history:
         return None
     parked_at = set(snap_next)
+    last: dict | None = None
     for entry in reversed(hitl_history):
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("gate_node") not in parked_at:
-            continue
-        if entry.get("resolution") == "reject" or entry.get("option") == "abort":
-            return entry
+        if isinstance(entry, dict):
+            last = entry
+        break
+    if last is None:
         return None
+    if last.get("gate_node") not in parked_at:
+        return None
+    if last.get("gate_node") == "plan_gate":
+        # Instance identity: a plan_gate resolution only binds to the exact
+        # plan_revision it was recorded against (mirrors
+        # `materialise_plan_steps`'s own "latest resolution for the CURRENT
+        # plan_revision" filter — see the round 5 follow-up comment on the
+        # `resolution["plan_revision"]` stamp in `_cmd_resume_locked`).
+        if last.get("plan_revision") != current_plan_revision:
+            return None
+    if last.get("resolution") == "reject" or last.get("option") == "abort":
+        return last
     return None
 
 
@@ -2177,7 +2208,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # parked gate (MU7: paused before synthesis/judge_synthesis, never
         # resolved) returns None here and falls through unaffected.
         _terminal_hist_entry = _bare_interrupt_terminal_resolution(
-            values.get("hitl_history") or [], _snap_next)
+            values.get("hitl_history") or [], _snap_next,
+            current_plan_revision=values.get("plan_revision"))
         if _snap_next and _terminal_hist_entry is not None:
             emit(project, wf, "hitl_resumed", {
                 "action": action,
@@ -4705,7 +4737,7 @@ def _cmd_attended_submit(args) -> int:
     HydraState budget (keeping the 80%/100% tripwires live) and record the task
     outcome — so attended execution is never budget-blind."""
     from . import host_bridge
-    from .governance import charge_and_gate
+    from .governance import charge_and_gate, should_block_for_budget, should_downgrade_model
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
@@ -4870,14 +4902,34 @@ def _cmd_attended_submit(args) -> int:
             _reconciled = True
             _charge_applied = True
             _persisted_charge: dict[str, object] | None = None
+            # Round 6 follow-up defect 1 (cross-vendor, HIGH): a TRUE legacy
+            # cursor — `_call_identity == "legacy"`, i.e. `terminal_call_key`
+            # is ABSENT from the cursor (persisted by an older version of
+            # this code, before that field existed, or terminated outside
+            # `submit_host_result`) — has no way to ever prove its charge
+            # landed via the marker: `already_charged=True` on its own is
+            # the ONLY evidence available for it, and is treated as
+            # conclusive (never re-`charge_and_gate` it, marker or no
+            # marker). This is deliberately NARROWER than "no marker for
+            # this recon_key": a NON-legacy cursor (terminal_call_key
+            # present) whose marker is absent is proof the OPPOSITE way —
+            # the marker and the `budget` field are always written together
+            # in the SAME atomic checkpoint patch, so an absent marker for
+            # THIS cursor's own unique recon_key means this exact call's
+            # charge genuinely never reached the checkpoint yet, and
+            # `charge_and_gate` MUST still run on this retry (that is a
+            # crash-recovery repair, not a double charge — nothing landed).
+            _legacy_charge_repair = False
             if _already_charged:
                 # Idempotent re-submit candidate: the cursor sidecar says
                 # this call was already charged on a prior terminal submit.
-                # That flag alone is NOT proof the checkpoint write actually
-                # landed (the crash-ordering rationale below explicitly
-                # accepts a window where mark_charged succeeds but the
-                # LangGraph checkpoint write after it fails) — check the
-                # checkpoint-side markers before trusting it.
+                # That flag alone is NOT proof every checkpoint write
+                # actually landed (the crash-ordering rationale below
+                # explicitly accepts a window where mark_charged succeeds
+                # but the LangGraph checkpoint write after it fails) — check
+                # the checkpoint-side markers before trusting reconciliation
+                # is complete. It IS, however, conclusive proof the CHARGE
+                # itself must never be repeated — see `_legacy_charge_repair`.
                 from .supervisor import build_supervisor as _recon_bs, _PurePythonRunner as _recon_ppr
                 _recon_sup = _recon_bs(project_root=project, dispatcher=dispatcher)
                 if not isinstance(_recon_sup, _recon_ppr):
@@ -4894,10 +4946,24 @@ def _cmd_attended_submit(args) -> int:
                         (_recon_values.get("attended_charge_applied") or {})
                         .get(_recon_key)
                     )
-                    _charge_applied = bool(_charge_evidence)
                     _persisted_charge = (
                         _charge_evidence if isinstance(_charge_evidence, dict) else None
                     )
+                    if _call_identity == "legacy":
+                        # True legacy cursor: `already_charged=True` is
+                        # conclusive on its own; never re-invoke
+                        # `charge_and_gate` for it regardless of the marker.
+                        _charge_applied = True
+                        _legacy_charge_repair = _persisted_charge is None
+                    else:
+                        # Non-legacy cursor: this recon_key is unique to
+                        # THIS cursor's one terminal call (a different
+                        # call_key against an already-terminal cursor is
+                        # refused as stale before ever reaching here), so an
+                        # absent marker for it is conclusive proof this
+                        # exact call's charge never reached the checkpoint —
+                        # `charge_and_gate` must still run below.
+                        _charge_applied = _persisted_charge is not None
                 if _reconciled:
                     # Genuinely done: cursor charged AND EVERY checkpoint
                     # write for this exact call already landed. Return the
@@ -4980,16 +5046,33 @@ def _cmd_attended_submit(args) -> int:
                     # comment above — credit only the per-component estimated
                     # figure, not the whole (possibly mixed) stage total.
                     estimated_component = float(res.get("estimated_cost_usd") or 0.0)
-                    # Hydra#69 round 6 defect 1 (HIGH): if the checkpoint
-                    # already confirms `charge_and_gate` ran for this exact
-                    # call (`_charge_applied`, checked above against the
-                    # `attended_charge_applied` marker), this is a repair
-                    # retry after the charge landed but a LATER write in this
-                    # block failed — reuse the persisted block/downgrade
-                    # outcome instead of charging the budget a second time.
+                    # Hydra#69 round 6 defect 1 (HIGH), follow-up (cross-
+                    # vendor, HIGH): `_charge_applied` is True whenever the
+                    # cursor itself says charged (`_already_charged`) — that
+                    # is conclusive on its own and `charge_and_gate` must
+                    # NEVER run again in that case, marker or no marker.
                     if _charge_applied and _persisted_charge is not None:
+                        # Repair retry after the charge landed AND the
+                        # checkpoint marker recording its outcome also
+                        # landed — reuse the persisted block/downgrade
+                        # outcome instead of charging the budget again.
                         block = bool(_persisted_charge.get("block"))
                         downgrade = bool(_persisted_charge.get("downgrade"))
+                    elif _charge_applied:
+                        # Legacy/under-charged reconciliation: the cursor
+                        # says charged but no `attended_charge_applied`
+                        # marker exists (written before the marker existed,
+                        # or terminated outside `submit_host_result`). Never
+                        # call `charge_and_gate` — that would re-record the
+                        # same cost a second time. Re-derive the current gate
+                        # outcome by READING the ledger `charge_and_gate`
+                        # would have gated on, without charging anything.
+                        block = should_block_for_budget(state)
+                        downgrade = should_downgrade_model(state)
+                        emit(project, wf, "attended.legacy_charge_reconciled", {
+                            "run_id": str(args.run_id), "call_key": str(args.call_key),
+                            "recon_key": _recon_key,
+                        })
                     else:
                         block, downgrade = charge_and_gate(
                             state, cost, toks, source=cost_source,
@@ -5064,13 +5147,20 @@ def _cmd_attended_submit(args) -> int:
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),
                         }
-                        if not _charge_applied:
-                            # Hydra#69 round 6 defect 1: CHARGE evidence only
-                            # — folded into the SAME atomic write as the
-                            # budget charge so a raise here leaves neither
-                            # landed, and a retry never re-charges. This is
-                            # NOT the full-reconciliation marker (see the end
-                            # of this call for that one).
+                        if not _charge_applied or _legacy_charge_repair:
+                            # Hydra#69 round 6 defect 1 (+ follow-up): CHARGE
+                            # evidence only — folded into the SAME atomic
+                            # write as the budget charge so a raise here
+                            # leaves neither landed, and a retry never
+                            # re-charges. This is NOT the full-reconciliation
+                            # marker (see the end of this call for that one).
+                            # A legacy repair (`_legacy_charge_repair`) also
+                            # stamps this marker even though `charge_and_gate`
+                            # did not run this call — the cursor already
+                            # proved the charge landed; this write only backs
+                            # that proof with the marker so FUTURE retries
+                            # converge on the persisted block/downgrade
+                            # instead of re-deriving it every time.
                             _patch["attended_charge_applied"] = {
                                 _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
                             }
@@ -5095,10 +5185,11 @@ def _cmd_attended_submit(args) -> int:
                             "budget": state.budget.model_dump(mode="json"),
                             "budget_downgrade_active": bool(downgrade),
                         }
-                        if not _charge_applied:
-                            # Hydra#69 round 6 defect 1: see the sibling
-                            # non-planning write above — same CHARGE-evidence
-                            # (not full-reconciliation) rationale.
+                        if not _charge_applied or _legacy_charge_repair:
+                            # Hydra#69 round 6 defect 1 (+ follow-up): see the
+                            # sibling non-planning write above — same
+                            # CHARGE-evidence (not full-reconciliation)
+                            # rationale, including the legacy-repair stamp.
                             _patch["attended_charge_applied"] = {
                                 _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
                             }

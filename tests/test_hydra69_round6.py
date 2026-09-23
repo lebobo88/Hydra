@@ -699,3 +699,258 @@ class TestDefect4StepSharesApprovalEvidencePredicate:
         out = self._step(tmp_path, wf, values, monkeypatch, capsys)
         assert out["status"] == "plan_approved_not_materialised", out
         assert out["ok"] is False
+
+
+# =========================================================================== #
+# Round 6 follow-up (cross-vendor, HIGH) defect 1 -- a LEGACY already-charged
+# cursor (its checkpoint has no `attended_charge_applied` marker at all, only
+# the cursor sidecar's own `charged=True`) must repair its missing downstream
+# writes WITHOUT ever re-invoking `charge_and_gate`.
+# =========================================================================== #
+
+class TestFollowupDefect1LegacyChargeNeverReCharges:
+    def test_legacy_already_charged_cursor_repairs_without_recharging(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A TRUE legacy cursor -- `terminal_call_key` absent entirely
+        (persisted by an older version of this code, or the field was
+        stripped/never written), `charged=True` on the sidecar, but the
+        checkpoint has NEITHER an `attended_charge_applied` marker NOR the
+        completion bookkeeping for it -- must repair the missing checkpoint
+        writes WITHOUT EVER re-invoking `charge_and_gate`, and must accept
+        the resulting permanent under-charge rather than risk a double
+        charge (the follow-up critique's exact repro)."""
+        wf = str(uuid4())
+        task = TaskState(owner_squad="customer-support", description="handle the ticket")
+        task_id = str(task.task_id)
+        original_call_key = f"squad-{task_id}-0"
+
+        host_bridge.begin_squad_stage(
+            workflow_id=wf, task_id=task_id, squad_slug="customer-support",
+            entrypoint="claude-skill", lead_agent="general-purpose",
+            pack_cwd=str(tmp_path), request_text="handle the ticket",
+            project_root=tmp_path,
+        )
+        cfile = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        # Directly (outside the CLI, simulating a PRIOR process/deploy) drive
+        # the cursor terminal + charged, then strip `terminal_call_key` to
+        # simulate a cursor that predates this reconciliation scheme
+        # entirely. The checkpoint (`fake_sup`, built fresh below) never saw
+        # ANY of this -- it has no marker and no completion record, exactly
+        # the "checkpoint lacks marker and lacks completion" repro.
+        host_bridge.submit_host_result(
+            _FakeAttendedDispatcher(), cursor_file=cfile, call_key=original_call_key,
+            result={"text": "resolved the ticket", "cost_usd": 2.0,
+                    "tokens_in": 10, "tokens_out": 5},
+        )
+        host_bridge.mark_charged(cfile)
+        cursor = host_bridge.load_cursor(cfile)
+        assert cursor.get("charged") is True
+        del cursor["terminal_call_key"]
+        host_bridge.save_cursor(cfile, cursor)
+
+        state = HydraState(root_goal="x", workflow_id=wf, tasks=[task])
+        fake_sup = _StatefulFakeSup(state.model_dump(mode="json"))
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeAttendedDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        charge_calls: list[float] = []
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (charge_calls.append(cost), (False, False))[1],
+        )
+
+        result_path = tmp_path / "result.json"
+        result_path.write_text(json.dumps({
+            "text": "resolved the ticket", "cost_usd": 2.0,
+            "tokens_in": 10, "tokens_out": 5,
+        }), encoding="utf-8")
+
+        # A legacy cursor (no terminal_call_key) accepts ANY call_key --
+        # use a DIFFERENT one than the original to also prove this is not
+        # merely the same-call_key idempotent path.
+        retry_call_key = "some-other-call-key"
+        rc1, body1 = _submit(capsys, wf, task_id, retry_call_key, result_path, project=tmp_path)
+        assert rc1 == 0, body1
+        assert charge_calls == [], (
+            "a TRUE legacy already-charged cursor must NEVER invoke "
+            "charge_and_gate -- not even once"
+        )
+        values1 = fake_sup._values
+        spent_after_repair = float((values1.get("budget") or {}).get("spent_usd") or 0.0)
+        assert spent_after_repair == 0.0, (
+            "budget.spent_usd must be UNCHANGED -- an accepted permanent "
+            "under-charge is safer than risking a double charge for a cursor "
+            "whose original charge cannot be verified"
+        )
+        assert task_id in (values1.get("attended_completed_task_ids") or []), (
+            f"the repair must land the missing completion write: {body1}"
+        )
+        recon_key = f"{task_id}:legacy"
+        assert (values1.get("attended_charge_applied") or {}).get(recon_key) is not None, (
+            "the repair must stamp the marker so future retries converge"
+        )
+
+        # A second submit (any call_key) must be a true no-op now.
+        prior_call_count = len(fake_sup.update_calls)
+        rc2, body2 = _submit(capsys, wf, task_id, "yet-another-key", result_path, project=tmp_path)
+        assert rc2 == 0, body2
+        assert charge_calls == []
+        assert len(fake_sup.update_calls) == prior_call_count, (
+            "a fully-reconciled retry must not write to the checkpoint again"
+        )
+
+    def test_non_legacy_crash_retry_still_recharges_exactly_once(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Control (must NOT regress): a cursor that DOES carry
+        `terminal_call_key` (i.e. is NOT legacy), whose first checkpoint
+        write genuinely failed to persist (so the atomic
+        `attended_charge_applied` + `budget` write never landed at all), is
+        safe -- and required -- to re-invoke `charge_and_gate` exactly once
+        on retry. This is the crash-recovery case, not the legacy case: the
+        recon_key is unique to this one cursor's one terminal call, so an
+        absent marker is conclusive proof nothing landed yet."""
+        wf = str(uuid4())
+        task = TaskState(owner_squad="customer-support", description="handle the ticket")
+        task_id = str(task.task_id)
+        call_key = f"squad-{task_id}-0"
+
+        host_bridge.begin_squad_stage(
+            workflow_id=wf, task_id=task_id, squad_slug="customer-support",
+            entrypoint="claude-skill", lead_agent="general-purpose",
+            pack_cwd=str(tmp_path), request_text="handle the ticket",
+            project_root=tmp_path,
+        )
+
+        state = HydraState(root_goal="x", workflow_id=wf, tasks=[task])
+        fake_sup = _FlakyKeyedSup(state.model_dump(mode="json"), "attended_charge_applied")
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeAttendedDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        charge_calls: list[float] = []
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (charge_calls.append(cost), (False, False))[1],
+        )
+
+        result_path = tmp_path / "result.json"
+        result_path.write_text(json.dumps({
+            "text": "resolved the ticket", "cost_usd": 2.0,
+            "tokens_in": 10, "tokens_out": 5,
+        }), encoding="utf-8")
+
+        rc1, body1 = _submit(capsys, wf, task_id, call_key, result_path, project=tmp_path)
+        assert rc1 == 1
+        assert body1.get("error") == "checkpoint_persist_failed"
+        assert charge_calls == [2.0], "the first call still charges exactly once"
+        values1 = fake_sup._values
+        assert float((values1.get("budget") or {}).get("spent_usd") or 0.0) == 0.0
+
+        rc2, body2 = _submit(capsys, wf, task_id, call_key, result_path, project=tmp_path)
+        assert rc2 == 0, body2
+        assert charge_calls == [2.0, 2.0], (
+            "a non-legacy crash-retry (unique recon_key, absent marker) "
+            "must re-charge exactly once to actually land the charge"
+        )
+        values2 = fake_sup._values
+        assert task_id in (values2.get("attended_completed_task_ids") or [])
+
+
+# =========================================================================== #
+# Round 6 follow-up (cross-vendor, HIGH) defect 2 -- the bare-interrupt
+# terminal-history guard must bind to the EXACT gate INSTANCE the checkpoint
+# is parked at (the latest hitl_history entry, plus a plan_revision match for
+# plan_gate), never just the gate_node's name.
+# =========================================================================== #
+
+def _plan_ref(step_id="step-1"):
+    return {
+        "steps": [{
+            "step_id": step_id, "target_squad": "engineering",
+            "description": "do the thing", "priority": "P2",
+            "acceptance_criteria": ["it works"], "envelope_type": "DEV_TASK",
+        }],
+    }
+
+
+class TestFollowupDefect2TerminalHistoryGateInstanceIdentity:
+    def test_unit_latest_entry_overall_wins_over_earlier_reject(self):
+        """An earlier reject of gate X followed by a later, genuinely
+        non-terminal resolution cycle (same gate_node) must never be found
+        by skipping past the later entry back to the older reject."""
+        history = [
+            {"gate_node": "approval", "resolution": "reject", "option": None},
+            {"gate_node": "approval", "resolution": "approve", "option": None},
+        ]
+        entry = cli._bare_interrupt_terminal_resolution(history, ("approval",))
+        assert entry is None, (
+            "the LATEST entry (a genuine approve) must win over the earlier reject"
+        )
+
+    def test_unit_plan_gate_revision_mismatch_does_not_block_new_occurrence(self):
+        """A reject recorded against plan_gate REVISION 1, with the
+        checkpoint's CURRENT plan_revision now at 2 (a fresh, never-resolved
+        occurrence of the same-named gate), must not be treated as a
+        terminal resolution for the NEW occurrence."""
+        history = [{
+            "gate_node": "plan_gate", "resolution": "reject",
+            "option": None, "plan_revision": 1,
+        }]
+        entry = cli._bare_interrupt_terminal_resolution(
+            history, ("plan_gate",), current_plan_revision=2)
+        assert entry is None, (
+            "a stale reject from an OLDER plan_revision must not block a "
+            "new, unresolved occurrence of plan_gate at a NEWER revision"
+        )
+
+    def test_unit_plan_gate_revision_match_still_blocks(self):
+        """Control: the SAME revision's reject still refuses correctly."""
+        history = [{
+            "gate_node": "plan_gate", "resolution": "reject",
+            "option": None, "plan_revision": 1,
+        }]
+        entry = cli._bare_interrupt_terminal_resolution(
+            history, ("plan_gate",), current_plan_revision=1)
+        assert entry is not None
+        assert entry["resolution"] == "reject"
+
+    def test_cli_bare_interrupt_continues_past_stale_reject_at_bumped_revision(
+        self, hermetic,
+    ):
+        """Full CLI-level integration: a real LangGraph checkpoint parked at
+        `plan_gate`, durable `hitl_history` carrying only a revision-1
+        reject, but the checkpoint's OWN `plan_revision` has since moved to
+        2 (a legitimate new plan cycle, never yet resolved). A plain
+        `--action approve` bare-interrupt retry must be allowed to continue
+        -- reverting the follow-up fix makes this wrongly refuse."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        wf = uuid4()
+        state = HydraState(
+            workflow_id=wf, root_goal="round 6 follow-up defect 2 repro",
+            phase="approval", plan_status="judged", plan_ref=_plan_ref(),
+            plan_revision=2, pending_hitl=None, tasks=[],
+            hitl_history=[{
+                "gate_node": "plan_gate", "resolution": "reject",
+                "option": None, "plan_revision": 1,
+            }],
+        )
+        sup = build_supervisor(project_root=HYDRA_ROOT, dispatcher=_StubDispatcher())
+        assert not isinstance(sup, _PurePythonRunner), "langgraph required for this test"
+        config = {"configurable": {"thread_id": str(wf)}}
+        sup.update_state(config, state.model_dump(mode="json"), as_node="plan_judge")
+        snap = sup.get_state(config)
+        assert tuple(snap.next) == ("plan_gate",), (
+            f"fixture must park at plan_gate; got next={snap.next!r}"
+        )
+
+        rc, body = _resume(HYDRA_ROOT, str(wf), "approve", None)
+        assert rc == 0, body
+        assert body.get("continued_bare_interrupt") is True, (
+            f"a fresh, unresolved plan_gate occurrence at a bumped revision "
+            f"must not be blocked by an older revision's stale reject: {body}"
+        )
