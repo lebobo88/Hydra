@@ -2637,6 +2637,27 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         )
         resolution["plan_revision"] = values.get("plan_revision")
 
+    # Hydra#69 follow-up defect 1 (abort atomicity): fold the terminal park
+    # (phase="surfaced", and plan_status="rejected" for a plan_gate reject)
+    # into THIS SAME `patch` -- the one about to be written by the single
+    # `sup.update_state` call below (whichever of the two branches runs).
+    # Previously an abort/reject wrote the ordinary resolution patch here
+    # (clearing pending_hitl) and only recorded phase="surfaced" in a
+    # SEPARATE, LATER `sup.update_state` call (after the TheEights/spool
+    # work) -- a crash between the two writes left a checkpoint where the
+    # gate was cleared but the workflow was never parked (not resumable,
+    # not surfaced, not retryable). Folding both into one write removes that
+    # window entirely: TheEights resolution / spool prune still happen
+    # AFTER this write (fail-soft, as before) -- they only ever narrow an
+    # already-durable park, never widen it. `plan_status` stays scoped to
+    # `gate_node == "plan_gate"` exactly as it always was (state.py's
+    # `_PLAN_BARRIER_STATES` comment): an unscoped write here would raise
+    # the plan barrier for every OTHER gate's reject too.
+    if _plan_terminal_option or action == "reject":
+        patch["phase"] = "surfaced"
+        if action == "reject" and resolution.get("gate_node") == "plan_gate":
+            patch["plan_status"] = "rejected"
+
     if (gate_only and action == "approve" and not _plan_terminal_option
             and resolution.get("gate_node") == "plan_gate"):
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
@@ -2704,10 +2725,11 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     })
 
     # F10: abort option → park the workflow surfaced without resuming the graph.
-    # Handled AFTER the patch+spool-prune+emit so the gate resolution is fully
-    # recorded before returning (mirrors the reject path).
+    # Hydra#69 follow-up defect 1: phase="surfaced" was already folded into
+    # `patch` above and written atomically with the gate-clear (the single
+    # `sup.update_state` call preceding the TheEights/spool work above) --
+    # no second write happens here. This block only reports the outcome.
     if option == "abort":
-        sup.update_state(config, {"phase": "surfaced"})
         print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,
@@ -2738,20 +2760,19 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # NO automatic re-plan: an engine that authors another plan the
         # moment one is rejected is a loop the operator cannot stop. The
         # rejected plan stays on disk marked rejected.
-        _reject_patch: dict[str, Any] = {"phase": "surfaced"}
-        # P5c Task 3: `rejected` IS a member of `_PLAN_BARRIER_STATES`
-        # (state.py) -- writing it RAISES the plan barrier. This handler
-        # runs for EVERY gate rejection (budget, high_risk, constitution,
-        # plan_gate, ...), so the write must be scoped to plan_gate: an
-        # unscoped write here would raise a barrier that, with
-        # HYDRA_PLAN_PHASE off, no flag-gated code could ever clear —
+        #
+        # Hydra#69 follow-up defect 1: phase="surfaced" (and, scoped to
+        # plan_gate, plan_status="rejected") were already folded into
+        # `patch` above and written atomically with the gate-clear -- no
+        # second write happens here. `rejected` IS a member of
+        # `_PLAN_BARRIER_STATES` (state.py), so that write is scoped to
+        # `gate_node == "plan_gate"` up in the fold, exactly as it was here
+        # before: an unscoped write would raise a barrier that, with
+        # HYDRA_PLAN_PHASE off, no flag-gated code could ever clear --
         # exactly the total-dispatch-freeze class of bug the flag exists to
         # prevent, reachable from an ordinary operator reject. See the
         # `bypassed` write above (Task 1) for the safe-by-construction
         # counterpart, and state.py's `_PLAN_BARRIER_STATES` comment.
-        if resolution.get("gate_node") == "plan_gate":
-            _reject_patch["plan_status"] = "rejected"
-        sup.update_state(config, _reject_patch)
         print(_cli_json_dumps({
             "workflow_id": wf,
             "ok": True,

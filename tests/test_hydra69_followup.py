@@ -162,6 +162,170 @@ class TestFix1AbortDoesNotMaterialise:
 
 
 # =========================================================================== #
+# Hydra#69 follow-up defect 1 (abort atomicity) -- the remaining gap from the
+# final cross-vendor review round: an abort/reject at plan_gate must park
+# ATOMICALLY. Historically the resolution patch (clearing pending_hitl) and
+# `phase="surfaced"` were two SEPARATE `sup.update_state` calls, with
+# TheEights/spool work in between -- a crash in that window left a checkpoint
+# where the gate was cleared but the workflow was never parked. Fixed by
+# folding `phase="surfaced"` (and, scoped to plan_gate, `plan_status=
+# "rejected"` on reject) into the SAME `patch` written by the single
+# `sup.update_state` call that also clears `pending_hitl`/records the
+# resolution.
+# =========================================================================== #
+
+class TestFix1AbortAtomicSingleWrite:
+    def test_abort_is_exactly_one_update_state_call(self, monkeypatch, tmp_path):
+        """The durable checkpoint write and the terminal park happen in ONE
+        `sup.update_state` call, not two."""
+        wf = str(uuid4())
+        pending = _plan_pending(wf, options=["approve", "abort"])
+        values = {
+            "pending_hitl": pending, "phase": "approval",
+            "plan_status": "judged", "plan_ref": _plan_ref(), "plan_revision": 1,
+            "tasks": [], "plan_placeholder_task_ids": [],
+        }
+        sup = _SimpleFakeSup(pending, values)
+        _patch_common(monkeypatch, sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        args = _resume_args(tmp_path, wf, "approve", option="abort")
+        from hydra_core.cli import _cmd_resume_locked
+        ret = _cmd_resume_locked(args, tmp_path, wf, "approve", "abort")
+        assert ret == 0
+
+        assert len(sup.updates) == 1, (
+            f"abort must write the checkpoint exactly once, got "
+            f"{len(sup.updates)}: {sup.updates}"
+        )
+        (patch, _as_node) = sup.updates[0]
+        assert patch.get("pending_hitl") is None
+        assert patch.get("phase") == "surfaced"
+        assert "hitl_history" in patch and patch["hitl_history"], (
+            "the single write must also carry the resolution record"
+        )
+        assert patch["hitl_history"][0].get("option") == "abort"
+        # Never approves/materialises (Fix 1's original guarantee, preserved).
+        assert patch.get("plan_status") != "approved"
+        assert not patch.get("tasks")
+
+    def test_reject_at_plan_gate_is_exactly_one_update_state_call(self, monkeypatch, tmp_path):
+        wf = str(uuid4())
+        pending = _plan_pending(wf)
+        values = {
+            "pending_hitl": pending, "phase": "approval",
+            "plan_status": "judged", "plan_ref": _plan_ref(), "plan_revision": 1,
+            "tasks": [], "plan_placeholder_task_ids": [],
+        }
+        sup = _SimpleFakeSup(pending, values)
+        _patch_common(monkeypatch, sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        args = _resume_args(tmp_path, wf, "reject")
+        from hydra_core.cli import _cmd_resume_locked
+        ret = _cmd_resume_locked(args, tmp_path, wf, "reject", None)
+        assert ret == 0
+
+        assert len(sup.updates) == 1, (
+            f"reject must write the checkpoint exactly once, got "
+            f"{len(sup.updates)}: {sup.updates}"
+        )
+        (patch, _as_node) = sup.updates[0]
+        assert patch.get("pending_hitl") is None
+        assert patch.get("phase") == "surfaced"
+        # Scoped to plan_gate exactly as before -- the `_PLAN_BARRIER_STATES`
+        # write only happens when the resolved gate IS plan_gate.
+        assert patch.get("plan_status") == "rejected"
+        assert "hitl_history" in patch and patch["hitl_history"]
+
+    def test_non_plan_gate_reject_write_count_drops_state_otherwise_unchanged(
+        self, monkeypatch, tmp_path,
+    ):
+        """A non-plan-gate reject (e.g. a budget gate) is not scoped to
+        write `plan_status` -- folding `phase="surfaced"` into the single
+        write is correct for every gate, but the write COUNT is the only
+        thing that changes: final state and JSON output are the same as the
+        pre-fix two-write behaviour."""
+        wf = str(uuid4())
+        pending = {
+            "workflow_id": wf, "reason": "over_budget", "gate_node": "budget_gate",
+            "options": ["approve", "reject"],
+        }
+        values = {"pending_hitl": pending, "phase": "approval"}
+        sup = _SimpleFakeSup(pending, values)
+        _patch_common(monkeypatch, sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        args = _resume_args(tmp_path, wf, "reject")
+        from hydra_core.cli import _cmd_resume_locked
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            ret = _cmd_resume_locked(args, tmp_path, wf, "reject", None)
+        assert ret == 0
+
+        assert len(sup.updates) == 1
+        (patch, _as_node) = sup.updates[0]
+        assert patch.get("phase") == "surfaced"
+        # `plan_status` is NEVER touched for a non-plan-gate reject.
+        assert "plan_status" not in patch
+        assert sup._values.get("phase") == "surfaced"
+        assert "plan_status" not in sup._values
+
+        out = json.loads(captured.getvalue())
+        assert out["ok"] is True
+        assert out["phase"] == "surfaced"
+        assert out["status"] == "surfaced"
+        assert out["gate_node"] == "budget_gate"
+        assert out["action"] == "reject"
+        assert out["pending_hitl"] is None
+        assert out["graph_reentered"] is False
+
+    def test_crash_after_write_before_eights_leaves_checkpoint_parked(
+        self, monkeypatch, tmp_path,
+    ):
+        """Simulate the TheEights/spool step raising AFTER the durable
+        checkpoint write: the already-persisted checkpoint must still show
+        the terminal park (phase=surfaced, plan_status not approved, no
+        step tasks) -- the crash must not un-park anything, because nothing
+        AFTER the single write is required for the park to hold."""
+        wf = str(uuid4())
+        pending = _plan_pending(wf, options=["approve", "abort"])
+        values = {
+            "pending_hitl": pending, "phase": "approval",
+            "plan_status": "judged", "plan_ref": _plan_ref(), "plan_revision": 1,
+            "tasks": [], "plan_placeholder_task_ids": [],
+        }
+        sup = _SimpleFakeSup(pending, values)
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor", lambda **_k: sup)
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests", lambda *_a: 0)
+
+        class _BoomAfterWrite(RuntimeError):
+            pass
+
+        def _boom(*_a, **_k):
+            raise _BoomAfterWrite("TheEights connection reset mid-resolve")
+
+        # Both routes the eights resolution can take, since `gate_only` here
+        # is False (the default `_resume_args` non-gate-only CLI path).
+        monkeypatch.setattr("hydra_core.cli._resolve_eights_hitl_for_workflow", _boom)
+        monkeypatch.setattr("hydra_core.cli._resolve_eights_hitl_gate_only_bounded", _boom)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        args = _resume_args(tmp_path, wf, "approve", option="abort")
+        from hydra_core.cli import _cmd_resume_locked
+        with pytest.raises(_BoomAfterWrite):
+            _cmd_resume_locked(args, tmp_path, wf, "approve", "abort")
+
+        # The checkpoint write already happened (exactly once) BEFORE the
+        # raise -- the crash never un-persists it.
+        assert len(sup.updates) == 1
+        assert sup._values.get("phase") == "surfaced"
+        assert sup._values.get("plan_status") == "judged"
+        assert not sup._values.get("tasks")
+        assert sup._values.get("pending_hitl") is None
+
+
+# =========================================================================== #
 # Fix 2 revision (HIGH) -- materialise_plan_steps itself refuses to run while
 # a plan_gate pending_hitl is still open, absent an explicit approval signal.
 # =========================================================================== #
