@@ -311,6 +311,65 @@ def test_worktree_isolation_and_merge_back(tmp_path):
     assert not Path(wt).exists()
 
 
+def test_workflow_terminal_passing_judge_refuses_merge_preserves_branch(tmp_path):
+    """Hydra#69 round 6 remaining-gap cross-vendor finding: a stale
+    engineering cursor opened BEFORE the workflow went terminal reaches
+    ``await_judge`` and gets a PASSING verdict submitted AFTER the workflow
+    became terminal (aborted/rejected at some other gate). The caller (cli.py
+    ``_cmd_attended_submit``) detects this from the checkpoint and passes
+    ``workflow_terminal=True`` into ``submit_host_result`` -- merging the
+    candidate worktree into the repo now would CONTINUE a terminal workflow,
+    so it must be refused even though the verdict itself passed. The pp
+    ledger bookkeeping (record_verdict/finalize_stage/finalize_run) still
+    runs exactly once (real spend already happened), and the branch is
+    preserved (committed, never merged) for the operator to pick up by hand."""
+    _init_repo(tmp_path)
+    disp = FakeDispatcher()
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-term", run_id="run-term",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+
+    from pathlib import Path
+    Path(wt, "feature.py").write_text("print('hello')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    assert res["state"] == "await_judge"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-run-term-stage-1-att-1-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05},
+        workflow_terminal=True)
+
+    # Never merged, never dispatched-as-complete -- the workflow was already
+    # terminal, so this call must refuse to land code.
+    assert res["merge"]["merged"] is False
+    assert res["merge"]["error"] == "workflow_terminal"
+    assert res["status"] != "complete"
+    assert not (tmp_path / "feature.py").exists(), (
+        "the candidate change must never land in the repo once the workflow "
+        "is terminal"
+    )
+    # The worktree checkout is cleaned up (ordinary cleanup, not a merge),
+    # but the branch itself is preserved for manual pickup.
+    assert not Path(wt).exists()
+    assert res.get("preserved_branch"), (
+        "a workflow-terminal refusal must still preserve the branch, never "
+        "silently discard the engineer's committed work"
+    )
+    # The pp-ledger bookkeeping for the ALREADY-INCURRED attempt/verdict
+    # still ran -- exactly once, not skipped and not doubled.
+    assert disp.count("record_verdict") == 1
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    # Cost accrued across generate + judge is still reported for the caller
+    # to charge on HydraState exactly once.
+    assert res["cost_usd"] == pytest.approx(0.05)
+
+
 def test_merge_worktree_back_excludes_byproduct_dirs(tmp_path):
     """_merge_worktree_back must not stage .hydra/, .harness/, or *.log
     byproducts left inside the worktree (e.g. by a nested tool run with

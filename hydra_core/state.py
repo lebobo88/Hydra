@@ -410,6 +410,67 @@ class HydraState(BaseModel):
     attended_checkpoint_reconciled: Annotated[dict[str, bool], _merge_dict] = Field(
         default_factory=dict)
 
+    # Hydra#69 round 6 defect 1 (HIGH): the round 5 marker above was written
+    # too early -- as part of the SAME atomic write as the budget charge,
+    # which lands BEFORE the later downstream checkpoint writes a terminal
+    # `_cmd_attended_submit` call still has to make (attempt-counter bump,
+    # PLAN acceptance/rejection outcome, attended_completed_task_ids /
+    # attended_results for a planning task). A crash after the charge write
+    # but before one of those later writes left `attended_checkpoint_reconciled`
+    # already `True`, so an identical retry took the cached-result shortcut
+    # and returned `ok: True` with the later writes still missing. This
+    # marker is CHARGE evidence only -- ``True`` means `charge_and_gate` has
+    # already run and its budget/downgrade outcome for this call is
+    # persisted (keyed the same way as `attended_checkpoint_reconciled`) --
+    # so a retry can skip re-charging without yet being fully reconciled.
+    # `attended_checkpoint_reconciled` is now written ONLY after every
+    # downstream write for the call has succeeded, making it a true
+    # fully-reconciled marker the cached-result shortcut can trust.
+    # `_merge_dict` reducer, same rationale as its sibling above.
+    attended_charge_applied: Annotated[dict[str, dict], _merge_dict] = Field(
+        default_factory=dict)
+
+    # Hydra#69 round 6 item 3 (redesign): the durable record of the ONE
+    # terminal (abort, or reject at any gate) resolution that ended this
+    # workflow, if any -- {gate_node, hitl_request_id, action, option,
+    # plan_revision, resolved_at}. Written in the SAME single
+    # `as_node="postcheck"` checkpoint write (`cli.py`'s `_cmd_resume_
+    # locked`) that also clears `pending_hitl` / parks `phase="surfaced"`
+    # for EVERY abort/reject at ANY gate, including the bare-interrupt
+    # reject/abort paths (a bare interrupt has no `pending_hitl` dict, so
+    # `gate_node`/`hitl_request_id` are `None` there).
+    #
+    # `hitl_request_id` is the resolved gate's own envelope `id` when the
+    # gate was filed via `HITLRequest` (most gates); a handful of ad-hoc
+    # `pending_hitl` dicts built directly in `supervisor.py` (e.g. the
+    # `intake` bad-`--repo`-arg gates) never carried an `id` at all -- for
+    # those this is `None` and `gate_node` (plus, for `plan_gate`,
+    # `plan_revision`) remains the identity a consumer keys on.
+    #
+    # The bare-interrupt resume branch consults THIS field directly instead
+    # of scanning `hitl_history` -- a later non-resolution note appended to
+    # `hitl_history` (e.g. the `plan_gate_bypassed` force-dispatch marker, a
+    # `plan_governance_note_failed` trace-adjacent note) can therefore never
+    # mask an earlier terminal reject the way a "read only the latest
+    # `hitl_history` entry" scan could. `None` while this workflow has never
+    # had a terminal resolution recorded on THIS field -- which is also true
+    # of a checkpoint written before this field existed (the Pydantic
+    # default, matching every other additive field). That legacy gap -- and the case of
+    # a checkpoint that genuinely predates this fix -- is covered by
+    # `cli._bare_interrupt_terminal_resolution`, kept as a
+    # `hitl_history`-scanning FALLBACK used ONLY when this field reads back
+    # `None`.
+    #
+    # Never silently cleared: once set, a workflow stays terminal for the
+    # rest of its life. No write path in this engine re-opens a terminal
+    # workflow (grepped: nothing re-sets `pending_hitl` to a fresh gate, and
+    # `plan_status`/`phase` never move off their terminal values, after a
+    # terminal write) -- if a future change legitimately needs to, it must
+    # explicitly write `terminal_resolution=None` in that same patch (plain
+    # `LastValue` channel, no reducer: `update_state` must write the FULL
+    # intended value or the channel keeps whatever it already held).
+    terminal_resolution: Optional[dict[str, Any]] = None
+
     # P0 planning substrate. Plain replace-by-default fields, no reducers: a
     # planning re-run REPLACES the prior plan snapshot rather than
     # accumulating history. P1 (plan_barrier_active, below) now reads
@@ -590,6 +651,131 @@ def plan_revision_ceiling_reached(plan_revision: int, max_revisions: int) -> boo
     history).
     """
     return max(0, plan_revision - 1) >= max_revisions
+
+
+def workflow_terminal_resolution(
+    values: dict, snap_next: "tuple | list | set" = (),
+) -> dict | None:
+    """Hydra#69 round 6 remaining-gap fix: the ONE predicate deciding whether
+    a checkpoint's workflow has already been terminally resolved (aborted, or
+    rejected at any gate) -- and therefore may never be continued, re-entered,
+    or finalized by ANY caller.
+
+    Primary source of truth is the durable ``HydraState.terminal_resolution``
+    field, written atomically in the single ``as_node="postcheck"`` checkpoint
+    write for every abort/reject at any gate (including the bare-interrupt
+    reject/abort paths). Returned as-is when present -- independent of
+    ``snap_next``, since a terminal workflow is terminal whether or not the
+    graph happens to still show a pending next node.
+
+    Falls back to a LEGACY-ONLY reconstruction, used only when ``values``
+    carries no durable ``terminal_resolution`` (a checkpoint written before
+    that field existed, or one that has never had a terminal resolution
+    recorded on it at all): scans ``hitl_history`` for the latest entry that
+    actually records a resolution (has a ``"resolution"`` key at all --
+    skipping past trailing non-resolution notes like the ``plan_gate_bypassed``
+    force-dispatch marker or a governance note, which must never mask a real
+    terminal decision underneath them), and treats it as terminal only if its
+    ``gate_node`` matches a node the graph is CURRENTLY parked at
+    (``snap_next``) and -- for ``plan_gate`` -- its ``plan_revision`` matches
+    the checkpoint's current ``plan_revision`` (a resolution only ever binds
+    to the exact gate occurrence it actually resolved). Returns ``None`` for a
+    genuine bare interrupt with no terminal history at the parked gate at all
+    (the MU7 case: graph paused before synthesis/judge_synthesis, never
+    resolved) -- callers must still allow that to continue.
+
+    This is the SINGLE implementation of both checks; every caller (resume,
+    attended-step, finalize, and any future entry point that can advance a
+    workflow) must consult this helper rather than re-deriving either the
+    durable read or the legacy scan, so they can never drift apart the way a
+    hand-duplicated predicate did before (see `plan_revision_ceiling_reached`
+    above for the same rationale).
+    """
+    terminal = values.get("terminal_resolution")
+    if isinstance(terminal, dict):
+        return terminal
+    hitl_history = values.get("hitl_history") or []
+    if not snap_next or not hitl_history:
+        return None
+    parked_at = set(snap_next)
+    current_plan_revision = values.get("plan_revision")
+    last: dict | None = None
+    for entry in reversed(hitl_history):
+        if not isinstance(entry, dict):
+            continue
+        if "resolution" not in entry:
+            # Legacy-path masking fix: a non-resolution note appended AFTER
+            # the real terminal decision must never be mistaken for "the
+            # latest entry" -- skip past it to find the actual resolution.
+            continue
+        last = entry
+        break
+    if last is None:
+        return None
+    if last.get("gate_node") not in parked_at:
+        return None
+    if last.get("gate_node") == "plan_gate":
+        # Instance identity: a plan_gate resolution only binds to the exact
+        # plan_revision it was recorded against.
+        if last.get("plan_revision") != current_plan_revision:
+            return None
+    if last.get("resolution") == "reject" or last.get("option") == "abort":
+        return last
+    return None
+
+
+def plan_gate_approve_evidence(state) -> dict | None:
+    """Hydra#69 round 6 defect 4 (LOW): the ONE predicate deciding whether
+    `hitl_history` proves a genuine (non-abort) `plan_gate` approve for
+    `state.plan_revision` -- factored out of `supervisor.materialise_plan_
+    steps` so `_cmd_attended_step` (cli.py) can never disagree with it about
+    whether a plan was actually approved. Previously `_cmd_attended_step`'s
+    own wedge-terminal used a DIFFERENT, looser check (any `hitl_history`
+    entry with `resolution == "approve"` and `gate_node == "plan_gate"` for
+    this revision) that did not exclude `option == "abort"` -- so an
+    operator's abort at `plan_gate` (which IS recorded with
+    `resolution == "approve", option == "abort"`, see the plan_gate's own
+    revision_ceiling_reached/unjudgeable_plan branches) was misreported by
+    `step` as `plan_approved_not_materialised` instead of the correct
+    terminal/unresolved status.
+
+    Returns the latest matching `hitl_history` entry (truthy) when it is
+    evidence of a genuine approve, or ``None`` when it is not (no matching
+    entry, the latest matching entry is an abort, or -- legacy policy -- an
+    unstamped entry that does not qualify per the rules below).
+
+    Policy (identical to `materialise_plan_steps`'s inline version this
+    replaces):
+      * scan `hitl_history` in reverse for the latest `plan_gate` entry
+        whose own `plan_revision` equals `state.plan_revision` exactly;
+      * a legacy (unstamped, no `plan_revision` key) entry counts ONLY when
+        `state.plan_revision <= 1` and no OTHER `plan_gate` entry in the
+        whole history carries an explicit `plan_revision` (i.e. the
+        checkpoint genuinely predates revisioning);
+      * the matched entry must have `resolution == "approve"` AND
+        `option != "abort"`.
+    """
+    history = state.hitl_history or []
+    any_stamped = any(
+        isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+        and e.get("plan_revision") is not None
+        for e in history
+    )
+    legacy_ok = state.plan_revision <= 1 and not any_stamped
+    latest_plan_gate_entry = next(
+        (e for e in reversed(history)
+         if isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+         and (
+             e.get("plan_revision") == state.plan_revision
+             or (e.get("plan_revision") is None and legacy_ok)
+         )),
+        None,
+    )
+    if (latest_plan_gate_entry is None
+            or latest_plan_gate_entry.get("resolution") != "approve"
+            or latest_plan_gate_entry.get("option") == "abort"):
+        return None
+    return latest_plan_gate_entry
 
 
 def plan_barrier_active(state) -> bool:

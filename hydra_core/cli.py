@@ -56,11 +56,13 @@ from .state import (
     PoisonedStateError,
     TaskState,
     plan_barrier_active,
+    plan_gate_approve_evidence,
     plan_max_revisions,
     plan_revision_ceiling_reached,
     fold_acceptance_criteria_into_request_text,
     task_eligible_for_dispatch,
     task_retired,
+    workflow_terminal_resolution,
 )
 from .telemetry import emit, trace_path
 
@@ -620,6 +622,15 @@ def _cmd_repo(args) -> int:
 
 
 def _cmd_run(args) -> int:
+    # Remaining-gap audit (round 6 follow-up): `hydra run` / `hydra.workflow.
+    # launch` (detached launch/continue) always constructs a FRESH in-memory
+    # `HydraState(workflow_id=workflow_id, ...)` below and invokes the graph
+    # from a clean intake -- it never loads or continues an EXISTING
+    # checkpoint's state, so it cannot re-open a terminal workflow's prior
+    # progress. `--workflow-id` colliding with an existing (terminal or
+    # non-terminal) checkpoint's thread_id is pre-existing, undefined
+    # behaviour unrelated to `terminal_resolution` specifically (the Cockpit
+    # bridge always pre-allocates a FRESH uuid4()); out of scope for this fix.
     project = Path(args.project) if args.project else Path.cwd()
     # WS1 retry (finding 1): --repo and --repos are mutually exclusive on the
     # CLI transport too. The MCP transport already rejects this combination
@@ -1888,6 +1899,100 @@ def _precheck_operator_identity_gate_only(args) -> dict | None:
     return None
 
 
+def _bare_interrupt_terminal_resolution(
+    hitl_history: list, snap_next: tuple, current_plan_revision: object = None,
+) -> dict | None:
+    """Round 6 item 3 REDESIGN: this is now a LEGACY-ONLY fallback.
+
+    The primary source of truth for "is this workflow already terminal" is
+    the durable `HydraState.terminal_resolution` field, consulted directly
+    by the bare-interrupt branch in `_cmd_resume_locked` -- written
+    atomically, in the SAME `as_node="postcheck"` checkpoint write, for
+    EVERY abort/reject at any gate (including the bare-interrupt reject/
+    abort paths themselves). That field can never be masked by a LATER
+    non-resolution note appended to `hitl_history` (e.g. the
+    `plan_gate_bypassed` force-dispatch marker), because it is a separate,
+    independently-written field, not derived from `hitl_history` at read
+    time.
+
+    This function is now called ONLY as a fallback when `state.terminal_
+    resolution` reads back `None` -- i.e. a checkpoint written before this
+    field existed (a genuine legacy checkpoint) or a checkpoint that has
+    never had a terminal resolution recorded on it at all. It reconstructs
+    the same decision by scanning `hitl_history` the way the engine did
+    before `terminal_resolution` existed -- `hitl_history` is genuinely the
+    only durable source available for a legacy checkpoint. This scan skips
+    past any entry with no `"resolution"` key at all (a note/event, not a
+    resolution) to find the latest entry that IS a resolution, so a
+    trailing non-resolution note appended after a genuine terminal
+    reject/abort (the same `plan_gate_bypassed`/governance-note shape
+    `terminal_resolution` itself is immune to) cannot mask it here either.
+
+    Hydra#69 round 6 defect 3 (MED), follow-up (cross-vendor, HIGH): the
+    durable `hitl_history` entry, if any, that records a TERMINAL resolution
+    (``resolution == "reject"``, or an ``approve`` carrying
+    ``option == "abort"``) for the SAME INSTANCE of the gate the graph's
+    checkpoint is CURRENTLY parked at (``snap_next``).
+
+    Used by the bare-interrupt branch (no ``pending_hitl``, but ``next`` is
+    still non-empty) as a backstop, independent of THIS call's own
+    action/option: an older checkpoint, or any gate other than plan_gate
+    written before round 6 folded every terminal resolution into the same
+    ``as_node="postcheck"`` write, can leave `next` truthy at a gate whose
+    terminal resolution is already durably recorded. A plain
+    ``--action approve`` (no option) or ``--action force-dispatch`` retry
+    against that checkpoint must never continue the graph. Returns ``None``
+    for a genuine bare interrupt with no terminal history at the parked
+    gate at all (the MU7 case: graph paused before synthesis/
+    judge_synthesis, never resolved) — that must still be allowed to
+    continue.
+
+    Only the LAST entry in `hitl_history` overall THAT ACTUALLY RECORDS A
+    RESOLUTION (has a `"resolution"` key at all) is ever consulted — NOT the
+    last entry whose ``gate_node`` happens to match, and NOT a trailing
+    NON-resolution note (this-drop fix: e.g. the `plan_gate_bypassed`
+    force-dispatch marker, or a governance note -- see
+    `_append_plan_governance_note`) appended after the real resolution,
+    which is skipped over rather than mistaken for "the latest entry" and
+    masking the genuine terminal reject underneath it. Skipping past
+    intervening entries for a DIFFERENT (or the SAME) gate_node to find an
+    older match was the follow-up bug: a durable reject of `plan_gate`
+    revision 1, followed by a legitimate new revision-2 cycle that has not
+    yet recorded ANY hitl_history entry, left the revision-1 reject as the
+    only "plan_gate" entry in history — the old skip-and-match search
+    wrongly bound that stale rejection to the brand-new, never-resolved
+    occurrence of the same-named gate and refused it. Anchoring on the
+    single latest RESOLUTION entry, plus (for `plan_gate`) an explicit
+    `plan_revision` instance check against the checkpoint's CURRENT
+    `plan_revision`, ensures a terminal resolution only ever blocks the
+    exact gate occurrence it actually resolved:
+      - an earlier reject of gate X, followed by a later legitimate
+        approve/resolution cycle (same or different gate) -> the latest
+        entry is that later, non-terminal (or different-gate) resolution,
+        so this returns ``None`` and the new occurrence proceeds;
+      - an earlier reject of `plan_gate` at revision N, with no later
+        history entry at all, but the checkpoint has since moved on to
+        revision N+1 (a fresh, unresolved plan_gate occurrence) -> the
+        revision mismatch means the stale reject does not apply here
+        either, so this returns ``None``;
+      - the latest entry genuinely IS a terminal resolution for the exact
+        gate instance the checkpoint is parked at -> this returns that
+        entry, and the caller refuses to continue.
+
+    Remaining-gap fix (round 6 follow-up): the actual scan now lives ONCE in
+    `state.workflow_terminal_resolution` -- every caller that can advance a
+    workflow (`_cmd_resume_locked`, `_cmd_attended_step`, `_cmd_finalize`)
+    consults that single implementation instead of each re-deriving it. This
+    function is kept as a thin, signature-compatible wrapper (hitl_history/
+    snap_next/current_plan_revision, rather than a `values` dict) for its
+    existing call sites and unit tests; it never re-implements the scan.
+    """
+    return workflow_terminal_resolution(
+        {"hitl_history": hitl_history, "plan_revision": current_plan_revision},
+        snap_next,
+    )
+
+
 def _cmd_resume(args) -> int:
     """Resume an HITL-paused workflow from its checkpoint.
 
@@ -2127,6 +2232,53 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # (no pending_hitl but graph paused before synthesis/judge_synthesis)
         # from a genuinely terminal state (snap.next empty).
         _snap_next = getattr(snap, "next", ()) or ()
+        # Round 6 item 3 REDESIGN: `HydraState.terminal_resolution` is now
+        # the primary authority on whether the gate the graph is parked at
+        # was ALREADY terminally resolved -- independent of what
+        # action/option THIS call carries, and independent of anything
+        # appended to `hitl_history` AFTER the terminal write (a later
+        # non-resolution note there, e.g. `plan_gate_bypassed`, can never
+        # mask this field the way scanning `hitl_history` alone could).
+        # `None` here means either "genuinely never terminal" or "a legacy
+        # checkpoint written before this field existed" -- both fall back to
+        # `workflow_terminal_resolution`'s hitl_history scan, which is
+        # the ONLY durable signal a legacy checkpoint carries. A genuine
+        # bare interrupt with no terminal resolution recorded either way
+        # (MU7: paused before synthesis/judge_synthesis, never resolved)
+        # returns None here and falls through unaffected. Remaining-gap fix
+        # (round 6 follow-up): this is now the SAME shared helper
+        # `_cmd_attended_step`/`_cmd_finalize` consult, so all three entry
+        # points can never drift apart on what counts as terminal.
+        _terminal_hist_entry = workflow_terminal_resolution(values, _snap_next)
+        if _snap_next and _terminal_hist_entry is not None:
+            emit(project, wf, "hitl_resumed", {
+                "action": action,
+                "option": option,
+                "gate_node": _terminal_hist_entry.get("gate_node"),
+                "bare_interrupt": list(_snap_next),
+                "gate_only": gate_only,
+                "note": ("durable terminal_resolution (or, for a legacy "
+                         "checkpoint, hitl_history) records a terminal "
+                         "resolution for the parked gate; graph not "
+                         "re-entered"),
+            })
+            print(_cli_json_dumps({
+                "workflow_id": wf,
+                "ok": True,
+                "resumed": False,
+                "gate_only": gate_only,
+                "graph_reentered": False,
+                "action": action,
+                "option": option,
+                "interrupted_before": list(_snap_next),
+                "gate_node": _terminal_hist_entry.get("gate_node"),
+                "phase": values.get("phase"),
+                "status": values.get("phase"),
+                "pending_hitl": None,
+                "note": ("already terminal (durable hitl_history); graph "
+                         "not re-entered"),
+            }))
+            return 0
         # Hydra#69 round 5 defect 1b (defense in depth): `option == "abort"`
         # is a terminal decision no matter what `action` carries it (the
         # plan_gate's own revision_ceiling_reached/unjudgeable_plan branches
@@ -2137,13 +2289,48 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # continue-branch so a repeated abort can never be misread as a
         # genuine approve just because `action` happens to be "approve".
         if _snap_next and option == "abort":
+            # Round 6 item 3 REDESIGN: this branch used to only ever REPORT
+            # "already terminal (abort)" -- it never wrote anything, on the
+            # (implicit) assumption this was always a REPEAT of a terminal
+            # write made elsewhere. That assumption is false the FIRST time a
+            # bare interrupt is aborted (no `terminal_hist_entry` match
+            # above, because nothing has recorded a terminal resolution for
+            # this parked gate yet): without a durable write here, a LATER
+            # retry with a different action/option (e.g. plain `--action
+            # approve`, no option) would fall through to the "continue the
+            # graph" branch below and wrongly resume. Fold the SAME single
+            # `as_node="postcheck"` terminal write every other abort/reject
+            # path uses into this branch too, recording `terminal_resolution`
+            # -- idempotent: a genuine repeat lands back in the durable-
+            # terminal-resolution branch above instead, via the freshly
+            # written field, and never reaches here at all.
+            from datetime import datetime, timezone
+            _bare_term_resolved_at = datetime.now(timezone.utc).isoformat()
+            _bare_terminal_resolution = {
+                "gate_node": None,
+                "hitl_request_id": None,
+                "action": action,
+                "option": option,
+                "plan_revision": values.get("plan_revision"),
+                "resolved_at": _bare_term_resolved_at,
+            }
+            sup.update_state(
+                config,
+                {"phase": "surfaced", "terminal_resolution": _bare_terminal_resolution},
+                as_node="postcheck",
+            )
+            _bare_abort_next = tuple(getattr(sup.get_state(config), "next", None) or ())
+            assert _bare_abort_next == (), (
+                "bare-interrupt abort must leave next==() so no later invoke "
+                f"can run the next node headless; got {_bare_abort_next!r}"
+            )
             emit(project, wf, "hitl_resumed", {
                 "action": action,
                 "option": option,
                 "gate_node": None,
                 "bare_interrupt": list(_snap_next),
                 "gate_only": gate_only,
-                "note": "repeated abort observed at bare interrupt; graph not re-entered",
+                "note": "bare-interrupt abort parked terminally (postcheck write)",
             })
             print(_cli_json_dumps({
                 "workflow_id": wf,
@@ -2155,8 +2342,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 "option": option,
                 "interrupted_before": list(_snap_next),
                 "gate_node": None,
-                "phase": values.get("phase"),
-                "status": values.get("phase"),
+                "phase": "surfaced",
+                "status": "surfaced",
                 "pending_hitl": None,
                 "note": ("already terminal (abort); graph not re-entered"),
             }))
@@ -2253,7 +2440,36 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             # ONCE, at the top of this function (finding 1) -- a refusal
             # there already returned before this branch could ever be
             # reached, so there is nothing further to verify here.
-            sup.update_state(config, {"phase": "surfaced"})
+            #
+            # Round 6 item 3 REDESIGN: this used to be a generic, node-
+            # context-less `sup.update_state(config, {"phase": "surfaced"})`
+            # -- it left `next` wherever the checkpoint was interrupted and
+            # recorded nothing durable a later resume could key on, so a
+            # different retry (e.g. a plain `--action approve`) could
+            # silently continue the graph past a workflow this branch had
+            # already, honestly, reported as terminal. Fold this into the
+            # SAME single `as_node="postcheck"` terminal write every other
+            # abort/reject path now uses, recording `terminal_resolution`.
+            from datetime import datetime, timezone
+            _bare_reject_resolved_at = datetime.now(timezone.utc).isoformat()
+            _bare_reject_terminal_resolution = {
+                "gate_node": None,
+                "hitl_request_id": None,
+                "action": action,
+                "option": option,
+                "plan_revision": values.get("plan_revision"),
+                "resolved_at": _bare_reject_resolved_at,
+            }
+            sup.update_state(
+                config,
+                {"phase": "surfaced", "terminal_resolution": _bare_reject_terminal_resolution},
+                as_node="postcheck",
+            )
+            _bare_reject_next = tuple(getattr(sup.get_state(config), "next", None) or ())
+            assert _bare_reject_next == (), (
+                "bare-interrupt reject must leave next==() so no later invoke "
+                f"can run the next node headless; got {_bare_reject_next!r}"
+            )
             print(_cli_json_dumps({
                 "workflow_id": wf,
                 "ok": True,
@@ -2708,45 +2924,64 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         patch["phase"] = "surfaced"
         if action == "reject" and resolution.get("gate_node") == "plan_gate":
             patch["plan_status"] = "rejected"
+        # Round 6 item 3 REDESIGN: record the durable, replace-channel
+        # `terminal_resolution` in this SAME patch -- the one atomic write
+        # below (as_node="postcheck") -- for EVERY abort/reject at ANY gate.
+        # `hitl_request_id` is `resolution.get("id")`: `resolution` already
+        # spreads the resolved `pending_hitl` dict's own keys (above), so
+        # this is the resolved gate's envelope `id` when it was filed via
+        # `HITLRequest` (most gates) and `None` for the handful of ad-hoc
+        # `pending_hitl` dicts built without one (e.g. some `intake` gates)
+        # -- `gate_node` (plus `plan_revision` for `plan_gate`) is that
+        # occurrence's identity either way.
+        patch["terminal_resolution"] = {
+            "gate_node": resolution.get("gate_node"),
+            "hitl_request_id": resolution.get("id"),
+            "action": action,
+            "option": option,
+            "plan_revision": resolution.get("plan_revision"),
+            "resolved_at": resolution["resolved_at"],
+        }
 
-    # Hydra#69 round 5 defect 1a: a TERMINAL plan_gate resolution (abort, or
-    # reject) must ALSO force the checkpoint's `next` to `()` via
-    # `as_node="postcheck"` -- not just the gate_only approve case above.
-    # Previously only the gate_only-approve branch used `as_node="postcheck"`;
-    # a terminal abort/reject (on EITHER the gate_only or the detached route
-    # -- both return early below without ever calling `sup.invoke`) fell
-    # through to the generic node-context-less write, which leaves `next`
-    # exactly where the checkpoint was interrupted (`("plan_gate",)`). A
-    # repeated, non-gate-only `hydra resume --action approve --option abort`
-    # (or `--action reject`) then finds no `pending_hitl` and takes the
-    # bare-interrupt "continue the graph" branch further up this function,
-    # which resumes STRAIGHT INTO `node_plan_gate` -> `materialise_plan_
-    # steps` and approves + materialises a plan that was already terminally
-    # parked. Folding the terminal case into the SAME `as_node="postcheck"`
-    # write closes that hole at the source: no later `sup.invoke` can ever
-    # pick up `plan_gate`'s static `add_edge("plan_gate", "dispatch")` for a
-    # workflow this function already parked as terminal.
-    _plan_gate_terminal = (
-        resolution.get("gate_node") == "plan_gate"
-        and (_plan_terminal_option or action == "reject")
-    )
+    # Hydra#69 round 5 defect 1a / round 6 defect 3: a TERMINAL resolution
+    # (abort, or reject) at ANY gate -- not just plan_gate -- must ALSO force
+    # the checkpoint's `next` to `()` via `as_node="postcheck"`. Previously
+    # only the gate_only-approve branch (plan_gate specifically) and a
+    # plan_gate-scoped terminal check used `as_node="postcheck"`; a terminal
+    # abort/reject at any OTHER gate (budget/approval/reflexion_override/...)
+    # fell through to the generic node-context-less write, which leaves
+    # `next` exactly where the checkpoint was interrupted -- e.g.
+    # `("budget_gate",)`. A repeated, non-gate-only `hydra resume --action
+    # approve --option abort` (or `--action reject`) at that gate then found
+    # no `pending_hitl` and took the bare-interrupt "continue the graph"
+    # branch further up this function, silently re-running whatever that
+    # gate's own static outgoing edge points at for a workflow this function
+    # already parked as terminal. Folding EVERY terminal case into the SAME
+    # `as_node="postcheck"` write closes that hole at the source: no later
+    # `sup.invoke` can ever pick up any gate's own outgoing edge for a
+    # workflow already parked as terminal here. `plan_status` writes stay
+    # scoped to `gate_node == "plan_gate"` exactly as above (state.py's
+    # `_PLAN_BARRIER_STATES` comment) -- only the `next==()` termination
+    # itself is now gate-agnostic.
+    _gate_terminal = _plan_terminal_option or action == "reject"
     if (gate_only and action == "approve" and not _plan_terminal_option
-            and resolution.get("gate_node") == "plan_gate") or _plan_gate_terminal:
+            and resolution.get("gate_node") == "plan_gate") or _gate_terminal:
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
         # the generic (node-context-less) write below. `postcheck`'s only
         # outgoing edge is `after_postcheck` -> END unconditionally, so this
         # forces the checkpoint's `next` to `()` -- no later `sup.invoke`
         # (a different gate's resume, a replay, an operator mistake) can
         # ever pick up `plan_gate`'s static `add_edge("plan_gate",
-        # "dispatch")` and run `node_dispatch` headlessly out from under the
-        # attended host's own step/submit cursor. Asserted, not just hoped:
-        # a future graph-wiring change that breaks this invariant must fail
-        # loudly here, not silently reopen the headless-dispatch hole.
+        # "dispatch")` (or any other gate's own outgoing edge) and run the
+        # next node headlessly out from under the attended host's own
+        # step/submit cursor. Asserted, not just hoped: a future
+        # graph-wiring change that breaks this invariant must fail loudly
+        # here, not silently reopen the headless-dispatch hole.
         sup.update_state(config, patch, as_node="postcheck")
         _plan_gate_next = tuple(getattr(sup.get_state(config), "next", None) or ())
         assert _plan_gate_next == (), (
-            "plan_gate gate-only approve/terminal must leave next==() so no "
-            f"later invoke can run dispatch headless; got {_plan_gate_next!r}"
+            "gate-only approve/terminal must leave next==() so no later "
+            f"invoke can run the next node headless; got {_plan_gate_next!r}"
         )
     else:
         sup.update_state(config, patch)
@@ -3962,6 +4197,34 @@ def _cmd_attended_step(args) -> int:
             return 1
         state = HydraState.model_validate(snap.values)
 
+        # Remaining-gap fix (round 6 follow-up): a workflow whose
+        # `terminal_resolution` is durably set (or, for a legacy checkpoint,
+        # whose `hitl_history` records a terminal reject/abort at the parked
+        # gate) was operator-aborted or -rejected and must never be advanced
+        # by ANY caller -- including `hydra step`, which otherwise selects
+        # and dispatches the next attended task (opening a cursor / pp run /
+        # worktree) with no awareness of that resolution at all. Checked
+        # BEFORE `_run_first_step_dispatch_pass` (which can itself re-enter
+        # the graph) and before task selection, so a terminal workflow opens
+        # nothing. This takes precedence over `ready_to_finalize` and the
+        # plan terminals below -- a terminal resolution is definitionally
+        # more final than either. Uses the SAME helper `_cmd_resume_locked`
+        # and `_cmd_finalize` consult, so the three can never drift apart on
+        # what counts as terminal. A merely SURFACED (not terminal) workflow
+        # -- e.g. a stage a judge surfaced for operator review, with no
+        # operator abort/reject recorded -- is unaffected: the helper returns
+        # `None` for it and `hydra step` proceeds exactly as before.
+        _terminal = workflow_terminal_resolution(
+            snap.values, getattr(snap, "next", ()) or ())
+        if _terminal is not None:
+            print(_cli_json_dumps({
+                "ok": False,
+                "status": "workflow_terminal",
+                "workflow_id": wf,
+                "terminal_resolution": _terminal,
+            }, indent=2, default=str))
+            return 0
+
         # E2-32: no-approval workflows have no `approve` caller to leave the
         # plan_only dispatch interrupt — run that same pass here, once.
         if _run_first_step_dispatch_pass(sup, config, project, wf, snap, state):
@@ -4251,13 +4514,15 @@ def _cmd_attended_step(args) -> int:
         #     pending_hitl) — genuinely unresolved, not a materialisation bug.
         # No automatic repair either way — the operator must act.
         if plan_barrier_active(state):
-            _approved_this_revision = any(
-                isinstance(h, dict)
-                and h.get("resolution") == "approve"
-                and h.get("gate_node") == "plan_gate"
-                and h.get("plan_revision") == state.plan_revision
-                for h in (getattr(state, "hitl_history", []) or [])
-            )
+            # Hydra#69 round 6 defect 4 (LOW): reuse the SAME approval-
+            # evidence predicate `materialise_plan_steps` (supervisor.py)
+            # uses, via `state.plan_gate_approve_evidence` -- the previous
+            # inline check here counted ANY `resolution == "approve"` entry
+            # for this revision, including an abort (which IS recorded as
+            # `resolution == "approve", option == "abort"`), so an aborted
+            # plan was misreported as `plan_approved_not_materialised`
+            # instead of the correct terminal/unresolved status.
+            _approved_this_revision = plan_gate_approve_evidence(state) is not None
             _wedge_status = (
                 "plan_approved_not_materialised" if _approved_this_revision
                 else "plan_gate_unresolved"
@@ -4319,6 +4584,14 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
     recovered stage is charged exactly once: ``already_charged`` (read off the
     cursor's persisted ``charged`` flag) gates the charge exactly as it does
     for a normal retried submit.
+
+    Remaining-gap audit (round 6 follow-up): same reasoning as `_cmd_
+    attended_submit` -- this reconciles an already-open, stranded CURSOR
+    (opened before the workflow could have become terminal, since `_cmd_
+    attended_step` now refuses to open one once `workflow_terminal_
+    resolution` is non-None) and never calls `sup.invoke`; it only patches
+    the checkpoint with the already-incurred cost/outcome. No `workflow_
+    terminal_resolution` guard needed.
     """
     from . import host_bridge
     if not option:
@@ -4621,9 +4894,44 @@ def _cmd_attended_submit(args) -> int:
     """Feed a host subagent's result back into an attended stage and advance it
     one step. On stage completion, charge the accrued cost on the checkpointed
     HydraState budget (keeping the 80%/100% tripwires live) and record the task
-    outcome — so attended execution is never budget-blind."""
+    outcome — so attended execution is never budget-blind.
+
+    Remaining-gap audit (round 6 follow-up, CORRECTED -- a cross-vendor judge
+    found the original version of this comment wrong): this command DOES need
+    a `workflow_terminal_resolution` guard, even though it only ever advances
+    a CURSOR that `_cmd_attended_step` already opened before the resume lock
+    (and `_cmd_attended_step` refuses to open any NEW cursor once the
+    workflow is terminal). A cursor opened while the workflow was still
+    non-terminal can still go terminal itself, right here, via a submit that
+    lands AFTER the workflow became terminal through a DIFFERENT gate --  and
+    a terminal pp stage's own completion is not harmless bookkeeping:
+      * a `planning`-owned cursor's completion IS graph re-entry --
+        `_apply_plan_reentry` below calls `sup.invoke`/`sup.update_state` to
+        apply the PLAN's `plan_patch`, and the ingest loop above it can
+        `dispatch_ingested_envelopes` a brand-new task from any emitted
+        delegation envelope. Both are refused below (guarded on
+        `workflow_terminal_resolution(snap.values, snap.next)`, computed
+        fresh from the checkpoint both BEFORE calling
+        `host_bridge.submit_host_result` and again once the post-submit
+        checkpoint state is read) -- the loop still runs far enough to record
+        THIS call's already-incurred cost, but never claims/dispatches an
+        envelope or re-enters the graph once terminal.
+      * an `engineering`-owned cursor's own terminal transition happens
+        INSIDE `host_bridge.submit_host_result` (via `_apply_judge` ->
+        `_finalize`), before this function's own checkpoint read even runs --
+        a passing judge verdict there merges the candidate worktree into the
+        target repo, which is itself "continuing" a terminal workflow. The
+        pre-submit checkpoint read above passes `workflow_terminal=True` into
+        `submit_host_result` so `_finalize` still records the pp-ledger
+        verdict (real spend already happened) but refuses the merge and
+        preserves the branch for manual pickup instead.
+    In both cases: budget/attended_results bookkeeping for the ALREADY-
+    INCURRED cost of this call is still recorded (idempotency and
+    exactly-once charging are unaffected by workflow-terminal status -- see
+    the accepted item-1/item-2 charge-vs-reconciliation split); only the
+    forward-looking side effects (dispatch, re-entry, merge) are refused."""
     from . import host_bridge
-    from .governance import charge_and_gate
+    from .governance import charge_and_gate, should_block_for_budget, should_downgrade_model
     project = Path(args.project) if args.project else Path.cwd()
     wf = str(args.workflow_id)
     if not _WORKFLOW_ID_RE.match(wf):
@@ -4724,8 +5032,50 @@ def _cmd_attended_submit(args) -> int:
             print(_cli_json_dumps({"ok": False, "error": "cursor_not_found",
                               "detail": str(cfile)}), file=sys.stderr)
             return 1
+        # Round 6 gap fix (engineering merge-back): a cursor opened BEFORE the
+        # workflow became terminal can still be driven to a terminal pp stage
+        # right here -- and `host_bridge.submit_host_result` (via
+        # `_apply_judge` -> `_finalize`) merges the candidate worktree into
+        # the repo on a passing finalize BEFORE this function ever reaches
+        # its own post-submit terminal check below. Read the checkpoint's
+        # terminal status FIRST, before `submit_host_result` runs, and pass
+        # it down so `_finalize` can still record the pp ledger bookkeeping
+        # (record_attempt/record_verdict already ran, or run inside this same
+        # call, for the already-incurred attempt) while refusing the merge
+        # itself and preserving the branch/worktree for the operator instead
+        # of silently continuing a terminal workflow.
+        from .supervisor import build_supervisor as _pre_bs, _PurePythonRunner as _pre_ppr
+        _pre_terminal = None
+        _pre_sup = _pre_bs(project_root=project, dispatcher=dispatcher)
+        if not isinstance(_pre_sup, _pre_ppr):
+            _pre_config = {"configurable": {"thread_id": wf}}
+            _pre_snap = _pre_sup.get_state(_pre_config)
+            if _pre_snap is not None and _pre_snap.values:
+                _pre_terminal = workflow_terminal_resolution(
+                    _pre_snap.values, getattr(_pre_snap, "next", ()) or ())
         res = host_bridge.submit_host_result(
-            dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result)
+            dispatcher, cursor_file=cfile, call_key=str(args.call_key), result=result,
+            workflow_terminal=_pre_terminal is not None)
+        # Surface the terminal resolution on the response even though `status`
+        # itself stays the cursor's own terminal state (e.g. "surfaced") --
+        # overriding `status` here would skip the charge/bookkeeping block
+        # below (gated on `res.get("status") in (...)`) and leave this call's
+        # already-incurred spend unrecorded, which is exactly the double-
+        # charge/never-charge failure mode this fix must not introduce.
+        if _pre_terminal is not None:
+            res["workflow_terminal"] = _pre_terminal
+        # Hydra#69 round 6 defect 2 (HIGH): a terminal cursor refused this
+        # call_key structurally — it does not match the call_key that
+        # actually produced the cursor's terminal transition. Never charge,
+        # never write a reconciliation marker, never fall through as if this
+        # were an idempotent re-submit.
+        if res.get("error_code") == "stale_call_key":
+            emit(project, wf, "attended.submit_stale_call_key",
+                 {"run_id": str(args.run_id), "call_key": str(args.call_key),
+                  "terminal_call_key": res.get("terminal_call_key")})
+            print(_cli_json_dumps({"ok": False, "error": "stale_call_key", **res},
+                                  indent=2, default=str))
+            return 1
         # Hydra#69 follow-up defect 3 (HIGH, part 2): every checkpoint write
         # below this point was fallible but only ever emitted telemetry on
         # failure -- the final response still reported `ok: True`, so a
@@ -4744,21 +5094,68 @@ def _cmd_attended_submit(args) -> int:
         if res.get("status") in ("complete", "complete_unpersisted",
                                  "surfaced", "aborted"):
             _already_charged = bool(res.get("already_charged"))
-            # Hydra#69 round 5 defect 2 (HIGH): keyed per call, not per
-            # cursor — a repeated submit against the SAME call_key must
-            # reconcile the SAME checkpoint writes, never a different call's.
-            _recon_key = f"{args.run_id}:{args.call_key}"
+            # Hydra#69 round 6 defect 2 (HIGH): derive the reconciliation/
+            # charge identity from the cursor's OWN trusted terminal call
+            # identity (host_bridge.submit_host_result validates and stamps
+            # this before ever returning a terminal result) — never from the
+            # caller-supplied args.call_key directly. Round 5's keying on
+            # args.call_key let a different/stale call_key mint its OWN
+            # reconciliation key against the SAME terminal cursor, missing
+            # the existing marker and re-billing the cached result. A legacy
+            # cursor (written before `terminal_call_key` existed, or
+            # terminated outside submit_host_result) collapses to a fixed
+            # "legacy" identity so every future retry — regardless of which
+            # call_key it carries — converges on the SAME key instead of
+            # growing a new one per call_key.
+            _call_identity = res.get("terminal_call_key") or "legacy"
+            _recon_key = f"{args.run_id}:{_call_identity}"
+            # Hydra#69 round 6 defect 1 (HIGH): CHARGE evidence
+            # (`attended_charge_applied`) and FULL-RECONCILIATION evidence
+            # (`attended_checkpoint_reconciled`) are now two SEPARATE
+            # checkpoint markers. Round 5 folded both into one marker written
+            # alongside the budget charge — before the later downstream
+            # writes this call still has to make (attempt-counter bump, PLAN
+            # acceptance/rejection outcome, completion ids). A crash between
+            # the charge write and one of those later writes left that single
+            # marker already `True`, so an identical retry took the
+            # cached-result shortcut with the later writes still missing.
+            # `_charge_applied` alone gates whether `charge_and_gate` runs
+            # again below (never re-charge); `_reconciled` alone gates the
+            # cached-result shortcut, and is only ever set `True` at the very
+            # end of this block, after every downstream write has succeeded.
+            _reconciled = True
+            _charge_applied = True
+            _persisted_charge: dict[str, object] | None = None
+            # Round 6 follow-up defect 1 (cross-vendor, HIGH): a TRUE legacy
+            # cursor — `_call_identity == "legacy"`, i.e. `terminal_call_key`
+            # is ABSENT from the cursor (persisted by an older version of
+            # this code, before that field existed, or terminated outside
+            # `submit_host_result`) — has no way to ever prove its charge
+            # landed via the marker: `already_charged=True` on its own is
+            # the ONLY evidence available for it, and is treated as
+            # conclusive (never re-`charge_and_gate` it, marker or no
+            # marker). This is deliberately NARROWER than "no marker for
+            # this recon_key": a NON-legacy cursor (terminal_call_key
+            # present) whose marker is absent is proof the OPPOSITE way —
+            # the marker and the `budget` field are always written together
+            # in the SAME atomic checkpoint patch, so an absent marker for
+            # THIS cursor's own unique recon_key means this exact call's
+            # charge genuinely never reached the checkpoint yet, and
+            # `charge_and_gate` MUST still run on this retry (that is a
+            # crash-recovery repair, not a double charge — nothing landed).
+            _legacy_charge_repair = False
             if _already_charged:
                 # Idempotent re-submit candidate: the cursor sidecar says
                 # this call was already charged on a prior terminal submit.
-                # That flag alone is NOT proof the checkpoint write actually
-                # landed (the crash-ordering rationale below explicitly
-                # accepts a window where mark_charged succeeds but the
-                # LangGraph checkpoint write after it fails) — check the
-                # checkpoint-side reconciliation marker before trusting it.
+                # That flag alone is NOT proof every checkpoint write
+                # actually landed (the crash-ordering rationale below
+                # explicitly accepts a window where mark_charged succeeds
+                # but the LangGraph checkpoint write after it fails) — check
+                # the checkpoint-side markers before trusting reconciliation
+                # is complete. It IS, however, conclusive proof the CHARGE
+                # itself must never be repeated — see `_legacy_charge_repair`.
                 from .supervisor import build_supervisor as _recon_bs, _PurePythonRunner as _recon_ppr
                 _recon_sup = _recon_bs(project_root=project, dispatcher=dispatcher)
-                _reconciled = True
                 if not isinstance(_recon_sup, _recon_ppr):
                     _recon_snap = _recon_sup.get_state({"configurable": {"thread_id": wf}})
                     _recon_values = (
@@ -4769,8 +5166,30 @@ def _cmd_attended_submit(args) -> int:
                         (_recon_values.get("attended_checkpoint_reconciled") or {})
                         .get(_recon_key)
                     )
+                    _charge_evidence = (
+                        (_recon_values.get("attended_charge_applied") or {})
+                        .get(_recon_key)
+                    )
+                    _persisted_charge = (
+                        _charge_evidence if isinstance(_charge_evidence, dict) else None
+                    )
+                    if _call_identity == "legacy":
+                        # True legacy cursor: `already_charged=True` is
+                        # conclusive on its own; never re-invoke
+                        # `charge_and_gate` for it regardless of the marker.
+                        _charge_applied = True
+                        _legacy_charge_repair = _persisted_charge is None
+                    else:
+                        # Non-legacy cursor: this recon_key is unique to
+                        # THIS cursor's one terminal call (a different
+                        # call_key against an already-terminal cursor is
+                        # refused as stale before ever reaching here), so an
+                        # absent marker for it is conclusive proof this
+                        # exact call's charge never reached the checkpoint —
+                        # `charge_and_gate` must still run below.
+                        _charge_applied = _persisted_charge is not None
                 if _reconciled:
-                    # Genuinely done: cursor charged AND the checkpoint
+                    # Genuinely done: cursor charged AND EVERY checkpoint
                     # write for this exact call already landed. Return the
                     # cached result without re-billing or repeating writes.
                     emit(project, wf, "attended.submit",
@@ -4779,12 +5198,14 @@ def _cmd_attended_submit(args) -> int:
                     print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
                     return 0
                 # Else: repair path. The cursor is already charged (never
-                # re-charge it), but the checkpoint writes below never
+                # re-charge it — `_charge_applied` below skips
+                # `charge_and_gate` when the checkpoint already confirms it
+                # landed), but one or more downstream checkpoint writes never
                 # landed — fall through and redo them. Every write in the
                 # block below is idempotent (membership-checked task-id
                 # lists, upsert-by-task_id results, a merge-dict reducer for
-                # the marker itself), so redoing them exactly reproduces the
-                # outcome the original terminal submit should have left.
+                # the markers themselves), so redoing them exactly reproduces
+                # the outcome the original terminal submit should have left.
                 emit(project, wf, "attended.checkpoint_reconcile_retry",
                      {"run_id": str(args.run_id), "call_key": str(args.call_key),
                       "status": res.get("status")})
@@ -4796,14 +5217,15 @@ def _cmd_attended_submit(args) -> int:
                 #   1. mark_charged(cfile)          ← cursor sidecar flagged first
                 #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
                 #   3. sup.update_state(...)         ← checkpoint persisted (with the
-                #                                       reconciliation marker for this
+                #                                       charge-applied marker for this
                 #                                       call folded into the SAME patch)
                 # If the process dies after (1) but before (3), the retry sees
-                # already_charged=True but an UNSET reconciliation marker, and repairs
+                # already_charged=True but an UNSET charge-applied marker, and repairs
                 # the checkpoint writes above instead of silently under-charging.
                 # The opposite order (charge then mark) would re-charge on that crash
                 # → double-charge, which burns real spend twice.
                 host_bridge.mark_charged(cfile)
+                _charge_applied = False
             from .supervisor import build_supervisor, _PurePythonRunner
             sup = build_supervisor(project_root=project, dispatcher=dispatcher)
             # The host returns the native pack artifact as text. Persist it only
@@ -4839,6 +5261,19 @@ def _cmd_attended_submit(args) -> int:
                 snap = sup.get_state(config)
                 if snap is not None and snap.values:
                     state = HydraState.model_validate(snap.values)
+                    # Round 6 gap fix (stale-cursor submit): re-derive terminal
+                    # status from the CURRENT checkpoint (may have gone
+                    # terminal via a different gate while this cursor was in
+                    # flight, or was already terminal at the pre-submit check
+                    # above -- re-read here rather than trust that snapshot,
+                    # since this is the checkpoint state every write below
+                    # actually applies against). Gates the ingest/dispatch and
+                    # PLAN re-entry blocks further down (never the cost/
+                    # bookkeeping writes immediately below, which record the
+                    # ALREADY-INCURRED spend regardless of workflow terminal
+                    # status -- see `_cmd_attended_submit`'s docstring).
+                    _terminal = workflow_terminal_resolution(
+                        snap.values, getattr(snap, "next", ()) or ())
                     cost = float(res.get("cost_usd") or 0.0)
                     toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
                     # B8: see the recover-stalled-stage twin above — an
@@ -4848,23 +5283,53 @@ def _cmd_attended_submit(args) -> int:
                     # comment above — credit only the per-component estimated
                     # figure, not the whole (possibly mixed) stage total.
                     estimated_component = float(res.get("estimated_cost_usd") or 0.0)
-                    block, downgrade = charge_and_gate(
-                        state, cost, toks, source=cost_source,
-                        estimated_usd=estimated_component,
-                    )
-                    if cost_source == "unmeasured":
-                        emit(project, wf, "attended.cost_unmeasured",
-                             {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
-                    # F34: budget_charge to eights (fail-soft; never blocks local work).
-                    try:
-                        from .eights.attestation import EightsAttestor as _EightsAttestor
-                        _att = _EightsAttestor(dispatcher=dispatcher, workflow_id=wf)
-                        _att.budget_charge(
-                            workflow_id=wf, usd=cost, tokens=toks,
-                            purpose="attended_submit",
+                    # Hydra#69 round 6 defect 1 (HIGH), follow-up (cross-
+                    # vendor, HIGH): `_charge_applied` is True whenever the
+                    # cursor itself says charged (`_already_charged`) — that
+                    # is conclusive on its own and `charge_and_gate` must
+                    # NEVER run again in that case, marker or no marker.
+                    if _charge_applied and _persisted_charge is not None:
+                        # Repair retry after the charge landed AND the
+                        # checkpoint marker recording its outcome also
+                        # landed — reuse the persisted block/downgrade
+                        # outcome instead of charging the budget again.
+                        block = bool(_persisted_charge.get("block"))
+                        downgrade = bool(_persisted_charge.get("downgrade"))
+                    elif _charge_applied:
+                        # Legacy/under-charged reconciliation: the cursor
+                        # says charged but no `attended_charge_applied`
+                        # marker exists (written before the marker existed,
+                        # or terminated outside `submit_host_result`). Never
+                        # call `charge_and_gate` — that would re-record the
+                        # same cost a second time. Re-derive the current gate
+                        # outcome by READING the ledger `charge_and_gate`
+                        # would have gated on, without charging anything.
+                        block = should_block_for_budget(state)
+                        downgrade = should_downgrade_model(state)
+                        emit(project, wf, "attended.legacy_charge_reconciled", {
+                            "run_id": str(args.run_id), "call_key": str(args.call_key),
+                            "recon_key": _recon_key,
+                        })
+                    else:
+                        block, downgrade = charge_and_gate(
+                            state, cost, toks, source=cost_source,
+                            estimated_usd=estimated_component,
                         )
-                    except Exception:  # noqa: BLE001 — fail-soft per F34
-                        pass
+                        if cost_source == "unmeasured":
+                            emit(project, wf, "attended.cost_unmeasured",
+                                 {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
+                        # F34: budget_charge to eights (fail-soft; never blocks local
+                        # work). Only fired on a FRESH charge — a repair retry above
+                        # must not double-report spend to eights either.
+                        try:
+                            from .eights.attestation import EightsAttestor as _EightsAttestor
+                            _att = _EightsAttestor(dispatcher=dispatcher, workflow_id=wf)
+                            _att.budget_charge(
+                                workflow_id=wf, usd=cost, tokens=toks,
+                                purpose="attended_submit",
+                            )
+                        except Exception:  # noqa: BLE001 — fail-soft per F34
+                            pass
                     # Mark this engineering task attended-complete (replace
                     # channel) so the next `step` does not re-pick it. We do NOT
                     # flip task.status — the `tasks` channel's _append reducer
@@ -4911,21 +5376,33 @@ def _cmd_attended_submit(args) -> int:
                         # node_synthesis (the in-graph dispatch never ran here).
                         attended_results = _merge_attended_result(
                             state.attended_results, _attended_result_record(state, res))
+                        _patch = {
+                            "attended_completed_task_ids": completed,
+                            "attended_done_task_ids": done_ids,
+                            "attended_results": attended_results,
+                            "open_pp_runs": open_runs,
+                            "budget": state.budget.model_dump(mode="json"),
+                            "budget_downgrade_active": bool(downgrade),
+                        }
+                        if not _charge_applied or _legacy_charge_repair:
+                            # Hydra#69 round 6 defect 1 (+ follow-up): CHARGE
+                            # evidence only — folded into the SAME atomic
+                            # write as the budget charge so a raise here
+                            # leaves neither landed, and a retry never
+                            # re-charges. This is NOT the full-reconciliation
+                            # marker (see the end of this call for that one).
+                            # A legacy repair (`_legacy_charge_repair`) also
+                            # stamps this marker even though `charge_and_gate`
+                            # did not run this call — the cursor already
+                            # proved the charge landed; this write only backs
+                            # that proof with the marker so FUTURE retries
+                            # converge on the persisted block/downgrade
+                            # instead of re-deriving it every time.
+                            _patch["attended_charge_applied"] = {
+                                _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
+                            }
                         try:
-                            sup.update_state(config, {
-                                "attended_completed_task_ids": completed,
-                                "attended_done_task_ids": done_ids,
-                                "attended_results": attended_results,
-                                "open_pp_runs": open_runs,
-                                "budget": state.budget.model_dump(mode="json"),
-                                "budget_downgrade_active": bool(downgrade),
-                                # Hydra#69 round 5 defect 2: folded into the
-                                # SAME atomic write as the budget charge —
-                                # if this call raises, neither the marker
-                                # nor the charge lands, and a retry repairs
-                                # both together (never a torn half-state).
-                                "attended_checkpoint_reconciled": {_recon_key: True},
-                            })
+                            sup.update_state(config, _patch)
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})
                             _persist_errors.append(str(e))
@@ -4940,16 +5417,21 @@ def _cmd_attended_submit(args) -> int:
                         # NEW attempt's cursor is never already_charged, so a
                         # charged-then-rejected attempt is not re-charged and
                         # the next attempt is still charged and ingested.
+                        _patch = {
+                            "open_pp_runs": open_runs,
+                            "budget": state.budget.model_dump(mode="json"),
+                            "budget_downgrade_active": bool(downgrade),
+                        }
+                        if not _charge_applied or _legacy_charge_repair:
+                            # Hydra#69 round 6 defect 1 (+ follow-up): see the
+                            # sibling non-planning write above — same
+                            # CHARGE-evidence (not full-reconciliation)
+                            # rationale, including the legacy-repair stamp.
+                            _patch["attended_charge_applied"] = {
+                                _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
+                            }
                         try:
-                            sup.update_state(config, {
-                                "open_pp_runs": open_runs,
-                                "budget": state.budget.model_dump(mode="json"),
-                                "budget_downgrade_active": bool(downgrade),
-                                # Hydra#69 round 5 defect 2: see the sibling
-                                # non-planning write above — same atomicity
-                                # rationale, planning-task branch.
-                                "attended_checkpoint_reconciled": {_recon_key: True},
-                            })
+                            sup.update_state(config, _patch)
                         except Exception as e:  # noqa: BLE001
                             emit(project, wf, "attended.persist_failed", {"error": str(e)})
                             _persist_errors.append(str(e))
@@ -4961,12 +5443,35 @@ def _cmd_attended_submit(args) -> int:
                     # the attended-host gap without creating an ungoverned
                     # direct Agent fan-out.
                     emitted = res.get("emitted_envelopes") or []
+                    # Round 6 gap fix (stale-cursor submit, cross-vendor
+                    # finding): a cursor opened before the workflow became
+                    # terminal reaches here with `emitted`/`is_planning_task`
+                    # exactly as before -- but dispatching those envelopes
+                    # (claim + `dispatch_ingested_envelopes`, which can itself
+                    # dispatch a new task) or re-entering the graph for a PLAN
+                    # (`_apply_plan_reentry` below) would CONTINUE a workflow
+                    # the operator already aborted/rejected elsewhere. Refuse
+                    # both here; the cost/bookkeeping write above already
+                    # recorded this call's already-incurred spend exactly
+                    # once, independent of this gate.
+                    if _terminal is not None:
+                        if emitted or is_planning_task:
+                            res["ingest"] = []
+                            res["status"] = "workflow_terminal"
+                            res["workflow_terminal"] = _terminal
+                            emit(project, wf, "attended.submit_terminal_refused", {
+                                "run_id": str(args.run_id),
+                                "call_key": str(args.call_key),
+                                "task_id": str(tid) if tid is not None else None,
+                                "emitted_count": len(emitted),
+                                "is_planning_task": is_planning_task,
+                            })
                     # Hydra#69 defect C: for a `planning` task the ingest loop
                     # must run even with an EMPTY `emitted` list — that is
                     # itself the "missing PLAN" rejection case, and the
                     # acceptance check right after this block needs to run
                     # regardless of whether anything was emitted.
-                    if emitted or is_planning_task:
+                    elif emitted or is_planning_task:
                         from .ingest import (
                             claim_ingested_ids,
                             dispatch_ingested_envelopes,
@@ -5110,11 +5615,47 @@ def _cmd_attended_submit(args) -> int:
                     # covers every rejection kind the brief enumerates
                     # (missing PLAN, schema-invalid PLAN, phase disabled,
                     # artifact write failure, re-entry failure) uniformly.
-                    if is_planning_task:
+                    # Round 6 gap fix: `_terminal is not None` short-circuited
+                    # the ingest block above (no `plan_reentry_patch`/
+                    # `outcomes` were ever computed this call, and `res` was
+                    # already set to the `workflow_terminal` refusal above) —
+                    # never run this acceptance/rejection decision in that
+                    # case, it would otherwise misclassify the refusal as an
+                    # ordinary `plan_rejected` and bump the attempt counter.
+                    if is_planning_task and _terminal is None:
+                        # Hydra#69 round 6 defect 1 (repair-retry corollary):
+                        # a repair retry (the completion write below failed
+                        # on a PRIOR call, after the PLAN itself was already
+                        # durably drafted+re-entered) re-runs this SAME loop
+                        # against a claim ledger that already marked the
+                        # PLAN's envelope_id claimed -- the outer dedup check
+                        # above short-circuits it to `skipped_duplicate`
+                        # WITHOUT ever calling `dispatch_ingested_envelopes`
+                        # again, so `plan_reentry_patch` is never (re)set on
+                        # this call even though the plan genuinely IS
+                        # accepted. Recognise that case from durable
+                        # checkpoint state instead of only this call's own
+                        # freshly-computed patch: if the emitted PLAN's own
+                        # id matches `state.plan_envelope_id` (stamped by
+                        # `_apply_plan_reentry`'s own checkpoint write) and
+                        # the plan barrier has actually been raised for it,
+                        # the acceptance already landed on an earlier call.
+                        _emitted_plan_id = next(
+                            (str(e.get("id")) for e in emitted
+                             if isinstance(e, dict) and e.get("type") == "PLAN"
+                             and e.get("id") is not None),
+                            None,
+                        )
+                        _plan_already_accepted = (
+                            _emitted_plan_id is not None
+                            and state.plan_envelope_id is not None
+                            and str(state.plan_envelope_id) == _emitted_plan_id
+                            and str(state.plan_status or "none") not in ("none", "rejected")
+                        )
                         _plan_accepted = (
                             bool(plan_reentry_patch)
                             and res.get("status") != "plan_reentry_failed"
-                        )
+                        ) or _plan_already_accepted
                         if _plan_accepted:
                             completed = list(state.attended_completed_task_ids)
                             if tid is not None and str(tid) not in completed:
@@ -5160,6 +5701,27 @@ def _cmd_attended_submit(args) -> int:
                                 "reason": _rejection.get("reason"),
                                 "attempt": _attempts.get(str(tid)),
                             })
+
+                    # Hydra#69 round 6 defect 1 (HIGH): the FULL-reconciliation
+                    # marker is written ONLY here, as the LAST checkpoint
+                    # write of this call, after every other write above
+                    # (charge, ingest, plan re-entry, rejected envelopes,
+                    # attempt-counter bump / plan acceptance) has had its
+                    # chance to run. A retry against an unset marker always
+                    # falls through and repairs whatever this call still left
+                    # missing, instead of returning a stale cached success.
+                    # Skipped entirely if any write above already failed --
+                    # `_persist_errors` already downgrades the response below,
+                    # and stamping "reconciled" over a known-incomplete call
+                    # would defeat the whole point of this marker.
+                    if not _persist_errors:
+                        try:
+                            sup.update_state(config, {
+                                "attended_checkpoint_reconciled": {_recon_key: True},
+                            })
+                        except Exception as e:  # noqa: BLE001
+                            emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                            _persist_errors.append(str(e))
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
@@ -5239,12 +5801,36 @@ def _cmd_finalize(args) -> int:
             return 1
 
         # Idempotent: a second call never re-synthesizes (that would duplicate
-        # the episodic rows RA-8 writes inside node_synthesis).
+        # the episodic rows RA-8 writes inside node_synthesis). Checked
+        # BEFORE the terminal-resolution guard below: a workflow finalized
+        # BEFORE it became terminal (it cannot become terminal afterwards --
+        # a finalized workflow has no pending gate left to abort/reject) must
+        # keep returning its already_finalized result unaffected.
         if state.attended_finalized_record_id:
             print(_cli_json_dumps({
                 "ok": True, "status": "already_finalized", "workflow_id": wf,
                 "decision_record_id": state.attended_finalized_record_id,
                 "phase": state.phase,
+            }, indent=2, default=str))
+            return 0
+
+        # Remaining-gap fix (round 6 follow-up): a workflow whose
+        # `terminal_resolution` is durably set (or, for a legacy checkpoint,
+        # whose `hitl_history` records a terminal reject/abort at the parked
+        # gate) was operator-aborted or -rejected and must never be
+        # finalized -- `_cmd_finalize` otherwise writes `phase="synthesis"`
+        # and re-enters the graph via `sup.update_state`/`sup.invoke` with no
+        # awareness of that resolution at all. Same shared helper
+        # `_cmd_resume_locked`/`_cmd_attended_step` consult, so all three can
+        # never drift apart on what counts as terminal.
+        _terminal = workflow_terminal_resolution(
+            snap.values, getattr(snap, "next", ()) or ())
+        if _terminal is not None:
+            print(_cli_json_dumps({
+                "ok": False,
+                "status": "workflow_terminal",
+                "workflow_id": wf,
+                "terminal_resolution": _terminal,
             }, indent=2, default=str))
             return 0
 
@@ -6232,6 +6818,14 @@ def _cmd_replay(args) -> int:
 
     Idempotency: a replay always produces a distinct new lineage; the source
     checkpoint is read-only and never mutated.
+
+    Remaining-gap audit (round 6 follow-up): does NOT need a `workflow_
+    terminal_resolution` guard. Replay never resumes or re-enters the SOURCE
+    workflow's own thread_id -- it mints a brand-new `replay_wf` and invokes
+    the graph fresh from `--from-phase` on that new id, leaving the source
+    checkpoint (and its `terminal_resolution`, if any) untouched. Replaying a
+    terminal source is a legitimate, explicit operator action (regression /
+    cost-study), not an accidental re-open of the terminal workflow itself.
     """
     project = Path(args.project) if args.project else Path.cwd()
     source_wf = str(args.workflow_id)
