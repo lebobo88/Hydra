@@ -66,6 +66,7 @@ from .state import (
     TaskState,
     make_checkpoint_serde,
     plan_barrier_active,
+    plan_gate_approve_evidence,
     plan_max_revisions,
     plan_revision_ceiling_reached,
     plan_deps_satisfied,
@@ -494,25 +495,12 @@ def materialise_plan_steps(
         # keeps the legacy fallback narrowly scoped to genuinely pre-
         # revisioning checkpoints instead of silently laundering a stale
         # approval on a mixed-history checkpoint.
-        _history = state.hitl_history or []
-        _any_stamped = any(
-            isinstance(e, dict) and e.get("gate_node") == "plan_gate"
-            and e.get("plan_revision") is not None
-            for e in _history
-        )
-        _legacy_ok = state.plan_revision <= 1 and not _any_stamped
-        _latest_plan_gate_entry = next(
-            (e for e in reversed(_history)
-             if isinstance(e, dict) and e.get("gate_node") == "plan_gate"
-             and (
-                 e.get("plan_revision") == state.plan_revision
-                 or (e.get("plan_revision") is None and _legacy_ok)
-             )),
-            None,
-        )
-        if (_latest_plan_gate_entry is None
-                or _latest_plan_gate_entry.get("resolution") != "approve"
-                or _latest_plan_gate_entry.get("option") == "abort"):
+        # Hydra#69 round 6 defect 4 (LOW): this predicate now lives in ONE
+        # shared place (`state.plan_gate_approve_evidence`) so `cli.py`'s
+        # `_cmd_attended_step` wedge-terminal can never disagree with this
+        # function about whether a `plan_gate` approve is genuine -- see
+        # that helper's docstring for the full policy.
+        if plan_gate_approve_evidence(state) is None:
             return {}
 
     plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}

@@ -1731,6 +1731,18 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         # Rider (b): expose charged flag so _cmd_attended_submit can skip
         # duplicate budget charges on a retried submit-host-result call.
         res["already_charged"] = bool(cursor.get("charged", False))
+        # Hydra#69 round 6 defect 2: the call_key that actually produced this
+        # cursor's terminal transition, persisted on the cursor itself (see
+        # `submit_host_result`'s post-transition stamp below). A caller
+        # derives its checkpoint-reconciliation/charge identity from THIS
+        # value, never from its own possibly-stale/different args.call_key.
+        # Absent (None) on a legacy cursor written before this field existed,
+        # or one terminated outside `submit_host_result` (operator abort,
+        # stalled-stage recovery) -- callers fold that into a fixed "legacy"
+        # identity so every future retry, regardless of which call_key it
+        # carries, converges on the SAME reconciliation/charge identity
+        # instead of growing a new one per call_key.
+        res["terminal_call_key"] = cursor.get("terminal_call_key")
         if cursor.get("emitted_envelopes"):
             res["emitted_envelopes"] = cursor["emitted_envelopes"]
             res["emitted_envelope_count"] = len(cursor["emitted_envelopes"])
@@ -3785,6 +3797,25 @@ def submit_host_result(
     cursor = load_cursor(cursor_file)
     state = cursor.get("state")
     if state in _TERMINAL:
+        # Hydra#69 round 6 defect 2: a terminal cursor only ever returns its
+        # cached result to the call_key that actually produced the terminal
+        # transition. A different call_key (stale, or belonging to another
+        # cursor's caller entirely) is refused structurally -- it must never
+        # be treated as an idempotent re-submit and re-billed by the caller.
+        # `terminal_call_key` is unset on a legacy cursor written before this
+        # field existed, or one terminated outside this function (operator
+        # abort, stalled-stage recovery); such a cursor accepts any call_key
+        # here (already fully charged/settled by definition of being on
+        # disk), matching the migration policy: never re-charge it.
+        _terminal_key = cursor.get("terminal_call_key")
+        if _terminal_key is not None and call_key != _terminal_key:
+            out = _step_result(cursor, cursor_file)
+            out["ignored"] = (
+                f"call_key {call_key!r} != terminal call identity "
+                f"{_terminal_key!r}"
+            )
+            out["error_code"] = "stale_call_key"
+            return out
         return _step_result(cursor, cursor_file)
 
     pending = cursor.get("pending_action") or {}
@@ -3836,6 +3867,17 @@ def submit_host_result(
         cursor["state"] = "aborted"
         cursor["final_status"] = "aborted"
         cursor["error"] = f"unknown attended state {state!r}"
+
+    # Hydra#69 round 6 defect 2: stamp the call_key that produced THIS
+    # transition as the cursor's trusted terminal call identity, the instant
+    # the cursor first goes terminal. `call_key` here has already been
+    # validated == `pending.get("call_key")` above, so this is exactly the
+    # call that drove the transition -- never a caller-supplied value taken
+    # on faith. `setdefault` so a cursor that was already terminal before
+    # this call (e.g. the stalled_infra retry path above, which returns
+    # before reaching here) never has its original identity overwritten.
+    if cursor.get("state") in _TERMINAL:
+        cursor.setdefault("terminal_call_key", call_key)
 
     save_cursor(cursor_file, cursor)
     return _step_result(cursor, cursor_file)
