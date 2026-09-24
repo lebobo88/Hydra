@@ -253,8 +253,60 @@ def _worktree_dirty_set(project_path: str | None) -> set[str]:
     return out
 
 
+def _worktree_committed_since(project_path: str | None, base_sha: str | None) -> set[str]:
+    """Paths touched by commits made in ``project_path`` since ``base_sha``
+    (exclusive of ``base_sha`` itself, inclusive of ``HEAD``).
+
+    Hydra#71: the attended host path COMMITS the engineer's work (unlike the
+    headless drive loop, which leaves it uncommitted for the harness to
+    harvest), so ``_worktree_dirty_set`` alone -- which only sees uncommitted
+    porcelain status -- reports an empty run-scoped diff for a run that in
+    fact wrote and committed real changes. This is the commit-aware
+    complement: a run's true attribution is the union of this and the
+    dirty-set delta.
+
+    Fail-soft, same discipline as ``_worktree_dirty_set``: a missing base sha,
+    non-git root, or any git error returns an empty set rather than raising.
+    """
+    if not project_path or not base_sha:
+        return set()
+    root = Path(project_path)
+    if not root.is_dir():
+        return set()
+    try:
+        res = run_text(
+            ["git", "diff", "--name-only", f"{base_sha}..HEAD"],
+            cwd=root, capture_output=True, check=False,
+        )
+    except Exception:  # noqa: BLE001 — never crash on a git hiccup
+        return set()
+    if res.returncode != 0:
+        return set()
+    return {line.strip() for line in res.stdout.splitlines() if line.strip()}
+
+
+def _git_head_sha(project_path: str | None) -> str | None:
+    """Current ``HEAD`` sha in ``project_path``, or ``None`` on any failure.
+
+    Used to stamp a generate attempt's base commit (``generate_base_sha``) so
+    a later attribution pass can scope ``_worktree_committed_since`` to
+    exactly the commits THIS attempt made, not the whole branch history.
+    """
+    if not project_path:
+        return None
+    try:
+        res = run_text(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(project_path), capture_output=True, check=False,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
 def _generate_failure_reason(
-    gen: Any, gen_text: str, wrote_changes: bool = False
+    gen: Any, gen_text: str, wrote_changes: bool = False,
+    *, apply_text_markers: bool = True,
 ) -> str | None:
     """Reason a ``pp_codex.generate`` call produced no code, else ``None``.
 
@@ -277,6 +329,20 @@ def _generate_failure_reason(
     as a failure when this run wrote NOTHING. The hard cases (timeout /
     transport error / empty output) remain failures regardless, since they mean
     no code was produced.
+
+    ``apply_text_markers`` (Hydra#71): the soft narration markers above describe
+    what an autonomous CLI generator (codex) narrated about ITS OWN sandbox
+    restrictions, and were never meant to classify free-text prose written by a
+    human-attended host session reporting the project's own test/build results
+    ("one test timed out", "permission denied" in a fixture, etc.) — those are
+    substrings of an honest summary, not a signal the generator produced no
+    code. The headless drive loop (this module's own callers) always passes
+    ``True`` (unchanged behaviour). The attended host-bridge path
+    (``host_bridge._apply_generate``) passes ``False``: on that path a host
+    result is a structured payload (``result.get(...)``), not free-form CLI
+    narration, so only the hard signals below (an explicit failure-shaped
+    ``gen`` dict, or truly empty output with NOTHING attributed to the run)
+    still fail the stage; markers embedded in a host's prose summary never do.
     """
     if isinstance(gen, dict):
         if gen.get("timeout"):
@@ -289,7 +355,17 @@ def _generate_failure_reason(
             if status and status not in {"done", "ok", "complete"}:
                 return f"codex generate returned status={status!r}"
     if not (gen_text or "").strip():
-        return "codex generate returned no output (no code written)"
+        # Headless: always a failure (unchanged). Attended: only a failure when
+        # this run also attributed no committed/dirty changes -- an engineer
+        # that committed real work but wrote a terse/empty summary still did
+        # its job.
+        if apply_text_markers or not wrote_changes:
+            return "codex generate returned no output (no code written)"
+        return None
+    if not apply_text_markers:
+        # Attended host path: prose is a human-facing summary, not CLI
+        # narration about sandbox restrictions -- never marker-classified.
+        return None
     low = (gen_text or "").lower()
     for marker in _GEN_FAIL_MARKERS:
         if marker in low:

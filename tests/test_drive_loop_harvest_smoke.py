@@ -61,6 +61,87 @@ def test_clean_success_returns_none():
         _OK, "Changed signal.ts and hud.ts.", wrote_changes=True) is None
 
 
+# ─── Hydra#71: apply_text_markers gates the attended host path ─────────────
+#
+# The headless drive loop (this module's own callers) always passes the
+# DEFAULT (True) — every test above already pins that this is unchanged. The
+# attended host-bridge path (host_bridge._apply_generate) passes False: a
+# host result is a structured payload, not free-form CLI sandbox narration,
+# so soft text markers in its prose summary must never fail the stage.
+
+def test_headless_default_still_fails_marker_with_no_changes():
+    """Explicit regression pin (Hydra#71 test (c)): the headless path is
+    unchanged — a marker with no attributed changes stays a real failure
+    whether or not apply_text_markers is passed explicitly as True."""
+    text = "writing is blocked by read-only sandbox; permission denied"
+    reason = _generate_failure_reason(
+        _OK, text, wrote_changes=False, apply_text_markers=True)
+    assert reason is not None
+    assert "permission denied" in reason.lower()
+
+
+def test_apply_text_markers_false_never_fails_on_marker_text():
+    """Hydra#71 fix (2): on the attended host path (apply_text_markers=False)
+    a marker substring in the host's prose summary is never a generate
+    failure, REGARDLESS of wrote_changes -- only hard signals (structured
+    failure fields, or truly empty output with nothing attributed) fail."""
+    text = ("One test timed out after 1800 s and a fixture reported "
+            "permission denied on a scratch file; both are pre-existing "
+            "flaky failures the project's own suite already had.")
+    assert _generate_failure_reason(
+        _OK, text, wrote_changes=True, apply_text_markers=False) is None
+    # Even with wrote_changes=False, marker text alone (non-empty output) is
+    # not classified as a failure on the attended path -- only the
+    # empty-output-with-no-changes hard case still is (see next test).
+    assert _generate_failure_reason(
+        _OK, text, wrote_changes=False, apply_text_markers=False) is None
+
+
+def test_apply_text_markers_false_empty_output_no_changes_still_fails():
+    """Hydra#71 fix (2), the one hard case preserved on the attended path:
+    empty output AND nothing attributed to the run is still a failure."""
+    reason = _generate_failure_reason(
+        _OK, "   ", wrote_changes=False, apply_text_markers=False)
+    assert reason is not None and "no output" in reason.lower()
+
+
+def test_apply_text_markers_false_empty_output_with_changes_is_not_a_failure():
+    """Hydra#71: an attended engineer that committed real work but returned a
+    terse/empty summary still did its job -- empty text is only a hard
+    failure when NOTHING was attributed to the run."""
+    assert _generate_failure_reason(
+        _OK, "", wrote_changes=True, apply_text_markers=False) is None
+
+
+# ─── Hydra#71: commit-aware attribution helpers ─────────────────────────────
+
+def test_worktree_committed_since_scopes_to_new_commits_only(tmp_path):
+    """``_worktree_committed_since`` must attribute exactly the commits made
+    after ``base_sha`` -- the property a Reflexion retry (test (d)) depends
+    on to attribute only ITS OWN new commits, not the first attempt's."""
+    from hydra_core.squad_node import _git_head_sha, _worktree_committed_since
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    base_sha = _git_head_sha(str(repo))
+
+    (repo / "a.py").write_text("a\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add a")
+    mid_sha = _git_head_sha(str(repo))
+
+    (repo / "b.py").write_text("b\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add b")
+
+    assert _worktree_committed_since(str(repo), mid_sha) == {"b.py"}
+    assert _worktree_committed_since(str(repo), base_sha) == {"a.py", "b.py"}
+    # Fail-soft: missing base / non-git root never raises.
+    assert _worktree_committed_since(str(repo), None) == set()
+    assert _worktree_committed_since(None, base_sha) == set()
+
+
 # ─── _run_smoke: host-side execution, exit code authoritative ──────────────
 
 def test_smoke_pass_on_zero_exit(monkeypatch):

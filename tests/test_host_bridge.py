@@ -12,7 +12,9 @@ re-applies (exactly-once), and (5) the complete vs surfaced finalize.
 """
 from __future__ import annotations
 
+import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -3219,3 +3221,288 @@ def test_begin_stage_no_gate_type_falls_back_to_code_style_default(tmp_path):
     res = _begin(disp, tmp_path)
     cursor = host_bridge.load_cursor(res["cursor_path"])
     assert cursor["gate_type"] == "code_style"
+
+
+# --------------------------------------------------------------------------- #
+# Hydra#71: attended generate-failure classifier discarded committed work    #
+# --------------------------------------------------------------------------- #
+#
+# The attended host engineer COMMITS its work in the candidate worktree
+# (unlike the headless drive loop, which the harness commits on the run's
+# behalf later). `_apply_generate` used to attribute a run's changes from the
+# uncommitted-dirty-set delta ONLY, so a host that committed its work showed
+# `wrote_changes=False` -- and any narration-marker substring in the host's
+# own prose summary (reporting the PROJECT's real test/build output) then
+# looked, to the marker-classifier, like codex reporting its own sandbox was
+# blocked with nothing written. Real, committed work was surfaced as a
+# generate failure and its worktree (including untracked evidence excluded
+# from the branch commit) was deleted.
+
+def _begin_isolated(disp, tmp_path, monkeypatch, **kw):
+    """Like `_begin` but against a REAL git repo with worktree isolation
+    live, so the host `engineer` subagent commits into an actual linked
+    worktree exactly like the real attended flow (`begin_stage`'s default
+    `isolate=True`)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+    return host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(repo), request_text="implement the thing",
+        project_root=str(repo), **kw)
+
+
+def _commit_file(work_path, rel, content, message="engineer commit"):
+    p = Path(work_path) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    _git(["add", "-A"], work_path)
+    _git(["-c", "user.email=e@e.test", "-c", "user.name=Engineer",
+          "commit", "-m", message, "--no-verify"], work_path)
+
+
+def test_committed_work_with_soft_narration_text_is_not_discarded(tmp_path, monkeypatch):
+    """Hydra#71 test (a): the host commits changes and its summary contains
+    soft narration substrings describing the PROJECT's own test output. The
+    stage must proceed to await_judge (not error), and changed_paths must
+    list the committed files (commit-aware attribution)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    work_path = res["host_action"]["cwd"]
+    _commit_file(work_path, "foo.py", "print('hi')\n")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": ("Implemented the fix. In the project's own test "
+                          "run, one test timed out after 1800 s and a "
+                          "fixture reported permission denied on a scratch "
+                          "path -- both pre-existing and unrelated to this "
+                          "change."),
+                "cost_usd": 0.10, "tokens_in": 100, "tokens_out": 50,
+                "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["changed_paths"] == ["foo.py"]
+    assert disp.count("record_attempt") == 1
+    _, _, attempt_args, _sq = next(
+        c for c in disp.calls if c[1] == "record_attempt")
+    assert attempt_args["status"] == "ok"
+
+
+def test_marker_text_with_no_attributed_changes_is_not_a_failure_on_attended_path(
+        tmp_path, monkeypatch):
+    """Hydra#71 fix (2), isolated from fix (1): a host result whose prose
+    contains soft narration marker substrings must never be marker-classified
+    on the attended path -- even when the run attributed NO commits/dirty
+    changes at all (unlike test (a), which also exercises commit-aware
+    attribution). Only the empty-output-with-no-changes hard case still
+    fails (see the next test)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    # No files committed/edited in work_path -- wrote_changes will be False.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": ("One test timed out after 1800 s and a fixture "
+                          "reported permission denied on a scratch path; "
+                          "both pre-existing and unrelated to this change."),
+                "cost_usd": 0.05, "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+
+
+def test_empty_text_no_changes_is_still_a_generate_failure(tmp_path, monkeypatch):
+    """Hydra#71 test (b): a host result with empty text and NO commits/dirty
+    changes is still a genuine generate failure -- the one hard case the
+    attended path keeps."""
+    disp = FakeDispatcher()
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    assert res["state"] == "surfaced"
+    assert "no output" in (res.get("error") or "").lower()
+
+
+def test_reflexion_retry_attributes_only_its_own_new_commits(tmp_path, monkeypatch):
+    """Hydra#71 test (d): a Reflexion×1 retry (generate-1) must attribute only
+    the commits IT made, relative to its own base -- not re-attribute (or
+    lose) the first attempt's commit."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    cfile = res["cursor_path"]
+    work_path = res["host_action"]["cwd"]
+    _commit_file(work_path, "attempt0.py", "v0\n")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "first pass", "cost_usd": 0.05,
+                "model": "claude-opus-4-8"})
+    assert res["state"] == "await_judge"
+    judge_call_key_0 = res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_call_key_0,
+        result={"outcome": "revise", "critique_md": "needs work",
+                "judge_producer": "codex", "cost_usd": 0.02})
+    assert res["state"] == "await_generate"
+    assert res["host_action"]["call_key"] == "generate-1"
+
+    cursor_mid = host_bridge.load_cursor(cfile)
+    assert cursor_mid["changed_paths"] == ["attempt0.py"]
+
+    _commit_file(work_path, "attempt1.py", "v1\n")
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-1",
+        result={"text": "revised", "cost_usd": 0.05,
+                "model": "claude-opus-4-8"})
+    assert res["state"] == "await_judge"
+    cursor_after = host_bridge.load_cursor(cfile)
+    assert set(cursor_after["changed_paths"]) == {"attempt0.py", "attempt1.py"}
+
+
+def test_generate_failure_preserves_untracked_evidence_before_worktree_removal(
+        tmp_path, monkeypatch):
+    """Hydra#71 test (e): on a genuine generate failure, untracked evidence
+    excluded from the preserved-branch commit (``.harness/`` -- see
+    ``_BYPRODUCT_PATTERNS``) must be copied out before the worktree is
+    removed, and its location reported on the terminal result."""
+    disp = FakeDispatcher()
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    work_path = Path(res["host_action"]["cwd"])
+    # Excluded so it is genuinely untracked/byproduct evidence, not something
+    # the dirty-set attribution would (correctly) count as run-scoped work —
+    # mirrors what `_write_worktree_gitexcludes` sets up on any preserve call.
+    host_bridge._write_worktree_gitexcludes(str(work_path))
+    evidence_dir = work_path / ".harness"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "run.log").write_text("evidence of what happened\n",
+                                          encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    assert res.get("preserved_evidence_path"), res
+    preserved = Path(res["preserved_evidence_path"])
+    assert (preserved / ".harness" / "run.log").exists()
+    assert (preserved / ".harness" / "run.log").read_text(encoding="utf-8") == \
+        "evidence of what happened\n"
+    # The worktree itself is really gone (disk reclaimed) -- this is a copy,
+    # not a reason to skip the removal.
+    assert not work_path.exists()
+
+
+def _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, populate):
+    """Like ``_begin_isolated``, but ``populate(repo_path)`` runs BEFORE the
+    base commit -- so the fixture files it creates are already committed
+    (part of the linked worktree's checkout) rather than freshly untracked
+    edits the run itself would be attributed as having made. Used by the
+    evidence-preservation bound tests, which need the worktree to hold
+    pre-existing on-disk files WITHOUT that presence itself counting as
+    ``wrote_changes`` and turning an intended generate failure into a
+    (correctly) non-failing empty-summary success."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    populate(repo)
+    _init_repo(repo)
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+    return host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(repo), request_text="implement the thing",
+        project_root=str(repo))
+
+
+def test_evidence_preserves_build_logs_excludes_binaries_and_node_modules(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: bound what evidence preservation copies.
+
+    ``build/`` is a multi-gigabyte output tree on the repos that surfaced
+    #71 -- only small report files are candidates, never build binaries or
+    a whole ``build/`` tree, and vendor caches like ``node_modules`` are
+    never descended into at all."""
+    def _populate(repo: Path) -> None:
+        # A ctest-shaped log under build/logs -- eligible evidence.
+        log_dir = repo / "build" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "ctest.log").write_text("1/1 tests passed\n", encoding="utf-8")
+        # A large build binary directly under build/ (not under
+        # logs/Testing) -- never a candidate regardless of size: build
+        # output, not a report.
+        big_binary = repo / "build" / "engine.bin"
+        with open(big_binary, "wb") as fh:
+            fh.seek(25 * 1024 * 1024 - 1)
+            fh.write(b"\0")
+        # A log nested under node_modules/**/build/ -- the whole subtree
+        # must never be descended into, even though it superficially
+        # matches "build/**/logs".
+        nm_log_dir = repo / "node_modules" / "somepkg" / "build" / "logs"
+        nm_log_dir.mkdir(parents=True, exist_ok=True)
+        (nm_log_dir / "vendor.log").write_text("vendor noise\n", encoding="utf-8")
+
+    disp = FakeDispatcher()
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / "build" / "logs" / "ctest.log").read_text(
+        encoding="utf-8") == "1/1 tests passed\n"
+    assert not (preserved / "build" / "engine.bin").exists()
+    assert not (preserved / "node_modules").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    copied_paths = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert "build/logs/ctest.log" in copied_paths
+    assert not any("engine.bin" in p for p in copied_paths)
+    assert not any("node_modules" in p for p in copied_paths)
+    # node_modules was pruned outright -- it never even reaches "skipped".
+    skipped_paths = {s["path"].replace("\\", "/") for s in manifest["skipped"]}
+    assert not any("node_modules" in p for p in skipped_paths)
+
+
+def test_evidence_enforces_size_caps_and_records_skips_in_manifest(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: a per-file cap and a total-per-run cap
+    (``HYDRA_EVIDENCE_MAX_BYTES``) bound the copy even for eligible
+    report-shaped files; anything declined is listed in ``manifest.json``
+    with its path/size/reason so nothing is silently dropped."""
+    def _populate(repo: Path) -> None:
+        evidence_dir = repo / ".harness"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "a_small.log").write_text("x" * 50, encoding="utf-8")
+        # Exceeds the per-file cap (100 bytes) on its own.
+        (evidence_dir / "b_oversized.log").write_text("y" * 200, encoding="utf-8")
+        # Under the per-file cap alone, but (processed after a_small.log,
+        # alphabetically) pushes the run past the total cap (100 bytes)
+        # once a_small.log's 50 bytes are already counted.
+        (evidence_dir / "c_second.log").write_text("z" * 90, encoding="utf-8")
+
+    disp = FakeDispatcher()
+    # Small caps so modest fixture files exercise them without real
+    # multi-megabyte writes.
+    monkeypatch.setattr(host_bridge, "_EVIDENCE_PER_FILE_MAX_BYTES", 100)
+    monkeypatch.setenv("HYDRA_EVIDENCE_MAX_BYTES", "100")
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / ".harness" / "a_small.log").exists()
+    assert not (preserved / ".harness" / "b_oversized.log").exists()
+    assert not (preserved / ".harness" / "c_second.log").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    skipped = {s["path"].replace("\\", "/"): s["reason"] for s in manifest["skipped"]}
+    assert "exceeds_per_file_cap" in skipped[".harness/b_oversized.log"]
+    assert "exceeds_total_cap" in skipped[".harness/c_second.log"]
+    copied = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert copied == {".harness/a_small.log"}
