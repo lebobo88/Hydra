@@ -127,11 +127,15 @@ def popen_detached(cmd: Any, **kwargs: Any) -> "subprocess.Popen[Any]":
     :func:`detached_popen_kwargs`'s docstring for why that matters beyond
     the plain detached flags). When the current job object does not permit
     breakaway, ``subprocess.Popen`` raises ``OSError`` (frequently
-    ``PermissionError``, a subclass of ``OSError``) -- this retries the
-    IDENTICAL spawn once more WITHOUT the breakaway flag rather than letting
-    the caller's spawn fail outright; a genuine launch failure (bad argv,
-    missing executable, ...) fails on that second attempt exactly as it
-    always did.
+    ``PermissionError``, a subclass of ``OSError``) whose ``winerror`` is
+    exactly ``5`` (``ERROR_ACCESS_DENIED``) -- this, and ONLY this specific
+    condition, retries the IDENTICAL spawn once more WITHOUT the breakaway
+    flag rather than letting the caller's spawn fail outright. Any OTHER
+    ``OSError`` (a missing executable -- ``FileNotFoundError``, winerror
+    ``2``; a different access failure; a malformed argv) is a genuine
+    launch failure unrelated to breakaway and re-raises immediately, WITHOUT
+    a second ``Popen`` attempt -- retrying it would mask the real error
+    while still failing identically the second time.
 
     What remains out of reach even with a successful breakaway: a full
     desktop logoff/shutdown that tears down the SESSION itself (not merely a
@@ -149,10 +153,22 @@ def popen_detached(cmd: Any, **kwargs: Any) -> "subprocess.Popen[Any]":
         return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs())
     try:
         return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs(breakaway=True))
-    except OSError:
-        # Breakaway not permitted by the current job object (or any other
-        # transient OS-level rejection tied to that flag) -- fall back
-        # cleanly to a spawn without it rather than failing the caller.
+    except OSError as e:
+        # Only the breakaway-denied condition falls back to a second spawn
+        # without the flag. On Windows, `CreateProcess` failing because the
+        # current job object does not permit breakaway
+        # (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` unset) surfaces to Python as an
+        # `OSError`/`PermissionError` whose `winerror` attribute is exactly
+        # `5` (`ERROR_ACCESS_DENIED`) -- CPython's `subprocess` module maps
+        # that Win32 error verbatim onto the raised exception's `winerror`.
+        # Any OTHER `OSError` (a missing executable -> `FileNotFoundError`,
+        # winerror 2 `ERROR_FILE_NOT_FOUND`; a different access failure; a
+        # malformed argv) is a genuine launch failure unrelated to the
+        # breakaway flag and must propagate immediately -- retrying it
+        # without breakaway would silently mask the real error and still
+        # fail identically on the second attempt anyway.
+        if getattr(e, "winerror", None) != 5:
+            raise
         return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs(breakaway=False))
 
 
@@ -403,29 +419,49 @@ _POSIX_INFRA_SIGNALS: frozenset[int] = frozenset({1, 2, 9, 15})
 _POSIX_INFRA_128_PLUS_N: frozenset[int] = frozenset(128 + n for n in _POSIX_INFRA_SIGNALS)
 
 
-def is_infra_interrupt_returncode(returncode: "int | None") -> bool:
+def is_infra_interrupt_returncode(
+    returncode: "int | None", *, platform_is_windows: "bool | None" = None
+) -> bool:
     """``True`` when ``returncode`` denotes the process was interrupted by
     something EXTERNAL to the program under test (external Ctrl-C, a
     session logoff mid-run, a signal delivered from outside), never a
     genuine non-zero exit from the program's own logic.
 
-    Matches:
-      - the raw Windows NTSTATUS values above, in EITHER their unsigned
-        32-bit form (``3221225786`` -- what a wrapper/shell typically
-        reports as ITS OWN propagated exit code, e.g. ``node`` printing
-        ``ctest exited 3221225786``) or Python's signed 32-bit
-        ``Popen.returncode`` form for the same value (``returncode & 0`` is
-        never negative for these NTSTATUS codes on the unsigned side, but a
-        negative ``returncode`` is still normalized to unsigned before the
-        NTSTATUS comparison, in case a future platform surfaces it that way)
-      - a POSIX signal death: ``returncode == -N`` (Python's own convention
-        when it reaped the child) or ``returncode == 128 + N`` (a
-        shell/wrapper's reported exit status for a signal-killed child) for
-        SIGHUP/SIGINT/SIGKILL/SIGTERM
+    Critique follow-up: the POSIX signal-death shapes (a negative
+    ``returncode``, or the ``128 + N`` shell/wrapper convention) are POSIX-
+    only conventions. On Windows, 129/130/137/143 etc. are ordinary,
+    unrelated application exit codes a real smoke command can legitimately
+    return on a genuine failure -- treating them as "interrupted" there
+    would excuse a real smoke failure as retryable infra. Likewise the
+    Windows NTSTATUS values are a Windows-only concept. This function is
+    therefore platform-gated: which shape it checks depends on
+    ``platform_is_windows`` (defaults to the ACTUAL running platform,
+    ``os.name == "nt"``, but is exposed as a keyword so tests can exercise
+    both platforms' behaviour deterministically regardless of which OS
+    pytest itself runs on).
+
+    On Windows (``platform_is_windows`` true):
+      - matches the raw Windows NTSTATUS values above, in EITHER their
+        unsigned 32-bit form (``3221225786`` -- what a wrapper/shell
+        typically reports as ITS OWN propagated exit code, e.g. ``node``
+        printing ``ctest exited 3221225786``) or Python's signed 32-bit
+        ``Popen.returncode`` form for the same value (a negative
+        ``returncode`` is normalized to unsigned before the NTSTATUS
+        comparison)
+      - does NOT match the POSIX signal-death shapes at all
+
+    On POSIX (``platform_is_windows`` false):
+      - matches a POSIX signal death: ``returncode == -N`` (Python's own
+        convention when it reaped the child) or ``returncode == 128 + N``
+        (a shell/wrapper's reported exit status for a signal-killed child)
+        for SIGHUP/SIGINT/SIGKILL/SIGTERM
+      - does NOT match the Windows NTSTATUS shapes at all (they are far
+        outside any plausible POSIX exit-code range in practice, but the
+        explicit platform gate keeps the contract unambiguous either way)
 
     Deliberately conservative: a returncode that does not match one of these
     known external-interruption shapes returns ``False`` -- callers must
-    still run their own infra-marker checks (e.g. a launcher-preamble regex)
+    still run their own infra-marker checks (e.g. a launcher-pattern regex)
     for other infra classes; this function is only ever ONE contributing
     signal, not the sole infra classifier.
     """
@@ -435,12 +471,11 @@ def is_infra_interrupt_returncode(returncode: "int | None") -> bool:
         rc = int(returncode)
     except (TypeError, ValueError):
         return False
+    is_windows = (os.name == "nt") if platform_is_windows is None else platform_is_windows
+    if not is_windows:
+        if rc < 0:
+            return -rc in _POSIX_INFRA_SIGNALS
+        return rc in _POSIX_INFRA_128_PLUS_N
     if rc < 0:
-        if -rc in _POSIX_INFRA_SIGNALS:
-            return True
         rc &= 0xFFFFFFFF  # normalize a signed NTSTATUS-shaped value to unsigned
-    if rc in _WIN_INFRA_NTSTATUS:
-        return True
-    if rc in _POSIX_INFRA_128_PLUS_N:
-        return True
-    return False
+    return rc in _WIN_INFRA_NTSTATUS

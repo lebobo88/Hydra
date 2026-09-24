@@ -403,42 +403,86 @@ _SMOKE_PROMPT = (
 )
 
 
-# F10: markers that mean a smoke runner FAILED for infra reasons (not a real
-# test failure) — host EPERM/ENOENT, esbuild/bundler crash, native segfault, or
-# a child-process spawn failure. A non-zero exit carrying any of these is an
-# `infra_error`, not a `fail` (the artifact was not actually evaluated).
-_INFRA_SMOKE_RE = __import__("re").compile(
-    r"\bEPERM\b|\bENOENT\b|\besbuild\b|\bsegfault\b|\bspawn\b|"
-    r"command not found|is not recognized|ModuleNotFoundError|No module named",
-    __import__("re").IGNORECASE,
+# Hydra#71 follow-up, cross-vendor re-review (gpt-5.6-terra): a bounded-region
+# heuristic ("marker somewhere in the first N lines") is still not evidence
+# that the smoke RUNNER ITSELF failed to launch -- a test suite that
+# fast-fails on its very first assertion, and whose assertion text happens to
+# mention "spawn" or "ENOENT", sits in that same early region and would still
+# be wrongly excused as infra_error. Line POSITION never proves origin.
+#
+# Replaced with a shared matcher of IDENTIFIABLE LAUNCHER/STRUCTURED-ERROR
+# patterns -- output shapes that only a failed LAUNCH produces, never a
+# passing-runner's own test output, anchored to the start of a transcript
+# line (`re.MULTILINE`) so incidental substrings inside a longer diagnostic
+# line never match:
+#
+#   - Windows cmd.exe:  `'<x>' is not recognized as an internal or external
+#     command` -- cmd's own message when the shell could not resolve the
+#     command at all (bare `npm`/`npx`/etc. not on PATH).
+#   - POSIX shell:      a line starting with non-whitespace and ENDING in
+#     `command not found` / `not found` -- sh's own `<x>: not found` and
+#     bash's own `bash: <x>: command not found` messages for the same
+#     missing-command condition (both shapes end the same way).
+#   - Node `child_process`: `Error: spawn [<x> ]ENOENT|EACCES|EPERM` -- node's
+#     own launch-error form (`Error: spawn`, optionally the executable name,
+#     then an errno code); this is what a FAILED `child_process.spawn`
+#     itself prints (node omits the executable name for some syscall-level
+#     failures, e.g. a bare `Error: spawn EPERM`), never ordinary test
+#     output that merely mentions the word "spawn".
+#   - npm: `npm ERR! code ENOENT|EPERM|EACCES` -- npm's own structured error
+#     line when ITS OWN spawn of a script failed.
+#   - Python: `<path-to-python>: No module named <x>` (the interpreter's own
+#     one-line startup failure for `python -m <missing>`), OR a transcript
+#     whose LAST non-empty line is `ModuleNotFoundError: ...` AND the
+#     transcript contains no test-runner summary line anywhere (pytest's
+#     `==== ... ====` trailer, a `\d+ (?:passed|failed|error)` count line, or
+#     a `FAILED <nodeid>` line) -- i.e. the interpreter's own unhandled,
+#     terminating traceback because it never even reached a test runner,
+#     not a test that legitimately raises/reports `ModuleNotFoundError`
+#     as part of a suite that DID run (which always leaves a summary line).
+#
+# Bare words ("spawn", "ENOENT", "EPERM", "esbuild", "segfault", "No module
+# named" appearing anywhere in ordinary test output/diagnostics) no longer
+# qualify on their own -- see `_smoke_infra_marker_hit`'s docstring.
+_INFRA_LAUNCHER_LINE_RE = re.compile(
+    r"^(?:"
+    r"'[^']+' is not recognized as an internal or external command"
+    r"|\S.*: (?:command not found|not found)\s*$"
+    r"|Error: spawn (?:\S+ )?(?:ENOENT|EACCES|EPERM)"
+    r"|npm ERR! code (?:ENOENT|EPERM|EACCES)"
+    r"|\S*python\S*: No module named"
+    r")",
+    re.MULTILINE | re.IGNORECASE,
 )
 
-# Hydra#71 follow-up (cross-vendor judge finding): `_INFRA_SMOKE_RE` used to
-# be searched over the ENTIRE smoke transcript. A genuine, deterministic test
-# failure whose own output incidentally CONTAINS one of these words --
-# clang-tidy printing "spawn" a dozen times, a test asserting on an ENOENT
-# error message -- was reclassified `infra_error` purely because the marker
-# text happened to appear somewhere far downstream of the actual failure,
-# which also silently skipped `HYDRA_SMOKE_BASELINE_TESTS` excusal (that gate
-# only ever runs for `fail`, never `infra_error`). The marker is now only
-# ever searched over the LAUNCHER PREAMBLE -- the first
-# `_INFRA_SMOKE_PREAMBLE_LINES` lines of the transcript -- which is where a
-# runner that could not actually START (missing interpreter, missing module,
-# a bundler crashing before it reaches user code) prints its failure; once
-# the test runner itself has started emitting output, a "spawn"/"ENOENT"
-# string appearing later is test OUTPUT, not evidence the runner failed to
-# launch. A genuine launch failure that never even starts producing output
-# (a Popen exception) is still classified `infra_error` directly by the
-# `except` block around the launch call, independent of this region.
-_INFRA_SMOKE_PREAMBLE_LINES = 40
+# A test-runner summary line -- its presence anywhere in the transcript means
+# the runner itself DID start and run, so a terminating `ModuleNotFoundError`
+# traceback is a genuine test/import failure inside a completed run, not
+# evidence the runner failed to launch. Covers pytest's `==== ... ====`
+# trailer, its `N passed/failed/error(s)` count line, and a `FAILED <id>`
+# line (pytest, and the shape most other runners also emit).
+_TEST_RUNNER_SUMMARY_RE = re.compile(
+    r"^={3,}.*={3,}\s*$|^\d+ (?:passed|failed|error)|^FAILED ",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def _smoke_infra_marker_hit(combined: str) -> bool:
-    """``True`` when an infra marker (`_INFRA_SMOKE_RE`) appears within the
-    launcher-preamble region (see the note above) of a smoke transcript --
-    the only region searched, not the full transcript."""
-    preamble = "\n".join((combined or "").splitlines()[:_INFRA_SMOKE_PREAMBLE_LINES])
-    return bool(_INFRA_SMOKE_RE.search(preamble))
+    """``True`` when the smoke transcript carries evidence that the RUNNER
+    ITSELF failed to launch/run -- one of the identifiable launcher/
+    structured-error patterns in `_INFRA_LAUNCHER_LINE_RE`, or a terminating
+    `ModuleNotFoundError` traceback with no test-runner summary anywhere in
+    the transcript (see the module-level note above for why line position
+    alone is never used as the signal)."""
+    text = combined or ""
+    if _INFRA_LAUNCHER_LINE_RE.search(text):
+        return True
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    if lines[-1].strip().startswith("ModuleNotFoundError"):
+        return not _TEST_RUNNER_SUMMARY_RE.search(text)
+    return False
 
 
 def _parse_smoke_verdict(text: str) -> tuple[str, str]:
@@ -825,9 +869,9 @@ def _run_smoke(
     # session logoff mid-run) is classified the SAME way — retryable
     # infra_error, never `fail` — via the shared, code-based classifier
     # (`is_infra_interrupt_returncode`), independent of transcript text.
-    # Hydra#71 follow-up: the text-marker check is now bounded to the
-    # launcher preamble (`_smoke_infra_marker_hit`), never the full
-    # transcript — see that helper's docstring.
+    # Hydra#71 follow-up: the text-marker check now only matches
+    # identifiable launcher/structured-error patterns (`_smoke_infra_marker_hit`),
+    # never a full-transcript substring search — see that helper's docstring.
     _interrupted = is_infra_interrupt_returncode(res.returncode)
     if res.returncode != 0 and (_interrupted or _smoke_infra_marker_hit(combined)):
         # MU6b: persist full log so infra crashes are recoverable post-mortem.

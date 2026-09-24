@@ -792,7 +792,8 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
     # Hydra#70 follow-up: an EXTERNAL interruption (Ctrl-C propagation,
     # session logoff mid-run) classifies as infra_error via the code-based
     # classifier, independent of transcript text. Hydra#71 follow-up: the
-    # text-marker check is bounded to the launcher preamble.
+    # text-marker check matches only identifiable launcher/structured-error
+    # patterns, never a full-transcript substring search.
     _interrupted = is_infra_interrupt_returncode(returncode)
     if returncode != 0 and (_interrupted or _smoke_infra_marker_hit(combined)):
         artifact = _write_smoke_log(project_path, stage_id, combined, evidence_dir=evidence_dir)
