@@ -274,6 +274,57 @@ def test_job_process_vanished_without_result_is_infra_failure(tmp_path, monkeypa
     assert "vanished" in cursor["smoke_reason"]
 
 
+def test_poll_job_tolerates_a_delayed_result_file_after_process_death(
+    tmp_path, monkeypatch,
+):
+    """Regression (flake investigation, Hydra#70 follow-up): `is_pid_alive`
+    (a process-table probe) and the result file's `os.replace` rename (a
+    filesystem visibility event) are two INDEPENDENT observations of the
+    same child's exit, made through two different OS channels. Reproduced
+    live under synthetic CPU load (10 busy processes, 20x stress loop): the
+    process can be observed dead a hair before the result file it wrote a
+    moment earlier becomes visible to this process's `Path.exists()`. A
+    poller that classified "not alive + no result file yet" as "vanished"
+    on the FIRST check would lose a job that actually succeeded.
+
+    This pins the fix directly (no real subprocess needed): `is_pid_alive`
+    reports the process as already dead from the very first poll, while the
+    result file is written by a background thread shortly afterward
+    (comfortably inside the grace window) -- `poll_job` must still return
+    the real (passing) result, not `infra_error`/"vanished". Reverting the
+    grace-retry loop in `hydra_core.smoke_job.poll_job` makes this fail.
+    """
+    import threading
+
+    result_path = tmp_path / "delayed-result.json"
+    job = {
+        "pid": 4_242_424,  # never actually alive -- is_pid_alive is stubbed anyway
+        "started_at": time.time(),
+        "deadline": time.time() + 300,
+        "result_path": str(result_path),
+        "log_path": str(tmp_path / "delayed.log"),
+        "call_key": "judge-0",
+    }
+    monkeypatch.setattr(smoke_job, "is_pid_alive", lambda pid: False)
+    killed: list[int] = []
+    monkeypatch.setattr(smoke_job, "kill_process_tree",
+                        lambda pid, **k: killed.append(pid))
+
+    def _delayed_write():
+        time.sleep(0.4)  # well inside the ~2s grace window
+        result_path.write_text(
+            json.dumps({"status": "pass", "reason": "delayed but real",
+                       "finished_at": time.time()}),
+            encoding="utf-8")
+
+    threading.Thread(target=_delayed_write, daemon=True).start()
+
+    result = smoke_job.poll_job(job)
+    assert result is not None, "poll_job gave up before the delayed write landed"
+    assert result["status"] == "pass", result
+    assert not killed, "a job that actually succeeded must not have its tree killed"
+
+
 # --------------------------------------------------------------------------- #
 # 4. job exceeds its deadline -> whole process tree killed                   #
 # --------------------------------------------------------------------------- #
@@ -427,8 +478,16 @@ def test_integration_real_job_submit_poll_complete(tmp_path, monkeypatch):
     assert res2["state"] == "await_smoke"
 
     # Poll (mirrors hydra.workflow.step's poll route -- host_bridge.poll_smoke_job).
-    deadline = time.time() + 30
+    # Derive the wait budget from the JOB'S OWN deadline (+ a fixed grace
+    # margin for pytest/host overhead) rather than a fixed guess -- a fixed
+    # 30s budget is itself what a prior flake investigation traced a false
+    # failure to under heavy system load (the real job stayed well within
+    # its own configured budget but pytest's independent 30s clock ran out
+    # first). This still fails loudly (not silently extends forever) if the
+    # job genuinely never resolves.
     cursor = host_bridge.load_cursor(res["cursor_path"])
+    job = cursor.get("smoke_job") or {}
+    deadline = float(job.get("deadline") or (time.time() + 120)) + 30
     while time.time() < deadline:
         still_pending = host_bridge.poll_smoke_job(
             disp, cursor, cursor_file=res["cursor_path"])
@@ -437,9 +496,25 @@ def test_integration_real_job_submit_poll_complete(tmp_path, monkeypatch):
         time.sleep(0.3)
         cursor = host_bridge.load_cursor(res["cursor_path"])
     else:
-        pytest.fail("real smoke job never completed within 30s")
+        _diag_result_path = job.get("result_path")
+        _diag_result = None
+        if _diag_result_path and Path(_diag_result_path).exists():
+            _diag_result = Path(_diag_result_path).read_text(
+                encoding="utf-8", errors="replace")
+        pytest.fail(
+            "real smoke job never completed within its own deadline + "
+            f"grace ({deadline - time.time():.1f}s left)\n"
+            f"cursor: {json.dumps(cursor, default=str, indent=2)}\n"
+            f"job: {json.dumps(job, default=str, indent=2)}\n"
+            f"result_path contents: {_diag_result!r}"
+        )
 
     host_bridge.save_cursor(res["cursor_path"], cursor)
     final = host_bridge.step_result(cursor, res["cursor_path"])
-    assert final["status"] == "complete", final
+    if final["status"] != "complete":
+        pytest.fail(
+            f"final: {json.dumps(final, default=str, indent=2)}\n"
+            f"cursor: {json.dumps(cursor, default=str, indent=2)}\n"
+            f"job: {json.dumps(job, default=str, indent=2)}"
+        )
     assert final["smoke_status"] == "pass"

@@ -162,6 +162,42 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     }
 
 
+# Hydra#70 follow-up (flake investigation): `is_pid_alive` and the result
+# file's `os.replace` rename are two INDEPENDENT observations of the SAME
+# child process's exit, made from a DIFFERENT process (this poller) through
+# two different OS-level channels (a process-table probe vs. a filesystem
+# rename's visibility). Under heavy CPU/disk load (an antivirus scanner
+# holding a lock on the rename, an overloaded NTFS MFT, a delayed
+# `tasklist` snapshot) those two observations can land on either side of a
+# race: the child has ALREADY exited (`is_pid_alive` correctly reports
+# False) a hair before the result file it wrote a moment earlier becomes
+# visible to THIS process's `Path.exists()`. A poller that immediately
+# classifies "not alive + no result file" as "vanished" (Hydra#70's
+# original shape) can therefore genuinely lose a job that succeeded --
+# reproduced live under synthetic CPU load (10 busy processes) in a stress
+# loop: 1/20 real integration-test runs surfaced with `smoke_status
+# infra_error` / "vanished" even though the job actually completed. Give
+# the result file a short grace window to appear once the process is
+# observed dead before concluding it is lost.
+_VANISHED_GRACE_RETRIES = 8
+_VANISHED_GRACE_INTERVAL_S = 0.25
+
+
+def _read_result_file(result_path: str) -> dict[str, Any] | None:
+    """Read+parse the result file if it exists; ``None`` if absent. A file
+    that exists but fails to parse (a genuine race with the writer's
+    ``os.replace`` — vanishingly rare, since the rename is atomic, but not
+    provably impossible under a hostile filesystem driver) is treated the
+    SAME as absent here so the retry loop below gives it another lap
+    instead of a caller seeing a transient parse error as a hard failure."""
+    if not Path(result_path).exists():
+        return None
+    try:
+        return json.loads(Path(result_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """Poll a job started by :func:`start_job`.
 
@@ -169,20 +205,16 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
       - ``None`` if the job is still running and before its deadline
         (caller should return "still pending" without blocking).
       - ``{"status": ..., "reason": ..., ...}`` once a result is available OR
-        the job is judged lost (deadline passed with no result file, or the
-        process vanished without writing one) -- in the lost case this
-        function KILLS any surviving tree first, so the caller never has to.
+        the job is judged lost (deadline passed with no result file even
+        after a short grace window, or the process vanished without ever
+        writing one) -- in the lost case this function KILLS any surviving
+        tree first, so the caller never has to.
     """
     result_path = job.get("result_path")
-    if result_path and Path(result_path).exists():
-        try:
-            return json.loads(Path(result_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            return {
-                "status": "infra_error",
-                "reason": f"smoke job result file unreadable: {exc!r}",
-                "finished_at": time.time(),
-            }
+    if result_path:
+        found = _read_result_file(result_path)
+        if found is not None:
+            return found
 
     pid = job.get("pid")
     deadline = float(job.get("deadline") or 0)
@@ -192,16 +224,33 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     if alive and now < deadline:
         return None  # still running, within budget — poll again later
 
+    if not alive and result_path:
+        # The process is gone (or was never seen alive) and no result file
+        # exists YET -- see the module-level race note above. Retry across a
+        # short grace window before concluding the job is truly lost; a
+        # genuinely crashed/killed job still resolves to infra_error, just
+        # not on a false-negative race.
+        for _ in range(_VANISHED_GRACE_RETRIES):
+            time.sleep(_VANISHED_GRACE_INTERVAL_S)
+            found = _read_result_file(result_path)
+            if found is not None:
+                return found
+
     # Either the deadline has passed (job still running or wedged) or the
-    # process is gone with no result file (crashed / killed externally /
-    # never started cleanly). Either way this is an infra failure — kill
-    # any surviving tree as a backstop (the job enforces its own internal
-    # timeout, but this covers a wedged/zombie tree it failed to reap).
+    # process is gone with no result file even after the grace window
+    # (crashed / killed externally / never started cleanly). Either way
+    # this is an infra failure — kill any surviving tree as a backstop (the
+    # job enforces its own internal timeout, but this covers a
+    # wedged/zombie tree it failed to reap).
     kill_process_tree(pid)
+    now = time.time()
     if now >= deadline:
         reason = f"smoke job exceeded its deadline ({job.get('deadline')!r}) and was killed"
     else:
-        reason = "smoke job process vanished without writing a result file"
+        reason = (
+            "smoke job process vanished without writing a result file "
+            f"(waited {_VANISHED_GRACE_RETRIES * _VANISHED_GRACE_INTERVAL_S}s grace period)"
+        )
     return {
         "status": "infra_error",
         "reason": reason,
