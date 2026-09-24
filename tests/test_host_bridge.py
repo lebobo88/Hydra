@@ -12,6 +12,7 @@ re-applies (exactly-once), and (5) the complete vs surfaced finalize.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -3392,3 +3393,116 @@ def test_generate_failure_preserves_untracked_evidence_before_worktree_removal(
     # The worktree itself is really gone (disk reclaimed) -- this is a copy,
     # not a reason to skip the removal.
     assert not work_path.exists()
+
+
+def _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, populate):
+    """Like ``_begin_isolated``, but ``populate(repo_path)`` runs BEFORE the
+    base commit -- so the fixture files it creates are already committed
+    (part of the linked worktree's checkout) rather than freshly untracked
+    edits the run itself would be attributed as having made. Used by the
+    evidence-preservation bound tests, which need the worktree to hold
+    pre-existing on-disk files WITHOUT that presence itself counting as
+    ``wrote_changes`` and turning an intended generate failure into a
+    (correctly) non-failing empty-summary success."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    populate(repo)
+    _init_repo(repo)
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+    return host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(repo), request_text="implement the thing",
+        project_root=str(repo))
+
+
+def test_evidence_preserves_build_logs_excludes_binaries_and_node_modules(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: bound what evidence preservation copies.
+
+    ``build/`` is a multi-gigabyte output tree on the repos that surfaced
+    #71 -- only small report files are candidates, never build binaries or
+    a whole ``build/`` tree, and vendor caches like ``node_modules`` are
+    never descended into at all."""
+    def _populate(repo: Path) -> None:
+        # A ctest-shaped log under build/logs -- eligible evidence.
+        log_dir = repo / "build" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "ctest.log").write_text("1/1 tests passed\n", encoding="utf-8")
+        # A large build binary directly under build/ (not under
+        # logs/Testing) -- never a candidate regardless of size: build
+        # output, not a report.
+        big_binary = repo / "build" / "engine.bin"
+        with open(big_binary, "wb") as fh:
+            fh.seek(25 * 1024 * 1024 - 1)
+            fh.write(b"\0")
+        # A log nested under node_modules/**/build/ -- the whole subtree
+        # must never be descended into, even though it superficially
+        # matches "build/**/logs".
+        nm_log_dir = repo / "node_modules" / "somepkg" / "build" / "logs"
+        nm_log_dir.mkdir(parents=True, exist_ok=True)
+        (nm_log_dir / "vendor.log").write_text("vendor noise\n", encoding="utf-8")
+
+    disp = FakeDispatcher()
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / "build" / "logs" / "ctest.log").read_text(
+        encoding="utf-8") == "1/1 tests passed\n"
+    assert not (preserved / "build" / "engine.bin").exists()
+    assert not (preserved / "node_modules").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    copied_paths = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert "build/logs/ctest.log" in copied_paths
+    assert not any("engine.bin" in p for p in copied_paths)
+    assert not any("node_modules" in p for p in copied_paths)
+    # node_modules was pruned outright -- it never even reaches "skipped".
+    skipped_paths = {s["path"].replace("\\", "/") for s in manifest["skipped"]}
+    assert not any("node_modules" in p for p in skipped_paths)
+
+
+def test_evidence_enforces_size_caps_and_records_skips_in_manifest(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: a per-file cap and a total-per-run cap
+    (``HYDRA_EVIDENCE_MAX_BYTES``) bound the copy even for eligible
+    report-shaped files; anything declined is listed in ``manifest.json``
+    with its path/size/reason so nothing is silently dropped."""
+    def _populate(repo: Path) -> None:
+        evidence_dir = repo / ".harness"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "a_small.log").write_text("x" * 50, encoding="utf-8")
+        # Exceeds the per-file cap (100 bytes) on its own.
+        (evidence_dir / "b_oversized.log").write_text("y" * 200, encoding="utf-8")
+        # Under the per-file cap alone, but (processed after a_small.log,
+        # alphabetically) pushes the run past the total cap (100 bytes)
+        # once a_small.log's 50 bytes are already counted.
+        (evidence_dir / "c_second.log").write_text("z" * 90, encoding="utf-8")
+
+    disp = FakeDispatcher()
+    # Small caps so modest fixture files exercise them without real
+    # multi-megabyte writes.
+    monkeypatch.setattr(host_bridge, "_EVIDENCE_PER_FILE_MAX_BYTES", 100)
+    monkeypatch.setenv("HYDRA_EVIDENCE_MAX_BYTES", "100")
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / ".harness" / "a_small.log").exists()
+    assert not (preserved / ".harness" / "b_oversized.log").exists()
+    assert not (preserved / ".harness" / "c_second.log").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    skipped = {s["path"].replace("\\", "/"): s["reason"] for s in manifest["skipped"]}
+    assert "exceeds_per_file_cap" in skipped[".harness/b_oversized.log"]
+    assert "exceeds_total_cap" in skipped[".harness/c_second.log"]
+    copied = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert copied == {".harness/a_small.log"}

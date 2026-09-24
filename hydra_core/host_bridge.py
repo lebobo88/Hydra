@@ -1412,10 +1412,100 @@ def _clear_stage_active_sentinel(project_root: str | Path) -> None:
         pass
 
 
+# Hydra#71 follow-up: the first cut copied entire ``build/`` and ``.harness/``
+# TREES via unbounded ``**/`` globs. On a C++ repo (the case that surfaced
+# #71) ``build/`` is a multi-gigabyte output tree, not evidence -- copying it
+# whole on every non-complete finalize would silently balloon disk usage
+# without limit. This policy copies only small, text-shaped report files
+# (never binaries/object files/build trees) and enforces hard size caps.
+_EVIDENCE_ALLOWED_EXTS: frozenset[str] = frozenset({".log", ".txt", ".json", ".xml"})
+# Directory names never descended into, anywhere in the tree: vendor/build
+# caches that can each independently be enormous and carry no run evidence.
+_EVIDENCE_EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+})
+_EVIDENCE_PER_FILE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _evidence_max_total_bytes() -> int:
+    """Total evidence-copy budget per preserved run, ``HYDRA_EVIDENCE_MAX_BYTES``
+    (default 200 MB). Any non-integer/negative override falls back to the
+    default rather than disabling the cap."""
+    raw = os.environ.get("HYDRA_EVIDENCE_MAX_BYTES")
+    if raw is None:
+        return 200 * 1024 * 1024
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 200 * 1024 * 1024
+    return val if val >= 0 else 200 * 1024 * 1024
+
+
+def _evidence_within_build_logs_or_testing(dir_parts: Sequence[str]) -> bool:
+    """True when ``dir_parts`` (the directory components of a candidate
+    file's path, relative to the worktree root, lower-cased) descend from a
+    ``build`` directory into a ``logs`` or ``Testing`` (ctest) subdirectory --
+    the only evidence this policy takes FROM a build tree. A file directly
+    under ``build/`` (or under any other build subdirectory) never qualifies:
+    that is build output, not a log/report."""
+    try:
+        build_idx = dir_parts.index("build")
+    except ValueError:
+        return False
+    remainder = dir_parts[build_idx + 1:]
+    return "logs" in remainder or "testing" in remainder
+
+
+def _evidence_candidate_files(src: Path) -> list[Path]:
+    """Walk ``src`` and return every file eligible for evidence preservation.
+
+    Eligible:
+      - anything under ``.harness/`` (small run metadata Hydra itself writes,
+        regardless of extension), and
+      - ``.log``/``.txt``/``.json``/``.xml`` report files that are either
+        OUTSIDE any ``build/`` tree, or inside a ``build/**/logs`` or
+        ``build/**/Testing`` (ctest) subtree.
+
+    Never eligible: anything else under ``build/`` (binaries, object files,
+    build-system caches) and anything under an excluded vendor/cache
+    directory (``_EVIDENCE_EXCLUDED_DIR_NAMES``) or a NESTED git checkout
+    (a directory containing its own ``.git`` — a separate worktree/repo, not
+    this run's evidence) at any depth.
+    """
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        d = Path(dirpath)
+        for name in list(dirnames):
+            if name in _EVIDENCE_EXCLUDED_DIR_NAMES:
+                dirnames.remove(name)
+                continue
+            child = d / name
+            if child != src and (child / ".git").exists():
+                dirnames.remove(name)
+        for fname in filenames:
+            f = d / fname
+            try:
+                rel_parts = f.relative_to(src).parts
+            except ValueError:  # pragma: no cover — defensive, path is under src
+                continue
+            dir_parts_lower = [p.lower() for p in rel_parts[:-1]]
+            if dir_parts_lower and dir_parts_lower[0] == ".harness":
+                out.append(f)
+                continue
+            if f.suffix.lower() not in _EVIDENCE_ALLOWED_EXTS:
+                continue
+            if "build" in dir_parts_lower and not _evidence_within_build_logs_or_testing(
+                    dir_parts_lower):
+                continue
+            out.append(f)
+    return out
+
+
 def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
                                 run_id: str) -> str | None:
-    """Copy untracked build/log/``.harness`` evidence out of ``worktree_path``
-    before ``_remove_worktree`` deletes it on a non-complete outcome.
+    """Copy bounded, text-shaped build/log/``.harness`` evidence out of
+    ``worktree_path`` before ``_remove_worktree`` deletes it on a
+    non-complete outcome.
 
     Hydra#71: ``_BYPRODUCT_PATTERNS`` deliberately excludes ``.harness/`` and
     ``*.log`` from the worktree-local git excludes so
@@ -1423,10 +1513,30 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
     up -- they are build/log byproducts, not source. But that also means a
     genuine generate-failure/judge-fail/smoke-fail worktree removal silently
     destroyed them, taking the only on-disk record of what actually happened
-    with it. Copies (never moves -- the worktree removal below is the thing
-    that actually reclaims the disk) any ``build/``, ``.harness/`` directories
-    and ``*.log`` files found anywhere under the worktree to a sibling
-    directory that survives the removal.
+    with it.
+
+    Bounded (Hydra#71 follow-up): only report-shaped files
+    (``_evidence_candidate_files`` — never build binaries/object files/build
+    trees, never vendor/build-cache dirs, never a nested checkout) are
+    candidates; a per-file cap (``_EVIDENCE_PER_FILE_MAX_BYTES``, 20 MB) and a
+    total-per-run cap (``HYDRA_EVIDENCE_MAX_BYTES``, default 200 MB) bound the
+    copy. Any candidate declined by either cap is recorded — never silently
+    dropped — in ``manifest.json`` alongside the copy, with its path, size,
+    and the reason it was skipped.
+
+    Retention: this function only COPIES (the worktree removal below is what
+    reclaims the source disk); nothing currently deletes OLD entries under
+    ``.hydra-preserved-evidence/`` itself -- it is intentionally excluded from
+    ``sweep_stale_worktrees`` (``_sweep_one_root`` only matches ``attended-*``
+    worktree directory names), since a preserved evidence bundle is exactly
+    the kind of record an operator investigating a surfaced run must be able
+    to find AFTER the worktree itself is gone, so it must never be swept on
+    the same terminal-cursor signal that reclaims worktrees. Until an
+    explicit operator-facing retention command exists, `.hydra-preserved-
+    evidence/` is bounded per-run by the caps above but grows without bound
+    ACROSS runs; an operator (or a future age-based janitor pass explicitly
+    scoped to this directory, not `sweep_stale_worktrees`) should periodically
+    reclaim it by run age.
 
     Fail-soft: never raises: any error, or nothing found to preserve, returns
     ``None`` without touching ``cursor`` or blocking finalize. On success sets
@@ -1436,49 +1546,78 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
         src = Path(worktree_path)
         if not src.is_dir():
             return None
-        candidate_dirs = {
-            p for pattern in ("build", ".harness")
-            for p in src.glob(f"**/{pattern}") if p.is_dir()
-        }
-        # Drop any dir nested under another candidate — copytree already
-        # recurses, and a nested dest write after its own parent was removed
-        # by a prior copy would otherwise error.
-        candidate_dirs = {
-            p for p in candidate_dirs
-            if not any(other != p and other in p.parents for other in candidate_dirs)
-        }
-        candidate_files = {p for p in src.glob("**/*.log") if p.is_file()}
-        if not candidate_dirs and not candidate_files:
+        candidates = _evidence_candidate_files(src)
+        if not candidates:
             return None
         dest_root = (Path(worktree_path).parent
                     / ".hydra-preserved-evidence" / str(run_id))
-        dest_root.mkdir(parents=True, exist_ok=True)
-        copied = False
-        for d in candidate_dirs:
-            rel = d.relative_to(src)
-            dest = dest_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copytree(d, dest, dirs_exist_ok=True)
-                copied = True
-            except Exception:  # noqa: BLE001 — best-effort per-item
-                continue
-        for f in candidate_files:
+        max_total = _evidence_max_total_bytes()
+        per_file_max = _EVIDENCE_PER_FILE_MAX_BYTES
+        copied_total = 0
+        copied_manifest: list[dict[str, Any]] = []
+        skipped_manifest: list[dict[str, Any]] = []
+        for f in sorted(candidates):
             rel = f.relative_to(src)
-            # A .log already carried inside a copied build/.harness dir is
-            # harmless to re-copy; skip only on error.
-            dest = dest_root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                shutil.copy2(f, dest)
-                copied = True
-            except Exception:  # noqa: BLE001
+                size = f.stat().st_size
+            except OSError as exc:  # noqa: BLE001 — record and move on
+                skipped_manifest.append({
+                    "path": str(rel), "size": None,
+                    "reason": f"stat_failed: {exc!r}"[:200],
+                })
                 continue
-        if not copied:
+            if size > per_file_max:
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"exceeds_per_file_cap_bytes={per_file_max}",
+                })
+                continue
+            if copied_total + size > max_total:
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"exceeds_total_cap_bytes={max_total}",
+                })
+                continue
+            dest = dest_root / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+            except Exception as exc:  # noqa: BLE001 — best-effort per-item
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"copy_failed: {exc!r}"[:200],
+                })
+                continue
+            copied_total += size
+            copied_manifest.append({"path": str(rel), "size": size})
+        if not copied_manifest and not skipped_manifest:
             return None
+        dest_root.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "run_id": run_id,
+            "source_worktree": str(src),
+            "max_per_file_bytes": per_file_max,
+            "max_total_bytes": max_total,
+            "total_bytes_copied": copied_total,
+            "copied": copied_manifest,
+            "skipped": skipped_manifest,
+        }
+        try:
+            (dest_root / "manifest.json").write_text(
+                dumps_strict(manifest, label="preserved-evidence manifest",
+                            indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 — the copies themselves still stand
+            _trace(cursor, "attended.evidence_manifest_write_failed",
+                   {"run_id": run_id, "error": str(exc)[:200]})
         cursor["preserved_evidence_path"] = str(dest_root)
-        _trace(cursor, "attended.evidence_preserved",
-               {"run_id": run_id, "path": str(dest_root)})
+        _trace(cursor, "attended.evidence_preserved", {
+            "run_id": run_id, "path": str(dest_root),
+            "copied_count": len(copied_manifest),
+            "skipped_count": len(skipped_manifest),
+            "total_bytes_copied": copied_total,
+        })
         return str(dest_root)
     except Exception as exc:  # noqa: BLE001 — never block finalize
         _trace(cursor, "attended.evidence_preserve_failed",
