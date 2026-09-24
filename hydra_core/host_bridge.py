@@ -2880,6 +2880,145 @@ def _finalize_immediate_smoke_spawn_failure(
         raise
 
 
+def _adopt_or_launch_smoke_job(
+    cursor: dict[str, Any], *, cursor_file: "str | Path | None",
+    call_key: str, work_path: str, stage_id: str,
+) -> dict[str, Any]:
+    """P2-3 (cross-vendor gpt-6-astra, MEDIUM): reserve the cursor's
+    transition to ``await_smoke`` BEFORE ever spawning the detached worker,
+    so a crash between spawn and the cursor save that used to follow it can
+    never start a SECOND worker writing the same result/log/sidecar paths.
+
+    Previously the judge-pass branch (and ``recover_stalled_stage``'s
+    ``stalled_infra`` smoke start) called ``smoke_job.start_job`` first and
+    only persisted ``cursor["smoke_job"]``/``state="await_smoke"`` to the
+    cursor file AFTER it returned. A crash in that window left the cursor at
+    ``await_judge`` with the verdict already recorded — a retry re-entered
+    the judge-pass branch from scratch and spawned a SECOND worker against
+    the exact same ``(cursor_file, call_key)`` pair (``smoke_job.job_paths``
+    is a pure function of those two, so both workers race to write the
+    identical result/log/sidecar files).
+
+    This function persists a ``state: "launching"`` reservation (with the
+    deterministic paths ``smoke_job.job_paths`` will use) and
+    ``cursor["state"] = "await_smoke"`` to disk FIRST. Only once that save
+    has landed does it call ``smoke_job.start_job`` and persist the pid.
+
+    A retry that finds an existing ``"launching"`` reservation for the SAME
+    ``call_key`` (the crash-recovery case — spawn never got another chance
+    to run, or ran but the pid was never saved) never spawns a second
+    worker. It first checks whether one is already live via the
+    deterministic result/sidecar paths:
+      - the result file already exists -> the job already finished; adopt
+        it (the caller's poll reads it directly, no pid needed).
+      - the sidecar shows a smoke child pid that is still alive -> a worker
+        IS running (it got far enough to write the sidecar); adopt by
+        polling the existing paths rather than spawning again.
+      - neither -> genuinely lost (the worker died before ever writing
+        anything this function can observe); resolved as ``infra_error``,
+        never a second spawn.
+
+    Returns a ``smoke_job``-shaped dict (may carry ``spawn_error`` for the
+    caller's existing spawn-failure handling, exactly like
+    ``smoke_job.start_job``'s own return value)."""
+    import time as _time
+
+    from . import smoke_job as _smoke_job
+    from .proc import is_pid_alive as _is_pid_alive
+
+    existing = cursor.get("smoke_job") or {}
+    if existing.get("call_key") == call_key and existing.get("pid") is not None:
+        # Already fully launched for this exact call_key — never re-spawn.
+        return existing
+    if existing.get("call_key") == call_key and existing.get("spawn_error"):
+        return existing
+    if existing.get("call_key") == call_key and existing.get("state") == "launching":
+        # Reservation from a prior (crashed) attempt at this SAME call_key.
+        # Never blindly spawn a second worker — first look for evidence one
+        # is already live or already finished.
+        paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {
+            "result_path": existing.get("result_path"),
+            "log_path": existing.get("log_path"),
+            "sidecar_path": existing.get("sidecar_path"),
+        }
+        result_path = paths.get("result_path")
+        if result_path and Path(str(result_path)).exists():
+            job = dict(existing)
+            job.update(paths)
+            # Clear the "launching" marker -- this job is now resolved (or,
+            # for the sidecar-alive case below, actively running with a
+            # real pid) so a LATER poll must never re-enter this adoption
+            # branch and re-derive adoption evidence every single poll.
+            job.pop("state", None)
+            job["adopted"] = "result_already_written"
+            _trace(cursor, "attended.smoke_job_adopted", {
+                "stage_id": stage_id, "call_key": call_key,
+                "reason": "result_already_written",
+            })
+            return job
+        sidecar_path = paths.get("sidecar_path")
+        sidecar: dict[str, Any] | None = None
+        if sidecar_path and Path(str(sidecar_path)).exists():
+            try:
+                sidecar = json.loads(Path(str(sidecar_path)).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                sidecar = None
+        smoke_pid = sidecar.get("pid") if isinstance(sidecar, dict) else None
+        if isinstance(smoke_pid, int) and smoke_pid > 0 and _is_pid_alive(smoke_pid):
+            job = dict(existing)
+            job.update(paths)
+            job.pop("state", None)
+            job.setdefault("started_at", existing.get("reserved_at") or _time.time())
+            job["deadline"] = float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60
+            # P2-3 adoption note: this "pid" now tracks the SMOKE CHILD
+            # (from the sidecar), not a worker -- there is no live worker
+            # left to poll (that is exactly why adoption fired). Downstream
+            # `is_pid_alive(pid)`/`kill_process_tree(pid)` calls work
+            # identically against either kind of pid.
+            job["pid"] = smoke_pid
+            job["adopted"] = "sidecar_pid_alive"
+            _trace(cursor, "attended.smoke_job_adopted", {
+                "stage_id": stage_id, "call_key": call_key,
+                "reason": "sidecar_pid_alive", "smoke_pid": smoke_pid,
+            })
+            return job
+        # No evidence of a live or completed job — the previous reservation
+        # never got far enough to leave anything observable. Resolve as a
+        # lost job (never spawn a second worker for this call_key).
+        reason = (
+            "smoke job reservation found no live worker to adopt (no result "
+            "file, no live sidecar pid) — treating as lost rather than "
+            "spawning a second worker for the same call_key"
+        )
+        _trace(cursor, "attended.smoke_job_reservation_lost", {
+            "stage_id": stage_id, "call_key": call_key, "reason": reason,
+        })
+        job = dict(existing)
+        job.update(paths)
+        job.pop("state", None)
+        job["spawn_error"] = reason
+        return job
+
+    # Fresh launch: persist the reservation BEFORE spawning.
+    paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {}
+    reservation = {
+        "call_key": call_key,
+        "reserved_at": _time.time(),
+        "state": "launching",
+        **paths,
+    }
+    cursor["smoke_job"] = reservation
+    cursor["state"] = "await_smoke"
+    if cursor_file is not None:
+        save_cursor(cursor_file, cursor)
+    _trace(cursor, "attended.smoke_job_reserved", {
+        "stage_id": stage_id, "call_key": call_key,
+    })
+    job = _smoke_job.start_job(
+        cursor_file, project_path=work_path, stage_id=stage_id, call_key=call_key)
+    return job
+
+
 def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
                    cursor_file: "str | Path | None",
                    workflow_terminal: bool = False) -> bool:
@@ -2910,6 +3049,29 @@ def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
         if cursor.get("state") in _TERMINAL:
             cursor.setdefault("terminal_call_key", call_key)
         return False
+    if job.get("state") == "launching" and not job.get("pid") and not job.get("spawn_error"):
+        # P2-3: a reservation from a (possibly crashed) launch attempt that
+        # never got as far as this poll seeing a pid. This is the SAME
+        # crash-recovery case `_adopt_or_launch_smoke_job` handles at the
+        # original launch call sites -- reached here too because once the
+        # reservation flipped `cursor["state"]` to "await_smoke", every
+        # LATER retry (a step poll, or a same-call_key resubmit) routes
+        # through THIS function, never back to the judge-pass branch that
+        # made the original reservation. Never spawn a second worker here
+        # either -- adopt a live/finished job via the deterministic
+        # result/sidecar paths, or resolve as lost.
+        job = _adopt_or_launch_smoke_job(
+            cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, stage_id=cursor.get("stage_id"))
+        cursor["smoke_job"] = job
+        if job.get("spawn_error"):
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, smoke_status="infra_error",
+                smoke_reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+            if cursor.get("state") in _TERMINAL:
+                cursor.setdefault("terminal_call_key", call_key)
+            return False
     result = _smoke_job.poll_job(job)
     if result is None:
         return True
@@ -3458,10 +3620,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 work_path=work_path, smoke_status=smoke_status,
                 smoke_reason=smoke_reason, workflow_terminal=workflow_terminal)
             return None
-        from . import smoke_job as _smoke_job
-        job = _smoke_job.start_job(
-            cursor_file, project_path=work_path, stage_id=cursor["stage_id"],
-            call_key=call_key)
+        # P2-3: reserve the await_smoke transition BEFORE ever spawning the
+        # worker -- see `_adopt_or_launch_smoke_job`'s docstring.
+        job = _adopt_or_launch_smoke_job(
+            cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, stage_id=cursor["stage_id"])
         if job.get("spawn_error"):
             # Hydra#70 follow-up: nothing was actually spawned -- finalize
             # synchronously as an infra smoke failure instead of parking
@@ -4276,12 +4439,13 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # inline for a prompt recovery result.
         if outcome == "pass" and attempt_id and _attended_smoke_mode() != "sync":
             work_path = cursor.get("work_path") or cursor["project_path"]
-            from . import smoke_job as _smoke_job
             _recovery_call_key = (cursor.get("pending_action") or {}).get(
                 "call_key") or f"recovery-{stage_id}"
-            job = _smoke_job.start_job(
-                cursor_file, project_path=work_path, stage_id=stage_id,
-                call_key=_recovery_call_key)
+            # P2-3: reserve the await_smoke transition BEFORE ever spawning
+            # the worker -- see `_adopt_or_launch_smoke_job`'s docstring.
+            job = _adopt_or_launch_smoke_job(
+                cursor, cursor_file=cursor_file, call_key=_recovery_call_key,
+                work_path=work_path, stage_id=stage_id)
             if job.get("spawn_error"):
                 # Hydra#70 follow-up: nothing was actually spawned -- finalize
                 # synchronously as an infra smoke failure instead of parking
