@@ -145,10 +145,13 @@ def is_pid_alive(pid: int | None) -> bool:
         return False
     if os.name == "nt":
         try:
-            r = subprocess.run(
+            # E2-36: text-mode subprocess output must be decoded UTF-8 with
+            # errors="replace" (run_text), never a bare text=True (which
+            # decodes via the Windows ANSI codepage and can kill the reader
+            # thread on an undecodable byte).
+            r = run_text(
                 ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=no_window_creationflags(),
+                capture_output=True, timeout=10,
             )
             return str(pid) in (r.stdout or "")
         except Exception:  # noqa: BLE001

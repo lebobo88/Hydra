@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .proc import detached_popen_kwargs, is_pid_alive, kill_process_tree
+from .strict_json import dumps_strict
 
 __all__ = [
     "job_paths",
@@ -81,10 +82,30 @@ def job_paths(cursor_file: str | Path, call_key: str) -> dict[str, str]:
 
 
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
+    """Write the job result atomically, through ``strict_json.dumps_strict``
+    (this is persisted decision state -- a bare ``json.dumps`` would silently
+    accept a NaN/Infinity token that a strict downstream parser refuses).
+
+    A ``dumps_strict`` refusal (a non-finite value, or any other
+    JSON-strict-unsafe content) must never mean the job crashes with NO
+    result file at all -- that reproduces exactly the "lost job" class this
+    module exists to eliminate -- so it falls back to a minimal, guaranteed
+    strict-safe error result instead of propagating.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(data), encoding="utf-8")
+    try:
+        text = dumps_strict(data, label="smoke_job_result")
+    except Exception as exc:  # noqa: BLE001 — see docstring: never lose the write
+        text = dumps_strict({
+            "status": "infra_error",
+            "reason": (
+                f"smoke job result was not JSON-strict-safe: {exc!r}"
+            )[:2000],
+            "finished_at": time.time(),
+        }, label="smoke_job_result_fallback")
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, p)
 
 
