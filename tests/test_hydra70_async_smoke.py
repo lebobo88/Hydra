@@ -528,9 +528,12 @@ def test_start_job_result_write_failure_falls_back_to_spawn_error(
 # instead of raising past an already-recorded verdict.                       #
 # --------------------------------------------------------------------------- #
 
-def test_apply_judge_popen_failure_reaches_infra_smoke_without_wedging(
+def test_apply_judge_popen_failure_finalizes_infra_smoke_on_the_same_submit(
     tmp_path, monkeypatch,
 ):
+    """Guidance fix (revision round): a spawn failure must NOT park the
+    cursor in await_smoke waiting for a poll of a job that never started --
+    it finalizes synchronously, on this SAME submit call."""
     real_popen = subprocess.Popen
 
     def _raise_popen(cmd, *a, **kw):
@@ -547,12 +550,11 @@ def test_apply_judge_popen_failure_reaches_infra_smoke_without_wedging(
 
     res2 = host_bridge.submit_host_result(
         disp, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY, result=_JUDGE_PASS)
-    assert res2["state"] == "await_smoke"
-    assert disp.count("record_verdict") == 1
-
-    res3 = host_bridge.submit_host_result(
-        disp, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY, result=_JUDGE_PASS)
-    assert res3["status"] in ("surfaced", "complete_unpersisted"), res3
+    assert res2["status"] in ("surfaced", "complete_unpersisted"), res2
+    assert res2["state"] != "await_smoke", (
+        "a spawn failure must never park the cursor in await_smoke -- "
+        "there is nothing to poll"
+    )
     cursor = host_bridge.load_cursor(res["cursor_path"])
     assert cursor["smoke_status"] == "infra_error"
     assert "no interpreter" in cursor["smoke_reason"]
@@ -561,9 +563,12 @@ def test_apply_judge_popen_failure_reaches_infra_smoke_without_wedging(
     assert disp.count("record_smoke_status") == 1
 
 
-def test_recover_stalled_stage_popen_failure_reaches_infra_smoke_without_wedging(
+def test_recover_stalled_stage_popen_failure_finalizes_infra_smoke_on_the_same_call(
     tmp_path, monkeypatch,
 ):
+    """Guidance fix (revision round): recovery must also finalize
+    synchronously on a spawn failure, not park in await_smoke for a poll
+    that would have nothing to observe."""
     real_popen = subprocess.Popen
 
     def _raise_popen(cmd, *a, **kw):
@@ -589,15 +594,185 @@ def test_recover_stalled_stage_popen_failure_reaches_infra_smoke_without_wedging
 
     out = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
     assert out["ok"] is True
-    assert out["state"] == "await_smoke"
-    assert disp.count("record_verdict") == 1
-
-    out2 = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
-    assert out2["ok"] is True
+    assert out["state"] != "await_smoke", (
+        "a spawn failure must never park the cursor in await_smoke -- "
+        "there is nothing to poll"
+    )
     cursor2 = host_bridge.load_cursor(res["cursor_path"])
     assert cursor2["smoke_status"] == "infra_error"
     assert "no interpreter" in cursor2["smoke_reason"]
     assert disp.count("record_verdict") == 1, "recovery must never re-record the verdict"
+    assert disp.count("record_smoke_status") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Revision-round fixes: mkdir failure for the job's result/log dir, process-  #
+# tree kill on a post-Popen teardown failure, and the "even the terminal     #
+# cursor save fails" last-resort path.                                       #
+# --------------------------------------------------------------------------- #
+
+def test_start_job_log_dir_mkdir_failure_never_raises_and_writes_infra_error(
+    tmp_path, monkeypatch,
+):
+    """A failure creating the job's log/result DIRECTORY (not the log file
+    itself) must be caught the same way as a Popen failure -- this is
+    distinct from ``test_start_job_log_open_failure_...`` above, which
+    exercises the log file's ``open()`` call, not ``Path.mkdir``."""
+    cursor_file = tmp_path / "cursor.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+
+    real_mkdir = Path.mkdir
+
+    def _raise_mkdir(self, *a, **kw):
+        if self == Path(smoke_job.job_paths(cursor_file, "judge-0")["log_path"]).parent:
+            raise PermissionError(f"permission denied creating dir: {self}")
+        return real_mkdir(self, *a, **kw)
+    monkeypatch.setattr(Path, "mkdir", _raise_mkdir)
+
+    job = smoke_job.start_job(
+        cursor_file, project_path=str(tmp_path), stage_id="s1", call_key="judge-0")
+
+    assert job["pid"] is None
+    assert job.get("spawn_error"), "spawn_error must be set on an mkdir failure"
+    assert "permission denied" in job["spawn_error"]
+
+    result = smoke_job.poll_job(job)
+    assert result is not None
+    assert result["status"] == "infra_error"
+    assert "permission denied" in result["reason"]
+
+
+def test_start_job_kills_process_tree_when_teardown_after_popen_raises(
+    tmp_path, monkeypatch,
+):
+    """If ``subprocess.Popen`` actually spawns a process but a LATER step in
+    ``start_job`` raises (the log file's context-manager teardown), the
+    spawned process must be killed, not reported as "never started" and
+    orphaned."""
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def _spawn_then_record(cmd, *a, **kw):
+        proc = real_popen(cmd, *a, **kw)
+        spawned.append(proc)
+        return proc
+    monkeypatch.setattr(smoke_job.subprocess, "Popen", _spawn_then_record)
+
+    class _RaisingFile:
+        """A fake log-file handle whose ``__exit__`` raises AFTER Popen has
+        already been handed the real file descriptor it needs -- simulates
+        a flush/close failure in the ``with open(log_path, "ab") as log_f``
+        block, independent of Popen itself."""
+
+        def __init__(self, real_f):
+            self._real_f = real_f
+
+        def __enter__(self):
+            return self._real_f
+
+        def __exit__(self, *exc_info):
+            raise OSError("boom-teardown: disk full flushing log")
+
+        def fileno(self):
+            return self._real_f.fileno()
+
+    real_open = open
+
+    def _wrap_open(path, *a, **kw):
+        f = real_open(path, *a, **kw)
+        if str(path) == smoke_job.job_paths(cursor_file, "judge-0")["log_path"]:
+            return _RaisingFile(f)
+        return f
+    cursor_file = tmp_path / "cursor.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("builtins.open", _wrap_open)
+
+    killed: list[int] = []
+    monkeypatch.setattr(smoke_job, "kill_process_tree",
+                        lambda pid, **k: killed.append(pid) or True)
+
+    # This spawns a REAL (short-lived) child -- `python -m hydra_core.smoke_job`
+    # against a bare tmp_path with no detectable smoke command, so it exits
+    # almost immediately on its own; `kill_process_tree` is monkeypatched
+    # above to only RECORD the pid it was asked to kill, not actually kill
+    # it, so the assertion below is meaningful even if the child has
+    # already exited by the time start_job's except-block runs.
+    job = smoke_job.start_job(
+        cursor_file, project_path=str(tmp_path), stage_id="s1", call_key="judge-0")
+
+    assert job["pid"] is None
+    assert job.get("spawn_error")
+    assert "boom-teardown" in job["spawn_error"]
+    assert spawned, "Popen must have actually been called"
+    assert killed == [spawned[0].pid], (
+        "the process that WAS spawned must be killed before reporting "
+        "'failed to spawn', not orphaned"
+    )
+    # Best-effort real cleanup in case kill_process_tree (monkeypatched
+    # above to only record, not actually kill) left the child alive.
+    try:
+        spawned[0].kill()
+    except Exception:
+        pass
+
+
+def test_apply_judge_spawn_failure_reraises_when_terminal_cursor_save_also_fails(
+    tmp_path, monkeypatch,
+):
+    """Guidance fix: if start_job's spawn ITSELF fails AND the call site's
+    attempt to persist the resulting terminal infra_error cursor outcome
+    (save_cursor inside _apply_smoke_and_finalize) also fails, the call
+    site must not silently succeed with nothing persisted -- it must emit a
+    trace event and re-raise."""
+    def _raise_start_job(cursor_file, *, project_path, stage_id, call_key):
+        return {
+            "pid": None, "started_at": time.time(), "deadline": time.time() - 1,
+            "result_path": str(tmp_path / "no-write.result.json"),
+            "log_path": str(tmp_path / "no-write.log"),
+            "call_key": call_key,
+            "spawn_error": "smoke job failed to spawn: OSError('boom-spawn-2')",
+        }
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+
+    monkeypatch.setattr(smoke_job, "start_job", _raise_start_job)
+
+    real_save_cursor = host_bridge.save_cursor
+    save_calls = {"n": 0}
+
+    def _raise_save_cursor(path, cursor):
+        save_calls["n"] += 1
+        # Only fail the SPECIFIC save this test targets -- the terminal
+        # smoke-outcome persist inside _apply_smoke_and_finalize, which is
+        # uniquely identifiable by "smoke_result_for" having just been
+        # stamped onto the cursor immediately before that call. Earlier
+        # saves in _apply_judge (the pending_verdict_payload /
+        # verdict_recorded_for markers) must succeed normally so the test
+        # actually reaches the code path under test instead of tripping an
+        # unrelated pre-existing save earlier in the same function.
+        if "smoke_result_for" in cursor:
+            raise OSError("boom-cursor-save: disk full")
+        return real_save_cursor(path, cursor)
+    monkeypatch.setattr(host_bridge, "save_cursor", _raise_save_cursor)
+
+    with pytest.raises(OSError, match="boom-cursor-save"):
+        host_bridge.submit_host_result(
+            disp, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY, result=_JUDGE_PASS)
+    assert save_calls["n"] >= 1, "save_cursor must actually have been attempted"
+
+    # Restore the real save_cursor and confirm a trace event documenting the
+    # persist failure landed on an INDEPENDENT channel (trace.jsonl), even
+    # though the cursor file itself never got the terminal outcome.
+    monkeypatch.setattr(host_bridge, "save_cursor", real_save_cursor)
+    cursor_after = host_bridge.load_cursor(res["cursor_path"])
+    trace_path = host_bridge._telemetry.trace_path(
+        Path(cursor_after["project_path"]), cursor_after["workflow_id"])
+    assert trace_path.exists(), "a trace event must be emitted even when the cursor save fails"
+    trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
+    assert any(
+        "attended.smoke_job_terminal_persist_failed" in ln and "boom-cursor-save" in ln
+        for ln in trace_lines
+    ), "the trace must document the spawn reason AND the persist failure"
 
 
 def test_recover_stalled_stage_starts_a_smoke_job(tmp_path, monkeypatch):

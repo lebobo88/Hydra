@@ -115,25 +115,46 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     ``{pid, started_at, deadline, result_path, log_path, call_key}``.
 
     Hydra#70 follow-up (cross-vendor judge finding): this function must
-    NEVER raise. The caller (``host_bridge._apply_judge`` /
-    ``recover_stalled_stage``) invokes this AFTER the judge verdict has
-    already been durably recorded -- a raised exception here would surface
-    at the call site with no persisted outcome, leaving the cursor stuck in
-    ``await_judge``/``await_smoke`` with no job to poll and the verdict
-    already spent. Any spawn/setup failure (a missing interpreter on
-    ``sys.executable``, a permission error creating the job's log
-    directory, ``detached_popen_kwargs()`` raising, ``subprocess.Popen``
-    itself raising ``OSError``/``FileNotFoundError``) is instead caught and
-    turned into a terminal ``infra_error`` result, written through the SAME
-    atomic ``dumps_strict`` writer (:func:`_atomic_write_json`) the job's own
-    ``main()`` uses, so the job's very first :func:`poll_job` call resolves
-    to that infra failure immediately (the returned job's ``deadline`` is
-    already in the past). If even that write fails (e.g. the identical
-    permission error that stopped the log directory being created), the
-    returned job instead carries a ``spawn_error`` string that
-    :func:`poll_job` recognizes and resolves from directly -- so the
-    ``await_smoke`` poll ALWAYS finalizes as an infra smoke failure exactly
-    like a lost job, never wedges, and never re-records the verdict."""
+    NEVER raise for a spawn/setup failure. The caller
+    (``host_bridge._apply_judge`` / ``recover_stalled_stage``) invokes this
+    AFTER the judge verdict has already been durably recorded -- a raised
+    exception here would surface at the call site with no persisted
+    outcome, leaving the cursor stuck in ``await_judge``/``await_smoke``
+    with no job to poll and the verdict already spent. Any spawn/setup
+    failure -- ``OSError``/``ValueError``/``subprocess.SubprocessError``
+    (a missing interpreter on ``sys.executable``, a permission error
+    creating the job's log directory or file, ``detached_popen_kwargs()``
+    raising, ``subprocess.Popen`` itself raising
+    ``OSError``/``FileNotFoundError``) -- is caught and turned into a
+    terminal ``infra_error`` result: ``job["spawn_error"]`` is ALWAYS set to
+    the reason (not only when the write below also fails), and the same
+    result is best-effort written through the SAME atomic ``dumps_strict``
+    writer (:func:`_atomic_write_json`) the job's own ``main()`` uses, so
+    the job's very first :func:`poll_job` call resolves to that infra
+    failure immediately (the returned job's ``deadline`` is already in the
+    past). A caller does not have to poll at all to learn of the failure --
+    it can check ``job.get("spawn_error")`` on the return value and
+    finalize the stage synchronously right there (see
+    ``host_bridge._finalize_immediate_smoke_spawn_failure``), never parking
+    into ``await_smoke`` to await a poll of a job that never started. If the
+    result-file write ALSO fails (e.g. the identical permission error that
+    stopped the log directory being created), ``spawn_error`` is still set,
+    so :func:`poll_job` (for any caller that DOES still park and poll) falls
+    back to resolving from it directly -- the ``await_smoke`` poll ALWAYS
+    finalizes as an infra smoke failure exactly like a lost job, never
+    wedges, and never re-records the verdict.
+
+    A genuine programming-error exception class (``TypeError``,
+    ``AttributeError``, ...) is deliberately NOT caught here and propagates
+    -- misclassifying a code bug as an infra spawn failure would silently
+    hide it as an "environment problem" with no trace of what actually
+    broke.
+
+    If ``proc`` was actually started (``subprocess.Popen`` returned) but a
+    LATER step in this function raises before returning, the spawned
+    process tree is killed before this function reports "failed to spawn"
+    -- otherwise a real, running process would be reported as never
+    started and orphaned."""
     paths = job_paths(cursor_file, call_key)
     result_path = paths["result_path"]
     log_path = paths["log_path"]
@@ -145,6 +166,13 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         pass
     timeout_s = smoke_timeout_s()
     started_at = time.time()
+    # Tracked separately from the try/except below (cross-vendor judge
+    # finding): if Popen itself succeeds but a LATER step in this block
+    # raises (e.g. the log file's `with open(...)` context-manager __exit__
+    # failing on close/flush), the spawned process is real and running --
+    # reporting "failed to spawn" without killing it would orphan a live
+    # process tree while telling the caller nothing ever started.
+    proc: "subprocess.Popen | None" = None
     try:
         cmd = [
             sys.executable, "-m", "hydra_core.smoke_job",
@@ -171,7 +199,21 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
                 env=env, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
                 **detached_popen_kwargs(),
             )
-    except Exception as exc:  # noqa: BLE001 — see docstring: never raise, always a terminal result
+    # Cross-vendor judge finding: narrowed from a bare `except Exception` --
+    # that swallowed a `TypeError`/`AttributeError` from a genuine
+    # programming error (a bad argument to `Popen`, a broken
+    # `detached_popen_kwargs()`) as an indistinguishable "infra spawn
+    # failure", silently reclassifying a code bug as an environment problem
+    # with no trace of what actually happened. Only the real spawn/setup
+    # failure classes (missing interpreter, permission error, OS-level
+    # launch failure) are caught here; a programming error still propagates
+    # so it fails loudly instead of masquerading as infra_error.
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if proc is not None:
+            # Popen succeeded; something AFTER it (e.g. the log file's
+            # context-manager teardown) is what actually raised. Do not
+            # leave that process running unaccounted for.
+            kill_process_tree(proc.pid)
         reason = f"smoke job failed to spawn: {exc!r}"[:2000]
         finished_at = time.time()
         job: dict[str, Any] = {
@@ -183,6 +225,12 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             "result_path": result_path,
             "log_path": log_path,
             "call_key": call_key,
+            # Always populated on a spawn failure (not just when the result
+            # write below also fails): call sites (`host_bridge._apply_judge`
+            # / `recover_stalled_stage`) check this to finalize the stage
+            # synchronously as an infra smoke failure instead of parking
+            # into `await_smoke` to poll a job that never started.
+            "spawn_error": reason,
         }
         try:
             _atomic_write_json(result_path, {
@@ -192,10 +240,11 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             })
         except Exception:  # noqa: BLE001 — the write itself can fail (e.g. the
             # same permission error that stopped the log dir from being
-            # created); poll_job falls back to job["spawn_error"] in that
-            # case so the caller still gets a correctly-reasoned terminal
-            # outcome instead of a generic "vanished" one.
-            job["spawn_error"] = reason
+            # created); job["spawn_error"] (set above unconditionally) is
+            # what the caller/poller falls back to in that case, so the
+            # caller still gets a correctly-reasoned terminal outcome
+            # instead of a generic "vanished" one.
+            pass
         return job
     return {
         "pid": proc.pid,
