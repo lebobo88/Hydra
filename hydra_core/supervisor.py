@@ -4634,6 +4634,13 @@ def build_supervisor(
             # commit` -- say so rather than let the operator assume the
             # artifact is committed.
             "artifact_location": state.plan_artifact_location,
+            # Operator decision 2026-09-24: the repo id the plan artifact
+            # actually lives in (None when the workflow had no single
+            # engineering target and the artifact fell back to the Hydra
+            # project root -- see `plan_artifact_repo_root`), so a plan_gate
+            # render never has to guess which checkout `artifact_location`
+            # resolves against.
+            "artifact_repo_id": state.plan_artifact_repo_id,
             "artifact_committed": False,
             "judge_vendor": judge_vendor,
             "open_question_count": len(plan_ref.get("open_questions") or []),
@@ -4671,15 +4678,26 @@ def build_supervisor(
                 from .plan_artifact import (
                     extract_governance_section,
                     extract_plan_provenance,
+                    plan_artifact_repo_root,
                     render_plan_html,
                 )
 
                 _relpath = str(state.plan_artifact_location)[len("repo:artifact:"):]
-                _repo_root = getattr(dispatcher, "project_root", None) or project_root
-                if _repo_root is None:
+                _default_root = getattr(dispatcher, "project_root", None) or project_root
+                if _default_root is None:
                     raise ArtifactStoreError(
                         "no project_root available; cannot re-render the plan artifact"
                     )
+                # Operator decision 2026-09-24: reuse the SAME resolved root
+                # `hydra_core.ingest`'s PLAN branch recorded on `state`
+                # (`plan_artifact_repo_root`, precedence 1 -- a recorded
+                # root always wins) rather than re-deriving it, so this
+                # re-render can never disagree with where the artifact was
+                # actually written.
+                _repo_root, _ = plan_artifact_repo_root(
+                    state, _default_root, purpose="read",
+                    emit=lambda k, p: emit_trace(judge_trace_root, state.workflow_id, k, p),
+                )
                 _plan_model_for_render = Plan.model_validate(plan_ref)
                 _existing_path = resolve_repo_artifact_path(_repo_root, _relpath)
                 _existing_html = (
