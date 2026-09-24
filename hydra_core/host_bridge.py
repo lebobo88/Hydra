@@ -2841,6 +2841,45 @@ def _apply_smoke_and_finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
              workflow_terminal=workflow_terminal)
 
 
+def _finalize_immediate_smoke_spawn_failure(
+    dispatcher: Dispatcher, cursor: dict[str, Any], *,
+    cursor_file: "str | Path | None", call_key: str | None,
+    work_path: str, reason: str, workflow_terminal: bool,
+) -> None:
+    """Hydra#70 follow-up (cross-vendor judge finding): when
+    ``smoke_job.start_job`` reports an immediate spawn/setup failure (the
+    returned job carries ``spawn_error``), the caller must NOT park the
+    cursor into ``await_smoke`` to await a poll of a job that never
+    started -- there is nothing to poll. Finalize the stage synchronously,
+    right here, through the SAME shared tail every other smoke-result
+    source converges on (:func:`_apply_smoke_and_finalize`), so the infra
+    failure is terminal on this very call instead of requiring a second
+    submit/poll round-trip.
+
+    If ``_apply_smoke_and_finalize``'s own terminal cursor save then ALSO
+    fails (the identical disk/permission failure class that stopped the
+    job from spawning in the first place), there is no second writable
+    channel for the cursor file itself on a host in that state. Emit a
+    trace event through :func:`_trace` -- an INDEPENDENT file write (via
+    ``telemetry.emit``'s own ``trace.jsonl``), not the cursor file, so it
+    is the closest thing to a durable record still available -- documenting
+    exactly why no terminal cursor record exists, then re-raise so the
+    caller (``submit_host_result`` / ``recover_stalled_stage``) surfaces
+    loudly instead of silently reporting success with nothing persisted.
+    """
+    try:
+        _apply_smoke_and_finalize(
+            dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, smoke_status="infra_error", smoke_reason=reason,
+            workflow_terminal=workflow_terminal)
+    except Exception as exc:  # noqa: BLE001 — see docstring: last-resort trace + re-raise
+        _trace(cursor, "attended.smoke_job_terminal_persist_failed", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "spawn_reason": reason, "persist_error": repr(exc),
+        })
+        raise
+
+
 def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
                    cursor_file: "str | Path | None",
                    workflow_terminal: bool = False) -> bool:
@@ -3400,6 +3439,19 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         job = _smoke_job.start_job(
             cursor_file, project_path=work_path, stage_id=cursor["stage_id"],
             call_key=call_key)
+        if job.get("spawn_error"):
+            # Hydra#70 follow-up: nothing was actually spawned -- finalize
+            # synchronously as an infra smoke failure instead of parking
+            # into await_smoke to poll a job that never started.
+            _trace(cursor, "attended.smoke_job_spawn_failed", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "reason": job["spawn_error"],
+            })
+            _finalize_immediate_smoke_spawn_failure(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, reason=job["spawn_error"],
+                workflow_terminal=workflow_terminal)
+            return None
         cursor["smoke_job"] = job
         cursor["state"] = "await_smoke"
         # W2-3-shaped: keep the SAME judge call_key as pending_action.call_key
@@ -4207,6 +4259,25 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             job = _smoke_job.start_job(
                 cursor_file, project_path=work_path, stage_id=stage_id,
                 call_key=_recovery_call_key)
+            if job.get("spawn_error"):
+                # Hydra#70 follow-up: nothing was actually spawned -- finalize
+                # synchronously as an infra smoke failure instead of parking
+                # into await_smoke to poll a job that never started.
+                _trace(cursor, "attended.recovery.smoke_job_spawn_failed", {
+                    "stage_id": stage_id, "reason": job["spawn_error"],
+                })
+                _finalize_immediate_smoke_spawn_failure(
+                    dispatcher, cursor, cursor_file=cursor_file,
+                    call_key=_recovery_call_key, work_path=work_path,
+                    reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+                # _apply_smoke_and_finalize's own internal save_cursor (Fix-1b)
+                # runs BEFORE it stamps the final smoke_status/outcome fields
+                # onto the in-memory cursor -- persist the fully-finalized
+                # cursor here, mirroring every other branch in this block.
+                save_cursor(cursor_file, cursor)
+                out = _step_result(cursor, cursor_file)
+                out["ok"] = True
+                return out
             cursor["smoke_job"] = job
             cursor["state"] = "await_smoke"
             cursor["pending_action"] = {
