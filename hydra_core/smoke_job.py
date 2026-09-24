@@ -68,16 +68,24 @@ def smoke_timeout_s() -> int:
 
 
 def job_paths(cursor_file: str | Path, call_key: str) -> dict[str, str]:
-    """Derive the job's result/log/lock file paths from the cursor file's
+    """Derive the job's result/log/sidecar file paths from the cursor file's
     location. ``call_key`` is folded into the filename so a NEW judge call
     (e.g. a Reflexion retry's judge-1) never reads a stale prior job's
-    result file."""
+    result file.
+
+    ``sidecar_path`` (P2-2) is where the worker records the SMOKE CHILD's
+    own pid (and, on POSIX, its process group) immediately after spawning
+    it -- separate from the worker's own pid (returned by ``start_job`` and
+    recorded on ``cursor["smoke_job"]["pid"]``), so a caller can kill the
+    smoke tree even once the worker process itself is gone (killed, crashed,
+    or reaped) and can no longer be walked from."""
     cf = Path(cursor_file)
     safe_key = "".join(c for c in call_key if c.isalnum() or c in "-_") or "job"
     base = cf.with_name(f"{cf.stem}.smoke-{safe_key}")
     return {
         "result_path": str(base.with_suffix(".result.json")),
         "log_path": str(base.with_suffix(".log")),
+        "sidecar_path": str(base.with_suffix(".smokepid.json")),
     }
 
 
@@ -158,12 +166,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     paths = job_paths(cursor_file, call_key)
     result_path = paths["result_path"]
     log_path = paths["log_path"]
-    # A stale result from a previous run of THIS exact (cursor, call_key)
-    # pair must not be read as fresh — clear it before spawning.
-    try:
-        os.remove(result_path)
-    except FileNotFoundError:
-        pass
+    sidecar_path = paths["sidecar_path"]
     timeout_s = smoke_timeout_s()
     started_at = time.time()
     # Tracked separately from the try/except below (cross-vendor judge
@@ -174,11 +177,38 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     # process tree while telling the caller nothing ever started.
     proc: "subprocess.Popen | None" = None
     try:
+        # P2-4 (cross-vendor gpt-6-astra, MEDIUM): stale-result removal used
+        # to sit OUTSIDE this guarded block, catching only FileNotFoundError
+        # -- a PermissionError / Windows sharing violation (another process
+        # still has the previous run's result file open) propagated straight
+        # out of `start_job` AFTER the judge verdict was already durably
+        # recorded, leaving the cursor stuck in `await_judge` instead of
+        # resolving synchronously as an infra_error like every other
+        # spawn/setup failure below. Moved inside the guarded setup path so
+        # ANY removal failure (not just a permission error) is caught by the
+        # same `except (OSError, ValueError, subprocess.SubprocessError)`
+        # below and resolves the same way. A stale result that could not be
+        # removed must also never be read as THIS job's result -- resolved
+        # by construction here: this function returns before ever spawning a
+        # NEW job whose poll could read the old file, and the infra_error
+        # result written below (when the write itself succeeds) overwrites
+        # it via the same atomic `os.replace` every other writer uses.
+        try:
+            os.remove(result_path)
+        except FileNotFoundError:
+            pass
+        # Clear a stale sidecar the same way — an old smoke child's pid must
+        # never be read as belonging to a job this call is about to spawn.
+        try:
+            os.remove(sidecar_path)
+        except FileNotFoundError:
+            pass
         cmd = [
             sys.executable, "-m", "hydra_core.smoke_job",
             "--project-path", str(project_path),
             "--stage-id", str(stage_id),
             "--result-path", result_path,
+            "--sidecar-path", sidecar_path,
             "--timeout-s", str(timeout_s),
         ]
         env = dict(os.environ)
@@ -224,6 +254,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             "deadline": started_at - 1,
             "result_path": result_path,
             "log_path": log_path,
+            "sidecar_path": sidecar_path,
             "call_key": call_key,
             # Always populated on a spawn failure (not just when the result
             # write below also fails): call sites (`host_bridge._apply_judge`
@@ -255,6 +286,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         "deadline": started_at + timeout_s + 60,
         "result_path": result_path,
         "log_path": log_path,
+        "sidecar_path": sidecar_path,
         "call_key": call_key,
     }
 
@@ -293,6 +325,57 @@ def _read_result_file(result_path: str) -> dict[str, Any] | None:
         return json.loads(Path(result_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _read_smoke_sidecar(sidecar_path: "str | None") -> dict[str, Any] | None:
+    """Read+parse the P2-2 smoke-pid sidecar if present; ``None`` if absent
+    or unreadable -- the sidecar is written best-effort by the worker (see
+    :func:`_write_smoke_sidecar`), so its absence (worker died before ever
+    writing it, or never spawned the smoke child at all) must be tolerated,
+    not treated as an error."""
+    if not sidecar_path:
+        return None
+    p = Path(sidecar_path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _kill_recorded_smoke_child(job: dict[str, Any]) -> None:
+    """P2-2: kill the smoke child recorded in the sidecar, independent of
+    the worker's own pid. Called from every ``poll_job`` cleanup path that
+    already kills the worker tree (``kill_process_tree(pid)``) -- that call
+    alone cannot always reach the smoke tree once the worker itself is gone
+    (Windows ``taskkill /T`` needs a live root to walk from; POSIX
+    ``killpg`` on the worker's own pgid never reaches the smoke child's
+    SEPARATE session/group). Tolerates an absent sidecar entirely (the
+    worker died, or was killed, before ever writing one)."""
+    sidecar = _read_smoke_sidecar(job.get("sidecar_path"))
+    if not sidecar:
+        return
+    smoke_pid = sidecar.get("pid")
+    if isinstance(smoke_pid, int) and smoke_pid > 0:
+        # Reaches the smoke child directly (Windows: a live `taskkill /T`
+        # root; POSIX: `os.getpgid(smoke_pid)` while it is still lookupable).
+        kill_process_tree(smoke_pid)
+    if os.name != "nt":
+        pgid = sidecar.get("pgid")
+        if isinstance(pgid, int) and pgid > 0:
+            # Belt-and-braces: once the smoke pid itself has already been
+            # reaped (zombied), `os.getpgid(smoke_pid)` inside
+            # `kill_process_tree` above can no longer resolve it, stranding
+            # any surviving grandchild still in that same process group.
+            # The pgid was captured explicitly at spawn time (P2-2) so it
+            # is still killable directly here even in that case.
+            import signal
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
 
 def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
@@ -352,8 +435,11 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     # (crashed / killed externally / never started cleanly). Either way
     # this is an infra failure — kill any surviving tree as a backstop (the
     # job enforces its own internal timeout, but this covers a
-    # wedged/zombie tree it failed to reap).
+    # wedged/zombie tree it failed to reap). P2-2: the worker's own pid
+    # alone may not reach the smoke tree once the worker is gone -- also
+    # kill the smoke child recorded in the sidecar (tolerates its absence).
     kill_process_tree(pid)
+    _kill_recorded_smoke_child(job)
     now = time.time()
     if now >= deadline:
         reason = f"smoke job exceeded its deadline ({job.get('deadline')!r}) and was killed"
@@ -370,8 +456,44 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _write_smoke_sidecar(sidecar_path: str | None, proc: "subprocess.Popen") -> None:
+    """P2-2 (cross-vendor gpt-6-astra, MEDIUM): record the SMOKE CHILD's own
+    pid (and, on POSIX, its process group) atomically to the sidecar,
+    immediately after ``Popen`` returns -- BEFORE this process blocks on
+    ``communicate()``. The job record on the cursor only ever carries the
+    WORKER's pid; if the worker itself dies (killed, crashed) or the poller
+    enforces the deadline after losing the worker, ``kill_process_tree
+    (worker_pid)`` alone cannot reach the smoke tree once the worker is gone
+    (a live Windows ``taskkill /T`` needs a live root to walk from; POSIX
+    ``killpg`` targets the WORKER's own process group, not the smoke
+    child's). The smoke child is spawned via
+    :func:`detached_popen_kwargs` too (``start_new_session=True`` on POSIX),
+    so it is its own session/group leader -- ``proc.pid`` doubles as the
+    pgid there, but the pgid is captured explicitly (rather than re-derived
+    later via ``os.getpgid``) so cleanup still has it even once the pid
+    itself can no longer be looked up (already reaped/zombied).
+
+    Best-effort: a write failure here must never abort the smoke run itself
+    (the sidecar is an optimization for the "worker died" cleanup path, not
+    a correctness requirement for the ordinary case where the worker
+    survives to poll its own child directly)."""
+    if not sidecar_path:
+        return
+    payload: dict[str, Any] = {"pid": proc.pid}
+    if os.name != "nt":
+        try:
+            payload["pgid"] = os.getpgid(proc.pid)
+        except OSError:
+            pass
+    try:
+        _atomic_write_json(sidecar_path, payload)
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        pass
+
+
 def _run_smoke_tracked(project_path: str, stage_id: str,
-                       timeout_s: int) -> tuple[str, str]:
+                       timeout_s: int, *,
+                       sidecar_path: str | None = None) -> tuple[str, str]:
     """Run the smoke command directly (Popen, not ``run_text``) so this
     process controls the child's pid and can kill its WHOLE tree
     (:func:`kill_process_tree`) on timeout -- reaching grandchildren
@@ -400,6 +522,11 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
         )
     except Exception as e:  # noqa: BLE001 — launch failure is infra
         return "infra_error", f"smoke could not launch ({' '.join(cmd)}): {e!r}"[:300]
+
+    # P2-2: write the sidecar immediately after Popen succeeds, before this
+    # process blocks on `communicate()` below -- a worker killed mid-smoke
+    # must still leave the sidecar behind for the poller's cleanup path.
+    _write_smoke_sidecar(sidecar_path, proc)
 
     try:
         out_bytes, _ = proc.communicate(timeout=timeout_s)
@@ -452,12 +579,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-path", required=True)
     parser.add_argument("--stage-id", required=True)
     parser.add_argument("--result-path", required=True)
+    parser.add_argument("--sidecar-path", default=None)
     parser.add_argument("--timeout-s", type=int, default=smoke_timeout_s())
     args = parser.parse_args(argv)
 
     try:
         status, reason = _run_smoke_tracked(
-            args.project_path, args.stage_id, args.timeout_s)
+            args.project_path, args.stage_id, args.timeout_s,
+            sidecar_path=args.sidecar_path)
     except Exception as e:  # noqa: BLE001 — a job crash is an infra result, not a hang
         status, reason = "infra_error", f"smoke job crashed: {e!r}"[:2000]
 
