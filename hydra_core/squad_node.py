@@ -35,7 +35,7 @@ _log = logging.getLogger("hydra.engineering")
 
 from .iolaus import post_dispatch, pre_dispatch
 from .judge_vendor import _judge_vendor_chain
-from .proc import run_text
+from .proc import is_infra_interrupt_returncode, run_text
 from .schemas import (
     DecisionRecord,
     Handoff,
@@ -413,6 +413,33 @@ _INFRA_SMOKE_RE = __import__("re").compile(
     __import__("re").IGNORECASE,
 )
 
+# Hydra#71 follow-up (cross-vendor judge finding): `_INFRA_SMOKE_RE` used to
+# be searched over the ENTIRE smoke transcript. A genuine, deterministic test
+# failure whose own output incidentally CONTAINS one of these words --
+# clang-tidy printing "spawn" a dozen times, a test asserting on an ENOENT
+# error message -- was reclassified `infra_error` purely because the marker
+# text happened to appear somewhere far downstream of the actual failure,
+# which also silently skipped `HYDRA_SMOKE_BASELINE_TESTS` excusal (that gate
+# only ever runs for `fail`, never `infra_error`). The marker is now only
+# ever searched over the LAUNCHER PREAMBLE -- the first
+# `_INFRA_SMOKE_PREAMBLE_LINES` lines of the transcript -- which is where a
+# runner that could not actually START (missing interpreter, missing module,
+# a bundler crashing before it reaches user code) prints its failure; once
+# the test runner itself has started emitting output, a "spawn"/"ENOENT"
+# string appearing later is test OUTPUT, not evidence the runner failed to
+# launch. A genuine launch failure that never even starts producing output
+# (a Popen exception) is still classified `infra_error` directly by the
+# `except` block around the launch call, independent of this region.
+_INFRA_SMOKE_PREAMBLE_LINES = 40
+
+
+def _smoke_infra_marker_hit(combined: str) -> bool:
+    """``True`` when an infra marker (`_INFRA_SMOKE_RE`) appears within the
+    launcher-preamble region (see the note above) of a smoke transcript --
+    the only region searched, not the full transcript."""
+    preamble = "\n".join((combined or "").splitlines()[:_INFRA_SMOKE_PREAMBLE_LINES])
+    return bool(_INFRA_SMOKE_RE.search(preamble))
+
 
 def _parse_smoke_verdict(text: str) -> tuple[str, str]:
     """Extract the last ``{"status": ...}`` JSON object from smoke output.
@@ -677,18 +704,37 @@ def _detect_smoke_command_and_cwd(project_path: str) -> tuple[list[str] | None, 
     return None, str(root)
 
 
-def _write_smoke_log(project_path: str, stage_id: str, content: str) -> str | None:
-    """Persist full smoke output to <project_path>/.harness/smoke/<stage_id>-<ts>.log.
+def _write_smoke_log(
+    project_path: str, stage_id: str, content: str, *,
+    evidence_dir: "str | Path | None" = None,
+) -> str | None:
+    """Persist full smoke output to ``<smoke_dir>/<stage_id>-<ts>.log``.
 
     MU6b: gives post-mortem access to the full runner transcript so failing
     test ids and stack traces are not discarded after a smoke failure.
+
+    Hydra#71 follow-up (cross-vendor judge finding): by default (no
+    ``evidence_dir``) this still writes under
+    ``<project_path>/.harness/smoke/`` — the synchronous headless
+    drive-loop path (``_run_smoke``) keeps that behaviour unchanged, per the
+    task contract. The ASYNC attended smoke job
+    (``smoke_job._run_smoke_tracked``) passes ``evidence_dir`` explicitly —
+    a directory next to the attended cursor file, OUTSIDE the candidate
+    worktree — because ``project_path`` there IS the worktree: on a
+    discarded merge (a lost/losing candidate, an infra-failed smoke) the
+    whole worktree is deleted, taking a log written under it down with it,
+    exactly when the transcript is most needed for post-mortem. Evidence
+    written under ``evidence_dir`` survives that deletion.
 
     Returns the absolute path string on success; None on any write error
     (fail-soft — callers always have a short-form fallback reason ready).
     """
     import time as _t
     try:
-        smoke_dir = Path(project_path) / ".harness" / "smoke"
+        smoke_dir = (
+            Path(evidence_dir) / "smoke" if evidence_dir is not None
+            else Path(project_path) / ".harness" / "smoke"
+        )
         smoke_dir.mkdir(parents=True, exist_ok=True)
         ts = int(_t.time())
         log_file = smoke_dir / f"{stage_id}-{ts}.log"
@@ -775,11 +821,20 @@ def _run_smoke(
     # F10: a runner that STARTED then exited non-zero for an INFRA reason
     # (host EPERM/ENOENT, esbuild crash, segfault, spawn failure, missing
     # toolchain) is mislabeled `fail` — pattern-match those markers → infra_error.
-    if res.returncode != 0 and _INFRA_SMOKE_RE.search(combined):
+    # Hydra#70 follow-up: an EXTERNAL interruption (Ctrl-C propagation, a
+    # session logoff mid-run) is classified the SAME way — retryable
+    # infra_error, never `fail` — via the shared, code-based classifier
+    # (`is_infra_interrupt_returncode`), independent of transcript text.
+    # Hydra#71 follow-up: the text-marker check is now bounded to the
+    # launcher preamble (`_smoke_infra_marker_hit`), never the full
+    # transcript — see that helper's docstring.
+    _interrupted = is_infra_interrupt_returncode(res.returncode)
+    if res.returncode != 0 and (_interrupted or _smoke_infra_marker_hit(combined)):
         # MU6b: persist full log so infra crashes are recoverable post-mortem.
         artifact = _write_smoke_log(project_path, stage_id, combined)
         tail = combined.strip().splitlines()[-1:] or [""]
-        reason = f"`{label}` exit={res.returncode} (infra) :: {tail[0]}"
+        _kind = "external interruption" if _interrupted else "infra"
+        reason = f"`{label}` exit={res.returncode} ({_kind}) :: {tail[0]}"
         if artifact:
             reason += f" :: full_log={artifact}"
         return "infra_error", reason[:2000]
