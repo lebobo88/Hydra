@@ -2932,6 +2932,38 @@ def _read_adoption_sidecar(sidecar_path: "str | None") -> "dict[str, Any] | None
     return data if isinstance(data, dict) else None
 
 
+def _read_adoption_result(result_path: "str | None") -> "dict[str, Any] | None":
+    if not result_path or not Path(str(result_path)).exists():
+        return None
+    try:
+        data = json.loads(Path(str(result_path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _adoption_evidence_matches_token(
+    evidence: "dict[str, Any] | None", reservation: "dict[str, Any]",
+) -> bool:
+    """R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening): a
+    reservation that minted a ``launch_token`` only ever adopts a
+    result/marker/sidecar that echoes the SAME token back -- a crash
+    between the reservation save (below) and ``start_job``'s own
+    stale-result/-sidecar/-marker removal could otherwise let a LATER
+    retry adopt evidence left over from an EARLIER run of the same
+    deterministic ``(cursor_file, call_key)`` paths (e.g.
+    ``recover_stalled_stage`` reusing the judge call_key). A reservation
+    with no ``launch_token`` (a legacy in-flight reservation persisted
+    before this field existed) keeps today's behaviour -- trusts whatever
+    evidence it finds, unconditionally."""
+    reservation_token = reservation.get("launch_token")
+    if reservation_token is None:
+        return True
+    if evidence is None:
+        return False
+    return evidence.get("launch_token") == reservation_token
+
+
 def _adopt_or_launch_smoke_job(
     cursor: dict[str, Any], *, cursor_file: "str | Path | None",
     call_key: str, work_path: str, stage_id: str,
@@ -2974,6 +3006,7 @@ def _adopt_or_launch_smoke_job(
     caller's existing spawn-failure handling, exactly like
     ``smoke_job.start_job``'s own return value)."""
     import time as _time
+    import uuid
 
     from . import smoke_job as _smoke_job
     from .proc import is_pid_alive as _is_pid_alive
@@ -3000,20 +3033,31 @@ def _adopt_or_launch_smoke_job(
         sidecar_path = paths.get("sidecar_path")
         marker_path = paths.get("marker_path")
 
-        if result_path and Path(str(result_path)).exists():
-            job = dict(existing)
-            job.update(paths)
-            # Clear the "launching" marker -- this job is now resolved
-            # (or, for the adopted-alive cases below, actively running
-            # with a real pid) so a LATER poll must never re-enter this
-            # adoption branch and re-derive adoption evidence every poll.
-            job.pop("state", None)
-            job["adopted"] = "result_already_written"
-            _trace(cursor, "attended.smoke_job_adopted", {
+        _result_evidence = _read_adoption_result(result_path)
+        if _result_evidence is not None:
+            if _adoption_evidence_matches_token(_result_evidence, existing):
+                job = dict(existing)
+                job.update(paths)
+                # Clear the "launching" marker -- this job is now resolved
+                # (or, for the adopted-alive cases below, actively running
+                # with a real pid) so a LATER poll must never re-enter this
+                # adoption branch and re-derive adoption evidence every poll.
+                job.pop("state", None)
+                job["adopted"] = "result_already_written"
+                _trace(cursor, "attended.smoke_job_adopted", {
+                    "stage_id": stage_id, "call_key": call_key,
+                    "reason": "result_already_written",
+                })
+                return job
+            # R3: a result file exists but names a DIFFERENT launch_token --
+            # it belongs to an earlier run of these same deterministic
+            # paths, not this reservation. Never adopt it (never report a
+            # stale pass/fail as this call's own outcome); fall through to
+            # the marker/sidecar/no-evidence handling below exactly as if
+            # no result existed yet.
+            _trace(cursor, "attended.smoke_job_stale_result_ignored", {
                 "stage_id": stage_id, "call_key": call_key,
-                "reason": "result_already_written",
             })
-            return job
 
         # (1) Worker-level launch evidence (D follow-up): the worker writes
         # its OWN pid + identity to the marker as the very first action in
@@ -3029,7 +3073,12 @@ def _adopt_or_launch_smoke_job(
         worker_identity = marker.get("pid_identity") if marker else None
         if (isinstance(worker_pid, int) and worker_pid > 0
                 and _is_pid_alive(worker_pid)
-                and _is_same_process(worker_pid, worker_identity)):
+                and _is_same_process(worker_pid, worker_identity)
+                # R3: a live, identity-verified marker left over from an
+                # earlier run of these same deterministic paths (wrong
+                # launch_token) is not proof of life for THIS reservation --
+                # treated as no evidence, never adopted.
+                and _adoption_evidence_matches_token(marker, existing)):
             job = dict(existing)
             job.update(paths)
             job.pop("state", None)
@@ -3055,7 +3104,12 @@ def _adopt_or_launch_smoke_job(
             # and the OS reused the pid, adopting it here would attach
             # this stage's lifecycle (and, on a later poll, kill
             # authority) to an unrelated process. Verify identity first.
-            if _is_same_process(smoke_pid, smoke_identity):
+            if (_is_same_process(smoke_pid, smoke_identity)
+                    # R3: a live, identity-verified sidecar left over from
+                    # an earlier run of these same deterministic paths
+                    # (wrong launch_token) is not proof of life for THIS
+                    # reservation -- treated as no evidence, never adopted.
+                    and _adoption_evidence_matches_token(sidecar, existing)):
                 job = dict(existing)
                 job.update(paths)
                 job.pop("state", None)
@@ -3078,17 +3132,21 @@ def _adopt_or_launch_smoke_job(
                 })
                 return job
             # A live sidecar pid whose identity does not match (or cannot be
-            # verified) is proof of the OPPOSITE of "still launching" -- the
-            # real smoke child already exited and this pid was reused, so
-            # further waiting inside the startup bound would only ever see
-            # the same mismatched pid again. Resolve as lost immediately,
-            # without waiting for the startup bound to elapse.
+            # verified), OR whose identity matches but whose launch_token
+            # does not (R3: a leftover sidecar from an earlier run of these
+            # same deterministic paths), is proof of the OPPOSITE of "still
+            # launching" -- the real smoke child for THIS reservation either
+            # already exited (pid reused) or never belonged to it in the
+            # first place, so further waiting inside the startup bound would
+            # only ever see the same unusable pid again. Resolve as lost
+            # immediately, without waiting for the startup bound to elapse.
             reason = (
                 "smoke job reservation's sidecar pid "
                 f"({smoke_pid}) is alive but is NOT the recorded smoke "
-                "child (identity mismatch / unverifiable) — refusing to "
-                "adopt it and treating the reservation as lost rather than "
-                "spawning a second worker for the same call_key"
+                "child for this reservation (identity mismatch/unverifiable, "
+                "or a launch_token belonging to an earlier reservation) — "
+                "refusing to adopt it and treating the reservation as lost "
+                "rather than spawning a second worker for the same call_key"
             )
             _trace(cursor, "attended.smoke_job_reservation_lost", {
                 "stage_id": stage_id, "call_key": call_key, "reason": reason,
@@ -3144,10 +3202,21 @@ def _adopt_or_launch_smoke_job(
 
     # Fresh launch: persist the reservation BEFORE spawning.
     paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {}
+    # R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening): a
+    # unique per-reservation token, threaded through to the worker (argv)
+    # and echoed back into every marker/sidecar/result file it writes. A
+    # crash between THIS save and `start_job`'s own stale-result/-sidecar/
+    # -marker removal could otherwise let a retry adopt evidence left over
+    # from an EARLIER reservation of these same deterministic
+    # (cursor_file, call_key) paths (e.g. `recover_stalled_stage` reusing
+    # the judge call_key) -- every adoption branch above, and `poll_job`'s
+    # result read, verify this token before trusting any of it.
+    launch_token = uuid.uuid4().hex
     reservation = {
         "call_key": call_key,
         "reserved_at": _time.time(),
         "state": "launching",
+        "launch_token": launch_token,
         **paths,
     }
     cursor["smoke_job"] = reservation
@@ -3158,7 +3227,8 @@ def _adopt_or_launch_smoke_job(
         "stage_id": stage_id, "call_key": call_key,
     })
     job = _smoke_job.start_job(
-        cursor_file, project_path=work_path, stage_id=stage_id, call_key=call_key)
+        cursor_file, project_path=work_path, stage_id=stage_id, call_key=call_key,
+        launch_token=launch_token)
     return job
 
 
