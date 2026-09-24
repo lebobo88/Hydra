@@ -515,6 +515,35 @@ class HydraState(BaseModel):
     plan_revision: int = 0
     plan_approved_at: Optional[datetime] = None
     plan_artifact_location: Optional[str] = None
+    # Operator decision 2026-09-24: the plan artifact belongs in the
+    # workflow's TARGET repo's docs/plans/, not Hydra's own working tree.
+    # `plan_artifact_location` (above) is a bare MemoryRef key
+    # (``repo:artifact:<relpath>``) with no repo identity, so a reader that
+    # only had that key could not tell which repo it lived in -- every
+    # existing reader (ingest's own write, node_plan_judge's verdict
+    # re-render, the force-dispatch governance note, and --critique-ref
+    # resolution) used to independently default to `dispatcher.project_root`
+    # (the Hydra checkout), which is wrong whenever the workflow targets a
+    # sibling repo. These two fields are written ONCE, in the SAME patch
+    # that first sets `plan_artifact_location` (`hydra_core.ingest`'s PLAN
+    # branch, via `hydra_core.plan_artifact.plan_artifact_repo_root`), and
+    # every subsequent reader uses the recorded root instead of re-deriving
+    # it -- so a write and a later read (possibly issued from a different
+    # process/session) can never disagree about which repo the artifact
+    # lives in. `plan_artifact_repo_id` is the allow-listed
+    # `hydra_core.repo_registry` id that resolved (None when the workflow
+    # had no single engineering target and the artifact fell back to the
+    # Hydra project root); `plan_artifact_root` is that resolution's
+    # absolute path, persisted so a reader never has to re-run
+    # `resolve_repo_path` (and never re-hits its allow-list/git-toplevel
+    # checks) just to find the file `plan_artifact_location` already names.
+    # A checkpoint from before this field existed (a "legacy checkpoint")
+    # reads back `None` here -- `plan_artifact_repo_root`'s fallback then
+    # behaves exactly like the old, single-root code (Hydra project root),
+    # so the five untracked warerender-gta plan artifacts already sitting
+    # under Hydra/docs/plans keep resolving exactly where they already are.
+    plan_artifact_repo_id: Optional[str] = None
+    plan_artifact_root: Optional[str] = None
     # Hydra#69 defect B: task_ids of the whole-goal TaskStates `node_planner`
     # synthesises in the SAME pass it seeds the "planning" task (while the
     # plan gate is active). These placeholders exist only so a plan-active

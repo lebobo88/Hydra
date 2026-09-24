@@ -32,7 +32,15 @@ Operationally:
    truncated to 2000 chars) and `verdict_plan_revision` (the plan revision the
    verdict was scored against) — render all four together, not outcome/vendor
    alone, so the operator sees WHY the judge reached its outcome and which
-   revision it judged.
+   revision it judged. Also render `plan_detail.artifact_location` (the
+   `repo:artifact:<relpath>` MemoryRef key) alongside `plan_detail.
+   artifact_repo_id` (operator decision 2026-09-24: the resolved
+   `hydra_core.repo_registry` id the plan artifact actually lives under —
+   `null` means it fell back to the Hydra checkout itself, either because the
+   workflow has no single engineering target or repo resolution failed) —
+   never render `artifact_location` alone, since the same relative path can
+   exist under two different repos and the operator needs to know which one
+   they are opening.
 2. Obtain the operator's explicit confirmation. Never infer it from prior text.
 3. Call `hydra.workflow.resume` with `action: "approve"` (or, from a shell,
    `python -m hydra_core.cli resume <workflow_id> --action approve
