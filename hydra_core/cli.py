@@ -1510,7 +1510,8 @@ def _append_plan_governance_note(
         from .artifact_store import resolve_repo_artifact_path, write_repo_artifact
         from .plan_artifact import append_governance_note, plan_artifact_repo_root
         repo_root, _ = plan_artifact_repo_root(
-            values, project, emit=lambda k, p: emit(project, wf, k, p),
+            values, project, purpose="read",
+            emit=lambda k, p: emit(project, wf, k, p),
         )
         full = resolve_repo_artifact_path(repo_root, relpath)
         existing = full.read_text(encoding="utf-8") if full.is_file() else ""
@@ -1579,7 +1580,7 @@ def _read_plan_critique(ref: str, project: Path, values: dict | None = None) -> 
     relpath = _plan_artifact_relpath(ref)
     if relpath is not None:
         from .plan_artifact import plan_artifact_repo_root
-        boundary_root, _ = plan_artifact_repo_root(values or {}, project)
+        boundary_root, _ = plan_artifact_repo_root(values or {}, project, purpose="read")
         raw_candidate = Path(boundary_root) / relpath
     else:
         boundary_root = project

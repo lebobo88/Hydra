@@ -763,7 +763,7 @@ def dispatch_ingested_envelopes(
                 # falling back to `default_root` (Hydra) when there is no
                 # single engineering target or resolution fails.
                 resolved_repo_root, resolved_repo_id = plan_artifact_repo_root(
-                    state, default_root, emit=_emit,
+                    state, default_root, purpose="write", emit=_emit,
                 )
                 slug = plan_slug(
                     getattr(plan_env, "goal_restatement", "") or "", plan_env.workflow_id

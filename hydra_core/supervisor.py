@@ -4695,7 +4695,7 @@ def build_supervisor(
                 # re-render can never disagree with where the artifact was
                 # actually written.
                 _repo_root, _ = plan_artifact_repo_root(
-                    state, _default_root,
+                    state, _default_root, purpose="read",
                     emit=lambda k, p: emit_trace(judge_trace_root, state.workflow_id, k, p),
                 )
                 _plan_model_for_render = Plan.model_validate(plan_ref)
