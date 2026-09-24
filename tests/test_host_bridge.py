@@ -3506,3 +3506,258 @@ def test_evidence_enforces_size_caps_and_records_skips_in_manifest(
     assert "exceeds_total_cap" in skipped[".harness/c_second.log"]
     copied = {c["path"].replace("\\", "/") for c in manifest["copied"]}
     assert copied == {".harness/a_small.log"}
+
+
+# --------------------------------------------------------------------------- #
+# Hydra#72: judge_model_source / judge_override_reason provenance forwarding  #
+# --------------------------------------------------------------------------- #
+#
+# pp's recordVerdict (daemon/src/orchestrator/runs.ts:981-1057) defaults
+# judge_model_source to "default" when the caller omits it, which in turn
+# requires judge_model_id to BE the vendor's pinned default model
+# (runs.ts:1029,1045-1057) -- so an attended verdict reporting any OTHER
+# pp-allowed model (the escalated pin, or any other allowed_models member)
+# was unconditionally rejected. `_FakeDispatcherEnforcingProvenance` below
+# reimplements that real three-part contract (allow-list, source enum + pin
+# match, override-reason length) so these tests fail the SAME way the live
+# bug did with the fix reverted.
+
+class _FakeDispatcherEnforcingProvenance(_FakeDispatcherWithDoctor):
+    """Enforces pp's real record_verdict provenance rules (runs.ts:1006-1057),
+    not just the judge_model_id pin `_FakeDispatcherWithDoctor` checks."""
+
+    _POLICY = {
+        "codex": {
+            "default": "gpt-5.6-terra", "escalated": "gpt-5.6-sol",
+            "allowed": {"gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"},
+        },
+        "agy": {
+            "default": "gemini-3.8-flash-medium", "escalated": "gemini-3.1-pro-high",
+            "allowed": {
+                "gemini-3.8-flash-high", "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+                "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+                "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+            },
+        },
+    }
+    _SOURCES = {"default", "escalated", "cli", "team_yaml", "hydra"}
+    _SOURCES_REQUIRING_REASON = {"cli", "team_yaml", "hydra"}
+
+    def call_mcp(self, server, tool, args, squad_id=None):
+        if tool == "record_verdict":
+            self.calls.append((server, tool, dict(args), squad_id))
+            producer = args.get("judge_producer")
+            model_id = args.get("judge_model_id")
+            policy = self._POLICY.get(producer)
+            if policy:
+                if model_id not in policy["allowed"]:
+                    return {"status": "failed", "error": (
+                        "judge_producer=" + str(producer) +
+                        " must record judge_model_id in {" +
+                        ", ".join(sorted(policy["allowed"])) +
+                        "} (JUDGE_MODEL_POLICY allow-list); got " + repr(model_id))}
+                source = args.get("judge_model_source") or "default"
+                if source not in self._SOURCES:
+                    return {"status": "failed", "error": (
+                        "judge_model_source must be one of {" +
+                        ", ".join(sorted(self._SOURCES)) + "}; got " + repr(source))}
+                reason = str(args.get("judge_override_reason") or "").strip()
+                if source in self._SOURCES_REQUIRING_REASON:
+                    if len(reason) < 8:
+                        return {"status": "failed", "error": (
+                            "judge_model_source=" + repr(source) +
+                            " is an operator override channel and requires "
+                            "judge_override_reason of at least 8 non-whitespace "
+                            "chars explaining why the vendor pin was not used")}
+                else:
+                    expected = policy["escalated"] if source == "escalated" else policy["default"]
+                    if model_id != expected:
+                        return {"status": "failed", "error": (
+                            "judge_model_source=" + repr(source) +
+                            " for judge_producer=" + str(producer) +
+                            " pins judge_model_id=" + repr(expected) +
+                            ", but " + repr(model_id) + " was recorded. "
+                            "Pass judge_model_source in {cli, team_yaml, hydra} with a "
+                            "judge_override_reason to record a deliberate override.")}
+            self.verdicts.append(dict(args))
+            return {"status": "done", "result": {"verdict_id": "v-1"}}
+        return super().call_mcp(server, tool, args, squad_id)
+
+
+def test_escalated_model_forwards_source_escalated_and_completes(tmp_path):
+    """codex's escalated pin (gpt-5.6-sol) must be recorded with
+    judge_model_source="escalated" and no reason, and the stage must pass --
+    NOT be rejected because it is not the default pin."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-sol", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    assert res["final_status"] == "complete"
+    assert len(disp.verdicts) == 1
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "escalated"
+    assert "judge_override_reason" not in v
+
+
+def test_hydra_override_source_for_allowed_non_pinned_model(tmp_path):
+    """A pp-allowed model that is NEITHER the default nor escalated pin
+    (agy's gemini-3.7-flash-high) must be recorded via the "hydra" override
+    channel with a real (>=8 char) reason, and the stage must pass."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "agy",
+                "judge_model_id": "gemini-3.7-flash-high", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "hydra"
+    assert len(v["judge_override_reason"].strip()) >= 8
+    assert "gemini-3.7-flash-high" in v["judge_override_reason"]
+
+
+def test_default_model_forwards_source_default(tmp_path):
+    """The vendor's default pin must be recorded with judge_model_source=
+    "default" and no override reason."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-terra", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "default"
+    assert "judge_override_reason" not in v
+
+
+def test_provenance_rejection_is_host_correctable_not_revise(tmp_path, monkeypatch):
+    """Simulated pp provenance rejection (Hydra#72's actual live shape): with
+    provenance forwarding unavailable (as it was pre-fix), record_verdict
+    rejects a legitimate escalated-model verdict with its judge_model_source/
+    judge_override_reason error. That must stay `await_judge` under the SAME
+    call_key and return a retryable error -- NEVER get downgraded to a
+    revise/surfaced verdict (the exact Hydra#72 defect)."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    with monkeypatch.context() as m:
+        # Simulate the pre-fix state: no provenance derived/forwarded at all.
+        m.setattr(host_bridge, "_judge_verdict_provenance", lambda *a, **k: {})
+
+        res = host_bridge.submit_host_result(
+            disp, cursor_file=cfile, call_key=judge_key,
+            result={"outcome": "pass", "critique_md": "looks good",
+                    "judge_producer": "codex",
+                    "judge_model_id": "gpt-5.6-sol",  # escalated, non-default
+                    "cost_usd": 0.05})
+
+        assert res["ok"] is False
+        assert res["retryable"] is True
+        assert "judge_model_source" in res["error"]
+        assert "judge_override_reason" in res["error"]
+        assert res["status"] == "awaiting_host"
+        assert res["state"] == "await_judge"
+        assert res["host_action"]["call_key"] == judge_key
+        assert disp.count("finalize_stage") == 0
+        assert disp.count("finalize_run") == 0
+        assert len(disp.verdicts) == 0
+        assert host_bridge.load_cursor(cfile)["state"] == "await_judge"
+
+    # Resubmitting the SAME call_key with real derivation restored completes
+    # the stage -- nothing about the cursor was corrupted by the rejection.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-sol", "cost_usd": 0.05})
+    assert res2["status"] == "complete"
+    assert res2["final_status"] == "complete"
+    assert disp.verdicts[0]["judge_model_source"] == "escalated"
+    # Judge cost accrued exactly once across both submits (double-count guard).
+    assert res2["cost_usd"] == pytest.approx(0.15)
+
+
+def test_supplied_valid_provenance_is_forwarded_verbatim(tmp_path):
+    """A judge result that self-reports a valid judge_model_source/
+    judge_override_reason for an allowed non-pinned model must be forwarded
+    as-is, not overwritten by the synthesized reason."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    own_reason = "operator explicitly requested gpt-5.6-luna for this stage"
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-luna",
+                "judge_model_source": "hydra",
+                "judge_override_reason": own_reason,
+                "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "hydra"
+    assert v["judge_override_reason"] == own_reason
+
+
+def test_invalid_supplied_provenance_falls_back_to_derivation(tmp_path):
+    """A judge result claiming judge_model_source="hydra" with a reason too
+    short to satisfy pp's >=8-char requirement must NOT be forwarded blindly
+    -- the host must fall back to deriving provenance from judge_model_id
+    itself (here, the default pin -> "default", no reason)."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-terra",  # the default pin
+                "judge_model_source": "hydra",
+                "judge_override_reason": "short",   # < 8 chars
+                "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "default"
+    assert "judge_override_reason" not in v
+
+
+def test_is_judge_provenance_error_matches_both_substrings():
+    """Unit-level check on the broadened predicate: it must match pp's real
+    provenance rejection text (both `judge_model_source` and
+    `judge_override_reason` present) and must NOT match an unrelated
+    validation error that happens to mention only one of the two terms."""
+    real_pp_message = (
+        'judge_model_source="default" for judge_producer=agy pins '
+        'judge_model_id="gemini-3.8-flash-medium", but "gemini-3.1-pro-high" '
+        'was recorded. Pass judge_model_source in {cli, team_yaml, hydra} '
+        'with a judge_override_reason to record a deliberate override.'
+    )
+    assert host_bridge._is_judge_provenance_error(RuntimeError(real_pp_message)) is True
+    assert host_bridge._is_judge_provenance_error(
+        RuntimeError("judge_model_source must be one of {default, escalated, "
+                     "cli, team_yaml, hydra}; got \"bogus\"")) is False
+    assert host_bridge._is_judge_provenance_error(
+        RuntimeError("some unrelated validation error")) is False
+    assert host_bridge._is_judge_provenance_error(None) is False

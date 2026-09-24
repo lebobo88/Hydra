@@ -268,6 +268,188 @@ _STATIC_JUDGE_MODEL_PINS: dict[str, tuple[str, ...]] = {
 # fatal defect in the artifact, so it must NOT surface a passing stage.
 _JUDGE_PIN_ERROR_MARKER = "must record judge_model_id"
 
+# --------------------------------------------------------------------------- #
+# Hydra#72: judge_model_source / judge_override_reason provenance             #
+# --------------------------------------------------------------------------- #
+# pp's ``recordVerdict`` (pair-programmer daemon/src/orchestrator/runs.ts:981-
+# 1057) enforces THREE independent things on every verdict, verified read-only
+# against pp's source for this fix:
+#
+#   1. ``isAllowedJudgeModel`` (config.ts:311-314, runs.ts:1006-1013): the
+#      reported ``judge_model_id`` must be a member of that vendor's
+#      ``JUDGE_MODEL_POLICY[vendor].allowed_models`` (config.ts:75-96) --
+#      e.g. codex allows {gpt-5.6-terra, gpt-5.6-sol, gpt-5.6-luna}, NOT just
+#      the default+escalated pair. This is a MODEL allow-list check,
+#      independent of (3) below.
+#   2. ``judge_reasoning_effort``, if present, must be one of that vendor's
+#      ``allowed_efforts`` (config.ts:47,1016-1022) -- codex: {low, medium,
+#      high, xhigh}; agy: {low, medium, high}.
+#   3. Provenance (runs.ts:1025-1057): ``judge_model_source`` defaults to
+#      "default" when omitted, and "default"/"escalated" are PINS -- the
+#      reported ``judge_model_id`` must equal that vendor's pinned
+#      default/escalated model exactly (runs.ts:1045-1057) or record_verdict
+#      throws. Any OTHER allowed_models member (e.g. codex's "gpt-5.6-luna",
+#      or any agy id besides the two pins) can only be recorded via one of
+#      the override channels {cli, team_yaml, hydra} (JUDGE_SOURCES_REQUIRING_
+#      REASON, runs.ts:887) together with a ``judge_override_reason`` of at
+#      least 8 non-whitespace chars (runs.ts:888,1036-1044) -- "hydra" does
+#      NOT accept an arbitrary model id, only one already in that vendor's
+#      ``allowed_models`` from (1).
+#
+# Hydra never forwarded judge_model_source/judge_override_reason/
+# judge_reasoning_effort, so every verdict implicitly claimed source=
+# "default" -- silently correct only when the judge happened to report the
+# exact default pin, and a hard rejection (masqueraded as a generic
+# "validation" failure -> deterministic-fatal -> revise) for every other
+# allowed model, discarding an otherwise-passing stage. ``_judge_verdict_
+# provenance`` derives the correct provenance from the SAME pin data
+# ``allowed_judge_model_ids`` already sources (doctor probe, falling back to
+# ``_STATIC_JUDGE_MODEL_PINS``) -- one helper, not a second copy of the pin
+# table -- and ``_is_judge_provenance_error`` routes a residual provenance
+# rejection (e.g. pp's live policy has drifted from Hydra's cached/static
+# pins) to the same host-correctable path as the E2-27 judge_model_id pin
+# error, instead of ever converting it into a revise/fail verdict.
+
+_JUDGE_OVERRIDE_SOURCES = frozenset({"default", "escalated", "cli", "team_yaml", "hydra"})
+_JUDGE_SOURCES_REQUIRING_REASON = frozenset({"cli", "team_yaml", "hydra"})
+_JUDGE_OVERRIDE_REASON_MIN_CHARS = 8
+
+# Substrings identifying pp's judge-selection PROVENANCE rejection on
+# record_verdict (runs.ts:1029-1057) -- distinct from the judge_model_id
+# allow-list rejection matched by ``_JUDGE_PIN_ERROR_MARKER`` above. Matched
+# together (both substrings must appear) rather than against the full
+# rendered sentence, which varies by branch (the "must be one of" source-
+# enum error, the override-reason-too-short error, and the source-pins-a-
+# different-model error all mention both terms).
+_JUDGE_PROVENANCE_ERROR_MARKERS: tuple[str, str] = (
+    "judge_model_source", "judge_override_reason",
+)
+
+
+def _judge_default_escalated_ids(
+    dispatcher: Dispatcher | None,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return ``{vendor: (default_id, escalated_id)}`` from the SAME pin
+    source ``allowed_judge_model_ids`` uses (doctor's ``judge_capabilities``,
+    falling back to ``_STATIC_JUDGE_MODEL_PINS``) -- never a second copy of
+    the pin table. Both sources order their list as [default, escalated,
+    ...remaining allow-listed ids] (see ``allowed_judge_model_ids``'s
+    docstring), so position 0/1 reliably identify the two pins; a vendor with
+    fewer than 2 entries (e.g. claude's empty tuple) reports ``None`` for the
+    missing slot(s).
+    """
+    out: dict[str, tuple[str | None, str | None]] = {}
+    for vendor, ids in allowed_judge_model_ids(dispatcher).items():
+        out[vendor] = (
+            ids[0] if len(ids) > 0 else None,
+            ids[1] if len(ids) > 1 else None,
+        )
+    return out
+
+
+def _judge_verdict_provenance(
+    dispatcher: Dispatcher | None, *, judge_vendor: str, judge_model_id: str,
+    result: dict[str, Any], allowed_models: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Derive the ``judge_model_source``/``judge_override_reason``/
+    ``judge_reasoning_effort`` fields to forward on ``record_verdict``.
+
+    Returns a dict to be splatted into the record_verdict payload -- empty
+    when pp pins nothing for ``judge_vendor`` (e.g. claude: producers with no
+    ``JUDGE_MODEL_POLICY`` entry are unchecked, runs.ts:1006-1007) or when
+    ``judge_model_id`` is not in that vendor's ``allowed_models`` at all (no
+    provenance field can fix an unlisted model id -- record_verdict's own
+    ``isAllowedJudgeModel`` check will reject it; that is the E2-27 pin-error
+    path, handled separately).
+
+    Precedence:
+      1. A judge result MAY self-report ``judge_model_source`` (and, for the
+         three override channels, ``judge_override_reason``) -- honored only
+         when internally consistent with ``judge_model_id`` (a "default"
+         claim must actually name the default pin; an override claim must
+         carry a reason of at least ``_JUDGE_OVERRIDE_REASON_MIN_CHARS``
+         chars). An inconsistent/invalid supplied source is never forwarded
+         blindly -- it falls through to derivation below.
+      2. Otherwise, derive from ``judge_model_id`` against the vendor's pins:
+         the default pin -> "default", the escalated pin -> "escalated",
+         any other allow-listed id -> "hydra" with a generated reason naming
+         the model (pp requires >= 8 chars for any of {cli, team_yaml,
+         hydra}; "hydra" is the correct label since this is Hydra's own
+         override, not a CLI flag or team_yaml entry).
+
+    ``judge_reasoning_effort`` is forwarded verbatim when the judge result
+    supplies one -- pp validates it against that vendor's ``allowed_efforts``
+    (config.ts:1016-1022) itself; an invalid effort surfaces as its own
+    record_verdict rejection.
+    """
+    ids = list(allowed_models.get(judge_vendor) or [])
+    if not ids:
+        return {}
+    default_id, escalated_id = ids[0], (ids[1] if len(ids) > 1 else None)
+
+    def _reason_or_none(raw: Any) -> str | None:
+        s = str(raw or "").strip()
+        return s if len(s) >= _JUDGE_OVERRIDE_REASON_MIN_CHARS else None
+
+    source: str | None = None
+    reason: str | None = None
+    supplied_source = result.get("judge_model_source")
+    if isinstance(supplied_source, str) and supplied_source in _JUDGE_OVERRIDE_SOURCES:
+        if supplied_source == "default" and judge_model_id == default_id:
+            source = "default"
+        elif supplied_source == "escalated" and judge_model_id == escalated_id:
+            source = "escalated"
+        elif (supplied_source in _JUDGE_SOURCES_REQUIRING_REASON
+              and judge_model_id in ids):
+            supplied_reason = _reason_or_none(result.get("judge_override_reason"))
+            if supplied_reason is not None:
+                source, reason = supplied_source, supplied_reason
+
+    if source is None:
+        if judge_model_id == default_id:
+            source = "default"
+        elif escalated_id is not None and judge_model_id == escalated_id:
+            source = "escalated"
+        elif judge_model_id in ids:
+            source = "hydra"
+            reason = (
+                f"attended judge selected {judge_model_id} from "
+                f"allowed_judge_model_ids ({judge_vendor} failover/override)"
+            )
+        else:
+            # Not in pp's allow-list at all -- isAllowedJudgeModel will reject
+            # the model id itself; no provenance field can fix that.
+            return {}
+
+    out: dict[str, Any] = {"judge_model_source": source}
+    if source in _JUDGE_SOURCES_REQUIRING_REASON:
+        out["judge_override_reason"] = reason
+    effort = result.get("judge_reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        out["judge_reasoning_effort"] = effort.strip()
+    return out
+
+
+def _is_judge_provenance_error(exc: Exception | None) -> bool:
+    """True when a record_verdict failure is pp's judge-selection provenance
+    rejection (runs.ts:1029-1057) -- a LABEL/provenance problem the host can
+    correct by re-deriving/re-reporting the source, not an artifact defect.
+    Must be routed to the host-correctable path exactly like
+    ``_is_judge_pin_error``, never converted into a revise/fail verdict.
+    """
+    if exc is None:
+        return False
+    msg = str(exc).lower()
+    if all(m in msg for m in _JUDGE_PROVENANCE_ERROR_MARKERS):
+        return True
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        pmsg = str(payload.get("error", "")).lower()
+        if all(m in pmsg for m in _JUDGE_PROVENANCE_ERROR_MARKERS):
+            return True
+    return False
+
+
 # Bound on how many times one judge call_key may be bounced back to the host
 # for a model-id/producer correction before the bridge stops asking and lets
 # the normal (pp-authoritative) path run. Without a bound a host that keeps
@@ -2744,6 +2926,15 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         })
         judge_model_id = _pinned
 
+    # Hydra#72: derive judge_model_source/judge_override_reason/
+    # judge_reasoning_effort BEFORE record_verdict -- see the module-level
+    # comment above ``_judge_verdict_provenance`` for the pp contract this
+    # forwards against (runs.ts:1029-1057).
+    _verdict_provenance = _judge_verdict_provenance(
+        dispatcher, judge_vendor=_judge_vendor, judge_model_id=judge_model_id,
+        result=result, allowed_models=allowed_models,
+    )
+
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
     # immediately — Reflexion is reserved for code defects the engineer can fix.
@@ -2787,6 +2978,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             "critique_md": critique_md[:4000],
             "score_json": score_json,
             "rubric_id": gate_rubric,
+            # Hydra#72: forward the derived judge-selection provenance so
+            # record_verdict does not implicitly treat every verdict as
+            # source="default" (see ``_judge_verdict_provenance``).
+            **_verdict_provenance,
             # W2-3: the attended call_key doubles as pp's idempotency token. A
             # re-drive after a stalled_infra hold resubmits the same call_key,
             # so pp's recordVerdict returns the original verdict_id instead of
@@ -2821,19 +3016,27 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             _record_verdict_ok = False
             _record_verdict_exc = exc
 
-    # E2-27: pp's judge-model pin rejection is a LABEL problem, not an
-    # artifact defect. `_classify_infra_failure` calls it "deterministic"
-    # (its text matches the "validation" marker), which used to surface a
-    # PASSING stage and discard the merge. Route it to the host-correctable
-    # path instead: nothing about the cursor state or pending_action changes,
-    # so a resubmit under the SAME call_key with a corrected judge_model_id
-    # re-enters here and retries record_verdict (no verdict row was written,
-    # so `verdict_recorded_for` is unset and there is nothing to double-write).
-    if not _record_verdict_ok and _is_judge_pin_error(_record_verdict_exc):
+    # E2-27 / Hydra#72: pp's judge-model pin rejection AND pp's judge-
+    # selection provenance rejection (judge_model_source/judge_override_
+    # reason -- runs.ts:1029-1057) are both LABEL problems, not an artifact
+    # defect. `_classify_infra_failure` calls either "deterministic" (the
+    # text matches the "validation" marker), which used to surface a PASSING
+    # stage and discard the merge. Route both to the host-correctable path
+    # instead: nothing about the cursor state or pending_action changes, so a
+    # resubmit under the SAME call_key with a corrected judge_model_id (or,
+    # for Hydra#72, after ``_judge_verdict_provenance`` re-derives on the
+    # next call) re-enters here and retries record_verdict (no verdict row
+    # was written, so `verdict_recorded_for` is unset and there is nothing to
+    # double-write).
+    _is_pin_error = _is_judge_pin_error(_record_verdict_exc)
+    _is_provenance_error = _is_judge_provenance_error(_record_verdict_exc)
+    if not _record_verdict_ok and (_is_pin_error or _is_provenance_error):
         _pin_reason = str(_record_verdict_exc)
         if _judge_correction_budget_left(cursor, call_key):
             n = _record_judge_correction(cursor, call_key)
-            _trace(cursor, "attended.judge_model_id_pin_rejected", {
+            _trace_event = ("attended.judge_provenance_rejected" if _is_provenance_error
+                             else "attended.judge_model_id_pin_rejected")
+            _trace(cursor, _trace_event, {
                 "stage_id": cursor.get("stage_id"), "call_key": call_key,
                 "attempt_id": attempt_id,
                 "judge_producer": judge_producer,
@@ -2844,11 +3047,14 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             })
             if cursor_file is not None:
                 save_cursor(cursor_file, cursor)
+            _err_prefix = ("pp rejected the judge selection provenance: "
+                           if _is_provenance_error else
+                           "pp rejected the judge model id: ")
             return {
                 "ok": False,
                 "retryable": True,
                 "error": (
-                    "pp rejected the judge model id: " + _pin_reason +
+                    _err_prefix + _pin_reason +
                     " — resubmit the SAME call_key with a judge_model_id from "
                     "allowed_judge_model_ids"),
                 "allowed_judge_model_ids": allowed_models,
