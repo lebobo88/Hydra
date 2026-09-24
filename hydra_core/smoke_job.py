@@ -57,6 +57,7 @@ __all__ = [
     "start_job",
     "poll_job",
     "smoke_timeout_s",
+    "read_worker_marker",
 ]
 
 
@@ -84,7 +85,16 @@ def job_paths(cursor_file: str | Path, call_key: str) -> dict[str, str]:
     it -- separate from the worker's own pid (returned by ``start_job`` and
     recorded on ``cursor["smoke_job"]["pid"]``), so a caller can kill the
     smoke tree even once the worker process itself is gone (killed, crashed,
-    or reaped) and can no longer be walked from."""
+    or reaped) and can no longer be walked from.
+
+    ``marker_path`` (D follow-up) is where the WORKER itself records its OWN
+    pid + identity as its very first action in ``main()``, before doing
+    anything slower (detecting/spawning the smoke command). A "launching"
+    reservation (no pid saved on the cursor yet, see
+    ``host_bridge._adopt_or_launch_smoke_job``) reads this marker to prove
+    the worker is alive well before it gets far enough to write the sidecar
+    -- closing the false-lost window for a worker that is simply slow to
+    start (e.g. Windows interpreter cold-start)."""
     cf = Path(cursor_file)
     safe_key = "".join(c for c in call_key if c.isalnum() or c in "-_") or "job"
     base = cf.with_name(f"{cf.stem}.smoke-{safe_key}")
@@ -92,6 +102,7 @@ def job_paths(cursor_file: str | Path, call_key: str) -> dict[str, str]:
         "result_path": str(base.with_suffix(".result.json")),
         "log_path": str(base.with_suffix(".log")),
         "sidecar_path": str(base.with_suffix(".smokepid.json")),
+        "marker_path": str(base.with_suffix(".workerpid.json")),
     }
 
 
@@ -173,6 +184,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     result_path = paths["result_path"]
     log_path = paths["log_path"]
     sidecar_path = paths["sidecar_path"]
+    marker_path = paths["marker_path"]
     timeout_s = smoke_timeout_s()
     started_at = time.time()
     # Tracked separately from the try/except below (cross-vendor judge
@@ -209,12 +221,19 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             os.remove(sidecar_path)
         except FileNotFoundError:
             pass
+        # Clear a stale worker marker too -- an old worker's pid/identity
+        # must never be read as belonging to THIS about-to-be-spawned job.
+        try:
+            os.remove(marker_path)
+        except FileNotFoundError:
+            pass
         cmd = [
             sys.executable, "-m", "hydra_core.smoke_job",
             "--project-path", str(project_path),
             "--stage-id", str(stage_id),
             "--result-path", result_path,
             "--sidecar-path", sidecar_path,
+            "--marker-path", marker_path,
             "--timeout-s", str(timeout_s),
         ]
         env = dict(os.environ)
@@ -261,6 +280,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             "result_path": result_path,
             "log_path": log_path,
             "sidecar_path": sidecar_path,
+            "marker_path": marker_path,
             "call_key": call_key,
             # Always populated on a spawn failure (not just when the result
             # write below also fails): call sites (`host_bridge._apply_judge`
@@ -300,6 +320,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         "result_path": result_path,
         "log_path": log_path,
         "sidecar_path": sidecar_path,
+        "marker_path": marker_path,
         "call_key": call_key,
     }
 
@@ -356,6 +377,59 @@ def _read_smoke_sidecar(sidecar_path: "str | None") -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_worker_marker(marker_path: "str | None") -> dict[str, Any] | None:
+    """Read+parse the (D-follow-up) worker marker if present; ``None`` if
+    absent or unreadable. Public (unlike ``_read_smoke_sidecar``) so
+    ``host_bridge._adopt_or_launch_smoke_job`` can read it too without
+    reimplementing the same best-effort parse. The worker writes this as its
+    very FIRST action in ``main()`` -- its presence with a VERIFIED identity
+    (:func:`hydra_core.proc.is_same_process`) is proof the worker is alive
+    long before it gets far enough to write the P2-2 sidecar."""
+    if not marker_path:
+        return None
+    p = Path(marker_path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_worker_marker(marker_path: "str | None") -> None:
+    """(D follow-up) Write THIS process's own pid + identity to
+    ``marker_path`` -- called as the very first action in ``main()``, before
+    importing/detecting/spawning anything slower. Best-effort: a write
+    failure here must never abort the smoke run itself (mirrors every other
+    best-effort marker/sidecar writer in this module) -- worst case, a
+    "launching" reservation adoption simply falls back to the sidecar/result
+    evidence it already used before this marker existed."""
+    if not marker_path:
+        return
+    try:
+        _atomic_write_json(marker_path, {
+            "pid": os.getpid(),
+            "pid_identity": process_identity(os.getpid()),
+        })
+    except Exception:  # noqa: BLE001 — best-effort, see docstring
+        pass
+
+
+def _clear_worker_marker(marker_path: "str | None") -> None:
+    """Retire the worker marker once the job has written its terminal
+    result -- nothing later should ever need to adopt a worker that has
+    already finished (mirrors :func:`_clear_smoke_sidecar`). Best-effort."""
+    if not marker_path:
+        return
+    try:
+        os.remove(marker_path)
+    except FileNotFoundError:
+        pass
+    except OSError:  # noqa: BLE001 — best-effort cleanup only
+        pass
 
 
 def _kill_recorded_smoke_child(job: dict[str, Any]) -> None:
@@ -640,14 +714,25 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point for ``python -m hydra_core.smoke_job`` (spawned detached by
     :func:`start_job`). Writes the result atomically to ``--result-path`` on
     every exit path, including an unexpected exception, so the poller never
-    sees "no result" for a job that actually ran to completion or crashed."""
+    sees "no result" for a job that actually ran to completion or crashed.
+
+    (D follow-up) The VERY FIRST action after parsing argv is writing this
+    process's own worker marker (pid + durable identity) to
+    ``--marker-path`` -- before ``_run_smoke_tracked`` is even called (that
+    is where the slow work lives: importing ``squad_node``, detecting the
+    smoke command, spawning it). A "launching" reservation with no pid saved
+    on the cursor yet can then prove this worker is alive from the marker
+    alone, long before it gets far enough to write the P2-2 sidecar."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-path", required=True)
     parser.add_argument("--stage-id", required=True)
     parser.add_argument("--result-path", required=True)
     parser.add_argument("--sidecar-path", default=None)
+    parser.add_argument("--marker-path", default=None)
     parser.add_argument("--timeout-s", type=int, default=smoke_timeout_s())
     args = parser.parse_args(argv)
+
+    _write_worker_marker(args.marker_path)
 
     try:
         status, reason = _run_smoke_tracked(
@@ -661,6 +746,10 @@ def main(argv: list[str] | None = None) -> int:
         "reason": reason,
         "finished_at": time.time(),
     })
+    # The worker has now reached a terminal result -- nothing should ever
+    # adopt it as "still launching" again. Best-effort, symmetrical with
+    # (C)'s sidecar retirement on normal smoke completion.
+    _clear_worker_marker(args.marker_path)
     return 0
 
 

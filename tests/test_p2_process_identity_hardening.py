@@ -235,8 +235,6 @@ def test_adopt_or_launch_smoke_job_refuses_sidecar_pid_alive_on_identity_mismatc
             "pid_identity": -1,  # deliberately wrong
         }), encoding="utf-8")
 
-        monkeypatch.setattr(host_bridge, "_ADOPT_LOST_GRACE_RETRIES", 0)
-
         job = host_bridge._adopt_or_launch_smoke_job(
             cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
             work_path=_work_path, stage_id="stage-1")
@@ -288,22 +286,11 @@ def test_sidecar_cleared_after_normal_smoke_completion(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 3. bounded poll for a still-launching reservation (D)                      #
+# 3. non-blocking startup-bound handling for a still-launching reservation   #
+#    (D, revise-round-2)                                                     #
 # --------------------------------------------------------------------------- #
 
-def test_still_launching_reservation_with_matching_worker_not_finalized_lost(
-    tmp_path, monkeypatch,
-):
-    """A "launching" reservation whose worker is genuinely alive but just
-    hasn't written its sidecar YET (simulated: the sidecar appears mid-poll,
-    inside the bounded grace window) must NOT be finalized as lost. Revert
-    the bounded-poll grace window (back to a single presence/absence check)
-    and this test's assertion on ``adopted`` fails."""
-    import threading
-
-    disp = FakeDispatcher(required_cross_vendor=True)
-    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
-
+def _seed_launching_reservation(host_bridge, res, tmp_path):
     cursor = host_bridge.load_cursor(res["cursor_path"])
     paths = smoke_job.job_paths(res["cursor_path"], _JUDGE_KEY)
     cursor["smoke_job"] = {
@@ -314,65 +301,270 @@ def test_still_launching_reservation_with_matching_worker_not_finalized_lost(
     cursor["verdict_recorded_for"] = _JUDGE_KEY
     cursor["pending_action"] = {"call_key": _JUDGE_KEY, "action": "poll_smoke", "poll": True}
     host_bridge.save_cursor(res["cursor_path"], cursor)
+    return cursor, paths
 
-    monkeypatch.setattr(host_bridge, "_ADOPT_LOST_GRACE_RETRIES", 8)
-    monkeypatch.setattr(host_bridge, "_ADOPT_LOST_GRACE_INTERVAL_S", 0.1)
+
+def test_still_launching_reservation_with_matching_worker_marker_adopted(
+    tmp_path, monkeypatch,
+):
+    """A "launching" reservation whose worker has written its OWN marker
+    (worker-level launch evidence, before it ever gets to the sidecar) must
+    be adopted immediately as ``worker_marker_alive`` -- proving the worker
+    is alive from the marker alone, without waiting for the sidecar. Revert
+    the worker-marker adoption branch and this test's assertion on
+    ``adopted`` fails (it would instead see no evidence and fall through to
+    the startup-bound "still launching" / lost path)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+    cursor, paths = _seed_launching_reservation(host_bridge, res, tmp_path)
 
     worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
-        def _delayed_sidecar_write():
-            time.sleep(0.35)  # inside the ~0.8s grace window configured above
-            Path(paths["sidecar_path"]).parent.mkdir(parents=True, exist_ok=True)
-            Path(paths["sidecar_path"]).write_text(json.dumps({
-                "pid": worker.pid,
-                "pid_identity": process_identity(worker.pid),
-            }), encoding="utf-8")
-
-        threading.Thread(target=_delayed_sidecar_write, daemon=True).start()
+        Path(paths["marker_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(paths["marker_path"]).write_text(json.dumps({
+            "pid": worker.pid,
+            "pid_identity": process_identity(worker.pid),
+        }), encoding="utf-8")
 
         job = host_bridge._adopt_or_launch_smoke_job(
             cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
             work_path=_work_path, stage_id="stage-1")
 
-        assert job.get("adopted") == "sidecar_pid_alive", (
-            "a worker that writes its sidecar within the bounded grace "
-            f"window must be adopted, not finalized lost; got {job!r}"
+        assert job.get("adopted") == "worker_marker_alive", (
+            f"a live, identity-verified worker marker must be adopted "
+            f"immediately; got {job!r}"
         )
+        assert job.get("pid") == worker.pid
         assert not job.get("spawn_error")
     finally:
         worker.kill()
         worker.wait(timeout=10)
 
 
-def test_still_launching_reservation_genuinely_gone_worker_is_finalized_lost(
+def test_still_launching_reservation_delayed_worker_reports_non_terminal_then_adopts(
     tmp_path, monkeypatch,
 ):
-    """The counterpart: a "launching" reservation that NEVER produces a
-    result file or a live sidecar (even across the bounded grace window)
-    must still resolve as lost -- the grace window bounds the wait, it does
-    not wait forever."""
+    """The false-lost repro this fix closes: a worker that cold-starts
+    LONGER than the old (insufficient) ~0.45s blocking grace window --
+    simulated here as 1.0s -- before it ever writes ANY evidence (marker or
+    sidecar). The first poll(s), while still within the startup bound, must
+    report non-terminal "still launching" (the reservation stays
+    unresolved: no pid, no spawn_error) -- NEVER finalized lost. Once the
+    marker appears with a verifying identity, a LATER poll adopts it and the
+    job later completes normally via the ordinary result-file path. Revert
+    either half of this fix and this test fails: reverting the non-blocking
+    startup bound makes the early poll(s) resolve to ``spawn_error``
+    immediately; reverting the worker-marker adoption makes the later poll
+    never adopt (falls through to sidecar/no-evidence handling)."""
+    monkeypatch.setenv("HYDRA_SMOKE_LAUNCH_GRACE_S", "5")
     disp = FakeDispatcher(required_cross_vendor=True)
     res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+    cursor, paths = _seed_launching_reservation(host_bridge, res, tmp_path)
 
-    cursor = host_bridge.load_cursor(res["cursor_path"])
-    paths = smoke_job.job_paths(res["cursor_path"], _JUDGE_KEY)
-    cursor["smoke_job"] = {
-        "call_key": _JUDGE_KEY, "reserved_at": time.time(),
-        "state": "launching", **paths,
-    }
-    cursor["state"] = "await_smoke"
-    cursor["verdict_recorded_for"] = _JUDGE_KEY
-    cursor["pending_action"] = {"call_key": _JUDGE_KEY, "action": "poll_smoke", "poll": True}
+    # No marker, no sidecar, no result yet -- the worker "hasn't cold-started
+    # far enough" in this simulation. The first poll, well within the 5s
+    # startup bound, must be non-terminal.
+    job = host_bridge._adopt_or_launch_smoke_job(
+        cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
+        work_path=_work_path, stage_id="stage-1")
+    assert job.get("state") == "launching", (
+        f"a reservation with no evidence yet, still within the startup "
+        f"bound, must stay non-terminal ('launching'), never resolve lost "
+        f"or adopted on this poll; got {job!r}"
+    )
+    assert not job.get("pid")
+    assert not job.get("spawn_error")
+
+    # `poll_smoke_job` (the real caller) must report "still pending" (True)
+    # for this exact shape, without blocking.
+    cursor["smoke_job"] = job
+    started = time.monotonic()
+    still_pending = host_bridge.poll_smoke_job(
+        disp, cursor, cursor_file=res["cursor_path"], workflow_terminal=False)
+    elapsed = time.monotonic() - started
+    assert still_pending is True
+    assert elapsed < 1.0, (
+        f"poll_smoke_job must be NON-blocking for a still-launching "
+        f"reservation within the startup bound; took {elapsed:.2f}s"
+    )
+
+    # Now the worker "cold-starts past" 1.0s (longer than the old ~0.45s
+    # blocking grace window) and writes its marker.
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        time.sleep(1.0)
+        Path(paths["marker_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(paths["marker_path"]).write_text(json.dumps({
+            "pid": worker.pid,
+            "pid_identity": process_identity(worker.pid),
+        }), encoding="utf-8")
+
+        job2 = host_bridge._adopt_or_launch_smoke_job(
+            cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
+            work_path=_work_path, stage_id="stage-1")
+        assert job2.get("adopted") == "worker_marker_alive", (
+            f"a worker that eventually writes its marker within the "
+            f"startup bound must be adopted on a LATER poll, not lost; "
+            f"got {job2!r}"
+        )
+        assert job2.get("pid") == worker.pid
+        assert not job2.get("spawn_error")
+
+        # And the job "later completes normally" via the ordinary result
+        # path -- write the result file (as the worker itself would) and
+        # confirm poll_job resolves it as a normal pass, not an infra kill.
+        Path(paths["result_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(paths["result_path"]).write_text(json.dumps({
+            "status": "pass", "reason": "ok", "finished_at": time.time(),
+        }), encoding="utf-8")
+        result = smoke_job.poll_job(job2)
+        assert result is not None and result["status"] == "pass"
+    finally:
+        worker.kill()
+        worker.wait(timeout=10)
+
+
+def test_still_launching_reservation_past_startup_bound_finalized_lost_once(
+    tmp_path, monkeypatch,
+):
+    """A "launching" reservation OLDER than the (tiny, env-set) startup bound
+    with no marker/sidecar/result at all must be finalized lost -- exactly
+    once, never spawning a second worker for the same call_key. Revert the
+    startup-bound check (make it wait forever / never resolve) and this
+    test's assertion on ``spawn_error`` fails; revert it the other way (drop
+    the bound entirely, always resolve lost) and the companion "still
+    launching" test above fails instead -- the two tests are complementary
+    proof the bound is applied correctly in both directions."""
+    monkeypatch.setenv("HYDRA_SMOKE_LAUNCH_GRACE_S", "0.05")
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+    cursor, paths = _seed_launching_reservation(host_bridge, res, tmp_path)
+    # Push the reservation's `reserved_at` unambiguously past the tiny bound.
+    cursor["smoke_job"]["reserved_at"] = time.time() - 10
     host_bridge.save_cursor(res["cursor_path"], cursor)
-
-    monkeypatch.setattr(host_bridge, "_ADOPT_LOST_GRACE_RETRIES", 2)
-    monkeypatch.setattr(host_bridge, "_ADOPT_LOST_GRACE_INTERVAL_S", 0.05)
 
     job = host_bridge._adopt_or_launch_smoke_job(
         cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
         work_path=_work_path, stage_id="stage-1")
 
     assert job.get("spawn_error"), (
-        f"a genuinely gone worker (no result, no sidecar ever) must resolve "
-        f"as lost after the bounded grace window; got {job!r}"
+        f"a reservation past the startup bound with no evidence at all must "
+        f"resolve as lost; got {job!r}"
     )
+    assert "startup bound" in job["spawn_error"]
+    assert job.get("state") is None
+
+
+def test_unverified_worker_marker_not_adopted_lost_past_bound_nothing_killed(
+    tmp_path, monkeypatch,
+):
+    """A worker marker whose identity does NOT verify (pid reused / mismatch)
+    must never be adopted -- and, past the startup bound, must still be
+    finalized lost, with nothing killed on the unverified pid (this
+    function never kills; only a later ``poll_job`` deadline-kill would, and
+    it only acts on a job's own recorded ``pid``/``pid_identity``, which an
+    unverified marker never sets). Revert the identity verification on the
+    marker-adoption branch and this test's assertion on ``adopted`` fails
+    (it would wrongly adopt the mismatched marker pid)."""
+    monkeypatch.setenv("HYDRA_SMOKE_LAUNCH_GRACE_S", "0.05")
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+    cursor, paths = _seed_launching_reservation(host_bridge, res, tmp_path)
+    cursor["smoke_job"]["reserved_at"] = time.time() - 10
+    host_bridge.save_cursor(res["cursor_path"], cursor)
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        Path(paths["marker_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(paths["marker_path"]).write_text(json.dumps({
+            "pid": victim.pid,
+            "pid_identity": -1,  # deliberately wrong
+        }), encoding="utf-8")
+
+        killed: list[int] = []
+        monkeypatch.setattr(smoke_job, "kill_process_tree",
+                            lambda pid, **k: killed.append(pid))
+
+        job = host_bridge._adopt_or_launch_smoke_job(
+            cursor, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY,
+            work_path=_work_path, stage_id="stage-1")
+
+        assert job.get("adopted") != "worker_marker_alive", (
+            f"an unverified/mismatched worker marker must never be adopted; "
+            f"got {job!r}"
+        )
+        assert job.get("spawn_error"), (
+            f"past the startup bound with only an unverified marker, the "
+            f"reservation must resolve as lost; got {job!r}"
+        )
+        assert victim.pid not in killed, (
+            "nothing must be killed on the unverified marker pid, but "
+            f"kill_process_tree was called with pids {killed}"
+        )
+    finally:
+        victim.kill()
+        victim.wait(timeout=10)
+
+
+def test_real_worker_writes_marker_before_anything_slow(tmp_path, monkeypatch):
+    """The REAL worker entry point (``smoke_job.main``) writes its marker as
+    its VERY FIRST action -- before ``_run_smoke_tracked`` even runs, let
+    alone finishes. Proven by a slow fake smoke command: while it is still
+    running (has not yet exited), the marker must already exist on disk and
+    verify against the (still-running) worker process's own pid. Revert the
+    marker write to happen AFTER ``_run_smoke_tracked`` (or drop it
+    entirely) and this test's assertion inside the polling loop times out /
+    fails, since the marker would only appear once the slow smoke command
+    (and thus the whole worker) has already finished."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".harness").mkdir()
+    # A "slow" fake smoke command -- sleeps long enough that a marker write
+    # AFTER `_run_smoke_tracked` would not be observable while it is still
+    # running.
+    (project / ".harness" / "smoke_cmd.json").write_text(
+        json.dumps({"cmd": [sys.executable, "-c",
+                            "import time; time.sleep(2); import sys; sys.exit(0)"]}),
+        encoding="utf-8")
+
+    result_path = tmp_path / "job.result.json"
+    marker_path = tmp_path / "job.workerpid.json"
+    sidecar_path = tmp_path / "job.smokepid.json"
+
+    worker = subprocess.Popen([
+        sys.executable, "-m", "hydra_core.smoke_job",
+        "--project-path", str(project), "--stage-id", "s1",
+        "--result-path", str(result_path),
+        "--sidecar-path", str(sidecar_path),
+        "--marker-path", str(marker_path),
+        "--timeout-s", "30",
+    ], cwd=str(Path(__file__).resolve().parent.parent))
+    try:
+        marker = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if marker_path.exists():
+                try:
+                    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    marker = None
+                if marker:
+                    break
+            time.sleep(0.05)
+
+        assert marker is not None, "the worker never wrote its marker in time"
+        assert marker.get("pid") == worker.pid
+        assert is_same_process(worker.pid, marker.get("pid_identity")), (
+            f"the marker's identity must verify against the still-running "
+            f"worker process; marker={marker!r}"
+        )
+        # The slow smoke command (2s sleep) must still be running -- proves
+        # the marker was written BEFORE `_run_smoke_tracked` finished, i.e.
+        # as the worker's very first action, not after.
+        assert not result_path.exists(), (
+            "the marker appeared only after the job already finished -- "
+            "it must be written as the worker's FIRST action, well before "
+            "the slow smoke command completes"
+        )
+    finally:
+        worker.wait(timeout=30)

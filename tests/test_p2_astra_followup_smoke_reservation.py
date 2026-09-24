@@ -148,11 +148,16 @@ def test_crash_after_reservation_before_spawn_never_starts_second_worker(
 
     # Manually construct the "crash after reservation, before start_job"
     # cursor shape (exactly what `_adopt_or_launch_smoke_job`'s reservation
-    # write leaves on disk).
+    # write leaves on disk). `reserved_at` is backdated well past the (D
+    # follow-up) startup bound (`HYDRA_SMOKE_LAUNCH_GRACE_S`, default 60s) --
+    # this retry is meant to simulate a long-since-crashed attempt with no
+    # adoptable evidence, which must resolve as lost on this single call,
+    # not a fresh reservation that would legitimately still be within its
+    # startup window.
     cursor = host_bridge.load_cursor(res["cursor_path"])
     paths = smoke_job.job_paths(res["cursor_path"], _JUDGE_KEY)
     cursor["smoke_job"] = {
-        "call_key": _JUDGE_KEY, "reserved_at": time.time(),
+        "call_key": _JUDGE_KEY, "reserved_at": time.time() - 3600,
         "state": "launching", **paths,
     }
     cursor["state"] = "await_smoke"

@@ -2880,15 +2880,46 @@ def _finalize_immediate_smoke_spawn_failure(
         raise
 
 
-# (D) cross-vendor judge follow-up: a retry that finds a "launching"
-# reservation with no result file and no adoptable sidecar yet must not
-# instantly conclude the worker is lost -- the worker may simply be alive
-# and not have gotten far enough to write its sidecar. Give it a short
-# bounded poll (mirrors `smoke_job`'s own `_VANISHED_GRACE_RETRIES` pattern)
-# before falling back to "lost" -- module-level so a test can monkeypatch it
-# down to keep the repro fast.
-_ADOPT_LOST_GRACE_RETRIES = 3
-_ADOPT_LOST_GRACE_INTERVAL_S = 0.15
+# (D) cross-vendor judge follow-up, revise-round-2: the previous fix here was
+# a single BLOCKING poll (~0.45s: `_ADOPT_LOST_GRACE_RETRIES` *
+# `_ADOPT_LOST_GRACE_INTERVAL_S`) inside one `_adopt_or_launch_smoke_job`
+# call. A worker can legitimately cold-start (Windows interpreter spin-up,
+# heavier `squad_node` imports) past that window before it ever spawns the
+# smoke child and writes the P2-2 sidecar -- a genuinely live worker was
+# still finalized lost.
+#
+# Fixed with two complementary changes:
+#   1. Worker-level launch evidence (`smoke_job.read_worker_marker`) -- the
+#      worker writes its OWN pid + identity as the very first action in
+#      `main()`, before any slow import/detect/spawn work. A "launching"
+#      reservation that finds a marker whose identity verifies is proof of
+#      life immediately, without waiting on the sidecar at all.
+#   2. A non-blocking, NON-TERMINAL "still launching" outcome bounded by a
+#      startup window (`HYDRA_SMOKE_LAUNCH_GRACE_S`, default 60s, measured
+#      from `reserved_at`) -- no evidence yet, but still within the window,
+#      returns non-terminal (the host polls again via `step`, exactly like a
+#      running job) instead of blocking THIS call or finalizing lost. Only
+#      once the reservation is OLDER than the window with still no verified
+#      worker/sidecar/result is it finalized lost.
+#
+# The prior blocking constants (`_ADOPT_LOST_GRACE_RETRIES` /
+# `_ADOPT_LOST_GRACE_INTERVAL_S`, a fixed ~0.45s sleep loop) are retired —
+# nothing in this module sleeps waiting for adoption evidence any more.
+_SMOKE_LAUNCH_GRACE_S_DEFAULT = 60.0
+
+
+def _smoke_launch_grace_s() -> float:
+    """``HYDRA_SMOKE_LAUNCH_GRACE_S`` (default 60s) -- how long a "launching"
+    reservation with no adoptable evidence yet is treated as non-terminal
+    (still starting up) rather than finalized lost. Module-level function
+    (not a constant) so a test can set the env var to a tiny value and keep
+    the repro fast without monkeypatching a blocking sleep."""
+    raw = os.environ.get("HYDRA_SMOKE_LAUNCH_GRACE_S")
+    try:
+        v = float(raw) if raw else _SMOKE_LAUNCH_GRACE_S_DEFAULT
+    except (TypeError, ValueError):
+        v = _SMOKE_LAUNCH_GRACE_S_DEFAULT
+    return v if v > 0 else _SMOKE_LAUNCH_GRACE_S_DEFAULT
 
 
 def _read_adoption_sidecar(sidecar_path: "str | None") -> "dict[str, Any] | None":
@@ -2955,101 +2986,155 @@ def _adopt_or_launch_smoke_job(
     if existing.get("call_key") == call_key and existing.get("spawn_error"):
         return existing
     if existing.get("call_key") == call_key and existing.get("state") == "launching":
-        # Reservation from a prior (crashed) attempt at this SAME call_key.
-        # Never blindly spawn a second worker — first look for evidence one
-        # is already live or already finished.
+        # Reservation from a prior (crashed, or simply still-starting)
+        # attempt at this SAME call_key. Never blindly spawn a second
+        # worker — first look for evidence one is already live or already
+        # finished.
         paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {
             "result_path": existing.get("result_path"),
             "log_path": existing.get("log_path"),
             "sidecar_path": existing.get("sidecar_path"),
+            "marker_path": existing.get("marker_path"),
         }
         result_path = paths.get("result_path")
         sidecar_path = paths.get("sidecar_path")
+        marker_path = paths.get("marker_path")
 
-        # (D) cross-vendor judge follow-up: a single presence/absence check
-        # here cannot distinguish "the worker genuinely never got going" from
-        # "the worker is alive and just hasn't written its sidecar yet" --
-        # give it a short bounded poll before concluding it is lost, mirroring
-        # `smoke_job.poll_job`'s own vanished-grace-window pattern.
-        mismatch_pid: "int | None" = None
-        for _attempt in range(_ADOPT_LOST_GRACE_RETRIES + 1):
-            if result_path and Path(str(result_path)).exists():
+        if result_path and Path(str(result_path)).exists():
+            job = dict(existing)
+            job.update(paths)
+            # Clear the "launching" marker -- this job is now resolved
+            # (or, for the adopted-alive cases below, actively running
+            # with a real pid) so a LATER poll must never re-enter this
+            # adoption branch and re-derive adoption evidence every poll.
+            job.pop("state", None)
+            job["adopted"] = "result_already_written"
+            _trace(cursor, "attended.smoke_job_adopted", {
+                "stage_id": stage_id, "call_key": call_key,
+                "reason": "result_already_written",
+            })
+            return job
+
+        # (1) Worker-level launch evidence (D follow-up): the worker writes
+        # its OWN pid + identity to the marker as the very first action in
+        # `main()`, before any slow import/detect/spawn work -- this is
+        # proof of life well before the P2-2 sidecar (written only once the
+        # worker has gotten as far as spawning the smoke child) can exist.
+        # An identity-verified marker is adopted immediately, no bound wait
+        # needed: the worker still writes the result/sidecar as today, this
+        # just lets the caller's job dict track the REAL worker pid instead
+        # of treating the reservation as unresolved.
+        marker = _smoke_job.read_worker_marker(marker_path)
+        worker_pid = marker.get("pid") if marker else None
+        worker_identity = marker.get("pid_identity") if marker else None
+        if (isinstance(worker_pid, int) and worker_pid > 0
+                and _is_pid_alive(worker_pid)
+                and _is_same_process(worker_pid, worker_identity)):
+            job = dict(existing)
+            job.update(paths)
+            job.pop("state", None)
+            job.setdefault("started_at", existing.get("reserved_at") or _time.time())
+            job["deadline"] = (
+                float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60)
+            job["pid"] = worker_pid
+            job["pid_identity"] = worker_identity
+            job["adopted"] = "worker_marker_alive"
+            _trace(cursor, "attended.smoke_job_adopted", {
+                "stage_id": stage_id, "call_key": call_key,
+                "reason": "worker_marker_alive", "worker_pid": worker_pid,
+            })
+            return job
+
+        sidecar = _read_adoption_sidecar(sidecar_path)
+        smoke_pid = sidecar.get("pid") if sidecar else None
+        smoke_identity = sidecar.get("pid_identity") if sidecar else None
+        if isinstance(smoke_pid, int) and smoke_pid > 0 and _is_pid_alive(smoke_pid):
+            # (B) durable identity fix (cross-vendor judge finding):
+            # `_is_pid_alive` alone only proves SOME process currently
+            # holds this pid -- if the real smoke child already exited
+            # and the OS reused the pid, adopting it here would attach
+            # this stage's lifecycle (and, on a later poll, kill
+            # authority) to an unrelated process. Verify identity first.
+            if _is_same_process(smoke_pid, smoke_identity):
                 job = dict(existing)
                 job.update(paths)
-                # Clear the "launching" marker -- this job is now resolved
-                # (or, for the sidecar-alive case below, actively running
-                # with a real pid) so a LATER poll must never re-enter this
-                # adoption branch and re-derive adoption evidence every poll.
                 job.pop("state", None)
-                job["adopted"] = "result_already_written"
+                job.setdefault("started_at", existing.get("reserved_at") or _time.time())
+                job["deadline"] = (
+                    float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60)
+                # P2-3 adoption note: this "pid" now tracks the SMOKE
+                # CHILD (from the sidecar), not a worker -- there is no
+                # live worker left to poll (that is exactly why adoption
+                # fired). Downstream `is_pid_alive(pid)`/
+                # `kill_process_tree(pid)` calls work identically against
+                # either kind of pid, and `pid_identity` travels with it
+                # so a LATER deadline-kill can still verify sameness.
+                job["pid"] = smoke_pid
+                job["pid_identity"] = smoke_identity
+                job["adopted"] = "sidecar_pid_alive"
                 _trace(cursor, "attended.smoke_job_adopted", {
                     "stage_id": stage_id, "call_key": call_key,
-                    "reason": "result_already_written",
+                    "reason": "sidecar_pid_alive", "smoke_pid": smoke_pid,
                 })
                 return job
-
-            sidecar = _read_adoption_sidecar(sidecar_path)
-            smoke_pid = sidecar.get("pid") if sidecar else None
-            smoke_identity = sidecar.get("pid_identity") if sidecar else None
-            if isinstance(smoke_pid, int) and smoke_pid > 0 and _is_pid_alive(smoke_pid):
-                # (B) durable identity fix (cross-vendor judge finding):
-                # `_is_pid_alive` alone only proves SOME process currently
-                # holds this pid -- if the real smoke child already exited
-                # and the OS reused the pid, adopting it here would attach
-                # this stage's lifecycle (and, on a later poll, kill
-                # authority) to an unrelated process. Verify identity first.
-                if _is_same_process(smoke_pid, smoke_identity):
-                    job = dict(existing)
-                    job.update(paths)
-                    job.pop("state", None)
-                    job.setdefault("started_at", existing.get("reserved_at") or _time.time())
-                    job["deadline"] = (
-                        float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60)
-                    # P2-3 adoption note: this "pid" now tracks the SMOKE
-                    # CHILD (from the sidecar), not a worker -- there is no
-                    # live worker left to poll (that is exactly why adoption
-                    # fired). Downstream `is_pid_alive(pid)`/
-                    # `kill_process_tree(pid)` calls work identically against
-                    # either kind of pid, and `pid_identity` travels with it
-                    # so a LATER deadline-kill can still verify sameness.
-                    job["pid"] = smoke_pid
-                    job["pid_identity"] = smoke_identity
-                    job["adopted"] = "sidecar_pid_alive"
-                    _trace(cursor, "attended.smoke_job_adopted", {
-                        "stage_id": stage_id, "call_key": call_key,
-                        "reason": "sidecar_pid_alive", "smoke_pid": smoke_pid,
-                    })
-                    return job
-                # A live pid whose identity does not match (or cannot be
-                # verified) is NOT evidence of a live worker -- record it for
-                # the lost-reason trace below and stop polling; retrying
-                # would only ever see the same mismatched pid again.
-                mismatch_pid = smoke_pid
-                break
-            if _attempt < _ADOPT_LOST_GRACE_RETRIES:
-                _time.sleep(_ADOPT_LOST_GRACE_INTERVAL_S)
-
-        # No evidence of a live or completed job even after the bounded
-        # grace window — the previous reservation never got far enough to
-        # leave anything observable (or the only evidence found was a
-        # pid-identity mismatch). Resolve as a lost job (never spawn a
-        # second worker for this call_key).
-        if mismatch_pid is not None:
+            # A live sidecar pid whose identity does not match (or cannot be
+            # verified) is proof of the OPPOSITE of "still launching" -- the
+            # real smoke child already exited and this pid was reused, so
+            # further waiting inside the startup bound would only ever see
+            # the same mismatched pid again. Resolve as lost immediately,
+            # without waiting for the startup bound to elapse.
             reason = (
                 "smoke job reservation's sidecar pid "
-                f"({mismatch_pid}) is alive but is NOT the recorded smoke "
+                f"({smoke_pid}) is alive but is NOT the recorded smoke "
                 "child (identity mismatch / unverifiable) — refusing to "
                 "adopt it and treating the reservation as lost rather than "
                 "spawning a second worker for the same call_key"
             )
-        else:
-            reason = (
-                "smoke job reservation found no live worker to adopt (no result "
-                "file, no live sidecar pid) — treating as lost rather than "
-                "spawning a second worker for the same call_key"
-            )
+            _trace(cursor, "attended.smoke_job_reservation_lost", {
+                "stage_id": stage_id, "call_key": call_key, "reason": reason,
+            })
+            job = dict(existing)
+            job.update(paths)
+            job.pop("state", None)
+            job["spawn_error"] = reason
+            return job
+
+        # (2) No adoptable evidence yet (no result, no verified worker
+        # marker, no live-and-verified sidecar pid; an unverified/mismatched
+        # marker counts as "no evidence", not proof of anything). This is
+        # the ordinary in-flight shape for a worker that simply has not
+        # gotten far enough yet -- NON-terminal as long as the reservation
+        # is still within its startup bound (`HYDRA_SMOKE_LAUNCH_GRACE_S`,
+        # default 60s, measured from `reserved_at`). Returning the
+        # unresolved reservation here (still `state: "launching"`, no pid,
+        # no spawn_error) tells the caller (`poll_smoke_job`) to report
+        # "still pending" and poll again later -- never blocks THIS call,
+        # never finalizes lost inside the window.
+        reserved_at = existing.get("reserved_at")
+        age_s = (
+            _time.time() - float(reserved_at)
+            if isinstance(reserved_at, (int, float)) else float("inf")
+        )
+        grace_s = _smoke_launch_grace_s()
+        if age_s < grace_s:
+            job = dict(existing)
+            job.update(paths)
+            return job
+
+        # Past the startup bound with still no verified worker/sidecar/
+        # result — the previous reservation never got far enough to leave
+        # anything observable. Resolve as a lost job (never spawn a second
+        # worker for this call_key).
+        reason = (
+            "smoke job reservation found no live worker to adopt (no result "
+            "file, no verified worker-marker pid, no live sidecar pid) after "
+            f"the {grace_s:g}s startup bound (HYDRA_SMOKE_LAUNCH_GRACE_S) — "
+            "treating as lost rather than spawning a second worker for the "
+            "same call_key"
+        )
         _trace(cursor, "attended.smoke_job_reservation_lost", {
             "stage_id": stage_id, "call_key": call_key, "reason": reason,
+            "age_s": age_s, "grace_s": grace_s,
         })
         job = dict(existing)
         job.update(paths)
@@ -3130,6 +3215,13 @@ def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
             if cursor.get("state") in _TERMINAL:
                 cursor.setdefault("terminal_call_key", call_key)
             return False
+        if job.get("state") == "launching":
+            # (D) still within the startup bound (`HYDRA_SMOKE_LAUNCH_GRACE_S`)
+            # with no adoptable evidence yet -- non-terminal, exactly like a
+            # running job: report "still pending" and let the caller poll
+            # again later. Never falls through to `poll_job` below (which
+            # would treat the still-`None` pid as a vanished worker).
+            return True
     result = _smoke_job.poll_job(job)
     if result is None:
         return True
