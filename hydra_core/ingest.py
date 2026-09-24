@@ -744,18 +744,34 @@ def dispatch_ingested_envelopes(
                 continue
 
             from .artifact_store import ArtifactStoreError, write_repo_artifact
-            from .plan_artifact import plan_slug, render_plan_html
-            repo_root = getattr(dispatcher, "project_root", None)
+            from .plan_artifact import (
+                plan_artifact_repo_root, plan_slug, render_plan_html,
+            )
+            default_root = getattr(dispatcher, "project_root", None)
+            resolved_repo_root: Path | None = None
+            resolved_repo_id: str | None = None
             try:
-                if repo_root is None:
+                if default_root is None:
                     raise ArtifactStoreError(
                         "dispatcher has no project_root; cannot write the plan artifact"
                     )
+                # Operator decision 2026-09-24: the plan artifact belongs in
+                # the workflow's TARGET repo's docs/plans/, not Hydra's own
+                # working tree -- `plan_artifact_repo_root` resolves
+                # `state.target_repo_id` through the SAME allow-listed
+                # `repo_registry` every engineering dispatch already uses,
+                # falling back to `default_root` (Hydra) when there is no
+                # single engineering target or resolution fails.
+                resolved_repo_root, resolved_repo_id = plan_artifact_repo_root(
+                    state, default_root, emit=_emit,
+                )
                 slug = plan_slug(
                     getattr(plan_env, "goal_restatement", "") or "", plan_env.workflow_id
                 )
                 html_text = render_plan_html(plan_env)
-                ref = write_repo_artifact(repo_root, f"docs/plans/{slug}.html", html_text)
+                ref = write_repo_artifact(
+                    resolved_repo_root, f"docs/plans/{slug}.html", html_text,
+                )
                 artifact_ref = ref.model_dump(mode="json")
             except (ArtifactStoreError, OSError, ValueError) as exc:
                 # Cross-vendor judge finding (item 2/4): `render_plan_html`
@@ -792,6 +808,14 @@ def dispatch_ingested_envelopes(
                 "plan_envelope_id": str(plan_env.id),
                 "plan_ref": plan_env.model_dump(mode="json"),
                 "plan_artifact_location": artifact_ref.get("key"),
+                # Recorded in the SAME patch that sets `plan_artifact_location`
+                # (explicit write, replace-channel semantics -- see the
+                # LangGraph LastValue-clear note on `HydraState`) so every
+                # later reader (node_plan_judge's re-render, the force-dispatch
+                # governance note, --critique-ref) agrees on the same root
+                # without re-deriving it from `target_repo_id`.
+                "plan_artifact_repo_id": resolved_repo_id,
+                "plan_artifact_root": str(resolved_repo_root),
                 "plan_revision": plan_env.plan_revision,
             }
             outcome.items.append(IngestItemResult(
@@ -802,6 +826,8 @@ def dispatch_ingested_envelopes(
             _emit("ingest.plan_drafted", {
                 "envelope_id": eid, "artifact": artifact_ref,
                 "revision": plan_env.plan_revision,
+                "repo_id": resolved_repo_id,
+                "repo_root": str(resolved_repo_root),
             })
             continue
 

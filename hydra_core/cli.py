@@ -1457,7 +1457,7 @@ def _plan_artifact_relpath(location: str | None) -> str | None:
 
 
 def _append_plan_governance_note(
-    project: Path, wf: str, plan_artifact_location: str | None, note: str,
+    project: Path, wf: str, values: dict | None, note: str,
 ) -> None:
     """Best-effort: append ``note`` to the tracked plan artifact's Governance
     Notes section (see `hydra_core.plan_artifact.append_governance_note`).
@@ -1489,17 +1489,33 @@ def _append_plan_governance_note(
     by which point the (potentially path-escaping) read had already
     happened. One containment check, shared with the write path, not a
     second hand-rolled one (see `_read_plan_critique`'s sibling comment).
+
+    ``values`` is the checkpoint's `HydraState` values dict (``snap.values``,
+    the same shape every other resume-time reader in this module already
+    has), not just the bare `plan_artifact_location` string -- operator
+    decision 2026-09-24: the note must land in the SAME repo the plan
+    artifact was actually written to (`hydra_core.plan_artifact.
+    plan_artifact_repo_root`, which prefers the recorded
+    `plan_artifact_root`/`plan_artifact_repo_id` on ``values`` and falls back
+    to ``project`` -- the Hydra checkout -- for a legacy checkpoint or a
+    workflow with no single engineering target, unchanged from before this
+    fix).
     """
+    values = values if isinstance(values, dict) else {}
+    plan_artifact_location = values.get("plan_artifact_location")
     relpath = _plan_artifact_relpath(plan_artifact_location)
     if relpath is None:
         return
     try:
         from .artifact_store import resolve_repo_artifact_path, write_repo_artifact
-        from .plan_artifact import append_governance_note
-        full = resolve_repo_artifact_path(project, relpath)
+        from .plan_artifact import append_governance_note, plan_artifact_repo_root
+        repo_root, _ = plan_artifact_repo_root(
+            values, project, emit=lambda k, p: emit(project, wf, k, p),
+        )
+        full = resolve_repo_artifact_path(repo_root, relpath)
         existing = full.read_text(encoding="utf-8") if full.is_file() else ""
         updated = append_governance_note(existing, note)
-        write_repo_artifact(project, relpath, updated)
+        write_repo_artifact(repo_root, relpath, updated)
     except Exception as exc:  # noqa: BLE001 — fail-soft (never block the resume), but say so
         try:
             emit(project, wf, "plan_governance_note_failed", {
@@ -1516,7 +1532,7 @@ class _PlanCritiqueError(ValueError):
     or empty content)."""
 
 
-def _read_plan_critique(ref: str, project: Path) -> str:
+def _read_plan_critique(ref: str, project: Path, values: dict | None = None) -> str:
     """Resolve `--critique-ref` (a file path or a `repo:artifact:<path>`
     MemoryRef key) to the operator's full, untruncated revision critique.
 
@@ -1544,20 +1560,35 @@ def _read_plan_critique(ref: str, project: Path) -> str:
     before comparing follows the symlink to its real target. Refusal is
     always `_PlanCritiqueError`, never a bare OSError/ValueError leaking the
     filesystem's own message.
+
+    ``values`` (the checkpoint's `HydraState` values dict, optional --
+    unset/``None`` behaves exactly as before this parameter existed)
+    resolves a `repo:artifact:<path>` ref against the SAME root
+    `hydra_core.plan_artifact.plan_artifact_repo_root` recorded when the
+    plan artifact was first written (operator decision 2026-09-24: the
+    artifact lives in the workflow's target repo, not necessarily
+    ``project`` / the Hydra checkout) -- falling back to ``project`` for a
+    legacy checkpoint or a workflow with no single engineering target,
+    unchanged from before this fix. A plain (non-MemoryRef) ``ref`` is
+    always resolved against ``project`` -- it never named a repo artifact
+    in the first place.
     """
     ref = (ref or "").strip()
     if not ref:
         raise _PlanCritiqueError("empty --critique-ref")
     relpath = _plan_artifact_relpath(ref)
     if relpath is not None:
-        raw_candidate = Path(project) / relpath
+        from .plan_artifact import plan_artifact_repo_root
+        boundary_root, _ = plan_artifact_repo_root(values or {}, project)
+        raw_candidate = Path(boundary_root) / relpath
     else:
+        boundary_root = project
         raw_candidate = Path(ref)
         if not raw_candidate.is_absolute():
             raw_candidate = Path(project) / raw_candidate
 
     try:
-        project_root = Path(project).resolve()
+        project_root = Path(boundary_root).resolve()
     except OSError as exc:
         raise _PlanCritiqueError(f"could not resolve project root: {exc}") from exc
     try:
@@ -2708,7 +2739,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             }), file=sys.stderr)
             return 1
         try:
-            _critique_text = _read_plan_critique(_critique_ref, project)
+            _critique_text = _read_plan_critique(_critique_ref, project, values)
         except _PlanCritiqueError as exc:
             print(_cli_json_dumps({"error": str(exc)}), file=sys.stderr)
             return 1
@@ -2845,7 +2876,7 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             }
             patch["hitl_history"] = [resolution, _bypass_note]
             _append_plan_governance_note(
-                project, wf, values.get("plan_artifact_location"),
+                project, wf, values,
                 "dispatch proceeded without plan approval (force-dispatch, "
                 f"resolved_at={resolution['resolved_at']})",
             )

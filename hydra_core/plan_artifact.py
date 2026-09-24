@@ -37,7 +37,8 @@ import hashlib
 import html
 import re
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .schemas import Plan, PlanStep
 from .strict_json import dumps_strict
@@ -48,10 +49,119 @@ __all__ = [
     "append_governance_note",
     "extract_governance_section",
     "extract_plan_provenance",
+    "plan_artifact_repo_root",
     "plan_slug",
     "render_plan_html",
     "render_plan_json",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Repo-root resolution (operator decision 2026-09-24)
+# ---------------------------------------------------------------------------
+
+
+def _get_field(state_or_values: Any, key: str) -> Any:
+    """Read ``key`` off either a `HydraState` instance or a plain checkpoint
+    ``values`` dict -- the two shapes every call site in this codebase has on
+    hand (a live graph node has the former; `cli.py`'s resume/ingest helpers,
+    working from `snap.values`, have the latter)."""
+    if isinstance(state_or_values, dict):
+        return state_or_values.get(key)
+    return getattr(state_or_values, key, None)
+
+
+def plan_artifact_repo_root(
+    state_or_values: Any,
+    default_root: Path | str,
+    *,
+    emit: Optional[Callable[[str, dict], None]] = None,
+) -> tuple[Path, Optional[str]]:
+    """Resolve the repo root a plan artifact must be read from / written to.
+
+    One shared resolver for every plan-artifact reader/writer (`hydra_core.
+    ingest`'s PLAN branch, `hydra_core.supervisor`'s `node_plan_judge` verdict
+    re-render, `hydra_core.cli`'s force-dispatch governance note, and
+    `--critique-ref repo:artifact:<path>` resolution) so a write and every
+    later read always agree on the same directory.
+
+    Precedence:
+      1. A previously RECORDED root (``plan_artifact_repo_id`` /
+         ``plan_artifact_root`` on ``state_or_values``) wins outright -- this
+         is what makes every reader after the first write agree with it,
+         even across a process boundary (a `--critique-ref` resume, a later
+         `node_plan_judge` re-render) where re-deriving from
+         ``target_repo_id`` alone could in principle drift if the workflow's
+         target were ever mutated mid-flight. If the recorded path no longer
+         exists as a directory (moved, deleted, a stale/corrupted
+         checkpoint), fall back to ``default_root`` and say why.
+      2. No recorded root yet (the FIRST write, `hydra_core.ingest`'s PLAN
+         branch): resolve the workflow's single engineering target via
+         ``hydra_core.repo_registry.resolve_repo_path`` -- reusing that
+         module's own allow-list / base-escape / git-toplevel checks, never
+         re-implementing them here. Only ``target_repo_id`` (never
+         ``target_repo_subpath``) is used: the plan artifact always lives at
+         the target REPO's ``docs/plans/``, not under a fleet subpath.
+      3. No single engineering target at all (no ``target_repo_id``, or
+         ``target_repo_ids`` is non-empty -- fleet/multi-repo mode has no one
+         answer) -- or resolution of an id that IS set fails (unknown repo,
+         escaped base, not a git repo) -- fall back to ``default_root`` (the
+         Hydra project root callers already had). Fail-soft: a plan must
+         never be lost over a repo-targeting problem. A resolution FAILURE
+         (case 3's second half) emits a trace event naming the reason via
+         ``emit`` when provided; a workflow that simply never named a target
+         repo (the common non-engineering-workflow case) does not -- that is
+         expected, unchanged behaviour, not a fallback worth flagging.
+
+    Returns ``(root, repo_id)`` -- ``repo_id`` is the resolved
+    ``hydra_core.repo_registry`` id (or the previously recorded one) on
+    success, ``None`` whenever ``root`` is ``default_root``.
+    """
+    default_root = Path(default_root)
+
+    recorded_root = _get_field(state_or_values, "plan_artifact_root")
+    if recorded_root:
+        try:
+            candidate = Path(recorded_root)
+            if candidate.is_dir():
+                recorded_repo_id = _get_field(state_or_values, "plan_artifact_repo_id")
+                return candidate, (str(recorded_repo_id) if recorded_repo_id else None)
+        except Exception:  # noqa: BLE001 -- a hostile/corrupt value falls through below
+            pass
+        if emit is not None:
+            try:
+                emit("plan_artifact_repo_root_fallback", {
+                    "reason": "recorded plan_artifact_root no longer resolves to a directory",
+                    "recorded_root": str(recorded_root),
+                })
+            except Exception:  # noqa: BLE001 -- tracing must never break resolution
+                pass
+        return default_root, None
+
+    target_repo_id = _get_field(state_or_values, "target_repo_id")
+    target_repo_ids = _get_field(state_or_values, "target_repo_ids") or []
+    if not target_repo_id or list(target_repo_ids):
+        # No single engineering target: either none was ever set (the
+        # common case for a non-engineering workflow, or one that hasn't
+        # resolved --repo yet), or this is fleet/multi-repo mode, which has
+        # no single answer by design. Neither is a "resolution failure" --
+        # both are expected states, so no trace event.
+        return default_root, None
+
+    try:
+        from .repo_registry import resolve_repo_path
+        root = resolve_repo_path(str(target_repo_id))
+    except Exception as exc:  # noqa: BLE001 -- fail-soft: never lose the plan
+        if emit is not None:
+            try:
+                emit("plan_artifact_repo_root_fallback", {
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "target_repo_id": str(target_repo_id),
+                })
+            except Exception:  # noqa: BLE001 -- tracing must never break resolution
+                pass
+        return default_root, None
+    return root, str(target_repo_id)
 
 
 # ---------------------------------------------------------------------------
