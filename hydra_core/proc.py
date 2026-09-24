@@ -26,8 +26,10 @@ __all__ = [
     "kill_process_tree",
     "is_pid_alive",
     "detached_popen_kwargs",
+    "popen_detached",
     "process_identity",
     "is_same_process",
+    "is_infra_interrupt_returncode",
 ]
 
 
@@ -75,7 +77,7 @@ def run_text(cmd: Any, **kwargs: Any) -> "subprocess.CompletedProcess[str]":
     )
 
 
-def detached_popen_kwargs() -> dict[str, Any]:
+def detached_popen_kwargs(*, breakaway: bool = True) -> dict[str, Any]:
     """``creationflags``/``start_new_session`` kwargs for a process that must
     survive its parent's death (Hydra#70 smoke job).
 
@@ -86,6 +88,23 @@ def detached_popen_kwargs() -> dict[str, Any]:
     POSIX: ``start_new_session=True`` (new session/process group) so the
     child is not in the parent's process group and survives a
     ``SIGTERM``/``SIGKILL`` sent to the parent alone.
+
+    Hydra#70 follow-up (grandchild survives the WORKER but not the HOST
+    SESSION): the flags above detach the child from the direct parent's own
+    console/job object, but do NOT necessarily escape a job object that the
+    PARENT's own process tree is itself enrolled in (e.g. the attended host
+    session's job object, a CI runner that groups its whole process tree) --
+    tearing down THAT job object can still reach down and kill every process
+    still assigned to it, "detached" or not. ``breakaway=True`` (the
+    default) additionally requests ``CREATE_BREAKAWAY_FROM_JOB`` on Windows
+    so the child escapes the CURRENT job object when it permits breakaway
+    (``JOB_OBJECT_LIMIT_BREAKAWAY_OK``). Not every job object allows this --
+    when it does not, ``CreateProcess`` fails and ``subprocess.Popen`` raises
+    ``OSError``/``PermissionError``; callers should use :func:`popen_detached`
+    rather than this function directly, which retries the same spawn with
+    ``breakaway=False`` on that failure instead of failing the spawn
+    outright. ``breakaway=False`` is exposed here only for that retry (and
+    for tests) -- new call sites should prefer :func:`popen_detached`.
     """
     if os.name == "nt":
         flags = (
@@ -93,8 +112,64 @@ def detached_popen_kwargs() -> dict[str, Any]:
             | getattr(subprocess, "DETACHED_PROCESS", 0)
             | no_window_creationflags()
         )
+        if breakaway:
+            flags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
         return {"creationflags": flags}
     return {"start_new_session": True}
+
+
+def popen_detached(cmd: Any, **kwargs: Any) -> "subprocess.Popen[Any]":
+    """Spawn ``cmd`` fully detached (:func:`detached_popen_kwargs`), with a
+    Windows-only breakaway fallback (Hydra#70 follow-up).
+
+    On Windows, first attempts the spawn WITH ``CREATE_BREAKAWAY_FROM_JOB``
+    (``breakaway=True``) so the child escapes the current job object (see
+    :func:`detached_popen_kwargs`'s docstring for why that matters beyond
+    the plain detached flags). When the current job object does not permit
+    breakaway, ``subprocess.Popen`` raises ``OSError`` (frequently
+    ``PermissionError``, a subclass of ``OSError``) whose ``winerror`` is
+    exactly ``5`` (``ERROR_ACCESS_DENIED``) -- this, and ONLY this specific
+    condition, retries the IDENTICAL spawn once more WITHOUT the breakaway
+    flag rather than letting the caller's spawn fail outright. Any OTHER
+    ``OSError`` (a missing executable -- ``FileNotFoundError``, winerror
+    ``2``; a different access failure; a malformed argv) is a genuine
+    launch failure unrelated to breakaway and re-raises immediately, WITHOUT
+    a second ``Popen`` attempt -- retrying it would mask the real error
+    while still failing identically the second time.
+
+    What remains out of reach even with a successful breakaway: a full
+    desktop logoff/shutdown that tears down the SESSION itself (not merely a
+    job object) can still reap a detached child depending on how Windows
+    session termination is configured for that station -- breakaway only
+    ever addresses job-object-scoped kills (the parent's own console/job,
+    a CI runner's or host session's process-tree job object), not a
+    session-wide teardown.
+
+    POSIX: no job-object concept exists; this is a thin pass-through to
+    ``subprocess.Popen`` with :func:`detached_popen_kwargs`'s
+    ``start_new_session=True``.
+    """
+    if os.name != "nt":
+        return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs())
+    try:
+        return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs(breakaway=True))
+    except OSError as e:
+        # Only the breakaway-denied condition falls back to a second spawn
+        # without the flag. On Windows, `CreateProcess` failing because the
+        # current job object does not permit breakaway
+        # (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` unset) surfaces to Python as an
+        # `OSError`/`PermissionError` whose `winerror` attribute is exactly
+        # `5` (`ERROR_ACCESS_DENIED`) -- CPython's `subprocess` module maps
+        # that Win32 error verbatim onto the raised exception's `winerror`.
+        # Any OTHER `OSError` (a missing executable -> `FileNotFoundError`,
+        # winerror 2 `ERROR_FILE_NOT_FOUND`; a different access failure; a
+        # malformed argv) is a genuine launch failure unrelated to the
+        # breakaway flag and must propagate immediately -- retrying it
+        # without breakaway would silently mask the real error and still
+        # fail identically on the second attempt anyway.
+        if getattr(e, "winerror", None) != 5:
+            raise
+        return subprocess.Popen(cmd, **kwargs, **detached_popen_kwargs(breakaway=False))
 
 
 def kill_process_tree(pid: int | None, *, timeout: int = 20) -> bool:
@@ -303,3 +378,104 @@ def is_same_process(pid: "int | None", recorded_identity: Any) -> bool:
     if current is None:
         return False
     return current == recorded_identity
+
+
+# --------------------------------------------------------------------------- #
+# Infra-interrupt exit-code classification (Hydra#70 follow-up).             #
+#                                                                             #
+# A smoke child killed by something EXTERNAL to the run under test -- Ctrl-C #
+# propagated by console attach, a DLL failing to init because the desktop    #
+# session is logging off, the whole process tree torn down mid-run -- exits  #
+# with one of a small, well-known set of codes.  A smoke classifier that     #
+# treats those the same as a genuine test failure (`fail`) discards an       #
+# already-judged, already-passing commit for a reason that has nothing to do #
+# with the code under test.  Shared by both smoke classifier call sites      #
+# (`squad_node._run_smoke`, `smoke_job._run_smoke_tracked`) so the           #
+# classification never drifts between them.                                 #
+# --------------------------------------------------------------------------- #
+
+# Windows NTSTATUS values (unsigned 32-bit form) that denote the process was
+# torn down by something external to the run itself, not by the program's
+# own logic:
+#   0xC000013A STATUS_CONTROL_C_EXIT           -- Ctrl-C / Ctrl-Break delivered
+#   0xC000026B STATUS_DLL_INIT_FAILED_LOGOFF   -- DLL init failed during logoff
+#   0xC0000142 STATUS_DLL_INIT_FAILED          -- DLL init failed (desktop
+#                                                  teardown / session churn)
+_WIN_INFRA_NTSTATUS: frozenset[int] = frozenset({
+    0xC000013A,
+    0xC000026B,
+    0xC0000142,
+})
+
+# POSIX: killed by SIGHUP(1)/SIGINT(2)/SIGKILL(9)/SIGTERM(15) -- either
+# observed directly as Python's `returncode == -signum` (the child was
+# reaped by this process, e.g. `Popen.communicate()`), or via the
+# `128 + signum` convention a shell/wrapper uses when IT reports the exit
+# status of a process it ran that died from that signal. Hardcoded numeric
+# values (not `signal.SIGHUP` etc.) because those constants are unavailable
+# on the `signal` module on Windows, and the numeric values themselves are
+# stable across every POSIX platform.
+_POSIX_INFRA_SIGNALS: frozenset[int] = frozenset({1, 2, 9, 15})
+_POSIX_INFRA_128_PLUS_N: frozenset[int] = frozenset(128 + n for n in _POSIX_INFRA_SIGNALS)
+
+
+def is_infra_interrupt_returncode(
+    returncode: "int | None", *, platform_is_windows: "bool | None" = None
+) -> bool:
+    """``True`` when ``returncode`` denotes the process was interrupted by
+    something EXTERNAL to the program under test (external Ctrl-C, a
+    session logoff mid-run, a signal delivered from outside), never a
+    genuine non-zero exit from the program's own logic.
+
+    Critique follow-up: the POSIX signal-death shapes (a negative
+    ``returncode``, or the ``128 + N`` shell/wrapper convention) are POSIX-
+    only conventions. On Windows, 129/130/137/143 etc. are ordinary,
+    unrelated application exit codes a real smoke command can legitimately
+    return on a genuine failure -- treating them as "interrupted" there
+    would excuse a real smoke failure as retryable infra. Likewise the
+    Windows NTSTATUS values are a Windows-only concept. This function is
+    therefore platform-gated: which shape it checks depends on
+    ``platform_is_windows`` (defaults to the ACTUAL running platform,
+    ``os.name == "nt"``, but is exposed as a keyword so tests can exercise
+    both platforms' behaviour deterministically regardless of which OS
+    pytest itself runs on).
+
+    On Windows (``platform_is_windows`` true):
+      - matches the raw Windows NTSTATUS values above, in EITHER their
+        unsigned 32-bit form (``3221225786`` -- what a wrapper/shell
+        typically reports as ITS OWN propagated exit code, e.g. ``node``
+        printing ``ctest exited 3221225786``) or Python's signed 32-bit
+        ``Popen.returncode`` form for the same value (a negative
+        ``returncode`` is normalized to unsigned before the NTSTATUS
+        comparison)
+      - does NOT match the POSIX signal-death shapes at all
+
+    On POSIX (``platform_is_windows`` false):
+      - matches a POSIX signal death: ``returncode == -N`` (Python's own
+        convention when it reaped the child) or ``returncode == 128 + N``
+        (a shell/wrapper's reported exit status for a signal-killed child)
+        for SIGHUP/SIGINT/SIGKILL/SIGTERM
+      - does NOT match the Windows NTSTATUS shapes at all (they are far
+        outside any plausible POSIX exit-code range in practice, but the
+        explicit platform gate keeps the contract unambiguous either way)
+
+    Deliberately conservative: a returncode that does not match one of these
+    known external-interruption shapes returns ``False`` -- callers must
+    still run their own infra-marker checks (e.g. a launcher-pattern regex)
+    for other infra classes; this function is only ever ONE contributing
+    signal, not the sole infra classifier.
+    """
+    if returncode is None:
+        return False
+    try:
+        rc = int(returncode)
+    except (TypeError, ValueError):
+        return False
+    is_windows = (os.name == "nt") if platform_is_windows is None else platform_is_windows
+    if not is_windows:
+        if rc < 0:
+            return -rc in _POSIX_INFRA_SIGNALS
+        return rc in _POSIX_INFRA_128_PLUS_N
+    if rc < 0:
+        rc &= 0xFFFFFFFF  # normalize a signed NTSTATUS-shaped value to unsigned
+    return rc in _WIN_INFRA_NTSTATUS

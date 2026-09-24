@@ -44,10 +44,11 @@ from pathlib import Path
 from typing import Any
 
 from .proc import (
-    detached_popen_kwargs,
+    is_infra_interrupt_returncode,
     is_pid_alive,
     is_same_process,
     kill_process_tree,
+    popen_detached,
     process_identity,
 )
 from .strict_json import dumps_strict
@@ -266,10 +267,16 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         )
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "ab") as log_f:
-            proc = subprocess.Popen(  # noqa: S603 — fixed argv, validated tokens
+            # Hydra#70 follow-up: `popen_detached` requests
+            # `CREATE_BREAKAWAY_FROM_JOB` on Windows (falling back cleanly
+            # to a spawn without it when the current job object does not
+            # permit breakaway) so this worker -- and everything it spawns
+            # in turn -- survives a teardown of the job object the HOST
+            # SESSION's own process tree is enrolled in, not just the
+            # direct parent's console.
+            proc = popen_detached(  # noqa: S603 — fixed argv, validated tokens
                 cmd, cwd=str(Path(project_path)) if Path(project_path).exists() else None,
                 env=env, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
-                **detached_popen_kwargs(),
             )
     # Cross-vendor judge finding: narrowed from a bare `except Exception` --
     # that swallowed a `TypeError`/`AttributeError` from a genuine
@@ -714,12 +721,26 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
 
     Mirrors ``squad_node._run_smoke``'s command detection + classification so
     the async job and the (still-supported, sync-mode) inline path agree on
-    status semantics."""
+    status semantics -- via the SAME shared helpers
+    (:func:`hydra_core.proc.is_infra_interrupt_returncode`,
+    ``squad_node._smoke_infra_marker_hit``), never per-site copies.
+
+    Hydra#71 follow-up (cross-vendor judge finding): the full smoke
+    transcript is written OUTSIDE the candidate worktree here -- next to
+    ``sidecar_path`` (the attended cursor's directory, which already
+    survives worktree deletion; see ``smoke_job.job_paths``), not under
+    ``<project_path>/.harness/smoke`` (``project_path`` IS the worktree for
+    this async path, and gets deleted whole on a discarded merge). A caller
+    with no ``sidecar_path`` (a legacy/direct invocation) falls back to the
+    old ``project_path``-relative location via ``_write_smoke_log``'s own
+    default."""
     from .squad_node import (  # local import — see module docstring
-        _INFRA_SMOKE_RE,
         _detect_smoke_command_and_cwd,
+        _smoke_infra_marker_hit,
         _write_smoke_log,
     )
+
+    evidence_dir = str(Path(sidecar_path).parent) if sidecar_path else None
 
     cmd, smoke_cwd = _detect_smoke_command_and_cwd(project_path)
     if not cmd:
@@ -728,10 +749,14 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
     use_shell = os.name == "nt" and cmd[0].lower() in ("npm", "npx", "yarn", "pnpm")
     launch_cmd = " ".join(cmd) if use_shell else cmd
     try:
-        proc = subprocess.Popen(  # noqa: S603 — argv detected, not user text
+        # Hydra#70 follow-up: `popen_detached` -- see its docstring and
+        # `start_job`'s use of it above -- requests
+        # `CREATE_BREAKAWAY_FROM_JOB` on Windows (with a clean fallback)
+        # so the smoke command's own tree also escapes the current job
+        # object, not just this worker.
+        proc = popen_detached(  # noqa: S603 — argv detected, not user text
             launch_cmd, cwd=smoke_cwd, shell=use_shell,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            **detached_popen_kwargs(),
         )
     except Exception as e:  # noqa: BLE001 — launch failure is infra
         return "infra_error", f"smoke could not launch ({' '.join(cmd)}): {e!r}"[:300]
@@ -755,7 +780,7 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
         except Exception:  # noqa: BLE001
             out_bytes = b""
         combined = out_bytes.decode("utf-8", errors="replace") if out_bytes else ""
-        artifact = _write_smoke_log(project_path, stage_id, combined)
+        artifact = _write_smoke_log(project_path, stage_id, combined, evidence_dir=evidence_dir)
         log_suffix = f" :: full_log={artifact}" if artifact else ""
         return (
             "infra_error",
@@ -764,10 +789,17 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
         )
 
     label = " ".join(cmd)
-    if returncode != 0 and _INFRA_SMOKE_RE.search(combined):
-        artifact = _write_smoke_log(project_path, stage_id, combined)
+    # Hydra#70 follow-up: an EXTERNAL interruption (Ctrl-C propagation,
+    # session logoff mid-run) classifies as infra_error via the code-based
+    # classifier, independent of transcript text. Hydra#71 follow-up: the
+    # text-marker check matches only identifiable launcher/structured-error
+    # patterns, never a full-transcript substring search.
+    _interrupted = is_infra_interrupt_returncode(returncode)
+    if returncode != 0 and (_interrupted or _smoke_infra_marker_hit(combined)):
+        artifact = _write_smoke_log(project_path, stage_id, combined, evidence_dir=evidence_dir)
         tail = combined.strip().splitlines()[-1:] or [""]
-        reason = f"`{label}` exit={returncode} (infra) :: {tail[0]}"
+        _kind = "external interruption" if _interrupted else "infra"
+        reason = f"`{label}` exit={returncode} ({_kind}) :: {tail[0]}"
         if artifact:
             reason += f" :: full_log={artifact}"
         return "infra_error", reason[:2000]
@@ -775,7 +807,7 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
     status = "pass" if returncode == 0 else "fail"
     tail = combined.strip().splitlines()[-1:] or [""]
     if status == "fail":
-        artifact = _write_smoke_log(project_path, stage_id, combined)
+        artifact = _write_smoke_log(project_path, stage_id, combined, evidence_dir=evidence_dir)
         failed_lines = [ln for ln in combined.splitlines() if ln.startswith("FAILED ")][:20]
         reason = f"`{label}` exit={returncode} :: {tail[0]}"
         if failed_lines:
