@@ -307,6 +307,125 @@ class TestDefect1FullReconciliationOrdering:
 
 
 # =========================================================================== #
+# P1-3 (MEDIUM, cross-vendor gpt-6-astra) -- a planning-owned terminal
+# submit's charge+marker write (`attended_charge_applied`) failing must
+# never leave a LATER write in the same call smuggling the in-memory
+# -charged `state.budget` onto the checkpoint WITHOUT the marker. A
+# marker-less charged budget is indistinguishable, to a retry, from "never
+# charged" -- `charge_and_gate` then runs again on top of an already
+# -charged ledger, a real double charge.
+# =========================================================================== #
+
+class TestP1_3PlanningChargeWriteFailureNoUnmarkedBudgetLeak:
+    def test_charge_write_failure_then_retry_charges_exactly_once(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """MUTATION PROOF: drop the `_charge_write_persist_failed` guard
+        around the per-envelope ingest-loop write's `"budget"` key (cli.py)
+        and this fails -- the per-envelope write (which does NOT carry the
+        `attended_charge_applied` key, so `_FlakyKeyedSup`'s trigger never
+        catches IT) would still smuggle the freshly-charged budget onto the
+        checkpoint even though the charge+marker write itself failed. The
+        retry would then see no marker (still absent -- the smuggled budget
+        carries no proof), re-invoke `charge_and_gate` a SECOND time on TOP
+        of the already-persisted (but unmarked) charged budget, and the
+        checkpoint's final `budget.spent_usd` would land at 0.20 (two
+        charges) instead of 0.10 (one)."""
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task])
+        fake_sup = _FlakyKeyedSup(state.model_dump(mode="json"), "attended_charge_applied")
+
+        class _FakeDispatcher:
+            project_root = tmp_path
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        charge_calls: list[float] = []
+
+        def _fake_charge_and_gate(state, cost, toks, **_kw):
+            charge_calls.append(cost)
+            state.budget.spent_usd = float(state.budget.spent_usd) + float(cost)
+            return (False, False)
+        monkeypatch.setattr("hydra_core.governance.charge_and_gate", _fake_charge_and_gate)
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+        wf_id, task_id = str(wf), str(task.task_id)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+
+        # A VALID plan -- deliberately not an invalid one: an invalid plan
+        # also records `rejected_envelopes` on the cursor sidecar
+        # (`host_bridge.record_rejected_envelopes`), and `_step_result`
+        # unconditionally reports `status="envelopes_rejected"` for ANY
+        # cursor carrying that field (host_bridge.py) -- forever after,
+        # independent of the cursor's own terminal `state`. That would
+        # permanently take the retry's cached response OUT of this
+        # function's own `status in ("complete", ...)` gate, which is a
+        # separate, pre-existing defect this test does not aim to cover.
+        # A valid plan reaches the SAME per-envelope ingest-loop write
+        # this test targets (unconditional, independent of validity)
+        # without tripping that unrelated gate.
+        plan = _plan_dict(wf_id)
+        r0 = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.10, "tokens_in": 5, "tokens_out": 5,
+            "emitted_envelopes": [plan],
+        })
+        rc1, body1 = _submit(capsys, wf_id, task_id, call_key_0, r0)
+        assert rc1 == 1
+        assert body1.get("error") == "checkpoint_persist_failed"
+        values1 = fake_sup._values
+        assert not (values1.get("attended_charge_applied") or {}), (
+            "the failed charge+marker write must not have landed"
+        )
+        assert charge_calls == [0.10], "the charge itself still ran once this call"
+        # The load-bearing assertion: no LATER write in this same call may
+        # have persisted the charged budget onto the checkpoint without the
+        # marker that proves it.
+        _budget_after_call1 = (values1.get("budget") or {}).get("spent_usd")
+        assert not _budget_after_call1, (
+            "a marker-less charged budget must never reach the checkpoint: "
+            f"got spent_usd={_budget_after_call1!r} with no "
+            "attended_charge_applied marker to back it"
+        )
+
+        # Retry with the SAME call_key (still `already_charged` on the
+        # cursor sidecar from the first attempt). Because the FIRST call's
+        # own charge+marker write never landed anywhere (call1's asserts
+        # above prove that), `charge_and_gate` legitimately runs a SECOND
+        # time here -- that in-memory mutation from call1 was discarded
+        # along with its failed write, so this is a repair, not a double
+        # charge. The load-bearing invariant is the CHECKPOINT's final
+        # persisted budget: it must land exactly ONE charge's worth
+        # (0.10), never two (0.20), and it must always be accompanied by
+        # the marker once it does land.
+        rc2, body2 = _submit(capsys, wf_id, task_id, call_key_0, r0)
+        assert rc2 == 0, body2
+        assert charge_calls == [0.10, 0.10], (
+            f"charge_and_gate legitimately re-runs on a repair of its own "
+            f"failed write (call1's charge never landed anywhere); "
+            f"got {charge_calls}"
+        )
+        values2 = fake_sup._values
+        assert (values2.get("budget") or {}).get("spent_usd") == 0.10, (
+            "the checkpoint must land exactly ONE charge's worth, never two "
+            f"-- got {(values2.get('budget') or {}).get('spent_usd')!r}"
+        )
+        assert any((values2.get("attended_charge_applied") or {}).values()), (
+            "the marker must be present after the retry repairs the write"
+        )
+
+
+# =========================================================================== #
 # Defect 2 (HIGH) -- a terminal cursor refuses a different call_key instead
 # of returning (and re-billing) its cached result.
 # =========================================================================== #

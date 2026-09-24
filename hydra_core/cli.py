@@ -2777,6 +2777,38 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
                 if _modify_plan_prior_envelope_id else None
             ),
         )
+        # P1-2 (HIGH, cross-vendor gpt-6-astra): fold the WHOLE revision
+        # patch into the SAME `patch` dict the ordinary gate-resolution
+        # write below already fills (pending_hitl clear, hitl_history) --
+        # mirrors the abort/reject atomicity fix (commit 2d4fd5e,
+        # `_plan_terminal_option`/`_gate_terminal` folded into `patch`
+        # instead of writing it in a later, separate `sup.update_state`
+        # call). Previously this function wrote the ordinary resolution
+        # patch FIRST (clearing pending_hitl) and only fed this revision
+        # patch into `_reenter_graph_after_dispatch` (a SECOND
+        # `sup.update_state(..., as_node="dispatch")` call) after spool
+        # pruning and TheEights reconciliation, further down. A crash
+        # between the two writes left the OLD judged plan cleared of its
+        # gate with no revision task ever recorded -- not resumable via
+        # the pending-gate branch (no pending_hitl left) and not
+        # continuable via the revision task (it was never written).
+        # Folding both into ONE checkpoint write removes that window:
+        # spool prune / TheEights resolution still run AFTER this single
+        # write (fail-soft, as before), they only ever narrow an already-
+        # durable revision, never widen it. Every LastValue replace-
+        # channel field is still written explicitly (state.py's
+        # LastValue-clear rule) -- nothing here relies on an implicit
+        # retain.
+        patch["plan_status"] = "authoring"
+        patch["plan_revision"] = _modify_plan_new_revision
+        patch["tasks"] = [_modify_plan_task]
+        patch["plan_supersedes_expected"] = (
+            str(_modify_plan_prior_envelope_id)
+            if _modify_plan_prior_envelope_id else None
+        )
+        patch["plan_superseded_task_ids"] = list(
+            values.get("plan_superseded_task_ids") or []
+        )
 
     # F8: reflexion_override → approve_override_raise_to_N handler.
     # When the operator approves a reflexion_override gate with the raise-to-N
@@ -3015,6 +3047,15 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
             "gate-only approve/terminal must leave next==() so no later "
             f"invoke can run the next node headless; got {_plan_gate_next!r}"
         )
+    elif action == "modify-plan":
+        # P1-2: `patch` already carries the FULL revision payload (folded
+        # in above, alongside `_modify_plan_task`) -- write it as
+        # `as_node="dispatch"` in this SAME single call so `after_dispatch`
+        # fires fresh against the NEW `plan_status` ("authoring") once the
+        # graph is re-entered below, exactly like the ingest PLAN branch's
+        # `_reenter_graph_after_dispatch` idiom. There is no second
+        # checkpoint write for this action anymore.
+        sup.update_state(config, patch, as_node="dispatch")
     else:
         sup.update_state(config, patch)
 
@@ -3149,32 +3190,17 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
         # "authoring") is applied either way; only the invoke loop that would
         # actually run the graph is skipped under gate_only (see
         # `_reenter_graph_after_dispatch`'s gate_only docstring).
-        parked_at = _reenter_graph_after_dispatch(sup, config, {
-            "plan_status": "authoring",
-            "plan_revision": _modify_plan_new_revision,
-            "tasks": [_modify_plan_task],
-            # Hydra#69 follow-up defect 3: stamp the expected predecessor
-            # HERE, once, when the revision is opened -- never overwritten by
-            # a later (possibly failed-then-retried) re-entry. See
-            # `plan_supersedes_expected`'s docstring (state.py).
-            "plan_supersedes_expected": (
-                str(_modify_plan_prior_envelope_id)
-                if _modify_plan_prior_envelope_id else None
-            ),
-            # Hydra#69 follow-up defect 5: explicit write, not an omission —
-            # a revision transition must carry the CURRENT
-            # `plan_superseded_task_ids` value forward unchanged (whatever
-            # `materialise_plan_steps` has already superseded stays
-            # superseded across a revision bump; nothing here is newly
-            # superseded by opening a revision). Mirrors `node_planner`'s
-            # identical LastValue-clear rationale — an omitted key on this
-            # `sup.update_state(..., as_node="dispatch")` patch would ALSO
-            # retain the prior value implicitly, but writing it explicitly
-            # keeps the invariant visible at every writer, not just readers.
-            "plan_superseded_task_ids": list(
-                values.get("plan_superseded_task_ids") or []
-            ),
-        }, gate_only=gate_only)
+        #
+        # P1-2: `patch` already carries the full revision payload (folded in
+        # above, alongside `_modify_plan_task`) AND was already written to
+        # the checkpoint atomically with the gate-resolution fields, as
+        # `as_node="dispatch"`, by the single `sup.update_state` call above
+        # (see the write-selection branch, `elif action == "modify-plan"`).
+        # `already_written=True` skips the redundant second write here and
+        # goes straight to the invoke loop / gate_only immediate-return.
+        parked_at = _reenter_graph_after_dispatch(
+            sup, config, patch, gate_only=gate_only, already_written=True,
+        )
         emit(project, wf, "plan_modify_requested", {
             "prior_plan_envelope_id": (
                 str(_modify_plan_prior_envelope_id)
@@ -4939,6 +4965,7 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
 def _reenter_graph_after_dispatch(
     sup: Any, config: dict, patch: dict[str, object], *, max_iterations: int = 6,
     target_next: tuple[str, ...] = ("plan_gate",), gate_only: bool = False,
+    already_written: bool = False,
 ) -> list[str]:
     """P5b Task 3: re-enter the compiled graph as if `dispatch` just finished.
 
@@ -4967,8 +4994,18 @@ def _reenter_graph_after_dispatch(
     mutation and return immediately without ever invoking -- the host's
     step/submit loop picks up the newly-authored plan-revision task from its
     own cursor exactly like a fresh planner task.
+
+    ``already_written`` (P1-2, resume's modify-plan CLI path): the caller
+    already wrote `patch` to the checkpoint itself, via its own
+    ``as_node="dispatch"`` `sup.update_state` call, folded atomically
+    together with the gate-resolution patch (pending_hitl clear,
+    hitl_history) to close the two-write crash window a cross-vendor
+    review found. Skip the redundant second write here and go straight to
+    the invoke loop (or the gate_only immediate-return) against the
+    already-durable checkpoint.
     """
-    sup.update_state(config, patch, as_node="dispatch")
+    if not already_written:
+        sup.update_state(config, patch, as_node="dispatch")
     if gate_only:
         return list(getattr(sup.get_state(config), "next", None) or [])
     for _ in range(max_iterations):
@@ -5452,6 +5489,20 @@ def _reconcile_attended_terminal_checkpoint(
                 res["budget_block"] = block
                 res["budget_downgrade"] = downgrade
                 res["spent_usd"] = state.budget.spent_usd
+                # P1-3 (MEDIUM, cross-vendor gpt-6-astra): set True if the
+                # write below that atomically carries the charged
+                # `state.budget` together with its own
+                # `attended_charge_applied` marker fails. No LATER write in
+                # this same call may then persist that same in-memory
+                # -charged `state.budget` without the marker -- a
+                # marker-less charged budget on the checkpoint is
+                # indistinguishable, to a retry, from "never charged", so
+                # `charge_and_gate` runs again on top of an already-charged
+                # ledger (a real double charge). The per-envelope
+                # ingest-loop write further below checks this flag and
+                # omits `budget` entirely when set, rather than smuggling
+                # the charge through unmarked.
+                _charge_write_persist_failed = False
                 if not is_planning_task:
                     completed = list(state.attended_completed_task_ids)
                     if tid is not None and str(tid) not in completed:
@@ -5503,6 +5554,7 @@ def _reconcile_attended_terminal_checkpoint(
                     except Exception as e:  # noqa: BLE001
                         emit(project, wf, "attended.persist_failed", {"error": str(e)})
                         _persist_errors.append(str(e))
+                        _charge_write_persist_failed = True
                 else:
                     # Budget/open-run bookkeeping is unconditional — the
                     # host attempt genuinely spent cost regardless of
@@ -5532,6 +5584,7 @@ def _reconcile_attended_terminal_checkpoint(
                     except Exception as e:  # noqa: BLE001
                         emit(project, wf, "attended.persist_failed", {"error": str(e)})
                         _persist_errors.append(str(e))
+                        _charge_write_persist_failed = True
 
                 # A native pack may emit typed work for a sibling squad.
                 # Route it through the same boundary validation, redaction,
@@ -5663,13 +5716,26 @@ def _reconcile_attended_terminal_checkpoint(
                                 release_ingested_ids(project, wf, [str(envelope_id)])
                             else:
                                 processed.add(str(envelope_id))
+                        _envelope_patch = {
+                            "tasks": outcome.new_tasks,
+                            "envelopes": outcome.new_envelopes,
+                            "open_pp_runs": state.open_pp_runs,
+                        }
+                        # P1-3 (MEDIUM): only carry the charged
+                        # `state.budget` forward if the earlier atomic
+                        # charge+marker write actually landed. A marker-less
+                        # charged budget smuggled through here would let a
+                        # retry (which reads the marker's absence as "never
+                        # charged") call `charge_and_gate` a second time on
+                        # top of an already-charged ledger. This write's
+                        # OTHER fields (tasks/envelopes/open_pp_runs) still
+                        # land regardless -- the dispatched envelope's
+                        # outcome is real and must not be dropped just
+                        # because the unrelated charge write failed.
+                        if not _charge_write_persist_failed:
+                            _envelope_patch["budget"] = state.budget.model_dump(mode="json")
                         try:
-                            sup.update_state(config, {
-                                "tasks": outcome.new_tasks,
-                                "envelopes": outcome.new_envelopes,
-                                "open_pp_runs": state.open_pp_runs,
-                                "budget": state.budget.model_dump(mode="json"),
-                            })
+                            sup.update_state(config, _envelope_patch)
                         except Exception as exc:  # noqa: BLE001
                             emit(project, wf, "attended.emitted_persist_failed",
                                  {"error": str(exc)})
@@ -5737,22 +5803,113 @@ def _reconcile_attended_terminal_checkpoint(
                     # `_apply_plan_reentry`'s own checkpoint write) and
                     # the plan barrier has actually been raised for it,
                     # the acceptance already landed on an earlier call.
+                    #
+                    # P1-1 (HIGH, cross-vendor gpt-6-astra): the ORIGINAL
+                    # form of this check accepted ANY `plan_status` other
+                    # than "none"/"rejected" -- including "drafted", the
+                    # status `_reenter_graph_after_dispatch`'s FIRST
+                    # statement (`sup.update_state(..., as_node="dispatch")`)
+                    # writes BEFORE its own bounded invoke loop ever runs
+                    # `plan_judge`. If that loop's `sup.invoke` call raised
+                    # (judge transport failure, process death) the checkpoint
+                    # was left at "drafted" with NO pending plan_gate and no
+                    # durable evidence the plan ever reached the gate -- yet
+                    # this check treated it as accepted, marked the planning
+                    # task complete/done, and every future attended step
+                    # then reported `plan_gate_unresolved` forever (the
+                    # checkpoint has no pending gate to resolve). It could
+                    # also override an explicit `plan_reentry_failed` set on
+                    # THIS SAME call's `res` above the moment "drafted"
+                    # happened to already be on the checkpoint from a still-
+                    # earlier attempt. Fixed: only treat "drafted" as
+                    # equivalent to accepted after independently confirming
+                    # the graph re-entry that carries it to plan_judge/
+                    # plan_gate has now (this call) actually landed --
+                    # ``_resume_stalled_plan_drafted`` below does that
+                    # resume-then-verify, never an optimistic status-string
+                    # guess.
                     _emitted_plan_id = next(
                         (str(e.get("id")) for e in emitted
                          if isinstance(e, dict) and e.get("type") == "PLAN"
                          and e.get("id") is not None),
                         None,
                     )
-                    _plan_already_accepted = (
+                    _plan_id_matches = (
                         _emitted_plan_id is not None
                         and state.plan_envelope_id is not None
                         and str(state.plan_envelope_id) == _emitted_plan_id
-                        and str(state.plan_status or "none") not in ("none", "rejected")
                     )
+                    _plan_status_now = str(state.plan_status or "none")
+                    # Durable evidence the plan genuinely reached (or passed)
+                    # the gate: judged/approved/bypassed are all states
+                    # `node_plan_gate`/force-dispatch only ever write AFTER
+                    # the interrupt is live or resolved -- "drafted" is
+                    # deliberately excluded, it is written by the very FIRST,
+                    # fallible statement of `_reenter_graph_after_dispatch`
+                    # and proves nothing about whether that call's own
+                    # invoke loop ever ran.
+                    _plan_gate_reached_states = frozenset(
+                        {"judged", "approved", "bypassed"})
+                    _snap_next = tuple(
+                        getattr(sup.get_state(config), "next", None) or ())
+                    _pending_plan_gate = (
+                        isinstance(state.pending_hitl, dict)
+                        and state.pending_hitl.get("gate_node") == "plan_gate"
+                    )
+                    _plan_already_accepted = _plan_id_matches and (
+                        _plan_status_now in _plan_gate_reached_states
+                        or _pending_plan_gate
+                        or _snap_next == ("plan_gate",)
+                    )
+                    if (not _plan_already_accepted and _plan_id_matches
+                            and _plan_status_now == "drafted"):
+                        # Checkpoint shows this exact envelope drafted but
+                        # NOT yet judged/gated -- resume the bounded graph
+                        # transition (re-run `_reenter_graph_after_dispatch`'s
+                        # invoke loop toward plan_gate) before deciding
+                        # anything, instead of guessing from the stale
+                        # status string. `already_written=True`: the
+                        # "drafted" patch is already on the checkpoint from
+                        # the earlier (possibly this-same-call) write --
+                        # never re-issue it, only drive the invoke loop.
+                        try:
+                            _resumed_next = _reenter_graph_after_dispatch(
+                                sup, config, {}, target_next=("plan_gate",),
+                                already_written=True,
+                            )
+                        except Exception as _resume_exc:  # noqa: BLE001
+                            emit(project, wf, "attended.plan_reentry_failed",
+                                 {"error": str(_resume_exc),
+                                  "detail": "resume of stalled drafted plan"})
+                            res["status"] = "plan_reentry_failed"
+                            res["plan_status"] = "plan_reentry_failed"
+                            res["plan_reentry_error"] = str(_resume_exc)
+                        else:
+                            if tuple(_resumed_next) == ("plan_gate",):
+                                _plan_already_accepted = True
+                                res["plan_parked_at"] = list(_resumed_next)
+                            else:
+                                emit(project, wf, "attended.plan_reentry_failed", {
+                                    "error": (
+                                        f"graph re-entry did not reach "
+                                        f"('plan_gate',); parked at "
+                                        f"{_resumed_next!r}"
+                                    ),
+                                    "detail": "resume of stalled drafted plan",
+                                })
+                                res["status"] = "plan_reentry_failed"
+                                res["plan_status"] = "plan_reentry_failed"
+                                res["plan_reentry_error"] = (
+                                    f"graph re-entry did not reach "
+                                    f"('plan_gate',); parked at {_resumed_next!r}"
+                                )
                     _plan_accepted = (
                         bool(plan_reentry_patch)
                         and res.get("status") != "plan_reentry_failed"
-                    ) or _plan_already_accepted
+                    ) or (
+                        _plan_already_accepted
+                        and res.get("status") != "plan_reentry_failed"
+                    )
                     if _plan_accepted:
                         completed = list(state.attended_completed_task_ids)
                         if tid is not None and str(tid) not in completed:
