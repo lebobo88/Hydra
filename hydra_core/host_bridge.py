@@ -2167,6 +2167,14 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
     return res
 
 
+def step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, Any]:
+    """Public wrapper over ``_step_result`` (Hydra#70): ``hydra_core.cli``'s
+    ``step`` command needs to project an ALREADY-LOADED cursor (one it polled
+    for an in-flight ``await_smoke`` job) without re-deriving the module's
+    private helper name."""
+    return _step_result(cursor, cursor_file)
+
+
 def _trace(cursor: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
     wf = cursor.get("workflow_id")
     if not wf:
@@ -2688,6 +2696,190 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     })
 
 
+def _attended_smoke_mode() -> str:
+    """``HYDRA_ATTENDED_SMOKE_MODE`` — ``"async"`` (default) or ``"sync"``.
+
+    Hydra#70: the MCP route (and the default CLI) always runs the smoke as a
+    detached, tracked job (see ``hydra_core.smoke_job``) so a smoke that runs
+    past ``HYDRA_SUBMIT_TIMEOUT_S`` is never orphaned when the submitting
+    process is killed. ``sync`` is an explicit escape hatch for callers not
+    bounded by that call budget (a test fixture, or a bespoke direct-CLI
+    driver) that want the old inline behaviour.
+    """
+    raw = (os.environ.get("HYDRA_ATTENDED_SMOKE_MODE") or "async").strip().lower()
+    return "sync" if raw == "sync" else "async"
+
+
+def _apply_smoke_baseline_excuse(cursor: dict[str, Any], work_path: str,
+                                 smoke_status: str, smoke_reason: str) -> tuple[str, str]:
+    """GAP-a2 / Rider (a): compare a `fail` smoke against the baseline
+    failures captured before the engineer's change. If every currently-
+    failing test was ALREADY failing before the change, the smoke failure is
+    not attributable to this change — excuse it (Finding 6: bounded set).
+
+    Split out of ``_apply_judge`` (Hydra#70) so both the sync inline path and
+    the async job-completion path apply the SAME excuse logic."""
+    if smoke_status != "fail":
+        return smoke_status, smoke_reason
+    _captured_baseline = list(cursor.get("baseline_failures") or [])
+    _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
+    _env_allowlist: set[str] | None = (
+        {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
+        if _env_bl_raw else None
+    )
+    _captured_set = set(_captured_baseline)
+    if _env_allowlist is not None:
+        _excusable = (_captured_set & _env_allowlist) if _captured_set else _env_allowlist
+    else:
+        _excusable = _captured_set
+
+    if not _excusable:
+        return smoke_status, smoke_reason
+
+    _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
+    if len(_excusable) > _max_excuse:
+        _trace(cursor, "attended.smoke.baseline_too_broad", {
+            "stage_id": cursor.get("stage_id"),
+            "excusable_count": len(_excusable), "max": _max_excuse,
+        })
+        smoke_reason = (
+            f"smoke: baseline too broad ({len(_excusable)} excusable "
+            f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
+            "treating as real failure"
+        )
+        return smoke_status, smoke_reason
+
+    import sys as _sys
+    try:
+        _reruns = run_text(
+            [_sys.executable, "-m", "pytest", "tests/", "--no-header", "-q", "--tb=no"],
+            cwd=work_path, capture_output=True, check=False,
+            timeout=_baseline_timeout_s(),
+        )
+        _current_failing = _parse_failing_tests(_reruns.stdout + "\n" + _reruns.stderr)
+    except Exception:  # noqa: BLE001
+        _current_failing = set()
+    _excused = _current_failing & _excusable
+    _new_failures = _current_failing - _excusable
+    if _current_failing or _excused:
+        _trace(cursor, "attended.smoke.baseline_excuse_decision", {
+            "stage_id": cursor.get("stage_id"),
+            "current_failing": sorted(_current_failing),
+            "excused": sorted(_excused),
+            "new_failures": sorted(_new_failures),
+            "excusable_set_size": len(_excusable),
+        })
+    if not _new_failures:
+        smoke_status = "pass"
+        smoke_reason = (
+            f"smoke: {len(_current_failing)} failure(s) all pre-existed in "
+            f"baseline ({len(_excused)} excused); treated as pass"
+        )
+    return smoke_status, smoke_reason
+
+
+def _apply_smoke_and_finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
+                              cursor_file: "str | Path | None", call_key: str | None,
+                              work_path: str, smoke_status: str, smoke_reason: str,
+                              workflow_terminal: bool) -> None:
+    """The common tail shared by every smoke-result source (sync inline run,
+    cached ``smoke_result_for`` replay, and the async job's completed
+    result): apply the baseline excuse, record the pp smoke status exactly
+    once, persist the idempotency marker, honour the finalize-readiness
+    gate, and finalize the stage.
+
+    Hydra#70: split out of ``_apply_judge`` so the async job-completion path
+    (``poll_smoke_job``) and the sync path converge on IDENTICAL gating
+    instead of two implementations drifting apart.
+    """
+    smoke_status, smoke_reason = _apply_smoke_baseline_excuse(
+        cursor, work_path, smoke_status, smoke_reason)
+    try:
+        _raise_on_error_payload(
+            dispatcher.call_mcp("pp_harness", "record_smoke_status", {
+                "stage_id": cursor["stage_id"], "candidate_index": 1,
+                "status": smoke_status,
+                "reason": (smoke_reason or "attended drive smoke")[:300],
+            }, squad_id=_SQ),
+            "record_smoke_status",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # Fix-1b: persist smoke outcome before _finalize so a timeout between
+    # here and the outer save_cursor does not restart the smoke on retry.
+    if call_key is not None and cursor_file is not None:
+        cursor["smoke_result_for"] = {
+            "call_key": call_key, "status": smoke_status, "reason": smoke_reason,
+        }
+        save_cursor(cursor_file, cursor)
+    passed = smoke_status == "pass"
+    cursor["smoke_status"] = smoke_status
+    cursor["smoke_reason"] = smoke_reason
+    cursor.pop("smoke_job", None)
+
+    # Honour pp's finalize-readiness gate (same auto-resolved deferrals as the
+    # headless loop).
+    if passed:
+        try:
+            rd = _pp_inner(_raise_on_error_payload(
+                dispatcher.call_mcp("pp_harness", "get_stage_finalize_readiness",
+                   {"stage_id": cursor["stage_id"]}, squad_id=_SQ),
+                "get_stage_finalize_readiness",
+            ))
+        except Exception:  # noqa: BLE001
+            rd = {}
+        if rd.get("can_pass") is False:
+            na = rd.get("next_action") or "not_ready"
+            _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
+                              "run_tdd_post_check", "record_smoke_or_assertion"}
+            if na not in _auto_resolved:
+                passed = False
+                cursor["outcome"] = "surfaced"
+                cursor["error"] = f"pp readiness: not ready (next_action={na})"
+
+    _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
+             workflow_terminal=workflow_terminal)
+
+
+def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
+                   cursor_file: "str | Path | None",
+                   workflow_terminal: bool = False) -> bool:
+    """Poll an ``await_smoke`` cursor's detached job (Hydra#70).
+
+    Returns ``True`` if the job is still running and before its deadline
+    (cursor left unchanged — caller should report "still pending" without
+    blocking). Returns ``False`` once the cursor has ADVANCED (finalized,
+    via ``_apply_smoke_and_finalize``) — either because the job completed,
+    or because it was judged lost (deadline passed / process vanished with
+    no result), which is always classified as an infra failure so a lost
+    job can never wedge the cursor in ``await_smoke`` forever.
+    """
+    from . import smoke_job as _smoke_job
+    job = cursor.get("smoke_job") or {}
+    work_path = cursor.get("work_path") or cursor.get("project_path")
+    call_key = job.get("call_key") or (cursor.get("pending_action") or {}).get("call_key")
+    if not job:
+        _apply_smoke_and_finalize(
+            dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, smoke_status="infra_error",
+            smoke_reason="await_smoke cursor has no smoke_job recorded",
+            workflow_terminal=workflow_terminal)
+        return False
+    result = _smoke_job.poll_job(job)
+    if result is None:
+        return True
+    _trace(cursor, "attended.smoke_job_polled", {
+        "stage_id": cursor.get("stage_id"), "call_key": call_key,
+        "status": result.get("status"),
+    })
+    _apply_smoke_and_finalize(
+        dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+        work_path=work_path, smoke_status=str(result.get("status") or "infra_error"),
+        smoke_reason=str(result.get("reason") or ""),
+        workflow_terminal=workflow_terminal)
+    return False
+
+
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any],
                  *, cursor_file: "str | Path | None" = None,
@@ -3161,9 +3353,6 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         return  # Don't finalize — wait for generate-1
 
     # PP-VG-5: a code stage may finalize 'complete' only with a real smoke result.
-    passed = False
-    smoke_status = "skipped"
-    smoke_reason = ""
     if outcome == "pass" and attempt_id:
         # Fix-1b: if the smoke already completed for this call_key (persisted before
         # a prior submit timed out inside _finalize), reuse the result without
@@ -3172,135 +3361,75 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         _smoke_from_cache = (call_key is not None
                              and _cached_smoke.get("call_key") == call_key)
         if _smoke_from_cache:
-            smoke_status = str(_cached_smoke.get("status") or "skipped")
-            smoke_reason = str(_cached_smoke.get("reason") or "")
             _trace(cursor, "attended.smoke_skip_idempotent", {
                 "stage_id": cursor.get("stage_id"),
                 "call_key": call_key,
-                "smoke_status": smoke_status,
+                "smoke_status": _cached_smoke.get("status"),
                 "reason": "smoke_result_for marker matches — reusing persisted smoke outcome",
             })
-        else:
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path,
+                smoke_status=str(_cached_smoke.get("status") or "skipped"),
+                smoke_reason=str(_cached_smoke.get("reason") or ""),
+                workflow_terminal=workflow_terminal)
+            return None
+        # Hydra#70: the smoke runs SYNCHRONOUSLY inside this single MCP call
+        # by default only under HYDRA_ATTENDED_SMOKE_MODE=sync (test
+        # fixtures / a caller not bounded by the MCP submit-call budget).
+        # The default (and the sole mode on the MCP route -- see
+        # `mcp_servers/hydra_control/server.py`'s HYDRA_SUBMIT_TIMEOUT_S vs
+        # HYDRA_SMOKE_TIMEOUT_S mismatch this fixes) is "async": start a
+        # DETACHED, TRACKED job (`hydra_core.smoke_job`) that survives this
+        # process's own death, and return promptly with state="await_smoke"
+        # so the host polls via `hydra.workflow.step` / a same-call_key
+        # resubmit instead of blocking the MCP call past its own timeout.
+        # An async job needs a cursor_file to derive its result/log paths and
+        # to persist cursor["smoke_job"] for a later poll -- a caller with no
+        # cursor_file (defensive/legacy) cannot use the async path at all, so
+        # it degrades to sync rather than losing the smoke job's location.
+        if _attended_smoke_mode() == "sync" or cursor_file is None:
             smoke_status, smoke_reason = _run_smoke(
-                dispatcher,
-                project_path=work_path,
-                stage_id=cursor["stage_id"])
-            # GAP-a2 / Rider (a): compare against the baseline failures.
-            # If every currently-failing test was ALREADY failing before the
-            # engineer's change, the smoke failure is not attributable to this
-            # change — excuse it.
-            # Finding 6: bound the excusable set to prevent real regressions being
-            # silently blessed by an overly broad baseline.
-            if smoke_status == "fail":
-                _captured_baseline = list(cursor.get("baseline_failures") or [])
-                _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
-                _env_allowlist: set[str] | None = (
-                    {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
-                    if _env_bl_raw else None
-                )
-                # Build excusable set:
-                #  - env var present + captured non-empty → intersection (tightest bound)
-                #  - env var present + captured empty → env var alone (legacy fallback)
-                #  - env var absent → captured baseline alone
-                _captured_set = set(_captured_baseline)
-                if _env_allowlist is not None:
-                    _excusable = ((_captured_set & _env_allowlist) if _captured_set
-                                  else _env_allowlist)
-                else:
-                    _excusable = _captured_set
-
-                if _excusable:
-                    _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
-                    if len(_excusable) > _max_excuse:
-                        # Baseline too broad — refuse to excuse; treat as real failure.
-                        _trace(cursor, "attended.smoke.baseline_too_broad", {
-                            "stage_id": cursor.get("stage_id"),
-                            "excusable_count": len(_excusable),
-                            "max": _max_excuse,
-                        })
-                        smoke_reason = (
-                            f"smoke: baseline too broad ({len(_excusable)} excusable "
-                            f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
-                            "treating as real failure"
-                        )
-                    else:
-                        import sys as _sys
-                        try:
-                            _reruns = run_text(
-                                [_sys.executable, "-m", "pytest",
-                                 "tests/", "--no-header", "-q", "--tb=no"],
-                                cwd=work_path,
-                                capture_output=True, check=False,
-                                timeout=_baseline_timeout_s(),
-                            )
-                            _current_failing = _parse_failing_tests(
-                                _reruns.stdout + "\n" + _reruns.stderr)
-                        except Exception:  # noqa: BLE001
-                            _current_failing = set()
-                        _excused = _current_failing & _excusable
-                        _new_failures = _current_failing - _excusable
-                        # Always emit telemetry about excused failures (Finding 6).
-                        if _current_failing or _excused:
-                            _trace(cursor, "attended.smoke.baseline_excuse_decision", {
-                                "stage_id": cursor.get("stage_id"),
-                                "current_failing": sorted(_current_failing),
-                                "excused": sorted(_excused),
-                                "new_failures": sorted(_new_failures),
-                                "excusable_set_size": len(_excusable),
-                            })
-                        if not _new_failures:
-                            smoke_status = "pass"
-                            smoke_reason = (
-                                f"smoke: {len(_current_failing)} failure(s) all "
-                                f"pre-existed in baseline ({len(_excused)} excused); "
-                                "treated as pass"
-                            )
-            try:
-                _raise_on_error_payload(
-                    cm("pp_harness", "record_smoke_status", {
-                        "stage_id": cursor["stage_id"], "candidate_index": 1,
-                        "status": smoke_status,
-                        "reason": (smoke_reason or "attended drive smoke")[:300],
-                    }, squad_id=_SQ),
-                    "record_smoke_status",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            # Fix-1b: persist smoke outcome before _finalize so a timeout between
-            # here and the outer save_cursor does not restart the smoke on retry.
-            if call_key is not None and cursor_file is not None:
-                cursor["smoke_result_for"] = {
-                    "call_key": call_key,
-                    "status": smoke_status,
-                    "reason": smoke_reason,
-                }
-                save_cursor(cursor_file, cursor)
-        passed = smoke_status == "pass"
-    cursor["smoke_status"] = smoke_status
-    cursor["smoke_reason"] = smoke_reason
-
-    # Honour pp's finalize-readiness gate (same auto-resolved deferrals as the
-    # headless loop).
-    if passed:
-        try:
-            rd = _pp_inner(_raise_on_error_payload(
-                cm("pp_harness", "get_stage_finalize_readiness",
-                   {"stage_id": cursor["stage_id"]}, squad_id=_SQ),
-                "get_stage_finalize_readiness",
-            ))
-        except Exception:  # noqa: BLE001
-            rd = {}
-        if rd.get("can_pass") is False:
-            na = rd.get("next_action") or "not_ready"
-            _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
-                              "run_tdd_post_check", "record_smoke_or_assertion"}
-            if na not in _auto_resolved:
-                passed = False
-                cursor["outcome"] = "surfaced"
-                cursor["error"] = f"pp readiness: not ready (next_action={na})"
-
-    _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
-             workflow_terminal=workflow_terminal)
+                dispatcher, project_path=work_path, stage_id=cursor["stage_id"])
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, smoke_status=smoke_status,
+                smoke_reason=smoke_reason, workflow_terminal=workflow_terminal)
+            return None
+        from . import smoke_job as _smoke_job
+        job = _smoke_job.start_job(
+            cursor_file, project_path=work_path, stage_id=cursor["stage_id"],
+            call_key=call_key)
+        cursor["smoke_job"] = job
+        cursor["state"] = "await_smoke"
+        # W2-3-shaped: keep the SAME judge call_key as pending_action.call_key
+        # so a re-issued submit_host_result under that call_key re-enters the
+        # "await_smoke" branch in `submit_host_result` as a POLL, never a
+        # duplicate record_verdict/record_attempt.
+        cursor["pending_action"] = {
+            "call_key": call_key,
+            "action": "poll_smoke",
+            "poll": True,
+            "instructions": (
+                "The verdict is already recorded. Smoke is running as a "
+                "detached background job — there is no agent to spawn. "
+                "Call hydra.workflow.step(workflow_id) again after a short "
+                "delay to poll for completion (a same-call_key "
+                "submit-host-result resubmit also works as a poll)."
+            ),
+        }
+        if cursor_file is not None:
+            save_cursor(cursor_file, cursor)
+        _trace(cursor, "attended.smoke_job_started", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "pid": job.get("pid"), "deadline": job.get("deadline"),
+        })
+        return None
+    else:
+        cursor["smoke_status"] = "skipped"
+        cursor["smoke_reason"] = ""
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
 
 
 def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
@@ -3978,6 +4107,16 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     if cursor.get("kind") not in (None, "engineering"):
         return {"ok": False, "error": "recovery only supports engineering stage cursors"}
     state = cursor.get("state")
+    if state == "await_smoke":
+        # Hydra#70: a prior recovery call already started the async smoke
+        # job (or `_apply_judge` did, on the normal path). Re-invoking
+        # recovery here is a POLL, not a fresh recovery attempt.
+        poll_smoke_job(dispatcher, cursor, cursor_file=cursor_file,
+                      workflow_terminal=workflow_terminal)
+        save_cursor(cursor_file, cursor)
+        out = _step_result(cursor, cursor_file)
+        out["ok"] = True
+        return out
     if state not in ("stalled_infra", "surfaced"):
         return {"ok": False, "error": f"cursor state {state!r} is not recoverable"}
 
@@ -4052,6 +4191,40 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # stalled -- everything past record_verdict is the SAME code the
         # normal (non-stranded) path runs, so reuse it verbatim instead of
         # re-implementing smoke/merge/finalize here.
+        #
+        # Hydra#70: the verdict was JUST (re-)recorded above in this same
+        # call, so route the smoke through the same detached-job mechanism
+        # `_apply_judge` uses -- recovery is itself invoked through the CLI
+        # under its own bounded timeout (`_cmd_resume_locked`), so blocking
+        # here on a long smoke reproduces the exact orphaned-tree bug this
+        # fix closes. `sync` mode (tests / a bespoke driver) still runs
+        # inline for a prompt recovery result.
+        if outcome == "pass" and attempt_id and _attended_smoke_mode() != "sync":
+            work_path = cursor.get("work_path") or cursor["project_path"]
+            from . import smoke_job as _smoke_job
+            _recovery_call_key = (cursor.get("pending_action") or {}).get(
+                "call_key") or f"recovery-{stage_id}"
+            job = _smoke_job.start_job(
+                cursor_file, project_path=work_path, stage_id=stage_id,
+                call_key=_recovery_call_key)
+            cursor["smoke_job"] = job
+            cursor["state"] = "await_smoke"
+            cursor["pending_action"] = {
+                "call_key": _recovery_call_key, "action": "poll_smoke",
+                "poll": True,
+                "instructions": (
+                    "Recovery re-recorded the verdict and started the smoke "
+                    "as a detached job. Poll via hydra.workflow.step "
+                    "(or resubmit recover-stalled-stage) until it completes."
+                ),
+            }
+            _trace(cursor, "attended.recovery.smoke_job_started", {
+                "stage_id": stage_id, "pid": job.get("pid"),
+            })
+            save_cursor(cursor_file, cursor)
+            out = _step_result(cursor, cursor_file)
+            out["ok"] = True
+            return out
         passed = False
         if outcome == "pass" and attempt_id:
             work_path = cursor.get("work_path") or cursor["project_path"]
@@ -4413,6 +4586,18 @@ def submit_host_result(
             out = _step_result(cursor, cursor_file)
             out.update(_judge_err)
             return out
+    elif state == "await_smoke":
+        # Hydra#70: the verdict is already recorded (see `_apply_judge`); the
+        # smoke is running as a detached job. A resubmit under the SAME
+        # call_key (the judge's -- pending_action.call_key was left
+        # unchanged when this state was entered) is treated as a POLL, never
+        # a duplicate record_verdict/record_attempt. `result` (the judge
+        # payload the host resubmitted) is intentionally ignored here.
+        still_pending = poll_smoke_job(dispatcher, cursor, cursor_file=cursor_file,
+                                       workflow_terminal=workflow_terminal)
+        if still_pending:
+            save_cursor(cursor_file, cursor)
+            return _step_result(cursor, cursor_file)
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
         _apply_squad_result(dispatcher, cursor, result, cursor_file=cursor_file)

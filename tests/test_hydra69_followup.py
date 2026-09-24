@@ -1088,7 +1088,11 @@ def test_e2e_plan_to_decision_record_real_checkpointer(monkeypatch, tmp_path):
     )
     # Smoke always passes -- the disposable target_repo below has no real
     # build/test command; mirrors test_host_bridge.py / test_phase4_
-    # hardening.py's own `_smoke_passes` fixture pattern.
+    # hardening.py's own `_smoke_passes` fixture pattern. Hydra#70: this test
+    # asserts on the SYNCHRONOUS terminal cursor immediately after the judge
+    # submit, so force HYDRA_ATTENDED_SMOKE_MODE=sync (the async detached-job
+    # path is covered by tests/test_hydra70_async_smoke.py).
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(host_bridge, "_run_smoke",
                         lambda *a, **k: ("pass", "fixture smoke pass"))
 
