@@ -98,7 +98,12 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
       terminal. A lost job (process vanished, or it ran past its own
       `HYDRA_SMOKE_TIMEOUT_S` deadline) is classified as an infra failure —
       its whole process tree is killed — and the stage finalizes
-      non-complete; it never wedges in `await_smoke` forever.
+      non-complete; it never wedges in `await_smoke` forever. A
+      just-launched job may report still-launching (non-terminal, same as
+      "still pending") for up to the startup bound
+      (`HYDRA_SMOKE_LAUNCH_GRACE_S`, default 60s) before a total absence of
+      worker evidence is finalized lost — this is normal for a worker that
+      is simply slow to start, not itself a failure.
 4. **Non-engineering squads** (claude-skill / agent-impersonation packs:
    executive, garland, rlm-gaming, marketing-*, …) are ALSO driven by the same
    step/submit loop: when the next pending task belongs to such a pack, `step`

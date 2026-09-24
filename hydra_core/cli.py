@@ -4899,62 +4899,37 @@ def _cmd_recover_stalled_stage(args, project: Path, wf: str, option) -> int:
         print(_cli_json_dumps(res, indent=2, default=str), file=sys.stderr)
         return 1
 
-    if res.get("status") in ("complete", "surfaced", "aborted") and not res.get("already_charged"):
-        host_bridge.mark_charged(cfile)
-        from .governance import charge_and_gate
-        from .supervisor import build_supervisor, _PurePythonRunner
-        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
-        if not isinstance(sup, _PurePythonRunner):
-            config = {"configurable": {"thread_id": wf}}
-            snap = sup.get_state(config)
-            if snap is not None and snap.values:
-                state = HydraState.model_validate(snap.values)
-                cost = float(res.get("cost_usd") or 0.0)
-                toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
-                # B8: host_bridge tags the stage's cost provenance in
-                # "cost_source" ("measured"/"estimated"/"unmeasured") — an
-                # unreporting host no longer charges as free.
-                cost_source = str(res.get("cost_source") or "measured")
-                # Fix (mixed-provenance estimated_usd): "cost_source" is a
-                # single collapsed label for the whole (possibly mixed)
-                # stage, so it cannot be used to size the estimated_usd
-                # credit for a stage that mixed a measured and an estimated
-                # component. Pass the per-component figure host_bridge
-                # tracked separately instead.
-                estimated_component = float(res.get("estimated_cost_usd") or 0.0)
-                block, downgrade = charge_and_gate(
-                    state, cost, toks, source=cost_source,
-                    estimated_usd=estimated_component,
-                )
-                if cost_source == "unmeasured":
-                    emit(project, wf, "attended.cost_unmeasured",
-                         {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
-                tid = res.get("task_id")
-                completed = list(state.attended_completed_task_ids)
-                if tid is not None and str(tid) not in completed:
-                    completed.append(str(tid))
-                done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
-                if (res.get("status") == "complete" and tid is not None
-                        and str(tid) not in done_ids):
-                    done_ids.append(str(tid))
-                open_runs = [e for e in state.open_pp_runs
-                             if e.get("run_id") != res.get("run_id")]
-                res["budget_block"] = block
-                res["budget_downgrade"] = downgrade
-                res["spent_usd"] = state.budget.spent_usd
-                attended_results = _merge_attended_result(
-                    state.attended_results, _attended_result_record(state, res))
-                try:
-                    sup.update_state(config, {
-                        "attended_completed_task_ids": completed,
-                        "attended_done_task_ids": done_ids,
-                        "attended_results": attended_results,
-                        "open_pp_runs": open_runs,
-                        "budget": state.budget.model_dump(mode="json"),
-                        "budget_downgrade_active": bool(downgrade),
-                    })
-                except Exception as e:  # noqa: BLE001
-                    emit(project, wf, "attended.persist_failed", {"error": str(e)})
+    # P2-1 (cross-vendor gpt-6-astra, HIGH): route recovery's terminal
+    # bookkeeping through the SAME shared `_reconcile_attended_terminal_
+    # checkpoint` every other terminal-driving caller (`_cmd_attended_submit`,
+    # the step-poll/self-heal helpers) uses, instead of a second hand-rolled
+    # copy. The old copy here wrote attended_completed_task_ids/
+    # attended_done_task_ids/attended_results/open_pp_runs/budget but NEVER
+    # attended_charge_applied/attended_checkpoint_reconciled -- and the
+    # step-poll refactor now has `poll_smoke_job` stamp `terminal_call_key`
+    # on every terminal cursor (including one recovery finalizes via the
+    # `stalled_infra` async-smoke path), so a later same-call_key `submit`
+    # reaches `_reconcile_attended_terminal_checkpoint`, finds no marker for
+    # `run_id:terminal_call_key`, and double-charges. Reusing the shared
+    # function closes that gap for every recovery-terminal shape uniformly:
+    # it derives its own charge identity from `res["terminal_call_key"]`
+    # (falling back to the same "legacy" identity as every other caller for
+    # a pre-fix cursor terminated some other way -- e.g. the `surfaced`
+    # direct-merge/finalize path below, which never goes through
+    # `poll_smoke_job`), so `already_charged`-true recovery results still
+    # charge exactly once and never re-charge on replay. `workflow_terminal`
+    # no-merge behaviour is decided entirely inside `recover_stalled_stage`
+    # itself (already computed into `res` above) -- this call only ever
+    # records already-incurred spend/bookkeeping, never re-drives the merge.
+    if res.get("status") in ("complete", "complete_unpersisted", "surfaced", "aborted"):
+        _recovery_call_key = str(res.get("terminal_call_key") or f"recovery-{run_id}")
+        res, _recovery_persist_errors = _reconcile_attended_terminal_checkpoint(
+            project, wf, run_id, _recovery_call_key, dispatcher, cfile, res,
+        )
+        if _recovery_persist_errors:
+            emit(project, wf, "attended.persist_failed",
+                 {"error": "; ".join(_recovery_persist_errors),
+                  "context": "recover_stalled_stage"})
 
     emit(project, wf, "attended.recovery.resume",
          {"run_id": run_id, "status": res.get("status")})
