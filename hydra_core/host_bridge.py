@@ -2903,6 +2903,12 @@ def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
             work_path=work_path, smoke_status="infra_error",
             smoke_reason="await_smoke cursor has no smoke_job recorded",
             workflow_terminal=workflow_terminal)
+        # See the stamp at the bottom of this function: this branch also
+        # finalizes the cursor (via `_apply_smoke_and_finalize`) and needs
+        # the SAME `terminal_call_key` stamp -- it returns below instead of
+        # falling through to the shared stamp, so it is duplicated here.
+        if cursor.get("state") in _TERMINAL:
+            cursor.setdefault("terminal_call_key", call_key)
         return False
     result = _smoke_job.poll_job(job)
     if result is None:
@@ -2916,6 +2922,23 @@ def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
         work_path=work_path, smoke_status=str(result.get("status") or "infra_error"),
         smoke_reason=str(result.get("reason") or ""),
         workflow_terminal=workflow_terminal)
+    # Hydra#70 checkpoint-bookkeeping fix: `submit_host_result` is the ONLY
+    # caller that stamped `terminal_call_key` (its own post-transition
+    # `setdefault` a few hundred lines down) -- a bare `hydra.workflow.step`
+    # poll drives this SAME finalize path (via `_apply_smoke_and_finalize`
+    # above) without ever reaching `submit_host_result`, so it left the
+    # cursor's trusted terminal-call identity permanently unset. Stamp it
+    # HERE, in the one function both callers (a `step` poll and a
+    # same-call_key `submit_host_result` resubmit acting as a poll) share,
+    # using the SAME `call_key` (the judge call that started this smoke job,
+    # captured above from `job["call_key"]` before `_apply_smoke_and_finalize`
+    # pops `cursor["smoke_job"]`) -- so the reconciliation key
+    # `run_id:terminal_call_key` a caller derives is identical regardless of
+    # which one actually finished the stage. `setdefault` mirrors
+    # `submit_host_result`'s own stamp so neither caller can ever clobber an
+    # identity the other already recorded.
+    if cursor.get("state") in _TERMINAL:
+        cursor.setdefault("terminal_call_key", call_key)
     return False
 
 

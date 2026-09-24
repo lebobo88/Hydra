@@ -4256,8 +4256,114 @@ def _cmd_attended_step(args) -> int:
             res = host_bridge.step_result(_open_cursor, _open_cfile)
             emit(project, wf, "attended.step_poll_smoke", {
                 "run_id": str(_open_run_id), "state": res.get("state")})
+            # Hydra#70 checkpoint-bookkeeping fix: a poll can ITSELF drive the
+            # cursor terminal (job completed/lost between this call and the
+            # next). Previously `step` returned here with the budget charge,
+            # attended_completed_task_ids/attended_done_task_ids/
+            # attended_results, and open_pp_runs removal all silently
+            # skipped -- the finished task stayed selectable and the next
+            # `step` opened a SECOND pp run for it. Reach the SAME
+            # reconciliation `_cmd_attended_submit` uses, exactly-once on
+            # `run_id:terminal_call_key` (now stamped by `poll_smoke_job`
+            # itself -- see host_bridge.py -- regardless of which caller
+            # finished the stage). No-op when the poll left the cursor
+            # non-terminal (still `await_smoke`): `res["status"]` is then
+            # `"awaiting_host"`, which the shared function's own status gate
+            # ignores.
+            res, _poll_persist_errors = _reconcile_attended_terminal_checkpoint(
+                project, wf, str(_open_run_id),
+                str(res.get("terminal_call_key") or ""), dispatcher, _open_cfile, res,
+            )
+            if _poll_persist_errors:
+                print(_cli_json_dumps({
+                    "ok": False,
+                    "error": "checkpoint_persist_failed",
+                    "checkpoint_persist_errors": _poll_persist_errors,
+                    **res,
+                }, indent=2, default=str))
+                return 1
             print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
+
+        # Hydra#70 self-heal: a cursor that already went terminal -- either
+        # via the poll branch above on an EARLIER `step` call, or left behind
+        # by a checkpoint written before this fix existed -- can still be
+        # sitting in `open_pp_runs` with the budget charge / task-completion
+        # bookkeeping never written, because nothing besides the poll branch
+        # (and `submit_host_result`) used to ever reach
+        # `_reconcile_attended_terminal_checkpoint`. Repair every such cursor
+        # HERE, before task selection, so a finished task is never re-picked
+        # and re-dispatched into a duplicate pp run. Distinct from the poll
+        # loop above: this one does NOT poll (the cursor is already
+        # terminal on disk, not `await_smoke`) and does not `return` --
+        # healing is silent bookkeeping, not a host_action.
+        _healed_any = False
+        for _open_run in list(getattr(state, "open_pp_runs", []) or []):
+            _open_run_id = (_open_run or {}).get("run_id")
+            if not _open_run_id:
+                continue
+            _open_cfile = host_bridge.cursor_path(project, wf, str(_open_run_id))
+            if not Path(_open_cfile).exists():
+                continue
+            _open_cursor = host_bridge.load_cursor(_open_cfile)
+            if _open_cursor.get("state") not in host_bridge._TERMINAL:
+                continue
+            # A cursor terminated by pre-fix code (or any path other than
+            # `submit_host_result`/the poll branch above) never had
+            # `terminal_call_key` stamped. Derive it from whichever
+            # idempotency marker the terminal transition itself left behind
+            # -- `verdict_recorded_for` (a bare call_key string written by
+            # `_apply_judge`) or `smoke_result_for.call_key` (written by
+            # `_apply_smoke_and_finalize`) -- both are the SAME judge
+            # call_key that drove this stage terminal. Falls through to the
+            # shared function's own "legacy" identity when neither is
+            # present (a cursor terminated some other way entirely, e.g.
+            # operator abort).
+            if not _open_cursor.get("terminal_call_key"):
+                _derived_key = (
+                    _open_cursor.get("verdict_recorded_for")
+                    or (_open_cursor.get("smoke_result_for") or {}).get("call_key")
+                )
+                if _derived_key:
+                    _open_cursor["terminal_call_key"] = _derived_key
+                    host_bridge.save_cursor(_open_cfile, _open_cursor)
+            _heal_res = host_bridge.step_result(_open_cursor, _open_cfile)
+            _heal_recon_key = (
+                f"{_open_run_id}:{_heal_res.get('terminal_call_key') or 'legacy'}"
+            )
+            _already_reconciled = bool(
+                (getattr(state, "attended_checkpoint_reconciled", None) or {})
+                .get(_heal_recon_key)
+            )
+            if _already_reconciled:
+                # Bookkeeping already landed for this exact identity; the run
+                # is only still in `open_pp_runs` because the atomic patch
+                # that would have removed it never re-read (defensive —
+                # normally reconciliation removes it in the same write that
+                # sets the marker). Nothing left to repair.
+                continue
+            _heal_res, _heal_errors = _reconcile_attended_terminal_checkpoint(
+                project, wf, str(_open_run_id),
+                str(_heal_res.get("terminal_call_key") or ""), dispatcher,
+                _open_cfile, _heal_res,
+            )
+            emit(project, wf, "attended.step_self_heal_reconciled", {
+                "run_id": str(_open_run_id), "status": _heal_res.get("status"),
+                "persist_errors": _heal_errors,
+            })
+            if _heal_errors:
+                print(_cli_json_dumps({
+                    "ok": False,
+                    "error": "checkpoint_persist_failed",
+                    "checkpoint_persist_errors": _heal_errors,
+                    "self_heal_run_id": str(_open_run_id),
+                }, indent=2, default=str))
+                return 1
+            _healed_any = True
+        if _healed_any:
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
 
         # E2-23: pick the next attended task in task-list order.  The squad
         # only decides WHICH cursor is opened (pp run vs squad stage) — it must
@@ -4942,6 +5048,678 @@ def _apply_rejected_envelopes(
         res["status"] = "envelopes_rejected"
 
 
+def _reconcile_attended_terminal_checkpoint(
+    project: Path, wf: str, run_id: str, call_key: str,
+    dispatcher, cfile, res: dict,
+) -> tuple[dict, list[str]]:
+    """Shared post-terminal checkpoint bookkeeping for a terminal attended
+    cursor result ``res`` (status in complete/complete_unpersisted/surfaced/
+    aborted): charges the HydraState budget ledger exactly once, records the
+    task outcome (``attended_completed_task_ids`` / ``attended_done_task_ids``
+    / ``attended_results``), removes the run from ``open_pp_runs``, ingests
+    any envelopes the host emitted (including PLAN re-entry / rejected-
+    envelope bookkeeping for a planning-owned task), and stamps the
+    exactly-once ``attended_charge_applied`` / ``attended_checkpoint_reconciled``
+    markers keyed on ``{run_id}:{terminal_call_key}``.
+
+    Factored out of ``_cmd_attended_submit`` (Hydra#70 async-smoke checkpoint
+    fix): ``_cmd_attended_step``'s ``await_smoke`` poll branch can ALSO drive
+    a cursor terminal -- via ``host_bridge.poll_smoke_job`` -- without ever
+    calling ``submit_host_result``/this command, and previously skipped every
+    write below, leaving the finished task re-selectable and the spend
+    unrecorded. Both callers now reach this SAME function so the
+    reconciliation key (``run_id:terminal_call_key``, now stamped by
+    ``poll_smoke_job`` itself regardless of caller -- see host_bridge.py) is
+    identical whichever caller finishes the stage, and a retry from either
+    caller against an already-reconciled key returns the cached result
+    instead of re-charging.
+
+    Returns ``(res, persist_errors)`` -- ``res`` is the (possibly mutated)
+    step-result dict, ``persist_errors`` is every checkpoint write that
+    raised (empty when everything landed; the caller downgrades its
+    response's ``ok`` to False when non-empty)."""
+    from . import host_bridge
+    from .governance import charge_and_gate, should_block_for_budget, should_downgrade_model
+    _persist_errors: list[str] = []
+
+    # On terminal: charge budget on the authoritative HydraState ledger and
+    # record the task outcome into the checkpoint.
+    # Rider (b): skip charge if already_charged=True (idempotency guard).
+    # E2-35: "complete_unpersisted" is terminal too — the pack agent ran and
+    # spent real money, so it must charge like any other terminal outcome.
+    if res.get("status") in ("complete", "complete_unpersisted",
+                             "surfaced", "aborted"):
+        _already_charged = bool(res.get("already_charged"))
+        # Hydra#69 round 6 defect 2 (HIGH): derive the reconciliation/
+        # charge identity from the cursor's OWN trusted terminal call
+        # identity (host_bridge.submit_host_result validates and stamps
+        # this before ever returning a terminal result) — never from the
+        # caller-supplied call_key directly. Round 5's keying on
+        # call_key let a different/stale call_key mint its OWN
+        # reconciliation key against the SAME terminal cursor, missing
+        # the existing marker and re-billing the cached result. A legacy
+        # cursor (written before `terminal_call_key` existed, or
+        # terminated outside submit_host_result) collapses to a fixed
+        # "legacy" identity so every future retry — regardless of which
+        # call_key it carries — converges on the SAME key instead of
+        # growing a new one per call_key.
+        _call_identity = res.get("terminal_call_key") or "legacy"
+        _recon_key = f"{run_id}:{_call_identity}"
+        # Hydra#69 round 6 defect 1 (HIGH): CHARGE evidence
+        # (`attended_charge_applied`) and FULL-RECONCILIATION evidence
+        # (`attended_checkpoint_reconciled`) are now two SEPARATE
+        # checkpoint markers. Round 5 folded both into one marker written
+        # alongside the budget charge — before the later downstream
+        # writes this call still has to make (attempt-counter bump, PLAN
+        # acceptance/rejection outcome, completion ids). A crash between
+        # the charge write and one of those later writes left that single
+        # marker already `True`, so an identical retry took the
+        # cached-result shortcut with the later writes still missing.
+        # `_charge_applied` alone gates whether `charge_and_gate` runs
+        # again below (never re-charge); `_reconciled` alone gates the
+        # cached-result shortcut, and is only ever set `True` at the very
+        # end of this block, after every downstream write has succeeded.
+        _reconciled = True
+        _charge_applied = True
+        _persisted_charge: dict[str, object] | None = None
+        # Round 6 follow-up defect 1 (cross-vendor, HIGH): a TRUE legacy
+        # cursor — `_call_identity == "legacy"`, i.e. `terminal_call_key`
+        # is ABSENT from the cursor (persisted by an older version of
+        # this code, before that field existed, or terminated outside
+        # `submit_host_result`) — has no way to ever prove its charge
+        # landed via the marker: `already_charged=True` on its own is
+        # the ONLY evidence available for it, and is treated as
+        # conclusive (never re-`charge_and_gate` it, marker or no
+        # marker). This is deliberately NARROWER than "no marker for
+        # this recon_key": a NON-legacy cursor (terminal_call_key
+        # present) whose marker is absent is proof the OPPOSITE way —
+        # the marker and the `budget` field are always written together
+        # in the SAME atomic checkpoint patch, so an absent marker for
+        # THIS cursor's own unique recon_key means this exact call's
+        # charge genuinely never reached the checkpoint yet, and
+        # `charge_and_gate` MUST still run on this retry (that is a
+        # crash-recovery repair, not a double charge — nothing landed).
+        _legacy_charge_repair = False
+        if _already_charged:
+            # Idempotent re-submit candidate: the cursor sidecar says
+            # this call was already charged on a prior terminal submit.
+            # That flag alone is NOT proof every checkpoint write
+            # actually landed (the crash-ordering rationale below
+            # explicitly accepts a window where mark_charged succeeds
+            # but the LangGraph checkpoint write after it fails) — check
+            # the checkpoint-side markers before trusting reconciliation
+            # is complete. It IS, however, conclusive proof the CHARGE
+            # itself must never be repeated — see `_legacy_charge_repair`.
+            from .supervisor import build_supervisor as _recon_bs, _PurePythonRunner as _recon_ppr
+            _recon_sup = _recon_bs(project_root=project, dispatcher=dispatcher)
+            if not isinstance(_recon_sup, _recon_ppr):
+                _recon_snap = _recon_sup.get_state({"configurable": {"thread_id": wf}})
+                _recon_values = (
+                    _recon_snap.values
+                    if _recon_snap is not None and _recon_snap.values else {}
+                )
+                _reconciled = bool(
+                    (_recon_values.get("attended_checkpoint_reconciled") or {})
+                    .get(_recon_key)
+                )
+                _charge_evidence = (
+                    (_recon_values.get("attended_charge_applied") or {})
+                    .get(_recon_key)
+                )
+                _persisted_charge = (
+                    _charge_evidence if isinstance(_charge_evidence, dict) else None
+                )
+                if _call_identity == "legacy":
+                    # True legacy cursor: `already_charged=True` is
+                    # conclusive on its own; never re-invoke
+                    # `charge_and_gate` for it regardless of the marker.
+                    _charge_applied = True
+                    _legacy_charge_repair = _persisted_charge is None
+                else:
+                    # Non-legacy cursor: this recon_key is unique to
+                    # THIS cursor's one terminal call (a different
+                    # call_key against an already-terminal cursor is
+                    # refused as stale before ever reaching here), so an
+                    # absent marker for it is conclusive proof this
+                    # exact call's charge never reached the checkpoint —
+                    # `charge_and_gate` must still run below.
+                    _charge_applied = _persisted_charge is not None
+            if _reconciled:
+                # Genuinely done: cursor charged AND EVERY checkpoint
+                # write for this exact call already landed. Return the
+                # cached result without re-billing or repeating writes --
+                # the caller (submit or a step poll) emits its own
+                # already_charged telemetry and formats the response.
+                return res, _persist_errors
+            # Else: repair path. The cursor is already charged (never
+            # re-charge it — `_charge_applied` below skips
+            # `charge_and_gate` when the checkpoint already confirms it
+            # landed), but one or more downstream checkpoint writes never
+            # landed — fall through and redo them. Every write in the
+            # block below is idempotent (membership-checked task-id
+            # lists, upsert-by-task_id results, a merge-dict reducer for
+            # the markers themselves), so redoing them exactly reproduces
+            # the outcome the original terminal submit should have left.
+            emit(project, wf, "attended.checkpoint_reconcile_retry",
+                 {"run_id": str(run_id), "call_key": str(call_key),
+                  "status": res.get("status")})
+        else:
+            # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
+            # budget write to the LangGraph checkpoint so that a crash between
+            # here and the checkpoint persist is an under-charge (acceptable) rather
+            # than a double-charge (unsafe).  Crash-ordering rationale:
+            #   1. mark_charged(cfile)          ← cursor sidecar flagged first
+            #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
+            #   3. sup.update_state(...)         ← checkpoint persisted (with the
+            #                                       charge-applied marker for this
+            #                                       call folded into the SAME patch)
+            # If the process dies after (1) but before (3), the retry sees
+            # already_charged=True but an UNSET charge-applied marker, and repairs
+            # the checkpoint writes above instead of silently under-charging.
+            # The opposite order (charge then mark) would re-charge on that crash
+            # → double-charge, which burns real spend twice.
+            host_bridge.mark_charged(cfile)
+            _charge_applied = False
+        from .supervisor import build_supervisor, _PurePythonRunner
+        sup = build_supervisor(project_root=project, dispatcher=dispatcher)
+        # The host returns the native pack artifact as text. Persist it only
+        # through the declared pack output root; the helper rejects escapes
+        # and non-text artifacts before producing the MemoryRef returned to
+        # the operator and telemetry.
+        squad_slug = str(res.get("squad_slug") or "")
+        artifact_text = str(res.get("artifact_text") or "")
+        # E2-35: host_bridge already persisted non-native squad artifacts
+        # (generic store + claude-skill shim) and recorded the outcome on
+        # the cursor. Only squads it left alone — the native packs — reach
+        # the native output-root writer here.
+        already_handled = (res.get("artifact_ref") is not None
+                           or res.get("artifact_persist_error") is not None)
+        if squad_slug and artifact_text and not already_handled:
+            try:
+                from .artifact_store import write_native_artifact
+                ref = write_native_artifact(
+                    squad_slug, f"attended/{res.get('task_id') or run_id}.md",
+                    artifact_text,
+                )
+                res["artifact_ref"] = ref.model_dump(mode="json")
+                emit(project, wf, "attended.native_artifact_persisted", {
+                    "squad_slug": squad_slug, "memory_ref": ref.key,
+                })
+            except (ValueError, OSError) as exc:
+                res["artifact_persist_error"] = str(exc)
+                emit(project, wf, "attended.native_artifact_persist_failed", {
+                    "squad_slug": squad_slug, "error": str(exc),
+                })
+        if not isinstance(sup, _PurePythonRunner):
+            config = {"configurable": {"thread_id": wf}}
+            snap = sup.get_state(config)
+            if snap is not None and snap.values:
+                state = HydraState.model_validate(snap.values)
+                # Round 6 gap fix (stale-cursor submit): re-derive terminal
+                # status from the CURRENT checkpoint (may have gone
+                # terminal via a different gate while this cursor was in
+                # flight, or was already terminal at the pre-submit check
+                # above -- re-read here rather than trust that snapshot,
+                # since this is the checkpoint state every write below
+                # actually applies against). Gates the ingest/dispatch and
+                # PLAN re-entry blocks further down (never the cost/
+                # bookkeeping writes immediately below, which record the
+                # ALREADY-INCURRED spend regardless of workflow terminal
+                # status -- see `_cmd_attended_submit`'s docstring).
+                _terminal = workflow_terminal_resolution(
+                    snap.values, getattr(snap, "next", ()) or ())
+                cost = float(res.get("cost_usd") or 0.0)
+                toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
+                # B8: see the recover-stalled-stage twin above — an
+                # unreporting host is estimated/unmeasured, never free.
+                cost_source = str(res.get("cost_source") or "measured")
+                # Fix (mixed-provenance estimated_usd): see the twin
+                # comment above — credit only the per-component estimated
+                # figure, not the whole (possibly mixed) stage total.
+                estimated_component = float(res.get("estimated_cost_usd") or 0.0)
+                # Hydra#69 round 6 defect 1 (HIGH), follow-up (cross-
+                # vendor, HIGH): `_charge_applied` is True whenever the
+                # cursor itself says charged (`_already_charged`) — that
+                # is conclusive on its own and `charge_and_gate` must
+                # NEVER run again in that case, marker or no marker.
+                if _charge_applied and _persisted_charge is not None:
+                    # Repair retry after the charge landed AND the
+                    # checkpoint marker recording its outcome also
+                    # landed — reuse the persisted block/downgrade
+                    # outcome instead of charging the budget again.
+                    block = bool(_persisted_charge.get("block"))
+                    downgrade = bool(_persisted_charge.get("downgrade"))
+                elif _charge_applied:
+                    # Legacy/under-charged reconciliation: the cursor
+                    # says charged but no `attended_charge_applied`
+                    # marker exists (written before the marker existed,
+                    # or terminated outside `submit_host_result`). Never
+                    # call `charge_and_gate` — that would re-record the
+                    # same cost a second time. Re-derive the current gate
+                    # outcome by READING the ledger `charge_and_gate`
+                    # would have gated on, without charging anything.
+                    block = should_block_for_budget(state)
+                    downgrade = should_downgrade_model(state)
+                    emit(project, wf, "attended.legacy_charge_reconciled", {
+                        "run_id": str(run_id), "call_key": str(call_key),
+                        "recon_key": _recon_key,
+                    })
+                else:
+                    block, downgrade = charge_and_gate(
+                        state, cost, toks, source=cost_source,
+                        estimated_usd=estimated_component,
+                    )
+                    if cost_source == "unmeasured":
+                        emit(project, wf, "attended.cost_unmeasured",
+                             {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
+                    # F34: budget_charge to eights (fail-soft; never blocks local
+                    # work). Only fired on a FRESH charge — a repair retry above
+                    # must not double-report spend to eights either.
+                    try:
+                        from .eights.attestation import EightsAttestor as _EightsAttestor
+                        _att = _EightsAttestor(dispatcher=dispatcher, workflow_id=wf)
+                        _att.budget_charge(
+                            workflow_id=wf, usd=cost, tokens=toks,
+                            purpose="attended_submit",
+                        )
+                    except Exception:  # noqa: BLE001 — fail-soft per F34
+                        pass
+                # Mark this engineering task attended-complete (replace
+                # channel) so the next `step` does not re-pick it. We do NOT
+                # flip task.status — the `tasks` channel's _append reducer
+                # would duplicate the task on update_state.
+                tid = res.get("task_id")
+                # Hydra#69 defect C: a `planning`-owned task must NOT be
+                # marked attended-complete/done (nor recorded into
+                # attended_results) here — its "artifact" is an EMITTED
+                # PLAN envelope, not just a host return, and that PLAN can
+                # still be rejected (missing, schema-invalid, phase
+                # disabled, artifact-write failure, or graph re-entry
+                # failure) by the ingest loop further below. Completion is
+                # written ONLY after that loop confirms durable acceptance
+                # (see the `is_planning_task` block after the envelope
+                # loop). Every other owner_squad keeps today's behaviour:
+                # completion is recorded immediately, right here.
+                is_planning_task = tid is not None and any(
+                    str(t.task_id) == str(tid) and t.owner_squad == "planning"
+                    for t in getattr(state, "tasks", [])
+                )
+                open_runs = [e for e in state.open_pp_runs
+                             if e.get("run_id") != res.get("run_id")]
+                res["budget_block"] = block
+                res["budget_downgrade"] = downgrade
+                res["spent_usd"] = state.budget.spent_usd
+                if not is_planning_task:
+                    completed = list(state.attended_completed_task_ids)
+                    if tid is not None and str(tid) not in completed:
+                        completed.append(str(tid))
+                    # MU15: record complete-only outcomes in
+                    # attended_done_task_ids so enforce_governance can skip
+                    # the deferred_to_host / surfaced check for tasks the
+                    # host successfully drove to completion. Only
+                    # 'complete' enters this list — surfaced/aborted
+                    # outcomes intentionally stay out so governance still
+                    # surfaces those.
+                    done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                    if (res.get("status") == "complete"
+                            and tid is not None
+                            and str(tid) not in done_ids):
+                        done_ids.append(str(tid))
+                    # E2-30: persist the attended outcome so `hydra finalize`
+                    # can materialise it into a squad result envelope for
+                    # node_synthesis (the in-graph dispatch never ran here).
+                    attended_results = _merge_attended_result(
+                        state.attended_results, _attended_result_record(state, res))
+                    _patch = {
+                        "attended_completed_task_ids": completed,
+                        "attended_done_task_ids": done_ids,
+                        "attended_results": attended_results,
+                        "open_pp_runs": open_runs,
+                        "budget": state.budget.model_dump(mode="json"),
+                        "budget_downgrade_active": bool(downgrade),
+                    }
+                    if not _charge_applied or _legacy_charge_repair:
+                        # Hydra#69 round 6 defect 1 (+ follow-up): CHARGE
+                        # evidence only — folded into the SAME atomic
+                        # write as the budget charge so a raise here
+                        # leaves neither landed, and a retry never
+                        # re-charges. This is NOT the full-reconciliation
+                        # marker (see the end of this call for that one).
+                        # A legacy repair (`_legacy_charge_repair`) also
+                        # stamps this marker even though `charge_and_gate`
+                        # did not run this call — the cursor already
+                        # proved the charge landed; this write only backs
+                        # that proof with the marker so FUTURE retries
+                        # converge on the persisted block/downgrade
+                        # instead of re-deriving it every time.
+                        _patch["attended_charge_applied"] = {
+                            _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
+                        }
+                    try:
+                        sup.update_state(config, _patch)
+                    except Exception as e:  # noqa: BLE001
+                        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                        _persist_errors.append(str(e))
+                else:
+                    # Budget/open-run bookkeeping is unconditional — the
+                    # host attempt genuinely spent cost regardless of
+                    # whether the PLAN it emitted is later accepted.
+                    # Rider (b)/task-3: charging is exactly-once per
+                    # cursor (guarded by the already_charged check above,
+                    # which returned early on a REPEATED submit against
+                    # the SAME cursor) and independent of acceptance — a
+                    # NEW attempt's cursor is never already_charged, so a
+                    # charged-then-rejected attempt is not re-charged and
+                    # the next attempt is still charged and ingested.
+                    _patch = {
+                        "open_pp_runs": open_runs,
+                        "budget": state.budget.model_dump(mode="json"),
+                        "budget_downgrade_active": bool(downgrade),
+                    }
+                    if not _charge_applied or _legacy_charge_repair:
+                        # Hydra#69 round 6 defect 1 (+ follow-up): see the
+                        # sibling non-planning write above — same
+                        # CHARGE-evidence (not full-reconciliation)
+                        # rationale, including the legacy-repair stamp.
+                        _patch["attended_charge_applied"] = {
+                            _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
+                        }
+                    try:
+                        sup.update_state(config, _patch)
+                    except Exception as e:  # noqa: BLE001
+                        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                        _persist_errors.append(str(e))
+
+                # A native pack may emit typed work for a sibling squad.
+                # Route it through the same boundary validation, redaction,
+                # claim-before-dispatch ledger, and checkpoint persistence
+                # used by `hydra workflow submit-envelopes`.  This closes
+                # the attended-host gap without creating an ungoverned
+                # direct Agent fan-out.
+                emitted = res.get("emitted_envelopes") or []
+                # Round 6 gap fix (stale-cursor submit, cross-vendor
+                # finding): a cursor opened before the workflow became
+                # terminal reaches here with `emitted`/`is_planning_task`
+                # exactly as before -- but dispatching those envelopes
+                # (claim + `dispatch_ingested_envelopes`, which can itself
+                # dispatch a new task) or re-entering the graph for a PLAN
+                # (`_apply_plan_reentry` below) would CONTINUE a workflow
+                # the operator already aborted/rejected elsewhere. Refuse
+                # both here; the cost/bookkeeping write above already
+                # recorded this call's already-incurred spend exactly
+                # once, independent of this gate.
+                if _terminal is not None:
+                    if emitted or is_planning_task:
+                        res["ingest"] = []
+                        res["status"] = "workflow_terminal"
+                        res["workflow_terminal"] = _terminal
+                        emit(project, wf, "attended.submit_terminal_refused", {
+                            "run_id": str(run_id),
+                            "call_key": str(call_key),
+                            "task_id": str(tid) if tid is not None else None,
+                            "emitted_count": len(emitted),
+                            "is_planning_task": is_planning_task,
+                        })
+                # Hydra#69 defect C: for a `planning` task the ingest loop
+                # must run even with an EMPTY `emitted` list — that is
+                # itself the "missing PLAN" rejection case, and the
+                # acceptance check right after this block needs to run
+                # regardless of whether anything was emitted.
+                elif emitted or is_planning_task:
+                    from .ingest import (
+                        claim_ingested_ids,
+                        dispatch_ingested_envelopes,
+                        load_ingested_ids,
+                        normalize_for_ingest,
+                        release_ingested_ids,
+                    )
+                    packs = discover_squads(project)
+                    if hasattr(dispatcher, "set_squad_packs"):
+                        dispatcher.set_squad_packs(packs)
+                    outcomes: list[dict[str, object]] = []
+                    # E2-34: envelopes that never reached a squad because
+                    # they failed schema validation. A non-empty list flips
+                    # the top-level status to "envelopes_rejected" so the
+                    # delegation is never dropped inside a "complete".
+                    rejected: list[dict[str, object]] = []
+                    # P5b Task 3: the state patch a PLAN item produced
+                    # (set by dispatch_ingested_envelopes on
+                    # outcome.plan_patch), applied via the graph re-entry
+                    # idiom AFTER this loop. Last-one-wins is fine — a
+                    # single attended submit ingesting more than one PLAN
+                    # is not a real scenario the host produces.
+                    plan_reentry_patch: dict[str, object] | None = None
+                    plan_reentry_envelope_id: str | None = None
+                    processed = load_ingested_ids(project, wf)
+                    for raw in emitted:
+                        if not isinstance(raw, dict):
+                            bad = {"status": "failed", "detail": "non-object envelope",
+                                   "errors": [{"field": "", "msg": "non-object envelope"}]}
+                            outcomes.append(bad)
+                            rejected.append(bad)
+                            emit(project, wf, "ingest.invalid_envelope",
+                                 {"envelope_id": None, "type": None,
+                                  "errors": bad["errors"]})
+                            continue
+                        # E2-34: normalize BEFORE reading the id. A pack may
+                        # omit `id` or use a non-UUID label; keying dedup on
+                        # the raw value would let such an envelope bypass
+                        # `processed` and dispatch twice.
+                        try:
+                            raw = normalize_for_ingest(
+                                raw,
+                                lambda event, payload: emit(project, wf, event, payload),
+                            )
+                        except ValueError as exc:
+                            # b1baf30 revise round item 6: a pack-supplied
+                            # budget_usd that could not be converted to a
+                            # finite float. Real failed item, not a crash.
+                            bad_id = raw.get("id")
+                            bad_errors = [{"field": "budget_usd", "msg": str(exc)}]
+                            bad = {"envelope_id": str(bad_id) if bad_id is not None else "?",
+                                   # Cross-vendor judge finding (this
+                                   # round, HIGH): this record omitted
+                                   # `envelope_type`, so a normalization
+                                   # -failed PLAN was misclassified as
+                                   # `missing_plan` by
+                                   # `_classify_plan_rejection` (which
+                                   # searches outcomes for
+                                   # `envelope_type == "PLAN"`) instead
+                                   # of `invalid_plan`. Preserve the raw
+                                   # type just like `ingest.py`'s own
+                                   # analogous failure record does
+                                   # (`envelope_type=bad.get("type")`).
+                                   "envelope_type": raw.get("type"),
+                                   "status": "failed", "detail": f"invalid envelope: {exc}",
+                                   "errors": bad_errors}
+                            outcomes.append(bad)
+                            rejected.append(bad)
+                            emit(project, wf, "ingest.invalid_envelope",
+                                 {"envelope_id": bad.get("envelope_id"),
+                                  "type": raw.get("type"), "errors": bad_errors})
+                            continue
+                        envelope_id = raw.get("id")
+                        if envelope_id is not None and str(envelope_id) in processed:
+                            outcomes.append({"envelope_id": str(envelope_id),
+                                             "status": "skipped_duplicate"})
+                            continue
+                        if envelope_id is not None:
+                            claim_ingested_ids(project, wf, [str(envelope_id)])
+                        outcome = dispatch_ingested_envelopes(
+                            state, [raw], packs=packs, dispatcher=dispatcher,
+                            already_ingested=processed,
+                            emit_fn=lambda event, payload: emit(project, wf, event, payload),
+                        )
+                        item = outcome.items[-1] if outcome.items else None
+                        if envelope_id is not None and item is not None:
+                            # A schema-rejected envelope never reached a
+                            # squad, so un-claim it: the host can re-submit
+                            # a corrected envelope under the same id without
+                            # being suppressed as a duplicate (E2-34).
+                            if _ingest_item_should_release_claim(item):
+                                release_ingested_ids(project, wf, [str(envelope_id)])
+                            else:
+                                processed.add(str(envelope_id))
+                        try:
+                            sup.update_state(config, {
+                                "tasks": outcome.new_tasks,
+                                "envelopes": outcome.new_envelopes,
+                                "open_pp_runs": state.open_pp_runs,
+                                "budget": state.budget.model_dump(mode="json"),
+                            })
+                        except Exception as exc:  # noqa: BLE001
+                            emit(project, wf, "attended.emitted_persist_failed",
+                                 {"error": str(exc)})
+                            _persist_errors.append(str(exc))
+                        if outcome.plan_patch:
+                            plan_reentry_patch = dict(outcome.plan_patch)
+                            # Tracked separately from `processed`/the
+                            # ledger so a re-entry failure below can
+                            # release exactly this claim without touching
+                            # any other envelope_id this loop processed.
+                            plan_reentry_envelope_id = (
+                                str(envelope_id) if envelope_id is not None else None
+                            )
+                        outcomes.extend(vars(it) for it in outcome.items)
+                        rejected.extend(vars(it) for it in outcome.rejected)
+                    res["ingest"] = outcomes
+                    if plan_reentry_patch:
+                        _apply_plan_reentry(
+                            sup, config, project, wf,
+                            plan_reentry_patch, plan_reentry_envelope_id, res,
+                            emit_fn=emit, release_fn=release_ingested_ids,
+                        )
+                    if rejected:
+                        _apply_rejected_envelopes(
+                            res, rejected,
+                            record_fn=host_bridge.record_rejected_envelopes,
+                            emit_fn=emit, project=project, wf=wf,
+                            cfile=cfile, run_id=str(run_id),
+                        )
+
+                # Hydra#69 defect C: the planning task's completion is
+                # decided HERE, after the PLAN has had a chance to be
+                # ingested/re-entered — never optimistically up front.
+                # `plan_reentry_patch` is only ever set by
+                # `dispatch_ingested_envelopes` when the PLAN it just
+                # validated (workflow_id / revision / supersedes — defect
+                # G) was durably drafted, and `_apply_plan_reentry` flips
+                # `res["status"]` to "plan_reentry_failed" iff the graph
+                # re-entry itself raised — so this single condition
+                # covers every rejection kind the brief enumerates
+                # (missing PLAN, schema-invalid PLAN, phase disabled,
+                # artifact write failure, re-entry failure) uniformly.
+                # Round 6 gap fix: `_terminal is not None` short-circuited
+                # the ingest block above (no `plan_reentry_patch`/
+                # `outcomes` were ever computed this call, and `res` was
+                # already set to the `workflow_terminal` refusal above) —
+                # never run this acceptance/rejection decision in that
+                # case, it would otherwise misclassify the refusal as an
+                # ordinary `plan_rejected` and bump the attempt counter.
+                if is_planning_task and _terminal is None:
+                    # Hydra#69 round 6 defect 1 (repair-retry corollary):
+                    # a repair retry (the completion write below failed
+                    # on a PRIOR call, after the PLAN itself was already
+                    # durably drafted+re-entered) re-runs this SAME loop
+                    # against a claim ledger that already marked the
+                    # PLAN's envelope_id claimed -- the outer dedup check
+                    # above short-circuits it to `skipped_duplicate`
+                    # WITHOUT ever calling `dispatch_ingested_envelopes`
+                    # again, so `plan_reentry_patch` is never (re)set on
+                    # this call even though the plan genuinely IS
+                    # accepted. Recognise that case from durable
+                    # checkpoint state instead of only this call's own
+                    # freshly-computed patch: if the emitted PLAN's own
+                    # id matches `state.plan_envelope_id` (stamped by
+                    # `_apply_plan_reentry`'s own checkpoint write) and
+                    # the plan barrier has actually been raised for it,
+                    # the acceptance already landed on an earlier call.
+                    _emitted_plan_id = next(
+                        (str(e.get("id")) for e in emitted
+                         if isinstance(e, dict) and e.get("type") == "PLAN"
+                         and e.get("id") is not None),
+                        None,
+                    )
+                    _plan_already_accepted = (
+                        _emitted_plan_id is not None
+                        and state.plan_envelope_id is not None
+                        and str(state.plan_envelope_id) == _emitted_plan_id
+                        and str(state.plan_status or "none") not in ("none", "rejected")
+                    )
+                    _plan_accepted = (
+                        bool(plan_reentry_patch)
+                        and res.get("status") != "plan_reentry_failed"
+                    ) or _plan_already_accepted
+                    if _plan_accepted:
+                        completed = list(state.attended_completed_task_ids)
+                        if tid is not None and str(tid) not in completed:
+                            completed.append(str(tid))
+                        done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                        if (res.get("status") == "complete"
+                                and tid is not None
+                                and str(tid) not in done_ids):
+                            done_ids.append(str(tid))
+                        attended_results = _merge_attended_result(
+                            state.attended_results, _attended_result_record(state, res))
+                        try:
+                            sup.update_state(config, {
+                                "attended_completed_task_ids": completed,
+                                "attended_done_task_ids": done_ids,
+                                "attended_results": attended_results,
+                            })
+                        except Exception as e:  # noqa: BLE001
+                            emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                            _persist_errors.append(str(e))
+                    else:
+                        _rejection = _classify_plan_rejection(
+                            emitted, outcomes if "outcomes" in locals() else [], res)
+                        res["status"] = "plan_rejected"
+                        res["plan_rejection"] = _rejection
+                        # Task 3: bump the per-task attempt counter so the
+                        # NEXT `_cmd_attended_step` mints a fresh
+                        # `squad-{task_id}-{attempt}` call_key — a late
+                        # response carrying this (now stale) attempt's
+                        # call_key can never match the re-issued cursor.
+                        _attempts = dict(
+                            getattr(state, "plan_submit_attempts", {}) or {})
+                        _attempts[str(tid)] = int(_attempts.get(str(tid), 0)) + 1
+                        try:
+                            sup.update_state(
+                                config, {"plan_submit_attempts": _attempts})
+                        except Exception as e:  # noqa: BLE001
+                            emit(project, wf, "attended.persist_failed",
+                                 {"error": str(e)})
+                            _persist_errors.append(str(e))
+                        emit(project, wf, "attended.plan_rejected", {
+                            "task_id": str(tid),
+                            "reason": _rejection.get("reason"),
+                            "attempt": _attempts.get(str(tid)),
+                        })
+
+                # Hydra#69 round 6 defect 1 (HIGH): the FULL-reconciliation
+                # marker is written ONLY here, as the LAST checkpoint
+                # write of this call, after every other write above
+                # (charge, ingest, plan re-entry, rejected envelopes,
+                # attempt-counter bump / plan acceptance) has had its
+                # chance to run. A retry against an unset marker always
+                # falls through and repairs whatever this call still left
+                # missing, instead of returning a stale cached success.
+                # Skipped entirely if any write above already failed --
+                # `_persist_errors` already downgrades the response below,
+                # and stamping "reconciled" over a known-incomplete call
+                # would defeat the whole point of this marker.
+                if not _persist_errors:
+                    try:
+                        sup.update_state(config, {
+                            "attended_checkpoint_reconciled": {_recon_key: True},
+                        })
+                    except Exception as e:  # noqa: BLE001
+                        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                        _persist_errors.append(str(e))
+
+    return res, _persist_errors
+
+
 def _cmd_attended_submit(args) -> int:
     """Feed a host subagent's result back into an attended stage and advance it
     one step. On stage completion, charge the accrued cost on the checkpointed
@@ -5136,644 +5914,9 @@ def _cmd_attended_submit(args) -> int:
         # ...) never actually reached the LangGraph checkpoint. Collect every
         # such failure here and downgrade the final response instead of
         # silently reporting success.
-        _persist_errors: list[str] = []
-
-        # On terminal: charge budget on the authoritative HydraState ledger and
-        # record the task outcome into the checkpoint.
-        # Rider (b): skip charge if already_charged=True (idempotency guard).
-        # E2-35: "complete_unpersisted" is terminal too — the pack agent ran and
-        # spent real money, so it must charge like any other terminal outcome.
-        if res.get("status") in ("complete", "complete_unpersisted",
-                                 "surfaced", "aborted"):
-            _already_charged = bool(res.get("already_charged"))
-            # Hydra#69 round 6 defect 2 (HIGH): derive the reconciliation/
-            # charge identity from the cursor's OWN trusted terminal call
-            # identity (host_bridge.submit_host_result validates and stamps
-            # this before ever returning a terminal result) — never from the
-            # caller-supplied args.call_key directly. Round 5's keying on
-            # args.call_key let a different/stale call_key mint its OWN
-            # reconciliation key against the SAME terminal cursor, missing
-            # the existing marker and re-billing the cached result. A legacy
-            # cursor (written before `terminal_call_key` existed, or
-            # terminated outside submit_host_result) collapses to a fixed
-            # "legacy" identity so every future retry — regardless of which
-            # call_key it carries — converges on the SAME key instead of
-            # growing a new one per call_key.
-            _call_identity = res.get("terminal_call_key") or "legacy"
-            _recon_key = f"{args.run_id}:{_call_identity}"
-            # Hydra#69 round 6 defect 1 (HIGH): CHARGE evidence
-            # (`attended_charge_applied`) and FULL-RECONCILIATION evidence
-            # (`attended_checkpoint_reconciled`) are now two SEPARATE
-            # checkpoint markers. Round 5 folded both into one marker written
-            # alongside the budget charge — before the later downstream
-            # writes this call still has to make (attempt-counter bump, PLAN
-            # acceptance/rejection outcome, completion ids). A crash between
-            # the charge write and one of those later writes left that single
-            # marker already `True`, so an identical retry took the
-            # cached-result shortcut with the later writes still missing.
-            # `_charge_applied` alone gates whether `charge_and_gate` runs
-            # again below (never re-charge); `_reconciled` alone gates the
-            # cached-result shortcut, and is only ever set `True` at the very
-            # end of this block, after every downstream write has succeeded.
-            _reconciled = True
-            _charge_applied = True
-            _persisted_charge: dict[str, object] | None = None
-            # Round 6 follow-up defect 1 (cross-vendor, HIGH): a TRUE legacy
-            # cursor — `_call_identity == "legacy"`, i.e. `terminal_call_key`
-            # is ABSENT from the cursor (persisted by an older version of
-            # this code, before that field existed, or terminated outside
-            # `submit_host_result`) — has no way to ever prove its charge
-            # landed via the marker: `already_charged=True` on its own is
-            # the ONLY evidence available for it, and is treated as
-            # conclusive (never re-`charge_and_gate` it, marker or no
-            # marker). This is deliberately NARROWER than "no marker for
-            # this recon_key": a NON-legacy cursor (terminal_call_key
-            # present) whose marker is absent is proof the OPPOSITE way —
-            # the marker and the `budget` field are always written together
-            # in the SAME atomic checkpoint patch, so an absent marker for
-            # THIS cursor's own unique recon_key means this exact call's
-            # charge genuinely never reached the checkpoint yet, and
-            # `charge_and_gate` MUST still run on this retry (that is a
-            # crash-recovery repair, not a double charge — nothing landed).
-            _legacy_charge_repair = False
-            if _already_charged:
-                # Idempotent re-submit candidate: the cursor sidecar says
-                # this call was already charged on a prior terminal submit.
-                # That flag alone is NOT proof every checkpoint write
-                # actually landed (the crash-ordering rationale below
-                # explicitly accepts a window where mark_charged succeeds
-                # but the LangGraph checkpoint write after it fails) — check
-                # the checkpoint-side markers before trusting reconciliation
-                # is complete. It IS, however, conclusive proof the CHARGE
-                # itself must never be repeated — see `_legacy_charge_repair`.
-                from .supervisor import build_supervisor as _recon_bs, _PurePythonRunner as _recon_ppr
-                _recon_sup = _recon_bs(project_root=project, dispatcher=dispatcher)
-                if not isinstance(_recon_sup, _recon_ppr):
-                    _recon_snap = _recon_sup.get_state({"configurable": {"thread_id": wf}})
-                    _recon_values = (
-                        _recon_snap.values
-                        if _recon_snap is not None and _recon_snap.values else {}
-                    )
-                    _reconciled = bool(
-                        (_recon_values.get("attended_checkpoint_reconciled") or {})
-                        .get(_recon_key)
-                    )
-                    _charge_evidence = (
-                        (_recon_values.get("attended_charge_applied") or {})
-                        .get(_recon_key)
-                    )
-                    _persisted_charge = (
-                        _charge_evidence if isinstance(_charge_evidence, dict) else None
-                    )
-                    if _call_identity == "legacy":
-                        # True legacy cursor: `already_charged=True` is
-                        # conclusive on its own; never re-invoke
-                        # `charge_and_gate` for it regardless of the marker.
-                        _charge_applied = True
-                        _legacy_charge_repair = _persisted_charge is None
-                    else:
-                        # Non-legacy cursor: this recon_key is unique to
-                        # THIS cursor's one terminal call (a different
-                        # call_key against an already-terminal cursor is
-                        # refused as stale before ever reaching here), so an
-                        # absent marker for it is conclusive proof this
-                        # exact call's charge never reached the checkpoint —
-                        # `charge_and_gate` must still run below.
-                        _charge_applied = _persisted_charge is not None
-                if _reconciled:
-                    # Genuinely done: cursor charged AND EVERY checkpoint
-                    # write for this exact call already landed. Return the
-                    # cached result without re-billing or repeating writes.
-                    emit(project, wf, "attended.submit",
-                         {"run_id": str(args.run_id), "call_key": str(args.call_key),
-                          "status": res.get("status"), "already_charged": True})
-                    print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
-                    return 0
-                # Else: repair path. The cursor is already charged (never
-                # re-charge it — `_charge_applied` below skips
-                # `charge_and_gate` when the checkpoint already confirms it
-                # landed), but one or more downstream checkpoint writes never
-                # landed — fall through and redo them. Every write in the
-                # block below is idempotent (membership-checked task-id
-                # lists, upsert-by-task_id results, a merge-dict reducer for
-                # the markers themselves), so redoing them exactly reproduces
-                # the outcome the original terminal submit should have left.
-                emit(project, wf, "attended.checkpoint_reconcile_retry",
-                     {"run_id": str(args.run_id), "call_key": str(args.call_key),
-                      "status": res.get("status")})
-            else:
-                # Rider (b) recovery-safe ordering: mark cursor charged BEFORE the
-                # budget write to the LangGraph checkpoint so that a crash between
-                # here and the checkpoint persist is an under-charge (acceptable) rather
-                # than a double-charge (unsafe).  Crash-ordering rationale:
-                #   1. mark_charged(cfile)          ← cursor sidecar flagged first
-                #   2. charge_and_gate(...)          ← HydraState.budget mutated in memory
-                #   3. sup.update_state(...)         ← checkpoint persisted (with the
-                #                                       charge-applied marker for this
-                #                                       call folded into the SAME patch)
-                # If the process dies after (1) but before (3), the retry sees
-                # already_charged=True but an UNSET charge-applied marker, and repairs
-                # the checkpoint writes above instead of silently under-charging.
-                # The opposite order (charge then mark) would re-charge on that crash
-                # → double-charge, which burns real spend twice.
-                host_bridge.mark_charged(cfile)
-                _charge_applied = False
-            from .supervisor import build_supervisor, _PurePythonRunner
-            sup = build_supervisor(project_root=project, dispatcher=dispatcher)
-            # The host returns the native pack artifact as text. Persist it only
-            # through the declared pack output root; the helper rejects escapes
-            # and non-text artifacts before producing the MemoryRef returned to
-            # the operator and telemetry.
-            squad_slug = str(res.get("squad_slug") or "")
-            artifact_text = str(res.get("artifact_text") or "")
-            # E2-35: host_bridge already persisted non-native squad artifacts
-            # (generic store + claude-skill shim) and recorded the outcome on
-            # the cursor. Only squads it left alone — the native packs — reach
-            # the native output-root writer here.
-            already_handled = (res.get("artifact_ref") is not None
-                               or res.get("artifact_persist_error") is not None)
-            if squad_slug and artifact_text and not already_handled:
-                try:
-                    from .artifact_store import write_native_artifact
-                    ref = write_native_artifact(
-                        squad_slug, f"attended/{res.get('task_id') or args.run_id}.md",
-                        artifact_text,
-                    )
-                    res["artifact_ref"] = ref.model_dump(mode="json")
-                    emit(project, wf, "attended.native_artifact_persisted", {
-                        "squad_slug": squad_slug, "memory_ref": ref.key,
-                    })
-                except (ValueError, OSError) as exc:
-                    res["artifact_persist_error"] = str(exc)
-                    emit(project, wf, "attended.native_artifact_persist_failed", {
-                        "squad_slug": squad_slug, "error": str(exc),
-                    })
-            if not isinstance(sup, _PurePythonRunner):
-                config = {"configurable": {"thread_id": wf}}
-                snap = sup.get_state(config)
-                if snap is not None and snap.values:
-                    state = HydraState.model_validate(snap.values)
-                    # Round 6 gap fix (stale-cursor submit): re-derive terminal
-                    # status from the CURRENT checkpoint (may have gone
-                    # terminal via a different gate while this cursor was in
-                    # flight, or was already terminal at the pre-submit check
-                    # above -- re-read here rather than trust that snapshot,
-                    # since this is the checkpoint state every write below
-                    # actually applies against). Gates the ingest/dispatch and
-                    # PLAN re-entry blocks further down (never the cost/
-                    # bookkeeping writes immediately below, which record the
-                    # ALREADY-INCURRED spend regardless of workflow terminal
-                    # status -- see `_cmd_attended_submit`'s docstring).
-                    _terminal = workflow_terminal_resolution(
-                        snap.values, getattr(snap, "next", ()) or ())
-                    cost = float(res.get("cost_usd") or 0.0)
-                    toks = int(res.get("tokens_in") or 0) + int(res.get("tokens_out") or 0)
-                    # B8: see the recover-stalled-stage twin above — an
-                    # unreporting host is estimated/unmeasured, never free.
-                    cost_source = str(res.get("cost_source") or "measured")
-                    # Fix (mixed-provenance estimated_usd): see the twin
-                    # comment above — credit only the per-component estimated
-                    # figure, not the whole (possibly mixed) stage total.
-                    estimated_component = float(res.get("estimated_cost_usd") or 0.0)
-                    # Hydra#69 round 6 defect 1 (HIGH), follow-up (cross-
-                    # vendor, HIGH): `_charge_applied` is True whenever the
-                    # cursor itself says charged (`_already_charged`) — that
-                    # is conclusive on its own and `charge_and_gate` must
-                    # NEVER run again in that case, marker or no marker.
-                    if _charge_applied and _persisted_charge is not None:
-                        # Repair retry after the charge landed AND the
-                        # checkpoint marker recording its outcome also
-                        # landed — reuse the persisted block/downgrade
-                        # outcome instead of charging the budget again.
-                        block = bool(_persisted_charge.get("block"))
-                        downgrade = bool(_persisted_charge.get("downgrade"))
-                    elif _charge_applied:
-                        # Legacy/under-charged reconciliation: the cursor
-                        # says charged but no `attended_charge_applied`
-                        # marker exists (written before the marker existed,
-                        # or terminated outside `submit_host_result`). Never
-                        # call `charge_and_gate` — that would re-record the
-                        # same cost a second time. Re-derive the current gate
-                        # outcome by READING the ledger `charge_and_gate`
-                        # would have gated on, without charging anything.
-                        block = should_block_for_budget(state)
-                        downgrade = should_downgrade_model(state)
-                        emit(project, wf, "attended.legacy_charge_reconciled", {
-                            "run_id": str(args.run_id), "call_key": str(args.call_key),
-                            "recon_key": _recon_key,
-                        })
-                    else:
-                        block, downgrade = charge_and_gate(
-                            state, cost, toks, source=cost_source,
-                            estimated_usd=estimated_component,
-                        )
-                        if cost_source == "unmeasured":
-                            emit(project, wf, "attended.cost_unmeasured",
-                                 {"stage_id": res.get("stage_id"), "run_id": res.get("run_id")})
-                        # F34: budget_charge to eights (fail-soft; never blocks local
-                        # work). Only fired on a FRESH charge — a repair retry above
-                        # must not double-report spend to eights either.
-                        try:
-                            from .eights.attestation import EightsAttestor as _EightsAttestor
-                            _att = _EightsAttestor(dispatcher=dispatcher, workflow_id=wf)
-                            _att.budget_charge(
-                                workflow_id=wf, usd=cost, tokens=toks,
-                                purpose="attended_submit",
-                            )
-                        except Exception:  # noqa: BLE001 — fail-soft per F34
-                            pass
-                    # Mark this engineering task attended-complete (replace
-                    # channel) so the next `step` does not re-pick it. We do NOT
-                    # flip task.status — the `tasks` channel's _append reducer
-                    # would duplicate the task on update_state.
-                    tid = res.get("task_id")
-                    # Hydra#69 defect C: a `planning`-owned task must NOT be
-                    # marked attended-complete/done (nor recorded into
-                    # attended_results) here — its "artifact" is an EMITTED
-                    # PLAN envelope, not just a host return, and that PLAN can
-                    # still be rejected (missing, schema-invalid, phase
-                    # disabled, artifact-write failure, or graph re-entry
-                    # failure) by the ingest loop further below. Completion is
-                    # written ONLY after that loop confirms durable acceptance
-                    # (see the `is_planning_task` block after the envelope
-                    # loop). Every other owner_squad keeps today's behaviour:
-                    # completion is recorded immediately, right here.
-                    is_planning_task = tid is not None and any(
-                        str(t.task_id) == str(tid) and t.owner_squad == "planning"
-                        for t in getattr(state, "tasks", [])
-                    )
-                    open_runs = [e for e in state.open_pp_runs
-                                 if e.get("run_id") != res.get("run_id")]
-                    res["budget_block"] = block
-                    res["budget_downgrade"] = downgrade
-                    res["spent_usd"] = state.budget.spent_usd
-                    if not is_planning_task:
-                        completed = list(state.attended_completed_task_ids)
-                        if tid is not None and str(tid) not in completed:
-                            completed.append(str(tid))
-                        # MU15: record complete-only outcomes in
-                        # attended_done_task_ids so enforce_governance can skip
-                        # the deferred_to_host / surfaced check for tasks the
-                        # host successfully drove to completion. Only
-                        # 'complete' enters this list — surfaced/aborted
-                        # outcomes intentionally stay out so governance still
-                        # surfaces those.
-                        done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
-                        if (res.get("status") == "complete"
-                                and tid is not None
-                                and str(tid) not in done_ids):
-                            done_ids.append(str(tid))
-                        # E2-30: persist the attended outcome so `hydra finalize`
-                        # can materialise it into a squad result envelope for
-                        # node_synthesis (the in-graph dispatch never ran here).
-                        attended_results = _merge_attended_result(
-                            state.attended_results, _attended_result_record(state, res))
-                        _patch = {
-                            "attended_completed_task_ids": completed,
-                            "attended_done_task_ids": done_ids,
-                            "attended_results": attended_results,
-                            "open_pp_runs": open_runs,
-                            "budget": state.budget.model_dump(mode="json"),
-                            "budget_downgrade_active": bool(downgrade),
-                        }
-                        if not _charge_applied or _legacy_charge_repair:
-                            # Hydra#69 round 6 defect 1 (+ follow-up): CHARGE
-                            # evidence only — folded into the SAME atomic
-                            # write as the budget charge so a raise here
-                            # leaves neither landed, and a retry never
-                            # re-charges. This is NOT the full-reconciliation
-                            # marker (see the end of this call for that one).
-                            # A legacy repair (`_legacy_charge_repair`) also
-                            # stamps this marker even though `charge_and_gate`
-                            # did not run this call — the cursor already
-                            # proved the charge landed; this write only backs
-                            # that proof with the marker so FUTURE retries
-                            # converge on the persisted block/downgrade
-                            # instead of re-deriving it every time.
-                            _patch["attended_charge_applied"] = {
-                                _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
-                            }
-                        try:
-                            sup.update_state(config, _patch)
-                        except Exception as e:  # noqa: BLE001
-                            emit(project, wf, "attended.persist_failed", {"error": str(e)})
-                            _persist_errors.append(str(e))
-                    else:
-                        # Budget/open-run bookkeeping is unconditional — the
-                        # host attempt genuinely spent cost regardless of
-                        # whether the PLAN it emitted is later accepted.
-                        # Rider (b)/task-3: charging is exactly-once per
-                        # cursor (guarded by the already_charged check above,
-                        # which returned early on a REPEATED submit against
-                        # the SAME cursor) and independent of acceptance — a
-                        # NEW attempt's cursor is never already_charged, so a
-                        # charged-then-rejected attempt is not re-charged and
-                        # the next attempt is still charged and ingested.
-                        _patch = {
-                            "open_pp_runs": open_runs,
-                            "budget": state.budget.model_dump(mode="json"),
-                            "budget_downgrade_active": bool(downgrade),
-                        }
-                        if not _charge_applied or _legacy_charge_repair:
-                            # Hydra#69 round 6 defect 1 (+ follow-up): see the
-                            # sibling non-planning write above — same
-                            # CHARGE-evidence (not full-reconciliation)
-                            # rationale, including the legacy-repair stamp.
-                            _patch["attended_charge_applied"] = {
-                                _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
-                            }
-                        try:
-                            sup.update_state(config, _patch)
-                        except Exception as e:  # noqa: BLE001
-                            emit(project, wf, "attended.persist_failed", {"error": str(e)})
-                            _persist_errors.append(str(e))
-
-                    # A native pack may emit typed work for a sibling squad.
-                    # Route it through the same boundary validation, redaction,
-                    # claim-before-dispatch ledger, and checkpoint persistence
-                    # used by `hydra workflow submit-envelopes`.  This closes
-                    # the attended-host gap without creating an ungoverned
-                    # direct Agent fan-out.
-                    emitted = res.get("emitted_envelopes") or []
-                    # Round 6 gap fix (stale-cursor submit, cross-vendor
-                    # finding): a cursor opened before the workflow became
-                    # terminal reaches here with `emitted`/`is_planning_task`
-                    # exactly as before -- but dispatching those envelopes
-                    # (claim + `dispatch_ingested_envelopes`, which can itself
-                    # dispatch a new task) or re-entering the graph for a PLAN
-                    # (`_apply_plan_reentry` below) would CONTINUE a workflow
-                    # the operator already aborted/rejected elsewhere. Refuse
-                    # both here; the cost/bookkeeping write above already
-                    # recorded this call's already-incurred spend exactly
-                    # once, independent of this gate.
-                    if _terminal is not None:
-                        if emitted or is_planning_task:
-                            res["ingest"] = []
-                            res["status"] = "workflow_terminal"
-                            res["workflow_terminal"] = _terminal
-                            emit(project, wf, "attended.submit_terminal_refused", {
-                                "run_id": str(args.run_id),
-                                "call_key": str(args.call_key),
-                                "task_id": str(tid) if tid is not None else None,
-                                "emitted_count": len(emitted),
-                                "is_planning_task": is_planning_task,
-                            })
-                    # Hydra#69 defect C: for a `planning` task the ingest loop
-                    # must run even with an EMPTY `emitted` list — that is
-                    # itself the "missing PLAN" rejection case, and the
-                    # acceptance check right after this block needs to run
-                    # regardless of whether anything was emitted.
-                    elif emitted or is_planning_task:
-                        from .ingest import (
-                            claim_ingested_ids,
-                            dispatch_ingested_envelopes,
-                            load_ingested_ids,
-                            normalize_for_ingest,
-                            release_ingested_ids,
-                        )
-                        packs = discover_squads(project)
-                        if hasattr(dispatcher, "set_squad_packs"):
-                            dispatcher.set_squad_packs(packs)
-                        outcomes: list[dict[str, object]] = []
-                        # E2-34: envelopes that never reached a squad because
-                        # they failed schema validation. A non-empty list flips
-                        # the top-level status to "envelopes_rejected" so the
-                        # delegation is never dropped inside a "complete".
-                        rejected: list[dict[str, object]] = []
-                        # P5b Task 3: the state patch a PLAN item produced
-                        # (set by dispatch_ingested_envelopes on
-                        # outcome.plan_patch), applied via the graph re-entry
-                        # idiom AFTER this loop. Last-one-wins is fine — a
-                        # single attended submit ingesting more than one PLAN
-                        # is not a real scenario the host produces.
-                        plan_reentry_patch: dict[str, object] | None = None
-                        plan_reentry_envelope_id: str | None = None
-                        processed = load_ingested_ids(project, wf)
-                        for raw in emitted:
-                            if not isinstance(raw, dict):
-                                bad = {"status": "failed", "detail": "non-object envelope",
-                                       "errors": [{"field": "", "msg": "non-object envelope"}]}
-                                outcomes.append(bad)
-                                rejected.append(bad)
-                                emit(project, wf, "ingest.invalid_envelope",
-                                     {"envelope_id": None, "type": None,
-                                      "errors": bad["errors"]})
-                                continue
-                            # E2-34: normalize BEFORE reading the id. A pack may
-                            # omit `id` or use a non-UUID label; keying dedup on
-                            # the raw value would let such an envelope bypass
-                            # `processed` and dispatch twice.
-                            try:
-                                raw = normalize_for_ingest(
-                                    raw,
-                                    lambda event, payload: emit(project, wf, event, payload),
-                                )
-                            except ValueError as exc:
-                                # b1baf30 revise round item 6: a pack-supplied
-                                # budget_usd that could not be converted to a
-                                # finite float. Real failed item, not a crash.
-                                bad_id = raw.get("id")
-                                bad_errors = [{"field": "budget_usd", "msg": str(exc)}]
-                                bad = {"envelope_id": str(bad_id) if bad_id is not None else "?",
-                                       # Cross-vendor judge finding (this
-                                       # round, HIGH): this record omitted
-                                       # `envelope_type`, so a normalization
-                                       # -failed PLAN was misclassified as
-                                       # `missing_plan` by
-                                       # `_classify_plan_rejection` (which
-                                       # searches outcomes for
-                                       # `envelope_type == "PLAN"`) instead
-                                       # of `invalid_plan`. Preserve the raw
-                                       # type just like `ingest.py`'s own
-                                       # analogous failure record does
-                                       # (`envelope_type=bad.get("type")`).
-                                       "envelope_type": raw.get("type"),
-                                       "status": "failed", "detail": f"invalid envelope: {exc}",
-                                       "errors": bad_errors}
-                                outcomes.append(bad)
-                                rejected.append(bad)
-                                emit(project, wf, "ingest.invalid_envelope",
-                                     {"envelope_id": bad.get("envelope_id"),
-                                      "type": raw.get("type"), "errors": bad_errors})
-                                continue
-                            envelope_id = raw.get("id")
-                            if envelope_id is not None and str(envelope_id) in processed:
-                                outcomes.append({"envelope_id": str(envelope_id),
-                                                 "status": "skipped_duplicate"})
-                                continue
-                            if envelope_id is not None:
-                                claim_ingested_ids(project, wf, [str(envelope_id)])
-                            outcome = dispatch_ingested_envelopes(
-                                state, [raw], packs=packs, dispatcher=dispatcher,
-                                already_ingested=processed,
-                                emit_fn=lambda event, payload: emit(project, wf, event, payload),
-                            )
-                            item = outcome.items[-1] if outcome.items else None
-                            if envelope_id is not None and item is not None:
-                                # A schema-rejected envelope never reached a
-                                # squad, so un-claim it: the host can re-submit
-                                # a corrected envelope under the same id without
-                                # being suppressed as a duplicate (E2-34).
-                                if _ingest_item_should_release_claim(item):
-                                    release_ingested_ids(project, wf, [str(envelope_id)])
-                                else:
-                                    processed.add(str(envelope_id))
-                            try:
-                                sup.update_state(config, {
-                                    "tasks": outcome.new_tasks,
-                                    "envelopes": outcome.new_envelopes,
-                                    "open_pp_runs": state.open_pp_runs,
-                                    "budget": state.budget.model_dump(mode="json"),
-                                })
-                            except Exception as exc:  # noqa: BLE001
-                                emit(project, wf, "attended.emitted_persist_failed",
-                                     {"error": str(exc)})
-                                _persist_errors.append(str(exc))
-                            if outcome.plan_patch:
-                                plan_reentry_patch = dict(outcome.plan_patch)
-                                # Tracked separately from `processed`/the
-                                # ledger so a re-entry failure below can
-                                # release exactly this claim without touching
-                                # any other envelope_id this loop processed.
-                                plan_reentry_envelope_id = (
-                                    str(envelope_id) if envelope_id is not None else None
-                                )
-                            outcomes.extend(vars(it) for it in outcome.items)
-                            rejected.extend(vars(it) for it in outcome.rejected)
-                        res["ingest"] = outcomes
-                        if plan_reentry_patch:
-                            _apply_plan_reentry(
-                                sup, config, project, wf,
-                                plan_reentry_patch, plan_reentry_envelope_id, res,
-                                emit_fn=emit, release_fn=release_ingested_ids,
-                            )
-                        if rejected:
-                            _apply_rejected_envelopes(
-                                res, rejected,
-                                record_fn=host_bridge.record_rejected_envelopes,
-                                emit_fn=emit, project=project, wf=wf,
-                                cfile=cfile, run_id=str(args.run_id),
-                            )
-
-                    # Hydra#69 defect C: the planning task's completion is
-                    # decided HERE, after the PLAN has had a chance to be
-                    # ingested/re-entered — never optimistically up front.
-                    # `plan_reentry_patch` is only ever set by
-                    # `dispatch_ingested_envelopes` when the PLAN it just
-                    # validated (workflow_id / revision / supersedes — defect
-                    # G) was durably drafted, and `_apply_plan_reentry` flips
-                    # `res["status"]` to "plan_reentry_failed" iff the graph
-                    # re-entry itself raised — so this single condition
-                    # covers every rejection kind the brief enumerates
-                    # (missing PLAN, schema-invalid PLAN, phase disabled,
-                    # artifact write failure, re-entry failure) uniformly.
-                    # Round 6 gap fix: `_terminal is not None` short-circuited
-                    # the ingest block above (no `plan_reentry_patch`/
-                    # `outcomes` were ever computed this call, and `res` was
-                    # already set to the `workflow_terminal` refusal above) —
-                    # never run this acceptance/rejection decision in that
-                    # case, it would otherwise misclassify the refusal as an
-                    # ordinary `plan_rejected` and bump the attempt counter.
-                    if is_planning_task and _terminal is None:
-                        # Hydra#69 round 6 defect 1 (repair-retry corollary):
-                        # a repair retry (the completion write below failed
-                        # on a PRIOR call, after the PLAN itself was already
-                        # durably drafted+re-entered) re-runs this SAME loop
-                        # against a claim ledger that already marked the
-                        # PLAN's envelope_id claimed -- the outer dedup check
-                        # above short-circuits it to `skipped_duplicate`
-                        # WITHOUT ever calling `dispatch_ingested_envelopes`
-                        # again, so `plan_reentry_patch` is never (re)set on
-                        # this call even though the plan genuinely IS
-                        # accepted. Recognise that case from durable
-                        # checkpoint state instead of only this call's own
-                        # freshly-computed patch: if the emitted PLAN's own
-                        # id matches `state.plan_envelope_id` (stamped by
-                        # `_apply_plan_reentry`'s own checkpoint write) and
-                        # the plan barrier has actually been raised for it,
-                        # the acceptance already landed on an earlier call.
-                        _emitted_plan_id = next(
-                            (str(e.get("id")) for e in emitted
-                             if isinstance(e, dict) and e.get("type") == "PLAN"
-                             and e.get("id") is not None),
-                            None,
-                        )
-                        _plan_already_accepted = (
-                            _emitted_plan_id is not None
-                            and state.plan_envelope_id is not None
-                            and str(state.plan_envelope_id) == _emitted_plan_id
-                            and str(state.plan_status or "none") not in ("none", "rejected")
-                        )
-                        _plan_accepted = (
-                            bool(plan_reentry_patch)
-                            and res.get("status") != "plan_reentry_failed"
-                        ) or _plan_already_accepted
-                        if _plan_accepted:
-                            completed = list(state.attended_completed_task_ids)
-                            if tid is not None and str(tid) not in completed:
-                                completed.append(str(tid))
-                            done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
-                            if (res.get("status") == "complete"
-                                    and tid is not None
-                                    and str(tid) not in done_ids):
-                                done_ids.append(str(tid))
-                            attended_results = _merge_attended_result(
-                                state.attended_results, _attended_result_record(state, res))
-                            try:
-                                sup.update_state(config, {
-                                    "attended_completed_task_ids": completed,
-                                    "attended_done_task_ids": done_ids,
-                                    "attended_results": attended_results,
-                                })
-                            except Exception as e:  # noqa: BLE001
-                                emit(project, wf, "attended.persist_failed", {"error": str(e)})
-                                _persist_errors.append(str(e))
-                        else:
-                            _rejection = _classify_plan_rejection(
-                                emitted, outcomes if "outcomes" in locals() else [], res)
-                            res["status"] = "plan_rejected"
-                            res["plan_rejection"] = _rejection
-                            # Task 3: bump the per-task attempt counter so the
-                            # NEXT `_cmd_attended_step` mints a fresh
-                            # `squad-{task_id}-{attempt}` call_key — a late
-                            # response carrying this (now stale) attempt's
-                            # call_key can never match the re-issued cursor.
-                            _attempts = dict(
-                                getattr(state, "plan_submit_attempts", {}) or {})
-                            _attempts[str(tid)] = int(_attempts.get(str(tid), 0)) + 1
-                            try:
-                                sup.update_state(
-                                    config, {"plan_submit_attempts": _attempts})
-                            except Exception as e:  # noqa: BLE001
-                                emit(project, wf, "attended.persist_failed",
-                                     {"error": str(e)})
-                                _persist_errors.append(str(e))
-                            emit(project, wf, "attended.plan_rejected", {
-                                "task_id": str(tid),
-                                "reason": _rejection.get("reason"),
-                                "attempt": _attempts.get(str(tid)),
-                            })
-
-                    # Hydra#69 round 6 defect 1 (HIGH): the FULL-reconciliation
-                    # marker is written ONLY here, as the LAST checkpoint
-                    # write of this call, after every other write above
-                    # (charge, ingest, plan re-entry, rejected envelopes,
-                    # attempt-counter bump / plan acceptance) has had its
-                    # chance to run. A retry against an unset marker always
-                    # falls through and repairs whatever this call still left
-                    # missing, instead of returning a stale cached success.
-                    # Skipped entirely if any write above already failed --
-                    # `_persist_errors` already downgrades the response below,
-                    # and stamping "reconciled" over a known-incomplete call
-                    # would defeat the whole point of this marker.
-                    if not _persist_errors:
-                        try:
-                            sup.update_state(config, {
-                                "attended_checkpoint_reconciled": {_recon_key: True},
-                            })
-                        except Exception as e:  # noqa: BLE001
-                            emit(project, wf, "attended.persist_failed", {"error": str(e)})
-                            _persist_errors.append(str(e))
+        res, _persist_errors = _reconcile_attended_terminal_checkpoint(
+            project, wf, str(args.run_id), str(args.call_key), dispatcher, cfile, res,
+        )
 
         emit(project, wf, "attended.submit", {"run_id": str(args.run_id),
                                               "call_key": str(args.call_key),
