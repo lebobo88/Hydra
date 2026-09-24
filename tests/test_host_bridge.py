@@ -3290,6 +3290,27 @@ def test_committed_work_with_soft_narration_text_is_not_discarded(tmp_path, monk
     assert attempt_args["status"] == "ok"
 
 
+def test_marker_text_with_no_attributed_changes_is_not_a_failure_on_attended_path(
+        tmp_path, monkeypatch):
+    """Hydra#71 fix (2), isolated from fix (1): a host result whose prose
+    contains soft narration marker substrings must never be marker-classified
+    on the attended path -- even when the run attributed NO commits/dirty
+    changes at all (unlike test (a), which also exercises commit-aware
+    attribution). Only the empty-output-with-no-changes hard case still
+    fails (see the next test)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    # No files committed/edited in work_path -- wrote_changes will be False.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": ("One test timed out after 1800 s and a fixture "
+                          "reported permission denied on a scratch path; "
+                          "both pre-existing and unrelated to this change."),
+                "cost_usd": 0.05, "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+
+
 def test_empty_text_no_changes_is_still_a_generate_failure(tmp_path, monkeypatch):
     """Hydra#71 test (b): a host result with empty text and NO commits/dirty
     changes is still a genuine generate failure -- the one hard case the
