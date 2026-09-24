@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -25,6 +26,8 @@ __all__ = [
     "kill_process_tree",
     "is_pid_alive",
     "detached_popen_kwargs",
+    "process_identity",
+    "is_same_process",
 ]
 
 
@@ -163,3 +166,123 @@ def is_pid_alive(pid: int | None) -> bool:
         return False
     except Exception:  # noqa: BLE001
         return True
+
+
+# --------------------------------------------------------------------------- #
+# Process identity (cross-vendor judge finding, P2-2/P2-3 follow-up).        #
+#                                                                             #
+# `is_pid_alive` (above) only proves SOME process currently holds `pid` --   #
+# never that it is the SAME instance a caller recorded earlier. A pid is a   #
+# small, OS-recycled integer: once the original process exits, the OS (very  #
+# aggressively on Windows) can hand the identical pid to a completely        #
+# unrelated later process. Any code path that kills or adopts a RECORDED pid #
+# (a stored worker pid, a smoke-child sidecar pid) must verify identity      #
+# first via `process_identity`/`is_same_process`, never trust `is_pid_alive` #
+# alone -- otherwise a kill/adopt call can act on an unrelated process tree. #
+# --------------------------------------------------------------------------- #
+
+
+def process_identity(pid: int | None) -> Any | None:
+    """Best-effort, durable identity for ``pid`` -- a value that only
+    matches the SAME OS process instance across its lifetime (its creation
+    time), distinguishing it from a LATER, unrelated process the OS reused
+    the identical pid for.
+
+    Returns ``None`` when the identity cannot be determined -- the pid is
+    invalid, the process is already gone, or the platform/permission model
+    does not expose the needed information (e.g. ``OpenProcess`` denied on
+    Windows). Callers MUST treat ``None`` as "unverifiable", never as
+    evidence of sameness -- see :func:`is_same_process`.
+    """
+    if not pid or pid <= 0:
+        return None
+    if os.name == "nt":
+        return _win_process_creation_time(pid)
+    return _posix_process_start_ticks(pid)
+
+
+def _win_process_creation_time(pid: int) -> int | None:
+    """Windows: ``GetProcessTimes``' creation-time ``FILETIME``, packed into
+    a single 64-bit integer. Requires only
+    ``PROCESS_QUERY_LIMITED_INFORMATION`` (available even for a process
+    owned by another user in most configurations); returns ``None`` on any
+    failure (invalid pid, access denied, API unavailable)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:  # noqa: BLE001
+        return None
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    handle = None
+    try:
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exit_time),
+            ctypes.byref(kernel_time), ctypes.byref(user_time),
+        )
+        if not ok:
+            return None
+        return (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _posix_process_start_ticks(pid: int) -> int | None:
+    """POSIX (Linux ``/proc``): the process's ``starttime`` field from
+    ``/proc/<pid>/stat`` (clock ticks since boot) -- reused pids get a
+    different starttime than the process that previously held them. Returns
+    ``None`` on any platform without a usable ``/proc`` (e.g. macOS) or on
+    any read/parse failure."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    try:
+        # `comm` (field 2) is parenthesized and may itself contain spaces or
+        # parens -- split on the LAST ')' to skip past it safely.
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return None
+        fields = raw[rparen + 2:].split()
+        # After `pid (comm) state ...`, `state` is fields[0]; `starttime` is
+        # the 22nd whitespace-delimited field overall, i.e. fields[19] here.
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def is_same_process(pid: "int | None", recorded_identity: Any) -> bool:
+    """``True`` only when ``pid`` currently refers to the SAME OS process
+    instance whose identity was captured (via :func:`process_identity`) as
+    ``recorded_identity``.
+
+    ``False`` whenever this cannot be positively verified -- including when
+    ``recorded_identity`` is ``None`` (never captured) or the current
+    process's identity cannot be read (gone / unverifiable). A live-but-
+    different (or unverifiable) pid is therefore NEVER treated as the
+    recorded process by a caller that gates a kill/adopt decision on this.
+    """
+    if recorded_identity is None:
+        return False
+    current = process_identity(pid)
+    if current is None:
+        return False
+    return current == recorded_identity

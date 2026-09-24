@@ -211,9 +211,18 @@ def test_crash_after_spawn_before_pid_save_adopts_live_worker_no_second_spawn(
     sleeper = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"])
     try:
+        from hydra_core.proc import process_identity
         Path(paths["sidecar_path"]).parent.mkdir(parents=True, exist_ok=True)
         Path(paths["sidecar_path"]).write_text(
-            json.dumps({"pid": sleeper.pid}), encoding="utf-8")
+            json.dumps({
+                "pid": sleeper.pid,
+                # Durable identity fix: production `_write_smoke_sidecar`
+                # always records this alongside the pid -- match that shape
+                # here so adoption's identity check (which refuses to adopt
+                # an unverified pid) can positively verify this really is
+                # the sleeper process this test just spawned.
+                "pid_identity": process_identity(sleeper.pid),
+            }), encoding="utf-8")
 
         popen_calls = _count_popen_calls(monkeypatch)
 

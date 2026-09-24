@@ -43,7 +43,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .proc import detached_popen_kwargs, is_pid_alive, kill_process_tree
+from .proc import (
+    detached_popen_kwargs,
+    is_pid_alive,
+    is_same_process,
+    kill_process_tree,
+    process_identity,
+)
 from .strict_json import dumps_strict
 
 __all__ = [
@@ -279,6 +285,13 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         return job
     return {
         "pid": proc.pid,
+        # Durable identity fix (cross-vendor judge finding): captured
+        # immediately after Popen returns, so a later liveness/kill check
+        # against this recorded pid can verify it is still the SAME process
+        # -- never just that SOME process currently holds this pid (a
+        # Windows pid can be reused within moments of the original exiting).
+        # See `hydra_core.proc.process_identity`/`is_same_process`.
+        "pid_identity": process_identity(proc.pid),
         "started_at": started_at,
         # A grace buffer beyond the smoke's own internal timeout so a
         # slow-to-exit child (writing its result file) is not treated as
@@ -353,15 +366,29 @@ def _kill_recorded_smoke_child(job: dict[str, Any]) -> None:
     (Windows ``taskkill /T`` needs a live root to walk from; POSIX
     ``killpg`` on the worker's own pgid never reaches the smoke child's
     SEPARATE session/group). Tolerates an absent sidecar entirely (the
-    worker died, or was killed, before ever writing one)."""
+    worker died, or was killed, before ever writing one).
+
+    Durable identity fix (cross-vendor judge finding): the sidecar-recorded
+    pid is verified via :func:`hydra_core.proc.is_same_process` against the
+    identity captured at sidecar-write time (see :func:`_write_smoke_sidecar`)
+    BEFORE any kill is issued. ``is_pid_alive`` alone only proves SOME
+    process currently holds that pid -- if the real smoke child already
+    exited and the OS reused the pid (common and fast on Windows), an
+    unverified kill would tear down an unrelated process tree. A pid whose
+    identity cannot be verified (no identity was recorded, or the current
+    holder's identity cannot be read / does not match) is treated as NOT the
+    recorded smoke child and is never killed."""
     sidecar = _read_smoke_sidecar(job.get("sidecar_path"))
     if not sidecar:
         return
     smoke_pid = sidecar.get("pid")
-    if isinstance(smoke_pid, int) and smoke_pid > 0:
-        # Reaches the smoke child directly (Windows: a live `taskkill /T`
-        # root; POSIX: `os.getpgid(smoke_pid)` while it is still lookupable).
-        kill_process_tree(smoke_pid)
+    smoke_identity = sidecar.get("pid_identity")
+    if not (isinstance(smoke_pid, int) and smoke_pid > 0
+            and is_same_process(smoke_pid, smoke_identity)):
+        return
+    # Reaches the smoke child directly (Windows: a live `taskkill /T`
+    # root; POSIX: `os.getpgid(smoke_pid)` while it is still lookupable).
+    kill_process_tree(smoke_pid)
     if os.name != "nt":
         pgid = sidecar.get("pgid")
         if isinstance(pgid, int) and pgid > 0:
@@ -370,7 +397,10 @@ def _kill_recorded_smoke_child(job: dict[str, Any]) -> None:
             # `kill_process_tree` above can no longer resolve it, stranding
             # any surviving grandchild still in that same process group.
             # The pgid was captured explicitly at spawn time (P2-2) so it
-            # is still killable directly here even in that case.
+            # is still killable directly here even in that case. Gated on
+            # the SAME identity check above -- the pgid is only trustworthy
+            # as long as `smoke_pid` was verified to still be the recorded
+            # process (a pgid alone carries no independent identity proof).
             import signal
             try:
                 os.killpg(pgid, signal.SIGKILL)
@@ -438,7 +468,15 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     # wedged/zombie tree it failed to reap). P2-2: the worker's own pid
     # alone may not reach the smoke tree once the worker is gone -- also
     # kill the smoke child recorded in the sidecar (tolerates its absence).
-    kill_process_tree(pid)
+    #
+    # Durable identity fix (cross-vendor judge finding): `pid` here is the
+    # WORKER pid recorded at spawn time (`start_job`'s `pid_identity`) -- an
+    # `is_pid_alive(pid)` pass alone does not prove it is still that SAME
+    # worker (the OS can reuse a pid the instant the real worker exits).
+    # Verify identity before killing; an unverifiable/mismatched pid is
+    # never killed as if it were the recorded worker.
+    if pid and is_same_process(pid, job.get("pid_identity")):
+        kill_process_tree(pid)
     _kill_recorded_smoke_child(job)
     now = time.time()
     if now >= deadline:
@@ -479,7 +517,14 @@ def _write_smoke_sidecar(sidecar_path: str | None, proc: "subprocess.Popen") -> 
     survives to poll its own child directly)."""
     if not sidecar_path:
         return
-    payload: dict[str, Any] = {"pid": proc.pid}
+    payload: dict[str, Any] = {
+        "pid": proc.pid,
+        # Durable identity fix (cross-vendor judge finding): captured
+        # alongside the pid so a later kill/adopt decision against this
+        # sidecar can verify the pid still refers to the SAME smoke child
+        # before acting on it -- see `hydra_core.proc.is_same_process`.
+        "pid_identity": process_identity(proc.pid),
+    }
     if os.name != "nt":
         try:
             payload["pgid"] = os.getpgid(proc.pid)
@@ -488,6 +533,24 @@ def _write_smoke_sidecar(sidecar_path: str | None, proc: "subprocess.Popen") -> 
     try:
         _atomic_write_json(sidecar_path, payload)
     except Exception:  # noqa: BLE001 — best-effort, see docstring
+        pass
+
+
+def _clear_smoke_sidecar(sidecar_path: "str | None") -> None:
+    """(C) Retire the P2-2 sidecar once the smoke child it describes has
+    exited normally -- belt-and-suspenders with the identity check in
+    :func:`_kill_recorded_smoke_child`/``poll_job``'s deadline path: a
+    cleared sidecar leaves nothing stale for a LATER poll (e.g. a slow
+    worker-exit race, or a wedged poller retry) to ever act on, even before
+    considering identity. Best-effort -- a removal failure here must never
+    fail the smoke run itself."""
+    if not sidecar_path:
+        return
+    try:
+        os.remove(sidecar_path)
+    except FileNotFoundError:
+        pass
+    except OSError:  # noqa: BLE001 — best-effort cleanup only
         pass
 
 
@@ -532,6 +595,9 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
         out_bytes, _ = proc.communicate(timeout=timeout_s)
         combined = out_bytes.decode("utf-8", errors="replace") if out_bytes else ""
         returncode = proc.returncode
+        # (C) Normal completion -- retire the sidecar now, not just on the
+        # (rarer) timeout path, so nothing stale can be acted on later.
+        _clear_smoke_sidecar(sidecar_path)
     except subprocess.TimeoutExpired:
         kill_process_tree(proc.pid)
         try:
