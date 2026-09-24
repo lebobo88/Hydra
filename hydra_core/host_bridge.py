@@ -63,6 +63,8 @@ from .squad_node import (
     _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
+    _worktree_committed_since,
+    _git_head_sha,
     coerce_untrusted_cost,
     coerce_untrusted_count,
 )
@@ -1410,6 +1412,80 @@ def _clear_stage_active_sentinel(project_root: str | Path) -> None:
         pass
 
 
+def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
+                                run_id: str) -> str | None:
+    """Copy untracked build/log/``.harness`` evidence out of ``worktree_path``
+    before ``_remove_worktree`` deletes it on a non-complete outcome.
+
+    Hydra#71: ``_BYPRODUCT_PATTERNS`` deliberately excludes ``.harness/`` and
+    ``*.log`` from the worktree-local git excludes so
+    ``_preserve_non_complete_work``'s ``git add -A`` + commit never picks them
+    up -- they are build/log byproducts, not source. But that also means a
+    genuine generate-failure/judge-fail/smoke-fail worktree removal silently
+    destroyed them, taking the only on-disk record of what actually happened
+    with it. Copies (never moves -- the worktree removal below is the thing
+    that actually reclaims the disk) any ``build/``, ``.harness/`` directories
+    and ``*.log`` files found anywhere under the worktree to a sibling
+    directory that survives the removal.
+
+    Fail-soft: never raises: any error, or nothing found to preserve, returns
+    ``None`` without touching ``cursor`` or blocking finalize. On success sets
+    ``cursor["preserved_evidence_path"]`` and returns it.
+    """
+    try:
+        src = Path(worktree_path)
+        if not src.is_dir():
+            return None
+        candidate_dirs = {
+            p for pattern in ("build", ".harness")
+            for p in src.glob(f"**/{pattern}") if p.is_dir()
+        }
+        # Drop any dir nested under another candidate — copytree already
+        # recurses, and a nested dest write after its own parent was removed
+        # by a prior copy would otherwise error.
+        candidate_dirs = {
+            p for p in candidate_dirs
+            if not any(other != p and other in p.parents for other in candidate_dirs)
+        }
+        candidate_files = {p for p in src.glob("**/*.log") if p.is_file()}
+        if not candidate_dirs and not candidate_files:
+            return None
+        dest_root = (Path(worktree_path).parent
+                    / ".hydra-preserved-evidence" / str(run_id))
+        dest_root.mkdir(parents=True, exist_ok=True)
+        copied = False
+        for d in candidate_dirs:
+            rel = d.relative_to(src)
+            dest = dest_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copytree(d, dest, dirs_exist_ok=True)
+                copied = True
+            except Exception:  # noqa: BLE001 — best-effort per-item
+                continue
+        for f in candidate_files:
+            rel = f.relative_to(src)
+            # A .log already carried inside a copied build/.harness dir is
+            # harmless to re-copy; skip only on error.
+            dest = dest_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(f, dest)
+                copied = True
+            except Exception:  # noqa: BLE001
+                continue
+        if not copied:
+            return None
+        cursor["preserved_evidence_path"] = str(dest_root)
+        _trace(cursor, "attended.evidence_preserved",
+               {"run_id": run_id, "path": str(dest_root)})
+        return str(dest_root)
+    except Exception as exc:  # noqa: BLE001 — never block finalize
+        _trace(cursor, "attended.evidence_preserve_failed",
+               {"run_id": run_id, "error": str(exc)[:200]})
+        return None
+
+
 def _preserve_non_complete_work(cursor: dict[str, Any], worktree_path: str,
                                 branch: str, run_id: str,
                                 final_status: str = "surfaced") -> None:
@@ -1728,6 +1804,11 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         # the work when the stage surfaces without completing.
         if cursor.get("preserved_branch"):
             res["preserved_branch"] = cursor["preserved_branch"]
+        # Hydra#71: untracked build/log/.harness evidence excluded from the
+        # branch commit (see ``_BYPRODUCT_PATTERNS``) but copied out before
+        # ``_remove_worktree`` deletes the checkout on a non-complete outcome.
+        if cursor.get("preserved_evidence_path"):
+            res["preserved_evidence_path"] = cursor["preserved_evidence_path"]
         # Rider (b): expose charged flag so _cmd_attended_submit can skip
         # duplicate budget charges on a retried submit-host-result call.
         res["already_charged"] = bool(cursor.get("charged", False))
@@ -1990,6 +2071,11 @@ def begin_stage(
         "gate_type": gate_type,
         "state": "await_generate",
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
+        # Hydra#71: base commit for THIS generate attempt's commit-aware
+        # attribution (``_worktree_committed_since``). Re-stamped on the
+        # Reflexion×1 retry transition below so a retry attributes only its
+        # own new commits, not the first attempt's.
+        "generate_base_sha": _git_head_sha(work_path),
         "baseline_failures": baseline_failures,
         "producer": "claude",
         "generate_index": 0,   # GAP-f: tracks Reflexion×1 — 0=first attempt, 1=retry
@@ -2058,13 +2144,28 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
     cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
 
+    # Hydra#71: commit-aware attribution. The attended host engineer commits
+    # its work (unlike the headless drive loop, which the harness commits on
+    # its behalf later), so the uncommitted-dirty-set delta alone is empty for
+    # the normal case and silently attributes nothing. Union in the branch's
+    # own commit history since this attempt's recorded base -- captured at
+    # begin_stage / the Reflexion retry transition, per generate attempt.
     pre_dirty = set(cursor.get("pre_dirty") or [])
-    run_changed = _worktree_dirty_set(work_path) - pre_dirty
+    dirty_changed = _worktree_dirty_set(work_path) - pre_dirty
+    committed_changed = _worktree_committed_since(
+        work_path, cursor.get("generate_base_sha"))
+    run_changed = dirty_changed | committed_changed
     cursor["changed_paths"] = sorted(set(cursor.get("changed_paths") or []) | run_changed)
     wrote_changes = bool(run_changed)
 
+    # Hydra#71: on the attended path a host result is a structured payload,
+    # not free-form CLI narration -- never marker-classify its prose summary
+    # (``apply_text_markers=False``). Only hard signals (an explicit
+    # failure-shaped ``gen`` dict, or truly empty output with nothing
+    # attributed to this run) still fail the stage.
     gen_fail = _generate_failure_reason(
-        {"status": "done", "result": result}, gen_text, wrote_changes)
+        {"status": "done", "result": result}, gen_text, wrote_changes,
+        apply_text_markers=False)
 
     model_id = str(result.get("model") or cursor.get("model_tier") or f"{producer}-default")
 
@@ -2678,6 +2779,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if outcome == "revise" and gen_idx == 0 and not _infra_downgrade:
         cursor["generate_index"] = 1
         cursor["reflexion_critique"] = critique_md
+        # Hydra#71: re-stamp the attribution base to the current HEAD (attempt
+        # 0's commits, already folded into cursor["changed_paths"]) so the
+        # retry's own commit-aware attribution only picks up ITS new commits,
+        # not attempt 0's again.
+        cursor["generate_base_sha"] = _git_head_sha(work_path)
+        cursor["pre_dirty"] = sorted(_worktree_dirty_set(work_path))
         aug_prompt = _augment_with_critique(cursor["request_text"], critique_md)
         # 7b fix: re-prepend the hydra_context_block exactly once so the retry
         # prompt mirrors the initial generate-0 prompt structure.  The block was
@@ -2953,6 +3060,11 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
             _preserve_non_complete_work(
                 cursor, worktree_path, branch, run_id,
                 final_status=("workflow_terminal" if workflow_terminal else "surfaced"))
+            # Hydra#71: the branch commit above never carries the excluded
+            # build/log/.harness byproducts (see _BYPRODUCT_PATTERNS) — copy
+            # them out before the worktree directory is deleted below, or
+            # this generate/judge/smoke-fail's only on-disk evidence is lost.
+            _preserve_worktree_evidence(cursor, worktree_path, run_id)
         _remove_worktree(repo_root, worktree_path)
 
     # F30: build summary_md that embeds any error/abort reason.
