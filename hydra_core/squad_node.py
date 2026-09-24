@@ -433,7 +433,26 @@ _SMOKE_PROMPT = (
 #         `/bin/sh: <cmd>: not found`, `./bash: <cmd>: command not found`.
 #       * bash: `bash: <cmd>: command not found` and
 #         `bash: line <n>: <cmd>: command not found`.
-#       * zsh's own command-first form: `zsh: command not found: <cmd>`.
+#       * zsh's own command-first form: `zsh: command not found: <cmd>`, and
+#         non-interactive zsh's no-space, line-numbered variant of that same
+#         form: `zsh:<n>: command not found: <cmd>` / `/bin/zsh:<n>: ...`
+#         (cross-vendor re-review, gpt-5.6-terra: zsh scripts print
+#         `zsh:1: command not found: x`, not `zsh: 1: ...` -- the colon
+#         immediately precedes the line number, no space, unlike bash/sh's
+#         `[line ]<n>: ` form above).
+#     Deliberately NOT matched (documented, not reopened):
+#       * ksh/mksh's bracketed job-number form `ksh[3]: <cmd>: not found` /
+#         `/bin/ksh[3]: ...` -- a different, bracket-delimited shape from the
+#         colon-prefixed forms above; adding a third shape here would widen
+#         the anchor surface for marginal benefit (ksh's plain
+#         `ksh: <cmd>: not found`, no brackets, IS already covered by the
+#         shared shell-prefixed alternative).
+#       * a shell SCRIPT's filename, e.g. `script.sh: line 3: x: command not
+#         found` -- `script.sh` is a script path, not one of the literal
+#         shell names `sh|bash|dash|zsh|ksh`, so it never matches; this is
+#         intentional, since a project's own `script.sh` could legitimately
+#         emit lines shaped like that as part of ordinary (non-launcher)
+#         output and must not be reclassified as an infra_error.
 #     (PowerShell's `is not recognized as the name of a cmdlet...` is
 #     intentionally NOT included: `_detect_smoke_command_and_cwd`'s commands
 #     are only ever launched via `run_text`/`popen_detached` with
@@ -466,7 +485,7 @@ _INFRA_LAUNCHER_LINE_RE = re.compile(
     r"'[^']+' is not recognized as an internal or external command"
     r"|(?:\S*/)?(?:sh|bash|dash|zsh|ksh)(?:\.exe)?: (?:(?:line )?\d+: )?\S+: "
     r"(?:command not found|not found)\s*$"
-    r"|(?:\S*/)?zsh(?:\.exe)?: command not found: \S+\s*$"
+    r"|(?:\S*/)?zsh(?:\.exe)?(?::\d+)?: command not found: \S+\s*$"
     r"|Error: spawn (?:\S+ )?(?:ENOENT|EACCES|EPERM)"
     r"|npm ERR! code (?:ENOENT|EPERM|EACCES)"
     r"|\S*python\S*: No module named"

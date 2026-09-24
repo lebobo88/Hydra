@@ -536,6 +536,12 @@ def test_smoke_log_written_outside_worktree_survives_worktree_removal(tmp_path):
     "bash: some-missing-tool: command not found",  # bash, no line number
     "bash: line 12: some-missing-tool: command not found",  # bash, with line number
     "zsh: command not found: some-missing-tool",  # zsh's own command-first form
+    # Hydra#71 third follow-up (cross-vendor re-review, gpt-5.6-terra):
+    # non-interactive zsh's no-space, line-numbered variant of the
+    # command-first form.
+    "zsh:1: command not found: some-missing-tool",
+    "/bin/zsh:12: command not found: some-missing-tool",
+    "/usr/bin/zsh:3: command not found: some-missing-tool",
 ])
 def test_smoke_infra_marker_hit_matches_every_shell_prefixed_launcher_form(transcript):
     assert _smoke_infra_marker_hit(transcript) is True
@@ -553,6 +559,13 @@ def test_smoke_infra_marker_hit_matches_every_shell_prefixed_launcher_form(trans
     # An unprefixed `command not found` printed by a test's own assertion
     # message inside indented/test output -- no shell ever wrote it.
     "    AssertionError: foo: command not found\n1 failed in 0.03s",
+    # Hydra#71 third follow-up (cross-vendor re-review, gpt-5.6-terra):
+    # lines that merely resemble zsh's no-space line-numbered form but do
+    # NOT have a real shell name as a path component must not match --
+    # anchored on the shell name, not on the `:<n>: command not found:`
+    # shape alone.
+    "zsh-config:1: command not found: some-missing-tool",
+    "myzsh:1: command not found: some-missing-tool",
 ])
 def test_smoke_infra_marker_hit_does_not_match_test_output_ending_in_not_found(
     transcript,
@@ -629,6 +642,8 @@ def test_run_smoke_tracked_unprefixed_not_found_with_summary_is_fail_not_infra(
     ("sh: 1: some-missing-tool: not found", "infra"),
     ("/bin/sh: some-missing-tool: not found", "infra"),
     ("zsh: command not found: some-missing-tool", "infra"),
+    ("zsh:1: command not found: some-missing-tool", "infra"),
+    ("/bin/zsh:12: command not found: some-missing-tool", "infra"),
 ])
 def test_run_smoke_shell_prefixed_launcher_line_alone_is_infra_error(
     tmp_path, transcript, expected_reason_fragment
@@ -657,6 +672,7 @@ def test_run_smoke_shell_prefixed_launcher_line_alone_is_infra_error(
     ("bash: some-missing-tool: command not found", "infra"),
     ("sh: 1: some-missing-tool: not found", "infra"),
     ("zsh: command not found: some-missing-tool", "infra"),
+    ("zsh:1: command not found: some-missing-tool", "infra"),
 ])
 def test_run_smoke_tracked_shell_prefixed_launcher_line_alone_is_infra_error(
     tmp_path, transcript, expected_reason_fragment
