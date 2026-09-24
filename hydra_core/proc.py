@@ -206,7 +206,21 @@ def _win_process_creation_time(pid: int) -> int | None:
     a single 64-bit integer. Requires only
     ``PROCESS_QUERY_LIMITED_INFORMATION`` (available even for a process
     owned by another user in most configurations); returns ``None`` on any
-    failure (invalid pid, access denied, API unavailable)."""
+    failure (invalid pid, access denied, API unavailable).
+
+    R1 follow-up (surfaced by the smoke_job.poll_job liveness-gate fix): a
+    just-terminated pid can remain ``OpenProcess``-able (and
+    ``GetProcessTimes``-queryable, with its ORIGINAL creation time intact)
+    for a short window after exit, before Windows fully reaps the process
+    object and the pid becomes reusable -- ``tasklist`` (``is_pid_alive``)
+    stops listing it immediately, but this call alone would still report a
+    valid, matching identity for it in that window, falsely proving
+    "liveness" for an already-dead process. ``GetProcessTimes`` also fills
+    ``exit_time`` the instant the process has exited (zero/all-clear while
+    still running); a non-zero ``exit_time`` here means the process is
+    already gone, and this function returns ``None`` for it exactly like
+    any other unverifiable pid -- never a stale-but-real identity for a
+    process that no longer exists."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -233,6 +247,9 @@ def _win_process_creation_time(pid: int) -> int | None:
             ctypes.byref(kernel_time), ctypes.byref(user_time),
         )
         if not ok:
+            return None
+        if exit_time.dwHighDateTime or exit_time.dwLowDateTime:
+            # Already exited -- see the R1 follow-up note above.
             return None
         return (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
     except Exception:  # noqa: BLE001

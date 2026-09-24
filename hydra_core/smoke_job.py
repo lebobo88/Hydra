@@ -135,7 +135,7 @@ def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
 
 
 def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
-              call_key: str) -> dict[str, Any]:
+              call_key: str, launch_token: str | None = None) -> dict[str, Any]:
     """Spawn the detached smoke job. Returns the ``cursor["smoke_job"]`` shape:
     ``{pid, started_at, deadline, result_path, log_path, call_key}``.
 
@@ -179,7 +179,22 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     LATER step in this function raises before returning, the spawned
     process tree is killed before this function reports "failed to spawn"
     -- otherwise a real, running process would be reported as never
-    started and orphaned."""
+    started and orphaned.
+
+    R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening):
+    ``launch_token`` -- when the caller supplies one (``host_bridge``'s
+    ``_adopt_or_launch_smoke_job`` mints a fresh ``uuid4().hex`` per
+    reservation) -- is threaded through to the worker's argv and echoed
+    back into the marker/sidecar/result files it writes
+    (:func:`_write_worker_marker`, :func:`_write_smoke_sidecar`, the result
+    JSON in :func:`main`). A crash between the reservation save and
+    ``start_job``'s own stale-result/-sidecar/-marker removal above could
+    otherwise let a LATER retry adopt a result/marker/sidecar left over
+    from an EARLIER run of the same deterministic ``(cursor_file,
+    call_key)`` paths (e.g. ``recover_stalled_stage`` reusing the judge
+    call_key). The adoption/poll call sites verify the token before
+    trusting any of those files; ``None`` (a legacy caller that never
+    passes one) skips the check entirely, preserving today's behaviour."""
     paths = job_paths(cursor_file, call_key)
     result_path = paths["result_path"]
     log_path = paths["log_path"]
@@ -236,6 +251,8 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             "--marker-path", marker_path,
             "--timeout-s", str(timeout_s),
         ]
+        if launch_token:
+            cmd.extend(["--launch-token", str(launch_token)])
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         # The job's cwd is the (worktree) project_path, not the Hydra repo
@@ -282,6 +299,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
             "sidecar_path": sidecar_path,
             "marker_path": marker_path,
             "call_key": call_key,
+            "launch_token": launch_token,
             # Always populated on a spawn failure (not just when the result
             # write below also fails): call sites (`host_bridge._apply_judge`
             # / `recover_stalled_stage`) check this to finalize the stage
@@ -294,6 +312,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
                 "status": "infra_error",
                 "reason": reason,
                 "finished_at": finished_at,
+                "launch_token": launch_token,
             })
         except Exception:  # noqa: BLE001 — the write itself can fail (e.g. the
             # same permission error that stopped the log dir from being
@@ -322,6 +341,7 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
         "sidecar_path": sidecar_path,
         "marker_path": marker_path,
         "call_key": call_key,
+        "launch_token": launch_token,
     }
 
 
@@ -399,20 +419,28 @@ def read_worker_marker(marker_path: "str | None") -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _write_worker_marker(marker_path: "str | None") -> None:
+def _write_worker_marker(
+    marker_path: "str | None", launch_token: "str | None" = None,
+) -> None:
     """(D follow-up) Write THIS process's own pid + identity to
     ``marker_path`` -- called as the very first action in ``main()``, before
     importing/detecting/spawning anything slower. Best-effort: a write
     failure here must never abort the smoke run itself (mirrors every other
     best-effort marker/sidecar writer in this module) -- worst case, a
     "launching" reservation adoption simply falls back to the sidecar/result
-    evidence it already used before this marker existed."""
+    evidence it already used before this marker existed.
+
+    R3: ``launch_token`` (when the caller supplied one) is echoed into the
+    marker so an adopting caller can verify this marker belongs to THIS
+    reservation, not a stale one left over from an earlier run of the same
+    deterministic call_key paths."""
     if not marker_path:
         return
     try:
         _atomic_write_json(marker_path, {
             "pid": os.getpid(),
             "pid_identity": process_identity(os.getpid()),
+            "launch_token": launch_token,
         })
     except Exception:  # noqa: BLE001 — best-effort, see docstring
         pass
@@ -482,6 +510,22 @@ def _kill_recorded_smoke_child(job: dict[str, Any]) -> None:
                 pass
 
 
+def _result_matches_launch_token(found: dict[str, Any], job: dict[str, Any]) -> bool:
+    """R3: a job whose reservation minted a ``launch_token`` only ever
+    trusts a result file that echoes the SAME token back -- a crash between
+    the reservation save and ``start_job``'s own stale-result removal could
+    otherwise leave a LATER retry reading a result left over from an
+    EARLIER run of the same deterministic ``(cursor_file, call_key)`` paths
+    (e.g. ``recover_stalled_stage`` reusing the judge call_key). A job with
+    no ``launch_token`` recorded (a legacy in-flight job, or any caller that
+    never passed one to :func:`start_job`) keeps today's behaviour --
+    trusts whatever result file it finds, unconditionally."""
+    job_token = job.get("launch_token")
+    if job_token is None:
+        return True
+    return found.get("launch_token") == job_token
+
+
 def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """Poll a job started by :func:`start_job`.
 
@@ -497,7 +541,7 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     result_path = job.get("result_path")
     if result_path:
         found = _read_result_file(result_path)
-        if found is not None:
+        if found is not None and _result_matches_launch_token(found, job):
             return found
 
     spawn_error = job.get("spawn_error")
@@ -519,19 +563,43 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     now = time.time()
     alive = is_pid_alive(pid)
 
-    if alive and now < deadline:
+    # R1 (cross-vendor gpt-6-astra, MEDIUM): the pre-deadline "still
+    # running, poll again" early return used to trust a bare
+    # `is_pid_alive(pid)` -- if the worker died without writing a result
+    # and its pid was reused by an unrelated process before this poll, the
+    # job read as "alive" and the vanished/lost classification was delayed
+    # all the way out to the deadline (default ~41min) even though the
+    # recorded worker is long gone. Verify identity the same way the kill
+    # path below already does. A legacy in-flight job whose `pid_identity`
+    # was never recorded (started before this field existed) keeps the old
+    # bare-`is_pid_alive` liveness behaviour here -- for liveness ONLY, never
+    # for a kill (the kill path below independently requires a verified
+    # identity match and simply skips killing an unverifiable pid).
+    pid_identity = job.get("pid_identity")
+    if pid_identity is not None:
+        alive_verified = bool(pid) and is_same_process(pid, pid_identity)
+    else:
+        alive_verified = alive
+
+    if alive_verified and now < deadline:
         return None  # still running, within budget — poll again later
 
-    if not alive and result_path:
-        # The process is gone (or was never seen alive) and no result file
-        # exists YET -- see the module-level race note above. Retry across a
+    if not alive_verified and result_path:
+        # The process is gone -- OR was never seen alive -- OR (R1 revise,
+        # cross-vendor gpt-5.6-terra) IS alive but its pid identity no longer
+        # matches the recorded worker (pid reuse) -- and no result file
+        # exists YET -- see the module-level race note above. Gate this on
+        # `alive_verified`, not the bare `alive`, so an alive-but-mismatched
+        # pid is treated exactly like a vanished worker: it still gets the
+        # grace window in which an already-written, token-matching result can
+        # win, rather than jumping straight to infra_error. Retry across a
         # short grace window before concluding the job is truly lost; a
         # genuinely crashed/killed job still resolves to infra_error, just
         # not on a false-negative race.
         for _ in range(_VANISHED_GRACE_RETRIES):
             time.sleep(_VANISHED_GRACE_INTERVAL_S)
             found = _read_result_file(result_path)
-            if found is not None:
+            if found is not None and _result_matches_launch_token(found, job):
                 return found
 
     # Either the deadline has passed (job still running or wedged) or the
@@ -568,7 +636,10 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _write_smoke_sidecar(sidecar_path: str | None, proc: "subprocess.Popen") -> None:
+def _write_smoke_sidecar(
+    sidecar_path: str | None, proc: "subprocess.Popen",
+    launch_token: "str | None" = None,
+) -> None:
     """P2-2 (cross-vendor gpt-6-astra, MEDIUM): record the SMOKE CHILD's own
     pid (and, on POSIX, its process group) atomically to the sidecar,
     immediately after ``Popen`` returns -- BEFORE this process blocks on
@@ -598,6 +669,10 @@ def _write_smoke_sidecar(sidecar_path: str | None, proc: "subprocess.Popen") -> 
         # sidecar can verify the pid still refers to the SAME smoke child
         # before acting on it -- see `hydra_core.proc.is_same_process`.
         "pid_identity": process_identity(proc.pid),
+        # R3: echoed so an adopting caller can verify this sidecar belongs
+        # to THIS reservation, not a stale one left by an earlier run of the
+        # same deterministic call_key paths.
+        "launch_token": launch_token,
     }
     if os.name != "nt":
         try:
@@ -630,7 +705,8 @@ def _clear_smoke_sidecar(sidecar_path: "str | None") -> None:
 
 def _run_smoke_tracked(project_path: str, stage_id: str,
                        timeout_s: int, *,
-                       sidecar_path: str | None = None) -> tuple[str, str]:
+                       sidecar_path: str | None = None,
+                       launch_token: str | None = None) -> tuple[str, str]:
     """Run the smoke command directly (Popen, not ``run_text``) so this
     process controls the child's pid and can kill its WHOLE tree
     (:func:`kill_process_tree`) on timeout -- reaching grandchildren
@@ -663,7 +739,7 @@ def _run_smoke_tracked(project_path: str, stage_id: str,
     # P2-2: write the sidecar immediately after Popen succeeds, before this
     # process blocks on `communicate()` below -- a worker killed mid-smoke
     # must still leave the sidecar behind for the poller's cleanup path.
-    _write_smoke_sidecar(sidecar_path, proc)
+    _write_smoke_sidecar(sidecar_path, proc, launch_token)
 
     try:
         out_bytes, _ = proc.communicate(timeout=timeout_s)
@@ -730,14 +806,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sidecar-path", default=None)
     parser.add_argument("--marker-path", default=None)
     parser.add_argument("--timeout-s", type=int, default=smoke_timeout_s())
+    # R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening): opaque
+    # per-reservation token echoed into every marker/sidecar/result file
+    # this worker writes, so an adopting caller can verify none of it is
+    # stale evidence from an earlier run of the same deterministic
+    # (cursor_file, call_key) paths. Absent for a legacy invocation.
+    parser.add_argument("--launch-token", default=None)
     args = parser.parse_args(argv)
 
-    _write_worker_marker(args.marker_path)
+    _write_worker_marker(args.marker_path, args.launch_token)
 
     try:
         status, reason = _run_smoke_tracked(
             args.project_path, args.stage_id, args.timeout_s,
-            sidecar_path=args.sidecar_path)
+            sidecar_path=args.sidecar_path, launch_token=args.launch_token)
     except Exception as e:  # noqa: BLE001 — a job crash is an infra result, not a hang
         status, reason = "infra_error", f"smoke job crashed: {e!r}"[:2000]
 
@@ -745,6 +827,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "reason": reason,
         "finished_at": time.time(),
+        "launch_token": args.launch_token,
     })
     # The worker has now reached a terminal result -- nothing should ever
     # adopt it as "still launching" again. Best-effort, symmetrical with

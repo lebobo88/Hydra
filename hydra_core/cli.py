@@ -5579,7 +5579,34 @@ def _reconcile_attended_terminal_checkpoint(
                 # both here; the cost/bookkeeping write above already
                 # recorded this call's already-incurred spend exactly
                 # once, independent of this gate.
-                if _terminal is not None:
+                # R2 (MEDIUM, cross-vendor gpt-6-astra): if the atomic
+                # budget+`attended_charge_applied` write just above failed
+                # (`_charge_write_persist_failed`), the charged cost never
+                # reached the checkpoint. Claiming/dispatching an emitted
+                # envelope (or re-entering the graph for a PLAN) here would
+                # incur and charge ADDITIONAL cost into `state.budget` on
+                # top of that un-persisted charge, and the per-envelope
+                # write further below already omits `budget` entirely in
+                # this case (so that downstream cost would be silently
+                # lost forever) -- while the claim ledger permanently marks
+                # the envelope processed, so a retry (which DOES repair the
+                # charge write) would skip it as `skipped_duplicate` and
+                # never dispatch it at all. Refuse to claim/dispatch/PLAN
+                # -re-enter on this call; `_persist_errors` (already
+                # non-empty from the failed write above) makes the caller
+                # return the persist error with everything retryable, so a
+                # retry first repairs the charge and then processes the
+                # envelope(s) normally, exactly once.
+                if _charge_write_persist_failed:
+                    emit(project, wf, "attended.emitted_envelopes_deferred", {
+                        "run_id": str(run_id),
+                        "call_key": str(call_key),
+                        "task_id": str(tid) if tid is not None else None,
+                        "emitted_count": len(emitted),
+                        "is_planning_task": is_planning_task,
+                        "reason": "charge_write_persist_failed",
+                    })
+                elif _terminal is not None:
                     if emitted or is_planning_task:
                         res["ingest"] = []
                         res["status"] = "workflow_terminal"
@@ -5760,7 +5787,15 @@ def _reconcile_attended_terminal_checkpoint(
                 # never run this acceptance/rejection decision in that
                 # case, it would otherwise misclassify the refusal as an
                 # ordinary `plan_rejected` and bump the attempt counter.
-                if is_planning_task and _terminal is None:
+                # R2: `_charge_write_persist_failed` ALSO short-circuits the
+                # ingest block above (same reason: `plan_reentry_patch`/
+                # `outcomes` were never computed this call) -- skip this
+                # decision for the same reason, and so a retry (which
+                # repairs the charge write) re-runs the ingest/PLAN loop
+                # from a clean, unconsumed state instead of this block
+                # crashing on an unset `plan_reentry_patch` or misclassifying
+                # the deferral as a real plan rejection.
+                if is_planning_task and _terminal is None and not _charge_write_persist_failed:
                     # Hydra#69 round 6 defect 1 (repair-retry corollary):
                     # a repair retry (the completion write below failed
                     # on a PRIOR call, after the PLAN itself was already

@@ -129,7 +129,7 @@ def _fake_job(monkeypatch, *, calls: list):
     """Monkeypatch smoke_job.start_job to a no-subprocess fake that records
     every invocation (for the no-second-job assertions) and returns a job
     dict pointing at a result file the test controls directly."""
-    def _start(cursor_file, *, project_path, stage_id, call_key):
+    def _start(cursor_file, *, project_path, stage_id, call_key, launch_token=None):
         calls.append(call_key)
         result_path = str(Path(cursor_file).with_name(
             f"{Path(cursor_file).stem}.fake-result.json"))
@@ -144,6 +144,11 @@ def _fake_job(monkeypatch, *, calls: list):
             "result_path": result_path,
             "log_path": result_path + ".log",
             "call_key": call_key,
+            # R3: the fake does not track launch_token (the tests write
+            # their own result files directly, without one) -- omitting it
+            # here keeps `smoke_job._result_matches_launch_token`'s legacy
+            # (no-token-recorded) fallback path active, matching these
+            # tests' pre-existing unconditional-trust behaviour.
         }
     monkeypatch.setattr(smoke_job, "start_job", _start)
 
@@ -246,7 +251,7 @@ def test_job_completes_pass_finalizes_and_merges_exactly_once(tmp_path, monkeypa
 def test_job_process_vanished_without_result_is_infra_failure(tmp_path, monkeypatch):
     calls: list[str] = []
 
-    def _start(cursor_file, *, project_path, stage_id, call_key):
+    def _start(cursor_file, *, project_path, stage_id, call_key, launch_token=None):
         calls.append(call_key)
         # An implausibly high, almost-certainly-dead pid; deadline far in
         # the future so the "vanished" branch (not "deadline passed") fires.
@@ -724,7 +729,7 @@ def test_apply_judge_spawn_failure_reraises_when_terminal_cursor_save_also_fails
     (save_cursor inside _apply_smoke_and_finalize) also fails, the call
     site must not silently succeed with nothing persisted -- it must emit a
     trace event and re-raise."""
-    def _raise_start_job(cursor_file, *, project_path, stage_id, call_key):
+    def _raise_start_job(cursor_file, *, project_path, stage_id, call_key, launch_token=None):
         return {
             "pid": None, "started_at": time.time(), "deadline": time.time() - 1,
             "result_path": str(tmp_path / "no-write.result.json"),
