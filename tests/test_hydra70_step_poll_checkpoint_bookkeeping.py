@@ -48,8 +48,9 @@ from hydra_core.supervisor import build_supervisor, _PurePythonRunner
 from tests.test_hydra70_async_smoke import (
     FakeDispatcher,
     _commit_file,
-    _fake_job,
+    _git,
     _init_repo,
+    _fake_job,
 )
 
 HYDRA_ROOT = Path(__file__).resolve().parents[1]
@@ -204,6 +205,16 @@ def test_step_poll_completes_reconciles_checkpoint_exactly_once(hermetic, monkey
 
     cursor = host_bridge.load_cursor(ctx["cursor_path"])
     assert cursor.get("terminal_call_key") == judge_key
+    # Secondary evidence (round-2 critique item C): the identity
+    # `_reconcile_attended_terminal_checkpoint` reconciled on (and stamped as
+    # `terminal_call_key`) is the SAME judge call_key the terminal transition
+    # itself recorded on the cursor as `verdict_recorded_for` /
+    # `smoke_result_for.call_key` -- proving the self-heal derivation (which
+    # reads those two markers on a pre-fix cursor lacking `terminal_call_key`)
+    # reconstructs exactly the identity a normal poll/submit already stamps,
+    # never a different one.
+    assert cursor.get("verdict_recorded_for") == judge_key
+    assert cursor.get("smoke_result_for", {}).get("call_key") == judge_key
 
 
 def test_next_step_after_poll_reconcile_is_ready_to_finalize_no_start_run(
@@ -398,3 +409,154 @@ class _FlakySupProxy:
 
     def invoke(self, *a, **k):  # pragma: no cover -- never reached here
         return self._real.invoke(*a, **k)
+
+
+# =========================================================================== #
+# 7-9. round-2 critique fix: a workflow that has gone terminal (operator
+#      abort/reject) must still reach the SAME poll/self-heal reconciliation
+#      before returning `status: "workflow_terminal"` -- the previous early
+#      return skipped it entirely for any `open_pp_runs` cursor left
+#      `await_smoke` or terminal-but-unreconciled when the workflow went
+#      terminal.
+# =========================================================================== #
+
+def _set_terminal_resolution(ctx, *, action="abort", option="abort"):
+    """Durably mark the workflow terminal (operator abort), exactly the shape
+    `hydra_core.state.workflow_terminal_resolution` reads -- without
+    disturbing `tasks`/`open_pp_runs`, which the fixture already seeded."""
+    ctx["sup"].update_state(ctx["config"], {
+        "terminal_resolution": {
+            "gate_node": "approval", "hitl_request_id": None,
+            "action": action, "option": option, "plan_revision": None,
+            "resolved_at": "2026-09-24T00:00:00+00:00",
+        },
+    })
+
+
+def test_workflow_terminal_with_await_smoke_reconciles_no_merge_no_start_run(
+    hermetic, monkeypatch,
+):
+    ctx = _seed(hermetic, monkeypatch)
+    judge_key = _drive_to_await_smoke(ctx, monkeypatch)
+    _write_job_result(ctx, status="pass")
+    _set_terminal_resolution(ctx)
+
+    head_before = _git(["rev-parse", "HEAD"], ctx["repo"]).stdout.strip()
+    start_run_calls_before = ctx["disp"].count("start_run")
+
+    rc, body = _step(ctx)
+    assert rc == 0, body
+    assert body["status"] == "workflow_terminal", body
+    assert body["terminal_resolution"]["option"] == "abort", body
+    assert body.get("reconciled") == [
+        {"run_id": ctx["run_id"], "status": "surfaced"}
+    ], body
+
+    # Bookkeeping landed exactly once even though the workflow is terminal --
+    # this is the ALREADY-INCURRED spend for the judge-pass + smoke-pass
+    # attempt, not a forward-looking continuation.
+    state = _fresh_state(ctx)
+    assert state.budget.spent_usd > 0.0, "budget must have been charged"
+    assert ctx["task_id"] in state.attended_completed_task_ids
+    assert len(state.attended_results) == 1
+    assert state.open_pp_runs == [], "the finished run must be removed"
+    recon_key = f"{ctx['run_id']}:{judge_key}"
+    assert state.attended_checkpoint_reconciled.get(recon_key) is True
+    assert recon_key in state.attended_charge_applied
+
+    # The forward-looking side effect -- merging the candidate worktree back
+    # into the target repo -- must be refused: the branch is preserved, the
+    # repo's own HEAD never moves, and no new pp run/task is dispatched.
+    head_after = _git(["rev-parse", "HEAD"], ctx["repo"]).stdout.strip()
+    assert head_after == head_before, "a terminal workflow must never merge code"
+    cursor = host_bridge.load_cursor(ctx["cursor_path"])
+    assert (cursor.get("merge") or {}).get("error") == "workflow_terminal", cursor
+    assert ctx["disp"].count("start_run") == start_run_calls_before, (
+        "a terminal workflow must never dispatch a new task/pp run"
+    )
+
+    # Idempotent: a second step against the still-terminal workflow must not
+    # re-charge or duplicate the result.
+    spent_after = state.budget.spent_usd
+    rc2, body2 = _step(ctx)
+    assert rc2 == 0 and body2["status"] == "workflow_terminal", body2
+    assert body2.get("reconciled") == [], (
+        "an already-reconciled/removed run has nothing left to poll or heal"
+    )
+    state2 = _fresh_state(ctx)
+    assert state2.budget.spent_usd == spent_after
+    assert len(state2.attended_results) == 1
+
+
+def test_workflow_terminal_self_heals_unreconciled_cursor_idempotently(
+    hermetic, monkeypatch,
+):
+    ctx = _seed(hermetic, monkeypatch)
+    judge_key = _drive_to_await_smoke(ctx, monkeypatch)
+    _write_job_result(ctx, status="pass")
+
+    # Drive the cursor terminal via the raw host_bridge poll (bypassing both
+    # `submit_host_result`'s stamp and the CLI's own reconciliation) so it
+    # ends up terminal-but-unreconciled, then mark the workflow terminal --
+    # reproduces a workflow that was aborted while a pre-fix (or crashed)
+    # cursor sat unreconciled in `open_pp_runs`.
+    cursor = host_bridge.load_cursor(ctx["cursor_path"])
+    still_pending = host_bridge.poll_smoke_job(
+        ctx["disp"], cursor, cursor_file=ctx["cursor_path"])
+    assert still_pending is False
+    cursor.pop("terminal_call_key", None)
+    host_bridge.save_cursor(ctx["cursor_path"], cursor)
+    assert cursor["state"] == "complete"
+    _set_terminal_resolution(ctx)
+
+    state_before = _fresh_state(ctx)
+    assert state_before.budget.spent_usd == 0.0
+    assert state_before.open_pp_runs, "run must still be open pre-heal"
+
+    rc, body = _step(ctx)
+    assert rc == 0, body
+    assert body["status"] == "workflow_terminal", body
+    assert len(body.get("reconciled") or []) == 1, body
+
+    state = _fresh_state(ctx)
+    assert state.budget.spent_usd > 0.0, "self-heal must charge even on a terminal workflow"
+    assert ctx["task_id"] in state.attended_completed_task_ids
+    assert len(state.attended_results) == 1
+    assert state.open_pp_runs == []
+    assert any(v is True for v in state.attended_checkpoint_reconciled.values())
+
+    healed_cursor = host_bridge.load_cursor(ctx["cursor_path"])
+    assert healed_cursor.get("terminal_call_key") == judge_key
+
+    spent_after_heal = state.budget.spent_usd
+    rc2, body2 = _step(ctx)
+    assert rc2 == 0 and body2["status"] == "workflow_terminal", body2
+    assert body2.get("reconciled") == []
+    state2 = _fresh_state(ctx)
+    assert state2.budget.spent_usd == spent_after_heal
+    assert len(state2.attended_results) == 1
+
+
+def test_workflow_terminal_persist_failure_returns_ok_false(hermetic, monkeypatch):
+    ctx = _seed(hermetic, monkeypatch)
+    _drive_to_await_smoke(ctx, monkeypatch)
+    _write_job_result(ctx, status="pass")
+    _set_terminal_resolution(ctx)
+
+    real_update_state = ctx["sup"].update_state
+
+    def _flaky_update_state(config, patch, as_node=None):
+        if "budget" in patch:
+            raise RuntimeError("simulated checkpoint persistence failure")
+        return real_update_state(config, patch, as_node=as_node)
+
+    monkeypatch.setattr(
+        "hydra_core.supervisor.build_supervisor",
+        lambda **k: _FlakySupProxy(ctx["sup"], _flaky_update_state),
+    )
+
+    rc, body = _step(ctx)
+    assert rc == 1, body
+    assert body.get("status") == "workflow_terminal", body
+    assert body.get("error") == "checkpoint_persist_failed", body
+    assert body.get("checkpoint_persist_errors"), body

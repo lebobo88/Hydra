@@ -4216,12 +4216,155 @@ def _cmd_attended_step(args) -> int:
         # `None` for it and `hydra step` proceeds exactly as before.
         _terminal = workflow_terminal_resolution(
             snap.values, getattr(snap, "next", ()) or ())
+
+        # Hydra#70 checkpoint-bookkeeping fix: a poll can drive an
+        # `await_smoke` cursor terminal (job completed/lost between this
+        # call and the next). Previously `step` returned with the budget
+        # charge, attended_completed_task_ids/attended_done_task_ids/
+        # attended_results, and open_pp_runs removal all silently skipped --
+        # the finished task stayed selectable and the next `step` opened a
+        # SECOND pp run for it. Reach the SAME reconciliation
+        # `_cmd_attended_submit` uses, exactly-once on
+        # `run_id:terminal_call_key` (stamped by `poll_smoke_job` itself --
+        # see host_bridge.py -- regardless of which caller finished the
+        # stage). A no-op when the poll leaves the cursor non-terminal
+        # (still `await_smoke`): `res["status"]` is then `"awaiting_host"`,
+        # which the shared function's own status gate ignores. Factored so
+        # both the ordinary (non-terminal-workflow) poll branch below AND
+        # the workflow_terminal branch reach identical logic -- see the
+        # critique on the prior round: the workflow_terminal early return
+        # used to skip this reconciliation entirely for a workflow that
+        # went terminal while an attended cursor sat unreconciled.
+        def _poll_open_run_cursor(open_run_id: str, cfile) -> tuple[dict, list[str]]:
+            _cursor = host_bridge.load_cursor(cfile)
+            host_bridge.poll_smoke_job(
+                dispatcher, _cursor, cursor_file=cfile,
+                workflow_terminal=_terminal is not None)
+            host_bridge.save_cursor(cfile, _cursor)
+            _res = host_bridge.step_result(_cursor, cfile)
+            emit(project, wf, "attended.step_poll_smoke", {
+                "run_id": str(open_run_id), "state": _res.get("state")})
+            return _reconcile_attended_terminal_checkpoint(
+                project, wf, str(open_run_id),
+                str(_res.get("terminal_call_key") or ""), dispatcher, cfile, _res,
+            )
+
+        # Hydra#70 self-heal: a cursor that already went terminal -- either
+        # via the poll helper above on an EARLIER `step` call, or left
+        # behind by a checkpoint written before this fix existed -- can
+        # still be sitting in `open_pp_runs` with the budget charge /
+        # task-completion bookkeeping never written, because nothing
+        # besides the poll helper (and `submit_host_result`) used to ever
+        # reach `_reconcile_attended_terminal_checkpoint`. Repairs a single
+        # such cursor: `None` when the cursor isn't terminal, or is terminal
+        # but already fully reconciled (nothing left to repair).
+        def _self_heal_open_run_cursor(
+            open_run_id: str, cfile,
+        ) -> tuple[dict, list[str]] | None:
+            _cursor = host_bridge.load_cursor(cfile)
+            if _cursor.get("state") not in host_bridge._TERMINAL:
+                return None
+            # A cursor terminated by pre-fix code (or any path other than
+            # `submit_host_result`/the poll helper above) never had
+            # `terminal_call_key` stamped. Derive it from whichever
+            # idempotency marker the terminal transition itself left behind
+            # -- `verdict_recorded_for` (a bare call_key string written by
+            # `_apply_judge`) or `smoke_result_for.call_key` (written by
+            # `_apply_smoke_and_finalize`) -- both are the SAME judge
+            # call_key that drove this stage terminal. Falls through to the
+            # shared function's own "legacy" identity when neither is
+            # present (a cursor terminated some other way entirely, e.g.
+            # operator abort).
+            if not _cursor.get("terminal_call_key"):
+                _derived_key = (
+                    _cursor.get("verdict_recorded_for")
+                    or (_cursor.get("smoke_result_for") or {}).get("call_key")
+                )
+                if _derived_key:
+                    _cursor["terminal_call_key"] = _derived_key
+                    host_bridge.save_cursor(cfile, _cursor)
+            _heal_res = host_bridge.step_result(_cursor, cfile)
+            _heal_recon_key = (
+                f"{open_run_id}:{_heal_res.get('terminal_call_key') or 'legacy'}"
+            )
+            _already_reconciled = bool(
+                (getattr(state, "attended_checkpoint_reconciled", None) or {})
+                .get(_heal_recon_key)
+            )
+            if _already_reconciled:
+                # Bookkeeping already landed for this exact identity; the run
+                # is only still in `open_pp_runs` because the atomic patch
+                # that would have removed it never re-read (defensive —
+                # normally reconciliation removes it in the same write that
+                # sets the marker). Nothing left to repair.
+                return None
+            _heal_res, _heal_errors = _reconcile_attended_terminal_checkpoint(
+                project, wf, str(open_run_id),
+                str(_heal_res.get("terminal_call_key") or ""), dispatcher,
+                cfile, _heal_res,
+            )
+            emit(project, wf, "attended.step_self_heal_reconciled", {
+                "run_id": str(open_run_id), "status": _heal_res.get("status"),
+                "persist_errors": _heal_errors,
+            })
+            return _heal_res, _heal_errors
+
         if _terminal is not None:
+            # Round-2 critique fix: the workflow_terminal short-circuit used
+            # to return here BEFORE ever reaching the poll/self-heal logic
+            # above -- a workflow that went terminal while an attended
+            # cursor sat `await_smoke` (or terminal-but-unreconciled) in
+            # `open_pp_runs` never got its bookkeeping recorded, and the
+            # next `step`/`submit` on a resurrected (non-terminal) checkpoint
+            # could re-select the same task. Poll every `await_smoke` cursor
+            # (`workflow_terminal=True` -- `poll_smoke_job`/`_finalize`
+            # refuse the worktree merge and preserve the branch, exactly
+            # like a same-call_key `submit` reaching a terminal workflow)
+            # and self-heal every already-terminal-but-unreconciled cursor,
+            # reusing the SAME two helpers the non-terminal path below uses
+            # -- never a second copy of either loop. No task is ever
+            # selected or dispatched once terminal; this only records
+            # already-incurred spend/bookkeeping, exactly like
+            # `_reconcile_attended_terminal_checkpoint` (re-reading the
+            # checkpoint's own terminal status) already does for `submit`.
+            _term_persist_errors: list[str] = []
+            _term_reconciled: list[dict] = []
+            for _open_run in list(getattr(state, "open_pp_runs", []) or []):
+                _open_run_id = (_open_run or {}).get("run_id")
+                if not _open_run_id:
+                    continue
+                _open_cfile = host_bridge.cursor_path(project, wf, str(_open_run_id))
+                if not Path(_open_cfile).exists():
+                    continue
+                _open_cursor = host_bridge.load_cursor(_open_cfile)
+                if _open_cursor.get("state") == "await_smoke":
+                    _t_res, _t_errors = _poll_open_run_cursor(str(_open_run_id), _open_cfile)
+                else:
+                    _healed = _self_heal_open_run_cursor(str(_open_run_id), _open_cfile)
+                    if _healed is None:
+                        continue
+                    _t_res, _t_errors = _healed
+                _term_persist_errors.extend(_t_errors)
+                _term_reconciled.append({
+                    "run_id": str(_open_run_id), "status": _t_res.get("status"),
+                })
+            if _term_persist_errors:
+                print(_cli_json_dumps({
+                    "ok": False,
+                    "error": "checkpoint_persist_failed",
+                    "checkpoint_persist_errors": _term_persist_errors,
+                    "status": "workflow_terminal",
+                    "workflow_id": wf,
+                    "terminal_resolution": _terminal,
+                    "reconciled": _term_reconciled,
+                }, indent=2, default=str))
+                return 1
             print(_cli_json_dumps({
                 "ok": False,
                 "status": "workflow_terminal",
                 "workflow_id": wf,
                 "terminal_resolution": _terminal,
+                "reconciled": _term_reconciled,
             }, indent=2, default=str))
             return 0
 
@@ -4249,31 +4392,7 @@ def _cmd_attended_step(args) -> int:
             _open_cursor = host_bridge.load_cursor(_open_cfile)
             if _open_cursor.get("state") != "await_smoke":
                 continue
-            host_bridge.poll_smoke_job(
-                dispatcher, _open_cursor, cursor_file=_open_cfile,
-                workflow_terminal=_terminal is not None)
-            host_bridge.save_cursor(_open_cfile, _open_cursor)
-            res = host_bridge.step_result(_open_cursor, _open_cfile)
-            emit(project, wf, "attended.step_poll_smoke", {
-                "run_id": str(_open_run_id), "state": res.get("state")})
-            # Hydra#70 checkpoint-bookkeeping fix: a poll can ITSELF drive the
-            # cursor terminal (job completed/lost between this call and the
-            # next). Previously `step` returned here with the budget charge,
-            # attended_completed_task_ids/attended_done_task_ids/
-            # attended_results, and open_pp_runs removal all silently
-            # skipped -- the finished task stayed selectable and the next
-            # `step` opened a SECOND pp run for it. Reach the SAME
-            # reconciliation `_cmd_attended_submit` uses, exactly-once on
-            # `run_id:terminal_call_key` (now stamped by `poll_smoke_job`
-            # itself -- see host_bridge.py -- regardless of which caller
-            # finished the stage). No-op when the poll left the cursor
-            # non-terminal (still `await_smoke`): `res["status"]` is then
-            # `"awaiting_host"`, which the shared function's own status gate
-            # ignores.
-            res, _poll_persist_errors = _reconcile_attended_terminal_checkpoint(
-                project, wf, str(_open_run_id),
-                str(res.get("terminal_call_key") or ""), dispatcher, _open_cfile, res,
-            )
+            res, _poll_persist_errors = _poll_open_run_cursor(str(_open_run_id), _open_cfile)
             if _poll_persist_errors:
                 print(_cli_json_dumps({
                     "ok": False,
@@ -4285,18 +4404,12 @@ def _cmd_attended_step(args) -> int:
             print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
-        # Hydra#70 self-heal: a cursor that already went terminal -- either
-        # via the poll branch above on an EARLIER `step` call, or left behind
-        # by a checkpoint written before this fix existed -- can still be
-        # sitting in `open_pp_runs` with the budget charge / task-completion
-        # bookkeeping never written, because nothing besides the poll branch
-        # (and `submit_host_result`) used to ever reach
-        # `_reconcile_attended_terminal_checkpoint`. Repair every such cursor
-        # HERE, before task selection, so a finished task is never re-picked
-        # and re-dispatched into a duplicate pp run. Distinct from the poll
-        # loop above: this one does NOT poll (the cursor is already
-        # terminal on disk, not `await_smoke`) and does not `return` --
-        # healing is silent bookkeeping, not a host_action.
+        # Hydra#70 self-heal: repair every terminal-but-unreconciled cursor
+        # before task selection, so a finished task is never re-picked and
+        # re-dispatched into a duplicate pp run. Distinct from the poll loop
+        # above: this one does NOT poll (the cursor is already terminal on
+        # disk, not `await_smoke`) and does not `return` -- healing is
+        # silent bookkeeping, not a host_action.
         _healed_any = False
         for _open_run in list(getattr(state, "open_pp_runs", []) or []):
             _open_run_id = (_open_run or {}).get("run_id")
@@ -4305,52 +4418,10 @@ def _cmd_attended_step(args) -> int:
             _open_cfile = host_bridge.cursor_path(project, wf, str(_open_run_id))
             if not Path(_open_cfile).exists():
                 continue
-            _open_cursor = host_bridge.load_cursor(_open_cfile)
-            if _open_cursor.get("state") not in host_bridge._TERMINAL:
+            _healed = _self_heal_open_run_cursor(str(_open_run_id), _open_cfile)
+            if _healed is None:
                 continue
-            # A cursor terminated by pre-fix code (or any path other than
-            # `submit_host_result`/the poll branch above) never had
-            # `terminal_call_key` stamped. Derive it from whichever
-            # idempotency marker the terminal transition itself left behind
-            # -- `verdict_recorded_for` (a bare call_key string written by
-            # `_apply_judge`) or `smoke_result_for.call_key` (written by
-            # `_apply_smoke_and_finalize`) -- both are the SAME judge
-            # call_key that drove this stage terminal. Falls through to the
-            # shared function's own "legacy" identity when neither is
-            # present (a cursor terminated some other way entirely, e.g.
-            # operator abort).
-            if not _open_cursor.get("terminal_call_key"):
-                _derived_key = (
-                    _open_cursor.get("verdict_recorded_for")
-                    or (_open_cursor.get("smoke_result_for") or {}).get("call_key")
-                )
-                if _derived_key:
-                    _open_cursor["terminal_call_key"] = _derived_key
-                    host_bridge.save_cursor(_open_cfile, _open_cursor)
-            _heal_res = host_bridge.step_result(_open_cursor, _open_cfile)
-            _heal_recon_key = (
-                f"{_open_run_id}:{_heal_res.get('terminal_call_key') or 'legacy'}"
-            )
-            _already_reconciled = bool(
-                (getattr(state, "attended_checkpoint_reconciled", None) or {})
-                .get(_heal_recon_key)
-            )
-            if _already_reconciled:
-                # Bookkeeping already landed for this exact identity; the run
-                # is only still in `open_pp_runs` because the atomic patch
-                # that would have removed it never re-read (defensive —
-                # normally reconciliation removes it in the same write that
-                # sets the marker). Nothing left to repair.
-                continue
-            _heal_res, _heal_errors = _reconcile_attended_terminal_checkpoint(
-                project, wf, str(_open_run_id),
-                str(_heal_res.get("terminal_call_key") or ""), dispatcher,
-                _open_cfile, _heal_res,
-            )
-            emit(project, wf, "attended.step_self_heal_reconciled", {
-                "run_id": str(_open_run_id), "status": _heal_res.get("status"),
-                "persist_errors": _heal_errors,
-            })
+            _heal_res, _heal_errors = _healed
             if _heal_errors:
                 print(_cli_json_dumps({
                     "ok": False,
