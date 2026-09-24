@@ -532,6 +532,109 @@ class TestModifyPlan:
 
 
 # =========================================================================== #
+# P1-2 (HIGH, cross-vendor gpt-6-astra): modify-plan atomic write.
+# =========================================================================== #
+
+
+class TestP1_2ModifyPlanAtomicWrite:
+    """The gate-resolution patch (pending_hitl clear, hitl_history) and the
+    FULL revision patch (plan_status="authoring", plan_revision+1, the
+    revision task, plan_supersedes_expected, plan_superseded_task_ids) must
+    land in ONE atomic `sup.update_state(..., as_node="dispatch")` call --
+    not two, with spool pruning / TheEights reconciliation running in
+    between. A crash between two separate writes used to leave the OLD
+    judged plan cleared of its gate with no revision task ever recorded:
+    not resumable via the pending-gate branch (no pending_hitl left) and
+    not continuable via the revision task (never written).
+
+    MUTATION PROOF: revert the fold (split the write back into an ordinary
+    `sup.update_state(config, patch)` followed by a SEPARATE
+    `_reenter_graph_after_dispatch(sup, config, {...revision fields...})`
+    call, as the pre-fix code did) and BOTH tests below fail --
+    `test_modify_plan_writes_checkpoint_exactly_once` sees `len(sup.updates)
+    == 2`, and `test_crash_after_write_still_leaves_revision_durable` sees
+    the revision fields (`plan_status`/`plan_revision`/`tasks`) MISSING
+    from the checkpoint at the moment of the injected crash, because they
+    were still queued for the second, not-yet-run write."""
+
+    def _seeded(self, wf, prior_envelope_id):
+        pending = {
+            "workflow_id": wf, "reason": "plan_approval", "gate_node": "plan_gate",
+            "options": ["approve", "reject", "modify-plan", "modify-budget"],
+        }
+        values = {
+            "pending_hitl": pending, "phase": "approval",
+            "plan_revision": 1, "plan_envelope_id": prior_envelope_id,
+            "plan_rigor": "standard", "root_goal": "ship the thing",
+        }
+        return pending, values
+
+    def test_modify_plan_writes_checkpoint_exactly_once(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HYDRA_PLAN_MAX_REVISIONS", raising=False)
+        wf = str(uuid4())
+        prior_envelope_id = str(uuid4())
+        pending, values = self._seeded(wf, prior_envelope_id)
+        sup = _FakeModifyPlanSup(pending, values)
+        _patch_common(monkeypatch, sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        critique_file = tmp_path / "critique.txt"
+        critique_file.write_text("please revise", encoding="utf-8")
+
+        args = _resume_args(tmp_path, wf, "modify-plan", critique_ref=str(critique_file))
+        ret = _cmd_resume_locked(args, tmp_path, wf, "modify-plan", None)
+        assert ret == 0
+
+        assert len(sup.updates) == 1, (
+            f"modify-plan must write the checkpoint EXACTLY ONCE -- got "
+            f"{len(sup.updates)} call(s): {sup.updates}"
+        )
+        patch, as_node = sup.updates[0]
+        assert as_node == "dispatch"
+        assert patch.get("pending_hitl") is None
+        assert patch.get("plan_status") == "authoring"
+        assert patch.get("plan_revision") == 2
+        assert len(patch.get("tasks") or []) == 1
+        assert patch.get("plan_supersedes_expected") == prior_envelope_id
+        assert sup.invoked == 0
+
+    def test_crash_after_write_still_leaves_revision_durable(self, monkeypatch, tmp_path):
+        """Inject a crash in the fail-soft post-write work (spool prune) --
+        the single atomic write must already have landed by then, so the
+        checkpoint is durable regardless of what happens after."""
+        monkeypatch.delenv("HYDRA_PLAN_MAX_REVISIONS", raising=False)
+        wf = str(uuid4())
+        prior_envelope_id = str(uuid4())
+        pending, values = self._seeded(wf, prior_envelope_id)
+        sup = _FakeModifyPlanSup(pending, values)
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor", lambda **_k: sup)
+        monkeypatch.setattr("hydra_core.cli.emit", lambda *a, **k: None)
+
+        def _explodes(*_a, **_k):
+            raise RuntimeError("spool prune crashed (simulated process death)")
+        monkeypatch.setattr("hydra_core.cli._prune_spooled_hitl_requests", _explodes)
+        monkeypatch.setattr("hydra_core.cli._resolve_eights_hitl_for_workflow",
+                            lambda *_a, **_k: {"resolved": 0})
+
+        critique_file = tmp_path / "critique.txt"
+        critique_file.write_text("please revise", encoding="utf-8")
+        args = _resume_args(tmp_path, wf, "modify-plan", critique_ref=str(critique_file))
+
+        with pytest.raises(RuntimeError):
+            _cmd_resume_locked(args, tmp_path, wf, "modify-plan", None)
+
+        # The checkpoint write already happened BEFORE the injected crash --
+        # durable regardless of the crash.
+        assert len(sup.updates) == 1
+        patch, as_node = sup.updates[0]
+        assert as_node == "dispatch"
+        assert patch.get("plan_status") == "authoring"
+        assert patch.get("plan_revision") == 2
+        assert len(patch.get("tasks") or []) == 1
+        assert patch.get("pending_hitl") is None
+
+
+# =========================================================================== #
 # --critique-ref containment. `critique_ref` is reachable through the
 # `hydra.workflow.resume` MCP verb, not just the CLI a trusted human is
 # typing at -- an unconstrained read here is an arbitrary-file-read any

@@ -789,3 +789,217 @@ class TestAttendedPlanRejectionDefectC:
         assert charge_calls == [0.10]
         values = fake_sup.get_state({}).values
         assert (values.get("attended_completed_task_ids") or []).count(task_id) == 1
+
+
+class TestP1_1PlanReentryResumeOnStalledDrafted:
+    """P1-1 (HIGH, cross-vendor gpt-6-astra): `_reenter_graph_after_dispatch`'s
+    FIRST statement writes `plan_status="drafted"` (+ `plan_envelope_id`) to
+    the checkpoint; the bounded invoke loop that actually carries the plan to
+    plan_judge/plan_gate only runs AFTER that write. If the process dies (or
+    the exception-path cleanup -- releasing the claimed envelope_id -- never
+    durably lands either) between the two, a retry finds the SAME envelope
+    already claimed (`skipped_duplicate`) and a checkpoint stuck at "drafted"
+    with no pending plan_gate and no `plan_reentry_patch` this call (the
+    dispatch loop never re-ran `dispatch_ingested_envelopes` for a duplicate).
+    `_plan_already_accepted` must not treat "drafted" alone as durable
+    acceptance; it must RESUME the bounded graph transition before deciding,
+    and only complete the planning task if that resume actually reaches
+    plan_gate -- never wedge, and never silently mark the task done off a
+    stale status string.
+
+    MUTATION PROOF: revert the fix so `_plan_already_accepted` is
+    ``state.plan_status not in ("none", "rejected")`` again (accepting
+    "drafted" outright, no resume attempt) --
+    `test_retry_resumes_stalled_drafted_and_completes_once` fails, because
+    the retry call would short-circuit to "already accepted" WITHOUT ever
+    calling `sup.invoke` a second time, which this test asserts must happen
+    (`fake_sup.invoke_calls == 2`) and without ever setting
+    `plan_status="judged"` (the checkpoint would stay wedged at "drafted"
+    forever in a real deployment, masked here only by the accept-anyway bug)."""
+
+    def _stalled_drafted_sup(self, initial_values, *, resume_succeeds: bool):
+        class _StalledDraftedSup(_StatefulFakeSup):
+            """Unlike the base `_StatefulFakeSup` fixture (which reports the
+            graph already parked at plan_gate the INSTANT plan_status ==
+            "drafted"), this mirrors real graph semantics: writing
+            `plan_status="drafted"` on the checkpoint does not by itself
+            move `next` anywhere -- only `node_plan_judge` actually running
+            (via `invoke`) does. The first `invoke()` call always raises
+            (simulating the judge-transport failure / process death that
+            left the checkpoint stalled); later calls succeed or keep
+            failing depending on `resume_succeeds`."""
+
+            _raised_once = False
+
+            def get_state(self, config):
+                ps = self._values.get("plan_status")
+                next_ = (("plan_gate",)
+                         if ps in ("judged", "approved", "bypassed")
+                         else ("dispatch",))
+                return _Snap(dict(self._values), next_)
+
+            def invoke(self, arg, config=None):
+                self.invoke_calls += 1
+                if self._values.get("plan_status") != "drafted":
+                    # Ordinary graph progression unrelated to the plan
+                    # re-entry (e.g. `_cmd_attended_step`'s own initial
+                    # dispatch invoke, before any plan has been authored) --
+                    # no side effects to simulate here.
+                    return
+                if not self._raised_once:
+                    self._raised_once = True
+                    raise RuntimeError("judge transport failure")
+                if resume_succeeds:
+                    self._values = _merge_patch(
+                        self._values, {"plan_status": "judged"})
+                else:
+                    raise RuntimeError("judge transport failure (retry)")
+
+        return _StalledDraftedSup(initial_values)
+
+    def _wire(self, tmp_path, monkeypatch, fake_sup):
+        class _FakeDispatcher:
+            project_root = tmp_path
+
+            def call_mcp(self, *a, **k):
+                raise AssertionError("PLAN flow must never call an MCP tool")
+
+            def set_squad_packs(self, packs):
+                pass
+
+        monkeypatch.setattr(cli, "_attended_live_dispatcher",
+                            lambda *a, **k: _FakeDispatcher())
+        monkeypatch.setattr("hydra_core.supervisor.build_supervisor",
+                            lambda **k: fake_sup)
+        monkeypatch.setattr(
+            "hydra_core.governance.charge_and_gate",
+            lambda state, cost, toks, **_kw: (False, False),
+        )
+        # Simulate a genuine process death: the exception-path cleanup in
+        # `_apply_plan_reentry` (releasing the claimed envelope_id) never
+        # durably lands either -- exercise the SAME real ledger file the fix
+        # must cope with (skipped_duplicate on retry), not a mock that hides
+        # the claim.
+        import hydra_core.ingest as ingest_mod
+        monkeypatch.setattr(ingest_mod, "release_ingested_ids", lambda *a, **k: set())
+        monkeypatch.setenv("HYDRA_PLAN_PHASE", "1")
+
+    def test_retry_resumes_stalled_drafted_and_completes_once(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        # requires_human_approval=True: keeps `_run_first_step_dispatch_pass`
+        # (cli.py) from ALSO invoking the graph on every `_cmd_attended_step`
+        # call -- that bootstrap pass is orthogonal to this test (planning
+        # tasks always gate on plan_gate, a real operator approval point),
+        # and would otherwise fire whenever this fake's `get_state` reports
+        # a non-empty `next`, muddying which `invoke()` call is the one
+        # under test.
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task],
+                            requires_human_approval=True)
+        fake_sup = self._stalled_drafted_sup(
+            state.model_dump(mode="json"), resume_succeeds=True)
+        self._wire(tmp_path, monkeypatch, fake_sup)
+
+        wf_id = str(wf)
+        task_id = str(task.task_id)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+        assert call_key_0 == f"squad-{task_id}-0"
+        _invoke_calls_before_submit0 = fake_sup.invoke_calls
+
+        plan = _plan_dict(wf_id)
+        r0 = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.10, "tokens_in": 5, "tokens_out": 5,
+            "emitted_envelopes": [plan],
+        })
+        rc0, p0 = _submit(capsys, wf_id, task_id, call_key_0, r0)
+        assert rc0 == 0
+        assert fake_sup.invoke_calls == _invoke_calls_before_submit0 + 1, (
+            "the first attempt's own invoke must have been tried exactly "
+            "once and raised"
+        )
+        assert p0["status"] == "plan_rejected", p0
+        assert p0["plan_rejection"]["reason"] == "plan_reentry_failed", p0
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert values.get("plan_status") == "drafted", (
+            "the checkpoint write must have landed even though the invoke "
+            "loop that follows it raised"
+        )
+
+        # Retry: the host resubmits the SAME plan against a fresh cursor
+        # (the ledger still shows the envelope claimed, since the crash
+        # lost the release).
+        step2 = _step(capsys, wf_id)
+        call_key_1 = step2["host_action"]["call_key"]
+        assert call_key_1 == f"squad-{task_id}-1"
+        _invoke_calls_before_submit1 = fake_sup.invoke_calls
+        r1 = _write_result(tmp_path, "r1.json", {
+            "text": "plan authored (retry)", "cost_usd": 0.0,
+            "tokens_in": 0, "tokens_out": 0,
+            "emitted_envelopes": [plan],
+        })
+        rc1, p1 = _submit(capsys, wf_id, task_id, call_key_1, r1)
+        assert rc1 == 0
+        assert fake_sup.invoke_calls > _invoke_calls_before_submit1, (
+            "the retry must resume the bounded invoke loop, not accept the "
+            "stale 'drafted' status outright"
+        )
+        assert p1["status"] != "plan_rejected", p1
+        assert p1["status"] != "plan_reentry_failed", p1
+        assert p1.get("plan_parked_at") == ["plan_gate"], p1
+
+        values = fake_sup.get_state({}).values
+        assert (values.get("attended_completed_task_ids") or []).count(task_id) == 1, (
+            "planning task must complete exactly once across both calls"
+        )
+        assert values.get("plan_status") == "judged"
+
+    def test_retry_resume_failure_stays_open_not_wedged(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """Counterpart: if the RESUME attempt itself fails again, the task
+        must stay open (retryable) -- never silently complete, and never
+        permanently wedged (a further retry is still possible)."""
+        task = TaskState(owner_squad="planning", description="author a plan for: ship it")
+        wf = uuid4()
+        state = HydraState(root_goal="ship it", workflow_id=wf, tasks=[task],
+                            requires_human_approval=True)
+        fake_sup = self._stalled_drafted_sup(
+            state.model_dump(mode="json"), resume_succeeds=False)
+        self._wire(tmp_path, monkeypatch, fake_sup)
+
+        wf_id = str(wf)
+        task_id = str(task.task_id)
+
+        step1 = _step(capsys, wf_id)
+        call_key_0 = step1["host_action"]["call_key"]
+        plan = _plan_dict(wf_id)
+        r0 = _write_result(tmp_path, "r0.json", {
+            "text": "plan authored", "cost_usd": 0.10, "tokens_in": 5, "tokens_out": 5,
+            "emitted_envelopes": [plan],
+        })
+        _submit(capsys, wf_id, task_id, call_key_0, r0)
+
+        step2 = _step(capsys, wf_id)
+        call_key_1 = step2["host_action"]["call_key"]
+        r1 = _write_result(tmp_path, "r1.json", {
+            "text": "plan authored (retry)", "cost_usd": 0.0,
+            "tokens_in": 0, "tokens_out": 0,
+            "emitted_envelopes": [plan],
+        })
+        rc1, p1 = _submit(capsys, wf_id, task_id, call_key_1, r1)
+        assert rc1 == 0
+        assert p1["status"] == "plan_rejected", p1
+        assert p1["plan_rejection"]["reason"] == "plan_reentry_failed", p1
+
+        values = fake_sup.get_state({}).values
+        assert task_id not in (values.get("attended_completed_task_ids") or [])
+        assert _task_status(values, task_id) == "pending"
+
+        # A THIRD attempt is still possible -- not permanently wedged.
+        step3 = _step(capsys, wf_id)
+        assert step3["host_action"]["call_key"] == f"squad-{task_id}-2"
