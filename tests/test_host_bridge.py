@@ -76,7 +76,17 @@ class FakeDispatcher:
 @pytest.fixture(autouse=True)
 def _smoke_passes(monkeypatch):
     """Force a passing smoke so the happy path can finalize 'complete' without a
-    real build/test command in the temp dir."""
+    real build/test command in the temp dir.
+
+    Hydra#70: this module's tests were written against the SYNCHRONOUS
+    finalize-inline-in-submit behaviour (monkeypatching ``_run_smoke``
+    directly and asserting an immediate terminal cursor). The default mode
+    is now async (a detached, tracked job — see ``hydra_core.smoke_job``);
+    forcing ``HYDRA_ATTENDED_SMOKE_MODE=sync`` here keeps this whole test
+    module's synchronous assertions valid. The async job path itself is
+    covered by ``tests/test_hydra70_async_smoke.py``.
+    """
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(host_bridge, "_run_smoke",
                         lambda *a, **k: ("pass", "fake smoke pass"))
 

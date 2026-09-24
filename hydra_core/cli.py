@@ -4232,6 +4232,33 @@ def _cmd_attended_step(args) -> int:
             if snap is not None and snap.values:
                 state = HydraState.model_validate(snap.values)
 
+        # Hydra#70: a smoke job started by a prior judge-pass submit may
+        # still be running for the CURRENT engineering task. `step` must
+        # route that to a POLL rather than opening a brand-new stage
+        # (begin_stage would mint a second pp run / worktree for a task
+        # already in flight). Checked against every registered open pp run
+        # so a poll works regardless of which run_id the host's next call
+        # targets.
+        for _open_run in list(getattr(state, "open_pp_runs", []) or []):
+            _open_run_id = (_open_run or {}).get("run_id")
+            if not _open_run_id:
+                continue
+            _open_cfile = host_bridge.cursor_path(project, wf, str(_open_run_id))
+            if not Path(_open_cfile).exists():
+                continue
+            _open_cursor = host_bridge.load_cursor(_open_cfile)
+            if _open_cursor.get("state") != "await_smoke":
+                continue
+            host_bridge.poll_smoke_job(
+                dispatcher, _open_cursor, cursor_file=_open_cfile,
+                workflow_terminal=_terminal is not None)
+            host_bridge.save_cursor(_open_cfile, _open_cursor)
+            res = host_bridge.step_result(_open_cursor, _open_cfile)
+            emit(project, wf, "attended.step_poll_smoke", {
+                "run_id": str(_open_run_id), "state": res.get("state")})
+            print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
+            return 0
+
         # E2-23: pick the next attended task in task-list order.  The squad
         # only decides WHICH cursor is opened (pp run vs squad stage) — it must
         # not reorder the planner's dependency chain.

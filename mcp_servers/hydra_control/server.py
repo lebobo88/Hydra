@@ -1241,6 +1241,16 @@ def _tool_handlers() -> dict[str, Any]:
         Returns {status:"awaiting_host", host_action:{agent_type, prompt, cwd,
         call_key}, run_id, ...}. The host then spawns the Agent and feeds the
         result back via `hydra.workflow.submit_host_result`.
+
+        Hydra#70: when the current task's judge verdict already passed, the
+        repo smoke runs as a DETACHED background job instead of blocking
+        inside `submit_host_result` (a smoke that ran past this MCP call's
+        own timeout used to orphan its process tree with the verdict never
+        durably recorded). While that job is in flight this call returns
+        `{status:"awaiting_host", state:"await_smoke", host_action:
+        {action:"poll_smoke"}}` for the SAME task instead of opening a new
+        stage -- call it again (a poll, not a re-dispatch) until it goes
+        terminal.
         """
         workflow_id = str(args.get("workflow_id") or "")
         if not _WORKFLOW_ID_RE.match(workflow_id):
@@ -1257,6 +1267,12 @@ def _tool_handlers() -> dict[str, Any]:
         On stage completion the engine charges the accrued cost on the
         checkpointed HydraState budget (tripwires stay live) and records the task
         outcome — attended execution is never budget-blind.
+
+        Hydra#70: a resubmit under the SAME judge `call_key` while the cursor
+        is in `state:"await_smoke"` (the detached smoke job started by a
+        prior passing judge verdict) is treated as a POLL -- it never
+        re-records the verdict or restarts the job. `hydra.workflow.step` is
+        the other, agent-less way to poll the same job.
         """
         workflow_id = str(args.get("workflow_id") or "")
         run_id = str(args.get("run_id") or "")
