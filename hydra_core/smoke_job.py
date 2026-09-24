@@ -584,9 +584,15 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
     if alive_verified and now < deadline:
         return None  # still running, within budget — poll again later
 
-    if not alive and result_path:
-        # The process is gone (or was never seen alive) and no result file
-        # exists YET -- see the module-level race note above. Retry across a
+    if not alive_verified and result_path:
+        # The process is gone -- OR was never seen alive -- OR (R1 revise,
+        # cross-vendor gpt-5.6-terra) IS alive but its pid identity no longer
+        # matches the recorded worker (pid reuse) -- and no result file
+        # exists YET -- see the module-level race note above. Gate this on
+        # `alive_verified`, not the bare `alive`, so an alive-but-mismatched
+        # pid is treated exactly like a vanished worker: it still gets the
+        # grace window in which an already-written, token-matching result can
+        # win, rather than jumping straight to infra_error. Retry across a
         # short grace window before concluding the job is truly lost; a
         # genuinely crashed/killed job still resolves to infra_error, just
         # not on a false-negative race.
