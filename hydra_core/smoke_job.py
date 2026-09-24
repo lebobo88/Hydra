@@ -112,7 +112,28 @@ def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
 def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
               call_key: str) -> dict[str, Any]:
     """Spawn the detached smoke job. Returns the ``cursor["smoke_job"]`` shape:
-    ``{pid, started_at, deadline, result_path, log_path, call_key}``."""
+    ``{pid, started_at, deadline, result_path, log_path, call_key}``.
+
+    Hydra#70 follow-up (cross-vendor judge finding): this function must
+    NEVER raise. The caller (``host_bridge._apply_judge`` /
+    ``recover_stalled_stage``) invokes this AFTER the judge verdict has
+    already been durably recorded -- a raised exception here would surface
+    at the call site with no persisted outcome, leaving the cursor stuck in
+    ``await_judge``/``await_smoke`` with no job to poll and the verdict
+    already spent. Any spawn/setup failure (a missing interpreter on
+    ``sys.executable``, a permission error creating the job's log
+    directory, ``detached_popen_kwargs()`` raising, ``subprocess.Popen``
+    itself raising ``OSError``/``FileNotFoundError``) is instead caught and
+    turned into a terminal ``infra_error`` result, written through the SAME
+    atomic ``dumps_strict`` writer (:func:`_atomic_write_json`) the job's own
+    ``main()`` uses, so the job's very first :func:`poll_job` call resolves
+    to that infra failure immediately (the returned job's ``deadline`` is
+    already in the past). If even that write fails (e.g. the identical
+    permission error that stopped the log directory being created), the
+    returned job instead carries a ``spawn_error`` string that
+    :func:`poll_job` recognizes and resolves from directly -- so the
+    ``await_smoke`` poll ALWAYS finalizes as an infra smoke failure exactly
+    like a lost job, never wedges, and never re-records the verdict."""
     paths = job_paths(cursor_file, call_key)
     result_path = paths["result_path"]
     log_path = paths["log_path"]
@@ -123,32 +144,59 @@ def start_job(cursor_file: str | Path, *, project_path: str, stage_id: str,
     except FileNotFoundError:
         pass
     timeout_s = smoke_timeout_s()
-    cmd = [
-        sys.executable, "-m", "hydra_core.smoke_job",
-        "--project-path", str(project_path),
-        "--stage-id", str(stage_id),
-        "--result-path", result_path,
-        "--timeout-s", str(timeout_s),
-    ]
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
-    # The job's cwd is the (worktree) project_path, not the Hydra repo root,
-    # so `-m hydra_core.smoke_job` only resolves if the repo root (this
-    # module's package parent) is on PYTHONPATH.
-    _hydra_root = str(Path(__file__).resolve().parent.parent)
-    _existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        _hydra_root if not _existing_pp
-        else os.pathsep.join([_hydra_root, _existing_pp])
-    )
-    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     started_at = time.time()
-    with open(log_path, "ab") as log_f:
-        proc = subprocess.Popen(  # noqa: S603 — fixed argv, validated tokens
-            cmd, cwd=str(Path(project_path)) if Path(project_path).exists() else None,
-            env=env, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
-            **detached_popen_kwargs(),
+    try:
+        cmd = [
+            sys.executable, "-m", "hydra_core.smoke_job",
+            "--project-path", str(project_path),
+            "--stage-id", str(stage_id),
+            "--result-path", result_path,
+            "--timeout-s", str(timeout_s),
+        ]
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        # The job's cwd is the (worktree) project_path, not the Hydra repo
+        # root, so `-m hydra_core.smoke_job` only resolves if the repo root
+        # (this module's package parent) is on PYTHONPATH.
+        _hydra_root = str(Path(__file__).resolve().parent.parent)
+        _existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            _hydra_root if not _existing_pp
+            else os.pathsep.join([_hydra_root, _existing_pp])
         )
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as log_f:
+            proc = subprocess.Popen(  # noqa: S603 — fixed argv, validated tokens
+                cmd, cwd=str(Path(project_path)) if Path(project_path).exists() else None,
+                env=env, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+                **detached_popen_kwargs(),
+            )
+    except Exception as exc:  # noqa: BLE001 — see docstring: never raise, always a terminal result
+        reason = f"smoke job failed to spawn: {exc!r}"[:2000]
+        finished_at = time.time()
+        job: dict[str, Any] = {
+            "pid": None,
+            "started_at": started_at,
+            # Already-past deadline: a job that never spawned has nothing to
+            # wait on — the poller must resolve it on its very first poll.
+            "deadline": started_at - 1,
+            "result_path": result_path,
+            "log_path": log_path,
+            "call_key": call_key,
+        }
+        try:
+            _atomic_write_json(result_path, {
+                "status": "infra_error",
+                "reason": reason,
+                "finished_at": finished_at,
+            })
+        except Exception:  # noqa: BLE001 — the write itself can fail (e.g. the
+            # same permission error that stopped the log dir from being
+            # created); poll_job falls back to job["spawn_error"] in that
+            # case so the caller still gets a correctly-reasoned terminal
+            # outcome instead of a generic "vanished" one.
+            job["spawn_error"] = reason
+        return job
     return {
         "pid": proc.pid,
         "started_at": started_at,
@@ -215,6 +263,20 @@ def poll_job(job: dict[str, Any]) -> dict[str, Any] | None:
         found = _read_result_file(result_path)
         if found is not None:
             return found
+
+    spawn_error = job.get("spawn_error")
+    if spawn_error:
+        # start_job failed to spawn AND failed to persist a result file for
+        # it (see start_job's docstring) — resolve immediately from the
+        # captured reason instead of falling through to the vanished-grace
+        # window / generic "process vanished" reason below, which would lose
+        # the actual spawn failure detail.
+        return {
+            "status": "infra_error",
+            "reason": spawn_error,
+            "finished_at": time.time(),
+            "log_path": job.get("log_path"),
+        }
 
     pid = job.get("pid")
     deadline = float(job.get("deadline") or 0)

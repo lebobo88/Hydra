@@ -426,6 +426,180 @@ def test_kill_process_tree_reaches_grandchild(tmp_path):
 # recover_stalled_stage also routes stalled_infra -> await_smoke job         #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Hydra#70 follow-up (cross-vendor judge finding): start_job's own           #
+# spawn/setup failures must never raise -- they must resolve to a durably    #
+# persisted infra_error the very first time the job is polled.               #
+# --------------------------------------------------------------------------- #
+
+def test_start_job_popen_failure_never_raises_and_writes_infra_error(
+    tmp_path, monkeypatch,
+):
+    def _raise_popen(*_a, **_kw):
+        raise OSError("no such interpreter: fake-boom")
+    monkeypatch.setattr(smoke_job.subprocess, "Popen", _raise_popen)
+
+    cursor_file = tmp_path / "cursor.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+
+    job = smoke_job.start_job(
+        cursor_file, project_path=str(tmp_path), stage_id="s1", call_key="judge-0")
+
+    assert job["pid"] is None
+    assert job["deadline"] < time.time(), "a never-spawned job must resolve on the first poll"
+    assert Path(job["result_path"]).exists(), "the infra_error result must be persisted immediately"
+    written = json.loads(Path(job["result_path"]).read_text(encoding="utf-8"))
+    assert written["status"] == "infra_error"
+    assert "fake-boom" in written["reason"]
+
+    result = smoke_job.poll_job(job)
+    assert result is not None
+    assert result["status"] == "infra_error"
+    assert "fake-boom" in result["reason"]
+
+
+def test_start_job_log_open_failure_never_raises_and_writes_infra_error(
+    tmp_path, monkeypatch,
+):
+    """A permission error creating the job's log FILE (not the subprocess
+    itself) must be caught the same way as a Popen failure."""
+    cursor_file = tmp_path / "cursor.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+    log_path = smoke_job.job_paths(cursor_file, "judge-0")["log_path"]
+
+    real_open = open
+
+    def _raise_open(path, *a, **kw):
+        if str(path) == log_path:
+            raise PermissionError(f"permission denied: {path}")
+        return real_open(path, *a, **kw)
+    monkeypatch.setattr("builtins.open", _raise_open)
+
+    job = smoke_job.start_job(
+        cursor_file, project_path=str(tmp_path), stage_id="s1", call_key="judge-0")
+
+    assert job["pid"] is None
+    written = json.loads(Path(job["result_path"]).read_text(encoding="utf-8"))
+    assert written["status"] == "infra_error"
+    assert "permission denied" in written["reason"]
+
+    result = smoke_job.poll_job(job)
+    assert result is not None
+    assert result["status"] == "infra_error"
+    assert "permission denied" in result["reason"]
+
+
+def test_start_job_result_write_failure_falls_back_to_spawn_error(
+    tmp_path, monkeypatch,
+):
+    """If the spawn fails AND persisting the infra_error result ALSO fails
+    (e.g. the same permission error prevents both), start_job must still
+    never raise, and poll_job must still resolve immediately -- from
+    job["spawn_error"] instead of a result file."""
+    def _raise_popen(*_a, **_kw):
+        raise OSError("boom-spawn")
+    monkeypatch.setattr(smoke_job.subprocess, "Popen", _raise_popen)
+
+    def _raise_replace(*_a, **_kw):
+        raise OSError("boom-replace: permission denied writing result")
+    monkeypatch.setattr(smoke_job.os, "replace", _raise_replace)
+
+    cursor_file = tmp_path / "cursor.json"
+    cursor_file.write_text("{}", encoding="utf-8")
+
+    job = smoke_job.start_job(
+        cursor_file, project_path=str(tmp_path), stage_id="s1", call_key="judge-0")
+
+    assert job["pid"] is None
+    assert not Path(job["result_path"]).exists(), (
+        "the write itself failed -- no result file should have landed")
+    assert job.get("spawn_error"), "spawn_error must be set when the write also fails"
+    assert "boom-spawn" in job["spawn_error"]
+
+    result = smoke_job.poll_job(job)
+    assert result is not None
+    assert result["status"] == "infra_error"
+    assert "boom-spawn" in result["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# Integration: a spawn failure at the host_bridge call sites (_apply_judge   #
+# and recover_stalled_stage) must reach a terminal infra smoke failure       #
+# instead of raising past an already-recorded verdict.                       #
+# --------------------------------------------------------------------------- #
+
+def test_apply_judge_popen_failure_reaches_infra_smoke_without_wedging(
+    tmp_path, monkeypatch,
+):
+    real_popen = subprocess.Popen
+
+    def _raise_popen(cmd, *a, **kw):
+        # Only the smoke job's OWN spawn (`-m hydra_core.smoke_job`) must
+        # fail here -- the test helpers' own `git` subprocess calls (via the
+        # SAME shared `subprocess` module) must keep working normally.
+        if isinstance(cmd, (list, tuple)) and "hydra_core.smoke_job" in cmd:
+            raise OSError("no interpreter (host-bridge integration)")
+        return real_popen(cmd, *a, **kw)
+    monkeypatch.setattr(smoke_job.subprocess, "Popen", _raise_popen)
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY, result=_JUDGE_PASS)
+    assert res2["state"] == "await_smoke"
+    assert disp.count("record_verdict") == 1
+
+    res3 = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key=_JUDGE_KEY, result=_JUDGE_PASS)
+    assert res3["status"] in ("surfaced", "complete_unpersisted"), res3
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["smoke_status"] == "infra_error"
+    assert "no interpreter" in cursor["smoke_reason"]
+    assert cursor.get("smoke_job") is None, "smoke_job must be cleared once resolved"
+    assert disp.count("record_verdict") == 1, "verdict must be recorded exactly once"
+    assert disp.count("record_smoke_status") == 1
+
+
+def test_recover_stalled_stage_popen_failure_reaches_infra_smoke_without_wedging(
+    tmp_path, monkeypatch,
+):
+    real_popen = subprocess.Popen
+
+    def _raise_popen(cmd, *a, **kw):
+        if isinstance(cmd, (list, tuple)) and "hydra_core.smoke_job" in cmd:
+            raise OSError("no interpreter (recovery integration)")
+        return real_popen(cmd, *a, **kw)
+    monkeypatch.setattr(smoke_job.subprocess, "Popen", _raise_popen)
+
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res, _work_path = _drive_to_await_judge(disp, tmp_path, monkeypatch)
+
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    cursor["state"] = "stalled_infra"
+    cursor["attempt_id"] = "att-1"
+    cursor["outcome"] = "pass"
+    cursor["pending_verdict_payload"] = {
+        "attempt_id": "att-1", "outcome": "pass", "idempotency_token": "recovery-tok-2",
+        "judge_producer": "codex", "judge_model_id": None,
+        "critique_md": "ok", "score_json": None, "rubric_id": "rfc-2119-normative",
+    }
+    cursor["pending_action"] = {"call_key": _JUDGE_KEY}
+    host_bridge.save_cursor(res["cursor_path"], cursor)
+
+    out = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
+    assert out["ok"] is True
+    assert out["state"] == "await_smoke"
+    assert disp.count("record_verdict") == 1
+
+    out2 = host_bridge.recover_stalled_stage(disp, cursor_file=res["cursor_path"])
+    assert out2["ok"] is True
+    cursor2 = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor2["smoke_status"] == "infra_error"
+    assert "no interpreter" in cursor2["smoke_reason"]
+    assert disp.count("record_verdict") == 1, "recovery must never re-record the verdict"
+
+
 def test_recover_stalled_stage_starts_a_smoke_job(tmp_path, monkeypatch):
     calls: list[str] = []
     _fake_job(monkeypatch, calls=calls)
