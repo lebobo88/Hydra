@@ -419,10 +419,27 @@ _SMOKE_PROMPT = (
 #   - Windows cmd.exe:  `'<x>' is not recognized as an internal or external
 #     command` -- cmd's own message when the shell could not resolve the
 #     command at all (bare `npm`/`npx`/etc. not on PATH).
-#   - POSIX shell:      a line starting with non-whitespace and ENDING in
-#     `command not found` / `not found` -- sh's own `<x>: not found` and
-#     bash's own `bash: <x>: command not found` messages for the same
-#     missing-command condition (both shapes end the same way).
+#   - POSIX shell, SHELL-PREFIXED ONLY (cross-vendor re-review, gpt-5.6-terra:
+#     the earlier bare `\S.*: (?:command not found|not found)$` alternative
+#     matched ANY unindented line ending that way -- e.g. a test's own
+#     `route /api/foo: not found` or `fixture data.json: not found` assertion
+#     output -- reclassifying a genuine test failure as infra. Replaced with
+#     patterns anchored to an actual shell's own diagnostic prefix, which
+#     ordinary test output never happens to start a line with):
+#       * dash:  `sh: <n>: <cmd>: not found` (dash prints the offending
+#         word's 1-based position, no `line` keyword).
+#       * any absolute/relative path to sh/bash/dash/zsh/ksh: `<path to
+#         shell>: [line <n>: ]<cmd>: (command not found|not found)`, e.g.
+#         `/bin/sh: <cmd>: not found`, `./bash: <cmd>: command not found`.
+#       * bash: `bash: <cmd>: command not found` and
+#         `bash: line <n>: <cmd>: command not found`.
+#       * zsh's own command-first form: `zsh: command not found: <cmd>`.
+#     (PowerShell's `is not recognized as the name of a cmdlet...` is
+#     intentionally NOT included: `_detect_smoke_command_and_cwd`'s commands
+#     are only ever launched via `run_text`/`popen_detached` with
+#     `shell=False`, or `shell=True` for npm/npx/yarn/pnpm on Windows, which
+#     invokes `cmd.exe` (COMSPEC) -- never `powershell.exe`/`pwsh.exe` -- so
+#     that diagnostic can never appear in a smoke transcript.)
 #   - Node `child_process`: `Error: spawn [<x> ]ENOENT|EACCES|EPERM` -- node's
 #     own launch-error form (`Error: spawn`, optionally the executable name,
 #     then an errno code); this is what a FAILED `child_process.spawn`
@@ -447,7 +464,9 @@ _SMOKE_PROMPT = (
 _INFRA_LAUNCHER_LINE_RE = re.compile(
     r"^(?:"
     r"'[^']+' is not recognized as an internal or external command"
-    r"|\S.*: (?:command not found|not found)\s*$"
+    r"|(?:\S*/)?(?:sh|bash|dash|zsh|ksh)(?:\.exe)?: (?:(?:line )?\d+: )?\S+: "
+    r"(?:command not found|not found)\s*$"
+    r"|(?:\S*/)?zsh(?:\.exe)?: command not found: \S+\s*$"
     r"|Error: spawn (?:\S+ )?(?:ENOENT|EACCES|EPERM)"
     r"|npm ERR! code (?:ENOENT|EPERM|EACCES)"
     r"|\S*python\S*: No module named"

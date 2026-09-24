@@ -509,3 +509,172 @@ def test_smoke_log_written_outside_worktree_survives_worktree_removal(tmp_path):
     assert Path(artifact_path).exists(), (
         "the smoke log evidence must survive worktree deletion"
     )
+
+
+# --------------------------------------------------------------------------- #
+# F71 second follow-up (cross-vendor re-review, codex gpt-5.6-terra): the     #
+# POSIX-shell alternative used to be a bare `\S.*: (?:command not            #
+# found|not found)$` -- matching ANY unindented line ending that way, e.g. a #
+# test's own `route /api/foo: not found` assertion output. Replaced with     #
+# patterns anchored to an actual shell's own diagnostic prefix (dash, any    #
+# path to sh/bash/dash/zsh/ksh, bash, zsh). PowerShell's "is not recognized  #
+# as the name of a cmdlet..." is intentionally NOT one of them: the smoke    #
+# commands `_detect_smoke_command_and_cwd` returns are only ever launched    #
+# with `shell=False`, or `shell=True` for npm/npx/yarn/pnpm on Windows -- and#
+# Python's `shell=True` on Windows always invokes `cmd.exe` (COMSPEC), never #
+# `powershell.exe`/`pwsh.exe` -- so that diagnostic can never appear in a    #
+# smoke transcript from this codebase's launch paths.                       #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("transcript", [
+    "sh: 1: some-missing-tool: not found",  # dash: `sh: <n>: <cmd>: not found`
+    "/bin/sh: some-missing-tool: not found",  # absolute path to sh
+    "./sh: some-missing-tool: not found",  # relative path to sh
+    "/bin/dash: some-missing-tool: not found",  # absolute path to dash
+    "bin/zsh: some-missing-tool: not found",  # relative path to zsh
+    "/usr/bin/ksh: some-missing-tool: not found",  # absolute path to ksh
+    "bash: some-missing-tool: command not found",  # bash, no line number
+    "bash: line 12: some-missing-tool: command not found",  # bash, with line number
+    "zsh: command not found: some-missing-tool",  # zsh's own command-first form
+])
+def test_smoke_infra_marker_hit_matches_every_shell_prefixed_launcher_form(transcript):
+    assert _smoke_infra_marker_hit(transcript) is True
+
+
+@pytest.mark.parametrize("transcript", [
+    # A transcript that carries a real test-runner failure summary (so the
+    # runner DID start and run) alongside lines that end the same way as a
+    # POSIX shell's "not found" diagnostic but are NOT shell-prefixed --
+    # ordinary test/assertion output, never a launcher's own message.
+    "1 passed, 1 failed in 0.42s\nroute /api/foo: not found",
+    "FAILED test_config -- config key 'x': not found\n1 failed in 0.10s",
+    "==== FAILURES ====\nfixture data.json: not found\n1 failed in 0.05s",
+    "FAILED test_users -- ERROR: user: not found",
+    # An unprefixed `command not found` printed by a test's own assertion
+    # message inside indented/test output -- no shell ever wrote it.
+    "    AssertionError: foo: command not found\n1 failed in 0.03s",
+])
+def test_smoke_infra_marker_hit_does_not_match_test_output_ending_in_not_found(
+    transcript,
+):
+    assert _smoke_infra_marker_hit(transcript) is False
+
+
+def _write_shell_style_failure_script(tmp_path: Path, transcript_line: str) -> Path:
+    """A fake test runner that prints a genuine test-runner failure summary
+    PLUS one line that ends like a shell's "not found" diagnostic but is
+    NOT shell-prefixed -- i.e. it is the test's own assertion output, not a
+    launcher failure. Exits non-zero like a real failing smoke run."""
+    script = tmp_path / f"unprefixed_not_found_{abs(hash(transcript_line))}.py"
+    script.write_text(
+        "\n".join([
+            "print('collecting tests...')",
+            f"print({transcript_line!r})",
+            "print('1 failed in 0.10s')",
+            "import sys; sys.exit(1)",
+        ]),
+        encoding="utf-8",
+    )
+    return script
+
+
+@pytest.mark.parametrize("transcript_line", [
+    "route /api/foo: not found",
+    "config key 'x': not found",
+    "fixture data.json: not found",
+    "ERROR: user: not found",
+    "foo: command not found",
+])
+def test_run_smoke_unprefixed_not_found_with_summary_is_fail_not_infra(
+    tmp_path, transcript_line
+):
+    """squad_node._run_smoke call site: a genuine, summarized test failure
+    whose own output ends like a shell diagnostic (but is not shell-
+    prefixed) must classify `fail`, never `infra_error` -- the same F71
+    defect class through the newer, narrower marker."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _write_shell_style_failure_script(tmp_path, transcript_line)
+    _write_smoke_cmd(project, [sys.executable, str(script)])
+
+    status, reason = _run_smoke(None, project_path=str(project), stage_id="s1")
+    assert status == "fail", (status, reason)
+
+
+@pytest.mark.parametrize("transcript_line", [
+    "route /api/foo: not found",
+    "config key 'x': not found",
+    "fixture data.json: not found",
+    "ERROR: user: not found",
+    "foo: command not found",
+])
+def test_run_smoke_tracked_unprefixed_not_found_with_summary_is_fail_not_infra(
+    tmp_path, transcript_line
+):
+    """smoke_job._run_smoke_tracked call site: same guarantee as the
+    squad_node._run_smoke case above -- both classifier sites share the same
+    helper, but exercise both directly rather than assuming parity."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = _write_shell_style_failure_script(tmp_path, transcript_line)
+    _write_smoke_cmd(project, [sys.executable, str(script)])
+
+    status, reason = smoke_job._run_smoke_tracked(str(project), "s1", timeout_s=30)
+    assert status == "fail", (status, reason)
+
+
+@pytest.mark.parametrize("transcript,expected_reason_fragment", [
+    ("bash: some-missing-tool: command not found", "infra"),
+    ("bash: line 3: some-missing-tool: command not found", "infra"),
+    ("sh: 1: some-missing-tool: not found", "infra"),
+    ("/bin/sh: some-missing-tool: not found", "infra"),
+    ("zsh: command not found: some-missing-tool", "infra"),
+])
+def test_run_smoke_shell_prefixed_launcher_line_alone_is_infra_error(
+    tmp_path, transcript, expected_reason_fragment
+):
+    """squad_node._run_smoke call site: each shell-prefixed launcher form,
+    printed with NO test-runner summary at all, still classifies
+    infra_error (the runner itself never launched)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = tmp_path / f"shell_launch_fail_{abs(hash(transcript))}.py"
+    script.write_text(
+        "\n".join([
+            f"print({transcript!r})",
+            "import sys; sys.exit(127)",
+        ]),
+        encoding="utf-8",
+    )
+    _write_smoke_cmd(project, [sys.executable, str(script)])
+
+    status, reason = _run_smoke(None, project_path=str(project), stage_id="s1")
+    assert status == "infra_error", (status, reason)
+    assert expected_reason_fragment in reason
+
+
+@pytest.mark.parametrize("transcript,expected_reason_fragment", [
+    ("bash: some-missing-tool: command not found", "infra"),
+    ("sh: 1: some-missing-tool: not found", "infra"),
+    ("zsh: command not found: some-missing-tool", "infra"),
+])
+def test_run_smoke_tracked_shell_prefixed_launcher_line_alone_is_infra_error(
+    tmp_path, transcript, expected_reason_fragment
+):
+    """smoke_job._run_smoke_tracked call site: parity with the squad_node
+    case above."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    script = tmp_path / f"shell_launch_fail_tracked_{abs(hash(transcript))}.py"
+    script.write_text(
+        "\n".join([
+            f"print({transcript!r})",
+            "import sys; sys.exit(127)",
+        ]),
+        encoding="utf-8",
+    )
+    _write_smoke_cmd(project, [sys.executable, str(script)])
+
+    status, reason = smoke_job._run_smoke_tracked(str(project), "s1", timeout_s=30)
+    assert status == "infra_error", (status, reason)
+    assert expected_reason_fragment in reason
