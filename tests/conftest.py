@@ -231,10 +231,21 @@ _REAL_HOME_REPOS_JSON = Path.home() / ".hydra" / "repos.json"
 # ---------------------------------------------------------------------------
 
 
-def _snapshot_plans_dir(plans_dir: Path) -> frozenset[str]:
+def _snapshot_plans_dir(plans_dir: Path) -> dict[str, str]:
+    """Return a mapping of top-level file name -> sha256 of its bytes.
+
+    Read-only: only ``.is_dir()``, ``.iterdir()``, ``.is_file()``, and
+    ``.read_bytes()`` are used -- never a write. Content-hashing (rather than
+    just tracking names) is required to detect an in-place overwrite of a
+    pre-existing file, which a name-only snapshot would miss entirely.
+    """
     if not plans_dir.is_dir():
-        return frozenset()
-    return frozenset(p.name for p in plans_dir.iterdir())
+        return {}
+    snapshot: dict[str, str] = {}
+    for p in plans_dir.iterdir():
+        if p.is_file():
+            snapshot[p.name] = _hashlib.sha256(p.read_bytes()).hexdigest()
+    return snapshot
 
 
 def _snapshot_repos_json_sha256(repos_json: Path) -> str | None:
@@ -247,20 +258,36 @@ def _diff_pollution_guard_snapshots(
     *,
     plans_dir: Path,
     repos_json: Path,
-    before_plans: frozenset[str],
+    before_plans: dict[str, str],
     before_repos_sha: str | None,
-    after_plans: frozenset[str],
+    after_plans: dict[str, str],
     after_repos_sha: str | None,
 ) -> list[str]:
     """Pure comparison: given a before/after snapshot pair (already taken by
     the caller), return the list of human-readable problem strings -- empty
     if nothing changed. Takes no filesystem action itself."""
-    leaked_plans = sorted(after_plans - before_plans)
+    added = sorted(set(after_plans) - set(before_plans))
+    removed = sorted(set(before_plans) - set(after_plans))
+    modified = sorted(
+        name
+        for name in set(before_plans) & set(after_plans)
+        if before_plans[name] != after_plans[name]
+    )
     problems: list[str] = []
-    if leaked_plans:
+    if added:
         problems.append(
             "new file(s) appeared under the watched plans dir "
-            f"({plans_dir}): {leaked_plans!r}"
+            f"({plans_dir}): {added!r}"
+        )
+    if removed:
+        problems.append(
+            "file(s) disappeared from the watched plans dir "
+            f"({plans_dir}): {removed!r}"
+        )
+    if modified:
+        problems.append(
+            "file(s) were overwritten under the watched plans dir "
+            f"({plans_dir}): {modified!r}"
         )
     if after_repos_sha != before_repos_sha:
         problems.append(
@@ -273,7 +300,7 @@ def _diff_pollution_guard_snapshots(
 # Backwards-compatible aliases bound to the two REAL paths -- kept so the
 # session fixture below reads exactly as before (real-path snapshot calls),
 # while the pure logic above is the thing under unit test.
-def _snapshot_real_plans_dir() -> frozenset[str]:
+def _snapshot_real_plans_dir() -> dict[str, str]:
     return _snapshot_plans_dir(_REAL_CHECKOUT_DOCS_PLANS)
 
 
