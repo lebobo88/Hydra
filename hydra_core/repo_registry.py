@@ -188,12 +188,25 @@ def _get_base() -> Path:
 # and freezing the path at import time would silently decouple "where the
 # operator edits repos.json" from "where Hydra actually reads it" -- the same
 # class of silent divergence this registry exists to prevent.
+def _hydra_home() -> Path:
+    """The operator's Hydra state directory: ``$HYDRA_HOME`` when set,
+    ``~/.hydra`` otherwise -- the exact same precedence
+    ``hydra_core.memory.DEFAULT_DIR`` uses. A prior version of this module
+    hardcoded ``Path.home() / ".hydra"`` here, so the hermetic test suite's
+    ``HYDRA_HOME`` redirect (``tests/conftest.py``) never reached it: any
+    test exercising ``register_repo``/``_load_extra_repos`` without its own
+    per-test monkeypatch of ``_repos_json_path``/``_repos_lock_path`` wrote
+    straight into the operator's REAL ``~/.hydra/repos.json``."""
+    override = os.environ.get("HYDRA_HOME")
+    return Path(override) if override else Path.home() / ".hydra"
+
+
 def _repos_json_path() -> Path:
-    return Path.home() / ".hydra" / "repos.json"
+    return _hydra_home() / "repos.json"
 
 
 def _repos_lock_path() -> Path:
-    return Path.home() / ".hydra" / "repos.json.lock"
+    return _hydra_home() / "repos.json.lock"
 
 
 def _load_extra_repos() -> dict[str, Path]:
