@@ -777,3 +777,128 @@ def test_hydrastate_carries_plan_artifact_repo_fields():
     state = HydraState(root_goal="x")
     assert state.plan_artifact_repo_id is None
     assert state.plan_artifact_root is None
+
+
+# =========================================================================== #
+# WS1 follow-up: HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT env override
+# =========================================================================== #
+
+class TestDefaultRootEnvOverride:
+    """`plan_artifact_repo_root`'s `default_root` argument is normally
+    whatever the caller passes -- but a wide swath of the test suite
+    hardcodes the checkout root it happens to run from as that value
+    (`HYDRA_ROOT = Path(__file__).resolve().parents[1]`), which meant a
+    plan write with no resolvable target repo landed a real file under the
+    real checkout's tracked docs/plans/. The env override lets
+    tests/conftest.py redirect that fallback for every test, in one place,
+    without patching each call site's fixtures."""
+
+    def test_env_override_wins_when_default_root_is_outside_the_sandbox(
+        self, tmp_path, monkeypatch,
+    ):
+        """The property the whole override exists for: a `default_root`
+        that resolves OUTSIDE the declared sandbox root (mirroring a test
+        that hardcodes the real checkout path) is redirected to the env
+        override, never left as-is."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        # A path that is NOT inside HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT (which
+        # conftest already points at tmp_path's own `.tmp-pytest` base) --
+        # `tmp_path`'s PARENT's sibling is outside that tree.
+        outside_sandbox = tmp_path.parent.parent / "not-the-sandbox"
+        outside_sandbox.mkdir(parents=True, exist_ok=True)
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(tmp_path))
+
+        try:
+            root, repo_id = plan_artifact_repo_root({}, outside_sandbox, purpose="write")
+            assert root == override_root
+            assert root != outside_sandbox
+            assert repo_id is None
+        finally:
+            import shutil
+            shutil.rmtree(outside_sandbox, ignore_errors=True)
+
+    def test_env_override_is_a_no_op_when_default_root_is_inside_the_sandbox(
+        self, tmp_path, monkeypatch,
+    ):
+        """A `default_root` that already resolves INSIDE the declared
+        sandbox root (the common case -- a test-chosen tmp_path
+        subdirectory) is left exactly as the caller passed it, even with
+        the env override set -- this is what keeps every existing
+        `plan_artifact_repo_root(values, tmp_path / "...", ...)` unit test
+        in this file passing unmodified."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        explicit_default = tmp_path / "explicit-default"
+        explicit_default.mkdir()
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(tmp_path))
+
+        root, repo_id = plan_artifact_repo_root({}, explicit_default, purpose="write")
+        assert root == explicit_default
+        assert root != override_root
+        assert repo_id is None
+
+    def test_no_env_override_falls_back_to_explicit_default_root(
+        self, tmp_path, monkeypatch,
+    ):
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        monkeypatch.delenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", raising=False)
+        root, repo_id = plan_artifact_repo_root({}, tmp_path, purpose="write")
+        assert root == tmp_path
+        assert repo_id is None
+
+    def test_a_recorded_root_still_wins_over_the_env_override(
+        self, tmp_path, monkeypatch,
+    ):
+        """The env override only touches the `default_root` fallback, not
+        precedence 1 (a previously recorded root) -- a resumed workflow
+        must never have its already-committed artifact location silently
+        relocated by a test-only env var."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        recorded = tmp_path / "recorded"
+        recorded.mkdir()
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+
+        values = {
+            "plan_artifact_repo_id": "recorded-id",
+            "plan_artifact_root": str(recorded),
+        }
+        root, repo_id = plan_artifact_repo_root(values, tmp_path, purpose="read")
+        assert root == recorded
+        assert repo_id == "recorded-id"
+
+
+def test_plan_with_no_target_repo_lands_under_conftest_tmp_dir_not_checkout(
+    tmp_path,
+):
+    """Integration proof for the conftest-level guard: a workflow with NO
+    resolvable target repo, whose caller passes the on-disk checkout root
+    (mirroring `test_p5b_plan_lifecycle.py`'s `HYDRA_ROOT` /
+    `test_hydra69_part3.py`'s hardcoded-checkout closures) as
+    `default_root`, must still land its plan artifact under THIS test's own
+    tmp_path (tests/conftest.py's autouse `HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT`
+    override) -- never under the checkout's own tracked docs/plans/.
+
+    tests/conftest.py's autouse fixture already points
+    HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT at THIS test's tmp_path; no explicit
+    monkeypatch needed here -- that is the property being proven.
+    """
+    from hydra_core.plan_artifact import plan_artifact_repo_root
+
+    checkout_root = Path(__file__).resolve().parents[1]
+    root, repo_id = plan_artifact_repo_root(
+        {}, checkout_root, purpose="write",
+    )
+    assert root == tmp_path
+    assert root != checkout_root
+    assert repo_id is None

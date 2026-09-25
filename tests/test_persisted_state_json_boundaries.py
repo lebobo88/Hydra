@@ -198,6 +198,15 @@ def test_write_ledger_finite_ids_round_trip(tmp_path):
 def test_atomic_write_repos_json_refuses_non_finite(tmp_path, monkeypatch):
     import hydra_core.repo_registry as repo_registry_module
 
+    # WS1 follow-up: `_repos_json_path()` now resolves under `$HYDRA_HOME`
+    # (when set) BEFORE falling back to `Path.home()` -- and the hermetic
+    # test session always sets `HYDRA_HOME` (tests/conftest.py) to a SHARED
+    # directory that persists for the whole session. Monkeypatching only
+    # `HOME`/`USERPROFILE` (the pre-fix isolation technique) would no longer
+    # isolate this test: the write would land in that shared directory and
+    # leak into every later test in the same session. Monkeypatch
+    # `HYDRA_HOME` itself so this test's write stays under its own tmp_path.
+    monkeypatch.setenv("HYDRA_HOME", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     with pytest.raises(ValueError, match="non-finite value"):
@@ -210,6 +219,12 @@ def test_atomic_write_repos_json_refuses_non_finite(tmp_path, monkeypatch):
 def test_atomic_write_repos_json_finite_round_trips(tmp_path, monkeypatch):
     import hydra_core.repo_registry as repo_registry_module
 
+    # See test_atomic_write_repos_json_refuses_non_finite above: HYDRA_HOME
+    # must be pinned too, or this write leaks a stray {"hydra": "/repos/
+    # hydra"} entry into the shared hermetic HYDRA_HOME for the rest of the
+    # session (breaking any later test that resolves the real "hydra"
+    # repo_id via the allow-list).
+    monkeypatch.setenv("HYDRA_HOME", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     repo_registry_module._atomic_write_repos_json({"hydra": "/repos/hydra"})
