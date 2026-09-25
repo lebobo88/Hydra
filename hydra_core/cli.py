@@ -30,7 +30,7 @@ import sys
 import threading
 import warnings
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 # Validation regex for workflow ids supplied via --workflow-id.
@@ -6212,6 +6212,83 @@ def _cmd_attended_submit(args) -> int:
         _release_resume_lock(lock_fd, lock_path)
 
 
+def _build_surfaced_reason(final_state: HydraState) -> Optional[dict]:
+    """Machine-readable explanation for why a finalized workflow ended
+    ``phase="surfaced"`` instead of ``"done"``.
+
+    Names the source of the surface, one of:
+      * a judge verdict (``rubric_id`` + the ``criteria`` that scored below
+        the pass bar), when the most recent ``fail`` verdict is available;
+      * a HITL gate (``gate_id``/``hitl_reason``/``summary``), when
+        ``pending_hitl`` is populated (e.g. a judge-triggered
+        ``policy_breach``/``constitution_breach`` escalation, or an
+        operator-facing gate raised elsewhere in the graph);
+      * a governance gate id, when the surface came from
+        ``node_postcheck``'s `enforce_governance` pass (no HITL request is
+        raised for those — the reason lives in ``state.last_event``, see
+        `hydra_core.governance.enforce_governance`).
+
+    The failing-criteria rule is scale-aware: stored verdicts come from
+    critics scoring on different scales (e.g. codex returns 0-1, rubric
+    scores are 0-5). If every numeric score in the verdict's ``score_json``
+    is within ``[0, 1]``, a criterion is failing when it is ``< 0.6`` (the
+    rubric's 3-of-5 pass bar normalised to a 0-1 scale); otherwise a
+    criterion is failing when it is ``< 3``.
+
+    Returns ``None`` when the workflow is not surfaced, or when no usable
+    reason could be extracted (should not happen for a genuinely surfaced
+    workflow, but this must never raise into `_cmd_finalize`'s response).
+    """
+    if final_state.phase != "surfaced":
+        return None
+    reason: dict[str, object] = {}
+    hitl = final_state.pending_hitl
+    if isinstance(hitl, dict):
+        if hitl.get("reason"):
+            reason["hitl_reason"] = hitl.get("reason")
+        if hitl.get("gate_node"):
+            reason["gate_id"] = hitl.get("gate_node")
+        if hitl.get("summary"):
+            reason["summary"] = hitl.get("summary")
+    if "gate_id" not in reason and final_state.last_event:
+        # node_postcheck's governance gate surfaces without raising a
+        # HITLRequest -- `last_event` carries `GovernanceVerdict.reason`
+        # (see `node_postcheck`), which is the only record of why.
+        reason["gate_id"] = final_state.last_event
+    # A judge-driven surface (policy_breach / constitution_breach) has a
+    # concrete `fail` verdict on record -- name it and its failing
+    # dimensions instead of just the generic HITL reason string.
+    fail_verdicts = [v for v in (final_state.verdicts or [])
+                     if isinstance(v, dict) and v.get("outcome") == "fail"]
+    if fail_verdicts:
+        v = fail_verdicts[-1]
+        reason["rubric_id"] = v.get("rubric_id")
+        scores = v.get("score_json") or {}
+        numeric_scores = [
+            val for k, val in scores.items()
+            if not k.startswith("_")
+            and isinstance(val, (int, float))
+            and not isinstance(val, bool)
+        ]
+        # Scale-aware pass bar: an all-[0,1] verdict (e.g. a codex critic)
+        # uses the 3-of-5 pass bar normalised to 0.6; anything else uses the
+        # rubric's raw 3-of-5 bar.
+        normalized_scale = bool(numeric_scores) and all(
+            0 <= val <= 1 for val in numeric_scores
+        )
+        threshold = 0.6 if normalized_scale else 3
+        criteria = [
+            k for k, val in scores.items()
+            if not k.startswith("_")
+            and isinstance(val, (int, float))
+            and not isinstance(val, bool)
+            and val < threshold
+        ]
+        if criteria:
+            reason["criteria"] = criteria
+    return reason or None
+
+
 def _cmd_finalize(args) -> int:
     """``hydra finalize <workflow_id>`` — close an attended workflow properly.
 
@@ -6397,6 +6474,9 @@ def _cmd_finalize(args) -> int:
             "pending_hitl": final_state.pending_hitl,
             "trace": str(trace_path(project, wf)),
         }
+        surfaced_reason = _build_surfaced_reason(final_state)
+        if surfaced_reason is not None:
+            payload["surfaced_reason"] = surfaced_reason
         print(_cli_json_dumps(payload, indent=2, default=str))
         return 0 if record_id else 1
     except PoisonedStateError as e:
