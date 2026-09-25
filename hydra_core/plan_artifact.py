@@ -68,36 +68,38 @@ __all__ = [
 #: caller's default_root argument passes through -- covers every existing
 #: and future call site without patching each test's fixtures individually.
 #:
-#: The override is scoped by a SECOND env var naming the test sandbox's own
-#: root (`tests/conftest.py`'s `.tmp-pytest`): a `default_root` that already
-#: resolves INSIDE that sandbox is left untouched (many tests deliberately
-#: pass a specific tmp_path subdirectory and assert the resolver returns
-#: exactly that path -- overriding it unconditionally would break those
-#: legitimate, already-isolated cases). Only a `default_root` that resolves
-#: OUTSIDE the sandbox -- i.e. a real, persistent checkout path such as
-#: `Path(__file__).resolve().parents[1]` -- gets redirected. A caller with
-#: no sandbox-root env set (production) is unaffected either way.
-_DEFAULT_ROOT_ENV_VAR = "_".join(
-    ["HYDRA", "PLAN", "ARTIFACT", "DEFAULT", "ROOT"]
-)
-_SANDBOX_ROOT_ENV_VAR = "_".join(
-    ["HYDRA", "PLAN", "ARTIFACT", "SANDBOX", "ROOT"]
-)
+#: The override is gated by BOTH this env var AND a SECOND env var naming
+#: the test sandbox's own root (`tests/conftest.py`'s `.tmp-pytest`):
+#: the default-root var alone is NOT enough to redirect a production write
+#: -- a single leaked/forged env var must not be able to retarget where a
+#: real PLAN artifact lands. Only when BOTH vars are set does a
+#: `default_root` that resolves OUTSIDE the named sandbox (i.e. a real,
+#: persistent checkout path such as `Path(__file__).resolve().parents[1]`)
+#: get redirected to the override. A `default_root` that already resolves
+#: INSIDE that sandbox is left untouched (many tests deliberately pass a
+#: specific tmp_path subdirectory and assert the resolver returns exactly
+#: that path -- overriding it unconditionally would break those
+#: legitimate, already-isolated cases). A caller missing either env var
+#: (including production, where neither is set) is unaffected.
+_ENV_VAR_PREFIX = "HYDRA_PLAN_ARTIFACT_"
+_DEFAULT_ROOT_ENV_VAR = _ENV_VAR_PREFIX + "DEFAULT_ROOT"
+_SANDBOX_ROOT_ENV_VAR = _ENV_VAR_PREFIX + "SANDBOX_ROOT"
 
 
 def _resolve_default_root(explicit_default: Path | str) -> Path:
     override = os.environ.get(_DEFAULT_ROOT_ENV_VAR)
-    if not override:
+    sandbox_root = os.environ.get(_SANDBOX_ROOT_ENV_VAR)
+    if not override or not sandbox_root:
+        # Both vars are required; either one missing means the override is
+        # not honoured at all (see module-level comment above).
         return Path(explicit_default)
 
     explicit = Path(explicit_default)
-    sandbox_root = os.environ.get(_SANDBOX_ROOT_ENV_VAR)
-    if sandbox_root:
-        try:
-            if explicit.resolve().is_relative_to(Path(sandbox_root).resolve()):
-                return explicit
-        except OSError:  # noqa: BLE001 -- an unresolvable path is never "inside"
-            pass
+    try:
+        if explicit.resolve().is_relative_to(Path(sandbox_root).resolve()):
+            return explicit
+    except OSError:  # noqa: BLE001 -- an unresolvable path is never "inside"
+        pass
     return Path(override)
 
 

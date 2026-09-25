@@ -222,16 +222,63 @@ _REAL_CHECKOUT_DOCS_PLANS = Path(__file__).resolve().parent.parent / "docs" / "p
 _REAL_HOME_REPOS_JSON = Path.home() / ".hydra" / "repos.json"
 
 
-def _snapshot_real_plans_dir() -> frozenset[str]:
-    if not _REAL_CHECKOUT_DOCS_PLANS.is_dir():
+# ---------------------------------------------------------------------------
+# Pure helpers -- parameterized on the watched paths so they are unit
+# testable against throwaway tmp_path copies without ever touching the two
+# real paths above. The session fixture below is the only caller that
+# passes the real paths; every other caller (the unit tests further down)
+# passes tmp_path stand-ins.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_plans_dir(plans_dir: Path) -> frozenset[str]:
+    if not plans_dir.is_dir():
         return frozenset()
-    return frozenset(p.name for p in _REAL_CHECKOUT_DOCS_PLANS.iterdir())
+    return frozenset(p.name for p in plans_dir.iterdir())
+
+
+def _snapshot_repos_json_sha256(repos_json: Path) -> str | None:
+    if not repos_json.is_file():
+        return None
+    return _hashlib.sha256(repos_json.read_bytes()).hexdigest()
+
+
+def _diff_pollution_guard_snapshots(
+    *,
+    plans_dir: Path,
+    repos_json: Path,
+    before_plans: frozenset[str],
+    before_repos_sha: str | None,
+    after_plans: frozenset[str],
+    after_repos_sha: str | None,
+) -> list[str]:
+    """Pure comparison: given a before/after snapshot pair (already taken by
+    the caller), return the list of human-readable problem strings -- empty
+    if nothing changed. Takes no filesystem action itself."""
+    leaked_plans = sorted(after_plans - before_plans)
+    problems: list[str] = []
+    if leaked_plans:
+        problems.append(
+            "new file(s) appeared under the watched plans dir "
+            f"({plans_dir}): {leaked_plans!r}"
+        )
+    if after_repos_sha != before_repos_sha:
+        problems.append(
+            f"the watched repos.json changed ({repos_json}): "
+            f"sha256 before={before_repos_sha!r} after={after_repos_sha!r}"
+        )
+    return problems
+
+
+# Backwards-compatible aliases bound to the two REAL paths -- kept so the
+# session fixture below reads exactly as before (real-path snapshot calls),
+# while the pure logic above is the thing under unit test.
+def _snapshot_real_plans_dir() -> frozenset[str]:
+    return _snapshot_plans_dir(_REAL_CHECKOUT_DOCS_PLANS)
 
 
 def _snapshot_real_repos_json_sha256() -> str | None:
-    if not _REAL_HOME_REPOS_JSON.is_file():
-        return None
-    return _hashlib.sha256(_REAL_HOME_REPOS_JSON.read_bytes()).hexdigest()
+    return _snapshot_repos_json_sha256(_REAL_HOME_REPOS_JSON)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -244,7 +291,11 @@ def _real_hydra_home_pollution_guard():
     or ``.read_bytes()`` -- never a write, ``unlink``, ``rename``, or
     ``mkdir``. Pre-existing litter (files already present before the
     session started) is never flagged or touched; only NEW files / a
-    CHANGED hash trip this guard.
+    CHANGED hash trip this guard. The actual snapshot/compare logic lives in
+    ``_snapshot_plans_dir``/``_snapshot_repos_json_sha256``/
+    ``_diff_pollution_guard_snapshots`` above, which are unit tested against
+    tmp_path stand-ins in ``test_conftest_pollution_guard.py`` -- this
+    fixture only supplies the two real paths and the before/after timing.
     """
     before_plans = _snapshot_real_plans_dir()
     before_repos_sha = _snapshot_real_repos_json_sha256()
@@ -252,19 +303,14 @@ def _real_hydra_home_pollution_guard():
     after_plans = _snapshot_real_plans_dir()
     after_repos_sha = _snapshot_real_repos_json_sha256()
 
-    leaked_plans = sorted(after_plans - before_plans)
-    problems: list[str] = []
-    if leaked_plans:
-        problems.append(
-            "new file(s) appeared under the REAL checkout's tracked "
-            f"docs/plans/ ({_REAL_CHECKOUT_DOCS_PLANS}): {leaked_plans!r}"
-        )
-    if after_repos_sha != before_repos_sha:
-        problems.append(
-            "the operator's REAL ~/.hydra/repos.json changed "
-            f"({_REAL_HOME_REPOS_JSON}): sha256 before={before_repos_sha!r} "
-            f"after={after_repos_sha!r}"
-        )
+    problems = _diff_pollution_guard_snapshots(
+        plans_dir=_REAL_CHECKOUT_DOCS_PLANS,
+        repos_json=_REAL_HOME_REPOS_JSON,
+        before_plans=before_plans,
+        before_repos_sha=before_repos_sha,
+        after_plans=after_plans,
+        after_repos_sha=after_repos_sha,
+    )
     if problems:
         pytest.fail(
             "HERMETIC BOUNDARY VIOLATION -- a test wrote outside the "

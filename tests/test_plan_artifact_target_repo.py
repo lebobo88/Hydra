@@ -877,6 +877,83 @@ class TestDefaultRootEnvOverride:
         assert root == recorded
         assert repo_id == "recorded-id"
 
+    def test_only_default_root_set_is_not_honoured(self, tmp_path, monkeypatch):
+        """BLOCKING fix: a single env var must never be able to redirect a
+        production plan-artifact write. With ONLY
+        HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT set (no sandbox-root companion),
+        the override MUST be ignored and the explicit default returned
+        unchanged -- this is the case the pre-fix `_resolve_default_root`
+        (commit 2423c59) got wrong: it redirected on `DEFAULT_ROOT` alone."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        outside_sandbox = tmp_path / "outside-any-sandbox"
+        outside_sandbox.mkdir()
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.delenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", raising=False)
+
+        root, repo_id = plan_artifact_repo_root({}, outside_sandbox, purpose="write")
+        assert root == outside_sandbox
+        assert root != override_root
+        assert repo_id is None
+
+    def test_only_sandbox_root_set_is_not_honoured(self, tmp_path, monkeypatch):
+        """The mirror case: HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT set with NO
+        HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT must also be a no-op -- there is no
+        override value to redirect to, so the explicit default is
+        returned unchanged regardless of where it resolves."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        outside_sandbox = tmp_path / "outside-any-sandbox"
+        outside_sandbox.mkdir()
+        monkeypatch.delenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", raising=False)
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(tmp_path))
+
+        root, repo_id = plan_artifact_repo_root({}, outside_sandbox, purpose="write")
+        assert root == outside_sandbox
+        assert repo_id is None
+
+    def test_both_vars_set_default_outside_sandbox_is_redirected(
+        self, tmp_path, monkeypatch,
+    ):
+        """Both vars set + explicit default OUTSIDE the sandbox: override
+        wins (same property `test_env_override_wins_when_default_root_is_
+        outside_the_sandbox` proves at the `plan_artifact_repo_root` level;
+        this asserts it directly against `_resolve_default_root`)."""
+        from hydra_core.plan_artifact import _resolve_default_root
+
+        outside_sandbox = tmp_path / "outside-any-sandbox"
+        outside_sandbox.mkdir()
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        sandbox_root = tmp_path / "sandbox"
+        sandbox_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(sandbox_root))
+
+        result = _resolve_default_root(outside_sandbox)
+        assert result == override_root
+
+    def test_both_vars_set_default_inside_sandbox_is_untouched(
+        self, tmp_path, monkeypatch,
+    ):
+        """Both vars set + explicit default INSIDE the sandbox: explicit
+        default wins unchanged (the sandbox-scoping guarantee)."""
+        from hydra_core.plan_artifact import _resolve_default_root
+
+        sandbox_root = tmp_path / "sandbox"
+        sandbox_root.mkdir()
+        inside_sandbox = sandbox_root / "explicit-default"
+        inside_sandbox.mkdir()
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(sandbox_root))
+
+        result = _resolve_default_root(inside_sandbox)
+        assert result == inside_sandbox
+
 
 def test_plan_with_no_target_repo_lands_under_conftest_tmp_dir_not_checkout(
     tmp_path,
