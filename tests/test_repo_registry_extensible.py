@@ -111,6 +111,11 @@ def test_extra_repo_via_home_repos_json(
     (home / ".hydra" / "repos.json").write_text(
         json.dumps({"filereg": str(repo)}), encoding="utf-8"
     )
+    # WS1 follow-up: `_repos_json_path()` now checks `$HYDRA_HOME` BEFORE
+    # falling back to `Path.home()` -- the hermetic test session always sets
+    # HYDRA_HOME (tests/conftest.py), so it must be cleared here for this
+    # test's HOME/USERPROFILE monkeypatch to actually take effect.
+    monkeypatch.delenv("HYDRA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("HYDRA_EXTRA_REPOS", raising=False)
@@ -133,6 +138,10 @@ def test_repos_json_path_resolves_per_call_not_at_import(
     first_home = Path("/tmp/first-home") if os.name != "nt" else Path("C:/first-home")
     second_home = Path("/tmp/second-home") if os.name != "nt" else Path("C:/second-home")
 
+    # See test_extra_repo_via_home_repos_json above: HYDRA_HOME now takes
+    # precedence over Path.home(), so it must be cleared for this test to
+    # actually exercise the HOME/USERPROFILE fallback branch it names.
+    monkeypatch.delenv("HYDRA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(first_home))
     monkeypatch.setenv("USERPROFILE", str(first_home))
     first_resolved = repo_registry_module._repos_json_path()
