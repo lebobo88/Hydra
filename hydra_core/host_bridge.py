@@ -63,6 +63,8 @@ from .squad_node import (
     _rubric_md_ex,
     _run_smoke,
     _worktree_dirty_set,
+    _worktree_committed_since,
+    _git_head_sha,
     coerce_untrusted_cost,
     coerce_untrusted_count,
 )
@@ -265,6 +267,188 @@ _STATIC_JUDGE_MODEL_PINS: dict[str, tuple[str, ...]] = {
 # Such a rejection is host-correctable (re-report the model id) rather than a
 # fatal defect in the artifact, so it must NOT surface a passing stage.
 _JUDGE_PIN_ERROR_MARKER = "must record judge_model_id"
+
+# --------------------------------------------------------------------------- #
+# Hydra#72: judge_model_source / judge_override_reason provenance             #
+# --------------------------------------------------------------------------- #
+# pp's ``recordVerdict`` (pair-programmer daemon/src/orchestrator/runs.ts:981-
+# 1057) enforces THREE independent things on every verdict, verified read-only
+# against pp's source for this fix:
+#
+#   1. ``isAllowedJudgeModel`` (config.ts:311-314, runs.ts:1006-1013): the
+#      reported ``judge_model_id`` must be a member of that vendor's
+#      ``JUDGE_MODEL_POLICY[vendor].allowed_models`` (config.ts:75-96) --
+#      e.g. codex allows {gpt-5.6-terra, gpt-5.6-sol, gpt-5.6-luna}, NOT just
+#      the default+escalated pair. This is a MODEL allow-list check,
+#      independent of (3) below.
+#   2. ``judge_reasoning_effort``, if present, must be one of that vendor's
+#      ``allowed_efforts`` (config.ts:47,1016-1022) -- codex: {low, medium,
+#      high, xhigh}; agy: {low, medium, high}.
+#   3. Provenance (runs.ts:1025-1057): ``judge_model_source`` defaults to
+#      "default" when omitted, and "default"/"escalated" are PINS -- the
+#      reported ``judge_model_id`` must equal that vendor's pinned
+#      default/escalated model exactly (runs.ts:1045-1057) or record_verdict
+#      throws. Any OTHER allowed_models member (e.g. codex's "gpt-5.6-luna",
+#      or any agy id besides the two pins) can only be recorded via one of
+#      the override channels {cli, team_yaml, hydra} (JUDGE_SOURCES_REQUIRING_
+#      REASON, runs.ts:887) together with a ``judge_override_reason`` of at
+#      least 8 non-whitespace chars (runs.ts:888,1036-1044) -- "hydra" does
+#      NOT accept an arbitrary model id, only one already in that vendor's
+#      ``allowed_models`` from (1).
+#
+# Hydra never forwarded judge_model_source/judge_override_reason/
+# judge_reasoning_effort, so every verdict implicitly claimed source=
+# "default" -- silently correct only when the judge happened to report the
+# exact default pin, and a hard rejection (masqueraded as a generic
+# "validation" failure -> deterministic-fatal -> revise) for every other
+# allowed model, discarding an otherwise-passing stage. ``_judge_verdict_
+# provenance`` derives the correct provenance from the SAME pin data
+# ``allowed_judge_model_ids`` already sources (doctor probe, falling back to
+# ``_STATIC_JUDGE_MODEL_PINS``) -- one helper, not a second copy of the pin
+# table -- and ``_is_judge_provenance_error`` routes a residual provenance
+# rejection (e.g. pp's live policy has drifted from Hydra's cached/static
+# pins) to the same host-correctable path as the E2-27 judge_model_id pin
+# error, instead of ever converting it into a revise/fail verdict.
+
+_JUDGE_OVERRIDE_SOURCES = frozenset({"default", "escalated", "cli", "team_yaml", "hydra"})
+_JUDGE_SOURCES_REQUIRING_REASON = frozenset({"cli", "team_yaml", "hydra"})
+_JUDGE_OVERRIDE_REASON_MIN_CHARS = 8
+
+# Substrings identifying pp's judge-selection PROVENANCE rejection on
+# record_verdict (runs.ts:1029-1057) -- distinct from the judge_model_id
+# allow-list rejection matched by ``_JUDGE_PIN_ERROR_MARKER`` above. Matched
+# together (both substrings must appear) rather than against the full
+# rendered sentence, which varies by branch (the "must be one of" source-
+# enum error, the override-reason-too-short error, and the source-pins-a-
+# different-model error all mention both terms).
+_JUDGE_PROVENANCE_ERROR_MARKERS: tuple[str, str] = (
+    "judge_model_source", "judge_override_reason",
+)
+
+
+def _judge_default_escalated_ids(
+    dispatcher: Dispatcher | None,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return ``{vendor: (default_id, escalated_id)}`` from the SAME pin
+    source ``allowed_judge_model_ids`` uses (doctor's ``judge_capabilities``,
+    falling back to ``_STATIC_JUDGE_MODEL_PINS``) -- never a second copy of
+    the pin table. Both sources order their list as [default, escalated,
+    ...remaining allow-listed ids] (see ``allowed_judge_model_ids``'s
+    docstring), so position 0/1 reliably identify the two pins; a vendor with
+    fewer than 2 entries (e.g. claude's empty tuple) reports ``None`` for the
+    missing slot(s).
+    """
+    out: dict[str, tuple[str | None, str | None]] = {}
+    for vendor, ids in allowed_judge_model_ids(dispatcher).items():
+        out[vendor] = (
+            ids[0] if len(ids) > 0 else None,
+            ids[1] if len(ids) > 1 else None,
+        )
+    return out
+
+
+def _judge_verdict_provenance(
+    dispatcher: Dispatcher | None, *, judge_vendor: str, judge_model_id: str,
+    result: dict[str, Any], allowed_models: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Derive the ``judge_model_source``/``judge_override_reason``/
+    ``judge_reasoning_effort`` fields to forward on ``record_verdict``.
+
+    Returns a dict to be splatted into the record_verdict payload -- empty
+    when pp pins nothing for ``judge_vendor`` (e.g. claude: producers with no
+    ``JUDGE_MODEL_POLICY`` entry are unchecked, runs.ts:1006-1007) or when
+    ``judge_model_id`` is not in that vendor's ``allowed_models`` at all (no
+    provenance field can fix an unlisted model id -- record_verdict's own
+    ``isAllowedJudgeModel`` check will reject it; that is the E2-27 pin-error
+    path, handled separately).
+
+    Precedence:
+      1. A judge result MAY self-report ``judge_model_source`` (and, for the
+         three override channels, ``judge_override_reason``) -- honored only
+         when internally consistent with ``judge_model_id`` (a "default"
+         claim must actually name the default pin; an override claim must
+         carry a reason of at least ``_JUDGE_OVERRIDE_REASON_MIN_CHARS``
+         chars). An inconsistent/invalid supplied source is never forwarded
+         blindly -- it falls through to derivation below.
+      2. Otherwise, derive from ``judge_model_id`` against the vendor's pins:
+         the default pin -> "default", the escalated pin -> "escalated",
+         any other allow-listed id -> "hydra" with a generated reason naming
+         the model (pp requires >= 8 chars for any of {cli, team_yaml,
+         hydra}; "hydra" is the correct label since this is Hydra's own
+         override, not a CLI flag or team_yaml entry).
+
+    ``judge_reasoning_effort`` is forwarded verbatim when the judge result
+    supplies one -- pp validates it against that vendor's ``allowed_efforts``
+    (config.ts:1016-1022) itself; an invalid effort surfaces as its own
+    record_verdict rejection.
+    """
+    ids = list(allowed_models.get(judge_vendor) or [])
+    if not ids:
+        return {}
+    default_id, escalated_id = ids[0], (ids[1] if len(ids) > 1 else None)
+
+    def _reason_or_none(raw: Any) -> str | None:
+        s = str(raw or "").strip()
+        return s if len(s) >= _JUDGE_OVERRIDE_REASON_MIN_CHARS else None
+
+    source: str | None = None
+    reason: str | None = None
+    supplied_source = result.get("judge_model_source")
+    if isinstance(supplied_source, str) and supplied_source in _JUDGE_OVERRIDE_SOURCES:
+        if supplied_source == "default" and judge_model_id == default_id:
+            source = "default"
+        elif supplied_source == "escalated" and judge_model_id == escalated_id:
+            source = "escalated"
+        elif (supplied_source in _JUDGE_SOURCES_REQUIRING_REASON
+              and judge_model_id in ids):
+            supplied_reason = _reason_or_none(result.get("judge_override_reason"))
+            if supplied_reason is not None:
+                source, reason = supplied_source, supplied_reason
+
+    if source is None:
+        if judge_model_id == default_id:
+            source = "default"
+        elif escalated_id is not None and judge_model_id == escalated_id:
+            source = "escalated"
+        elif judge_model_id in ids:
+            source = "hydra"
+            reason = (
+                f"attended judge selected {judge_model_id} from "
+                f"allowed_judge_model_ids ({judge_vendor} failover/override)"
+            )
+        else:
+            # Not in pp's allow-list at all -- isAllowedJudgeModel will reject
+            # the model id itself; no provenance field can fix that.
+            return {}
+
+    out: dict[str, Any] = {"judge_model_source": source}
+    if source in _JUDGE_SOURCES_REQUIRING_REASON:
+        out["judge_override_reason"] = reason
+    effort = result.get("judge_reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        out["judge_reasoning_effort"] = effort.strip()
+    return out
+
+
+def _is_judge_provenance_error(exc: Exception | None) -> bool:
+    """True when a record_verdict failure is pp's judge-selection provenance
+    rejection (runs.ts:1029-1057) -- a LABEL/provenance problem the host can
+    correct by re-deriving/re-reporting the source, not an artifact defect.
+    Must be routed to the host-correctable path exactly like
+    ``_is_judge_pin_error``, never converted into a revise/fail verdict.
+    """
+    if exc is None:
+        return False
+    msg = str(exc).lower()
+    if all(m in msg for m in _JUDGE_PROVENANCE_ERROR_MARKERS):
+        return True
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, dict):
+        pmsg = str(payload.get("error", "")).lower()
+        if all(m in pmsg for m in _JUDGE_PROVENANCE_ERROR_MARKERS):
+            return True
+    return False
+
 
 # Bound on how many times one judge call_key may be bounced back to the host
 # for a model-id/producer correction before the bridge stops asking and lets
@@ -1410,6 +1594,219 @@ def _clear_stage_active_sentinel(project_root: str | Path) -> None:
         pass
 
 
+# Hydra#71 follow-up: the first cut copied entire ``build/`` and ``.harness/``
+# TREES via unbounded ``**/`` globs. On a C++ repo (the case that surfaced
+# #71) ``build/`` is a multi-gigabyte output tree, not evidence -- copying it
+# whole on every non-complete finalize would silently balloon disk usage
+# without limit. This policy copies only small, text-shaped report files
+# (never binaries/object files/build trees) and enforces hard size caps.
+_EVIDENCE_ALLOWED_EXTS: frozenset[str] = frozenset({".log", ".txt", ".json", ".xml"})
+# Directory names never descended into, anywhere in the tree: vendor/build
+# caches that can each independently be enormous and carry no run evidence.
+_EVIDENCE_EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+})
+_EVIDENCE_PER_FILE_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _evidence_max_total_bytes() -> int:
+    """Total evidence-copy budget per preserved run, ``HYDRA_EVIDENCE_MAX_BYTES``
+    (default 200 MB). Any non-integer/negative override falls back to the
+    default rather than disabling the cap."""
+    raw = os.environ.get("HYDRA_EVIDENCE_MAX_BYTES")
+    if raw is None:
+        return 200 * 1024 * 1024
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 200 * 1024 * 1024
+    return val if val >= 0 else 200 * 1024 * 1024
+
+
+def _evidence_within_build_logs_or_testing(dir_parts: Sequence[str]) -> bool:
+    """True when ``dir_parts`` (the directory components of a candidate
+    file's path, relative to the worktree root, lower-cased) descend from a
+    ``build`` directory into a ``logs`` or ``Testing`` (ctest) subdirectory --
+    the only evidence this policy takes FROM a build tree. A file directly
+    under ``build/`` (or under any other build subdirectory) never qualifies:
+    that is build output, not a log/report."""
+    try:
+        build_idx = dir_parts.index("build")
+    except ValueError:
+        return False
+    remainder = dir_parts[build_idx + 1:]
+    return "logs" in remainder or "testing" in remainder
+
+
+def _evidence_candidate_files(src: Path) -> list[Path]:
+    """Walk ``src`` and return every file eligible for evidence preservation.
+
+    Eligible:
+      - anything under ``.harness/`` (small run metadata Hydra itself writes,
+        regardless of extension), and
+      - ``.log``/``.txt``/``.json``/``.xml`` report files that are either
+        OUTSIDE any ``build/`` tree, or inside a ``build/**/logs`` or
+        ``build/**/Testing`` (ctest) subtree.
+
+    Never eligible: anything else under ``build/`` (binaries, object files,
+    build-system caches) and anything under an excluded vendor/cache
+    directory (``_EVIDENCE_EXCLUDED_DIR_NAMES``) or a NESTED git checkout
+    (a directory containing its own ``.git`` — a separate worktree/repo, not
+    this run's evidence) at any depth.
+    """
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        d = Path(dirpath)
+        for name in list(dirnames):
+            if name in _EVIDENCE_EXCLUDED_DIR_NAMES:
+                dirnames.remove(name)
+                continue
+            child = d / name
+            if child != src and (child / ".git").exists():
+                dirnames.remove(name)
+        for fname in filenames:
+            f = d / fname
+            try:
+                rel_parts = f.relative_to(src).parts
+            except ValueError:  # pragma: no cover — defensive, path is under src
+                continue
+            dir_parts_lower = [p.lower() for p in rel_parts[:-1]]
+            if dir_parts_lower and dir_parts_lower[0] == ".harness":
+                out.append(f)
+                continue
+            if f.suffix.lower() not in _EVIDENCE_ALLOWED_EXTS:
+                continue
+            if "build" in dir_parts_lower and not _evidence_within_build_logs_or_testing(
+                    dir_parts_lower):
+                continue
+            out.append(f)
+    return out
+
+
+def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
+                                run_id: str) -> str | None:
+    """Copy bounded, text-shaped build/log/``.harness`` evidence out of
+    ``worktree_path`` before ``_remove_worktree`` deletes it on a
+    non-complete outcome.
+
+    Hydra#71: ``_BYPRODUCT_PATTERNS`` deliberately excludes ``.harness/`` and
+    ``*.log`` from the worktree-local git excludes so
+    ``_preserve_non_complete_work``'s ``git add -A`` + commit never picks them
+    up -- they are build/log byproducts, not source. But that also means a
+    genuine generate-failure/judge-fail/smoke-fail worktree removal silently
+    destroyed them, taking the only on-disk record of what actually happened
+    with it.
+
+    Bounded (Hydra#71 follow-up): only report-shaped files
+    (``_evidence_candidate_files`` — never build binaries/object files/build
+    trees, never vendor/build-cache dirs, never a nested checkout) are
+    candidates; a per-file cap (``_EVIDENCE_PER_FILE_MAX_BYTES``, 20 MB) and a
+    total-per-run cap (``HYDRA_EVIDENCE_MAX_BYTES``, default 200 MB) bound the
+    copy. Any candidate declined by either cap is recorded — never silently
+    dropped — in ``manifest.json`` alongside the copy, with its path, size,
+    and the reason it was skipped.
+
+    Retention: this function only COPIES (the worktree removal below is what
+    reclaims the source disk); nothing currently deletes OLD entries under
+    ``.hydra-preserved-evidence/`` itself -- it is intentionally excluded from
+    ``sweep_stale_worktrees`` (``_sweep_one_root`` only matches ``attended-*``
+    worktree directory names), since a preserved evidence bundle is exactly
+    the kind of record an operator investigating a surfaced run must be able
+    to find AFTER the worktree itself is gone, so it must never be swept on
+    the same terminal-cursor signal that reclaims worktrees. Until an
+    explicit operator-facing retention command exists, `.hydra-preserved-
+    evidence/` is bounded per-run by the caps above but grows without bound
+    ACROSS runs; an operator (or a future age-based janitor pass explicitly
+    scoped to this directory, not `sweep_stale_worktrees`) should periodically
+    reclaim it by run age.
+
+    Fail-soft: never raises: any error, or nothing found to preserve, returns
+    ``None`` without touching ``cursor`` or blocking finalize. On success sets
+    ``cursor["preserved_evidence_path"]`` and returns it.
+    """
+    try:
+        src = Path(worktree_path)
+        if not src.is_dir():
+            return None
+        candidates = _evidence_candidate_files(src)
+        if not candidates:
+            return None
+        dest_root = (Path(worktree_path).parent
+                    / ".hydra-preserved-evidence" / str(run_id))
+        max_total = _evidence_max_total_bytes()
+        per_file_max = _EVIDENCE_PER_FILE_MAX_BYTES
+        copied_total = 0
+        copied_manifest: list[dict[str, Any]] = []
+        skipped_manifest: list[dict[str, Any]] = []
+        for f in sorted(candidates):
+            rel = f.relative_to(src)
+            try:
+                size = f.stat().st_size
+            except OSError as exc:  # noqa: BLE001 — record and move on
+                skipped_manifest.append({
+                    "path": str(rel), "size": None,
+                    "reason": f"stat_failed: {exc!r}"[:200],
+                })
+                continue
+            if size > per_file_max:
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"exceeds_per_file_cap_bytes={per_file_max}",
+                })
+                continue
+            if copied_total + size > max_total:
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"exceeds_total_cap_bytes={max_total}",
+                })
+                continue
+            dest = dest_root / rel
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+            except Exception as exc:  # noqa: BLE001 — best-effort per-item
+                skipped_manifest.append({
+                    "path": str(rel), "size": size,
+                    "reason": f"copy_failed: {exc!r}"[:200],
+                })
+                continue
+            copied_total += size
+            copied_manifest.append({"path": str(rel), "size": size})
+        if not copied_manifest and not skipped_manifest:
+            return None
+        dest_root.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "run_id": run_id,
+            "source_worktree": str(src),
+            "max_per_file_bytes": per_file_max,
+            "max_total_bytes": max_total,
+            "total_bytes_copied": copied_total,
+            "copied": copied_manifest,
+            "skipped": skipped_manifest,
+        }
+        try:
+            (dest_root / "manifest.json").write_text(
+                dumps_strict(manifest, label="preserved-evidence manifest",
+                            indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001 — the copies themselves still stand
+            _trace(cursor, "attended.evidence_manifest_write_failed",
+                   {"run_id": run_id, "error": str(exc)[:200]})
+        cursor["preserved_evidence_path"] = str(dest_root)
+        _trace(cursor, "attended.evidence_preserved", {
+            "run_id": run_id, "path": str(dest_root),
+            "copied_count": len(copied_manifest),
+            "skipped_count": len(skipped_manifest),
+            "total_bytes_copied": copied_total,
+        })
+        return str(dest_root)
+    except Exception as exc:  # noqa: BLE001 — never block finalize
+        _trace(cursor, "attended.evidence_preserve_failed",
+               {"run_id": run_id, "error": str(exc)[:200]})
+        return None
+
+
 def _preserve_non_complete_work(cursor: dict[str, Any], worktree_path: str,
                                 branch: str, run_id: str,
                                 final_status: str = "surfaced") -> None:
@@ -1728,9 +2125,26 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         # the work when the stage surfaces without completing.
         if cursor.get("preserved_branch"):
             res["preserved_branch"] = cursor["preserved_branch"]
+        # Hydra#71: untracked build/log/.harness evidence excluded from the
+        # branch commit (see ``_BYPRODUCT_PATTERNS``) but copied out before
+        # ``_remove_worktree`` deletes the checkout on a non-complete outcome.
+        if cursor.get("preserved_evidence_path"):
+            res["preserved_evidence_path"] = cursor["preserved_evidence_path"]
         # Rider (b): expose charged flag so _cmd_attended_submit can skip
         # duplicate budget charges on a retried submit-host-result call.
         res["already_charged"] = bool(cursor.get("charged", False))
+        # Hydra#69 round 6 defect 2: the call_key that actually produced this
+        # cursor's terminal transition, persisted on the cursor itself (see
+        # `submit_host_result`'s post-transition stamp below). A caller
+        # derives its checkpoint-reconciliation/charge identity from THIS
+        # value, never from its own possibly-stale/different args.call_key.
+        # Absent (None) on a legacy cursor written before this field existed,
+        # or one terminated outside `submit_host_result` (operator abort,
+        # stalled-stage recovery) -- callers fold that into a fixed "legacy"
+        # identity so every future retry, regardless of which call_key it
+        # carries, converges on the SAME reconciliation/charge identity
+        # instead of growing a new one per call_key.
+        res["terminal_call_key"] = cursor.get("terminal_call_key")
         if cursor.get("emitted_envelopes"):
             res["emitted_envelopes"] = cursor["emitted_envelopes"]
             res["emitted_envelope_count"] = len(cursor["emitted_envelopes"])
@@ -1751,6 +2165,14 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
             if cursor.get(key) is not None:
                 res[key] = cursor[key]
     return res
+
+
+def step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, Any]:
+    """Public wrapper over ``_step_result`` (Hydra#70): ``hydra_core.cli``'s
+    ``step`` command needs to project an ALREADY-LOADED cursor (one it polled
+    for an in-flight ``await_smoke`` job) without re-deriving the module's
+    private helper name."""
+    return _step_result(cursor, cursor_file)
 
 
 def _trace(cursor: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
@@ -1978,6 +2400,11 @@ def begin_stage(
         "gate_type": gate_type,
         "state": "await_generate",
         "pre_dirty": sorted(_worktree_dirty_set(work_path)),
+        # Hydra#71: base commit for THIS generate attempt's commit-aware
+        # attribution (``_worktree_committed_since``). Re-stamped on the
+        # Reflexion×1 retry transition below so a retry attributes only its
+        # own new commits, not the first attempt's.
+        "generate_base_sha": _git_head_sha(work_path),
         "baseline_failures": baseline_failures,
         "producer": "claude",
         "generate_index": 0,   # GAP-f: tracks Reflexion×1 — 0=first attempt, 1=retry
@@ -2015,13 +2442,21 @@ def begin_stage(
 
 
 def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
-                    result: dict[str, Any]) -> None:
+                    result: dict[str, Any], *,
+                    workflow_terminal: bool = False) -> None:
     """await_generate -> await_judge (or terminal on generate failure).
 
     The host's ``engineer`` subagent already wrote files in cwd; ``result`` is
     its summary + spend. We attribute the run-scoped diff, archive + record the
     attempt, route the judge via pp's ``gate_eligible_judges``, and stage the
     judge host-action.
+
+    ``workflow_terminal``: threaded through to ``_finalize`` on the
+    generate-failure terminal paths below -- see ``submit_host_result``'s
+    docstring. A generate FAILURE never reaches the merge branch of
+    ``_finalize`` (``passed=False`` there unconditionally), so this only
+    affects the ``merge`` error label reported to the operator, not any
+    dispatch/re-entry behaviour.
     """
     cm = dispatcher.call_mcp
     work_path = cursor.get("work_path") or cursor["project_path"]
@@ -2038,13 +2473,28 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     cursor["tokens_in"] = int(cursor["tokens_in"]) + coerce_untrusted_count(result.get("tokens_in"))
     cursor["tokens_out"] = int(cursor["tokens_out"]) + coerce_untrusted_count(result.get("tokens_out"))
 
+    # Hydra#71: commit-aware attribution. The attended host engineer commits
+    # its work (unlike the headless drive loop, which the harness commits on
+    # its behalf later), so the uncommitted-dirty-set delta alone is empty for
+    # the normal case and silently attributes nothing. Union in the branch's
+    # own commit history since this attempt's recorded base -- captured at
+    # begin_stage / the Reflexion retry transition, per generate attempt.
     pre_dirty = set(cursor.get("pre_dirty") or [])
-    run_changed = _worktree_dirty_set(work_path) - pre_dirty
+    dirty_changed = _worktree_dirty_set(work_path) - pre_dirty
+    committed_changed = _worktree_committed_since(
+        work_path, cursor.get("generate_base_sha"))
+    run_changed = dirty_changed | committed_changed
     cursor["changed_paths"] = sorted(set(cursor.get("changed_paths") or []) | run_changed)
     wrote_changes = bool(run_changed)
 
+    # Hydra#71: on the attended path a host result is a structured payload,
+    # not free-form CLI narration -- never marker-classify its prose summary
+    # (``apply_text_markers=False``). Only hard signals (an explicit
+    # failure-shaped ``gen`` dict, or truly empty output with nothing
+    # attributed to this run) still fail the stage.
     gen_fail = _generate_failure_reason(
-        {"status": "done", "result": result}, gen_text, wrote_changes)
+        {"status": "done", "result": result}, gen_text, wrote_changes,
+        apply_text_markers=False)
 
     model_id = str(result.get("model") or cursor.get("model_tier") or f"{producer}-default")
 
@@ -2083,7 +2533,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         except Exception:  # noqa: BLE001
             pass
         # Generation failed; finalize as surfaced (no judge).
-        _finalize(dispatcher, cursor, passed=False, gen_failed=True)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=True,
+                 workflow_terminal=workflow_terminal)
         return
 
     # Successful generate: archive the producer summary + record the attempt.
@@ -2126,7 +2577,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
         # record_attempt RPC failed — surface the stage immediately rather than
         # crashing. The engineer's work is generated but cannot be tracked.
         cursor["error"] = f"record_attempt RPC failed: {_ra_exc!r}"
-        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         return
 
     # Judge routing — honour pp's gate_eligible_judges (cross- vs same-vendor)
@@ -2244,11 +2696,648 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     })
 
 
+def _attended_smoke_mode() -> str:
+    """``HYDRA_ATTENDED_SMOKE_MODE`` — ``"async"`` (default) or ``"sync"``.
+
+    Hydra#70: the MCP route (and the default CLI) always runs the smoke as a
+    detached, tracked job (see ``hydra_core.smoke_job``) so a smoke that runs
+    past ``HYDRA_SUBMIT_TIMEOUT_S`` is never orphaned when the submitting
+    process is killed. ``sync`` is an explicit escape hatch for callers not
+    bounded by that call budget (a test fixture, or a bespoke direct-CLI
+    driver) that want the old inline behaviour.
+    """
+    raw = (os.environ.get("HYDRA_ATTENDED_SMOKE_MODE") or "async").strip().lower()
+    return "sync" if raw == "sync" else "async"
+
+
+def _apply_smoke_baseline_excuse(cursor: dict[str, Any], work_path: str,
+                                 smoke_status: str, smoke_reason: str) -> tuple[str, str]:
+    """GAP-a2 / Rider (a): compare a `fail` smoke against the baseline
+    failures captured before the engineer's change. If every currently-
+    failing test was ALREADY failing before the change, the smoke failure is
+    not attributable to this change — excuse it (Finding 6: bounded set).
+
+    Split out of ``_apply_judge`` (Hydra#70) so both the sync inline path and
+    the async job-completion path apply the SAME excuse logic."""
+    if smoke_status != "fail":
+        return smoke_status, smoke_reason
+    _captured_baseline = list(cursor.get("baseline_failures") or [])
+    _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
+    _env_allowlist: set[str] | None = (
+        {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
+        if _env_bl_raw else None
+    )
+    _captured_set = set(_captured_baseline)
+    if _env_allowlist is not None:
+        _excusable = (_captured_set & _env_allowlist) if _captured_set else _env_allowlist
+    else:
+        _excusable = _captured_set
+
+    if not _excusable:
+        return smoke_status, smoke_reason
+
+    _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
+    if len(_excusable) > _max_excuse:
+        _trace(cursor, "attended.smoke.baseline_too_broad", {
+            "stage_id": cursor.get("stage_id"),
+            "excusable_count": len(_excusable), "max": _max_excuse,
+        })
+        smoke_reason = (
+            f"smoke: baseline too broad ({len(_excusable)} excusable "
+            f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
+            "treating as real failure"
+        )
+        return smoke_status, smoke_reason
+
+    import sys as _sys
+    try:
+        _reruns = run_text(
+            [_sys.executable, "-m", "pytest", "tests/", "--no-header", "-q", "--tb=no"],
+            cwd=work_path, capture_output=True, check=False,
+            timeout=_baseline_timeout_s(),
+        )
+        _current_failing = _parse_failing_tests(_reruns.stdout + "\n" + _reruns.stderr)
+    except Exception:  # noqa: BLE001
+        _current_failing = set()
+    _excused = _current_failing & _excusable
+    _new_failures = _current_failing - _excusable
+    if _current_failing or _excused:
+        _trace(cursor, "attended.smoke.baseline_excuse_decision", {
+            "stage_id": cursor.get("stage_id"),
+            "current_failing": sorted(_current_failing),
+            "excused": sorted(_excused),
+            "new_failures": sorted(_new_failures),
+            "excusable_set_size": len(_excusable),
+        })
+    if not _new_failures:
+        smoke_status = "pass"
+        smoke_reason = (
+            f"smoke: {len(_current_failing)} failure(s) all pre-existed in "
+            f"baseline ({len(_excused)} excused); treated as pass"
+        )
+    return smoke_status, smoke_reason
+
+
+def _apply_smoke_and_finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
+                              cursor_file: "str | Path | None", call_key: str | None,
+                              work_path: str, smoke_status: str, smoke_reason: str,
+                              workflow_terminal: bool) -> None:
+    """The common tail shared by every smoke-result source (sync inline run,
+    cached ``smoke_result_for`` replay, and the async job's completed
+    result): apply the baseline excuse, record the pp smoke status exactly
+    once, persist the idempotency marker, honour the finalize-readiness
+    gate, and finalize the stage.
+
+    Hydra#70: split out of ``_apply_judge`` so the async job-completion path
+    (``poll_smoke_job``) and the sync path converge on IDENTICAL gating
+    instead of two implementations drifting apart.
+    """
+    smoke_status, smoke_reason = _apply_smoke_baseline_excuse(
+        cursor, work_path, smoke_status, smoke_reason)
+    try:
+        _raise_on_error_payload(
+            dispatcher.call_mcp("pp_harness", "record_smoke_status", {
+                "stage_id": cursor["stage_id"], "candidate_index": 1,
+                "status": smoke_status,
+                "reason": (smoke_reason or "attended drive smoke")[:300],
+            }, squad_id=_SQ),
+            "record_smoke_status",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # Fix-1b: persist smoke outcome before _finalize so a timeout between
+    # here and the outer save_cursor does not restart the smoke on retry.
+    if call_key is not None and cursor_file is not None:
+        cursor["smoke_result_for"] = {
+            "call_key": call_key, "status": smoke_status, "reason": smoke_reason,
+        }
+        save_cursor(cursor_file, cursor)
+    passed = smoke_status == "pass"
+    cursor["smoke_status"] = smoke_status
+    cursor["smoke_reason"] = smoke_reason
+    cursor.pop("smoke_job", None)
+
+    # Honour pp's finalize-readiness gate (same auto-resolved deferrals as the
+    # headless loop).
+    if passed:
+        try:
+            rd = _pp_inner(_raise_on_error_payload(
+                dispatcher.call_mcp("pp_harness", "get_stage_finalize_readiness",
+                   {"stage_id": cursor["stage_id"]}, squad_id=_SQ),
+                "get_stage_finalize_readiness",
+            ))
+        except Exception:  # noqa: BLE001
+            rd = {}
+        if rd.get("can_pass") is False:
+            na = rd.get("next_action") or "not_ready"
+            _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
+                              "run_tdd_post_check", "record_smoke_or_assertion"}
+            if na not in _auto_resolved:
+                passed = False
+                cursor["outcome"] = "surfaced"
+                cursor["error"] = f"pp readiness: not ready (next_action={na})"
+
+    _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
+             workflow_terminal=workflow_terminal)
+
+
+def _finalize_immediate_smoke_spawn_failure(
+    dispatcher: Dispatcher, cursor: dict[str, Any], *,
+    cursor_file: "str | Path | None", call_key: str | None,
+    work_path: str, reason: str, workflow_terminal: bool,
+) -> None:
+    """Hydra#70 follow-up (cross-vendor judge finding): when
+    ``smoke_job.start_job`` reports an immediate spawn/setup failure (the
+    returned job carries ``spawn_error``), the caller must NOT park the
+    cursor into ``await_smoke`` to await a poll of a job that never
+    started -- there is nothing to poll. Finalize the stage synchronously,
+    right here, through the SAME shared tail every other smoke-result
+    source converges on (:func:`_apply_smoke_and_finalize`), so the infra
+    failure is terminal on this very call instead of requiring a second
+    submit/poll round-trip.
+
+    If ``_apply_smoke_and_finalize``'s own terminal cursor save then ALSO
+    fails (the identical disk/permission failure class that stopped the
+    job from spawning in the first place), there is no second writable
+    channel for the cursor file itself on a host in that state. Emit a
+    trace event through :func:`_trace` -- an INDEPENDENT file write (via
+    ``telemetry.emit``'s own ``trace.jsonl``), not the cursor file, so it
+    is the closest thing to a durable record still available -- documenting
+    exactly why no terminal cursor record exists, then re-raise so the
+    caller (``submit_host_result`` / ``recover_stalled_stage``) surfaces
+    loudly instead of silently reporting success with nothing persisted.
+    """
+    try:
+        _apply_smoke_and_finalize(
+            dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, smoke_status="infra_error", smoke_reason=reason,
+            workflow_terminal=workflow_terminal)
+    except Exception as exc:  # noqa: BLE001 — see docstring: last-resort trace + re-raise
+        _trace(cursor, "attended.smoke_job_terminal_persist_failed", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "spawn_reason": reason, "persist_error": repr(exc),
+        })
+        raise
+
+
+# (D) cross-vendor judge follow-up, revise-round-2: the previous fix here was
+# a single BLOCKING poll (~0.45s: `_ADOPT_LOST_GRACE_RETRIES` *
+# `_ADOPT_LOST_GRACE_INTERVAL_S`) inside one `_adopt_or_launch_smoke_job`
+# call. A worker can legitimately cold-start (Windows interpreter spin-up,
+# heavier `squad_node` imports) past that window before it ever spawns the
+# smoke child and writes the P2-2 sidecar -- a genuinely live worker was
+# still finalized lost.
+#
+# Fixed with two complementary changes:
+#   1. Worker-level launch evidence (`smoke_job.read_worker_marker`) -- the
+#      worker writes its OWN pid + identity as the very first action in
+#      `main()`, before any slow import/detect/spawn work. A "launching"
+#      reservation that finds a marker whose identity verifies is proof of
+#      life immediately, without waiting on the sidecar at all.
+#   2. A non-blocking, NON-TERMINAL "still launching" outcome bounded by a
+#      startup window (`HYDRA_SMOKE_LAUNCH_GRACE_S`, default 60s, measured
+#      from `reserved_at`) -- no evidence yet, but still within the window,
+#      returns non-terminal (the host polls again via `step`, exactly like a
+#      running job) instead of blocking THIS call or finalizing lost. Only
+#      once the reservation is OLDER than the window with still no verified
+#      worker/sidecar/result is it finalized lost.
+#
+# The prior blocking constants (`_ADOPT_LOST_GRACE_RETRIES` /
+# `_ADOPT_LOST_GRACE_INTERVAL_S`, a fixed ~0.45s sleep loop) are retired —
+# nothing in this module sleeps waiting for adoption evidence any more.
+_SMOKE_LAUNCH_GRACE_S_DEFAULT = 60.0
+
+
+def _smoke_launch_grace_s() -> float:
+    """``HYDRA_SMOKE_LAUNCH_GRACE_S`` (default 60s) -- how long a "launching"
+    reservation with no adoptable evidence yet is treated as non-terminal
+    (still starting up) rather than finalized lost. Module-level function
+    (not a constant) so a test can set the env var to a tiny value and keep
+    the repro fast without monkeypatching a blocking sleep."""
+    raw = os.environ.get("HYDRA_SMOKE_LAUNCH_GRACE_S")
+    try:
+        v = float(raw) if raw else _SMOKE_LAUNCH_GRACE_S_DEFAULT
+    except (TypeError, ValueError):
+        v = _SMOKE_LAUNCH_GRACE_S_DEFAULT
+    return v if v > 0 else _SMOKE_LAUNCH_GRACE_S_DEFAULT
+
+
+def _read_adoption_sidecar(sidecar_path: "str | None") -> "dict[str, Any] | None":
+    if not sidecar_path or not Path(str(sidecar_path)).exists():
+        return None
+    try:
+        data = json.loads(Path(str(sidecar_path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_adoption_result(result_path: "str | None") -> "dict[str, Any] | None":
+    if not result_path or not Path(str(result_path)).exists():
+        return None
+    try:
+        data = json.loads(Path(str(result_path)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _adoption_evidence_matches_token(
+    evidence: "dict[str, Any] | None", reservation: "dict[str, Any]",
+) -> bool:
+    """R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening): a
+    reservation that minted a ``launch_token`` only ever adopts a
+    result/marker/sidecar that echoes the SAME token back -- a crash
+    between the reservation save (below) and ``start_job``'s own
+    stale-result/-sidecar/-marker removal could otherwise let a LATER
+    retry adopt evidence left over from an EARLIER run of the same
+    deterministic ``(cursor_file, call_key)`` paths (e.g.
+    ``recover_stalled_stage`` reusing the judge call_key). A reservation
+    with no ``launch_token`` (a legacy in-flight reservation persisted
+    before this field existed) keeps today's behaviour -- trusts whatever
+    evidence it finds, unconditionally."""
+    reservation_token = reservation.get("launch_token")
+    if reservation_token is None:
+        return True
+    if evidence is None:
+        return False
+    return evidence.get("launch_token") == reservation_token
+
+
+def _adopt_or_launch_smoke_job(
+    cursor: dict[str, Any], *, cursor_file: "str | Path | None",
+    call_key: str, work_path: str, stage_id: str,
+) -> dict[str, Any]:
+    """P2-3 (cross-vendor gpt-6-astra, MEDIUM): reserve the cursor's
+    transition to ``await_smoke`` BEFORE ever spawning the detached worker,
+    so a crash between spawn and the cursor save that used to follow it can
+    never start a SECOND worker writing the same result/log/sidecar paths.
+
+    Previously the judge-pass branch (and ``recover_stalled_stage``'s
+    ``stalled_infra`` smoke start) called ``smoke_job.start_job`` first and
+    only persisted ``cursor["smoke_job"]``/``state="await_smoke"`` to the
+    cursor file AFTER it returned. A crash in that window left the cursor at
+    ``await_judge`` with the verdict already recorded — a retry re-entered
+    the judge-pass branch from scratch and spawned a SECOND worker against
+    the exact same ``(cursor_file, call_key)`` pair (``smoke_job.job_paths``
+    is a pure function of those two, so both workers race to write the
+    identical result/log/sidecar files).
+
+    This function persists a ``state: "launching"`` reservation (with the
+    deterministic paths ``smoke_job.job_paths`` will use) and
+    ``cursor["state"] = "await_smoke"`` to disk FIRST. Only once that save
+    has landed does it call ``smoke_job.start_job`` and persist the pid.
+
+    A retry that finds an existing ``"launching"`` reservation for the SAME
+    ``call_key`` (the crash-recovery case — spawn never got another chance
+    to run, or ran but the pid was never saved) never spawns a second
+    worker. It first checks whether one is already live via the
+    deterministic result/sidecar paths:
+      - the result file already exists -> the job already finished; adopt
+        it (the caller's poll reads it directly, no pid needed).
+      - the sidecar shows a smoke child pid that is still alive -> a worker
+        IS running (it got far enough to write the sidecar); adopt by
+        polling the existing paths rather than spawning again.
+      - neither -> genuinely lost (the worker died before ever writing
+        anything this function can observe); resolved as ``infra_error``,
+        never a second spawn.
+
+    Returns a ``smoke_job``-shaped dict (may carry ``spawn_error`` for the
+    caller's existing spawn-failure handling, exactly like
+    ``smoke_job.start_job``'s own return value)."""
+    import time as _time
+    import uuid
+
+    from . import smoke_job as _smoke_job
+    from .proc import is_pid_alive as _is_pid_alive
+    from .proc import is_same_process as _is_same_process
+
+    existing = cursor.get("smoke_job") or {}
+    if existing.get("call_key") == call_key and existing.get("pid") is not None:
+        # Already fully launched for this exact call_key — never re-spawn.
+        return existing
+    if existing.get("call_key") == call_key and existing.get("spawn_error"):
+        return existing
+    if existing.get("call_key") == call_key and existing.get("state") == "launching":
+        # Reservation from a prior (crashed, or simply still-starting)
+        # attempt at this SAME call_key. Never blindly spawn a second
+        # worker — first look for evidence one is already live or already
+        # finished.
+        paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {
+            "result_path": existing.get("result_path"),
+            "log_path": existing.get("log_path"),
+            "sidecar_path": existing.get("sidecar_path"),
+            "marker_path": existing.get("marker_path"),
+        }
+        result_path = paths.get("result_path")
+        sidecar_path = paths.get("sidecar_path")
+        marker_path = paths.get("marker_path")
+
+        _result_evidence = _read_adoption_result(result_path)
+        if _result_evidence is not None:
+            if _adoption_evidence_matches_token(_result_evidence, existing):
+                job = dict(existing)
+                job.update(paths)
+                # Clear the "launching" marker -- this job is now resolved
+                # (or, for the adopted-alive cases below, actively running
+                # with a real pid) so a LATER poll must never re-enter this
+                # adoption branch and re-derive adoption evidence every poll.
+                job.pop("state", None)
+                job["adopted"] = "result_already_written"
+                _trace(cursor, "attended.smoke_job_adopted", {
+                    "stage_id": stage_id, "call_key": call_key,
+                    "reason": "result_already_written",
+                })
+                return job
+            # R3: a result file exists but names a DIFFERENT launch_token --
+            # it belongs to an earlier run of these same deterministic
+            # paths, not this reservation. Never adopt it (never report a
+            # stale pass/fail as this call's own outcome); fall through to
+            # the marker/sidecar/no-evidence handling below exactly as if
+            # no result existed yet.
+            _trace(cursor, "attended.smoke_job_stale_result_ignored", {
+                "stage_id": stage_id, "call_key": call_key,
+            })
+
+        # (1) Worker-level launch evidence (D follow-up): the worker writes
+        # its OWN pid + identity to the marker as the very first action in
+        # `main()`, before any slow import/detect/spawn work -- this is
+        # proof of life well before the P2-2 sidecar (written only once the
+        # worker has gotten as far as spawning the smoke child) can exist.
+        # An identity-verified marker is adopted immediately, no bound wait
+        # needed: the worker still writes the result/sidecar as today, this
+        # just lets the caller's job dict track the REAL worker pid instead
+        # of treating the reservation as unresolved.
+        marker = _smoke_job.read_worker_marker(marker_path)
+        worker_pid = marker.get("pid") if marker else None
+        worker_identity = marker.get("pid_identity") if marker else None
+        if (isinstance(worker_pid, int) and worker_pid > 0
+                and _is_pid_alive(worker_pid)
+                and _is_same_process(worker_pid, worker_identity)
+                # R3: a live, identity-verified marker left over from an
+                # earlier run of these same deterministic paths (wrong
+                # launch_token) is not proof of life for THIS reservation --
+                # treated as no evidence, never adopted.
+                and _adoption_evidence_matches_token(marker, existing)):
+            job = dict(existing)
+            job.update(paths)
+            job.pop("state", None)
+            job.setdefault("started_at", existing.get("reserved_at") or _time.time())
+            job["deadline"] = (
+                float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60)
+            job["pid"] = worker_pid
+            job["pid_identity"] = worker_identity
+            job["adopted"] = "worker_marker_alive"
+            _trace(cursor, "attended.smoke_job_adopted", {
+                "stage_id": stage_id, "call_key": call_key,
+                "reason": "worker_marker_alive", "worker_pid": worker_pid,
+            })
+            return job
+
+        sidecar = _read_adoption_sidecar(sidecar_path)
+        smoke_pid = sidecar.get("pid") if sidecar else None
+        smoke_identity = sidecar.get("pid_identity") if sidecar else None
+        if isinstance(smoke_pid, int) and smoke_pid > 0 and _is_pid_alive(smoke_pid):
+            # (B) durable identity fix (cross-vendor judge finding):
+            # `_is_pid_alive` alone only proves SOME process currently
+            # holds this pid -- if the real smoke child already exited
+            # and the OS reused the pid, adopting it here would attach
+            # this stage's lifecycle (and, on a later poll, kill
+            # authority) to an unrelated process. Verify identity first.
+            if (_is_same_process(smoke_pid, smoke_identity)
+                    # R3: a live, identity-verified sidecar left over from
+                    # an earlier run of these same deterministic paths
+                    # (wrong launch_token) is not proof of life for THIS
+                    # reservation -- treated as no evidence, never adopted.
+                    and _adoption_evidence_matches_token(sidecar, existing)):
+                job = dict(existing)
+                job.update(paths)
+                job.pop("state", None)
+                job.setdefault("started_at", existing.get("reserved_at") or _time.time())
+                job["deadline"] = (
+                    float(job["started_at"]) + _smoke_job.smoke_timeout_s() + 60)
+                # P2-3 adoption note: this "pid" now tracks the SMOKE
+                # CHILD (from the sidecar), not a worker -- there is no
+                # live worker left to poll (that is exactly why adoption
+                # fired). Downstream `is_pid_alive(pid)`/
+                # `kill_process_tree(pid)` calls work identically against
+                # either kind of pid, and `pid_identity` travels with it
+                # so a LATER deadline-kill can still verify sameness.
+                job["pid"] = smoke_pid
+                job["pid_identity"] = smoke_identity
+                job["adopted"] = "sidecar_pid_alive"
+                _trace(cursor, "attended.smoke_job_adopted", {
+                    "stage_id": stage_id, "call_key": call_key,
+                    "reason": "sidecar_pid_alive", "smoke_pid": smoke_pid,
+                })
+                return job
+            # A live sidecar pid whose identity does not match (or cannot be
+            # verified), OR whose identity matches but whose launch_token
+            # does not (R3: a leftover sidecar from an earlier run of these
+            # same deterministic paths), is proof of the OPPOSITE of "still
+            # launching" -- the real smoke child for THIS reservation either
+            # already exited (pid reused) or never belonged to it in the
+            # first place, so further waiting inside the startup bound would
+            # only ever see the same unusable pid again. Resolve as lost
+            # immediately, without waiting for the startup bound to elapse.
+            reason = (
+                "smoke job reservation's sidecar pid "
+                f"({smoke_pid}) is alive but is NOT the recorded smoke "
+                "child for this reservation (identity mismatch/unverifiable, "
+                "or a launch_token belonging to an earlier reservation) — "
+                "refusing to adopt it and treating the reservation as lost "
+                "rather than spawning a second worker for the same call_key"
+            )
+            _trace(cursor, "attended.smoke_job_reservation_lost", {
+                "stage_id": stage_id, "call_key": call_key, "reason": reason,
+            })
+            job = dict(existing)
+            job.update(paths)
+            job.pop("state", None)
+            job["spawn_error"] = reason
+            return job
+
+        # (2) No adoptable evidence yet (no result, no verified worker
+        # marker, no live-and-verified sidecar pid; an unverified/mismatched
+        # marker counts as "no evidence", not proof of anything). This is
+        # the ordinary in-flight shape for a worker that simply has not
+        # gotten far enough yet -- NON-terminal as long as the reservation
+        # is still within its startup bound (`HYDRA_SMOKE_LAUNCH_GRACE_S`,
+        # default 60s, measured from `reserved_at`). Returning the
+        # unresolved reservation here (still `state: "launching"`, no pid,
+        # no spawn_error) tells the caller (`poll_smoke_job`) to report
+        # "still pending" and poll again later -- never blocks THIS call,
+        # never finalizes lost inside the window.
+        reserved_at = existing.get("reserved_at")
+        age_s = (
+            _time.time() - float(reserved_at)
+            if isinstance(reserved_at, (int, float)) else float("inf")
+        )
+        grace_s = _smoke_launch_grace_s()
+        if age_s < grace_s:
+            job = dict(existing)
+            job.update(paths)
+            return job
+
+        # Past the startup bound with still no verified worker/sidecar/
+        # result — the previous reservation never got far enough to leave
+        # anything observable. Resolve as a lost job (never spawn a second
+        # worker for this call_key).
+        reason = (
+            "smoke job reservation found no live worker to adopt (no result "
+            "file, no verified worker-marker pid, no live sidecar pid) after "
+            f"the {grace_s:g}s startup bound (HYDRA_SMOKE_LAUNCH_GRACE_S) — "
+            "treating as lost rather than spawning a second worker for the "
+            "same call_key"
+        )
+        _trace(cursor, "attended.smoke_job_reservation_lost", {
+            "stage_id": stage_id, "call_key": call_key, "reason": reason,
+            "age_s": age_s, "grace_s": grace_s,
+        })
+        job = dict(existing)
+        job.update(paths)
+        job.pop("state", None)
+        job["spawn_error"] = reason
+        return job
+
+    # Fresh launch: persist the reservation BEFORE spawning.
+    paths = _smoke_job.job_paths(cursor_file, call_key) if cursor_file is not None else {}
+    # R3 (cross-vendor gpt-6-astra, final re-review, LOW/hardening): a
+    # unique per-reservation token, threaded through to the worker (argv)
+    # and echoed back into every marker/sidecar/result file it writes. A
+    # crash between THIS save and `start_job`'s own stale-result/-sidecar/
+    # -marker removal could otherwise let a retry adopt evidence left over
+    # from an EARLIER reservation of these same deterministic
+    # (cursor_file, call_key) paths (e.g. `recover_stalled_stage` reusing
+    # the judge call_key) -- every adoption branch above, and `poll_job`'s
+    # result read, verify this token before trusting any of it.
+    launch_token = uuid.uuid4().hex
+    reservation = {
+        "call_key": call_key,
+        "reserved_at": _time.time(),
+        "state": "launching",
+        "launch_token": launch_token,
+        **paths,
+    }
+    cursor["smoke_job"] = reservation
+    cursor["state"] = "await_smoke"
+    if cursor_file is not None:
+        save_cursor(cursor_file, cursor)
+    _trace(cursor, "attended.smoke_job_reserved", {
+        "stage_id": stage_id, "call_key": call_key,
+    })
+    job = _smoke_job.start_job(
+        cursor_file, project_path=work_path, stage_id=stage_id, call_key=call_key,
+        launch_token=launch_token)
+    return job
+
+
+def poll_smoke_job(dispatcher: Dispatcher, cursor: dict[str, Any], *,
+                   cursor_file: "str | Path | None",
+                   workflow_terminal: bool = False) -> bool:
+    """Poll an ``await_smoke`` cursor's detached job (Hydra#70).
+
+    Returns ``True`` if the job is still running and before its deadline
+    (cursor left unchanged — caller should report "still pending" without
+    blocking). Returns ``False`` once the cursor has ADVANCED (finalized,
+    via ``_apply_smoke_and_finalize``) — either because the job completed,
+    or because it was judged lost (deadline passed / process vanished with
+    no result), which is always classified as an infra failure so a lost
+    job can never wedge the cursor in ``await_smoke`` forever.
+    """
+    from . import smoke_job as _smoke_job
+    job = cursor.get("smoke_job") or {}
+    work_path = cursor.get("work_path") or cursor.get("project_path")
+    call_key = job.get("call_key") or (cursor.get("pending_action") or {}).get("call_key")
+    if not job:
+        _apply_smoke_and_finalize(
+            dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, smoke_status="infra_error",
+            smoke_reason="await_smoke cursor has no smoke_job recorded",
+            workflow_terminal=workflow_terminal)
+        # See the stamp at the bottom of this function: this branch also
+        # finalizes the cursor (via `_apply_smoke_and_finalize`) and needs
+        # the SAME `terminal_call_key` stamp -- it returns below instead of
+        # falling through to the shared stamp, so it is duplicated here.
+        if cursor.get("state") in _TERMINAL:
+            cursor.setdefault("terminal_call_key", call_key)
+        return False
+    if job.get("state") == "launching" and not job.get("pid") and not job.get("spawn_error"):
+        # P2-3: a reservation from a (possibly crashed) launch attempt that
+        # never got as far as this poll seeing a pid. This is the SAME
+        # crash-recovery case `_adopt_or_launch_smoke_job` handles at the
+        # original launch call sites -- reached here too because once the
+        # reservation flipped `cursor["state"]` to "await_smoke", every
+        # LATER retry (a step poll, or a same-call_key resubmit) routes
+        # through THIS function, never back to the judge-pass branch that
+        # made the original reservation. Never spawn a second worker here
+        # either -- adopt a live/finished job via the deterministic
+        # result/sidecar paths, or resolve as lost.
+        job = _adopt_or_launch_smoke_job(
+            cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, stage_id=cursor.get("stage_id"))
+        cursor["smoke_job"] = job
+        if job.get("spawn_error"):
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, smoke_status="infra_error",
+                smoke_reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+            if cursor.get("state") in _TERMINAL:
+                cursor.setdefault("terminal_call_key", call_key)
+            return False
+        if job.get("state") == "launching":
+            # (D) still within the startup bound (`HYDRA_SMOKE_LAUNCH_GRACE_S`)
+            # with no adoptable evidence yet -- non-terminal, exactly like a
+            # running job: report "still pending" and let the caller poll
+            # again later. Never falls through to `poll_job` below (which
+            # would treat the still-`None` pid as a vanished worker).
+            return True
+    result = _smoke_job.poll_job(job)
+    if result is None:
+        return True
+    _trace(cursor, "attended.smoke_job_polled", {
+        "stage_id": cursor.get("stage_id"), "call_key": call_key,
+        "status": result.get("status"),
+    })
+    _apply_smoke_and_finalize(
+        dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+        work_path=work_path, smoke_status=str(result.get("status") or "infra_error"),
+        smoke_reason=str(result.get("reason") or ""),
+        workflow_terminal=workflow_terminal)
+    # Hydra#70 checkpoint-bookkeeping fix: `submit_host_result` is the ONLY
+    # caller that stamped `terminal_call_key` (its own post-transition
+    # `setdefault` a few hundred lines down) -- a bare `hydra.workflow.step`
+    # poll drives this SAME finalize path (via `_apply_smoke_and_finalize`
+    # above) without ever reaching `submit_host_result`, so it left the
+    # cursor's trusted terminal-call identity permanently unset. Stamp it
+    # HERE, in the one function both callers (a `step` poll and a
+    # same-call_key `submit_host_result` resubmit acting as a poll) share,
+    # using the SAME `call_key` (the judge call that started this smoke job,
+    # captured above from `job["call_key"]` before `_apply_smoke_and_finalize`
+    # pops `cursor["smoke_job"]`) -- so the reconciliation key
+    # `run_id:terminal_call_key` a caller derives is identical regardless of
+    # which one actually finished the stage. `setdefault` mirrors
+    # `submit_host_result`'s own stamp so neither caller can ever clobber an
+    # identity the other already recorded.
+    if cursor.get("state") in _TERMINAL:
+        cursor.setdefault("terminal_call_key", call_key)
+    return False
+
+
 def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                  result: dict[str, Any],
                  *, cursor_file: "str | Path | None" = None,
-                 call_key: str | None = None) -> dict[str, Any] | None:
+                 call_key: str | None = None,
+                 workflow_terminal: bool = False) -> dict[str, Any] | None:
     """await_judge -> terminal (or back to await_generate for Reflexion x1).
+
+    ``workflow_terminal`` (round 6 gap fix): see ``submit_host_result``'s
+    docstring. Threaded through to every ``_finalize`` call below so a
+    PASSING verdict on a stale cursor still records the ledger verdict
+    (already happened via ``record_verdict`` above, before ``_finalize`` is
+    ever reached) but never merges the candidate worktree back into the
+    repo -- merging is itself the "continue a terminal workflow" act this
+    fix refuses.
 
     F26+M8: a failed record_verdict/finalize_stage on a pass outcome downgrades
     the stage to surfaced (never proceeds to finalize_run complete).
@@ -2331,7 +3420,8 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             "stage_id": stage_id, "call_key": call_key,
             "chain": chain, "reason": result.get("reason"),
         })
-        _finalize(dispatcher, cursor, passed=False, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         return None
 
     cm = dispatcher.call_mcp
@@ -2472,6 +3562,15 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         })
         judge_model_id = _pinned
 
+    # Hydra#72: derive judge_model_source/judge_override_reason/
+    # judge_reasoning_effort BEFORE record_verdict -- see the module-level
+    # comment above ``_judge_verdict_provenance`` for the pp contract this
+    # forwards against (runs.ts:1029-1057).
+    _verdict_provenance = _judge_verdict_provenance(
+        dispatcher, judge_vendor=_judge_vendor, judge_model_id=judge_model_id,
+        result=result, allowed_models=allowed_models,
+    )
+
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
     # immediately — Reflexion is reserved for code defects the engineer can fix.
@@ -2515,6 +3614,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             "critique_md": critique_md[:4000],
             "score_json": score_json,
             "rubric_id": gate_rubric,
+            # Hydra#72: forward the derived judge-selection provenance so
+            # record_verdict does not implicitly treat every verdict as
+            # source="default" (see ``_judge_verdict_provenance``).
+            **_verdict_provenance,
             # W2-3: the attended call_key doubles as pp's idempotency token. A
             # re-drive after a stalled_infra hold resubmits the same call_key,
             # so pp's recordVerdict returns the original verdict_id instead of
@@ -2549,19 +3652,27 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             _record_verdict_ok = False
             _record_verdict_exc = exc
 
-    # E2-27: pp's judge-model pin rejection is a LABEL problem, not an
-    # artifact defect. `_classify_infra_failure` calls it "deterministic"
-    # (its text matches the "validation" marker), which used to surface a
-    # PASSING stage and discard the merge. Route it to the host-correctable
-    # path instead: nothing about the cursor state or pending_action changes,
-    # so a resubmit under the SAME call_key with a corrected judge_model_id
-    # re-enters here and retries record_verdict (no verdict row was written,
-    # so `verdict_recorded_for` is unset and there is nothing to double-write).
-    if not _record_verdict_ok and _is_judge_pin_error(_record_verdict_exc):
+    # E2-27 / Hydra#72: pp's judge-model pin rejection AND pp's judge-
+    # selection provenance rejection (judge_model_source/judge_override_
+    # reason -- runs.ts:1029-1057) are both LABEL problems, not an artifact
+    # defect. `_classify_infra_failure` calls either "deterministic" (the
+    # text matches the "validation" marker), which used to surface a PASSING
+    # stage and discard the merge. Route both to the host-correctable path
+    # instead: nothing about the cursor state or pending_action changes, so a
+    # resubmit under the SAME call_key with a corrected judge_model_id (or,
+    # for Hydra#72, after ``_judge_verdict_provenance`` re-derives on the
+    # next call) re-enters here and retries record_verdict (no verdict row
+    # was written, so `verdict_recorded_for` is unset and there is nothing to
+    # double-write).
+    _is_pin_error = _is_judge_pin_error(_record_verdict_exc)
+    _is_provenance_error = _is_judge_provenance_error(_record_verdict_exc)
+    if not _record_verdict_ok and (_is_pin_error or _is_provenance_error):
         _pin_reason = str(_record_verdict_exc)
         if _judge_correction_budget_left(cursor, call_key):
             n = _record_judge_correction(cursor, call_key)
-            _trace(cursor, "attended.judge_model_id_pin_rejected", {
+            _trace_event = ("attended.judge_provenance_rejected" if _is_provenance_error
+                             else "attended.judge_model_id_pin_rejected")
+            _trace(cursor, _trace_event, {
                 "stage_id": cursor.get("stage_id"), "call_key": call_key,
                 "attempt_id": attempt_id,
                 "judge_producer": judge_producer,
@@ -2572,11 +3683,14 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             })
             if cursor_file is not None:
                 save_cursor(cursor_file, cursor)
+            _err_prefix = ("pp rejected the judge selection provenance: "
+                           if _is_provenance_error else
+                           "pp rejected the judge model id: ")
             return {
                 "ok": False,
                 "retryable": True,
                 "error": (
-                    "pp rejected the judge model id: " + _pin_reason +
+                    _err_prefix + _pin_reason +
                     " — resubmit the SAME call_key with a judge_model_id from "
                     "allowed_judge_model_ids"),
                 "allowed_judge_model_ids": allowed_models,
@@ -2646,6 +3760,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if outcome == "revise" and gen_idx == 0 and not _infra_downgrade:
         cursor["generate_index"] = 1
         cursor["reflexion_critique"] = critique_md
+        # Hydra#71: re-stamp the attribution base to the current HEAD (attempt
+        # 0's commits, already folded into cursor["changed_paths"]) so the
+        # retry's own commit-aware attribution only picks up ITS new commits,
+        # not attempt 0's again.
+        cursor["generate_base_sha"] = _git_head_sha(work_path)
+        cursor["pre_dirty"] = sorted(_worktree_dirty_set(work_path))
         aug_prompt = _augment_with_critique(cursor["request_text"], critique_md)
         # 7b fix: re-prepend the hydra_context_block exactly once so the retry
         # prompt mirrors the initial generate-0 prompt structure.  The block was
@@ -2677,9 +3797,6 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         return  # Don't finalize — wait for generate-1
 
     # PP-VG-5: a code stage may finalize 'complete' only with a real smoke result.
-    passed = False
-    smoke_status = "skipped"
-    smoke_reason = ""
     if outcome == "pass" and attempt_id:
         # Fix-1b: if the smoke already completed for this call_key (persisted before
         # a prior submit timed out inside _finalize), reuse the result without
@@ -2688,138 +3805,94 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         _smoke_from_cache = (call_key is not None
                              and _cached_smoke.get("call_key") == call_key)
         if _smoke_from_cache:
-            smoke_status = str(_cached_smoke.get("status") or "skipped")
-            smoke_reason = str(_cached_smoke.get("reason") or "")
             _trace(cursor, "attended.smoke_skip_idempotent", {
                 "stage_id": cursor.get("stage_id"),
                 "call_key": call_key,
-                "smoke_status": smoke_status,
+                "smoke_status": _cached_smoke.get("status"),
                 "reason": "smoke_result_for marker matches — reusing persisted smoke outcome",
             })
-        else:
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path,
+                smoke_status=str(_cached_smoke.get("status") or "skipped"),
+                smoke_reason=str(_cached_smoke.get("reason") or ""),
+                workflow_terminal=workflow_terminal)
+            return None
+        # Hydra#70: the smoke runs SYNCHRONOUSLY inside this single MCP call
+        # by default only under HYDRA_ATTENDED_SMOKE_MODE=sync (test
+        # fixtures / a caller not bounded by the MCP submit-call budget).
+        # The default (and the sole mode on the MCP route -- see
+        # `mcp_servers/hydra_control/server.py`'s HYDRA_SUBMIT_TIMEOUT_S vs
+        # HYDRA_SMOKE_TIMEOUT_S mismatch this fixes) is "async": start a
+        # DETACHED, TRACKED job (`hydra_core.smoke_job`) that survives this
+        # process's own death, and return promptly with state="await_smoke"
+        # so the host polls via `hydra.workflow.step` / a same-call_key
+        # resubmit instead of blocking the MCP call past its own timeout.
+        # An async job needs a cursor_file to derive its result/log paths and
+        # to persist cursor["smoke_job"] for a later poll -- a caller with no
+        # cursor_file (defensive/legacy) cannot use the async path at all, so
+        # it degrades to sync rather than losing the smoke job's location.
+        if _attended_smoke_mode() == "sync" or cursor_file is None:
             smoke_status, smoke_reason = _run_smoke(
-                dispatcher,
-                project_path=work_path,
-                stage_id=cursor["stage_id"])
-            # GAP-a2 / Rider (a): compare against the baseline failures.
-            # If every currently-failing test was ALREADY failing before the
-            # engineer's change, the smoke failure is not attributable to this
-            # change — excuse it.
-            # Finding 6: bound the excusable set to prevent real regressions being
-            # silently blessed by an overly broad baseline.
-            if smoke_status == "fail":
-                _captured_baseline = list(cursor.get("baseline_failures") or [])
-                _env_bl_raw = os.environ.get("HYDRA_SMOKE_BASELINE_TESTS", "")
-                _env_allowlist: set[str] | None = (
-                    {t.strip() for t in _env_bl_raw.split(",") if t.strip()}
-                    if _env_bl_raw else None
-                )
-                # Build excusable set:
-                #  - env var present + captured non-empty → intersection (tightest bound)
-                #  - env var present + captured empty → env var alone (legacy fallback)
-                #  - env var absent → captured baseline alone
-                _captured_set = set(_captured_baseline)
-                if _env_allowlist is not None:
-                    _excusable = ((_captured_set & _env_allowlist) if _captured_set
-                                  else _env_allowlist)
-                else:
-                    _excusable = _captured_set
-
-                if _excusable:
-                    _max_excuse = int(os.environ.get("HYDRA_SMOKE_BASELINE_MAX", "10"))
-                    if len(_excusable) > _max_excuse:
-                        # Baseline too broad — refuse to excuse; treat as real failure.
-                        _trace(cursor, "attended.smoke.baseline_too_broad", {
-                            "stage_id": cursor.get("stage_id"),
-                            "excusable_count": len(_excusable),
-                            "max": _max_excuse,
-                        })
-                        smoke_reason = (
-                            f"smoke: baseline too broad ({len(_excusable)} excusable "
-                            f"tests > HYDRA_SMOKE_BASELINE_MAX={_max_excuse}); "
-                            "treating as real failure"
-                        )
-                    else:
-                        import sys as _sys
-                        try:
-                            _reruns = run_text(
-                                [_sys.executable, "-m", "pytest",
-                                 "tests/", "--no-header", "-q", "--tb=no"],
-                                cwd=work_path,
-                                capture_output=True, check=False,
-                                timeout=_baseline_timeout_s(),
-                            )
-                            _current_failing = _parse_failing_tests(
-                                _reruns.stdout + "\n" + _reruns.stderr)
-                        except Exception:  # noqa: BLE001
-                            _current_failing = set()
-                        _excused = _current_failing & _excusable
-                        _new_failures = _current_failing - _excusable
-                        # Always emit telemetry about excused failures (Finding 6).
-                        if _current_failing or _excused:
-                            _trace(cursor, "attended.smoke.baseline_excuse_decision", {
-                                "stage_id": cursor.get("stage_id"),
-                                "current_failing": sorted(_current_failing),
-                                "excused": sorted(_excused),
-                                "new_failures": sorted(_new_failures),
-                                "excusable_set_size": len(_excusable),
-                            })
-                        if not _new_failures:
-                            smoke_status = "pass"
-                            smoke_reason = (
-                                f"smoke: {len(_current_failing)} failure(s) all "
-                                f"pre-existed in baseline ({len(_excused)} excused); "
-                                "treated as pass"
-                            )
-            try:
-                _raise_on_error_payload(
-                    cm("pp_harness", "record_smoke_status", {
-                        "stage_id": cursor["stage_id"], "candidate_index": 1,
-                        "status": smoke_status,
-                        "reason": (smoke_reason or "attended drive smoke")[:300],
-                    }, squad_id=_SQ),
-                    "record_smoke_status",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            # Fix-1b: persist smoke outcome before _finalize so a timeout between
-            # here and the outer save_cursor does not restart the smoke on retry.
-            if call_key is not None and cursor_file is not None:
-                cursor["smoke_result_for"] = {
-                    "call_key": call_key,
-                    "status": smoke_status,
-                    "reason": smoke_reason,
-                }
-                save_cursor(cursor_file, cursor)
-        passed = smoke_status == "pass"
-    cursor["smoke_status"] = smoke_status
-    cursor["smoke_reason"] = smoke_reason
-
-    # Honour pp's finalize-readiness gate (same auto-resolved deferrals as the
-    # headless loop).
-    if passed:
-        try:
-            rd = _pp_inner(_raise_on_error_payload(
-                cm("pp_harness", "get_stage_finalize_readiness",
-                   {"stage_id": cursor["stage_id"]}, squad_id=_SQ),
-                "get_stage_finalize_readiness",
-            ))
-        except Exception:  # noqa: BLE001
-            rd = {}
-        if rd.get("can_pass") is False:
-            na = rd.get("next_action") or "not_ready"
-            _auto_resolved = {"run_artifact_validate", "run_tdd_pre_check",
-                              "run_tdd_post_check", "record_smoke_or_assertion"}
-            if na not in _auto_resolved:
-                passed = False
-                cursor["outcome"] = "surfaced"
-                cursor["error"] = f"pp readiness: not ready (next_action={na})"
-
-    _finalize(dispatcher, cursor, passed=passed, gen_failed=False)
+                dispatcher, project_path=work_path, stage_id=cursor["stage_id"])
+            _apply_smoke_and_finalize(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, smoke_status=smoke_status,
+                smoke_reason=smoke_reason, workflow_terminal=workflow_terminal)
+            return None
+        # P2-3: reserve the await_smoke transition BEFORE ever spawning the
+        # worker -- see `_adopt_or_launch_smoke_job`'s docstring.
+        job = _adopt_or_launch_smoke_job(
+            cursor, cursor_file=cursor_file, call_key=call_key,
+            work_path=work_path, stage_id=cursor["stage_id"])
+        if job.get("spawn_error"):
+            # Hydra#70 follow-up: nothing was actually spawned -- finalize
+            # synchronously as an infra smoke failure instead of parking
+            # into await_smoke to poll a job that never started.
+            _trace(cursor, "attended.smoke_job_spawn_failed", {
+                "stage_id": cursor.get("stage_id"), "call_key": call_key,
+                "reason": job["spawn_error"],
+            })
+            _finalize_immediate_smoke_spawn_failure(
+                dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
+                work_path=work_path, reason=job["spawn_error"],
+                workflow_terminal=workflow_terminal)
+            return None
+        cursor["smoke_job"] = job
+        cursor["state"] = "await_smoke"
+        # W2-3-shaped: keep the SAME judge call_key as pending_action.call_key
+        # so a re-issued submit_host_result under that call_key re-enters the
+        # "await_smoke" branch in `submit_host_result` as a POLL, never a
+        # duplicate record_verdict/record_attempt.
+        cursor["pending_action"] = {
+            "call_key": call_key,
+            "action": "poll_smoke",
+            "poll": True,
+            "instructions": (
+                "The verdict is already recorded. Smoke is running as a "
+                "detached background job — there is no agent to spawn. "
+                "Call hydra.workflow.step(workflow_id) again after a short "
+                "delay to poll for completion (a same-call_key "
+                "submit-host-result resubmit also works as a poll)."
+            ),
+        }
+        if cursor_file is not None:
+            save_cursor(cursor_file, cursor)
+        _trace(cursor, "attended.smoke_job_started", {
+            "stage_id": cursor.get("stage_id"), "call_key": call_key,
+            "pid": job.get("pid"), "deadline": job.get("deadline"),
+        })
+        return None
+    else:
+        cursor["smoke_status"] = "skipped"
+        cursor["smoke_reason"] = ""
+        _finalize(dispatcher, cursor, passed=False, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
 
 
 def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
-              passed: bool, gen_failed: bool) -> None:
+              passed: bool, gen_failed: bool,
+              workflow_terminal: bool = False) -> None:
     """Finalize the stage + run and set the terminal cursor state. Mirrors the
     headless loop's downgrade-honouring finalize_run handling.
 
@@ -2831,6 +3904,15 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     was finalized 'complete' and only the cursor reflected the merge failure).
     F30: abort/error reason is included in summary_md (FinalizeRunSchema strips
     standalone `reason` / `project_path` keys).
+
+    Round 6 gap fix: ``workflow_terminal=True`` means the caller already
+    determined -- from the authoritative HydraState checkpoint -- that this
+    workflow has a durable ``terminal_resolution``. ``finalize_stage`` above
+    still runs unconditionally (pp ledger bookkeeping for the already-
+    incurred attempt/verdict, exactly once); the merge-back below is what
+    gets refused: it is the one side effect that would actually CONTINUE a
+    terminal workflow (landing code in the target repo). The branch is
+    preserved (committed, never merged) for manual operator pickup instead.
     """
     cm = dispatcher.call_mcp
     stage_id = cursor["stage_id"]
@@ -2869,7 +3951,7 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     repo_root = cursor.get("repo_root")
     branch = cursor.get("branch")
     if worktree_path and repo_root and branch:
-        if passed:
+        if passed and not workflow_terminal:
             merge = _merge_worktree_back(repo_root, worktree_path, branch)
             cursor["merge"] = merge
             if not merge.get("merged"):
@@ -2889,14 +3971,32 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
                        {"branch": branch, "run_id": run_id,
                         "via": "merge_helper_commit"})
         else:
-            cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
+            # Round 6 gap fix: a workflow-terminal finalize is refused the
+            # merge unconditionally, even though this attempt/verdict itself
+            # PASSED -- landing code now would continue a workflow the
+            # operator already aborted/rejected elsewhere. Reported error is
+            # distinct from the ordinary "never even attempted a merge"
+            # non-complete case so the operator can tell the two apart.
+            if workflow_terminal:
+                cursor["merge"] = {"merged": False, "error": "workflow_terminal"}
+                if passed:
+                    passed = False
+                    cursor["outcome"] = "workflow_terminal"
+            else:
+                cursor["merge"] = {"merged": False, "error": "discarded_non_complete"}
             # MU12: commit any engineer changes to the attended branch BEFORE
             # removing the worktree so the operator can pick them up.  The
             # complete path is handled by _merge_worktree_back above; this
             # preserves work on non-complete outcomes (smoke-fail, judge-fail,
-            # generate-fail).
-            _preserve_non_complete_work(cursor, worktree_path, branch, run_id,
-                                        final_status="surfaced")
+            # generate-fail, or a workflow-terminal refusal).
+            _preserve_non_complete_work(
+                cursor, worktree_path, branch, run_id,
+                final_status=("workflow_terminal" if workflow_terminal else "surfaced"))
+            # Hydra#71: the branch commit above never carries the excluded
+            # build/log/.harness byproducts (see _BYPRODUCT_PATTERNS) — copy
+            # them out before the worktree directory is deleted below, or
+            # this generate/judge/smoke-fail's only on-disk evidence is lost.
+            _preserve_worktree_evidence(cursor, worktree_path, run_id)
         _remove_worktree(repo_root, worktree_path)
 
     # F30: build summary_md that embeds any error/abort reason.
@@ -2942,6 +4042,109 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     })
 
 
+def _field_required_marker(field: Any) -> str:
+    """Return "required" / "optional" for a pydantic v2 ``FieldInfo``."""
+    try:
+        return "required" if field.is_required() else "optional"
+    except Exception:  # noqa: BLE001 — defensive; never let doc-gen crash a prompt
+        return "optional"
+
+
+def _field_type_label(field: Any) -> str:
+    """Render a `FieldInfo.annotation` as a readable type label.
+
+    A parameterised generic (e.g. `list[PlanStep]`) has `__name__ == "list"`
+    on the CPython versions this repo supports -- using it unguarded (as an
+    earlier revision did) silently drops the type argument for every such
+    field, `steps` included. `typing.get_args`/`get_origin` recover the
+    argument(s) so `steps` renders as `list[PlanStep]` from the schema
+    itself, the same as every other field, rather than needing a
+    hand-written special case.
+    """
+    import typing
+
+    ann = getattr(field, "annotation", None)
+    origin = typing.get_origin(ann)
+    if origin is not None:
+        args = typing.get_args(ann)
+        if args:
+            arg_labels = ", ".join(getattr(a, "__name__", str(a)) for a in args)
+            origin_label = getattr(origin, "__name__", str(origin))
+            return f"{origin_label}[{arg_labels}]"
+    label = getattr(ann, "__name__", None)
+    return label or str(ann)
+
+
+def _plan_envelope_schema_doc() -> str:
+    """D1: render the ``## Required output: PLAN envelope`` prompt section
+    straight from the live pydantic models (`hydra_core.schemas.Plan` /
+    `PlanStep`) so the plan-author prompt can never drift from the schema the
+    validator actually enforces -- the root cause of "every first draft was
+    rejected" (authors emitted step fields id/title/success that don't exist
+    on `PlanStep`).
+
+    Uses ``model_fields`` (schema introspection), never a hand-copied field
+    list.
+    """
+    from . import schemas as _schemas
+
+    plan_fields = _schemas.Plan.model_fields
+    step_fields = _schemas.PlanStep.model_fields
+    allowed_types = sorted(_schemas.SCHEMA_REGISTRY.keys())
+
+    lines = ["## Required output: PLAN envelope", ""]
+    lines.append(
+        "Return exactly one PLAN envelope (type=\"PLAN\") inside the submit "
+        "result's `emitted_envelopes` list. The field list below is generated "
+        "at runtime from `hydra_core.schemas.Plan` / `PlanStep` -- it cannot "
+        "drift from what the validator accepts."
+    )
+    lines.append("")
+    lines.append("### Plan fields (including inherited envelope fields)")
+    for name, field in plan_fields.items():
+        marker = _field_required_marker(field)
+        suffix = (
+            " -- see \"PlanStep fields\" below" if name == "steps" else ""
+        )
+        lines.append(f"- `{name}` ({_field_type_label(field)}, {marker}){suffix}")
+    lines.append("")
+    lines.append("### PlanStep fields (each entry in `steps`)")
+    for name, field in step_fields.items():
+        lines.append(
+            f"- `{name}` ({_field_type_label(field)}, {_field_required_marker(field)})"
+        )
+    lines.append("")
+    lines.append(
+        "### Allowed PlanStep.envelope_type values\n"
+        + ", ".join(allowed_types)
+    )
+    lines.append("")
+    # Hydra#69 round 5 defect 5 (LOW): the field-list rendering above is
+    # useful prose, but it is a SUMMARY derived from `model_fields` -- it
+    # drops constraints (min/max length, enum bounds, `$defs` nesting) that
+    # only the generated JSON Schema actually carries. Emit
+    # `Plan.model_json_schema()` verbatim (compact JSON, no manual field
+    # re-description) alongside the prose list so an author has both a
+    # human-readable summary AND the exact machine contract the validator
+    # enforces, in the SAME generated-from-the-model fashion as the summary
+    # above -- never a hand-copied schema that could drift from
+    # `hydra_core.schemas.Plan`.
+    plan_schema = _schemas.Plan.model_json_schema()
+    lines.append("### Plan JSON Schema (generated from hydra_core.schemas.Plan)")
+    # Static schema data (no operator-controlled floats can reach this), but
+    # `dumps_strict` is still the right choice over a bare `json.dumps`: it
+    # refuses a non-finite float / circular reference outright rather than
+    # emitting invalid RFC 8259 JSON, and keeps this call inside the same
+    # enforced boundary every other serialization site in this module uses
+    # (see `tests/test_json_dumps_enforcement.py`). `sort_keys=True` makes
+    # the embedded schema deterministic across pydantic dict-ordering
+    # variance, not just compact.
+    lines.append(dumps_strict(
+        plan_schema, label="plan_schema", separators=(",", ":"), sort_keys=True,
+    ))
+    return "\n".join(lines)
+
+
 def _build_squad_prompt(
     *,
     workflow_id: str,
@@ -2956,6 +4159,9 @@ def _build_squad_prompt(
     risk: str | None = None,
     priority: str | None = None,
     acceptance_criteria: Sequence[str] | None = None,
+    plan_revision: int | None = None,
+    plan_critique: str | None = None,
+    supersedes_plan_envelope_id: str | None = None,
 ) -> str:
     """E2-28: build the non-engineering squad host_action prompt.
 
@@ -2966,6 +4172,12 @@ def _build_squad_prompt(
     ``upstream_refs`` carries MemoryRef handles / envelope ids of prior completed
     work ONLY — never raw upstream artifact content, which must not cross a squad
     boundary un-redacted (AGENTS.md hard rule 3).
+
+    D1 (Hydra#69 part 3): ``plan_revision`` / ``plan_critique`` /
+    ``supersedes_plan_envelope_id`` are ONLY consumed when
+    ``squad_slug == "planning"`` -- every other squad's prompt is byte-for-byte
+    unchanged by their presence (they default to ``None`` and are simply never
+    read outside the planning branch below).
     """
     _none = "(none)"
     refs = [str(r).strip() for r in (upstream_refs or []) if str(r).strip()]
@@ -3000,6 +4212,23 @@ def _build_squad_prompt(
         "acceptance_criteria: " + (_none if not crit else ""),
     ]
     lines.extend(f"- {c}" for c in crit)
+
+    # D1 (Hydra#69 part 3): planning-only section, schema-generated.
+    if squad_slug == "planning":
+        lines.append("")
+        lines.append(_plan_envelope_schema_doc())
+        lines.append("")
+        _expected_revision = int(plan_revision) if plan_revision else 1
+        lines.append(f"expected plan_revision: {_expected_revision}")
+        if _expected_revision > 1:
+            lines.append(
+                f"supersedes: {supersedes_plan_envelope_id or _none} "
+                "(the prior plan envelope id -- set `Plan.supersedes` to this value)"
+            )
+            lines.append("")
+            lines.append("### Prior revision critique")
+            lines.append((plan_critique or "").strip() or _none)
+
     return "\n".join(lines)
 
 
@@ -3022,6 +4251,10 @@ def begin_squad_stage(
     priority: str | None = None,
     acceptance_criteria: Sequence[str] | None = None,
     action_extras: dict[str, Any] | None = None,
+    attempt: int = 0,
+    plan_revision: int | None = None,
+    plan_critique: str | None = None,
+    supersedes_plan_envelope_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -3037,8 +4270,15 @@ def begin_squad_stage(
     E2-28: ``host_action.prompt`` is the full context-bearing prompt built by
     ``_build_squad_prompt``; the bare planner task label stays available as
     ``host_action.task_description``.
+
+    Hydra#69 defect C: ``attempt`` (default 0, unchanged for every existing
+    caller) is folded into ``call_key`` so a re-issued cursor for the SAME
+    task_id (e.g. a ``planning`` task whose PLAN was rejected and the task
+    stays open) never reuses the prior attempt's call_key -- a late/duplicate
+    submit under the stale key is refused by `submit_host_result`'s call_key
+    match instead of silently matching the new cursor.
     """
-    call_key = f"squad-{task_id}-0"
+    call_key = f"squad-{task_id}-{int(attempt)}"
     prompt = _build_squad_prompt(
         workflow_id=workflow_id,
         task_id=task_id,
@@ -3052,6 +4292,9 @@ def begin_squad_stage(
         risk=risk,
         priority=priority,
         acceptance_criteria=acceptance_criteria,
+        plan_revision=plan_revision,
+        plan_critique=plan_critique,
+        supersedes_plan_envelope_id=supersedes_plan_envelope_id,
     )
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
@@ -3070,6 +4313,7 @@ def begin_squad_stage(
         "final_status": None,
         "error": None,
         "finalized": False,
+        "attempt": int(attempt),
         "pending_action": {
             "call_key": call_key,
             "agent_type": lead_agent,
@@ -3250,7 +4494,8 @@ def _apply_squad_result(
 
 
 def recover_stalled_stage(dispatcher: Dispatcher, *,
-                          cursor_file: str | Path) -> dict[str, Any]:
+                          cursor_file: str | Path,
+                          workflow_terminal: bool = False) -> dict[str, Any]:
     """W2-4: sanctioned recovery for an engineering stage stranded by a
     transport-shaped pp-ledger failure.
 
@@ -3298,12 +4543,38 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     only way that can happen for the pre-fix "surfaced" shape, since its
     original submit charged on the downgraded outcome before this fix existed)
     is never charged a second time.
+
+    Round 6 gap fix: ``workflow_terminal=True`` means the caller already
+    determined -- from the authoritative HydraState checkpoint -- that this
+    workflow has a durable ``terminal_resolution``. Recovery MUST still be
+    able to reconcile the pp ledger for cost/verdict bookkeeping that already
+    happened (exactly once, same as ``submit_host_result``), but it must
+    never CONTINUE a terminal workflow by landing code: for the
+    ``stalled_infra`` shape this threads straight into ``_finalize``, which
+    already refuses the worktree merge-back when ``workflow_terminal`` is
+    set; for the ``surfaced`` shape it refuses to call ``_merge_branch_back``
+    at all (the merge itself is the one side effect that lands preserved
+    work into the target repo) and instead reports
+    ``merge={"merged": False, "error": "workflow_terminal"}`` while the
+    branch stays preserved (untouched, uncommitted-nothing-lost) for manual
+    operator pickup, exactly like the existing "merge failed" branch already
+    does for other merge refusals.
     """
     cm = dispatcher.call_mcp
     cursor = load_cursor(cursor_file)
     if cursor.get("kind") not in (None, "engineering"):
         return {"ok": False, "error": "recovery only supports engineering stage cursors"}
     state = cursor.get("state")
+    if state == "await_smoke":
+        # Hydra#70: a prior recovery call already started the async smoke
+        # job (or `_apply_judge` did, on the normal path). Re-invoking
+        # recovery here is a POLL, not a fresh recovery attempt.
+        poll_smoke_job(dispatcher, cursor, cursor_file=cursor_file,
+                      workflow_terminal=workflow_terminal)
+        save_cursor(cursor_file, cursor)
+        out = _step_result(cursor, cursor_file)
+        out["ok"] = True
+        return out
     if state not in ("stalled_infra", "surfaced"):
         return {"ok": False, "error": f"cursor state {state!r} is not recoverable"}
 
@@ -3378,6 +4649,60 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # stalled -- everything past record_verdict is the SAME code the
         # normal (non-stranded) path runs, so reuse it verbatim instead of
         # re-implementing smoke/merge/finalize here.
+        #
+        # Hydra#70: the verdict was JUST (re-)recorded above in this same
+        # call, so route the smoke through the same detached-job mechanism
+        # `_apply_judge` uses -- recovery is itself invoked through the CLI
+        # under its own bounded timeout (`_cmd_resume_locked`), so blocking
+        # here on a long smoke reproduces the exact orphaned-tree bug this
+        # fix closes. `sync` mode (tests / a bespoke driver) still runs
+        # inline for a prompt recovery result.
+        if outcome == "pass" and attempt_id and _attended_smoke_mode() != "sync":
+            work_path = cursor.get("work_path") or cursor["project_path"]
+            _recovery_call_key = (cursor.get("pending_action") or {}).get(
+                "call_key") or f"recovery-{stage_id}"
+            # P2-3: reserve the await_smoke transition BEFORE ever spawning
+            # the worker -- see `_adopt_or_launch_smoke_job`'s docstring.
+            job = _adopt_or_launch_smoke_job(
+                cursor, cursor_file=cursor_file, call_key=_recovery_call_key,
+                work_path=work_path, stage_id=stage_id)
+            if job.get("spawn_error"):
+                # Hydra#70 follow-up: nothing was actually spawned -- finalize
+                # synchronously as an infra smoke failure instead of parking
+                # into await_smoke to poll a job that never started.
+                _trace(cursor, "attended.recovery.smoke_job_spawn_failed", {
+                    "stage_id": stage_id, "reason": job["spawn_error"],
+                })
+                _finalize_immediate_smoke_spawn_failure(
+                    dispatcher, cursor, cursor_file=cursor_file,
+                    call_key=_recovery_call_key, work_path=work_path,
+                    reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+                # _apply_smoke_and_finalize's own internal save_cursor (Fix-1b)
+                # runs BEFORE it stamps the final smoke_status/outcome fields
+                # onto the in-memory cursor -- persist the fully-finalized
+                # cursor here, mirroring every other branch in this block.
+                save_cursor(cursor_file, cursor)
+                out = _step_result(cursor, cursor_file)
+                out["ok"] = True
+                return out
+            cursor["smoke_job"] = job
+            cursor["state"] = "await_smoke"
+            cursor["pending_action"] = {
+                "call_key": _recovery_call_key, "action": "poll_smoke",
+                "poll": True,
+                "instructions": (
+                    "Recovery re-recorded the verdict and started the smoke "
+                    "as a detached job. Poll via hydra.workflow.step "
+                    "(or resubmit recover-stalled-stage) until it completes."
+                ),
+            }
+            _trace(cursor, "attended.recovery.smoke_job_started", {
+                "stage_id": stage_id, "pid": job.get("pid"),
+            })
+            save_cursor(cursor_file, cursor)
+            out = _step_result(cursor, cursor_file)
+            out["ok"] = True
+            return out
         passed = False
         if outcome == "pass" and attempt_id:
             work_path = cursor.get("work_path") or cursor["project_path"]
@@ -3396,11 +4721,15 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             passed = smoke_status == "pass"
         _trace(cursor, "attended.recovery.resuming_finalize", {
             "stage_id": stage_id, "outcome": outcome, "passed": passed,
+            "workflow_terminal": workflow_terminal,
         })
-        _finalize(dispatcher, cursor, passed=passed, gen_failed=False)
+        _finalize(dispatcher, cursor, passed=passed, gen_failed=False,
+                 workflow_terminal=workflow_terminal)
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = True
+        if workflow_terminal:
+            out["workflow_terminal"] = True
         return out
 
     # state == "surfaced": worktree is gone; merge directly from the
@@ -3408,17 +4737,35 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     # above), then best-effort re-finalize.
     repo_root = cursor.get("repo_root") or cursor.get("project_path")
     branch = recovery_branch
-    merge = _merge_branch_back(repo_root, branch)
+    if workflow_terminal:
+        # Round 6 gap fix: never call `_merge_branch_back` once the workflow
+        # is terminal -- that call is the one side effect here that would
+        # actually land preserved work into `repo_root`. The branch (already
+        # resolved above, either `preserved_branch` or the existing
+        # `cursor["branch"]`) stays exactly as it was -- nothing further to
+        # preserve, since recovery never touched it -- for manual operator
+        # pickup instead.
+        merge = {"merged": False, "error": "workflow_terminal"}
+    else:
+        merge = _merge_branch_back(repo_root, branch)
     cursor["merge"] = merge
     _trace(cursor, "attended.recovery.merge", {
         "stage_id": stage_id, "branch": branch, "merged": merge.get("merged"),
-        "error": merge.get("error"),
+        "error": merge.get("error"), "workflow_terminal": workflow_terminal,
     })
     if not merge.get("merged"):
         save_cursor(cursor_file, cursor)
         out = _step_result(cursor, cursor_file)
         out["ok"] = False
-        if merge.get("error") == "already_merged":
+        if workflow_terminal:
+            out["ok"] = True
+            out["workflow_terminal"] = True
+            out["error"] = (
+                "recovery refused to merge: workflow is terminal "
+                f"(branch {branch!r} preserved in {repo_root} for manual "
+                "operator pickup)"
+            )
+        elif merge.get("error") == "already_merged":
             # State-shaped, not failure-shaped: the branch's work is
             # ALREADY present in repo_root (git reported "Already up to
             # date." -- no new commit was needed or created). That is not
@@ -3628,6 +4975,7 @@ def submit_host_result(
     cursor_file: str | Path,
     call_key: str,
     result: dict[str, Any],
+    workflow_terminal: bool = False,
 ) -> dict[str, Any]:
     """Feed a host subagent's result back in and advance the cursor by exactly
     one transition. Idempotent on a stale/duplicate ``call_key`` (returns the
@@ -3637,10 +4985,40 @@ def submit_host_result(
     Handles both ``kind="engineering"`` (the default pp stage flow) and the
     lightweight ``kind="squad"`` cursors created by ``begin_squad_stage`` for
     non-engineering tasks (claude-skill / agent-impersonation).
+
+    ``workflow_terminal`` (round 6 gap fix): True when the CALLER already
+    determined -- from the authoritative HydraState checkpoint, BEFORE this
+    function runs -- that the workflow has a durable ``terminal_resolution``
+    (see ``hydra_core.state.workflow_terminal_resolution``). Threaded through
+    to ``_apply_generate``/``_apply_judge`` -> ``_finalize`` so a passing
+    finalize on a stale cursor still records the already-incurred pp ledger
+    attempt/verdict (real spend already happened) but refuses to merge the
+    candidate worktree into the repo -- merging would continue a terminal
+    workflow. Never itself re-reads the checkpoint; this module has no
+    supervisor/graph access, only the cursor sidecar.
     """
     cursor = load_cursor(cursor_file)
     state = cursor.get("state")
     if state in _TERMINAL:
+        # Hydra#69 round 6 defect 2: a terminal cursor only ever returns its
+        # cached result to the call_key that actually produced the terminal
+        # transition. A different call_key (stale, or belonging to another
+        # cursor's caller entirely) is refused structurally -- it must never
+        # be treated as an idempotent re-submit and re-billed by the caller.
+        # `terminal_call_key` is unset on a legacy cursor written before this
+        # field existed, or one terminated outside this function (operator
+        # abort, stalled-stage recovery); such a cursor accepts any call_key
+        # here (already fully charged/settled by definition of being on
+        # disk), matching the migration policy: never re-charge it.
+        _terminal_key = cursor.get("terminal_call_key")
+        if _terminal_key is not None and call_key != _terminal_key:
+            out = _step_result(cursor, cursor_file)
+            out["ignored"] = (
+                f"call_key {call_key!r} != terminal call identity "
+                f"{_terminal_key!r}"
+            )
+            out["error_code"] = "stale_call_key"
+            return out
         return _step_result(cursor, cursor_file)
 
     pending = cursor.get("pending_action") or {}
@@ -3649,10 +5027,22 @@ def submit_host_result(
         # Duplicate / out-of-order submit — do not re-apply (exactly-once).
         out = _step_result(cursor, cursor_file)
         out["ignored"] = f"call_key {call_key!r} != expected {expected_key!r}"
+        # Hydra#69 defect C: a squad cursor's call_key carries the attempt
+        # number (``squad-{task_id}-{attempt}``, see begin_squad_stage). A
+        # mismatch on a squad-shaped call_key is very likely a stale
+        # response from an EARLIER (rejected) attempt racing a freshly
+        # re-issued cursor -- flag it structurally so a caller can
+        # distinguish "stale attempt" from any other call_key mismatch
+        # instead of parsing the free-text `ignored` string.
+        if (isinstance(call_key, str) and isinstance(expected_key, str)
+                and call_key.rsplit("-", 1)[:-1] == expected_key.rsplit("-", 1)[:-1]
+                and call_key != expected_key):
+            out["stale_attempt"] = True
+            out["error_code"] = "stale_attempt"
         return out
 
     if state == "await_generate":
-        _apply_generate(dispatcher, cursor, result)
+        _apply_generate(dispatcher, cursor, result, workflow_terminal=workflow_terminal)
     elif state in ("await_judge", "stalled_infra"):
         # W2-3: "stalled_infra" is a non-terminal hold state entered when a
         # transport-shaped record_verdict failure would otherwise have been
@@ -3667,12 +5057,25 @@ def submit_host_result(
         # pending_action/call_key, so the host corrects the label and
         # resubmits under the SAME call_key rather than losing the stage.
         _judge_err = _apply_judge(dispatcher, cursor, result,
-                                  cursor_file=cursor_file, call_key=call_key)
+                                  cursor_file=cursor_file, call_key=call_key,
+                                  workflow_terminal=workflow_terminal)
         if _judge_err is not None:
             save_cursor(cursor_file, cursor)
             out = _step_result(cursor, cursor_file)
             out.update(_judge_err)
             return out
+    elif state == "await_smoke":
+        # Hydra#70: the verdict is already recorded (see `_apply_judge`); the
+        # smoke is running as a detached job. A resubmit under the SAME
+        # call_key (the judge's -- pending_action.call_key was left
+        # unchanged when this state was entered) is treated as a POLL, never
+        # a duplicate record_verdict/record_attempt. `result` (the judge
+        # payload the host resubmitted) is intentionally ignored here.
+        still_pending = poll_smoke_job(dispatcher, cursor, cursor_file=cursor_file,
+                                       workflow_terminal=workflow_terminal)
+        if still_pending:
+            save_cursor(cursor_file, cursor)
+            return _step_result(cursor, cursor_file)
     elif state == "await_squad_agent":
         # Lightweight non-engineering squad flow — no pp protocol calls needed.
         _apply_squad_result(dispatcher, cursor, result, cursor_file=cursor_file)
@@ -3680,6 +5083,17 @@ def submit_host_result(
         cursor["state"] = "aborted"
         cursor["final_status"] = "aborted"
         cursor["error"] = f"unknown attended state {state!r}"
+
+    # Hydra#69 round 6 defect 2: stamp the call_key that produced THIS
+    # transition as the cursor's trusted terminal call identity, the instant
+    # the cursor first goes terminal. `call_key` here has already been
+    # validated == `pending.get("call_key")` above, so this is exactly the
+    # call that drove the transition -- never a caller-supplied value taken
+    # on faith. `setdefault` so a cursor that was already terminal before
+    # this call (e.g. the stalled_infra retry path above, which returns
+    # before reaching here) never has its original identity overwritten.
+    if cursor.get("state") in _TERMINAL:
+        cursor.setdefault("terminal_call_key", call_key)
 
     save_cursor(cursor_file, cursor)
     return _step_result(cursor, cursor_file)

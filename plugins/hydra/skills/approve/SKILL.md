@@ -26,7 +26,21 @@ every other mutating resume action) returns `{ok: false, error:
 Operationally:
 
 1. Query `python -m hydra_core.cli status <workflow_id>` and render the pending
-   HITL request exactly enough for the operator to review.
+   HITL request exactly enough for the operator to review. At a `plan_gate`,
+   `plan_detail` carries the judge's `verdict_outcome` and `judge_vendor` PLUS
+   (Hydra#69 part 3, D3) `verdict_critique` (the judge's critique text,
+   truncated to 2000 chars) and `verdict_plan_revision` (the plan revision the
+   verdict was scored against) — render all four together, not outcome/vendor
+   alone, so the operator sees WHY the judge reached its outcome and which
+   revision it judged. Also render `plan_detail.artifact_location` (the
+   `repo:artifact:<relpath>` MemoryRef key) alongside `plan_detail.
+   artifact_repo_id` (operator decision 2026-09-24: the resolved
+   `hydra_core.repo_registry` id the plan artifact actually lives under —
+   `null` means it fell back to the Hydra checkout itself, either because the
+   workflow has no single engineering target or repo resolution failed) —
+   never render `artifact_location` alone, since the same relative path can
+   exist under two different repos and the operator needs to know which one
+   they are opening.
 2. Obtain the operator's explicit confirmation. Never infer it from prior text.
 3. Call `hydra.workflow.resume` with `action: "approve"` (or, from a shell,
    `python -m hydra_core.cli resume <workflow_id> --action approve
@@ -60,8 +74,18 @@ follow-up): `hydra.workflow.resume` picks its transport from
   NEVER re-enters the compiled graph — no `sup.invoke`, no `node_dispatch`,
   no squad of any kind runs, not even on the stub. The response says so
   explicitly (`graph_reentered: false`); the attended `step`/`submit` loop
-  continues from the cursor afterward, exactly as if the workflow had never
-  paused. This response body is ADDITIVE, not byte-for-byte identical to
+  continues from the cursor afterward. This is NOT "exactly as if the
+  workflow had never paused" at a `plan_gate`: approving there materialises
+  the plan's steps into real `TaskState` entries DURING the gate-only
+  resolve itself (`hydra_core.cli` calls `hydra_core.supervisor.
+  materialise_plan_steps` and folds its patch into the SAME checkpoint write
+  that clears the gate — Hydra#69 part 1), not on a later graph re-entry, so
+  a workflow with a plan is materially different in shape immediately after
+  this resolve than it was before the gate was ever hit. A `modify-budget`
+  resolution at `plan_gate` behaves differently again: it does not approve
+  the plan — it re-files the SAME `plan_gate` (the workflow stays parked
+  there with the adjusted budget) rather than advancing past it. This
+  response body is ADDITIVE, not byte-for-byte identical to
   the pre-gate-only shape (`gate_only` and, when applicable,
   `eights_resolution` are new fields). Identity is checked TWICE: a
   pure, state-free precheck (operator id known + a signing key present)

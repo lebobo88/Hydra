@@ -47,6 +47,7 @@ from .schemas import (
     DecisionRecord,
     HITLRequest,
     HydraEnvelope,
+    Plan,
     ProposedTask,
     validate_envelope,
 )
@@ -65,9 +66,11 @@ from .state import (
     TaskState,
     make_checkpoint_serde,
     plan_barrier_active,
+    plan_gate_approve_evidence,
     plan_max_revisions,
     plan_revision_ceiling_reached,
     plan_deps_satisfied,
+    task_eligible_for_dispatch,
 )
 
 
@@ -99,6 +102,28 @@ def _plan_phase_enabled() -> bool:
     to legacy behaviour just by forgetting to export something.
     """
     return os.environ.get("HYDRA_PLAN_PHASE") != "0"
+
+
+# D3 (Hydra#69 part 3): plan-gate verdict critique max length before
+# `plan_detail["verdict_critique"]` is cut with a trailing marker. Keeps
+# `plan_detail`'s JSON size bounded (checkpoint/trace/MCP-visible) the same
+# way every other truncated field in this module is, while still giving the
+# operator/downstream renderers real critique text instead of nothing.
+_PLAN_CRITIQUE_MAX_CHARS = 2000
+_PLAN_CRITIQUE_TRUNCATION_MARKER = "\n...[truncated]"
+
+
+def _truncate_plan_critique(critique_md: Any) -> Optional[str]:
+    """D3: bound `verdict_critique` for `plan_detail`. Never returns a
+    non-string (strict-JSON safety) -- `None` in, `None` out.
+    """
+    if not isinstance(critique_md, str) or not critique_md:
+        return None
+    if len(critique_md) <= _PLAN_CRITIQUE_MAX_CHARS:
+        return critique_md
+    cut_at = _PLAN_CRITIQUE_MAX_CHARS - len(_PLAN_CRITIQUE_TRUNCATION_MARKER)
+    cut_at = max(0, cut_at)
+    return critique_md[:cut_at] + _PLAN_CRITIQUE_TRUNCATION_MARKER
 
 
 # RC1 — delegation routing: which squad consumes each emitted envelope type
@@ -338,6 +363,235 @@ def _resolve_generator_vendor(env: dict) -> str:
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip().lower()
     return "claude"
+
+
+def materialise_plan_steps(
+    state: HydraState, *, approved_resolution: bool = False
+) -> dict[str, Any]:
+    """Hydra#69 defect A/B/E/H: the ONE decision function that turns an
+    approved plan's `PlanStep`s into `TaskState`s. `node_plan_gate` (below)
+    is a thin wrapper around this pure function — it is the in-graph caller,
+    invoked only when `sup.invoke` actually resumes the graph past the
+    `plan_gate` interrupt. `hydra_core.cli`'s attended `--gate-only` resume
+    handler is the SECOND caller: under `--gate-only`, `sup.invoke` is never
+    called at all (see that module's docstring on RESOLVE-GATE-ONLY), so
+    without a second caller here, an approved plan's steps would never
+    materialise and the checkpoint would wedge at `plan_status="judged"`
+    forever. Both callers get the exact same patch from the exact same
+    function — no hand-duplicated second copy of this logic.
+
+    Idempotent PER STEP, not per call: `existing_by_step_id` covers tasks
+    already materialised THIS revision (from either caller), so calling this
+    twice for the same approval (e.g. once from the CLI, once again when
+    `sup.invoke` subsequently replays through `plan_gate` on the
+    non-`--gate-only` route) converges on exactly one task per step per
+    revision rather than duplicating.
+
+    Defect H: returns a no-op patch (`{}`) when `state.plan_status ==
+    "bypassed"` — a detached `--force-dispatch` past `plan_gate` already
+    wrote `plan_status="bypassed"` (see `hydra_core.cli`'s force-dispatch
+    handler); overwriting that with "approved" here would silently discard
+    the bypass audit trail and make `--force-dispatch` and `--approve`
+    indistinguishable on replay.
+
+    Each materialised task is stamped with `plan_revision=state.plan_revision`
+    so `task_eligible_for_dispatch` (state.py) skips a step task from an
+    older revision exactly the way it skips any other stale-revision task.
+
+    Defect E: each task also carries the PlanStep's own `acceptance_criteria`
+    and `envelope_type` — previously dropped on the floor (TaskState had no
+    `envelope_type` field at all, and `acceptance_criteria` was never copied
+    from the step), so the attended engineering `start_run` request text and
+    `_attended_task_gate_type` could never see them.
+
+    Defect B: on approval, supersedes the whole-goal placeholder tasks
+    `node_planner` synthesised while the plan gate was active
+    (`state.plan_placeholder_task_ids`) by copying them into the
+    replace-channel `plan_superseded_task_ids` field. `task_eligible_for_
+    dispatch` excludes any task_id in that set from ever being selected
+    again — this is what stops the placeholder (materialised at
+    `plan_revision=0`, invisible to a revision-only stale check) from
+    dispatching once the plan's real step tasks take over.
+
+    Hydra#69 follow-up defect 2 (revision): this function itself must refuse
+    to materialise while a `plan_gate` `pending_hitl` is STILL OPEN on the
+    given `state`, unless the caller explicitly proves an approval happened
+    via `approved_resolution=True`. Previously the only guard here rejected
+    a DIFFERENT open gate (`gate_node not in (None, "plan_gate")`) and
+    silently treated an open `plan_gate` itself as "fine, proceed" — so any
+    caller that reached this function with the gate still pending (not just
+    the one legitimate `cli.py` approve path) would approve+materialise
+    regardless of what action was actually requested. `cli.py`'s
+    `--gate-only` approve handler is the ONLY caller that legitimately hands
+    this function a state whose `pending_hitl` is still the open `plan_gate`
+    dict (it calls this against `_pre_state`, the PRE-patch checkpoint
+    snapshot, precisely because the post-patch view with the gate cleared
+    and the approve resolution appended doesn't exist as a real checkpoint
+    row yet) — and it does so only after confirming `action == "approve"`
+    and `option != "abort"`, so it passes `approved_resolution=True`
+    explicitly. `node_plan_gate` (the in-graph wrapper below) never needs to
+    pass it: by construction the graph only re-enters `plan_gate` after
+    `cli.py`'s resume handler has ALREADY written `pending_hitl=None` via
+    `sup.update_state` in the same atomic patch that appends the approve
+    resolution — every real graph invocation of this node therefore already
+    sees a cleared gate and materialises via the `cur is None` path below,
+    the same as it always has.
+    """
+    # H: a bypassed plan is not an approval — never touch it here.
+    if state.plan_status == "bypassed":
+        return {}
+
+    cur = state.pending_hitl
+    if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
+        return {"phase": "approval"}
+    if isinstance(cur, dict) and cur.get("gate_node") == "plan_gate" and not approved_resolution:
+        # Defect 2: an open plan_gate with no proven approval is a no-op,
+        # not an implicit approve. Return {} (not {"phase": "approval"}) —
+        # this is indistinguishable, from the checkpoint's point of view,
+        # from never having been called at all: no tasks, no plan_status
+        # flip, no pending_hitl mutation, no placeholder supersession.
+        return {}
+
+    # Hydra#69 round 5 defect 1c: `cur is None` is reachable from TWO very
+    # different histories -- (1) the genuine post-approve graph re-entry
+    # (cli.py already wrote pending_hitl=None + the approve resolution in
+    # ONE atomic patch, `sup.invoke` now re-runs `node_plan_gate` against
+    # that already-cleared state), and (2) a terminal abort/reject that ALSO
+    # cleared pending_hitl in its own atomic park write (defect 1a/1b), where
+    # a stale/duplicate resume later reaches this function with `cur is
+    # None` too. `approved_resolution=True` (cli.py's own `--gate-only`
+    # approve caller, passing the PRE-patch snapshot whose `pending_hitl` is
+    # still the open dict) already proves case (1) explicitly and skips this
+    # block entirely. Every OTHER caller -- specifically `node_plan_gate`
+    # itself, called with no `approved_resolution` argument on every real
+    # graph re-entry -- must prove case (1) here, from durable state, before
+    # materialising: an already-parked workflow (phase=="surfaced") or an
+    # explicitly rejected plan (plan_status=="rejected") is refused
+    # immediately; otherwise the latest plan_gate entry recorded in
+    # `hitl_history` must itself be a genuine approve (not an abort) for the
+    # gate to have legitimately cleared.
+    if not approved_resolution:
+        if state.phase == "surfaced" or state.plan_status == "rejected":
+            return {}
+        # Hydra#69 round 5 follow-up: the latest plan_gate entry must be
+        # evidence for THIS revision, not merely the latest plan_gate entry
+        # of any age. An approve recorded against an older `plan_revision`
+        # (e.g. the operator approved revision 1, then the planner produced
+        # a revised, as-yet-unapproved revision 2) must never authorise
+        # materialising a newer revision's steps -- that would silently
+        # promote an unreviewed plan using stale consent. So: scan
+        # `hitl_history` in reverse for the latest plan_gate entry whose own
+        # `plan_revision` equals `state.plan_revision` exactly.
+        #
+        # Legacy-entry policy: entries written before this stamp existed
+        # carry no `plan_revision` key at all. Treat a legacy (unstamped)
+        # entry as evidence ONLY when `state.plan_revision <= 1` AND no
+        # entry in the whole history carries an explicit `plan_revision` --
+        # i.e. this checkpoint predates revisioning entirely and is still on
+        # its first (only) plan. The instant any entry in the history is
+        # revision-stamped, the checkpoint is revision-aware and an
+        # unstamped entry can no longer be trusted to mean "revision 1"; it
+        # is treated as not-evidence and materialisation is refused. This
+        # keeps the legacy fallback narrowly scoped to genuinely pre-
+        # revisioning checkpoints instead of silently laundering a stale
+        # approval on a mixed-history checkpoint.
+        # Hydra#69 round 6 defect 4 (LOW): this predicate now lives in ONE
+        # shared place (`state.plan_gate_approve_evidence`) so `cli.py`'s
+        # `_cmd_attended_step` wedge-terminal can never disagree with this
+        # function about whether a `plan_gate` approve is genuine -- see
+        # that helper's docstring for the full policy.
+        if plan_gate_approve_evidence(state) is None:
+            return {}
+
+    plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
+    valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]
+
+    # Steps already materialised THIS revision (a replay, a re-raised gate
+    # re-running this node, or the second caller above) must not be
+    # re-created.
+    existing_by_step_id: dict[str, TaskState] = {
+        str(t.plan_step_id): t
+        for t in (getattr(state, "tasks", None) or [])
+        if t.plan_step_id and t.plan_revision == state.plan_revision
+    }
+
+    new_tasks_by_step_id: dict[str, TaskState] = {}
+    for step in valid_steps:
+        step_id = str(step.get("step_id") or "")
+        if (not step_id or step_id in existing_by_step_id
+                or step_id in new_tasks_by_step_id):
+            # Already materialised this revision, or a defensive skip of
+            # a duplicate step_id (Plan._validate_dag already rejects
+            # duplicates at construction; this is belt-and-suspenders).
+            continue
+        _step_ac = [c for c in (step.get("acceptance_criteria") or []) if isinstance(c, str)]
+        new_tasks_by_step_id[step_id] = TaskState(
+            owner_squad=step.get("target_squad") or "engineering",
+            description=step.get("description") or "",
+            priority=step.get("priority") or "P2",
+            model_tier=step.get("model_tier"),
+            target_repo_id=step.get("target_repo_id"),
+            target_repo_subpath=step.get("target_repo_subpath"),
+            plan_step_id=step_id,
+            plan_revision=state.plan_revision,
+            # E: propagate the step's own acceptance criteria + envelope
+            # type onto the materialised task.
+            acceptance_criteria=_step_ac or None,
+            envelope_type=step.get("envelope_type"),
+        )
+
+    # Second pass: translate each PlanStep's step_id-keyed `depends_on`
+    # into the task_id-keyed `depends_on` TaskState/plan_deps_satisfied
+    # actually read. The lookup map covers BOTH already-existing
+    # (this-revision) tasks and the newly created ones — a new step's
+    # dependency on an already-materialised step must resolve to the
+    # EXISTING task's id, not be silently dropped (dropping it would
+    # release the new step with its prerequisite unsatisfied, which is
+    # worse than the duplicate this idempotency guard fixes). Only newly
+    # created tasks need their `depends_on` set here — an existing task's
+    # `depends_on` was already resolved and stamped when IT was first
+    # materialised, and it is not re-emitted in this patch.
+    task_id_by_step_id: dict[str, str] = {
+        sid: str(t.task_id) for sid, t in existing_by_step_id.items()
+    }
+    task_id_by_step_id.update(
+        {sid: str(t.task_id) for sid, t in new_tasks_by_step_id.items()}
+    )
+    for step in valid_steps:
+        step_id = str(step.get("step_id") or "")
+        task = new_tasks_by_step_id.get(step_id)
+        if task is None:
+            continue
+        task.depends_on = [
+            task_id_by_step_id[str(dep)]
+            for dep in (step.get("depends_on") or [])
+            # Belt-and-braces, not a reachable case: Plan._validate_dag
+            # already rejects a dangling `depends_on` (an id naming no
+            # step in the plan) at construction, for every plan_ref this
+            # dict came from a validated Plan. This filter's only live
+            # purpose is dropping a dependency on a step this SAME call
+            # skipped as a defensive duplicate, above.
+            if str(dep) in task_id_by_step_id
+        ]
+
+    patch: dict[str, Any] = {
+        "pending_hitl": None,
+        # Explicit write, not an omission — see node_planner's P5a
+        # seeding comment on why an omitted plan_status key here would
+        # RETAIN "judged" on the checkpoint channel instead of releasing
+        # the barrier.
+        "plan_status": "approved",
+        "phase": "dispatch",
+        # B: explicit on every approval pass (even an idempotent replay with
+        # nothing new to materialise) — see node_planner's identical
+        # LastValue-clear rationale.
+        "plan_superseded_task_ids": list(
+            getattr(state, "plan_placeholder_task_ids", None) or []
+        ),
+    }
+    if new_tasks_by_step_id:
+        patch["tasks"] = list(new_tasks_by_step_id.values())
+    return patch
 
 
 def build_supervisor(
@@ -1407,6 +1661,16 @@ def build_supervisor(
         # the gates below (and any later consumer of full_tasks) see it.
         # -----------------------------------------------------------------------
         _plan_gate_active = _plan_phase_on and plan_rigor != "trivial"
+        # Hydra#69 defect B: snapshot the whole-goal tasks THIS pass already
+        # synthesised (lines above, before the planning task itself is
+        # appended) -- these are the placeholders `materialise_plan_steps`
+        # supersedes on plan approval. Campaign/ingest pre-seeded tasks
+        # (`existing_tasks`) are NEVER placeholders (they predate this
+        # planner pass and must survive approval untouched), so only
+        # `synthesised_tasks` is captured here.
+        _whole_goal_placeholder_ids: list[str] = [
+            str(t.task_id) for t in synthesised_tasks
+        ]
         if _plan_gate_active and "planning" not in pre_seeded_squads:
             synthesised_tasks.append(TaskState(
                 owner_squad="planning",
@@ -1489,6 +1753,36 @@ def build_supervisor(
             "phase": "approval" if state.requires_human_approval else "dispatch",
             "plan_rigor": plan_rigor,
             "plan_rigor_source": plan_rigor_source,
+            # Hydra#69 defect B: explicit on EVERY planner pass (including
+            # `[]` when the plan gate is not active this pass) -- an omitted
+            # key on a LangGraph patch RETAINS the prior channel value
+            # instead of clearing it (LastValue-clear trap), which would
+            # leave a stale placeholder list from an earlier pass in place.
+            #
+            # Hydra#69 follow-up defect 5 (MED): a SECOND `node_planner`
+            # pass over the SAME checkpoint (a replay, or any re-invoke that
+            # re-runs this node rather than advancing past it) synthesises
+            # NOTHING new when every selected squad — including "planning"
+            # itself — is already in `pre_seeded_squads` from the first
+            # pass, so `_whole_goal_placeholder_ids` is `[]` on that second
+            # pass even though `_plan_gate_active` is still True. Writing
+            # `[]` here unconditionally (the LastValue-clear rule taken too
+            # literally) wiped out the FIRST pass's real placeholder ids,
+            # so a later approval's `materialise_plan_steps` had nothing
+            # left to supersede and the whole-goal placeholder kept
+            # dispatching alongside the plan's real step tasks. Only write
+            # a NEW value when this pass actually synthesised placeholders;
+            # otherwise explicitly carry the existing channel value forward
+            # (still an explicit write, not an omission — this is NOT the
+            # LastValue-clear trap, because the "intended value" on a no-op
+            # pass IS whatever was already recorded, not empty).
+            "plan_placeholder_task_ids": (
+                [] if not _plan_gate_active
+                else (
+                    _whole_goal_placeholder_ids if _whole_goal_placeholder_ids
+                    else list(getattr(state, "plan_placeholder_task_ids", None) or [])
+                )
+            ),
         }
         if _new_hitl_history:
             out["hitl_history"] = _new_hitl_history
@@ -1760,6 +2054,29 @@ def build_supervisor(
             })
         return out
 
+    def _decision_packet_task_fields(task: Any) -> dict[str, Any]:
+        """Hydra#69 round 5 defect 4: the SINGLE source for the fields every
+        `CSuiteDecisionPacket` constructed for a `TaskState` must carry.
+
+        Previously only `node_dispatch`'s sequential-loop `_build_payload`
+        threaded `acceptance_criteria`/`envelope_type` onto the packet
+        (Hydra#69 follow-up defect 6) — `_dispatch_best_of_n`'s per-candidate
+        packet and `_reflexion_retry`'s retry packet each hand-built their
+        own `CSuiteDecisionPacket` with neither field, so a best-of-N
+        candidate or a reflexion retry silently reverted to the DEFAULT
+        judge gate/rubric instead of the task's own acceptance criteria and
+        envelope type. Every `CSuiteDecisionPacket` constructor for a task
+        (`_build_payload`, `_dispatch_best_of_n`, `_reflexion_retry`) now
+        spreads this helper's output into its own packet instead of
+        hand-duplicating the field derivation a second/third time.
+        """
+        return {
+            "acceptance_criteria": (
+                list(getattr(task, "acceptance_criteria", None) or []) or None
+            ),
+            "envelope_type": getattr(task, "envelope_type", None),
+        }
+
     def _dispatch_best_of_n(
         state: HydraState,
         pack,
@@ -1802,6 +2119,9 @@ def build_supervisor(
                 target_repo_id=state.target_repo_id,
                 target_repo_subpath=getattr(task, "target_repo_subpath", None) or state.target_repo_subpath,
                 model_tier=getattr(task, "model_tier", None),
+                # Hydra#69 round 5 defect 4: single shared source — see
+                # `_decision_packet_task_fields`'s docstring.
+                **_decision_packet_task_fields(task),
             )
             try:
                 result = execute_squad(state, pack, payload, dispatcher)
@@ -2127,6 +2447,12 @@ def build_supervisor(
                 model_tier=getattr(task, "model_tier", None),
                 pp_team=getattr(task, "pp_team", None),
                 pp_profile=getattr(task, "pp_profile", None),
+                # Hydra#69 follow-up defect 6 / round 5 defect 4: same fields
+                # the attended request text folds in (cli.py, defect E) —
+                # carried through here (via the single shared helper) so the
+                # detached/fleet leg, best-of-N candidates, and reflexion
+                # retries all get them too.
+                **_decision_packet_task_fields(task),
             )
 
         # WS8 Fix 5: build EVERY pending task's payload EXACTLY ONCE, up-front,
@@ -2149,6 +2475,10 @@ def build_supervisor(
         # Non-mcp tasks (impersonation/claude-skill/stub) are never fleet-eligible
         # because they race on state.error_counters and ignore target_repo_id
         # (fleet.py engineering-only eligibility). They remain on the sequential path.
+        # Hydra#69 defect F: filter out stale-revision/superseded/deps-unmet
+        # tasks BEFORE fleet selection — otherwise a superseded plan
+        # placeholder or step task could be fanned out to the fleet even
+        # though the sequential loop above would have skipped it.
         _fleet_candidate_tasks: list[TaskState] = [
             t for t in _dispatch_tasks
             if t.status == "pending"
@@ -2156,6 +2486,7 @@ def build_supervisor(
             and not (packs[t.owner_squad].best_of_n and packs[t.owner_squad].best_of_n >= 2)
             and packs[t.owner_squad].entrypoint == "mcp"  # Fix 3+4: mcp-only
             and id(t) in _all_task_payloads  # skip tasks whose payload build failed
+            and task_eligible_for_dispatch(state, t)
         ]
         # Alias: fleet candidates share the already-built payloads.
         _fleet_candidate_payloads: dict[int, Any] = {
@@ -2490,10 +2821,12 @@ def build_supervisor(
                 continue
             if _barrier_active and task.owner_squad != "planning":
                 continue
-            # P1: a stale-revision task (superseded by a replan) never
-            # dispatches. tasks is append-only, so a superseded plan's step
-            # tasks would otherwise execute after a replan.
-            if getattr(task, "plan_revision", 0) and task.plan_revision != state.plan_revision:
+            # Hydra#69 defect F: one shared predicate — stale-revision,
+            # explicitly-superseded (the revision-0 placeholder case), and
+            # unmet plan_deps_satisfied. tasks is append-only, so a
+            # superseded plan's step tasks (or a supplanted whole-goal
+            # placeholder) would otherwise execute after a replan/approval.
+            if not task_eligible_for_dispatch(state, task):
                 continue
             pack = packs.get(task.owner_squad)
             if pack is None:
@@ -2948,6 +3281,11 @@ def build_supervisor(
                 getattr(_retry_task, "target_repo_subpath", None) or state.target_repo_subpath
             ),
             model_tier=_retry_model_tier,
+            # Hydra#69 round 5 defect 4: single shared source — see
+            # `_decision_packet_task_fields`'s docstring. `_retry_task` may
+            # be None (legacy-envelope fallback exhausted); the helper
+            # tolerates that via `getattr(None, ..., None)`.
+            **_decision_packet_task_fields(_retry_task),
         )
 
         try:
@@ -4276,6 +4614,15 @@ def build_supervisor(
             "remaining_budget_usd": remaining_budget,
             "over_plan_budget": over_plan_budget,
             "verdict_outcome": verdict_dict.get("outcome"),
+            # D3 (Hydra#69 part 3): the critique text previously lived ONLY in
+            # `state.verdicts` -- the plan gate render (approve/SKILL.md) and
+            # any MCP/checkpoint consumer of `plan_detail` alone never saw
+            # WHY the judge reached its outcome. Truncated (not the raw,
+            # unbounded critique_md) to keep plan_detail's JSON size bounded
+            # the same way every other trace/checkpoint field is; a trailing
+            # marker makes a cut visible instead of silently swallowing text.
+            "verdict_critique": _truncate_plan_critique(verdict_dict.get("critique_md")),
+            "verdict_plan_revision": state.plan_revision,
             "step_count": len(plan_steps),
             "max_revisions": max_revisions,
             "revisions_used": max(0, state.plan_revision - 1),
@@ -4287,6 +4634,13 @@ def build_supervisor(
             # commit` -- say so rather than let the operator assume the
             # artifact is committed.
             "artifact_location": state.plan_artifact_location,
+            # Operator decision 2026-09-24: the repo id the plan artifact
+            # actually lives in (None when the workflow had no single
+            # engineering target and the artifact fell back to the Hydra
+            # project root -- see `plan_artifact_repo_root`), so a plan_gate
+            # render never has to guess which checkout `artifact_location`
+            # resolves against.
+            "artifact_repo_id": state.plan_artifact_repo_id,
             "artifact_committed": False,
             "judge_vendor": judge_vendor,
             "open_question_count": len(plan_ref.get("open_questions") or []),
@@ -4299,6 +4653,127 @@ def build_supervisor(
                 for s in plan_steps if isinstance(s, dict)
             ],
         }
+
+        # D4 (Hydra#69 part 3): the plan HTML is rendered ONCE at ingest
+        # (`hydra_core.ingest.dispatch_ingested_envelopes`'s PLAN branch),
+        # BEFORE this node ever runs -- so the artifact on disk always says
+        # "No verdict recorded yet." even after a real verdict exists. Node
+        # functions here ARE inside `build_supervisor`'s closure over
+        # `dispatcher`/`project_root` (the same two values the ingest PLAN
+        # branch uses), so writing a repo artifact from this graph node is
+        # not architecturally disallowed -- re-render through the SAME
+        # `render_plan_html` + `write_repo_artifact` path ingest uses (no
+        # second writer), reusing `plan_ref` (the same dict the judge above
+        # was handed) to reconstruct the `Plan` model. Fail-soft: a re-render
+        # failure must never break the gate -- only a trace event marks it.
+        try:
+            if plan_ref and state.plan_artifact_location and str(
+                state.plan_artifact_location
+            ).startswith("repo:artifact:"):
+                from .artifact_store import (
+                    ArtifactStoreError,
+                    resolve_repo_artifact_path,
+                    write_repo_artifact,
+                )
+                from .plan_artifact import (
+                    extract_governance_section,
+                    extract_plan_provenance,
+                    plan_artifact_repo_root,
+                    render_plan_html,
+                )
+
+                _relpath = str(state.plan_artifact_location)[len("repo:artifact:"):]
+                _default_root = getattr(dispatcher, "project_root", None) or project_root
+                if _default_root is None:
+                    raise ArtifactStoreError(
+                        "no project_root available; cannot re-render the plan artifact"
+                    )
+                # Operator decision 2026-09-24: reuse the SAME resolved root
+                # `hydra_core.ingest`'s PLAN branch recorded on `state`
+                # (`plan_artifact_repo_root`, precedence 1 -- a recorded
+                # root always wins) rather than re-deriving it, so this
+                # re-render can never disagree with where the artifact was
+                # actually written.
+                _repo_root, _ = plan_artifact_repo_root(
+                    state, _default_root, purpose="read",
+                    emit=lambda k, p: emit_trace(judge_trace_root, state.workflow_id, k, p),
+                )
+                _plan_model_for_render = Plan.model_validate(plan_ref)
+                _existing_path = resolve_repo_artifact_path(_repo_root, _relpath)
+                _existing_html = (
+                    _existing_path.read_text(encoding="utf-8")
+                    if _existing_path.is_file() else ""
+                )
+
+                # Stale-write guard (cross-vendor judge revision finding
+                # #2): (a) the verdict was computed against THIS state's
+                # `plan_ref`, so its own plan_revision must match
+                # `state.plan_revision` -- a mismatch means `plan_ref` and
+                # `state.plan_revision` have drifted apart (should never
+                # happen, but a stale write is exactly the failure mode this
+                # guard exists to catch, so refuse rather than assume). (b)
+                # the artifact path is deterministic from goal+workflow_id
+                # ALONE (see `plan_slug`), shared across every revision -- a
+                # checkpoint replay invoking this node with an OLDER `state`
+                # snapshot after a NEWER revision's artifact already exists
+                # on disk must not clobber it. `extract_plan_provenance`
+                # reads the revision/envelope id the CURRENT on-disk artifact
+                # already carries (every `render_plan_html` call emits both,
+                # from the very first ingest-time write) and this render is
+                # only allowed to proceed when the artifact on disk is not
+                # already at or past the revision this render carries.
+                _on_disk_revision, _on_disk_envelope_id = extract_plan_provenance(_existing_html)
+                _render_is_stale = (
+                    _plan_model_for_render.plan_revision != state.plan_revision
+                ) or (
+                    _on_disk_revision is not None
+                    and (
+                        _on_disk_revision > _plan_model_for_render.plan_revision
+                        or (
+                            _on_disk_revision == _plan_model_for_render.plan_revision
+                            and _on_disk_envelope_id is not None
+                            and _on_disk_envelope_id != str(_plan_model_for_render.id)
+                        )
+                    )
+                )
+                if _render_is_stale:
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "plan_judge.artifact_rerender_skipped_stale", {
+                            "plan_artifact_location": state.plan_artifact_location,
+                            "verdict_plan_revision": state.plan_revision,
+                            "plan_ref_revision": _plan_model_for_render.plan_revision,
+                            "on_disk_revision": _on_disk_revision,
+                            "on_disk_envelope_id": _on_disk_envelope_id,
+                        },
+                    )
+                else:
+                    _judge_verdict_text = (
+                        f"outcome={verdict_dict.get('outcome') or 'unknown'}; "
+                        f"judge_vendor={judge_vendor}; plan_revision={state.plan_revision}. "
+                        + (plan_detail.get("verdict_critique") or "")
+                    ).strip()
+                    _governance_section = extract_governance_section(_existing_html)
+                    _rerendered = render_plan_html(
+                        _plan_model_for_render, judge_verdict=_judge_verdict_text,
+                    )
+                    if _governance_section:
+                        _rerendered = (
+                            _rerendered.rstrip("\n") + "\n" + _governance_section + "\n"
+                        )
+                    write_repo_artifact(_repo_root, _relpath, _rerendered)
+                    emit_trace(
+                        judge_trace_root, state.workflow_id,
+                        "plan_judge.artifact_rerendered", {
+                            "plan_artifact_location": state.plan_artifact_location,
+                            "plan_revision": state.plan_revision,
+                        },
+                    )
+        except Exception as exc:  # noqa: BLE001 — fail-soft: never break the gate
+            emit_trace(judge_trace_root, state.workflow_id, "plan_judge.artifact_rerender_failed", {
+                "plan_artifact_location": state.plan_artifact_location,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
         # Cross-vendor judge finding (item 2/6, HIGH): never format `None`
         # (the overflow sentinel) as a dollar amount -- report "unavailable"
@@ -4385,123 +4860,33 @@ def build_supervisor(
         """Post-resume bookkeeping for the `plan_approval` HITL gate.
 
         Runs only AFTER the operator resumes past the `plan_gate` interrupt —
-        the gate itself is rendered+filed by `node_plan_judge` above. Mirrors
-        `node_approval`'s clobber guard: only clear a gate this node owns, so
-        a different gate that landed via replay/update_state between the
-        operator's clear and this continuation is never silently discarded.
+        the gate itself is rendered+filed by `node_plan_judge` above. Thin
+        wrapper around the module-level `materialise_plan_steps` (Hydra#69
+        defect A) — that function IS the decision; this node exists only
+        because the compiled graph needs a callable with this name at this
+        position. `hydra_core.cli`'s attended `--gate-only` resume handler is
+        the SECOND caller of `materialise_plan_steps`, for the case where
+        `sup.invoke` never runs this node at all — see that function's
+        docstring for the full rationale (idempotency, defect H's bypass
+        no-op, defect E's acceptance_criteria/envelope_type propagation,
+        defect B's placeholder supersession).
 
-        P5b Task 4: materialises one `TaskState` per `PlanStep` HERE, ON
-        APPROVAL ONLY — never in ingest, never at "drafted". `state.tasks` is
-        append-only (the `_append` reducer in state.py), so nothing can ever
-        delete a task once appended; materialising earlier would leave a
-        rejected or superseded revision's steps selectable forever (a
-        rejected plan never reaches this node at all today — see the
-        docstring above — but a REVISED plan does re-author and re-judge, and
-        only the newest revision's steps should ever become tasks). Each
-        materialised task is stamped with `plan_revision=state.plan_revision`
-        so the four stale-revision-aware selectors (`_next_attended_task`,
-        `_next_stub_attended_task`, `_attended_pending_task_ids` in cli.py,
-        and node_dispatch's own sequential loop, above) skip a step task from
-        an older revision exactly the way they already skip any other
-        stale-revision task.
-
-        Idempotent PER STEP, not per node-execution. `hydra replay` re-invokes
-        the graph from a checkpoint snapshot at `--from-phase`; a snapshot
-        taken at or after `plan_gate` already carries the first
-        materialisation's tasks, so replaying through this node again -- or
-        any other path that re-raises the `plan_approval` gate and re-runs
-        this node against the same revision -- must not re-materialise a step
-        that already has a same-revision TaskState. `state.tasks` is
-        append-only, so a node-level "have I run" flag would either
-        under-materialise a partially-applied prior run or, done wrong,
-        double it; checking per `plan_step_id` at the CURRENT `plan_revision`
-        converges on exactly one task per step per revision regardless of
-        whether the previous materialisation was complete or partial. A step
-        at an OLDER revision is unaffected — it still materialises fresh here
-        under the new revision, which is the revision-bump case this
-        docstring's paragraph above already covers.
+        Hydra#69 follow-up defect 2 (HIGH): the real closure for "a detached
+        `--action modify-budget` at plan_gate must never reach dispatch" is
+        in `cli.py`'s resume handler -- `modify-budget` at plan_gate now
+        RETURNS before ever calling `sup.invoke` (on both the gate_only and
+        detached routes), so this node is never reached with a re-filed,
+        still-open gate. That guard lives at the CALL SITE, not here: this
+        node (and `materialise_plan_steps`) is also called directly by
+        `cli.py`'s own `--gate-only` approve path with the ORIGINAL
+        (pre-resolution) `pending_hitl` dict still attached to `state`
+        (`_pre_state` is the pre-patch snapshot) -- refusing here on
+        `isinstance(state.pending_hitl, dict)` would refuse every genuine
+        approval too, not just a re-filed one. See `materialise_plan_steps`'s
+        own docstring for the (deliberately narrower) other-gate guard it
+        keeps.
         """
-        cur = state.pending_hitl
-        if isinstance(cur, dict) and cur.get("gate_node") not in (None, "plan_gate"):
-            return {"phase": "approval"}
-
-        plan_ref = state.plan_ref if isinstance(state.plan_ref, dict) else {}
-        valid_steps = [s for s in (plan_ref.get("steps") or []) if isinstance(s, dict)]
-
-        # Steps already materialised THIS revision (a replay, or a re-raised
-        # gate re-running this node) must not be re-created.
-        existing_by_step_id: dict[str, TaskState] = {
-            str(t.plan_step_id): t
-            for t in (getattr(state, "tasks", None) or [])
-            if t.plan_step_id and t.plan_revision == state.plan_revision
-        }
-
-        new_tasks_by_step_id: dict[str, TaskState] = {}
-        for step in valid_steps:
-            step_id = str(step.get("step_id") or "")
-            if (not step_id or step_id in existing_by_step_id
-                    or step_id in new_tasks_by_step_id):
-                # Already materialised this revision, or a defensive skip of
-                # a duplicate step_id (Plan._validate_dag already rejects
-                # duplicates at construction; this is belt-and-suspenders).
-                continue
-            new_tasks_by_step_id[step_id] = TaskState(
-                owner_squad=step.get("target_squad") or "engineering",
-                description=step.get("description") or "",
-                priority=step.get("priority") or "P2",
-                model_tier=step.get("model_tier"),
-                target_repo_id=step.get("target_repo_id"),
-                target_repo_subpath=step.get("target_repo_subpath"),
-                plan_step_id=step_id,
-                plan_revision=state.plan_revision,
-            )
-
-        # Second pass: translate each PlanStep's step_id-keyed `depends_on`
-        # into the task_id-keyed `depends_on` TaskState/plan_deps_satisfied
-        # actually read. The lookup map covers BOTH already-existing
-        # (this-revision) tasks and the newly created ones — a new step's
-        # dependency on an already-materialised step must resolve to the
-        # EXISTING task's id, not be silently dropped (dropping it would
-        # release the new step with its prerequisite unsatisfied, which is
-        # worse than the duplicate this idempotency guard fixes). Only newly
-        # created tasks need their `depends_on` set here — an existing task's
-        # `depends_on` was already resolved and stamped when IT was first
-        # materialised, and it is not re-emitted in this patch.
-        task_id_by_step_id: dict[str, str] = {
-            sid: str(t.task_id) for sid, t in existing_by_step_id.items()
-        }
-        task_id_by_step_id.update(
-            {sid: str(t.task_id) for sid, t in new_tasks_by_step_id.items()}
-        )
-        for step in valid_steps:
-            step_id = str(step.get("step_id") or "")
-            task = new_tasks_by_step_id.get(step_id)
-            if task is None:
-                continue
-            task.depends_on = [
-                task_id_by_step_id[str(dep)]
-                for dep in (step.get("depends_on") or [])
-                # Belt-and-braces, not a reachable case: Plan._validate_dag
-                # already rejects a dangling `depends_on` (an id naming no
-                # step in the plan) at construction, for every plan_ref this
-                # dict came from a validated Plan. This filter's only live
-                # purpose is dropping a dependency on a step this SAME call
-                # skipped as a defensive duplicate, above.
-                if str(dep) in task_id_by_step_id
-            ]
-
-        patch: dict[str, Any] = {
-            "pending_hitl": None,
-            # Explicit write, not an omission — see node_planner's P5a
-            # seeding comment on why an omitted plan_status key here would
-            # RETAIN "judged" on the checkpoint channel instead of releasing
-            # the barrier.
-            "plan_status": "approved",
-            "phase": "dispatch",
-        }
-        if new_tasks_by_step_id:
-            patch["tasks"] = list(new_tasks_by_step_id.values())
-        return patch
+        return materialise_plan_steps(state)
 
     # ----- routing edges -----
 

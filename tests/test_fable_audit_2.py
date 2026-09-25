@@ -1694,17 +1694,44 @@ class TestRiderBRecoverySafeOrdering:
 
     def test_mark_charged_before_charge_and_gate_in_source(self):
         """Source-order guard: the CALL to mark_charged must precede the CALL to
-        charge_and_gate in _cmd_attended_submit (crash-ordering: under-charge on
-        crash is safer than double-charge).
+        charge_and_gate (crash-ordering: under-charge on crash is safer than
+        double-charge).
 
-        We match the actual call sites (not the import statement for charge_and_gate,
-        which appears earlier) to pin execution order, not declaration order.
+        T-1 (step-poll refactor, commit e201b69): this ordering used to live
+        directly inside ``_cmd_attended_submit``. It has since been factored
+        out into the SHARED ``_reconcile_attended_terminal_checkpoint`` (so
+        every terminal-driving caller -- `_cmd_attended_submit`, the
+        step-poll/self-heal helpers, and `_cmd_recover_stalled_stage` --
+        reaches identical charge/reconciliation bookkeeping, not a second
+        hand-rolled copy per caller). The ordering invariant itself did not
+        change, only WHICH function's source holds it -- inspect that
+        function directly, and independently confirm `_cmd_attended_submit`
+        still delegates to it (never re-inlines its own copy of the charge
+        logic, which would let the two drift apart again).
         """
         import inspect
         from hydra_core import cli as cli_mod
-        src = inspect.getsource(cli_mod._cmd_attended_submit)
-        # Match the actual CALL sites, not the import at the top of the function.
-        # mark_charged call: "mark_charged(cfile)"
+
+        submit_src = inspect.getsource(cli_mod._cmd_attended_submit)
+        assert "_reconcile_attended_terminal_checkpoint(" in submit_src, (
+            "_cmd_attended_submit must delegate its terminal charge/"
+            "reconciliation bookkeeping to the shared "
+            "_reconcile_attended_terminal_checkpoint function, not re-inline "
+            "its own copy of the charge ordering"
+        )
+
+        src = inspect.getsource(cli_mod._reconcile_attended_terminal_checkpoint)
+        # Match the actual CALL sites, not the import statement for charge_and_gate,
+        # which appears earlier) to pin execution order, not declaration order.
+        # mark_charged call: "host_bridge.mark_charged(cfile)" -- the FULLY
+        # QUALIFIED form, deliberately NOT the bare "mark_charged(cfile)":
+        # this function's own docstring quotes the bare form in its
+        # crash-ordering rationale comment ("1. mark_charged(cfile) <-
+        # cursor sidecar flagged first"), which appears BEFORE the real call
+        # -- matching the bare form would silently pin position 0 to that
+        # prose instead of the actual call, defeating the ordering check
+        # (verified live: reversing the real call order still "passed" a
+        # bare-form match against this docstring).
         # charge_and_gate call: the "charge_and_gate(" invocation that follows
         # mark_charged, keyed on "source=cost_source" appearing in the same
         # call (not just the import statement further up).
@@ -1713,9 +1740,10 @@ class TestRiderBRecoverySafeOrdering:
         # call now also forwards estimated_usd=; the call site's SHAPE
         # changed, but the ordering this test pins is unchanged.)
         import re
-        idx_mark = src.find("mark_charged(cfile)")
+        idx_mark = src.find("host_bridge.mark_charged(cfile)")
         assert idx_mark != -1, (
-            "mark_charged(cfile) call must appear in _cmd_attended_submit"
+            "host_bridge.mark_charged(cfile) call must appear in "
+            "_reconcile_attended_terminal_checkpoint"
         )
         # Match the real invocation ("charge_and_gate(state, ..." or
         # "charge_and_gate(\n    state, ..."), not a bare "charge_and_gate(...)"
@@ -1749,8 +1777,8 @@ class TestRiderBRecoverySafeOrdering:
             break
         assert m is not None, (
             "a charge_and_gate(state, ...) call must appear in "
-            "_cmd_attended_submit (excluding the import statement and any "
-            "comment mentions)"
+            "_reconcile_attended_terminal_checkpoint (excluding the import "
+            "statement and any comment mentions)"
         )
         call_snippet = src[idx_charge:idx_charge + 200]
         assert "source=cost_source" in call_snippet, (
@@ -1760,8 +1788,9 @@ class TestRiderBRecoverySafeOrdering:
         assert idx_mark < idx_charge, (
             f"Rider (b) recovery-safe ordering: mark_charged call (pos {idx_mark}) must "
             f"appear BEFORE charge_and_gate call (pos {idx_charge}) in "
-            "_cmd_attended_submit. A crash between them is an under-charge (acceptable); "
-            "the reverse ordering would be a double-charge (unsafe)."
+            "_reconcile_attended_terminal_checkpoint. A crash between them is an "
+            "under-charge (acceptable); the reverse ordering would be a "
+            "double-charge (unsafe)."
         )
 
     def test_cursor_round_trip_already_charged_after_mark(self, tmp_path):

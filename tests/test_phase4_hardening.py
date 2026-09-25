@@ -60,7 +60,14 @@ class FakeDispatcher:
 
 @pytest.fixture(autouse=True)
 def _smoke_passes(monkeypatch):
-    """Default: smoke always passes so happy-path tests don't need a real build."""
+    """Default: smoke always passes so happy-path tests don't need a real build.
+
+    Hydra#70: this module's tests assert on the SYNCHRONOUS inline finalize
+    (monkeypatching ``_run_smoke`` directly and reading an immediate terminal
+    cursor) — force ``HYDRA_ATTENDED_SMOKE_MODE=sync`` so that keeps working.
+    The async detached-job path is covered by ``tests/test_hydra70_async_smoke.py``.
+    """
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(host_bridge, "_run_smoke",
                         lambda *a, **k: ("pass", "fixture smoke pass"))
 

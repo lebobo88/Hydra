@@ -193,6 +193,16 @@ class TaskState(BaseModel):
     # existing checkpoint loads fine with both None.
     plan_critique: Optional[str] = None
     supersedes_plan_envelope_id: Optional[str] = None
+    # Hydra#69 defect E: the PlanStep's own `envelope_type` (PRD/ARCH_RFC/
+    # DEV_TASK/...), copied onto the materialised TaskState so
+    # `_attended_task_gate_type` / the attended engineering `start_run` call
+    # (hydra_core.cli, `_start_run_args["hydra_envelope_type"]`) can see the
+    # real gate type instead of always reading `getattr(task,
+    # "envelope_type", None)` as None -- the field never existed on TaskState
+    # before this, so that getattr's default was the only value ever
+    # produced. None for tasks that predate planning or were not
+    # materialised from a PlanStep.
+    envelope_type: Optional[str] = None
 
 
 class HydraState(BaseModel):
@@ -371,6 +381,96 @@ class HydraState(BaseModel):
     # re-synthesizing (which would double-write episodic rows).
     attended_finalized_record_id: Optional[str] = None
 
+    # Hydra#69 defect C: per-task attempt counter for a ``planning``-owned
+    # attended squad cursor. ``_cmd_attended_submit`` increments the entry for
+    # a task_id each time its emitted PLAN is rejected (missing/invalid PLAN,
+    # HYDRA_PLAN_PHASE disabled, artifact write failure, graph re-entry
+    # failure) instead of writing the task attended-complete. The next
+    # `_cmd_attended_step` re-issue reads this to mint
+    # ``call_key = f"squad-{task_id}-{attempt}"`` (host_bridge.begin_squad_stage)
+    # so a late response from a rejected attempt can never match the newly
+    # issued cursor's call_key. `_merge_dict` reducer so an out-of-graph
+    # `update_state` can grow it key-by-key like `error_counters`.
+    plan_submit_attempts: Annotated[dict[str, int], _merge_dict] = Field(default_factory=dict)
+
+    # Hydra#69 round 5 defect 2 (HIGH): keyed by ``f"{run_id}:{call_key}"``,
+    # set to ``True`` in the SAME ``sup.update_state`` patch that persists
+    # the ``budget`` charge for a terminal ``_cmd_attended_submit`` call
+    # (cli.py). The cursor-side ``host_bridge.mark_charged`` flag alone only
+    # proves the sidecar file was updated -- it says nothing about whether
+    # the CHECKPOINT write that should have landed alongside it (budget,
+    # attended_completed_task_ids/attended_done_task_ids, attended_results,
+    # plan_submit_attempts) actually persisted. A retried submit against an
+    # already-``charged`` cursor now checks THIS marker, not just the cursor
+    # flag, before treating the checkpoint as reconciled: an unset marker
+    # means the earlier checkpoint write never landed and the retry must
+    # repair it (without re-charging the budget, since the cursor already
+    # reports ``already_charged``). `_merge_dict` reducer so concurrent
+    # per-call reconciliation writes never clobber each other's keys.
+    attended_checkpoint_reconciled: Annotated[dict[str, bool], _merge_dict] = Field(
+        default_factory=dict)
+
+    # Hydra#69 round 6 defect 1 (HIGH): the round 5 marker above was written
+    # too early -- as part of the SAME atomic write as the budget charge,
+    # which lands BEFORE the later downstream checkpoint writes a terminal
+    # `_cmd_attended_submit` call still has to make (attempt-counter bump,
+    # PLAN acceptance/rejection outcome, attended_completed_task_ids /
+    # attended_results for a planning task). A crash after the charge write
+    # but before one of those later writes left `attended_checkpoint_reconciled`
+    # already `True`, so an identical retry took the cached-result shortcut
+    # and returned `ok: True` with the later writes still missing. This
+    # marker is CHARGE evidence only -- ``True`` means `charge_and_gate` has
+    # already run and its budget/downgrade outcome for this call is
+    # persisted (keyed the same way as `attended_checkpoint_reconciled`) --
+    # so a retry can skip re-charging without yet being fully reconciled.
+    # `attended_checkpoint_reconciled` is now written ONLY after every
+    # downstream write for the call has succeeded, making it a true
+    # fully-reconciled marker the cached-result shortcut can trust.
+    # `_merge_dict` reducer, same rationale as its sibling above.
+    attended_charge_applied: Annotated[dict[str, dict], _merge_dict] = Field(
+        default_factory=dict)
+
+    # Hydra#69 round 6 item 3 (redesign): the durable record of the ONE
+    # terminal (abort, or reject at any gate) resolution that ended this
+    # workflow, if any -- {gate_node, hitl_request_id, action, option,
+    # plan_revision, resolved_at}. Written in the SAME single
+    # `as_node="postcheck"` checkpoint write (`cli.py`'s `_cmd_resume_
+    # locked`) that also clears `pending_hitl` / parks `phase="surfaced"`
+    # for EVERY abort/reject at ANY gate, including the bare-interrupt
+    # reject/abort paths (a bare interrupt has no `pending_hitl` dict, so
+    # `gate_node`/`hitl_request_id` are `None` there).
+    #
+    # `hitl_request_id` is the resolved gate's own envelope `id` when the
+    # gate was filed via `HITLRequest` (most gates); a handful of ad-hoc
+    # `pending_hitl` dicts built directly in `supervisor.py` (e.g. the
+    # `intake` bad-`--repo`-arg gates) never carried an `id` at all -- for
+    # those this is `None` and `gate_node` (plus, for `plan_gate`,
+    # `plan_revision`) remains the identity a consumer keys on.
+    #
+    # The bare-interrupt resume branch consults THIS field directly instead
+    # of scanning `hitl_history` -- a later non-resolution note appended to
+    # `hitl_history` (e.g. the `plan_gate_bypassed` force-dispatch marker, a
+    # `plan_governance_note_failed` trace-adjacent note) can therefore never
+    # mask an earlier terminal reject the way a "read only the latest
+    # `hitl_history` entry" scan could. `None` while this workflow has never
+    # had a terminal resolution recorded on THIS field -- which is also true
+    # of a checkpoint written before this field existed (the Pydantic
+    # default, matching every other additive field). That legacy gap -- and the case of
+    # a checkpoint that genuinely predates this fix -- is covered by
+    # `cli._bare_interrupt_terminal_resolution`, kept as a
+    # `hitl_history`-scanning FALLBACK used ONLY when this field reads back
+    # `None`.
+    #
+    # Never silently cleared: once set, a workflow stays terminal for the
+    # rest of its life. No write path in this engine re-opens a terminal
+    # workflow (grepped: nothing re-sets `pending_hitl` to a fresh gate, and
+    # `plan_status`/`phase` never move off their terminal values, after a
+    # terminal write) -- if a future change legitimately needs to, it must
+    # explicitly write `terminal_resolution=None` in that same patch (plain
+    # `LastValue` channel, no reducer: `update_state` must write the FULL
+    # intended value or the channel keeps whatever it already held).
+    terminal_resolution: Optional[dict[str, Any]] = None
+
     # P0 planning substrate. Plain replace-by-default fields, no reducers: a
     # planning re-run REPLACES the prior plan snapshot rather than
     # accumulating history. P1 (plan_barrier_active, below) now reads
@@ -393,10 +493,79 @@ class HydraState(BaseModel):
     # a derived one) so replay reproduces the same override.
     plan_rigor_override: Optional[Literal["trivial", "standard", "major"]] = None
     plan_envelope_id: Optional[UUID] = None
+    # Hydra#69 follow-up defect 3 (HIGH): the predecessor envelope id a
+    # REVISION's authoring PLAN must name in its `supersedes` field, set
+    # ONCE by `--modify-plan` when it opens the new revision (cli.py) and
+    # NEVER overwritten by anything else -- in particular not by
+    # `_reenter_graph_after_dispatch`'s `plan_envelope_id` write (ingest.py's
+    # `outcome.plan_patch`), which happens BEFORE the revision's PLAN is
+    # actually judged and can therefore be checkpointed even when the
+    # subsequent graph re-entry (plan_judge) then fails. Before this field
+    # existed, `ingest.py` validated a revision's `supersedes` against
+    # `state.plan_envelope_id` directly -- which a failed re-entry attempt
+    # had already advanced to the FAILED attempt's own new envelope id,
+    # rejecting the operator's correctly-addressed resubmission (which still
+    # names the true predecessor, revision-1's envelope id) as a
+    # `supersedes` mismatch. Explicit write, not an omission, when
+    # `--modify-plan` opens a revision; retained (never cleared) across a
+    # failed or retried re-entry so the expectation survives exactly as many
+    # attempts as it takes to land.
+    plan_supersedes_expected: Optional[str] = None
     plan_ref: Optional[dict[str, Any]] = None
     plan_revision: int = 0
     plan_approved_at: Optional[datetime] = None
     plan_artifact_location: Optional[str] = None
+    # Operator decision 2026-09-24: the plan artifact belongs in the
+    # workflow's TARGET repo's docs/plans/, not Hydra's own working tree.
+    # `plan_artifact_location` (above) is a bare MemoryRef key
+    # (``repo:artifact:<relpath>``) with no repo identity, so a reader that
+    # only had that key could not tell which repo it lived in -- every
+    # existing reader (ingest's own write, node_plan_judge's verdict
+    # re-render, the force-dispatch governance note, and --critique-ref
+    # resolution) used to independently default to `dispatcher.project_root`
+    # (the Hydra checkout), which is wrong whenever the workflow targets a
+    # sibling repo. These two fields are written ONCE, in the SAME patch
+    # that first sets `plan_artifact_location` (`hydra_core.ingest`'s PLAN
+    # branch, via `hydra_core.plan_artifact.plan_artifact_repo_root`), and
+    # every subsequent reader uses the recorded root instead of re-deriving
+    # it -- so a write and a later read (possibly issued from a different
+    # process/session) can never disagree about which repo the artifact
+    # lives in. `plan_artifact_repo_id` is the allow-listed
+    # `hydra_core.repo_registry` id that resolved (None when the workflow
+    # had no single engineering target and the artifact fell back to the
+    # Hydra project root); `plan_artifact_root` is that resolution's
+    # absolute path, persisted so a reader never has to re-run
+    # `resolve_repo_path` (and never re-hits its allow-list/git-toplevel
+    # checks) just to find the file `plan_artifact_location` already names.
+    # A checkpoint from before this field existed (a "legacy checkpoint")
+    # reads back `None` here -- `plan_artifact_repo_root`'s fallback then
+    # behaves exactly like the old, single-root code (Hydra project root),
+    # so the five untracked warerender-gta plan artifacts already sitting
+    # under Hydra/docs/plans keep resolving exactly where they already are.
+    plan_artifact_repo_id: Optional[str] = None
+    plan_artifact_root: Optional[str] = None
+    # Hydra#69 defect B: task_ids of the whole-goal TaskStates `node_planner`
+    # synthesises in the SAME pass it seeds the "planning" task (while the
+    # plan gate is active). These placeholders exist only so a plan-active
+    # workflow still has *a* task per selected squad on record; once the
+    # plan is approved, `materialise_plan_steps` supersedes them with the
+    # plan's real per-step tasks. Replace-by-default (not `_append`): a
+    # revision bump does not create new placeholders, so this stays the
+    # ids from the FIRST planner pass for the life of the workflow. Explicit
+    # write on every `node_planner` pass (including `[]` when the plan gate
+    # is not active) — see the LangGraph LastValue-clear note above.
+    plan_placeholder_task_ids: list[str] = Field(default_factory=list)
+    # Hydra#69 defect B: task_ids the plan's approval superseded (today,
+    # always a copy of `plan_placeholder_task_ids` at the moment
+    # `materialise_plan_steps` approves the plan). Replace-by-default so a
+    # later revision (or a defensive re-write) can update it without
+    # duplicating. `task_eligible_for_dispatch` below excludes any task_id
+    # in this set from ever being selected/dispatched again — this is what
+    # stops the whole-goal placeholder task (materialised at
+    # `plan_revision=0`, which the OLDER stale-revision-only filter did not
+    # catch because 0 is falsy) from dispatching after the plan's real step
+    # tasks take over.
+    plan_superseded_task_ids: list[str] = Field(default_factory=list)
 
     def bump_iteration(self) -> None:
         self.iteration_count += 1
@@ -513,6 +682,131 @@ def plan_revision_ceiling_reached(plan_revision: int, max_revisions: int) -> boo
     return max(0, plan_revision - 1) >= max_revisions
 
 
+def workflow_terminal_resolution(
+    values: dict, snap_next: "tuple | list | set" = (),
+) -> dict | None:
+    """Hydra#69 round 6 remaining-gap fix: the ONE predicate deciding whether
+    a checkpoint's workflow has already been terminally resolved (aborted, or
+    rejected at any gate) -- and therefore may never be continued, re-entered,
+    or finalized by ANY caller.
+
+    Primary source of truth is the durable ``HydraState.terminal_resolution``
+    field, written atomically in the single ``as_node="postcheck"`` checkpoint
+    write for every abort/reject at any gate (including the bare-interrupt
+    reject/abort paths). Returned as-is when present -- independent of
+    ``snap_next``, since a terminal workflow is terminal whether or not the
+    graph happens to still show a pending next node.
+
+    Falls back to a LEGACY-ONLY reconstruction, used only when ``values``
+    carries no durable ``terminal_resolution`` (a checkpoint written before
+    that field existed, or one that has never had a terminal resolution
+    recorded on it at all): scans ``hitl_history`` for the latest entry that
+    actually records a resolution (has a ``"resolution"`` key at all --
+    skipping past trailing non-resolution notes like the ``plan_gate_bypassed``
+    force-dispatch marker or a governance note, which must never mask a real
+    terminal decision underneath them), and treats it as terminal only if its
+    ``gate_node`` matches a node the graph is CURRENTLY parked at
+    (``snap_next``) and -- for ``plan_gate`` -- its ``plan_revision`` matches
+    the checkpoint's current ``plan_revision`` (a resolution only ever binds
+    to the exact gate occurrence it actually resolved). Returns ``None`` for a
+    genuine bare interrupt with no terminal history at the parked gate at all
+    (the MU7 case: graph paused before synthesis/judge_synthesis, never
+    resolved) -- callers must still allow that to continue.
+
+    This is the SINGLE implementation of both checks; every caller (resume,
+    attended-step, finalize, and any future entry point that can advance a
+    workflow) must consult this helper rather than re-deriving either the
+    durable read or the legacy scan, so they can never drift apart the way a
+    hand-duplicated predicate did before (see `plan_revision_ceiling_reached`
+    above for the same rationale).
+    """
+    terminal = values.get("terminal_resolution")
+    if isinstance(terminal, dict):
+        return terminal
+    hitl_history = values.get("hitl_history") or []
+    if not snap_next or not hitl_history:
+        return None
+    parked_at = set(snap_next)
+    current_plan_revision = values.get("plan_revision")
+    last: dict | None = None
+    for entry in reversed(hitl_history):
+        if not isinstance(entry, dict):
+            continue
+        if "resolution" not in entry:
+            # Legacy-path masking fix: a non-resolution note appended AFTER
+            # the real terminal decision must never be mistaken for "the
+            # latest entry" -- skip past it to find the actual resolution.
+            continue
+        last = entry
+        break
+    if last is None:
+        return None
+    if last.get("gate_node") not in parked_at:
+        return None
+    if last.get("gate_node") == "plan_gate":
+        # Instance identity: a plan_gate resolution only binds to the exact
+        # plan_revision it was recorded against.
+        if last.get("plan_revision") != current_plan_revision:
+            return None
+    if last.get("resolution") == "reject" or last.get("option") == "abort":
+        return last
+    return None
+
+
+def plan_gate_approve_evidence(state) -> dict | None:
+    """Hydra#69 round 6 defect 4 (LOW): the ONE predicate deciding whether
+    `hitl_history` proves a genuine (non-abort) `plan_gate` approve for
+    `state.plan_revision` -- factored out of `supervisor.materialise_plan_
+    steps` so `_cmd_attended_step` (cli.py) can never disagree with it about
+    whether a plan was actually approved. Previously `_cmd_attended_step`'s
+    own wedge-terminal used a DIFFERENT, looser check (any `hitl_history`
+    entry with `resolution == "approve"` and `gate_node == "plan_gate"` for
+    this revision) that did not exclude `option == "abort"` -- so an
+    operator's abort at `plan_gate` (which IS recorded with
+    `resolution == "approve", option == "abort"`, see the plan_gate's own
+    revision_ceiling_reached/unjudgeable_plan branches) was misreported by
+    `step` as `plan_approved_not_materialised` instead of the correct
+    terminal/unresolved status.
+
+    Returns the latest matching `hitl_history` entry (truthy) when it is
+    evidence of a genuine approve, or ``None`` when it is not (no matching
+    entry, the latest matching entry is an abort, or -- legacy policy -- an
+    unstamped entry that does not qualify per the rules below).
+
+    Policy (identical to `materialise_plan_steps`'s inline version this
+    replaces):
+      * scan `hitl_history` in reverse for the latest `plan_gate` entry
+        whose own `plan_revision` equals `state.plan_revision` exactly;
+      * a legacy (unstamped, no `plan_revision` key) entry counts ONLY when
+        `state.plan_revision <= 1` and no OTHER `plan_gate` entry in the
+        whole history carries an explicit `plan_revision` (i.e. the
+        checkpoint genuinely predates revisioning);
+      * the matched entry must have `resolution == "approve"` AND
+        `option != "abort"`.
+    """
+    history = state.hitl_history or []
+    any_stamped = any(
+        isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+        and e.get("plan_revision") is not None
+        for e in history
+    )
+    legacy_ok = state.plan_revision <= 1 and not any_stamped
+    latest_plan_gate_entry = next(
+        (e for e in reversed(history)
+         if isinstance(e, dict) and e.get("gate_node") == "plan_gate"
+         and (
+             e.get("plan_revision") == state.plan_revision
+             or (e.get("plan_revision") is None and legacy_ok)
+         )),
+        None,
+    )
+    if (latest_plan_gate_entry is None
+            or latest_plan_gate_entry.get("resolution") != "approve"
+            or latest_plan_gate_entry.get("option") == "abort"):
+        return None
+    return latest_plan_gate_entry
+
+
 def plan_barrier_active(state) -> bool:
     """True while a plan is mid-authoring/judging/rejected and dispatch should
     hold non-planning work. ``getattr`` with a "none" default so a checkpoint
@@ -548,6 +842,103 @@ def plan_deps_satisfied(state, task) -> bool:
             continue
         return False
     return True
+
+
+def task_eligible_for_dispatch(state, task) -> bool:
+    """Hydra#69 defect F: the ONE dispatch-eligibility predicate, used by
+    every reader that decides whether a task may still be selected/
+    dispatched: ``_next_attended_task``, ``_next_stub_attended_task``,
+    ``_attended_pending_task_ids``, the ``_blocked_deps`` list in
+    ``hydra_core.cli``'s attended ``step``, ``node_dispatch``'s sequential
+    loop, and the fleet candidate list (all in ``supervisor.py`` /
+    ``cli.py``). A prior generation of this logic was hand-duplicated at
+    each call site as ``getattr(t, "plan_revision", 0) and t.plan_revision
+    != state.plan_revision`` — a stale-revision-only check that silently
+    exempted ``plan_revision == 0`` (the ``TaskState`` default, and what
+    every pre-plan-phase whole-goal placeholder task carries) from ever
+    being excluded. Combines three independent reasons a task is not
+    eligible:
+
+    1. Explicitly superseded — its id is in ``state.plan_superseded_task_ids``
+       (set by ``materialise_plan_steps`` on plan approval; covers the
+       revision-0 placeholder case the old check missed).
+    2. Stale revision — it carries a non-zero ``plan_revision`` that does not
+       match the current ``state.plan_revision`` (a step task from a
+       superseded plan revision).
+    3. Blocked on an unmet dependency — ``plan_deps_satisfied`` is False.
+
+    A task excluded here is not necessarily "done" or "failed"; it may
+    simply not be selectable *yet* (case 3) or *ever again* (cases 1-2).
+    Callers that need to distinguish "still pending, but blocked" from
+    "resolved, stop counting it at all" read ``plan_deps_satisfied``
+    directly instead — see ``_attended_pending_task_ids``'s docstring.
+    """
+    tid = str(getattr(task, "task_id", ""))
+    superseded = set(getattr(state, "plan_superseded_task_ids", None) or [])
+    if tid in superseded:
+        return False
+    plan_rev = getattr(task, "plan_revision", 0)
+    if plan_rev and plan_rev != getattr(state, "plan_revision", 0):
+        return False
+    return plan_deps_satisfied(state, task)
+
+
+def task_retired(state, task) -> bool:
+    """Hydra#69 follow-up defect 4 (HIGH): the ``task_eligible_for_dispatch``
+    exclusion reasons split into two very different fates that finalize-time
+    accounting must NOT collapse into one another:
+
+    * cases 1-2 of ``task_eligible_for_dispatch`` (explicitly superseded, or
+      a stale ``plan_revision``) mean the task will NEVER dispatch again —
+      it is RETIRED, and correctly excluded from a "still pending" count.
+    * case 3 (an unmet dependency — ``plan_deps_satisfied`` is False) means
+      the task is simply not selectable YET; it is still genuinely pending
+      and unfinished work.
+
+    ``_attended_pending_task_ids`` used to filter with
+    ``task_eligible_for_dispatch`` alone, which conflated the two: a task B
+    blocked on an unfinished (surfaced, not attended-done) upstream A was
+    excluded from "pending" exactly like a retired task, so
+    ``_attended_pending_task_ids`` returned ``[]`` and ``hydra finalize``
+    proceeded straight to synthesis with B never having run at all. Use
+    THIS predicate for "has this task left the pool for good" accounting
+    (finalize's pending/blocked reporting); keep
+    ``task_eligible_for_dispatch`` for "may this task be selected right
+    now" (dispatch selection).
+    """
+    tid = str(getattr(task, "task_id", ""))
+    superseded = set(getattr(state, "plan_superseded_task_ids", None) or [])
+    if tid in superseded:
+        return True
+    plan_rev = getattr(task, "plan_revision", 0)
+    if plan_rev and plan_rev != getattr(state, "plan_revision", 0):
+        return True
+    return False
+
+
+def fold_acceptance_criteria_into_request_text(
+    request_text: str, acceptance_criteria: list[str] | None,
+) -> str:
+    """Hydra#69 follow-up defect 6 (MED): the ONE place acceptance criteria
+    get folded into an engineering request's text — used by BOTH the
+    attended host request builder (``cli.py``'s ``_cmd_attended_step``) and
+    the detached/fleet dispatch payload (``squad_node._via_mcp``, fed by
+    ``supervisor.py``'s shared ``_build_payload``). Before this helper
+    existed, only the attended path folded ``TaskState.acceptance_criteria``
+    into the text an engineer actually reads (Hydra#69 defect E) — a
+    detached or fleet-dispatched plan-step task silently dropped its
+    acceptance criteria on the floor, because ``_build_payload`` only ever
+    set ``objective=task.description`` on the shared ``CSuiteDecisionPacket``.
+    Both callers now build the SAME text from the SAME two inputs instead of
+    hand-duplicating the formatting.
+    """
+    ac = [c for c in (acceptance_criteria or []) if isinstance(c, str) and c.strip()]
+    if not ac:
+        return request_text
+    return (
+        f"{request_text}\n\nAcceptance criteria:\n"
+        + "\n".join(f"- {c}" for c in ac)
+    )
 
 
 class PoisonedStateError(Exception):

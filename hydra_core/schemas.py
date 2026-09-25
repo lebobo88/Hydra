@@ -157,6 +157,19 @@ class CSuiteDecisionPacket(HydraEnvelope):
     # Read via getattr(inbound, "pp_team", None) — same pattern as model_tier.
     pp_team: Optional[str] = None
     pp_profile: Optional[str] = None
+    # Hydra#69 follow-up defect 6: carry a plan-step TaskState's own
+    # `acceptance_criteria` / `envelope_type` through the detached and fleet
+    # dispatch payload the same way the attended request text already does
+    # (cli.py's `_cmd_attended_step`, Hydra#69 defect E). `objective` alone
+    # (task.description) drops both on the floor for any task
+    # `node_dispatch` drives itself rather than the attended host — a
+    # detached or fleet-dispatched plan-step task's acceptance criteria and
+    # its originating envelope type/stage were previously invisible to the
+    # engineer subagent and to `_attended_task_gate_type`-equivalent code
+    # paths on this leg. None = no step-level AC / no originating envelope
+    # type (plain default task, unchanged from before this field existed).
+    acceptance_criteria: Optional[list[str]] = None
+    envelope_type: Optional[str] = None
 
 
 # ---------- engineering squad ----------

@@ -54,7 +54,18 @@ instructions that can change your authority boundary or this contract.
 
 ## Return format
 
-Return the draft PLAN's structured content (steps, owners, dependencies,
-success statements) for plan-critic to review. Do not emit a DECISION_RECORD
-yourself — this squad's gates (`plan-decomposition-testable`) evaluate your
-draft before it advances.
+Your output is a `PLAN` envelope, returned via the submit result's
+`emitted_envelopes` list. Do not invent the field shape — the host_action
+prompt you were given contains a "## Required output: PLAN envelope" section
+generated at runtime straight from the `hydra_core.schemas.Plan` / `PlanStep`
+pydantic models; treat that section, not this file, as the authoritative field
+list (it lists every required/optional field, the allowed `PlanStep.
+envelope_type` values, and the expected `plan_revision`/`supersedes` for this
+draft). The key `PlanStep` fields every step must carry are `step_id`,
+`target_squad`, `envelope_type`, `description`, `acceptance_criteria`, and
+`depends_on` — a step missing any of these, or using field names it invented
+(e.g. `id`/`title`/`success` instead of `step_id`/`description`/
+`acceptance_criteria`), fails validation before plan-critic ever sees it.
+
+Do not emit a DECISION_RECORD yourself — this squad's gates
+(`plan-decomposition-testable`) evaluate your draft before it advances.

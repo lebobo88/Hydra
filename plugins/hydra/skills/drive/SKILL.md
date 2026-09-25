@@ -76,9 +76,34 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
         — pp vendor pinning rejects generator-identical producer+model, and
         the rejection currently surfaces only as an error payload).
    d. The response is either the next `host_action` (the judge, then the next
-      stage) or a terminal `{status:"complete"|"surfaced"}` carrying the real
-      `final_status`, smoke result, `merge`, and budget charge. On terminal, go
-      back to (a) for the next stage.
+      stage), an `await_smoke` poll (see below), or a terminal
+      `{status:"complete"|"surfaced"}` carrying the real `final_status`, smoke
+      result, `merge`, and budget charge. On terminal, go back to (a) for the
+      next stage.
+   e. **`await_smoke` (Hydra#70)** — a PASSING judge verdict is recorded
+      immediately, then the repo smoke runs as a **detached background job**
+      (`hydra_core.smoke_job`) instead of blocking inside the
+      `submit_host_result` call (a smoke that ran past the MCP call's own
+      timeout used to orphan its process tree with no verdict ever recorded).
+      `submit_host_result` returns promptly with `{status:"awaiting_host",
+      state:"await_smoke", host_action:{action:"poll_smoke", instructions}}`
+      — there is **no agent to spawn**. Poll by either:
+      - calling `hydra.workflow.step {workflow_id}` again (it detects the
+        in-flight job for the current task and polls instead of opening a new
+        stage — it never mints a second pp run/worktree while one is
+        pending), or
+      - re-issuing `submit_host_result` with the SAME judge `call_key` (a
+        harmless poll — it never re-records the verdict or restarts the job).
+      Keep polling (a short delay between calls) until the response is
+      terminal. A lost job (process vanished, or it ran past its own
+      `HYDRA_SMOKE_TIMEOUT_S` deadline) is classified as an infra failure —
+      its whole process tree is killed — and the stage finalizes
+      non-complete; it never wedges in `await_smoke` forever. A
+      just-launched job may report still-launching (non-terminal, same as
+      "still pending") for up to the startup bound
+      (`HYDRA_SMOKE_LAUNCH_GRACE_S`, default 60s) before a total absence of
+      worker evidence is finalized lost — this is normal for a worker that
+      is simply slow to start, not itself a failure.
 4. **Non-engineering squads** (claude-skill / agent-impersonation packs:
    executive, garland, rlm-gaming, marketing-*, …) are ALSO driven by the same
    step/submit loop: when the next pending task belongs to such a pack, `step`

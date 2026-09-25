@@ -205,6 +205,7 @@ def test_mu12_non_complete_finalize_preserves_work(tmp_path, monkeypatch):
     _init_repo_mu12(tmp_path)
 
     # Force smoke to fail so the judge-pass path surfaces the run.
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(_hb, "_run_smoke",
                         lambda *a, **k: ("fail", "MU12 injected smoke failure"))
 
@@ -267,6 +268,7 @@ def test_mu12_complete_path_merge_unchanged(tmp_path, monkeypatch):
     _init_repo_mu12(tmp_path)
 
     # Force smoke to pass.
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(_hb, "_run_smoke",
                         lambda *a, **k: ("pass", "MU12 injected smoke pass"))
 
@@ -319,6 +321,7 @@ def test_mu12_pass_unlanded_preserves_branch(tmp_path, monkeypatch):
     _init_repo_mu12(tmp_path)
 
     # Force smoke to pass.
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(_hb, "_run_smoke",
                         lambda *a, **k: ("pass", "MU12c injected smoke pass"))
 
@@ -1641,6 +1644,7 @@ def test_mu13_byproduct_excluded_from_preserved_branch(tmp_path, monkeypatch):
     _init_repo_mu12(tmp_path)
 
     # Force smoke to fail so the non-complete preserve path fires.
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(_hb, "_run_smoke",
                         lambda *a, **k: ("fail", "MU13 injected smoke failure"))
 

@@ -12,7 +12,9 @@ re-applies (exactly-once), and (5) the complete vs surfaced finalize.
 """
 from __future__ import annotations
 
+import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -74,7 +76,17 @@ class FakeDispatcher:
 @pytest.fixture(autouse=True)
 def _smoke_passes(monkeypatch):
     """Force a passing smoke so the happy path can finalize 'complete' without a
-    real build/test command in the temp dir."""
+    real build/test command in the temp dir.
+
+    Hydra#70: this module's tests were written against the SYNCHRONOUS
+    finalize-inline-in-submit behaviour (monkeypatching ``_run_smoke``
+    directly and asserting an immediate terminal cursor). The default mode
+    is now async (a detached, tracked job — see ``hydra_core.smoke_job``);
+    forcing ``HYDRA_ATTENDED_SMOKE_MODE=sync`` here keeps this whole test
+    module's synchronous assertions valid. The async job path itself is
+    covered by ``tests/test_hydra70_async_smoke.py``.
+    """
+    monkeypatch.setenv("HYDRA_ATTENDED_SMOKE_MODE", "sync")
     monkeypatch.setattr(host_bridge, "_run_smoke",
                         lambda *a, **k: ("pass", "fake smoke pass"))
 
@@ -309,6 +321,65 @@ def test_worktree_isolation_and_merge_back(tmp_path):
     assert (tmp_path / "feature.py").exists()
     # ...and the worktree was cleaned up.
     assert not Path(wt).exists()
+
+
+def test_workflow_terminal_passing_judge_refuses_merge_preserves_branch(tmp_path):
+    """Hydra#69 round 6 remaining-gap cross-vendor finding: a stale
+    engineering cursor opened BEFORE the workflow went terminal reaches
+    ``await_judge`` and gets a PASSING verdict submitted AFTER the workflow
+    became terminal (aborted/rejected at some other gate). The caller (cli.py
+    ``_cmd_attended_submit``) detects this from the checkpoint and passes
+    ``workflow_terminal=True`` into ``submit_host_result`` -- merging the
+    candidate worktree into the repo now would CONTINUE a terminal workflow,
+    so it must be refused even though the verdict itself passed. The pp
+    ledger bookkeeping (record_verdict/finalize_stage/finalize_run) still
+    runs exactly once (real spend already happened), and the branch is
+    preserved (committed, never merged) for the operator to pick up by hand."""
+    _init_repo(tmp_path)
+    disp = FakeDispatcher()
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-term", run_id="run-term",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+
+    from pathlib import Path
+    Path(wt, "feature.py").write_text("print('hello')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    assert res["state"] == "await_judge"
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-run-term-stage-1-att-1-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05},
+        workflow_terminal=True)
+
+    # Never merged, never dispatched-as-complete -- the workflow was already
+    # terminal, so this call must refuse to land code.
+    assert res["merge"]["merged"] is False
+    assert res["merge"]["error"] == "workflow_terminal"
+    assert res["status"] != "complete"
+    assert not (tmp_path / "feature.py").exists(), (
+        "the candidate change must never land in the repo once the workflow "
+        "is terminal"
+    )
+    # The worktree checkout is cleaned up (ordinary cleanup, not a merge),
+    # but the branch itself is preserved for manual pickup.
+    assert not Path(wt).exists()
+    assert res.get("preserved_branch"), (
+        "a workflow-terminal refusal must still preserve the branch, never "
+        "silently discard the engineer's committed work"
+    )
+    # The pp-ledger bookkeeping for the ALREADY-INCURRED attempt/verdict
+    # still ran -- exactly once, not skipped and not doubled.
+    assert disp.count("record_verdict") == 1
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    # Cost accrued across generate + judge is still reported for the caller
+    # to charge on HydraState exactly once.
+    assert res["cost_usd"] == pytest.approx(0.05)
 
 
 def test_merge_worktree_back_excludes_byproduct_dirs(tmp_path):
@@ -1396,6 +1467,57 @@ def test_recover_stalled_stage_via_resume_action(tmp_path):
     assert disp.count("finalize_run") == 1
 
 
+def test_recover_stalled_stage_workflow_terminal_stalled_infra_refuses_merge(tmp_path):
+    """Hydra#69 round 6 remaining-gap fix: `recover-stalled-stage` must never
+    continue a terminal workflow. A `stalled_infra` cursor that WOULD pass
+    (worktree still present, verdict already pass) reaches
+    `host_bridge.recover_stalled_stage` with `workflow_terminal=True` (the
+    caller having already read this from the authoritative checkpoint) --
+    the pp-ledger bookkeeping for the already-incurred attempt/verdict still
+    runs exactly once, but the worktree merge-back is refused and the branch
+    is preserved for manual operator pickup instead of landing in the repo."""
+    from pathlib import Path
+    _init_repo(tmp_path)
+    disp = _FakeDispatcherVerdictTransportFail(required_cross_vendor=True)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-rec-term", run_id="run-rec-term",
+        project_path=str(tmp_path), request_text="add a feature file",
+        project_root=str(tmp_path), isolate=True)
+    wt = res["host_action"]["cwd"]
+    Path(wt, "feature.py").write_text("print('hi')\n", encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "added feature.py"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="judge-run-rec-term-stage-1-att-1-0",
+        result={"outcome": "pass", "judge_producer": "codex", "cost_usd": 0.05})
+    assert res["state"] == "stalled_infra"
+    assert Path(wt).exists()
+
+    disp.recover()
+    rec = host_bridge.recover_stalled_stage(
+        disp, cursor_file=res["cursor_path"], workflow_terminal=True)
+
+    assert rec["ok"] is True
+    assert rec["workflow_terminal"] is True
+    # Never merged -- the workflow was already terminal, so recovery must
+    # refuse to land code even though the underlying stage would have passed.
+    assert rec["merge"]["merged"] is False
+    assert not (tmp_path / "feature.py").exists(), (
+        "recovery must never land code once the workflow is terminal"
+    )
+    assert rec.get("preserved_branch") or rec.get("merge", {}).get("error"), (
+        "the branch must be preserved / the refusal explained, not silently "
+        "discarded"
+    )
+    # The pp-ledger bookkeeping for the already-incurred attempt/verdict
+    # still ran exactly once (real spend already happened).
+    assert disp.count("finalize_stage") == 1
+    assert disp.count("finalize_run") == 1
+    assert rec["cost_usd"] == pytest.approx(0.05)
+
+
 def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path):
     """The pre-fix shape: a cursor already finalized 'surfaced' with a
     preserved_branch and no verdict_recorded_for (the worktree is gone, but
@@ -1464,6 +1586,99 @@ def test_recover_stalled_stage_legacy_surfaced_shape_merges_from_branch(tmp_path
     # skipping charge_and_gate, but recover_stalled_stage itself never touches
     # budget -- confirm the flag survives untouched.
     assert rec["already_charged"] is True
+
+
+def test_recover_stalled_stage_workflow_terminal_surfaced_never_calls_merge_branch_back(
+    tmp_path, monkeypatch,
+):
+    """Hydra#69 round 6 remaining-gap fix: the legacy 'surfaced' recovery
+    shape merges directly from a preserved branch via `_merge_branch_back` --
+    once the workflow is terminal, that call must never happen at all (not
+    just refuse after running). Assert on the function object itself so a
+    regression that re-introduces an unconditional call is caught even if
+    `_merge_branch_back`'s own internals later change to look like a no-op
+    success."""
+    _init_repo(tmp_path)
+    branch = "attended/legacy-run-terminal"
+    subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    (tmp_path / "legacy_feature_terminal.py").write_text(
+        "print('legacy terminal')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "legacy work", "--no-verify"],
+                   cwd=tmp_path, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "master"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path,
+                   capture_output=True, text=True, check=False)
+
+    called = {"merge_branch_back": 0}
+    real_merge = host_bridge._merge_branch_back
+
+    def _tripwire(*a, **kw):
+        called["merge_branch_back"] += 1
+        return real_merge(*a, **kw)
+
+    monkeypatch.setattr(host_bridge, "_merge_branch_back", _tripwire)
+
+    disp = FakeDispatcher()
+    cfile = tmp_path / ".hydra" / "wf-legacy-term" / "attended" / "run_legacy_term.json"
+    cfile.parent.mkdir(parents=True, exist_ok=True)
+    cursor = {
+        "schema": host_bridge.CURSOR_SCHEMA,
+        "kind": "engineering",
+        "workflow_id": "wf-legacy-term",
+        "run_id": "run_legacy_term",
+        "stage_id": "stage-1",
+        "attempt_id": "att-1",
+        "project_path": str(tmp_path),
+        "repo_root": str(tmp_path),
+        "branch": branch,
+        "preserved_branch": branch,
+        "state": "surfaced",
+        "outcome": "revise",
+        "final_status": "surfaced",
+        "cost_usd": 0.10,
+        "tokens_in": 100,
+        "tokens_out": 50,
+        "smoke_status": None,
+        "finalized": True,
+        "charged": False,
+        "pending_verdict_payload": {
+            "attempt_id": "att-1",
+            "judge_producer": "codex",
+            "judge_model_id": "codex-default",
+            "outcome": "pass",
+            "critique_md": "looks good",
+            "score_json": {},
+            "rubric_id": "rfc-2119-normative",
+            "idempotency_token": "judge-terminal-0",
+        },
+        "merge": {"merged": False, "error": "discarded_non_complete"},
+    }
+    host_bridge.save_cursor(cfile, cursor)
+
+    rec = host_bridge.recover_stalled_stage(
+        disp, cursor_file=cfile, workflow_terminal=True)
+
+    assert called["merge_branch_back"] == 0, (
+        "_merge_branch_back must never be called once the workflow is terminal"
+    )
+    assert rec["ok"] is True
+    assert rec["workflow_terminal"] is True
+    assert rec["merge"]["merged"] is False
+    assert rec["merge"]["error"] == "workflow_terminal"
+    assert not (tmp_path / "legacy_feature_terminal.py").exists(), (
+        "the branch's work must never land in repo_root once terminal"
+    )
+    # The branch itself is untouched (recovery never ran a merge against it),
+    # so it is still exactly as recoverable as before this call.
+    chk = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=tmp_path,
+                         capture_output=True, text=True)
+    assert chk.returncode == 0, "the preserved branch must survive a terminal refusal"
+    # The pp-ledger reconciliation (record_verdict for the already-incurred
+    # attempt) still ran exactly once.
+    assert disp.count("record_verdict") == 1
 
 
 def test_recover_stalled_stage_legacy_surfaced_failing_smoke_reverts_merge(tmp_path, monkeypatch):
@@ -3016,3 +3231,543 @@ def test_begin_stage_no_gate_type_falls_back_to_code_style_default(tmp_path):
     res = _begin(disp, tmp_path)
     cursor = host_bridge.load_cursor(res["cursor_path"])
     assert cursor["gate_type"] == "code_style"
+
+
+# --------------------------------------------------------------------------- #
+# Hydra#71: attended generate-failure classifier discarded committed work    #
+# --------------------------------------------------------------------------- #
+#
+# The attended host engineer COMMITS its work in the candidate worktree
+# (unlike the headless drive loop, which the harness commits on the run's
+# behalf later). `_apply_generate` used to attribute a run's changes from the
+# uncommitted-dirty-set delta ONLY, so a host that committed its work showed
+# `wrote_changes=False` -- and any narration-marker substring in the host's
+# own prose summary (reporting the PROJECT's real test/build output) then
+# looked, to the marker-classifier, like codex reporting its own sandbox was
+# blocked with nothing written. Real, committed work was surfaced as a
+# generate failure and its worktree (including untracked evidence excluded
+# from the branch commit) was deleted.
+
+def _begin_isolated(disp, tmp_path, monkeypatch, **kw):
+    """Like `_begin` but against a REAL git repo with worktree isolation
+    live, so the host `engineer` subagent commits into an actual linked
+    worktree exactly like the real attended flow (`begin_stage`'s default
+    `isolate=True`)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+    return host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(repo), request_text="implement the thing",
+        project_root=str(repo), **kw)
+
+
+def _commit_file(work_path, rel, content, message="engineer commit"):
+    p = Path(work_path) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    _git(["add", "-A"], work_path)
+    _git(["-c", "user.email=e@e.test", "-c", "user.name=Engineer",
+          "commit", "-m", message, "--no-verify"], work_path)
+
+
+def test_committed_work_with_soft_narration_text_is_not_discarded(tmp_path, monkeypatch):
+    """Hydra#71 test (a): the host commits changes and its summary contains
+    soft narration substrings describing the PROJECT's own test output. The
+    stage must proceed to await_judge (not error), and changed_paths must
+    list the committed files (commit-aware attribution)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    work_path = res["host_action"]["cwd"]
+    _commit_file(work_path, "foo.py", "print('hi')\n")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": ("Implemented the fix. In the project's own test "
+                          "run, one test timed out after 1800 s and a "
+                          "fixture reported permission denied on a scratch "
+                          "path -- both pre-existing and unrelated to this "
+                          "change."),
+                "cost_usd": 0.10, "tokens_in": 100, "tokens_out": 50,
+                "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+    cursor = host_bridge.load_cursor(res["cursor_path"])
+    assert cursor["changed_paths"] == ["foo.py"]
+    assert disp.count("record_attempt") == 1
+    _, _, attempt_args, _sq = next(
+        c for c in disp.calls if c[1] == "record_attempt")
+    assert attempt_args["status"] == "ok"
+
+
+def test_marker_text_with_no_attributed_changes_is_not_a_failure_on_attended_path(
+        tmp_path, monkeypatch):
+    """Hydra#71 fix (2), isolated from fix (1): a host result whose prose
+    contains soft narration marker substrings must never be marker-classified
+    on the attended path -- even when the run attributed NO commits/dirty
+    changes at all (unlike test (a), which also exercises commit-aware
+    attribution). Only the empty-output-with-no-changes hard case still
+    fails (see the next test)."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    # No files committed/edited in work_path -- wrote_changes will be False.
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": ("One test timed out after 1800 s and a fixture "
+                          "reported permission denied on a scratch path; "
+                          "both pre-existing and unrelated to this change."),
+                "cost_usd": 0.05, "model": "claude-opus-4-8"})
+    assert res["status"] == "awaiting_host"
+    assert res["state"] == "await_judge"
+
+
+def test_empty_text_no_changes_is_still_a_generate_failure(tmp_path, monkeypatch):
+    """Hydra#71 test (b): a host result with empty text and NO commits/dirty
+    changes is still a genuine generate failure -- the one hard case the
+    attended path keeps."""
+    disp = FakeDispatcher()
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    assert res["state"] == "surfaced"
+    assert "no output" in (res.get("error") or "").lower()
+
+
+def test_reflexion_retry_attributes_only_its_own_new_commits(tmp_path, monkeypatch):
+    """Hydra#71 test (d): a Reflexion×1 retry (generate-1) must attribute only
+    the commits IT made, relative to its own base -- not re-attribute (or
+    lose) the first attempt's commit."""
+    disp = FakeDispatcher(required_cross_vendor=True)
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    cfile = res["cursor_path"]
+    work_path = res["host_action"]["cwd"]
+    _commit_file(work_path, "attempt0.py", "v0\n")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "first pass", "cost_usd": 0.05,
+                "model": "claude-opus-4-8"})
+    assert res["state"] == "await_judge"
+    judge_call_key_0 = res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_call_key_0,
+        result={"outcome": "revise", "critique_md": "needs work",
+                "judge_producer": "codex", "cost_usd": 0.02})
+    assert res["state"] == "await_generate"
+    assert res["host_action"]["call_key"] == "generate-1"
+
+    cursor_mid = host_bridge.load_cursor(cfile)
+    assert cursor_mid["changed_paths"] == ["attempt0.py"]
+
+    _commit_file(work_path, "attempt1.py", "v1\n")
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-1",
+        result={"text": "revised", "cost_usd": 0.05,
+                "model": "claude-opus-4-8"})
+    assert res["state"] == "await_judge"
+    cursor_after = host_bridge.load_cursor(cfile)
+    assert set(cursor_after["changed_paths"]) == {"attempt0.py", "attempt1.py"}
+
+
+def test_generate_failure_preserves_untracked_evidence_before_worktree_removal(
+        tmp_path, monkeypatch):
+    """Hydra#71 test (e): on a genuine generate failure, untracked evidence
+    excluded from the preserved-branch commit (``.harness/`` -- see
+    ``_BYPRODUCT_PATTERNS``) must be copied out before the worktree is
+    removed, and its location reported on the terminal result."""
+    disp = FakeDispatcher()
+    res = _begin_isolated(disp, tmp_path, monkeypatch)
+    work_path = Path(res["host_action"]["cwd"])
+    # Excluded so it is genuinely untracked/byproduct evidence, not something
+    # the dirty-set attribution would (correctly) count as run-scoped work —
+    # mirrors what `_write_worktree_gitexcludes` sets up on any preserve call.
+    host_bridge._write_worktree_gitexcludes(str(work_path))
+    evidence_dir = work_path / ".harness"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "run.log").write_text("evidence of what happened\n",
+                                          encoding="utf-8")
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    assert res.get("preserved_evidence_path"), res
+    preserved = Path(res["preserved_evidence_path"])
+    assert (preserved / ".harness" / "run.log").exists()
+    assert (preserved / ".harness" / "run.log").read_text(encoding="utf-8") == \
+        "evidence of what happened\n"
+    # The worktree itself is really gone (disk reclaimed) -- this is a copy,
+    # not a reason to skip the removal.
+    assert not work_path.exists()
+
+
+def _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, populate):
+    """Like ``_begin_isolated``, but ``populate(repo_path)`` runs BEFORE the
+    base commit -- so the fixture files it creates are already committed
+    (part of the linked worktree's checkout) rather than freshly untracked
+    edits the run itself would be attributed as having made. Used by the
+    evidence-preservation bound tests, which need the worktree to hold
+    pre-existing on-disk files WITHOUT that presence itself counting as
+    ``wrote_changes`` and turning an intended generate failure into a
+    (correctly) non-failing empty-summary success."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    populate(repo)
+    _init_repo(repo)
+    monkeypatch.setenv("HYDRA_WORKTREE_ROOT", str(tmp_path / "wt-root"))
+    return host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1",
+        project_path=str(repo), request_text="implement the thing",
+        project_root=str(repo))
+
+
+def test_evidence_preserves_build_logs_excludes_binaries_and_node_modules(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: bound what evidence preservation copies.
+
+    ``build/`` is a multi-gigabyte output tree on the repos that surfaced
+    #71 -- only small report files are candidates, never build binaries or
+    a whole ``build/`` tree, and vendor caches like ``node_modules`` are
+    never descended into at all."""
+    def _populate(repo: Path) -> None:
+        # A ctest-shaped log under build/logs -- eligible evidence.
+        log_dir = repo / "build" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "ctest.log").write_text("1/1 tests passed\n", encoding="utf-8")
+        # A large build binary directly under build/ (not under
+        # logs/Testing) -- never a candidate regardless of size: build
+        # output, not a report.
+        big_binary = repo / "build" / "engine.bin"
+        with open(big_binary, "wb") as fh:
+            fh.seek(25 * 1024 * 1024 - 1)
+            fh.write(b"\0")
+        # A log nested under node_modules/**/build/ -- the whole subtree
+        # must never be descended into, even though it superficially
+        # matches "build/**/logs".
+        nm_log_dir = repo / "node_modules" / "somepkg" / "build" / "logs"
+        nm_log_dir.mkdir(parents=True, exist_ok=True)
+        (nm_log_dir / "vendor.log").write_text("vendor noise\n", encoding="utf-8")
+
+    disp = FakeDispatcher()
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / "build" / "logs" / "ctest.log").read_text(
+        encoding="utf-8") == "1/1 tests passed\n"
+    assert not (preserved / "build" / "engine.bin").exists()
+    assert not (preserved / "node_modules").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    copied_paths = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert "build/logs/ctest.log" in copied_paths
+    assert not any("engine.bin" in p for p in copied_paths)
+    assert not any("node_modules" in p for p in copied_paths)
+    # node_modules was pruned outright -- it never even reaches "skipped".
+    skipped_paths = {s["path"].replace("\\", "/") for s in manifest["skipped"]}
+    assert not any("node_modules" in p for p in skipped_paths)
+
+
+def test_evidence_enforces_size_caps_and_records_skips_in_manifest(
+        tmp_path, monkeypatch):
+    """Hydra#71 follow-up: a per-file cap and a total-per-run cap
+    (``HYDRA_EVIDENCE_MAX_BYTES``) bound the copy even for eligible
+    report-shaped files; anything declined is listed in ``manifest.json``
+    with its path/size/reason so nothing is silently dropped."""
+    def _populate(repo: Path) -> None:
+        evidence_dir = repo / ".harness"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "a_small.log").write_text("x" * 50, encoding="utf-8")
+        # Exceeds the per-file cap (100 bytes) on its own.
+        (evidence_dir / "b_oversized.log").write_text("y" * 200, encoding="utf-8")
+        # Under the per-file cap alone, but (processed after a_small.log,
+        # alphabetically) pushes the run past the total cap (100 bytes)
+        # once a_small.log's 50 bytes are already counted.
+        (evidence_dir / "c_second.log").write_text("z" * 90, encoding="utf-8")
+
+    disp = FakeDispatcher()
+    # Small caps so modest fixture files exercise them without real
+    # multi-megabyte writes.
+    monkeypatch.setattr(host_bridge, "_EVIDENCE_PER_FILE_MAX_BYTES", 100)
+    monkeypatch.setenv("HYDRA_EVIDENCE_MAX_BYTES", "100")
+    res = _begin_isolated_with_fixture(disp, tmp_path, monkeypatch, _populate)
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": "", "cost_usd": 0.0, "model": "claude-opus-4-8"})
+    assert res["status"] == "surfaced"
+    preserved = Path(res["preserved_evidence_path"])
+
+    assert (preserved / ".harness" / "a_small.log").exists()
+    assert not (preserved / ".harness" / "b_oversized.log").exists()
+    assert not (preserved / ".harness" / "c_second.log").exists()
+
+    manifest = json.loads((preserved / "manifest.json").read_text(encoding="utf-8"))
+    skipped = {s["path"].replace("\\", "/"): s["reason"] for s in manifest["skipped"]}
+    assert "exceeds_per_file_cap" in skipped[".harness/b_oversized.log"]
+    assert "exceeds_total_cap" in skipped[".harness/c_second.log"]
+    copied = {c["path"].replace("\\", "/") for c in manifest["copied"]}
+    assert copied == {".harness/a_small.log"}
+
+
+# --------------------------------------------------------------------------- #
+# Hydra#72: judge_model_source / judge_override_reason provenance forwarding  #
+# --------------------------------------------------------------------------- #
+#
+# pp's recordVerdict (daemon/src/orchestrator/runs.ts:981-1057) defaults
+# judge_model_source to "default" when the caller omits it, which in turn
+# requires judge_model_id to BE the vendor's pinned default model
+# (runs.ts:1029,1045-1057) -- so an attended verdict reporting any OTHER
+# pp-allowed model (the escalated pin, or any other allowed_models member)
+# was unconditionally rejected. `_FakeDispatcherEnforcingProvenance` below
+# reimplements that real three-part contract (allow-list, source enum + pin
+# match, override-reason length) so these tests fail the SAME way the live
+# bug did with the fix reverted.
+
+class _FakeDispatcherEnforcingProvenance(_FakeDispatcherWithDoctor):
+    """Enforces pp's real record_verdict provenance rules (runs.ts:1006-1057),
+    not just the judge_model_id pin `_FakeDispatcherWithDoctor` checks."""
+
+    _POLICY = {
+        "codex": {
+            "default": "gpt-5.6-terra", "escalated": "gpt-5.6-sol",
+            "allowed": {"gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"},
+        },
+        "agy": {
+            "default": "gemini-3.8-flash-medium", "escalated": "gemini-3.1-pro-high",
+            "allowed": {
+                "gemini-3.8-flash-high", "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low", "gemini-3.7-flash-high",
+                "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+                "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+            },
+        },
+    }
+    _SOURCES = {"default", "escalated", "cli", "team_yaml", "hydra"}
+    _SOURCES_REQUIRING_REASON = {"cli", "team_yaml", "hydra"}
+
+    def call_mcp(self, server, tool, args, squad_id=None):
+        if tool == "record_verdict":
+            self.calls.append((server, tool, dict(args), squad_id))
+            producer = args.get("judge_producer")
+            model_id = args.get("judge_model_id")
+            policy = self._POLICY.get(producer)
+            if policy:
+                if model_id not in policy["allowed"]:
+                    return {"status": "failed", "error": (
+                        "judge_producer=" + str(producer) +
+                        " must record judge_model_id in {" +
+                        ", ".join(sorted(policy["allowed"])) +
+                        "} (JUDGE_MODEL_POLICY allow-list); got " + repr(model_id))}
+                source = args.get("judge_model_source") or "default"
+                if source not in self._SOURCES:
+                    return {"status": "failed", "error": (
+                        "judge_model_source must be one of {" +
+                        ", ".join(sorted(self._SOURCES)) + "}; got " + repr(source))}
+                reason = str(args.get("judge_override_reason") or "").strip()
+                if source in self._SOURCES_REQUIRING_REASON:
+                    if len(reason) < 8:
+                        return {"status": "failed", "error": (
+                            "judge_model_source=" + repr(source) +
+                            " is an operator override channel and requires "
+                            "judge_override_reason of at least 8 non-whitespace "
+                            "chars explaining why the vendor pin was not used")}
+                else:
+                    expected = policy["escalated"] if source == "escalated" else policy["default"]
+                    if model_id != expected:
+                        return {"status": "failed", "error": (
+                            "judge_model_source=" + repr(source) +
+                            " for judge_producer=" + str(producer) +
+                            " pins judge_model_id=" + repr(expected) +
+                            ", but " + repr(model_id) + " was recorded. "
+                            "Pass judge_model_source in {cli, team_yaml, hydra} with a "
+                            "judge_override_reason to record a deliberate override.")}
+            self.verdicts.append(dict(args))
+            return {"status": "done", "result": {"verdict_id": "v-1"}}
+        return super().call_mcp(server, tool, args, squad_id)
+
+
+def test_escalated_model_forwards_source_escalated_and_completes(tmp_path):
+    """codex's escalated pin (gpt-5.6-sol) must be recorded with
+    judge_model_source="escalated" and no reason, and the stage must pass --
+    NOT be rejected because it is not the default pin."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-sol", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    assert res["final_status"] == "complete"
+    assert len(disp.verdicts) == 1
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "escalated"
+    assert "judge_override_reason" not in v
+
+
+def test_hydra_override_source_for_allowed_non_pinned_model(tmp_path):
+    """A pp-allowed model that is NEITHER the default nor escalated pin
+    (agy's gemini-3.7-flash-high) must be recorded via the "hydra" override
+    channel with a real (>=8 char) reason, and the stage must pass."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "agy",
+                "judge_model_id": "gemini-3.7-flash-high", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "hydra"
+    assert len(v["judge_override_reason"].strip()) >= 8
+    assert "gemini-3.7-flash-high" in v["judge_override_reason"]
+
+
+def test_default_model_forwards_source_default(tmp_path):
+    """The vendor's default pin must be recorded with judge_model_source=
+    "default" and no override reason."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-terra", "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "default"
+    assert "judge_override_reason" not in v
+
+
+def test_provenance_rejection_is_host_correctable_not_revise(tmp_path, monkeypatch):
+    """Simulated pp provenance rejection (Hydra#72's actual live shape): with
+    provenance forwarding unavailable (as it was pre-fix), record_verdict
+    rejects a legitimate escalated-model verdict with its judge_model_source/
+    judge_override_reason error. That must stay `await_judge` under the SAME
+    call_key and return a retryable error -- NEVER get downgraded to a
+    revise/surfaced verdict (the exact Hydra#72 defect)."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    with monkeypatch.context() as m:
+        # Simulate the pre-fix state: no provenance derived/forwarded at all.
+        m.setattr(host_bridge, "_judge_verdict_provenance", lambda *a, **k: {})
+
+        res = host_bridge.submit_host_result(
+            disp, cursor_file=cfile, call_key=judge_key,
+            result={"outcome": "pass", "critique_md": "looks good",
+                    "judge_producer": "codex",
+                    "judge_model_id": "gpt-5.6-sol",  # escalated, non-default
+                    "cost_usd": 0.05})
+
+        assert res["ok"] is False
+        assert res["retryable"] is True
+        assert "judge_model_source" in res["error"]
+        assert "judge_override_reason" in res["error"]
+        assert res["status"] == "awaiting_host"
+        assert res["state"] == "await_judge"
+        assert res["host_action"]["call_key"] == judge_key
+        assert disp.count("finalize_stage") == 0
+        assert disp.count("finalize_run") == 0
+        assert len(disp.verdicts) == 0
+        assert host_bridge.load_cursor(cfile)["state"] == "await_judge"
+
+    # Resubmitting the SAME call_key with real derivation restored completes
+    # the stage -- nothing about the cursor was corrupted by the rejection.
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-sol", "cost_usd": 0.05})
+    assert res2["status"] == "complete"
+    assert res2["final_status"] == "complete"
+    assert disp.verdicts[0]["judge_model_source"] == "escalated"
+    # Judge cost accrued exactly once across both submits (double-count guard).
+    assert res2["cost_usd"] == pytest.approx(0.15)
+
+
+def test_supplied_valid_provenance_is_forwarded_verbatim(tmp_path):
+    """A judge result that self-reports a valid judge_model_source/
+    judge_override_reason for an allowed non-pinned model must be forwarded
+    as-is, not overwritten by the synthesized reason."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    own_reason = "operator explicitly requested gpt-5.6-luna for this stage"
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-luna",
+                "judge_model_source": "hydra",
+                "judge_override_reason": own_reason,
+                "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "hydra"
+    assert v["judge_override_reason"] == own_reason
+
+
+def test_invalid_supplied_provenance_falls_back_to_derivation(tmp_path):
+    """A judge result claiming judge_model_source="hydra" with a reason too
+    short to satisfy pp's >=8-char requirement must NOT be forwarded blindly
+    -- the host must fall back to deriving provenance from judge_model_id
+    itself (here, the default pin -> "default", no reason)."""
+    disp = _FakeDispatcherEnforcingProvenance(required_cross_vendor=True)
+    cfile, judge_res = _drive_to_judge(disp, tmp_path)
+    judge_key = judge_res["host_action"]["call_key"]
+
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=judge_key,
+        result={"outcome": "pass", "critique_md": "looks good",
+                "judge_producer": "codex",
+                "judge_model_id": "gpt-5.6-terra",  # the default pin
+                "judge_model_source": "hydra",
+                "judge_override_reason": "short",   # < 8 chars
+                "cost_usd": 0.05})
+
+    assert res["status"] == "complete"
+    v = disp.verdicts[0]
+    assert v["judge_model_source"] == "default"
+    assert "judge_override_reason" not in v
+
+
+def test_is_judge_provenance_error_matches_both_substrings():
+    """Unit-level check on the broadened predicate: it must match pp's real
+    provenance rejection text (both `judge_model_source` and
+    `judge_override_reason` present) and must NOT match an unrelated
+    validation error that happens to mention only one of the two terms."""
+    real_pp_message = (
+        'judge_model_source="default" for judge_producer=agy pins '
+        'judge_model_id="gemini-3.8-flash-medium", but "gemini-3.1-pro-high" '
+        'was recorded. Pass judge_model_source in {cli, team_yaml, hydra} '
+        'with a judge_override_reason to record a deliberate override.'
+    )
+    assert host_bridge._is_judge_provenance_error(RuntimeError(real_pp_message)) is True
+    assert host_bridge._is_judge_provenance_error(
+        RuntimeError("judge_model_source must be one of {default, escalated, "
+                     "cli, team_yaml, hydra}; got \"bogus\"")) is False
+    assert host_bridge._is_judge_provenance_error(
+        RuntimeError("some unrelated validation error")) is False
+    assert host_bridge._is_judge_provenance_error(None) is False

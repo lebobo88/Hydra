@@ -627,21 +627,151 @@ def dispatch_ingested_envelopes(
                 _emit("ingest.plan_phase_disabled", {"envelope_id": eid, "type": etype})
                 continue
 
-            from .artifact_store import ArtifactStoreError, write_repo_artifact
-            from .plan_artifact import plan_slug, render_plan_html
-
             plan_env = env  # SCHEMA_REGISTRY["PLAN"] -> Plan; already validated
-            repo_root = getattr(dispatcher, "project_root", None)
+
+            # Hydra#69 defect G: `validate_envelope` only proves the PLAN is a
+            # well-FORMED envelope -- it says nothing about whether this PLAN
+            # is the one the engine is actually waiting for. Before this
+            # check, `plan_patch["plan_revision"]` below adopted whatever
+            # revision the submitted envelope carried AS-IS, so a resubmit
+            # with the schema default (`plan_revision=1`, `Plan` field
+            # default) could roll `state.plan_revision` BACKWARD over an
+            # already-advanced modify-plan revision, or a PLAN authored for a
+            # DIFFERENT workflow could be adopted here by workflow_id
+            # accident.
+            #
+            # Expected revision rule: `node_planner`'s FIRST authoring pass
+            # never touches `state.plan_revision` (it stays at the model
+            # default, 0) while `plan_status` becomes "authoring" -- so a
+            # first draft expects revision 1. `--modify-plan` (cli.py) bumps
+            # `state.plan_revision` to the NEW revision it is about to author
+            # BEFORE re-entering the graph (`_reenter_graph_after_dispatch`
+            # applies `{"plan_revision": _modify_plan_new_revision, ...}`
+            # atomically with `plan_status="authoring"`), so by the time a
+            # revised PLAN reaches this branch `state.plan_revision` already
+            # names the exact revision being authored. One rule covers both:
+            # `state.plan_revision` when non-zero (revised authoring),
+            # else 1 (first draft, the 0 default never having been advanced).
+            _expected_revision = state.plan_revision if state.plan_revision else 1
+            _plan_validation_errors: list[dict[str, Any]] = []
+            if str(plan_env.workflow_id) != str(state.workflow_id):
+                _plan_validation_errors.append({
+                    "field": "workflow_id",
+                    "msg": (f"PLAN workflow_id {str(plan_env.workflow_id)!r} does not "
+                            f"match this workflow ({str(state.workflow_id)!r})"),
+                })
+            if plan_env.plan_revision != _expected_revision:
+                _plan_validation_errors.append({
+                    "field": "plan_revision",
+                    "msg": (f"PLAN plan_revision {plan_env.plan_revision!r} does not "
+                            f"match the expected revision {_expected_revision!r} for "
+                            "the revision currently being authored "
+                            f"(state.plan_revision={state.plan_revision!r})"),
+                })
+            elif _expected_revision > 1:
+                # Only meaningful once we know the revision itself is right —
+                # a revision-mismatched PLAN already fails above without a
+                # confusing second "supersedes" complaint layered on top.
+                # Hydra#69 follow-up defect 3 (HIGH): validate against the
+                # independently-persisted `plan_supersedes_expected` (set
+                # ONCE by `--modify-plan` when it opens this revision), not
+                # `state.plan_envelope_id`. The latter is overwritten by
+                # THIS SAME branch's own `outcome.plan_patch` (below) as soon
+                # as a candidate PLAN is drafted -- including a candidate
+                # whose SUBSEQUENT graph re-entry (plan_judge) then fails.
+                # A failed re-entry left `state.plan_envelope_id` pointing at
+                # the failed attempt's own envelope id, so a correctly
+                # addressed resubmission (naming the TRUE predecessor, the
+                # prior revision's envelope id) was rejected as a
+                # `supersedes` mismatch. `plan_supersedes_expected` is never
+                # touched by that write, so it survives any number of failed
+                # attempts unchanged.
+                _expected_supersedes = (
+                    str(state.plan_supersedes_expected)
+                    if getattr(state, "plan_supersedes_expected", None) else None)
+                if _expected_supersedes is None:
+                    # Hydra#69 round 5 defect 3 (MED): a checkpoint created
+                    # before `plan_supersedes_expected` existed on HydraState
+                    # (or restored from a pre-fix snapshot) leaves the field
+                    # at its `Optional[str]` default, None -- comparing
+                    # directly against it above would reject EVERY revision
+                    # >1 PLAN outright, even one correctly naming its true
+                    # predecessor. Derive the expectation instead, in order:
+                    #   1. the current revision's own planning TaskState's
+                    #      `supersedes_plan_envelope_id` (stamped when
+                    #      `--modify-plan` created it -- see cli.py's
+                    #      `_modify_plan_task` construction);
+                    #   2. a recorded modify-plan transition in
+                    #      `hitl_history` naming the same revision.
+                    # Deliberately NEVER `state.plan_envelope_id` -- see the
+                    # comment above this block on why that mutable field
+                    # (overwritten by this same branch's own `plan_patch` as
+                    # soon as ANY candidate PLAN is drafted, even one whose
+                    # subsequent graph re-entry fails) is unsafe here.
+                    for _t in (getattr(state, "tasks", None) or []):
+                        if (getattr(_t, "owner_squad", None) == "planning"
+                                and getattr(_t, "plan_revision", None) == state.plan_revision
+                                and getattr(_t, "supersedes_plan_envelope_id", None)):
+                            _expected_supersedes = str(_t.supersedes_plan_envelope_id)
+                            break
+                    if _expected_supersedes is None:
+                        for _entry in reversed(state.hitl_history or []):
+                            if (isinstance(_entry, dict)
+                                    and _entry.get("event") == "plan_modify_requested"
+                                    and _entry.get("plan_revision") == state.plan_revision
+                                    and _entry.get("prior_plan_envelope_id")):
+                                _expected_supersedes = str(_entry["prior_plan_envelope_id"])
+                                break
+                _submitted_supersedes = (
+                    str(plan_env.supersedes) if plan_env.supersedes else None)
+                if _submitted_supersedes != _expected_supersedes:
+                    _plan_validation_errors.append({
+                        "field": "supersedes",
+                        "msg": (f"PLAN supersedes {_submitted_supersedes!r} does not "
+                                f"name the prior plan envelope "
+                                f"({_expected_supersedes!r})"),
+                    })
+            if _plan_validation_errors:
+                _detail = ("PLAN rejected: state validation failed ("
+                           + "; ".join(e["msg"] for e in _plan_validation_errors) + ")")
+                outcome.items.append(IngestItemResult(
+                    envelope_id=eid, envelope_type=etype, target=None,
+                    status="failed", detail=_detail, errors=_plan_validation_errors,
+                ))
+                _emit("ingest.plan_state_mismatch", {
+                    "envelope_id": eid, "errors": _plan_validation_errors,
+                })
+                continue
+
+            from .artifact_store import ArtifactStoreError, write_repo_artifact
+            from .plan_artifact import (
+                plan_artifact_repo_root, plan_slug, render_plan_html,
+            )
+            default_root = getattr(dispatcher, "project_root", None)
+            resolved_repo_root: Path | None = None
+            resolved_repo_id: str | None = None
             try:
-                if repo_root is None:
+                if default_root is None:
                     raise ArtifactStoreError(
                         "dispatcher has no project_root; cannot write the plan artifact"
                     )
+                # Operator decision 2026-09-24: the plan artifact belongs in
+                # the workflow's TARGET repo's docs/plans/, not Hydra's own
+                # working tree -- `plan_artifact_repo_root` resolves
+                # `state.target_repo_id` through the SAME allow-listed
+                # `repo_registry` every engineering dispatch already uses,
+                # falling back to `default_root` (Hydra) when there is no
+                # single engineering target or resolution fails.
+                resolved_repo_root, resolved_repo_id = plan_artifact_repo_root(
+                    state, default_root, purpose="write", emit=_emit,
+                )
                 slug = plan_slug(
                     getattr(plan_env, "goal_restatement", "") or "", plan_env.workflow_id
                 )
                 html_text = render_plan_html(plan_env)
-                ref = write_repo_artifact(repo_root, f"docs/plans/{slug}.html", html_text)
+                ref = write_repo_artifact(
+                    resolved_repo_root, f"docs/plans/{slug}.html", html_text,
+                )
                 artifact_ref = ref.model_dump(mode="json")
             except (ArtifactStoreError, OSError, ValueError) as exc:
                 # Cross-vendor judge finding (item 2/4): `render_plan_html`
@@ -678,6 +808,14 @@ def dispatch_ingested_envelopes(
                 "plan_envelope_id": str(plan_env.id),
                 "plan_ref": plan_env.model_dump(mode="json"),
                 "plan_artifact_location": artifact_ref.get("key"),
+                # Recorded in the SAME patch that sets `plan_artifact_location`
+                # (explicit write, replace-channel semantics -- see the
+                # LangGraph LastValue-clear note on `HydraState`) so every
+                # later reader (node_plan_judge's re-render, the force-dispatch
+                # governance note, --critique-ref) agrees on the same root
+                # without re-deriving it from `target_repo_id`.
+                "plan_artifact_repo_id": resolved_repo_id,
+                "plan_artifact_root": str(resolved_repo_root),
                 "plan_revision": plan_env.plan_revision,
             }
             outcome.items.append(IngestItemResult(
@@ -688,6 +826,8 @@ def dispatch_ingested_envelopes(
             _emit("ingest.plan_drafted", {
                 "envelope_id": eid, "artifact": artifact_ref,
                 "revision": plan_env.plan_revision,
+                "repo_id": resolved_repo_id,
+                "repo_root": str(resolved_repo_root),
             })
             continue
 

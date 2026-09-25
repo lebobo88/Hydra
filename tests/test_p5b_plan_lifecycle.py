@@ -68,8 +68,9 @@ def _stub_pack(slug: str) -> SquadPack:
     return SquadPack(slug=slug, name=slug, description=slug, entrypoint="stub")
 
 
-def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None):
-    return {
+def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None,
+                        supersedes=None):
+    d = {
         "id": str(plan_id or uuid4()),
         "type": "PLAN",
         "origin_squad": "planning",
@@ -81,6 +82,9 @@ def _minimal_plan_dict(workflow_id, *, plan_id=None, revision=1, steps=None):
         "plan_revision": revision,
         "steps": steps or [],
     }
+    if supersedes is not None:
+        d["supersedes"] = str(supersedes)
+    return d
 
 
 # =========================================================================== #
@@ -465,8 +469,22 @@ class TestTask2IngestBranch:
         assert again.items[0].status == "skipped_duplicate"
         assert not again.plan_patch
 
-        # A revision with a FRESH envelope id is not suppressed.
-        revised = _minimal_plan_dict(state.workflow_id, revision=2)
+        # A revision with a FRESH envelope id is not suppressed. Hydra#69
+        # defect G: a real `--modify-plan` re-entry bumps state.plan_revision
+        # to the NEW revision (and stamps plan_envelope_id to the prior
+        # plan's id) BEFORE the revised PLAN is ever authored/submitted
+        # (mirrors `_cmd_resume_locked`'s modify-plan branch) -- the revised
+        # PLAN must carry that same expected revision and name the prior
+        # plan as its `supersedes`, or the state-validation check this
+        # defect adds refuses it.
+        state.plan_revision = 2
+        state.plan_envelope_id = plan["id"]
+        # Hydra#69 follow-up defect 3: validated against
+        # `plan_supersedes_expected` now, not `plan_envelope_id` -- see that
+        # field's docstring (state.py).
+        state.plan_supersedes_expected = plan["id"]
+        revised = _minimal_plan_dict(
+            state.workflow_id, revision=2, supersedes=plan["id"])
         third = dispatch_ingested_envelopes(
             state, [revised], packs=packs, dispatcher=_ProjectRootDispatcher(tmp_path),
             already_ingested={plan["id"]},
@@ -969,7 +987,8 @@ class TestTask4Materialisation:
         ])
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = node_plan_gate(state)
         assert patch["plan_status"] == "approved"
@@ -984,7 +1003,8 @@ class TestTask4Materialisation:
         node_plan_gate = _plan_gate_fn()
         state = HydraState(
             root_goal="x", plan_status="judged", plan_revision=1,
-            pending_hitl={"gate_node": "plan_gate"},
+            pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         patch = node_plan_gate(state)
         assert "tasks" not in patch
@@ -1014,7 +1034,8 @@ class TestTask4Materialisation:
         plan = self._two_step_plan(wf)
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         first_patch = node_plan_gate(state)
         assert len(first_patch["tasks"]) == 2
@@ -1054,7 +1075,8 @@ class TestTask4Materialisation:
         )
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
         )
         state.tasks.append(existing_a)
 
@@ -1081,7 +1103,8 @@ class TestTask4Materialisation:
         )
         state = HydraState(
             root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=2,
-            plan_ref=plan, pending_hitl={"gate_node": "plan_gate"},
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 2}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (2 here)
         )
         state.tasks.append(stale_a)
 
@@ -1186,3 +1209,238 @@ class TestTask4Materialisation:
         assert by_desc["fresh-task"].status != "pending", (
             "a same-revision task must still dispatch normally"
         )
+
+
+# =========================================================================== #
+# Hydra#69 (part 1) defects B, E, F, H:
+#   B: node_planner's whole-goal placeholder tasks are superseded on approval
+#      (plan_placeholder_task_ids / plan_superseded_task_ids), closing the
+#      revision-0 gap a stale-revision-only check could never catch.
+#   E: materialise_plan_steps copies each PlanStep's acceptance_criteria and
+#      envelope_type onto the materialised TaskState.
+#   F: task_eligible_for_dispatch is the ONE predicate every selector uses
+#      (stale revision + explicit supersession + plan_deps_satisfied).
+#   H: materialise_plan_steps is a no-op once plan_status == "bypassed".
+# =========================================================================== #
+
+from hydra_core.supervisor import materialise_plan_steps
+from hydra_core.state import task_eligible_for_dispatch
+
+
+class TestDefectEAcceptanceCriteriaEnvelopeType:
+    def test_materialised_task_carries_step_acceptance_criteria_and_envelope_type(self):
+        wf = uuid4()
+        plan = _minimal_plan_dict(wf, steps=[
+            {"step_id": "a", "target_squad": "engineering", "envelope_type": "DEV_TASK",
+             "description": "wire the middleware", "depends_on": [],
+             "acceptance_criteria": ["middleware wired", "tests green"]},
+        ])
+        state = HydraState(
+            root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
+        )
+        patch = materialise_plan_steps(state)
+        task = patch["tasks"][0]
+        assert task.envelope_type == "DEV_TASK"
+        assert task.acceptance_criteria == ["middleware wired", "tests green"]
+
+    def test_step_without_acceptance_criteria_leaves_task_field_none(self):
+        wf = uuid4()
+        plan = _minimal_plan_dict(wf, steps=[
+            {"step_id": "a", "target_squad": "engineering", "envelope_type": "DEV_TASK",
+             "description": "x", "depends_on": []},
+        ])
+        state = HydraState(
+            root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
+        )
+        patch = materialise_plan_steps(state)
+        assert patch["tasks"][0].acceptance_criteria is None
+
+
+class TestDefectBPlaceholderSupersession:
+    def test_planner_records_whole_goal_placeholder_ids_when_plan_active(self):
+        from hydra_core.supervisor import build_supervisor
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT, dispatcher=MagicMock(), force_pure_python=True,
+        )
+        node_planner = dict(runner.steps)["planner"]
+        state = HydraState(
+            root_goal="x", selected_squads=["engineering"], target_repo_id="hydra",
+            plan_rigor_override="standard",
+        )
+        patch = node_planner(state)
+        assert patch["plan_placeholder_task_ids"], (
+            "the whole-goal engineering task must be recorded as a placeholder "
+            "while the plan gate is active"
+        )
+        placeholder_ids = set(patch["plan_placeholder_task_ids"])
+        synthesised_ids = {str(t.task_id) for t in patch["tasks"]}
+        planning_ids = {str(t.task_id) for t in patch["tasks"]
+                        if t.owner_squad == "planning"}
+        assert placeholder_ids == synthesised_ids - planning_ids, (
+            "the planning task itself must never be its own placeholder"
+        )
+
+    def test_planner_writes_empty_placeholder_list_when_plan_not_active(self):
+        from hydra_core.supervisor import build_supervisor
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT, dispatcher=MagicMock(), force_pure_python=True,
+            # trivial rigor -> the plan gate never activates this pass.
+            force_trivial_plan_rigor=True,
+        )
+        node_planner = dict(runner.steps)["planner"]
+        state = HydraState(
+            root_goal="x", selected_squads=["engineering"], target_repo_id="hydra",
+        )
+        patch = node_planner(state)
+        assert patch["plan_placeholder_task_ids"] == [], (
+            "the field must be explicitly written as [] (LastValue-clear), "
+            "not omitted, whenever the plan gate is not active this pass"
+        )
+
+    def test_materialise_plan_steps_supersedes_placeholder_ids(self):
+        wf = uuid4()
+        plan = _minimal_plan_dict(wf, steps=[
+            {"step_id": "a", "target_squad": "engineering", "envelope_type": "DEV_TASK",
+             "description": "x", "depends_on": []},
+        ])
+        placeholder = TaskState(owner_squad="engineering", description="whole-goal placeholder")
+        state = HydraState(
+            root_goal="x", workflow_id=wf, plan_status="judged", plan_revision=1,
+            plan_ref=plan, pending_hitl=None,  # cleared: mirrors real node_plan_gate invocation (see materialise_plan_steps's Hydra#69 follow-up defect 2 docstring -- the resume handler always clears the gate before the graph re-enters this node)
+            hitl_history=[{"gate_node": "plan_gate", "resolution": "approve", "option": None, "plan_revision": 1}],  # Hydra#69 round 5 defect 1c: materialise_plan_steps now requires this affirmative approve evidence when the gate is already cleared; round 5 follow-up: evidence must carry plan_revision matching state (1 here)
+            plan_placeholder_task_ids=[str(placeholder.task_id)],
+        )
+        patch = materialise_plan_steps(state)
+        assert patch["plan_superseded_task_ids"] == [str(placeholder.task_id)]
+
+    def test_placeholder_at_revision_zero_ineligible_once_superseded(self):
+        """The bug: a revision-0 placeholder is NEVER caught by a stale-
+        revision-only check (``0 and ...`` is falsy). task_eligible_for_
+        dispatch must exclude it once it is explicitly superseded."""
+        placeholder = TaskState(owner_squad="engineering", description="placeholder")
+        assert placeholder.plan_revision == 0
+        state = HydraState(
+            root_goal="x", plan_revision=1,
+            plan_superseded_task_ids=[str(placeholder.task_id)],
+        )
+        assert task_eligible_for_dispatch(state, placeholder) is False
+
+    def test_bypass_keeps_placeholder_eligible(self):
+        """H: force-dispatch bypass must not supersede the placeholder — the
+        placeholder is exactly what keeps the workflow running when the plan
+        is bypassed."""
+        placeholder = TaskState(owner_squad="engineering", description="placeholder")
+        state = HydraState(root_goal="x", plan_status="bypassed",
+                           plan_superseded_task_ids=[])
+        assert task_eligible_for_dispatch(state, placeholder) is True
+
+
+class TestDefectHBypassNoOp:
+    def test_materialise_plan_steps_is_noop_when_bypassed(self):
+        wf = uuid4()
+        plan = _minimal_plan_dict(wf, steps=[
+            {"step_id": "a", "target_squad": "engineering", "envelope_type": "DEV_TASK",
+             "description": "x", "depends_on": []},
+        ])
+        state = HydraState(
+            root_goal="x", workflow_id=wf, plan_status="bypassed", plan_revision=1,
+            plan_ref=plan, pending_hitl=None,
+        )
+        patch = materialise_plan_steps(state)
+        assert patch == {}, "a bypassed plan must never be overwritten to approved"
+
+
+class TestDefectFSharedPredicate:
+    def test_next_stub_attended_task_honours_unmet_dependency(self):
+        packs = {"stubby": _stub_pack("stubby")}
+        upstream = TaskState(owner_squad="engineering", description="upstream")
+        blocked = TaskState(owner_squad="stubby", description="blocked",
+                            depends_on=[str(upstream.task_id)])
+        state = HydraState(root_goal="x")
+        state.tasks.extend([upstream, blocked])
+        task, pack = _next_stub_attended_task(state, packs)
+        assert task is None, (
+            "the stub selector must honour depends_on, not just stale revision "
+            "-- this was the actual gap defect F closes"
+        )
+
+    def test_next_stub_attended_task_releases_once_dependency_done(self):
+        packs = {"stubby": _stub_pack("stubby")}
+        upstream = TaskState(owner_squad="engineering", description="upstream")
+        blocked = TaskState(owner_squad="stubby", description="blocked",
+                            depends_on=[str(upstream.task_id)])
+        state = HydraState(root_goal="x", attended_done_task_ids=[str(upstream.task_id)])
+        state.tasks.extend([upstream, blocked])
+        task, pack = _next_stub_attended_task(state, packs)
+        assert task is not None and task.description == "blocked"
+
+    def test_next_attended_task_skips_superseded_even_at_revision_zero(self, packs):
+        placeholder = TaskState(owner_squad="engineering", description="placeholder")
+        real = TaskState(owner_squad="engineering", description="real step", plan_revision=1)
+        state = HydraState(
+            root_goal="x", plan_revision=1,
+            plan_superseded_task_ids=[str(placeholder.task_id)],
+        )
+        state.tasks.extend([placeholder, real])
+        task, kind, pack = _next_attended_task(state, packs)
+        assert task is not None and task.description == "real step"
+
+    def test_attended_pending_task_ids_excludes_superseded(self):
+        placeholder = TaskState(owner_squad="engineering", description="placeholder")
+        real = TaskState(owner_squad="engineering", description="real", plan_revision=1)
+        state = HydraState(
+            root_goal="x", plan_revision=1,
+            plan_superseded_task_ids=[str(placeholder.task_id)],
+        )
+        state.tasks.extend([placeholder, real])
+        pending = _attended_pending_task_ids(state)
+        assert str(placeholder.task_id) not in pending
+        assert str(real.task_id) in pending
+
+    def test_dispatch_excludes_superseded_task_with_distinct_target_repos(self, monkeypatch):
+        """node_dispatch (and, ahead of it, the fleet candidate list -- both
+        now share `task_eligible_for_dispatch`) must never dispatch a
+        superseded task, proven here with two DISTINCT target_repo_id
+        engineering tasks (the shape the fleet candidate filter cares about),
+        one of which is superseded."""
+        from hydra_core.supervisor import build_supervisor, _PurePythonRunner
+
+        calls: list[str] = []
+
+        def _fake_execute_squad(state, pack, env, dispatcher, **kw):
+            calls.append(env.objective if hasattr(env, "objective") else "?")
+            from hydra_core.squad_node import SquadResult
+            return SquadResult(envelopes=[], artifacts=[], status="done", rationale="ok")
+
+        monkeypatch.setattr("hydra_core.supervisor.execute_squad", _fake_execute_squad)
+
+        class _OfflineDispatcher:
+            allow_offline_mcp_dispatch = True
+            live_execution = False
+
+        runner = build_supervisor(
+            project_root=HYDRA_ROOT, dispatcher=_OfflineDispatcher(),
+            force_pure_python=True, force_trivial_plan_rigor=True,
+        )
+        assert isinstance(runner, _PurePythonRunner)
+
+        superseded = TaskState(owner_squad="engineering", description="superseded-task",
+                               target_repo_id="hydra")
+        live = TaskState(owner_squad="engineering", description="live-task",
+                         target_repo_id="hydra-two")
+        state = HydraState(
+            root_goal="x", selected_squads=["engineering"], target_repo_id="hydra",
+            plan_superseded_task_ids=[str(superseded.task_id)],
+        )
+        state.tasks.extend([superseded, live])
+
+        final = runner.invoke(state, stop_before="judge_per_squad")
+        by_desc = {t.description: t for t in final.tasks}
+        assert by_desc["superseded-task"].status == "pending", (
+            "a superseded task must never be dispatched, sequential or fleet"
+        )
+        assert by_desc["live-task"].status != "pending"
