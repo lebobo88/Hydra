@@ -254,18 +254,17 @@ def _snapshot_repos_json_sha256(repos_json: Path) -> str | None:
     return _hashlib.sha256(repos_json.read_bytes()).hexdigest()
 
 
-def _diff_pollution_guard_snapshots(
-    *,
+def _diff_plans_dir(
     plans_dir: Path,
-    repos_json: Path,
     before_plans: dict[str, str],
-    before_repos_sha: str | None,
     after_plans: dict[str, str],
-    after_repos_sha: str | None,
 ) -> list[str]:
-    """Pure comparison: given a before/after snapshot pair (already taken by
-    the caller), return the list of human-readable problem strings -- empty
-    if nothing changed. Takes no filesystem action itself."""
+    """Pure comparison of a single watched plans-dir snapshot pair. Split out
+    of ``_diff_pollution_guard_snapshots`` so the fixture below can run the
+    same added/removed/modified comparison against MULTIPLE watched plans
+    dirs (the checkout the suite runs from, plus -- in a worktree run -- the
+    operator's actual main checkout) without duplicating the repos.json
+    check per dir."""
     added = sorted(set(after_plans) - set(before_plans))
     removed = sorted(set(before_plans) - set(after_plans))
     modified = sorted(
@@ -289,12 +288,92 @@ def _diff_pollution_guard_snapshots(
             "file(s) were overwritten under the watched plans dir "
             f"({plans_dir}): {modified!r}"
         )
+    return problems
+
+
+def _diff_repos_json(
+    repos_json: Path,
+    before_repos_sha: str | None,
+    after_repos_sha: str | None,
+) -> list[str]:
+    """Pure comparison of a single watched repos.json digest pair."""
     if after_repos_sha != before_repos_sha:
-        problems.append(
+        return [
             f"the watched repos.json changed ({repos_json}): "
             f"sha256 before={before_repos_sha!r} after={after_repos_sha!r}"
-        )
-    return problems
+        ]
+    return []
+
+
+def _diff_pollution_guard_snapshots(
+    *,
+    plans_dir: Path,
+    repos_json: Path,
+    before_plans: dict[str, str],
+    before_repos_sha: str | None,
+    after_plans: dict[str, str],
+    after_repos_sha: str | None,
+) -> list[str]:
+    """Pure comparison: given a before/after snapshot pair (already taken by
+    the caller), return the list of human-readable problem strings -- empty
+    if nothing changed. Takes no filesystem action itself. Thin orchestrator
+    over ``_diff_plans_dir``/``_diff_repos_json`` above -- kept as its own
+    function (rather than inlined at each call site) because it is the
+    signature the existing unit tests in
+    ``test_conftest_pollution_guard.py`` exercise directly."""
+    return _diff_plans_dir(plans_dir, before_plans, after_plans) + _diff_repos_json(
+        repos_json, before_repos_sha, after_repos_sha
+    )
+
+
+def _resolve_main_checkout_plans_dir() -> Path | None:
+    """Resolve the ``docs/plans`` dir of the repo the BUILTIN ``"hydra"``
+    repo id points at, independent of anything an individual test does --
+    the exact resolution `hydra_core.plan_artifact.plan_artifact_repo_root`
+    performs via `hydra_core.repo_registry.resolve_repo_path("hydra")` for
+    any workflow whose ``target_repo_id`` is the builtin ``"hydra"`` id
+    (e.g. ``hydra plan --repo hydra``, or a DEV_TASK step naming
+    ``target_repo_id: "hydra"``, as `tests/test_hydra69_followup.py`'s
+    `_cmd_plan`-driven E2E test does).
+
+    This is a SEPARATE watched path from ``_REAL_CHECKOUT_DOCS_PLANS``
+    (derived from this file's own on-disk location): when the suite runs
+    from an isolated WORKTREE, ``_REAL_CHECKOUT_DOCS_PLANS`` is that
+    worktree's own ``docs/plans`` -- but `resolve_repo_path("hydra")`'s
+    worktree-aware base-directory probe (`repo_registry._get_base()`)
+    still resolves to the OPERATOR'S actual main checkout regardless of
+    which worktree is running, because "hydra" means "the one real Hydra
+    repo" by design. A test that resolves a write root through that path
+    without redirecting it lands a real file in the main checkout even
+    though the suite itself is sandboxed -- this is the leak the guard
+    must also watch for.
+
+    Read-only: `resolve_repo_path` only runs `git rev-parse
+    --show-toplevel` (a local, no-network git invocation), never a write.
+    Returns ``None`` (never raises) if resolution fails for any reason,
+    so a guard that cannot resolve the main checkout degrades to watching
+    only the suite's own checkout rather than crashing every session.
+    """
+    try:
+        from hydra_core.repo_registry import resolve_repo_path
+
+        return resolve_repo_path("hydra") / "docs" / "plans"
+    except Exception:  # noqa: BLE001 -- guard scope degrading beats crashing
+        return None
+
+
+def _watched_plans_dirs() -> list[Path]:
+    """All real ``docs/plans`` directories this pytest session's tests must
+    never write into, deduplicated. See ``_resolve_main_checkout_plans_dir``
+    for why a worktree run needs a SECOND watched dir beyond its own."""
+    dirs = {_REAL_CHECKOUT_DOCS_PLANS.resolve()}
+    main_dir = _resolve_main_checkout_plans_dir()
+    if main_dir is not None:
+        try:
+            dirs.add(main_dir.resolve())
+        except OSError:
+            pass
+    return sorted(dirs)
 
 
 # Backwards-compatible aliases bound to the two REAL paths -- kept so the
@@ -310,33 +389,44 @@ def _snapshot_real_repos_json_sha256() -> str | None:
 
 @pytest.fixture(scope="session", autouse=True)
 def _real_hydra_home_pollution_guard():
-    """Fail the session if any test wrote into the REAL checkout's tracked
-    ``docs/plans/`` or mutated the operator's REAL ``~/.hydra/repos.json``.
+    """Fail the session if any test wrote into a REAL checkout's tracked
+    ``docs/plans/`` (the suite's own checkout AND -- when a worktree run
+    resolves it differently -- the operator's actual main checkout; see
+    ``_resolve_main_checkout_plans_dir``) or mutated the operator's REAL
+    ``~/.hydra/repos.json``.
 
     READ-ONLY by construction: every call this fixture makes against the
-    two real paths above is ``.is_dir()``, ``.is_file()``, ``.iterdir()``,
-    or ``.read_bytes()`` -- never a write, ``unlink``, ``rename``, or
-    ``mkdir``. Pre-existing litter (files already present before the
-    session started) is never flagged or touched; only NEW files / a
-    CHANGED hash trip this guard. The actual snapshot/compare logic lives in
-    ``_snapshot_plans_dir``/``_snapshot_repos_json_sha256``/
-    ``_diff_pollution_guard_snapshots`` above, which are unit tested against
-    tmp_path stand-ins in ``test_conftest_pollution_guard.py`` -- this
-    fixture only supplies the two real paths and the before/after timing.
+    watched real paths is ``.is_dir()``, ``.is_file()``, ``.iterdir()``, or
+    ``.read_bytes()`` -- never a write, ``unlink``, ``rename``, or
+    ``mkdir`` -- plus the local, no-network ``git rev-parse
+    --show-toplevel`` that ``resolve_repo_path`` runs to find the main
+    checkout. Pre-existing litter (files already present before the session
+    started) is never flagged or touched; only NEW files / a CHANGED hash /
+    a REMOVED file trips this guard. The actual snapshot/compare logic
+    lives in ``_snapshot_plans_dir``/``_snapshot_repos_json_sha256``/
+    ``_diff_pollution_guard_snapshots``/``_diff_plans_dir`` above, which are
+    unit tested against tmp_path stand-ins in
+    ``test_conftest_pollution_guard.py`` -- this fixture only supplies the
+    real paths and the before/after timing.
     """
-    before_plans = _snapshot_real_plans_dir()
+    watched_plans_dirs = _watched_plans_dirs()
+    before_plans_by_dir = {d: _snapshot_plans_dir(d) for d in watched_plans_dirs}
     before_repos_sha = _snapshot_real_repos_json_sha256()
     yield
-    after_plans = _snapshot_real_plans_dir()
+    after_plans_by_dir = {d: _snapshot_plans_dir(d) for d in watched_plans_dirs}
     after_repos_sha = _snapshot_real_repos_json_sha256()
 
-    problems = _diff_pollution_guard_snapshots(
-        plans_dir=_REAL_CHECKOUT_DOCS_PLANS,
-        repos_json=_REAL_HOME_REPOS_JSON,
-        before_plans=before_plans,
-        before_repos_sha=before_repos_sha,
-        after_plans=after_plans,
-        after_repos_sha=after_repos_sha,
+    problems: list[str] = []
+    for plans_dir in watched_plans_dirs:
+        problems.extend(
+            _diff_plans_dir(
+                plans_dir,
+                before_plans_by_dir[plans_dir],
+                after_plans_by_dir[plans_dir],
+            )
+        )
+    problems.extend(
+        _diff_repos_json(_REAL_HOME_REPOS_JSON, before_repos_sha, after_repos_sha)
     )
     if problems:
         pytest.fail(

@@ -955,6 +955,81 @@ class TestDefaultRootEnvOverride:
         assert result == inside_sandbox
 
 
+class TestTargetRepoResolvedRootSandboxScoping:
+    """The same two-env-var sandbox scoping `_resolve_default_root` applies
+    to the "no target repo" `default_root` fallback ALSO applies to a
+    write-purpose root resolved via `repo_registry.resolve_repo_path`
+    (branch 3b of `plan_artifact_repo_root`) -- this is the fix for the
+    real leak a coordinator host review caught: `tests/test_hydra69_
+    followup.py`'s E2E test sets `target_repo_id="hydra"` (a BUILTIN repo
+    id resolving through `resolve_repo_path`, a DIFFERENT function from
+    `resolve_repo_project_path`, which is the one that test's own
+    monkeypatch covers) and landed a real PLAN artifact under the
+    operator's actual checkout even though the suite ran from an isolated
+    worktree."""
+
+    def test_target_repo_resolved_root_outside_sandbox_is_redirected(
+        self, tmp_path, monkeypatch,
+    ):
+        """The leak-fix property: a `target_repo_id` that resolves (via
+        `repo_registry`, e.g. `HYDRA_EXTRA_REPOS`) to a directory OUTSIDE
+        the declared sandbox is redirected to the env override -- exactly
+        like an out-of-sandbox `default_root` already was -- rather than
+        being returned as-is."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        outside_sandbox = tmp_path.parent.parent / "not-the-sandbox-repo"
+        outside_sandbox.mkdir(parents=True, exist_ok=True)
+        _git_init(outside_sandbox)
+        override_root = tmp_path / "env-override"
+        override_root.mkdir()
+        monkeypatch.setenv("HYDRA_EXTRA_REPOS", json.dumps({"tgt": str(outside_sandbox)}))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", str(override_root))
+        monkeypatch.setenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", str(tmp_path))
+
+        try:
+            root, repo_id = plan_artifact_repo_root(
+                {"target_repo_id": "tgt"}, tmp_path, purpose="write",
+            )
+            assert root == override_root
+            assert root != outside_sandbox.resolve()
+            # The resolved id is still reported even though the physical
+            # root was redirected -- matches the existing default_root
+            # override's contract (it never touches repo_id, only root).
+            assert repo_id == "tgt"
+        finally:
+            import shutil
+            shutil.rmtree(outside_sandbox, ignore_errors=True)
+
+    def test_target_repo_resolved_root_unaffected_when_env_vars_unset(
+        self, tmp_path, monkeypatch,
+    ):
+        """Production-behaviour guarantee: with BOTH env vars unset (the
+        real production state -- `tests/conftest.py`'s autouse fixture is
+        the only thing that ever sets them), a `target_repo_id` resolving
+        outside any notion of a sandbox is returned completely unchanged --
+        proving this fix does not alter the resolver's behaviour outside
+        the test harness."""
+        from hydra_core.plan_artifact import plan_artifact_repo_root
+
+        outside_sandbox = tmp_path.parent.parent / "not-the-sandbox-repo-2"
+        outside_sandbox.mkdir(parents=True, exist_ok=True)
+        _git_init(outside_sandbox)
+        monkeypatch.setenv("HYDRA_EXTRA_REPOS", json.dumps({"tgt2": str(outside_sandbox)}))
+        monkeypatch.delenv("HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT", raising=False)
+        monkeypatch.delenv("HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT", raising=False)
+
+        try:
+            root, repo_id = plan_artifact_repo_root(
+                {"target_repo_id": "tgt2"}, tmp_path, purpose="write",
+            )
+            assert root == outside_sandbox.resolve()
+            assert repo_id == "tgt2"
+        finally:
+            import shutil
+            shutil.rmtree(outside_sandbox, ignore_errors=True)
+
+
 def test_plan_with_no_target_repo_lands_under_conftest_tmp_dir_not_checkout(
     tmp_path,
 ):
