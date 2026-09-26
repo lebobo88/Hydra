@@ -6228,64 +6228,121 @@ def _build_surfaced_reason(final_state: HydraState) -> Optional[dict]:
         raised for those — the reason lives in ``state.last_event``, see
         `hydra_core.governance.enforce_governance`).
 
-    The failing-criteria rule is scale-aware: stored verdicts come from
-    critics scoring on different scales (e.g. codex returns 0-1, rubric
-    scores are 0-5). If every numeric score in the verdict's ``score_json``
-    is within ``[0, 1]``, a criterion is failing when it is ``< 0.6`` (the
-    rubric's 3-of-5 pass bar normalised to a 0-1 scale); otherwise a
-    criterion is failing when it is ``< 3``.
+    The failing-criteria rule is scale-aware but never guesses: stored
+    verdicts come from critics scoring on different scales (e.g. codex
+    returns 0-1, rubric scores are 0-5).
+
+      * If every numeric score in the verdict's ``score_json`` is within
+        ``[0, 1]``, the scale is ``"0-1"`` and a criterion is failing when
+        it is ``< 0.6`` (the rubric's 3-of-5 pass bar normalised to 0-1).
+      * Else, if every numeric score is within ``[0, 5]`` AND at least one
+        score is ``> 1`` (so an all-zero/all-one verdict isn't misread as
+        0-5), the scale is ``"0-5"`` and a criterion is failing when it is
+        ``< 3``.
+      * Otherwise (mixed scales, or any score outside ``[0, 5]``), the
+        scale is ambiguous: ``criteria_scale`` is set to ``"unknown"`` and
+        no ``criteria`` are named (the key is omitted rather than guessed).
+
+    This helper is total: it is built to never raise regardless of what
+    malformed data a corrupted/partial checkpoint holds (non-dict verdict
+    entries, non-mapping ``score_json``, non-string score keys, a
+    non-dict ``pending_hitl``, a non-string ``rubric_id``, etc.) -- each
+    verdict is processed defensively and any unexpected shape is skipped
+    rather than allowed to raise into `_cmd_finalize`'s response.
 
     Returns ``None`` when the workflow is not surfaced, or when no usable
     reason could be extracted (should not happen for a genuinely surfaced
     workflow, but this must never raise into `_cmd_finalize`'s response).
     """
-    if final_state.phase != "surfaced":
+    try:
+        if final_state.phase != "surfaced":
+            return None
+    except Exception:  # noqa: BLE001
         return None
     reason: dict[str, object] = {}
-    hitl = final_state.pending_hitl
-    if isinstance(hitl, dict):
-        if hitl.get("reason"):
-            reason["hitl_reason"] = hitl.get("reason")
-        if hitl.get("gate_node"):
-            reason["gate_id"] = hitl.get("gate_node")
-        if hitl.get("summary"):
-            reason["summary"] = hitl.get("summary")
-    if "gate_id" not in reason and final_state.last_event:
-        # node_postcheck's governance gate surfaces without raising a
-        # HITLRequest -- `last_event` carries `GovernanceVerdict.reason`
-        # (see `node_postcheck`), which is the only record of why.
-        reason["gate_id"] = final_state.last_event
+    try:
+        hitl = final_state.pending_hitl
+        if isinstance(hitl, dict):
+            if hitl.get("reason"):
+                reason["hitl_reason"] = hitl.get("reason")
+            if hitl.get("gate_node"):
+                reason["gate_id"] = hitl.get("gate_node")
+            if hitl.get("summary"):
+                reason["summary"] = hitl.get("summary")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if "gate_id" not in reason and final_state.last_event:
+            # node_postcheck's governance gate surfaces without raising a
+            # HITLRequest -- `last_event` carries `GovernanceVerdict.reason`
+            # (see `node_postcheck`), which is the only record of why.
+            reason["gate_id"] = final_state.last_event
+    except Exception:  # noqa: BLE001
+        pass
     # A judge-driven surface (policy_breach / constitution_breach) has a
     # concrete `fail` verdict on record -- name it and its failing
-    # dimensions instead of just the generic HITL reason string.
-    fail_verdicts = [v for v in (final_state.verdicts or [])
-                     if isinstance(v, dict) and v.get("outcome") == "fail"]
+    # dimensions instead of just the generic HITL reason string. Each
+    # verdict is untrusted checkpoint data, so process it defensively:
+    # one malformed entry must not blank out an otherwise-good reason.
+    try:
+        raw_verdicts = final_state.verdicts or []
+    except Exception:  # noqa: BLE001
+        raw_verdicts = []
+    fail_verdicts = []
+    for v in raw_verdicts:
+        try:
+            if isinstance(v, dict) and v.get("outcome") == "fail":
+                fail_verdicts.append(v)
+        except Exception:  # noqa: BLE001
+            continue
     if fail_verdicts:
-        v = fail_verdicts[-1]
-        reason["rubric_id"] = v.get("rubric_id")
-        scores = v.get("score_json") or {}
-        numeric_scores = [
-            val for k, val in scores.items()
-            if not k.startswith("_")
-            and isinstance(val, (int, float))
-            and not isinstance(val, bool)
-        ]
-        # Scale-aware pass bar: an all-[0,1] verdict (e.g. a codex critic)
-        # uses the 3-of-5 pass bar normalised to 0.6; anything else uses the
-        # rubric's raw 3-of-5 bar.
-        normalized_scale = bool(numeric_scores) and all(
-            0 <= val <= 1 for val in numeric_scores
-        )
-        threshold = 0.6 if normalized_scale else 3
-        criteria = [
-            k for k, val in scores.items()
-            if not k.startswith("_")
-            and isinstance(val, (int, float))
-            and not isinstance(val, bool)
-            and val < threshold
-        ]
-        if criteria:
-            reason["criteria"] = criteria
+        try:
+            v = fail_verdicts[-1]
+            # `rubric_id` is stored verbatim (never parsed/formatted here),
+            # so a non-string value (a defect elsewhere) is passed through
+            # rather than raising -- it's still useful for debugging.
+            judge_reason: dict[str, object] = {"rubric_id": v.get("rubric_id")}
+            scores = v.get("score_json")
+            if not isinstance(scores, dict):
+                scores = {}
+            numeric_items = []
+            for k, val in scores.items():
+                try:
+                    if (
+                        isinstance(k, str)
+                        and not k.startswith("_")
+                        and isinstance(val, (int, float))
+                        and not isinstance(val, bool)
+                    ):
+                        numeric_items.append((k, val))
+                except Exception:  # noqa: BLE001
+                    continue
+            numeric_values = [val for _k, val in numeric_items]
+            is_scale_01 = bool(numeric_values) and all(
+                0 <= val <= 1 for val in numeric_values
+            )
+            is_scale_05 = (
+                not is_scale_01
+                and bool(numeric_values)
+                and all(0 <= val <= 5 for val in numeric_values)
+                and any(val > 1 for val in numeric_values)
+            )
+            if is_scale_01:
+                threshold = 0.6
+            elif is_scale_05:
+                threshold = 3
+            else:
+                threshold = None
+            if threshold is not None:
+                criteria = [k for k, val in numeric_items if val < threshold]
+                if criteria:
+                    judge_reason["criteria"] = criteria
+            else:
+                # Mixed or out-of-range scores: don't guess a pass bar.
+                judge_reason["criteria_scale"] = "unknown"
+            reason.update(judge_reason)
+        except Exception:  # noqa: BLE001
+            pass
     return reason or None
 
 

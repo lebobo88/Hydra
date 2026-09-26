@@ -277,3 +277,103 @@ def test_surfaced_reason_judge_branch_uses_most_recent_fail_verdict():
     reason = cli._build_surfaced_reason(state)
     assert reason["rubric_id"] == "constitution-alignment@1"
     assert reason["criteria"] == ["fresh_criterion"]
+
+
+def test_surfaced_reason_mixed_scale_is_unknown_not_guessed():
+    """A verdict mixing a plausible 0-1-scale value with a value outside
+    both the [0,1] and [0,5] bounds (e.g. a negative score alongside a
+    normalised one) is ambiguous -- the helper must not guess a pass bar
+    for it. Neither the [0,1] rule (violated by -0.5) nor the [0,5] rule
+    (also violated by -0.5) apply, so it falls through to "unknown"."""
+    state = _base_state(
+        verdicts=[
+            {
+                "outcome": "fail",
+                "rubric_id": "constitution-alignment@1",
+                "score_json": {"clarity": 0.4, "correctness": -0.5},
+            },
+        ],
+    )
+    reason = cli._build_surfaced_reason(state)
+    assert reason["rubric_id"] == "constitution-alignment@1"
+    assert reason.get("criteria_scale") == "unknown"
+    assert not reason.get("criteria")
+
+
+def test_surfaced_reason_out_of_range_scale_is_unknown_not_guessed():
+    """Scores outside [0, 5] (e.g. a 0-10 scale) are not misread as 0-5."""
+    state = _base_state(
+        verdicts=[
+            {
+                "outcome": "fail",
+                "rubric_id": "constitution-alignment@1",
+                "score_json": {"clarity": 2, "correctness": 10},
+            },
+        ],
+    )
+    reason = cli._build_surfaced_reason(state)
+    assert reason["rubric_id"] == "constitution-alignment@1"
+    assert reason.get("criteria_scale") == "unknown"
+    assert not reason.get("criteria")
+
+
+# --- Total-function guards: malformed/untrusted checkpoint data must -----
+# never raise into `_cmd_finalize`'s response.
+#
+# `HydraState.verdicts` is typed `list[dict[str, Any]]` and `pending_hitl`
+# is typed `Optional[dict[str, Any]]`, so pydantic itself would reject a
+# non-dict verdict entry or a non-dict `pending_hitl` at construction time.
+# `_build_surfaced_reason` is duck-typed (it only reads `.phase`,
+# `.pending_hitl`, `.last_event`, `.verdicts`), so a corrupted/partial
+# checkpoint that bypasses that validation (e.g. sanitized/replayed state,
+# or a future schema drift) is modeled here with a minimal stand-in rather
+# than fighting pydantic's own type enforcement.
+class _RawState:
+    def __init__(self, *, phase="surfaced", pending_hitl=None, last_event=None,
+                 verdicts=None):
+        self.phase = phase
+        self.pending_hitl = pending_hitl
+        self.last_event = last_event
+        self.verdicts = verdicts
+
+
+def test_surfaced_reason_never_raises_on_non_mapping_score_json():
+    state = _base_state(
+        verdicts=[
+            {"outcome": "fail", "rubric_id": "constitution-alignment@1",
+             "score_json": "bad"},
+        ],
+    )
+    reason = cli._build_surfaced_reason(state)  # must not raise
+    assert reason["rubric_id"] == "constitution-alignment@1"
+    assert "criteria" not in reason
+
+
+def test_surfaced_reason_never_raises_on_non_string_score_keys():
+    state = _base_state(
+        verdicts=[
+            {"outcome": "fail", "rubric_id": "constitution-alignment@1",
+             "score_json": {1: 0.2, "clarity": 0.4}},
+        ],
+    )
+    reason = cli._build_surfaced_reason(state)  # must not raise
+    assert reason["rubric_id"] == "constitution-alignment@1"
+    assert reason["criteria"] == ["clarity"]
+
+
+def test_surfaced_reason_never_raises_on_non_dict_verdict_entry():
+    state = _RawState(
+        verdicts=[
+            "not-a-verdict",
+            {"outcome": "fail", "rubric_id": "constitution-alignment@1",
+             "score_json": {"clarity": 1}},
+        ],
+    )
+    reason = cli._build_surfaced_reason(state)  # must not raise
+    assert reason["rubric_id"] == "constitution-alignment@1"
+
+
+def test_surfaced_reason_never_raises_on_non_dict_pending_hitl():
+    state = _RawState(pending_hitl="not-a-dict", last_event="N task(s) failed")
+    reason = cli._build_surfaced_reason(state)  # must not raise
+    assert reason == {"gate_id": "N task(s) failed"}
