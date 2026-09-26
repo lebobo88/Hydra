@@ -6288,6 +6288,12 @@ def _build_surfaced_reason(final_state: HydraState) -> Optional[dict]:
         raw_verdicts = final_state.verdicts or []
     except Exception:  # noqa: BLE001
         raw_verdicts = []
+    if not isinstance(raw_verdicts, (list, tuple)):
+        # A truthy non-iterable (e.g. an int or a bare object()) is reachable
+        # via HydraState.model_construct on corrupted/partial checkpoint
+        # data; treat it as no verdicts rather than raising TypeError on
+        # iteration below.
+        raw_verdicts = []
     fail_verdicts = []
     for v in raw_verdicts:
         try:

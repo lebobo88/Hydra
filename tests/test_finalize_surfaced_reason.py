@@ -377,3 +377,43 @@ def test_surfaced_reason_never_raises_on_non_dict_pending_hitl():
     state = _RawState(pending_hitl="not-a-dict", last_event="N task(s) failed")
     reason = cli._build_surfaced_reason(state)  # must not raise
     assert reason == {"gate_id": "N task(s) failed"}
+
+
+def test_surfaced_reason_never_raises_on_truthy_non_iterable_verdicts():
+    """`HydraState.verdicts` is typed `list[dict[str, Any]]`, so a truthy
+    non-iterable (an int, a bare `object()`) is only reachable via
+    `model_construct`, which bypasses pydantic validation -- e.g. a
+    corrupted/partial checkpoint or a future schema drift. The old
+    `raw_verdicts = final_state.verdicts or []` guard only catches falsy
+    values (`0`, `None`, `[]`); a truthy non-iterable like `5` or
+    `object()` sailed straight into `for v in raw_verdicts:` and raised
+    `TypeError: 'int' object is not iterable`.
+
+    A HITL reason is present so we can also assert the fix doesn't regress
+    the HITL branch: the result must still surface the HITL-reason fields
+    even though the malformed `verdicts` value is discarded, and it must
+    carry no verdict-derived `rubric_id`/`criteria`.
+    """
+    wf = uuid4()
+    for bad_verdicts in (5, object()):
+        state = HydraState.model_construct(
+            workflow_id=wf,
+            root_goal="surfaced_reason unit coverage",
+            selected_squads=["engineering"],
+            phase="surfaced",
+            pending_hitl={
+                "reason": "policy_breach",
+                "gate_node": "node_postcheck",
+                "summary": "operator review required",
+            },
+            last_event=None,
+            verdicts=bad_verdicts,
+        )
+        reason = cli._build_surfaced_reason(state)  # must not raise
+        assert reason == {
+            "hitl_reason": "policy_breach",
+            "gate_id": "node_postcheck",
+            "summary": "operator review required",
+        }
+        assert "rubric_id" not in reason
+        assert "criteria" not in reason
