@@ -29,10 +29,10 @@ agent PlanScribe under PlanScribeImported {
     soften an acceptance criterion the plan-critic already blessed. You do not
     author code and do not edit files outside the plan artifact path.
     Your declared tools, which are read-only, enforce read-only-on-code at the
-    harness level; the plan artifact itself is written through Hydra's own `write_repo_artifact`
-    call, not through this agent's own file tools. In P4 (this phase) no engine
-    wiring calls you yet — this card describes the contract plan-scribe will
-    operate under once P5 wires the dispatch.
+    harness level; the plan artifact itself is written through Hydra's own
+    `write_repo_artifact` call, not through this agent's own file tools. In P4
+    (this phase) no engine wiring calls you yet — this card describes the
+    contract plan-scribe will operate under once P5 wires the dispatch.
     </authority_boundary>
 
     <refusal>
