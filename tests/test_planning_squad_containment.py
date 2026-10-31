@@ -435,10 +435,22 @@ def test_planning_agent_file_exists(agent_slug):
     text = p.read_text(encoding="utf-8")
     assert text.startswith("---")
     assert f"name: {agent_slug}" in text
-    # The emitter quotes string values (`permissionMode: "plan"`), so the key is read
-    # from the parsed frontmatter and compared exactly instead of as a substring.
+    # Read-only on code is the agent's tool list, not `permissionMode`: Claude Code
+    # ignores `permissionMode` for plugin subagents (these load as `hydra:plan-*`), but
+    # honours `tools`. The source declares `uses fs.read("**")`, which the Claude target
+    # writes as Read, Grep and Glob, sorted (Covenant emitter
+    # packages/emit/src/targets/claude.ts `toolsOf` "fs.read" and `allowlist`;
+    # LANGUAGE.md §12). An omitted `tools` key would give every tool, so the key must be
+    # present and exact. The list is read from the parsed frontmatter, not as a substring.
     frontmatter = yaml.safe_load(text.split("---", 2)[1])
-    assert frontmatter["permissionMode"] == "plan"
+    assert "permissionMode" not in frontmatter
+    assert frontmatter.get("tools") == ["Glob", "Grep", "Read"]
+    for write_or_shell in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"):
+        assert write_or_shell not in frontmatter["tools"]
+    # The covenant's `forbid fs.write("**")` and `forbid shell("*")` are also written as
+    # denials, so the limit holds even if a later `uses` widens the list.
+    for denied in ("Edit", "NotebookEdit", "Write", "Bash"):
+        assert denied in frontmatter.get("disallowedTools", [])
 
 
 def test_planning_agents_listed_in_plugin_manifest():
