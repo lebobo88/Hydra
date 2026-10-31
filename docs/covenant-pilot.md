@@ -122,7 +122,7 @@ Every original frontmatter key and value survives: `name`, `description`, `model
 
 **One difference outside NORMALIZATIONS.md, caused by the flow.** A flow can pass a value to an agent only through its `input` fields (LANGUAGE.md §8, §11). The Claude runtime provider sends the input record as the user message. An agent with an `input` gets an `## Input` section in its built file (LANGUAGE.md §12, l.1392 and l.1419; C.23). So since commit 9746080 each generated file also has, after the prompt, an `## Input` section (8, 6 and 6 lines, blank lines included). It reads "`{name}` placeholders in the instructions above stand for these inputs:", followed by the fields and their docs. These prompts contain no `{name}` placeholder, so that lead sentence is not accurate for them (see "Covenant issue from this pilot"). The section is documented in LANGUAGE.md §12, but neither of NORMALIZATIONS.md's lists names it, because import never produces an `input`. The brief's decisions 4 (only header and normalization differences) and 5 (a flow that passes the goal and draft between heads) cannot both hold exactly. I kept the flow and report the difference here.
 
-## Drift check runs (fresh clone of this branch at 9746080, Node 26.12.1)
+## Drift check runs (fresh clone of this branch at 42a18ab, Node 26.12.1; first run at 9746080 with the same results)
 
 | run | change | command | exit | message |
 |---|---|---|---|---|
@@ -198,7 +198,7 @@ Before, the model split was `claude-opus-5-5` 1.0603 and 0.8354, and `claude-hai
 - **Flow shape.** Version A added an unjudged third author call when both reviews said revise (0.4314 and 0.1888 USD). B and C make at most the before procedure's calls: author, critic, author, critic, then scribe or escalate.
 - **Caching.** All runs share the account's prompt cache, and later runs read more from it (before 2's first step: 130057 cache-read tokens, 0.0859 USD). Run order was before 1, after 1, before 2 and after 2 (overlapping), then after 3 and after 4. One run per condition per round is not enough to call either cheaper. The author, critic, revise, critic steps cost 1.0615 and 0.8368 before, and 1.1239, 0.6034 and 0.6635 after.
 
-Measurement spend: 1.0615 + 0.8368 + 1.5553 + 0.7922 + 0.6635 + 0.5506 + 0.1730 (load check) = **5.6329 USD**, under the 10 USD cap. The brief allows one run of each condition, and a second while the total stays under the cap. After runs 3 and 4 measured the two later versions of the flow, made after review, so that the committed flow has a measured run. They stayed under the same cap. No measurement script or output is committed. They are in the session scratch directory.
+Measurement spend: 1.0615 + 0.8368 + 1.5553 + 0.7922 + 0.6635 + 0.5506 + 0.1730 (load check) = **5.6329 USD**, under the 10 USD cap. The brief allows one run of each condition, and a second while the total stays under the cap. After runs 3 and 4 measured the two later versions of the flow, made after review, so that the committed flow has a measured run. They stayed under the same cap. **This departs from the brief's run limit and needs Rob's yes.** If he does not accept it, the brief-conforming measurement is after runs 1 and 2, of flow version A. No measurement script or output is committed. They are in the session scratch directory.
 
 ## Changes outside the listed files (`covenant/**`, `docs/covenant-pilot.md`)
 
