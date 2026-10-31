@@ -35,9 +35,9 @@ rubric PlanReview v1 {
 // (docs/covenant-pilot.md, "Cost"). It is a default, not a measured limit.
 // usd 3.00: the longest path is two plan-author calls, two plan-critic calls and one
 // plan-scribe call. The measured runs (docs/covenant-pilot.md, "Cost") cost at most 0.56 USD
-// per author call and 0.30 per critic call; plan-scribe never ran there, so it is taken at the
-// critic's 0.30. That path is about 2.02 USD, and 3.00 leaves headroom. It is a default from
-// those runs, not a measured limit.
+// per author call and 0.30 per critic call, and plan-scribe's one run cost 0.13. That path is
+// about 1.85 USD, and 3.00 leaves headroom. It is a default from those runs, not a measured
+// limit.
 flow Plan(goal: Text) -> Untrusted<Text> under PlanningFlow budget { usd: 3.00 } {
   let draft = ask PlanAuthor(goal)
   let review = judge draft with PlanReview by PlanCritic
