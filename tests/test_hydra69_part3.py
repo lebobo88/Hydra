@@ -3,7 +3,7 @@
 D1. `_build_squad_prompt` (hydra_core.host_bridge) appends a schema-generated
     "## Required output: PLAN envelope" section for squad_slug=="planning"
     ONLY -- every other squad's prompt stays byte-for-byte unchanged.
-D2. plugins/hydra/agents/plan-author.md names the key PlanStep fields and
+D2. plugins/hydra/.claude/agents/plan-author.md names the key PlanStep fields and
     points at the schema-generated section (markdown-only, smoke-checked
     here just for the load-bearing strings).
 D3. `node_plan_judge` (hydra_core.supervisor) adds `verdict_critique`
@@ -245,7 +245,7 @@ def test_begin_squad_stage_threads_plan_revision_into_prompt(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_plan_author_md_names_key_planstep_fields_and_points_at_prompt():
-    md = (HYDRA_ROOT / "plugins" / "hydra" / "agents" / "plan-author.md").read_text(
+    md = (HYDRA_ROOT / "plugins" / "hydra" / ".claude" / "agents" / "plan-author.md").read_text(
         encoding="utf-8"
     )
     assert "Required output: PLAN envelope" in md
