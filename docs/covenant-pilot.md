@@ -21,7 +21,7 @@ Every number below comes from a command run on branch `claude/project-thread-o9s
 2. `cd covenant && npx cov check` exit 0 with no output. `npx cov fmt --check` exit 0.
 3. `npx cov build --target claude --out ../plugins/hydra`: `3 written, 0 unchanged, 0 stale`. The build overwrote the three moved originals with generated files. Commit 6a6a143 holds this state: the import as written, with no hand edits.
 4. The manifest and paths were repointed, as described under "Changes outside the listed files".
-5. The flow (step 9746080). `covenant/plan.cov` was written. Each agent gained one `input` item: `goal`, `feedback?` and `draft?` for plan-author, and `plan` for plan-critic and plan-scribe. `cov fmt` normalized the layout. Then `cov check` and `cov fmt --check` exit 0, and `cov build --target claude --out ../plugins/hydra` gives `3 written, 0 unchanged, 0 stale`.
+5. The flow (commit 9746080, revised twice after review and measurement; see "The flow"). `covenant/plan.cov` was written. Each agent gained one `input` item: `goal`, `feedback?` and `draft?` for plan-author, and `plan` for plan-critic and plan-scribe. `cov fmt` normalized the layout. Then `cov check` and `cov fmt --check` exit 0, and `cov build --target claude --out ../plugins/hydra` gives `3 written, 0 unchanged, 0 stale`.
 
 `TODO(import)` comments left, as TASK-019 left them: `covenant rules not present in source` (3 files) and `usd, tokens and wall budget not present in source` (3 files). The originals have neither covenant rules nor a usd, token or wall budget. Giving an agent a usd cap would add a `## Budget` section to the generated file and a new limit Hydra does not have today. The flow has its own budget (below).
 
@@ -30,23 +30,30 @@ Every number below comes from a command run on branch `claude/project-thread-o9s
 ```
 flow Plan(goal: Text) -> Untrusted<Text> under PlanningFlow budget { usd: 3.00 } {
   let draft = ask PlanAuthor(goal)
-  loop max 2 {
-    let review = judge draft with PlanReview by PlanCritic
+  let review = judge draft with PlanReview by PlanCritic
+  loop max 1 {
     if review.verdict == pass {
       let blessed = verify(draft, review)
       let rendered = ask PlanScribe(blessed)
       return rendered
     }
     draft = ask PlanAuthor(goal, feedback: review.notes, draft: draft)
+    review = judge draft with PlanReview by PlanCritic
+  }
+  if review.verdict == pass {
+    let blessed = verify(draft, review)
+    let rendered = ask PlanScribe(blessed)
+    return rendered
   }
   escalate human "plan-critic did not bless the plan within one revise round"
 }
 ```
 
-- Rubric `PlanReview v1` has three dimensions, the checks in plan-critic's "Procedure" step 2: `owners`, `acceptance` and `dependencies`. The verdict is `pass when all == 1`, `revise otherwise`. The critic blocks on any fault and never approves "with reservations" (step 4), so the skill has no `fail` outcome.
+- Rubric `PlanReview v1` has four dimensions. `owners`, `acceptance` and `dependencies` are the checks in plan-critic's "Procedure" step 2. `approved` is the critic's decision from steps 3 and 4 and "Return format" (approved true or false). The verdict is `pass when approved == 1`, `revise otherwise`. The critic blocks on any fault and never approves "with reservations" (step 4), so the skill has no `fail` outcome.
 - No head blesses its own work. The judge is `PlanCritic`, a different agent from `PlanAuthor`. `PlanScribe` receives only `verify(draft, review)`, which the runtime gives only when the verdict is `pass`.
-- `loop max 2` means the critic judges at most twice, so plan-author gets at most one revise round. The skill names no cap. One revise round is the procedure the cost measurement uses. It is a default, not a measured limit. One cost of the language's loop shape (the same shape as Covenant's `examples/ship-change.cov`): when the second review is also `revise`, the body still asks plan-author for a third draft that nothing judges, and then escalates. Both after runs below took that path.
-- `budget { usd: 3.00 }`. The longest path is three author calls and two critic calls. Before run 1, measured first, cost 0.21 to 0.41 USD per author call and 0.19 to 0.26 per critic call, so that path is about 1.75 USD, and 3.00 leaves headroom. It is a default from one run, not a measured limit. No agent has a usd cap, so the checker's structural sum is 0 and W0302 cannot fire.
+- `loop max 1`: the body runs once, so plan-author gets at most one revise round and the critic judges at most twice. A second `revise` escalates without another author call. The skill names no cap. One revise round is the procedure the cost measurement uses. It is a default, not a measured limit. The scribe branch is written twice (inside the loop, and after it for the second review), because the language has no loop counter.
+- `budget { usd: 3.00 }`. The longest path is two author calls, two critic calls and one scribe call. The measured runs below cost at most 0.56 USD per author call and 0.30 per critic call. The scribe never ran before the last run, so it was taken at the critic's 0.30. That path is about 2.02 USD, and 3.00 leaves headroom. It is a default from those runs, not a measured limit. No agent has a usd cap, so the checker's structural sum is 0 and W0302 cannot fire.
+- **Three versions of the flow were measured** (all `cov run`, below). Version A (commit 9746080) had `loop max 2` around judge-then-revise and `pass when all == 1` over the three checks. In both of its runs, after a second `revise` it asked plan-author for a third draft that nothing judged (0.4314 and 0.1888 USD). Version B judged twice in sequence, the loop as above, and kept `all == 1`. In its run the critic blessed the first draft (`approved: true` in its notes) while scoring `acceptance` 0.95 and `dependencies` 0.9, and `all == 1` sent the draft back against the critic's own decision. Version C, the committed flow, keeps B's shape and makes the verdict the critic's `approved`.
 - `PlanningFlow` has one invariant, `CAPPED` (`require budget`). The three imported covenants (`PlanAuthorImported` and the others) are empty, as the import wrote them.
 
 ## Maintenance surface
@@ -63,12 +70,12 @@ What a maintainer edits by hand for this squad's agents and pipeline (`wc -l -c`
 | **After**: `covenant/plan-author.cov` | 1 | 82 | 4051 |
 | `covenant/plan-critic.cov` | 1 | 71 | 3198 |
 | `covenant/plan-scribe.cov` | 1 | 71 | 3340 |
-| `covenant/plan.cov` (the flow) | 1 | 48 | 2566 |
+| `covenant/plan.cov` (the flow) | 1 | 59 | 3273 |
 | `covenant/covenant.toml` | 1 | 3 | 140 |
 | `covenant/package.json` | 1 | 13 | 286 |
 | `covenant/.gitignore` | 1 | 1 | 14 |
 | SKILL.md "The three-head pipeline" section, unchanged | (part of 1) | 21 | 1138 |
-| **After, total** | 7 + 1 section | **310** | **14733** |
+| **After, total** | 7 + 1 section | **321** | **15440** |
 
 Generated, not edited by hand (counted separately): `plugins/hydra/.claude/agents/plan-author.md` 90 lines and 4178 bytes, `plan-critic.md` 81 and 3353, `plan-scribe.md` 81 and 3491, for a total of 252 lines and 11022 bytes. Also `covenant/package-lock.json` (521 lines, 17921 bytes, written by npm) and the vendored tarball and its `.sha256`.
 
@@ -84,7 +91,7 @@ Port alone, without the flow (commit 6a6a143): the three `.cov` sources are 217 
 | authority (gatekeeper, execute) | `squad.yaml` `authority`; SKILL.md pipeline prose | not removed |
 | read-only on code | agent `permissionMode: plan`; `description` "Read-only on code."; `<authority_boundary>` body | not removed (`extra claude` plus the prompt) |
 | pipeline order (author, critic, scribe) | SKILL.md pipeline prose; each agent's `<role>` | **one more place**: `plan.cov` |
-| plan-critic's checks (owner, acceptance, dependencies) | plan-critic body; SKILL.md prose | **one more place**: rubric `PlanReview` |
+| plan-critic's checks (owner, acceptance, dependencies) and its decision (approved true or false) | plan-critic body; SKILL.md prose | **one more place**: rubric `PlanReview` |
 | gate rubric ids | `squad.yaml` `gates`; agent bodies (`plan-decomposition-testable`, `plan-critic-owner-and-acceptance`) | not removed |
 
 Covenant removes none of these. It writes agent files only, not `squad.yaml` or `heads.yaml`, and in the originals each agent's facts are already in one file. The flow adds two new copies: the pipeline order and the critic's checks.
@@ -148,16 +155,18 @@ Both conditions used only this session's own sign-in. No key, token or sign-in w
 
 ### Per-step cost (USD)
 
-| step | before run 1 | before run 2 | after run 1 | after run 2 |
-|---|---|---|---|---|
-| plan-author (draft) | 0.4055 | 0.0859 | 0.5644 (9 model calls) | 0.2322 (7) |
-| plan-critic (review 1) | 0.2552 | 0.2017 | 0.2972 (2) | 0.1021 (1) |
-| plan-author (revise) | 0.2109 | 0.2939 | 0.1535 (1) | 0.1478 (1) |
-| plan-critic (review 2) | 0.1900 | 0.2552 | 0.1087 (1) | 0.1213 (1) |
-| plan-author (third draft, unjudged) | n/a | n/a | 0.4314 (5) | 0.1888 (1) |
-| plan-scribe | not run | not run | not run | not run |
-| **total** | **1.0615** | **0.8368** | **1.5553** | **0.7922** |
-| total of the four comparable steps | 1.0615 | 0.8368 | 1.1239 | 0.6034 |
+After runs 1 and 2 ran flow version A, after run 3 ran version B, and after run 4 ran version C, the committed flow ("The flow", above). In each case the project's `.cov` files were byte-identical to the repository's at that point (`cmp`). Model calls per step are in parentheses.
+
+| step | before 1 | before 2 | after 1 (A) | after 2 (A) | after 3 (B) | after 4 (C) |
+|---|---|---|---|---|---|---|
+| plan-author (draft) | 0.4055 | 0.0859 | 0.5644 (9) | 0.2322 (7) | 0.4277 (12) | 0.1215 (3) |
+| plan-critic (review 1) | 0.2552 | 0.2017 | 0.2972 (2) | 0.1021 (1) | 0.0736 (1) | 0.2981 (3) |
+| plan-author (revise) | 0.2109 | 0.2939 | 0.1535 (1) | 0.1478 (1) | 0.1134 (1) | n/a |
+| plan-critic (review 2) | 0.1900 | 0.2552 | 0.1087 (1) | 0.1213 (1) | 0.0488 (1) | n/a |
+| plan-author (third draft, unjudged; A only) | n/a | n/a | 0.4314 (5) | 0.1888 (1) | n/a | n/a |
+| plan-scribe | not run | not run | not run | not run | not run | 0.1311 (3, `claude-sonnet-5-5`) |
+| **total** | **1.0615** | **0.8368** | **1.5553** | **0.7922** | **0.6635** | **0.5506** |
+| total of the author, critic, revise, critic steps | 1.0615 | 0.8368 | 1.1239 | 0.6034 | 0.6635 | n/a |
 
 Tokens per run (input, output, cache read, cache write; all models):
 
@@ -165,27 +174,31 @@ Tokens per run (input, output, cache read, cache write; all models):
 |---|---|---|---|---|---|
 | before 1 | 11791 | 12583 | 220521 | 95746 | 340641 |
 | before 2 | 13843 | 15767 | 456748 | 53765 | 540123 |
-| after 1 | 36 | 31491 | 480329 | 103331 | 615187 |
-| after 2 | 22 | 22638 | 292833 | 34775 | 350268 |
+| after 1 (A) | 36 | 31491 | 480329 | 103331 | 615187 |
+| after 2 (A) | 22 | 22638 | 292833 | 34775 | 350268 |
+| after 3 (B) | 30 | 16981 | 452368 | 28949 | 498328 |
+| after 4 (C) | 20 | 7219 | 185008 | 62363 | 254610 |
 
-Before, the model split was `claude-opus-5-5` 1.0603 and 0.8354, and `claude-haiku-5-5` 0.0012 and 0.0014 (Claude Code's own side calls). Wall time: after run 1 was 6 min 21 s and after run 2 was 4 min 29 s (journal `runs`). Before steps took 29 to 62 s each (`duration_ms`).
+Before, the model split was `claude-opus-5-5` 1.0603 and 0.8354, and `claude-haiku-5-5` 0.0012 and 0.0014 (Claude Code's own side calls). Wall time in the journal's `runs` table: after 1 took 6 min 21 s, after 2 4 min 29 s, after 3 4 min 7 s and after 4 1 min 27 s. Before steps took 29 to 62 s each (`duration_ms`).
 
 ### Outcomes
 
-- **No run produced a plan the critic blessed.** In all four runs plan-critic sent both drafts back, so plan-scribe never ran in this measurement. The flow's scribe path was not exercised with a live model.
-- Before 1 and 2: both reviews said `approved: false`, naming faults per step, mostly unproduced dependencies and owners that do not name a real squad.
-- After 1: scores were `owners` 0.95, `acceptance` 0.72, `dependencies` 0.68, then 1, 0.85 and 0.95, so the verdict was `revise` twice. The run ended `Escalated: plan-critic did not bless the plan within one revise round` (exit 1). After 2: 1, 0.8 and 0.7, then 0.95, 0.72 and 0.68, and the same escalation. The critic's own `notes` said "approved: false" in each review, so the rubric's verdict agreed with the critic's text every time.
+- **Before 1 and 2: no blessed plan.** Both reviews in each run said `approved: false`, naming faults per step, mostly unproduced dependencies and owners that do not name a real squad. plan-scribe did not run.
+- **After 1 and 2 (A): no blessed plan.** Scores were `owners` 0.95, `acceptance` 0.72, `dependencies` 0.68, then 1, 0.85 and 0.95 (after 1), and 1, 0.8 and 0.7, then 0.95, 0.72 and 0.68 (after 2). Each run ended `Escalated: plan-critic did not bless the plan within one revise round` (exit 1). The critic's notes said "approved: false" in all four reviews.
+- **After 3 (B): the rubric overrode the critic.** Review 1's notes began "approved: true. Pass to plan-scribe with the substance unchanged.", but the scores were 1, 0.95 and 0.9, so `all == 1` gave `revise`. Review 2 said "approved: false" (1, 0.72 and 0.8). The run escalated (exit 1). This run is why version C takes the verdict from the critic's `approved`.
+- **After 4 (C): the critic blessed the first draft** (`owners`, `acceptance`, `dependencies` and `approved` all 1; notes "approved: true. Pass the PLAN (revision 1) to plan-scribe with its substance unchanged."). plan-scribe ran, and the flow returned (exit 0), but **the scribe rendered nothing**. It returned: "No artifact written. hydra_core is not installed (ModuleNotFoundError), so write_repo_artifact cannot be called, and I will not hand-write docs/plans files with my own file tools." It also said the critic's approval was not shown to it, because the flow passes plan-scribe only the plan. The scribe's contract writes through Hydra's `write_repo_artifact`, which a bare `cov run` does not provide, so the flow returns the scribe's report, not a rendered plan file. No file in either repo changed (`git status`).
+- So across the six runs, one blessed plan exists (after 4), and no run produced a rendered plan file.
 
 ### What differs between the two conditions
 
-- **Tools.** Before, under `claude -p` with no permission flags, tool calls that needed approval did not run. The before run 2 critic said its listing of `squads/*/squad.yaml` "needed approval and didn't run", and steps took 1 to 6 turns. After, the runtime runs every agent with `permissionMode: "dontAsk"` and `settingSources: []` (`@covenant/providers` `claude.ts`), and `harness("*")` approves every tool. The agents read files: the after-1 critic cited `/home/user/hydra/squads`, and the first author step made 9 and 7 model calls. The SDK printed `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` five times per run ("canUseTool will not be invoked for: Bash, Edit, Glob, Grep, NotebookEdit, Read, WebFetch, WebSearch, Write"). `permissionMode: plan` reaches only the generated Claude Code file (`extra claude`), not `cov run`. No file in either repo changed during the runs (`git status`). The after agents therefore have more tool access than the before ones. That is the largest behavioral difference, and it explains most of the after-1 first-step cost.
+- **Tools.** Before, under `claude -p` with no permission flags, tool calls that needed approval did not run. The before run 2 critic said its listing of `squads/*/squad.yaml` "needed approval and didn't run", and steps took 1 to 6 turns. After, the runtime runs every agent with `permissionMode: "dontAsk"` and `settingSources: []` (`@covenant/providers` `claude.ts`), and `harness("*")` approves every tool. The agents read files: the after-1 critic cited `/home/user/hydra/squads`, the first author step made 3 to 12 model calls, and the after-4 scribe tried to import `hydra_core`. The SDK printed `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` once per agent call ("canUseTool will not be invoked for: Bash, Edit, Glob, Grep, NotebookEdit, Read, WebFetch, WebSearch, Write"). `permissionMode: plan` reaches only the generated Claude Code file (`extra claude`), not `cov run`. No file in either repo changed during the runs (`git status`). The after agents therefore have more tool access than the before ones. That is the largest behavioral difference, and it explains most of the first-step cost in after 1 and after 3.
 - **System prompt.** Before, it is Claude Code's own system prompt plus the agent body (43690 cache-write tokens on the first call). After, it is the agent prompt alone, rendered by the runtime (24640 on the first call).
 - **Messages.** Before, the critic got the draft as plain text and the reviser got plain text sections. After, each agent gets its input record as JSON (`goal`, `feedback`, `draft`; `plan`). The after author returned a JSON `{"emitted_envelopes": [...]}` PLAN, and the before author returned Markdown tables.
-- **Verdict.** Before, I read `approved: true/false` from the critic's free text. After, the critic returns `PlanReview` scores through the SDK's structured output, and the rubric decides.
-- **Flow shape.** The after flow adds the unjudged third author call when both reviews say revise (0.4314 and 0.1888 USD here). That call is the whole of after run 2's total exceeding its four comparable steps.
-- **Caching.** All runs share the account's prompt cache, and later runs read more from it (before 2's first step: 130057 cache-read tokens, 0.0859 USD). Run order was before 1, after 1, before 2, after 2 (before 2 and after 2 overlapped). One run per condition per round is not enough to call either cheaper. The four comparable steps cost 1.0615 against 1.1239, and 0.8368 against 0.6034.
+- **Verdict.** Before, I read `approved: true/false` from the critic's free text. After, the critic returns `PlanReview` scores through the SDK's structured output, and the rubric decides: on the three checks in A and B, and on the critic's `approved` in C.
+- **Flow shape.** Version A added an unjudged third author call when both reviews said revise (0.4314 and 0.1888 USD). B and C make at most the before procedure's calls: author, critic, author, critic, then scribe or escalate.
+- **Caching.** All runs share the account's prompt cache, and later runs read more from it (before 2's first step: 130057 cache-read tokens, 0.0859 USD). Run order was before 1, after 1, before 2 and after 2 (overlapping), then after 3 and after 4. One run per condition per round is not enough to call either cheaper. The author, critic, revise, critic steps cost 1.0615 and 0.8368 before, and 1.1239, 0.6034 and 0.6635 after.
 
-Measurement spend: 1.0615 + 0.8368 + 1.5553 + 0.7922 + 0.1730 (load check) = **4.4188 USD**, under the 10 USD cap. A second run of each was made because the total stayed under the cap. No measurement script or output is committed. They are in the session scratch directory.
+Measurement spend: 1.0615 + 0.8368 + 1.5553 + 0.7922 + 0.6635 + 0.5506 + 0.1730 (load check) = **5.6329 USD**, under the 10 USD cap. The brief allows one run of each condition, and a second while the total stays under the cap. After runs 3 and 4 measured the two later versions of the flow, made after review, so that the committed flow has a measured run. They stayed under the same cap. No measurement script or output is committed. They are in the session scratch directory.
 
 ## Changes outside the listed files (`covenant/**`, `docs/covenant-pilot.md`)
 
@@ -204,11 +217,19 @@ Process: Hydra's `CLAUDE.md` routes productive work through `/hydra:run`. Rob's 
 
 ## Hydra's suite
 
-Gate: `/mnt/project-files/.task-notes/cmsg_01DNynCktowEWcwkZVo7zsgGHwFGdUfSs6MHBqxWRo8bTs/hydra-pytest-gate.sh`. Run directly here, it exits 126 (`/usr/bin/env: bad interpreter: Permission denied`; the file is mode `-rw-r--r--`), so it was run as `bash <gate>` from the repository root. At 7c497fb (this report's commit; the later amend changes only this paragraph) it printed `30 failed, 2907 passed, 383 skipped`, `baseline failures: 105; now: 30; no longer failing: 75`, `no new failures`, exit 0. The first run, at 9746080, gave `31 failed, 2906 passed, 383 skipped`, with one new failure, `test_native_pack_lead_agent_exists_in_sibling_pack[planning]`, fixed in 78da914. The baseline's 105 failures include 75 that do not fail in this container now. That comes from the environment, not from this change. The suite also writes `docs/plans/ship-it-*.html` and `docs/plans/ship-the-e2e-regression-*.html` into the working tree, and those files were deleted, not committed.
+Gate: `/mnt/project-files/.task-notes/cmsg_01DNynCktowEWcwkZVo7zsgGHwFGdUfSs6MHBqxWRo8bTs/hydra-pytest-gate.sh`.
+
+- **Run as the harness runs it (by path): exit 126 before pytest starts**, with `/usr/bin/env: bad interpreter: Permission denied`. The file is mode `-rw-r--r--` (`ls -l`), so it cannot be executed. Making it executable would change the gate file, and the task forbids that, so this check has **no passing harness result**. It needs the harness to call `bash <gate>`, or the file to be made executable by whoever owns it.
+- Run as `bash <gate>` from the repository root, on the working tree of the final commit: `30 failed, 2907 passed, 383 skipped`, `baseline failures: 105; now: 30; no longer failing: 75`, `no new failures`, exit 0. This is my run, not the harness's.
+- The first run, at 9746080, gave `31 failed, 2906 passed, 383 skipped`, with one new failure, `test_native_pack_lead_agent_exists_in_sibling_pack[planning]`, fixed in 78da914.
+- The baseline's 105 failures include 75 that do not fail in this container now. That comes from the environment, not from this change.
+- The suite writes `docs/plans/ship-it-*.html` and `docs/plans/ship-the-e2e-regression-*.html` into the working tree on each run. Those files were deleted, not committed.
+
+The drift runs above (exit 1 after a hand edit) were also mine, run in a fresh clone. The harness runs only `npm ci && npm test` on the unedited tree.
 
 ## Gate 5 reading ("one Hydra squad ported with smaller maintenance surface")
 
-**The measured surface is larger.** Hand-maintained for this squad's agents and pipeline: 220 lines and 9882 bytes before, 310 lines and 14733 bytes after (+49%). The port alone (three `.cov` against three `.md`) is 10249 bytes against 8744 (+17%). This is the same direction as pair-programmer's TASK-019, where the sources were 5.0% larger than the generated tree. Covenant removes none of the facts duplicated across `squad.yaml`, `heads.yaml`, the agent files and SKILL.md, and the flow adds two more copies (pipeline order, critic checks). What the port does give: a drift check (`npm test`) that fails on any hand edit of a generated agent file, and a pipeline that `cov run` executes with a budget and a journal. On this squad, Gate 5's criterion as worded is **not met**.
+**The measured surface is larger.** Hand-maintained for this squad's agents and pipeline: 220 lines and 9882 bytes before, 321 lines and 15440 bytes after (+56%). The port alone (three `.cov` against three `.md`) is 10249 bytes against 8744 (+17%). This is the same direction as pair-programmer's TASK-019, where the sources were 5.0% larger than the generated tree. Covenant removes none of the facts duplicated across `squad.yaml`, `heads.yaml`, the agent files and SKILL.md, and the flow adds two more copies (pipeline order, critic checks). What the port does give: a drift check (`npm test`) that fails on any hand edit of a generated agent file, and a pipeline that `cov run` executes with a budget and a journal. On this squad, Gate 5's criterion as worded is **not met**.
 
 ## Covenant issue from this pilot (draft; sessions cannot open issues)
 

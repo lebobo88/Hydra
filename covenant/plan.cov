@@ -10,39 +10,50 @@ covenant PlanningFlow {
   invariant CAPPED "the planning run is capped" = require budget
 }
 
-// plan-critic's checks (plan-critic.md "Procedure" step 2). Each dimension is 1 or 0: the
-// critic blocks on any fault and never approves "with reservations" (step 4), so the plan
-// passes only when every dimension is 1; anything else goes back to plan-author.
+// plan-critic's checks (plan-critic.md "Procedure" step 2) are scored as owners, acceptance
+// and dependencies, and its decision (steps 3 and 4, "Return format": approved true or
+// false) as approved. The verdict follows the critic's decision alone. A first version passed
+// only when all three checks scored 1; in a measured run the critic blessed a draft
+// ("approved: true") while scoring acceptance 0.95 and dependencies 0.9, and that rule sent it
+// back (docs/covenant-pilot.md, "Cost"). The critic, not a threshold on its scores, blesses.
 rubric PlanReview v1 {
   score 0..1 {
     owners "1 when every step names an owner (a squad, or a person for a step outside squad scope); 0 when any step has none"
     acceptance "1 when every step's success statement is checkable (a test, a named artifact or a measurable threshold); 0 when any step's is not"
     dependencies "1 when every step's stated dependencies are sufficient; 0 when any step assumes context the plan never established"
+    approved "1 when you bless the plan forward to plan-scribe (approved: true); 0 when you return it to plan-author with the faults named in notes (approved: false)"
   }
   verdict {
-    pass when all == 1
+    pass when approved == 1
     revise otherwise
   }
 }
 
-// loop max 2: the critic judges at most twice, so plan-author gets at most one revise
-// round. The skill names no cap; one revise round is the run TASK-036 measures against
+// loop max 1: the body runs once, so plan-author gets at most one revise round and the
+// critic judges at most twice; a second "revise" escalates without asking for a draft nobody
+// would judge. The skill names no cap; one revise round is the run TASK-036 measures against
 // (docs/covenant-pilot.md, "Cost"). It is a default, not a measured limit.
-// usd 3.00: the longest path is three plan-author calls and two plan-critic calls (the
-// third author call follows a second "revise" and is not judged). One measured run of the
-// original agents under `claude -p` cost 0.21 to 0.41 USD per author call and 0.19 to 0.26
-// per critic call (docs/covenant-pilot.md), so that path is about 1.75 USD; 3.00 leaves
-// headroom for one measurement. It is a default from that one run, not a measured limit.
+// usd 3.00: the longest path is two plan-author calls, two plan-critic calls and one
+// plan-scribe call. The measured runs (docs/covenant-pilot.md, "Cost") cost at most 0.56 USD
+// per author call and 0.30 per critic call; plan-scribe never ran there, so it is taken at the
+// critic's 0.30. That path is about 2.02 USD, and 3.00 leaves headroom. It is a default from
+// those runs, not a measured limit.
 flow Plan(goal: Text) -> Untrusted<Text> under PlanningFlow budget { usd: 3.00 } {
   let draft = ask PlanAuthor(goal)
-  loop max 2 {
-    let review = judge draft with PlanReview by PlanCritic
+  let review = judge draft with PlanReview by PlanCritic
+  loop max 1 {
     if review.verdict == pass {
       let blessed = verify(draft, review)
       let rendered = ask PlanScribe(blessed)
       return rendered
     }
     draft = ask PlanAuthor(goal, feedback: review.notes, draft: draft)
+    review = judge draft with PlanReview by PlanCritic
+  }
+  if review.verdict == pass {
+    let blessed = verify(draft, review)
+    let rendered = ask PlanScribe(blessed)
+    return rendered
   }
   escalate human "plan-critic did not bless the plan within one revise round"
 }
