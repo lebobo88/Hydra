@@ -6,6 +6,11 @@ covenant PlanAuthorImported {
 agent PlanAuthor under PlanAuthorImported {
   describe "Pyrrha, the Plan Author. Decomposes a routed goal into a typed PLAN — steps with owners, dependencies, and a testable success statement — before any squad is dispatched. Read-only on code."
   model opus
+  input {
+    goal: Text "The routed goal to decompose",
+    feedback: Text? "plan-critic's named faults, when the draft is sent back",
+    draft: Text? "Your previous draft, when plan-critic sent it back"
+  }
   uses harness("*")
   skills "cross-squad-message"
   // TODO(import): usd, tokens and wall budget not present in source

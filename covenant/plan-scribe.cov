@@ -6,6 +6,7 @@ covenant PlanScribeImported {
 agent PlanScribe under PlanScribeImported {
   describe "Theseus, the Plan Scribe. Renders an approved PLAN envelope through write_repo_artifact — never writes a plan file that disagrees with the envelope it came from. Read-only on code."
   model sonnet
+  input { plan: Text "The PLAN exactly as plan-critic blessed it" }
   uses harness("*")
   skills "cross-squad-message"
   // TODO(import): usd, tokens and wall budget not present in source

@@ -6,6 +6,7 @@ covenant PlanCriticImported {
 agent PlanCritic under PlanCriticImported {
   describe "Momus, the Plan Critic. Reviews plan-author's draft PLAN and either blesses it or sends it back — never blesses a plan whose steps have no owner or no acceptance criterion. Read-only on code."
   model opus
+  input { plan: Text "plan-author's draft PLAN, every step" }
   uses harness("*")
   skills "cross-squad-message"
   // TODO(import): usd, tokens and wall budget not present in source

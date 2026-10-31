@@ -1,0 +1,48 @@
+// The planning squad's three-head pipeline as a flow (plugins/hydra/skills/plan/SKILL.md,
+// "The three-head pipeline"): Pyrrha drafts, Momus blesses or sends back with the fault
+// named, Theseus renders the blessed plan. No head blesses its own work: the critic is a
+// different agent from the author, and the scribe receives only a plan the critic passed.
+import { PlanAuthor } from "./plan-author.cov"
+import { PlanCritic } from "./plan-critic.cov"
+import { PlanScribe } from "./plan-scribe.cov"
+
+covenant PlanningFlow {
+  invariant CAPPED "the planning run is capped" = require budget
+}
+
+// plan-critic's checks (plan-critic.md "Procedure" step 2). Each dimension is 1 or 0: the
+// critic blocks on any fault and never approves "with reservations" (step 4), so the plan
+// passes only when every dimension is 1; anything else goes back to plan-author.
+rubric PlanReview v1 {
+  score 0..1 {
+    owners "1 when every step names an owner (a squad, or a person for a step outside squad scope); 0 when any step has none"
+    acceptance "1 when every step's success statement is checkable (a test, a named artifact or a measurable threshold); 0 when any step's is not"
+    dependencies "1 when every step's stated dependencies are sufficient; 0 when any step assumes context the plan never established"
+  }
+  verdict {
+    pass when all == 1
+    revise otherwise
+  }
+}
+
+// loop max 2: the critic judges at most twice, so plan-author gets at most one revise
+// round. The skill names no cap; one revise round is the run TASK-036 measures against
+// (docs/covenant-pilot.md, "Cost"). It is a default, not a measured limit.
+// usd 3.00: the longest path is three plan-author calls and two plan-critic calls (the
+// third author call follows a second "revise" and is not judged). One measured run of the
+// original agents under `claude -p` cost 0.21 to 0.41 USD per author call and 0.19 to 0.26
+// per critic call (docs/covenant-pilot.md), so that path is about 1.75 USD; 3.00 leaves
+// headroom for one measurement. It is a default from that one run, not a measured limit.
+flow Plan(goal: Text) -> Untrusted<Text> under PlanningFlow budget { usd: 3.00 } {
+  let draft = ask PlanAuthor(goal)
+  loop max 2 {
+    let review = judge draft with PlanReview by PlanCritic
+    if review.verdict == pass {
+      let blessed = verify(draft, review)
+      let rendered = ask PlanScribe(blessed)
+      return rendered
+    }
+    draft = ask PlanAuthor(goal, feedback: review.notes, draft: draft)
+  }
+  escalate human "plan-critic did not bless the plan within one revise round"
+}
