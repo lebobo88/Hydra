@@ -194,9 +194,21 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
         "Project-scope .claude/ directories must not duplicate the plugin "
         f"namespace, but found entries: {offenders}"
     )
+    # commit 88a451b allowed model invocation for `run` and `drive` so the
+    # engine can invoke them directly; every other operator skill still
+    # requires an explicit human invocation.
+    MODEL_INVOCABLE_SKILLS = {"run", "drive"}
+    assert MODEL_INVOCABLE_SKILLS <= expected
     for skill in expected:
         body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
-        assert "disable-model-invocation: true" in body
+        want = "false" if skill in MODEL_INVOCABLE_SKILLS else "true"
+        not_want = "true" if skill in MODEL_INVOCABLE_SKILLS else "false"
+        assert f"disable-model-invocation: {want}" in body, (
+            f"{skill}: expected disable-model-invocation: {want}"
+        )
+        assert f"disable-model-invocation: {not_want}" not in body, (
+            f"{skill}: unexpected disable-model-invocation: {not_want}"
+        )
 
 
 @pytest.mark.parametrize("agent_filename", ["hydra.md", "hydra-plaza.md"])
