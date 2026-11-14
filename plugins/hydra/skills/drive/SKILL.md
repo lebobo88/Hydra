@@ -2,7 +2,7 @@
 description: "Attended (host-bridged) execution: drive the Hydra supervisor lifecycle IN-CONTEXT so you follow along, with engineering generation + judging surfacing as visible Agent subagents."
 argument-hint: "<goal text> [--squad slug,slug] [--budget 50]"
 model: opus
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # /hydra:drive
