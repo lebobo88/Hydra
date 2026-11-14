@@ -33,6 +33,9 @@ def _agent_file(repo_root: Path, pack: NativePack) -> Path | None:
     """First existing agent markdown file for *pack*'s lead agent, if any."""
     candidates = (
         repo_root / "plugins" / pack.plugin / "agents" / f"{pack.lead_agent}.md",
+        # Where `cov build --target claude --out plugins/<plugin>` writes a pack's
+        # agents (Hydra's planning squad; docs/covenant-pilot.md).
+        repo_root / "plugins" / pack.plugin / ".claude" / "agents" / f"{pack.lead_agent}.md",
         repo_root / ".claude" / "agents" / f"{pack.lead_agent}.md",
     )
     return next((c for c in candidates if c.is_file()), None)

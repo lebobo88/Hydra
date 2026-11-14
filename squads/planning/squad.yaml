@@ -55,7 +55,7 @@ agents:
     role: "Plan Author"
     authority: gatekeeper
     model_tier: opus
-    agent_file: plugins/hydra/agents/plan-author.md
+    agent_file: plugins/hydra/.claude/agents/plan-author.md
     hitl_trigger: false
     notes: "Decomposes the routed goal into a typed PLAN. Never authors a plan whose steps have no testable success statement."
 
@@ -64,7 +64,7 @@ agents:
     role: "Plan Critic"
     authority: gatekeeper
     model_tier: opus
-    agent_file: plugins/hydra/agents/plan-critic.md
+    agent_file: plugins/hydra/.claude/agents/plan-critic.md
     hitl_trigger: false
     notes: "Blesses or revises the draft plan. Never blesses a plan whose steps have no owner or no acceptance criterion."
 
@@ -73,7 +73,7 @@ agents:
     role: "Plan Scribe"
     authority: execute
     model_tier: sonnet
-    agent_file: plugins/hydra/agents/plan-scribe.md
+    agent_file: plugins/hydra/.claude/agents/plan-scribe.md
     hitl_trigger: false
     notes: "Renders the approved PLAN envelope to disk. Never writes a plan file that disagrees with the envelope it came from."
 

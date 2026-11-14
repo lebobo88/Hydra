@@ -1,0 +1,3 @@
+# Written by `cov import`. Each model id the agent files named is listed so that it resolves (LANGUAGE.md §8).
+[project]
+name = "covenant"
