@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hydra unified orchestration plan</title>
+<style>
+:root{
+  --bg:#f7f6f2; --card:#ffffff; --ink:#1b1d21; --muted:#5b6170; --line:#c9ccd4;
+  --accent:#0f6e6a; --accent-bg:#e1f1ef; --ext-bg:#eeeef2;
+  --warn:#b23a2a; --warn-bg:#fbe9e5; --ok:#2f7a3b; --ok-bg:#e6f3e7;
+  --arrow:#555b69; --code-bg:#ecebe6;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14161a; --card:#1d2026; --ink:#e7e8ec; --muted:#a0a6b4; --line:#3b404b;
+    --accent:#4fc4bd; --accent-bg:#143533; --ext-bg:#262a32;
+    --warn:#f08a78; --warn-bg:#3a1e1a; --ok:#7fcf8b; --ok-bg:#1a3220;
+    --arrow:#a0a6b4; --code-bg:#262a32;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14161a; --card:#1d2026; --ink:#e7e8ec; --muted:#a0a6b4; --line:#3b404b;
+  --accent:#4fc4bd; --accent-bg:#143533; --ext-bg:#262a32;
+  --warn:#f08a78; --warn-bg:#3a1e1a; --ok:#7fcf8b; --ok-bg:#1a3220;
+  --arrow:#a0a6b4; --code-bg:#262a32;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1040px;margin:0 auto;padding:32px 16px 80px}
+h1{font-size:2rem;line-height:1.2;margin:0 0 8px}
+h2{font-size:1.45rem;margin:56px 0 12px;padding-top:16px;border-top:2px solid var(--line)}
+h3{font-size:1.1rem;margin:32px 0 8px}
+p,li{max-width:76ch}
+a{color:var(--accent)}
+code{background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:.88em;
+  font-family:ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
+.lede{color:var(--muted);font-size:1.05rem}
+.meta{color:var(--muted);font-size:.9rem;margin:4px 0 20px}
+nav{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 18px;margin:24px 0}
+nav ol{margin:0;padding-left:20px;columns:2;column-gap:32px}
+@media (max-width:640px){nav ol{columns:1}}
+figure{margin:20px 0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
+figure img{display:block;width:100%;height:auto;border-radius:4px}
+figcaption{color:var(--muted);font-size:.88rem;margin-top:8px}
+.scroll{overflow-x:auto}
+svg.d{display:block;width:100%;min-width:720px;height:auto}
+svg.d text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(--ink)}
+.b{fill:var(--card);stroke:var(--line);stroke-width:1.2}
+.bh{fill:var(--accent-bg);stroke:var(--accent);stroke-width:1.4}
+.bx{fill:var(--ext-bg);stroke:var(--line);stroke-width:1.2}
+.bw{fill:var(--warn-bg);stroke:var(--warn);stroke-width:1.2}
+.bg{fill:var(--ok-bg);stroke:var(--ok);stroke-width:1.2}
+.bd{fill:none;stroke:var(--line);stroke-width:1.2;stroke-dasharray:5 4}
+svg.d .t{font-size:12.5px;font-weight:600}
+svg.d .h{font-size:14px;font-weight:700}
+svg.d .s{font-size:11px;fill:var(--muted)}
+svg.d .w{font-size:11px;fill:var(--warn);font-weight:600}
+.a{stroke:var(--arrow);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.ahp{fill:var(--arrow)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--card)}
+th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+th{background:var(--ext-bg);font-weight:600}
+td.id{white-space:nowrap;font-weight:600}
+td.iss{white-space:nowrap}
+.note{border-left:4px solid var(--accent);background:var(--accent-bg);padding:10px 14px;border-radius:0 6px 6px 0;margin:16px 0}
+.warnbox{border-left:4px solid var(--warn);background:var(--warn-bg);padding:10px 14px;border-radius:0 6px 6px 0;margin:16px 0}
+.exp{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 5px;vertical-align:middle}
+</style>
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ahp"/></marker>
+</defs></svg>
+<main>
+
+<h1>Hydra: one orchestrator, one engine policy</h1>
+<p class="lede">Implementation plan for making <code>hydra:hydra</code> the single orchestrator: squad heads dispatched as native subagents under one governance seam, daemon-backed systems behind a governed gateway, and every gateway tool mirrored on a CLI.</p>
+<p class="meta">Repo <code>lebobo88/Hydra</code> · written 2026-11-14 · status: approved by the operator, not started · tracking issue: <span data-issue="EPIC">pending</span></p>
+
+<figure>
+  <img src="assets/hydra-unified-orchestration/hero-target-architecture.png" alt="Illustration of the target architecture: the operator talks to one Hydra orchestrator, which dispatches squad heads and reaches daemons through a governed gateway.">
+  <figcaption>Target architecture, illustrative. The SVG diagrams below are the source of truth.</figcaption>
+</figure>
+
+<div class="note"><strong>How to use this page.</strong> It is written so a new session can implement from it without the planning conversation. Section 5 lists every workstream with files, reuse points and an acceptance test. Section 9 says how to run them. No engine code was changed in the planning session.</div>
+
+<nav aria-label="Contents"><ol>
+<li><a href="#s1">Context</a></li>
+<li><a href="#s2">What the investigation found</a></li>
+<li><a href="#s3">Operator decisions</a></li>
+<li><a href="#s4">Target shape</a></li>
+<li><a href="#s5">Workstreams</a></li>
+<li><a href="#s6">Needs operator sign-off</a></li>
+<li><a href="#s7">Assumptions and unverified points</a></li>
+<li><a href="#s8">Verification</a></li>
+<li><a href="#s9">How to implement</a></li>
+<li><a href="#s10">Sources</a></li>
+</ol></nav>
+
+<h2 id="s1">1. Context</h2>
+<p>Hydra has grown three apparent ways of operating: "drive", "attended", and the "supervisor persona". The operator wants one. He talks to <code>hydra:hydra</code>, which manages everything, dispatches other squads' agents as native Claude Code subagents (teammates on request), keeps the daemon-backed systems (pair-programmer, AgentSmith, TheEights) behind the MCP gateway, and exposes every gateway tool on a CLI as well.</p>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 400" role="img" aria-label="C4 level 1 system context diagram">
+<text x="20" y="18" class="h">C4 level 1: system context</text>
+<rect class="bd" x="230" y="30" width="720" height="355" rx="8"/>
+<text x="242" y="48" class="s">Claude Code session: host interface only. Hydra stays authoritative for state, gates, budget and trace.</text>
+<rect class="b" x="15" y="165" width="140" height="80" rx="8"/>
+<text x="85" y="198" text-anchor="middle" class="t">Operator</text>
+<text x="85" y="216" text-anchor="middle" class="s">one conversation</text>
+<rect class="bh" x="290" y="145" width="220" height="120" rx="8"/>
+<text x="400" y="176" text-anchor="middle" class="h">Hydra</text>
+<text x="400" y="196" text-anchor="middle" class="s">hydra:hydra orchestrator</text>
+<text x="400" y="211" text-anchor="middle" class="s">+ Python engine (LangGraph)</text>
+<text x="400" y="236" text-anchor="middle" class="s">routes · governs · synthesizes</text>
+<rect class="b" x="620" y="62" width="320" height="84" rx="8"/>
+<text x="780" y="88" text-anchor="middle" class="t">Squad-pack plugins</text>
+<text x="780" y="107" text-anchor="middle" class="s">executive-suite · senate · marketbliss</text>
+<text x="780" y="122" text-anchor="middle" class="s">rlm-creative · rlm-gaming · xenia · planning</text>
+<rect class="bx" x="620" y="168" width="320" height="84" rx="8"/>
+<text x="780" y="194" text-anchor="middle" class="t">Daemon-backed systems</text>
+<text x="780" y="213" text-anchor="middle" class="s">pair-programmer · AgentSmith · TheEights</text>
+<text x="780" y="228" text-anchor="middle" class="s">reached only through the MCP gateway</text>
+<rect class="bx" x="620" y="274" width="320" height="84" rx="8"/>
+<text x="780" y="300" text-anchor="middle" class="t">Registered repos</text>
+<text x="780" y="319" text-anchor="middle" class="s">allow-list in ~/.hydra/repos.json</text>
+<text x="780" y="334" text-anchor="middle" class="s">engineering lands in worktrees</text>
+<path class="a" d="M155 205 H288"/>
+<text x="222" y="197" text-anchor="middle" class="s">goal, gate decisions</text>
+<path class="a" d="M510 178 L618 108"/>
+<text x="532" y="112" text-anchor="middle" class="s">ticketed subagents</text>
+<path class="a" d="M510 208 H618"/>
+<text x="564" y="201" text-anchor="middle" class="s">governed_call</text>
+<path class="a" d="M510 235 L618 310"/>
+<text x="528" y="306" text-anchor="middle" class="s">engineer + judge</text>
+</svg></div>
+<figcaption>Figure 1. The operator talks to Hydra only. Hydra dispatches squad heads as subagents against a dispatch ticket, reaches daemons through one governed call path, and lands engineering in worktrees of registered repos.</figcaption></figure>
+
+<h2 id="s2">2. What the investigation found</h2>
+
+<h3>2.1 The "three modes" are one engine with prose on top</h3>
+<ul>
+<li><code>/hydra:drive</code> and <code>/hydra:run</code> are markdown runbooks (<code>plugins/hydra/skills/{drive,run}/SKILL.md</code>). "Attended" is the Python engine behind the verbs they call: <code>hydra_control</code> <code>plan / step / submit_host_result / finalize</code> (<code>mcp_servers/hydra_control/server.py</code>), each of which subprocesses <code>python -m hydra_core.cli</code> (<code>_cmd_plan</code> cli.py:813, <code>_cmd_attended_step</code> :4210, <code>_cmd_attended_submit</code> :5993, <code>_cmd_finalize</code> :6355). The state machine is <code>hydra_core/host_bridge.py</code> (<code>begin_stage</code> :2298, <code>begin_squad_stage</code> :4235, <code>_build_squad_prompt</code> :4148, <code>_apply_squad_result</code> :4427, <code>submit_host_result</code> :4972).</li>
+<li>The persona layer has no engine. Eight plugin agents are never spawned: <code>hydra-supervisor</code>, <code>hydra-router</code>, <code>hydra-planner</code>, <code>hydra-synthesizer</code>, <code>hydra-hitl-gate</code>, <code>hydra-cfo-gate</code>, <code>plan-critic</code>, <code>plan-scribe</code>. Python does that work (<code>classify_intent</code>, <code>node_planner</code>, <code>node_synthesis</code>, <code>governance.charge_and_gate</code>, <code>dispatch_judge</code>). <code>plan-critic</code> and <code>plan-scribe</code> are still in the <code>squads/planning/squad.yaml</code> roster.</li>
+<li>The real divergence is four engine paths: the attended cursor; detached <code>run --live</code> (cli.py:712-738, which forces trivial plan rigor); detached <code>ingest --live</code> behind <code>submit_envelopes</code> (server.py:557-644, ungated); and the web cockpit launch (<code>web/server/launch.ts:239</code>). They differ on plan phase, per-squad judging, synthesis gates, native-pack execution, and the detached gate.</li>
+<li><code>HYDRA_ALLOW_DETACHED</code> is read at one place (server.py:294). The fleet exemption is a regex on goal text, <code>_FLEET_GOAL_RE</code> (server.py:297-319). Nothing sets the variable internally.</li>
+<li>Attended finalize skips <code>node_judge_per_squad</code> via <code>as_node</code> (cli.py:6494-6497) and auto-drives synthesis (cli.py:6499-6509). <code>build_supervisor</code> sets <code>drive_pp_loop=True</code> for any live dispatcher (supervisor.py:664-677).</li>
+<li>The runbooks contradict each other on <code>launch</code>, on Skill-versus-Agent for squad packs, and on <code>submit_envelopes</code>.</li>
+</ul>
+
+<figure>
+  <img src="assets/hydra-unified-orchestration/modes-before-after.png" alt="Illustration: several operating modes on the left collapse into one orchestrator and one engine path on the right.">
+  <figcaption>Operating modes before and after, illustrative.</figcaption>
+</figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 400" role="img" aria-label="Flowchart: four engine paths today versus one policy">
+<text x="20" y="24" class="h">Today: four engine paths</text>
+<text x="500" y="24" class="h">Target: one policy</text>
+<rect class="b" x="20" y="44" width="440" height="60" rx="6"/>
+<text x="34" y="68" class="t">Attended cursor (plan / step / submit / finalize)</text>
+<text x="34" y="88" class="s">has a plan phase · per-squad judge skipped · synthesis auto-driven</text>
+<rect class="bw" x="20" y="118" width="440" height="60" rx="6"/>
+<text x="34" y="142" class="t">Detached run --live</text>
+<text x="34" y="162" class="s">forces trivial plan rigor · gate checked on one MCP verb only</text>
+<rect class="bw" x="20" y="192" width="440" height="60" rx="6"/>
+<text x="34" y="216" class="t">Detached ingest --live (submit_envelopes)</text>
+<text x="34" y="236" class="s">ungated · pack-emitted engineering runs headless</text>
+<rect class="bw" x="20" y="266" width="440" height="60" rx="6"/>
+<text x="34" y="290" class="t">Web cockpit launch (web/server/launch.ts)</text>
+<text x="34" y="310" class="s">does not pass through the detached gate</text>
+<path class="a" d="M462 185 H498"/>
+<rect class="bg" x="500" y="44" width="440" height="110" rx="6"/>
+<text x="514" y="68" class="t">Interactive: plan → step → submit_host_result → finalize</text>
+<text x="514" y="90" class="s">same plan rigor, per-squad judge, budget and gates on every run</text>
+<text x="514" y="108" class="s">pack-emitted engineering queues as an attended task</text>
+<text x="514" y="126" class="s">visible engineer and judge subagents</text>
+<text x="514" y="144" class="s">cockpit launches go through the same gated path</text>
+<path class="a" d="M720 154 V190"/>
+<rect class="bh" x="500" y="192" width="440" height="60" rx="6"/>
+<text x="514" y="216" class="t">detached_policy.py: gate enforced in the engine</text>
+<text x="514" y="236" class="s">allowed only for the fleet (two or more resolved repo ids) and explicit automation</text>
+<path class="a" d="M720 252 V264"/>
+<rect class="b" x="500" y="266" width="440" height="60" rx="6"/>
+<text x="514" y="290" class="t">Fleet or automation run</text>
+<text x="514" y="310" class="s">same plan, judge and budget policy · parks until planned</text>
+<text x="20" y="360" class="s">Red boxes are paths that skip a control the attended path applies.</text>
+</svg></div>
+<figcaption>Figure 2. Four engine paths today, one policy in the target. Detached execution survives only as a gated exception.</figcaption></figure>
+
+<h3>2.2 Squad dispatch</h3>
+<ul>
+<li>Seven squads are <code>entrypoint: claude-native</code> (executive, garland, legal-compliance, rlm-gaming, the five marketing-* packs, planning) and already run as a plugin-scoped subagent. Only the squad lead is mapped, hardcoded in <code>hydra_core/native_packs.py:27-56</code>: <code>executive-suite:boardroom</code>, <code>rlm-creative:calliope</code>, <code>senate:general-counsel</code>, <code>rlm-gaming:the-director</code>, <code>marketbliss:marketing-supervisor</code>, <code>hydra:plan-author</code>. No slug-to-plugin-agent map exists for other heads.</li>
+<li>customer-support (Xenia) is <code>claude-skill</code> only, has no plugin, and falls back to <code>general-purpose</code>.</li>
+<li>The attended squad path lacks governance the in-graph path has: per-squad RBAC, Iolaus, validation and redaction of the outbound prompt, the tool-scope directive, and a pre-dispatch budget check. Subagent cost is self-reported. Telemetry lands in the pack's directory (<code>host_bridge._trace</code> :2178).</li>
+<li>Engineering emitted by a squad pack (a DEV_TASK) runs headless (ingest.py:895 → <code>_drive_pp_stage_loop</code>), not through the visible engineer/judge cursor.</li>
+<li>Each attended verb builds a fresh <code>MCPStdioDispatcher</code> (cli.py:3545, 4241, 6387), so every <code>step</code>, <code>submit</code> and <code>finalize</code> cold-starts its own pp daemon.</li>
+<li><code>run_host_agent</code> is unimplemented (dispatcher.py:526); <code>_via_impersonation</code> is unreachable; squad-YAML <code>model_tier</code> and <code>best_of_n</code> have no effect on native squads.</li>
+<li>The <code>AGENTS.md</code> squad table is stale: it lists 14 squads with <code>claude-skill</code> entrypoints; discovery reports 15 squads, 12 active, and <code>claude-native</code> is undocumented.</li>
+</ul>
+
+<h3>2.3 Installation</h3>
+<ul>
+<li>Plugins at user scope: executive-suite, senate, marketbliss, rlm-creative, rlm-gaming, hydra (0.1.7, cache stale), all from local directory marketplaces. No script installs them.</li>
+<li>Xenia, pair-programmer, AgentSmith and TheEights have no plugin manifest. pair-programmer is installed by symlinking <code>~/.claude/agents</code> and <code>~/.claude/skills</code>. AgentSmith's agents and skills are missing from disk. Nine ExecutiveSuite command symlinks dangle.</li>
+<li><code>engineer</code>, <code>judge-cross-vendor</code>, <code>judge-same-vendor</code> exist both in the <code>hydra</code> plugin and as pair-programmer user-scope agents; <code>host_action</code> uses the bare name.</li>
+<li>The gateway is hand-registered in <code>~/.claude.json</code>. The Hydra plugin ships no <code>.mcp.json</code> and no <code>bin/</code>.</li>
+<li>A pair-programmer hook (<code>enforce-active-run</code>, <code>pair-programmer/daemon/src/hooks/dispatcher.ts</code>) blocks Write/Edit in this repo unless a pp run owns the edit, the path contains <code>.harness</code> or <code>.claude</code>, or <code>PP_ALLOW_AD_HOC=1</code> is set. This applies to documentation files too.</li>
+</ul>
+
+<h3>2.4 MCP versus CLI</h3>
+<ul>
+<li><code>plan</code>, <code>step</code>, <code>submit_host_result</code>, <code>finalize</code>, <code>budget</code> already share one code path: the MCP tool runs the CLI (<code>hydra_core/cli.py</code>, <code>main()</code> :8171).</li>
+<li>No shell route to an arbitrary gateway tool exists.</li>
+<li>The gateway (<code>mcp_servers/hydra_gateway/server.py</code>, <code>AsyncBackendPool</code> :103-526) serves 16 backends from a static catalog in <code>hydra_core/toolshed.py</code> (<code>HYDRA_CONTROL_TOOLS</code> :420, <code>HYDRA_MEMORY_TOOLS</code> :364, <code>build_default_shed</code> :1150, <code>SCHEMA_OVERRIDES</code> :595) plus <code>~/.hydra/gateway_schemas.json</code>. It enforces no RBAC, venom gate or telemetry. Its fallback route (:893-902) proxies any <code>server__tool</code> with no catalog check.</li>
+<li>Seven in-repo tools are not advertised: <code>hydra.workflow.budget</code>, <code>hydra.worktree.sweep_status</code>, and <code>hydra-mem.{ping, workflows_list, workflow_status, squad_list, hitl_pending}</code>.</li>
+<li>RBAC lives only in <code>MCPStdioDispatcher._check_tool_rbac</code> (dispatcher.py:268-328), which fails open when <code>squad_id</code> is None or the pack is unknown. The venom gate is at dispatcher.py:409-484; <code>call_mcp</code> at :332.</li>
+<li>Several matchers in <code>plugins/hydra/hooks/hooks.json</code> use pre-gateway tool names, or <code>Task</code> instead of <code>Agent</code>, and never fire.</li>
+<li>Tests that pin current behavior: <code>tests/test_gateway_catalog_complete.py</code>, <code>tests/test_hydra_control_schema_parity.py</code>, <code>tests/test_fable_audit2_phase5.py:725-759</code>, <code>tests/test_pack_shims.py:215</code>.</li>
+</ul>
+
+<h3>2.5 Claude Code host capabilities that shape the design</h3>
+<p>These are host-interface capabilities. None of them replaces Hydra's typed state, governance or execution protocol; the right column names the Hydra component that stays authoritative. Sources are in <a href="#s10">section 10</a>.</p>
+<div class="scroll"><table>
+<tr><th>Host capability</th><th>What it gives the design</th><th>Hydra component that stays authoritative</th></tr>
+<tr><td>Plugin agents spawn by scoped name from the Agent tool, a workflow (<code>agentType</code>), or as teammates. Their <code>hooks</code>, <code>mcpServers</code>, <code>permissionMode</code> and <code>initialPrompt</code> frontmatter is ignored.</td><td>Heads can be dispatched natively. Governance cannot live in the pack's agent file.</td><td>Head registry and dispatch seam (<code>hydra_core/head_registry.py</code>, <code>dispatch_seam.py</code>); Hydra plugin hooks</td></tr>
+<tr><td>The main-thread agent can restrict spawnable types with <code>tools: Agent(a, b)</code>.</td><td><code>hydra:hydra</code> can spawn only registered heads and engine agent types.</td><td>Head registry generates the list</td></tr>
+<tr><td>Hooks on <code>PreToolUse</code>/<code>PostToolUse</code> for <code>Agent</code>, plus <code>SubagentStart</code>/<code>SubagentStop</code>, can deny, rewrite the prompt (<code>updatedInput</code>) and read usage. <code>onFailure: "block"</code> fails closed.</td><td>A fail-closed checkpoint on every subagent spawn.</td><td>Ticket store and budget ledger in the engine; the hook only enforces what the engine wrote</td></tr>
+<tr><td>Agent teams <span class="exp">experimental</span>: not restored on <code>/resume</code>, one team per session, in-process only on Windows; while enabled, a named subagent becomes a teammate.</td><td>Opt-in for deliberation steps only.</td><td>Workflow state and dissent record stay in the engine checkpoint</td></tr>
+<tr><td>Dynamic workflows take no user input mid-run.</td><td>Usable only for gate-free fan-out (audits). They cannot span a HITL gate.</td><td>HITL gates (<code>/hydra:approve</code>, <code>/hydra:resume</code>)</td></tr>
+<tr><td>Plugin <code>bin/</code> is on the Bash tool PATH. Plugin <code>.mcp.json</code> names tools <code>mcp__plugin_&lt;plugin&gt;_&lt;server&gt;__&lt;tool&gt;</code>. Plugin <code>dependencies</code> resolve from git tags.</td><td>Where the CLI ships; a tool-name prefix change to plan for; how packs become dependencies.</td><td><code>governed_call</code> (RBAC, venom gate, telemetry)</td></tr>
+<tr><td>Channels <span class="exp">research preview</span>.</td><td>Not used by this plan.</td><td>n/a</td></tr>
+</table></div>
+
+<h2 id="s3">3. Operator decisions</h2>
+<ol>
+<li>The engine names each head. One <code>host_action</code> per head; per-head budget, RBAC, trace and dissent.</li>
+<li>Subagents by default. Agent teams only when a workflow calls for deliberation or the operator asks.</li>
+<li>Two tiers: a governed lightweight "consult" and the full workflow.</li>
+<li>CLI: generic <code>hydra tool list|describe|call</code> generated from the gateway catalog, plus curated commands for Hydra's own verbs; shipped in plugin <code>bin/</code>.</li>
+<li>Delete the eight dead agents. <code>hydra:hydra</code> is the only supervisor.</li>
+<li>One policy; detached execution only for the fleet and explicit automation, gate enforced in the engine.</li>
+<li>Pack-emitted engineering runs through the visible engineer/judge cursor.</li>
+<li>Every squad pack becomes a proper plugin; Hydra declares them as dependencies and ships the gateway and CLI. In the operator's words, "each of the squad pack repos needs proper investigate and rca and planning for alignment". None is changed before that.</li>
+</ol>
+
+<h2 id="s4">4. Target shape</h2>
+<ul>
+<li><strong>One orchestrator.</strong> <code>hydra:hydra</code> is the only supervisor agent. Its <code>tools:</code> lists the spawnable agent types, generated from the head registry.</li>
+<li><strong>One engine path for interactive work.</strong> <code>plan → step → submit_host_result → finalize</code>. <code>step</code> returns one <code>host_action</code> per head (plugin-scoped agent name), then one for the squad lead's synthesis. Engineering, whether requested directly or emitted by a pack, uses the same visible engineer/judge cursor.</li>
+<li><strong>One governance seam for every subagent dispatch.</strong>
+  <ul>
+  <li>Engine side (<code>hydra_core/dispatch_seam.py</code>, at <code>step</code> and at consult open): pre-dispatch budget check, redaction of the outbound prompt, tool-scope directive, and a dispatch ticket on disk.</li>
+  <li>Hook side (one entry point, fail-closed): a squad, engineer or judge agent may spawn only against a live ticket; the prompt is replaced from the ticket; token usage is captured from the tool response, replacing self-reported cost.</li>
+  <li>Gateway side: the hook stamps each gateway call with the caller's ticket; the gateway resolves ticket to squad and enforces RBAC and the venom gate. A missing stamp is denied.</li>
+  </ul></li>
+<li><strong>Consult tier.</strong> The orchestrator spawns a head directly. The hook opens and closes a consult: read-only tool scope, budget charged exactly once, a <code>ConsultNote</code> envelope validated at open and close, its own trace. It escalates to a workflow on any write attempt, spend over threshold, a second squad, emitted envelopes, a venom-class tool, or any engineer or judge type.</li>
+<li><strong>One call path for MCP and CLI.</strong> <code>governed_call(server, tool, args, ctx)</code> in <code>hydra_core/gateway_runtime.py</code> is used by the gateway, by <code>hydra tool call</code>, and by the dispatcher. The CLI connects to the running gateway through a loopback broker so it does not fork duplicate daemons.</li>
+<li><strong>Detached is the exception.</strong> Only the fleet (two or more resolved repo ids) and explicit automation, gated in the engine, under the same plan, judge and budget policy.</li>
+<li><strong>Agent teams</strong> <span class="exp">experimental</span> stay off by default in Hydra sessions and are enabled only for a workflow step marked as deliberation, or on request.</li>
+<li><strong>Dynamic workflows</strong> are used only for gate-free fan-out: the sibling-repo audit, catalog and doctor audits. Never for the step/submit loop, engineering, or anything with a gate.</li>
+</ul>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 520" role="img" aria-label="C4 level 2 container diagram, today and target">
+<text x="20" y="24" class="h">C4 level 2: containers today</text>
+<text x="500" y="24" class="h">C4 level 2: containers in the target</text>
+<g>
+<rect class="bw" x="20" y="40" width="440" height="52" rx="6"/><text x="34" y="62" class="t">hydra:hydra session</text><text x="34" y="80" class="s">plus eight persona agents that are never spawned</text>
+<rect class="bw" x="20" y="106" width="440" height="52" rx="6"/><text x="34" y="128" class="t">Runbooks: run · drive · campaign</text><text x="34" y="146" class="s">three prose procedures that contradict each other</text>
+<rect class="b" x="20" y="172" width="440" height="52" rx="6"/><text x="34" y="194" class="t">hydra_control MCP server</text><text x="34" y="212" class="s">plan · step · submit · finalize · launch · submit_envelopes</text>
+<rect class="bw" x="20" y="238" width="440" height="52" rx="6"/><text x="34" y="260" class="t">Engine CLI: four paths</text><text x="34" y="278" class="s">attended cursor · run --live · ingest --live · cockpit launch</text>
+<rect class="bw" x="20" y="304" width="440" height="52" rx="6"/><text x="34" y="326" class="t">hydra_gateway</text><text x="34" y="344" class="s">static catalog · no RBAC or venom gate · open fallback route</text>
+<rect class="bx" x="20" y="370" width="440" height="52" rx="6"/><text x="34" y="392" class="t">16 backends</text><text x="34" y="410" class="s">every stdio client forks its own daemons</text>
+<rect class="bx" x="20" y="436" width="440" height="52" rx="6"/><text x="34" y="458" class="t">Stores</text><text x="34" y="476" class="s">checkpoint db · trace (squad traces land in pack directories)</text>
+<path class="a" d="M240 92 V104"/><path class="a" d="M240 158 V170"/><path class="a" d="M240 224 V236"/><path class="a" d="M240 290 V302"/><path class="a" d="M240 356 V368"/><path class="a" d="M240 422 V434"/>
+</g>
+<g>
+<rect class="bh" x="500" y="40" width="440" height="52" rx="6"/><text x="514" y="62" class="t">hydra:hydra, the sole supervisor</text><text x="514" y="80" class="s">tools: Agent(...) generated from the head registry</text>
+<rect class="bh" x="500" y="106" width="440" height="52" rx="6"/><text x="514" y="128" class="t">Plugin hooks (hydra_hook.py) and one runbook</text><text x="514" y="146" class="s">ticket check · prompt from ticket · usage capture · call stamp</text>
+<rect class="b" x="500" y="172" width="440" height="52" rx="6"/><text x="514" y="194" class="t">hydra_control MCP server + bin/hydra CLI</text><text x="514" y="212" class="s">the same verbs on both surfaces</text>
+<rect class="bg" x="500" y="238" width="440" height="52" rx="6"/><text x="514" y="260" class="t">Engine CLI: one path</text><text x="514" y="278" class="s">plan → step → submit → finalize · dispatch_seam · consult</text>
+<rect class="bg" x="500" y="304" width="440" height="52" rx="6"/><text x="514" y="326" class="t">governed_call + loopback broker</text><text x="514" y="344" class="s">catalog check · RBAC · venom gate · telemetry</text>
+<rect class="bx" x="500" y="370" width="440" height="52" rx="6"/><text x="514" y="392" class="t">16 backends</text><text x="514" y="410" class="s">one daemon set per session</text>
+<rect class="bx" x="500" y="436" width="440" height="52" rx="6"/><text x="514" y="458" class="t">Stores</text><text x="514" y="476" class="s">checkpoint · project trace · dispatch tickets · consult ledger</text>
+<path class="a" d="M720 92 V104"/><path class="a" d="M720 158 V170"/><path class="a" d="M720 224 V236"/><path class="a" d="M720 290 V302"/><path class="a" d="M720 356 V368"/><path class="a" d="M720 422 V434"/>
+</g>
+<text x="20" y="510" class="s">Red: a container with a known gap. Green and teal: containers the plan adds or changes.</text>
+</svg></div>
+<figcaption>Figure 3. Containers today and in the target. The layers stay; the gaps in each are closed.</figcaption></figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 400" role="img" aria-label="C4 level 3 component diagram of the governance seam">
+<text x="20" y="20" class="h">C4 level 3: the governance seam</text>
+<rect class="bd" x="20" y="32" width="290" height="350" rx="8"/><text x="34" y="50" class="s">Engine side · hydra_core/dispatch_seam.py</text>
+<rect class="bd" x="335" y="32" width="290" height="350" rx="8"/><text x="349" y="50" class="s">Hook side · plugins/hydra/hooks/hydra_hook.py</text>
+<rect class="bd" x="650" y="32" width="290" height="350" rx="8"/><text x="664" y="50" class="s">Gateway side · hydra_core/gateway_runtime.py</text>
+
+<rect class="b" x="40" y="62" width="250" height="48" rx="6"/><text x="52" y="82" class="t">Pre-dispatch budget check</text><text x="52" y="98" class="s">governance.should_block_for_budget</text>
+<rect class="b" x="40" y="124" width="250" height="48" rx="6"/><text x="52" y="144" class="t">Redact outbound prompt</text><text x="52" y="160" class="s">redact_for_squad_boundary</text>
+<rect class="b" x="40" y="186" width="250" height="48" rx="6"/><text x="52" y="206" class="t">Tool-scope directive</text><text x="52" y="222" class="s">tool_scope.build_tool_scope_directive</text>
+<rect class="b" x="40" y="248" width="250" height="48" rx="6"/><text x="52" y="268" class="t">Write dispatch ticket</text><text x="52" y="284" class="s">agent type, squad, head, prompt, budget</text>
+<rect class="bx" x="40" y="318" width="250" height="48" rx="6"/><text x="52" y="338" class="t">Ticket store (on disk)</text><text x="52" y="354" class="s">read by the hook and the gateway</text>
+<path class="a" d="M165 110 V122"/><path class="a" d="M165 172 V184"/><path class="a" d="M165 234 V246"/><path class="a" d="M165 296 V316"/>
+
+<rect class="bh" x="355" y="62" width="250" height="48" rx="6"/><text x="367" y="82" class="t">PreToolUse on Agent</text><text x="367" y="98" class="s">no live ticket: deny (fails closed)</text>
+<rect class="bh" x="355" y="124" width="250" height="48" rx="6"/><text x="367" y="144" class="t">Replace prompt from ticket</text><text x="367" y="160" class="s">the model cannot widen its own brief</text>
+<rect class="bh" x="355" y="186" width="250" height="48" rx="6"/><text x="367" y="206" class="t">PostToolUse on Agent</text><text x="367" y="222" class="s">capture token usage into the ledger</text>
+<rect class="bh" x="355" y="248" width="250" height="48" rx="6"/><text x="367" y="268" class="t">PreToolUse on gateway tools</text><text x="367" y="284" class="s">stamp the call with the ticket id</text>
+<path class="a" d="M480 110 V122"/><path class="a" d="M480 172 V184"/><path class="a" d="M480 234 V246"/>
+<path class="a" d="M290 342 H322 V86 H353"/>
+
+<rect class="bg" x="670" y="62" width="250" height="48" rx="6"/><text x="682" y="82" class="t">governed_call</text><text x="682" y="98" class="s">missing stamp: deny</text>
+<rect class="bg" x="670" y="124" width="250" height="48" rx="6"/><text x="682" y="144" class="t">Resolve ticket to squad</text><text x="682" y="160" class="s">ticket bound to another agent: deny</text>
+<rect class="bg" x="670" y="186" width="250" height="48" rx="6"/><text x="682" y="206" class="t">RBAC allow-list</text><text x="682" y="222" class="s">hydra_core/boundary.py, strict mode</text>
+<rect class="bg" x="670" y="248" width="250" height="48" rx="6"/><text x="682" y="268" class="t">Venom gate</text><text x="682" y="284" class="s">governance.enforce_constitution</text>
+<rect class="bx" x="670" y="318" width="250" height="48" rx="6"/><text x="682" y="338" class="t">Backend call</text><text x="682" y="354" class="s">then telemetry.emit to the workflow trace</text>
+<path class="a" d="M795 110 V122"/><path class="a" d="M795 172 V184"/><path class="a" d="M795 234 V246"/><path class="a" d="M795 296 V316"/>
+<path class="a" d="M605 272 H637 V86 H668"/>
+</svg></div>
+<figcaption>Figure 4. The governance seam. The engine writes a ticket; the hook lets a subagent spawn only against it and stamps its gateway calls; the gateway resolves the stamp to a squad and applies RBAC and the venom gate.</figcaption></figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 330" role="img" aria-label="Flowchart of the workflow tier with gates">
+<text x="20" y="20" class="h">Workflow tier</text>
+<rect class="b" x="20" y="40" width="160" height="56" rx="6"/><text x="100" y="64" text-anchor="middle" class="t">plan</text><text x="100" y="82" text-anchor="middle" class="s">typed PLAN, heads named</text>
+<rect class="bw" x="210" y="40" width="160" height="56" rx="6"/><text x="290" y="64" text-anchor="middle" class="t">Plan approval gate</text><text x="290" y="82" text-anchor="middle" class="w">HITL</text>
+<rect class="bh" x="400" y="40" width="160" height="56" rx="6"/><text x="480" y="64" text-anchor="middle" class="t">step</text><text x="480" y="82" text-anchor="middle" class="s">one ticket per head</text>
+<rect class="b" x="590" y="40" width="160" height="56" rx="6"/><text x="670" y="64" text-anchor="middle" class="t">Head legs, in parallel</text><text x="670" y="82" text-anchor="middle" class="s">one subagent per host_action</text>
+<rect class="b" x="780" y="40" width="160" height="56" rx="6"/><text x="860" y="64" text-anchor="middle" class="t">submit_host_result</text><text x="860" y="82" text-anchor="middle" class="s">per leg, charged once</text>
+<path class="a" d="M180 68 H208"/><path class="a" d="M370 68 H398"/><path class="a" d="M560 68 H588"/><path class="a" d="M750 68 H778"/>
+<path class="a" d="M860 96 V140 H85 V178"/>
+<rect class="b" x="20" y="180" width="130" height="56" rx="6"/><text x="85" y="204" text-anchor="middle" class="t">Lead synthesis leg</text><text x="85" y="222" text-anchor="middle" class="s">dissents kept</text>
+<rect class="b" x="178" y="180" width="130" height="56" rx="6"/><text x="243" y="204" text-anchor="middle" class="t">Engineer + judge</text><text x="243" y="222" text-anchor="middle" class="s">if a pack emitted work</text>
+<rect class="b" x="336" y="180" width="130" height="56" rx="6"/><text x="401" y="204" text-anchor="middle" class="t">finalize</text><text x="401" y="222" text-anchor="middle" class="s">shared drive_tail</text>
+<rect class="b" x="494" y="180" width="130" height="56" rx="6"/><text x="559" y="204" text-anchor="middle" class="t">Per-squad judge</text><text x="559" y="222" text-anchor="middle" class="s">verdict row per squad</text>
+<rect class="bw" x="652" y="180" width="130" height="56" rx="6"/><text x="717" y="204" text-anchor="middle" class="t">Synthesis, postcheck</text><text x="717" y="222" text-anchor="middle" class="w">HITL</text>
+<rect class="bg" x="810" y="180" width="130" height="56" rx="6"/><text x="875" y="204" text-anchor="middle" class="t">DECISION_RECORD</text><text x="875" y="222" text-anchor="middle" class="s">Hydra speaks</text>
+<path class="a" d="M150 208 H176"/><path class="a" d="M308 208 H334"/><path class="a" d="M466 208 H492"/><path class="a" d="M624 208 H650"/><path class="a" d="M782 208 H808"/>
+<text x="20" y="276" class="s">At a red box the engine returns pending_hitl and the turn ends. Only /hydra:approve or /hydra:resume continues the workflow.</text>
+<text x="20" y="294" class="s">Budget at 100 percent, constitution_breach and an unknown repo id pause the same way at any point.</text>
+</svg></div>
+<figcaption>Figure 5. The workflow tier. One path for every interactive run; gates are never passed by the drive loop.</figcaption></figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 330" role="img" aria-label="Flowchart of the consult tier and its escalation triggers">
+<text x="20" y="20" class="h">Consult tier</text>
+<rect class="b" x="20" y="40" width="150" height="60" rx="6"/><text x="95" y="64" text-anchor="middle" class="t">Operator asks</text><text x="95" y="82" text-anchor="middle" class="s">"ask the CFO ..."</text>
+<rect class="bh" x="200" y="40" width="170" height="60" rx="6"/><text x="285" y="64" text-anchor="middle" class="t">hydra:hydra spawns head</text><text x="285" y="82" text-anchor="middle" class="s">plugin-scoped agent name</text>
+<rect class="bh" x="400" y="40" width="210" height="60" rx="6"/><text x="505" y="64" text-anchor="middle" class="t">Hook opens a consult</text><text x="505" y="82" text-anchor="middle" class="s">no ticket, eligible head: consult open</text>
+<rect class="b" x="640" y="40" width="150" height="60" rx="6"/><text x="715" y="64" text-anchor="middle" class="t">Head answers</text><text x="715" y="82" text-anchor="middle" class="s">read-only tool scope</text>
+<rect class="bg" x="820" y="40" width="120" height="60" rx="6"/><text x="880" y="64" text-anchor="middle" class="t">Consult close</text><text x="880" y="82" text-anchor="middle" class="s">one charge</text>
+<path class="a" d="M170 70 H198"/><path class="a" d="M370 70 H398"/><path class="a" d="M610 70 H638"/><path class="a" d="M790 70 H818"/>
+<rect class="bg" x="20" y="150" width="350" height="150" rx="6"/>
+<text x="34" y="174" class="t">What every consult guarantees</text>
+<text x="34" y="198" class="s">Read-only tool scope</text>
+<text x="34" y="218" class="s">Budget charged exactly once, even on a double close</text>
+<text x="34" y="238" class="s">ConsultNote envelope validated at open and at close</text>
+<text x="34" y="258" class="s">Its own trace under the Hydra project</text>
+<text x="34" y="278" class="s">Answer returned with a MemoryRef</text>
+<path class="a" d="M715 100 V148"/>
+<rect class="bw" x="400" y="150" width="540" height="150" rx="6"/>
+<text x="414" y="174" class="t">Escalates to a workflow (/hydra:run) on any of these</text>
+<text x="414" y="198" class="s">A write attempt</text>
+<text x="414" y="218" class="s">Spend over the consult threshold</text>
+<text x="414" y="238" class="s">A second squad is needed</text>
+<text x="680" y="198" class="s">The head emits envelopes</text>
+<text x="680" y="218" class="s">A venom-class tool is called</text>
+<text x="680" y="238" class="s">Any engineer or judge agent type</text>
+<text x="414" y="278" class="s">The denied action is not retried inside the consult.</text>
+</svg></div>
+<figcaption>Figure 6. The consult tier. Cheap and governed; anything beyond a read-only answer becomes a workflow.</figcaption></figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 330" role="img" aria-label="Flowchart of a gateway call from a squad subagent">
+<text x="20" y="20" class="h">A gateway call from a squad subagent</text>
+<rect class="b" x="20" y="40" width="200" height="60" rx="6"/><text x="120" y="64" text-anchor="middle" class="t">Squad subagent</text><text x="120" y="82" text-anchor="middle" class="s">calls a gateway tool</text>
+<rect class="bh" x="260" y="40" width="200" height="60" rx="6"/><text x="360" y="64" text-anchor="middle" class="t">Hook stamps the call</text><text x="360" y="82" text-anchor="middle" class="s">ticket id in _hydra_ctx</text>
+<rect class="bg" x="500" y="40" width="200" height="60" rx="6"/><text x="600" y="64" text-anchor="middle" class="t">Stamp valid?</text><text x="600" y="82" text-anchor="middle" class="s">present and bound to this agent</text>
+<rect class="bg" x="740" y="40" width="200" height="60" rx="6"/><text x="840" y="64" text-anchor="middle" class="t">Tool in the catalog?</text><text x="840" y="82" text-anchor="middle" class="s">no open fallback route</text>
+<path class="a" d="M220 70 H258"/><path class="a" d="M460 70 H498"/><path class="a" d="M700 70 H738"/>
+<text x="600" y="118" text-anchor="middle" class="w">no: denied and logged</text>
+<text x="840" y="118" text-anchor="middle" class="w">no: denied and logged</text>
+<path class="a" d="M940 70 H952 V150 H120 V188"/>
+<rect class="bg" x="20" y="190" width="200" height="60" rx="6"/><text x="120" y="214" text-anchor="middle" class="t">In the squad allow-list?</text><text x="120" y="232" text-anchor="middle" class="s">ticket resolves to squad.yaml</text>
+<rect class="bg" x="260" y="190" width="200" height="60" rx="6"/><text x="360" y="214" text-anchor="middle" class="t">Venom-class tool?</text><text x="360" y="232" text-anchor="middle" class="s">enforce_constitution</text>
+<rect class="bx" x="500" y="190" width="440" height="60" rx="6"/><text x="720" y="214" text-anchor="middle" class="t">Backend call, then telemetry.emit</text><text x="720" y="232" text-anchor="middle" class="s">result returns to the subagent</text>
+<path class="a" d="M220 220 H258"/><path class="a" d="M460 220 H498"/>
+<text x="120" y="268" text-anchor="middle" class="w">no: denied and logged</text>
+<text x="360" y="268" text-anchor="middle" class="w">yes: refused or held for HITL</text>
+<text x="20" y="304" class="s">Enforcement is staged: the stamp is audited first, baseline grants are added for each pack's own shim and read-only memory, then it is enforced.</text>
+</svg></div>
+<figcaption>Figure 7. One gateway call. Agents do not self-check; the gateway decides from the stamp.</figcaption></figure>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 290" role="img" aria-label="Flowchart of MCP and CLI converging on one call path">
+<text x="20" y="20" class="h">MCP and CLI on one call path</text>
+<rect class="b" x="20" y="36" width="270" height="56" rx="6"/><text x="34" y="60" class="t">MCP tool call</text><text x="34" y="78" class="s">mcp__hydra_gateway__&lt;server&gt;__&lt;tool&gt;</text>
+<rect class="bh" x="20" y="122" width="270" height="56" rx="6"/><text x="34" y="146" class="t">hydra tool list | describe | call</text><text x="34" y="164" class="s">plugin bin/hydra, on the Bash PATH</text>
+<rect class="b" x="20" y="208" width="270" height="56" rx="6"/><text x="34" y="232" class="t">Engine dispatcher</text><text x="34" y="250" class="s">attended verbs via BrokerDispatcher</text>
+<rect class="bh" x="350" y="122" width="170" height="56" rx="6"/><text x="435" y="146" text-anchor="middle" class="t">Loopback broker</text><text x="435" y="164" text-anchor="middle" class="s">no duplicate daemons</text>
+<rect class="bg" x="580" y="112" width="170" height="76" rx="6"/><text x="665" y="140" text-anchor="middle" class="t">governed_call</text><text x="665" y="158" text-anchor="middle" class="s">catalog · RBAC · venom</text><text x="665" y="174" text-anchor="middle" class="s">telemetry</text>
+<rect class="bx" x="810" y="122" width="130" height="56" rx="6"/><text x="875" y="146" text-anchor="middle" class="t">Backends</text><text x="875" y="164" text-anchor="middle" class="s">one set per session</text>
+<path class="a" d="M290 64 H665 V110"/>
+<path class="a" d="M290 150 H348"/>
+<path class="a" d="M290 236 H435 V180"/>
+<path class="a" d="M520 150 H578"/>
+<path class="a" d="M750 150 H808"/>
+</svg></div>
+<figcaption>Figure 8. Three callers, one function. The same call returns the same payload on either surface, including denials.</figcaption></figure>
+
+<h2 id="s5">5. Workstreams</h2>
+<p>All engine source is written by the pair-programmer harness through Hydra workflows. Each row is one DEV_TASK-sized change. Each acceptance test must fail when the change is reverted. The Issue column links the GitHub issue for the row.</p>
+
+<figure><div class="scroll">
+<svg class="d" viewBox="0 0 960 350" role="img" aria-label="Phase dependency graph">
+<text x="20" y="16" class="h">Phase dependencies</text>
+<rect class="b" x="20" y="50" width="200" height="110" rx="6"/><text x="34" y="74" class="t">Phase 0: groundwork</text><text x="34" y="94" class="s">W0.1 trace root · W0.2 head registry</text><text x="34" y="110" class="s">W0.3 catalogs · W0.4 hook matchers</text><text x="34" y="126" class="s">W0.5 sibling audits</text><text x="34" y="146" class="s">parallel, starts first</text>
+<rect class="b" x="20" y="210" width="200" height="110" rx="6"/><text x="34" y="234" class="t">Phase 1: seams (audit mode)</text><text x="34" y="254" class="s">W1.1 boundary · W1.2 dispatch seam</text><text x="34" y="270" class="s">W1.3 hooks · W1.4 queued eng.</text><text x="34" y="286" class="s">W1.5 execution_mode</text>
+<rect class="bh" x="380" y="50" width="200" height="80" rx="6"/><text x="394" y="74" class="t">Phase 2: per-head dispatch</text><text x="394" y="94" class="s">W2.1 to W2.5</text>
+<rect class="bh" x="380" y="150" width="200" height="80" rx="6"/><text x="394" y="174" class="t">Phase 3: gateway + CLI</text><text x="394" y="194" class="s">W3.1 to W3.5</text>
+<rect class="bh" x="380" y="250" width="200" height="80" rx="6"/><text x="394" y="274" class="t">Phase 5: one policy</text><text x="394" y="294" class="s">W5.1 to W5.4</text>
+<rect class="bg" x="740" y="150" width="200" height="80" rx="6"/><text x="754" y="174" class="t">Phase 4: consult tier</text><text x="754" y="194" class="s">W4.1, W4.2</text><text x="754" y="212" class="s">needs phases 1 and 3</text>
+<rect class="bg" x="740" y="50" width="200" height="80" rx="6"/><text x="754" y="74" class="t">Phase 6: packaging</text><text x="754" y="94" class="s">per-repo alignment plans</text>
+<path class="a" d="M220 90 H378"/><text x="299" y="83" text-anchor="middle" class="s">W0.2</text>
+<path class="a" d="M220 235 L378 112"/><text x="282" y="160" text-anchor="middle" class="s">W1.2</text>
+<path class="a" d="M220 262 L378 196"/><text x="318" y="246" text-anchor="middle" class="s">W1.1</text>
+<path class="a" d="M220 295 H378"/><text x="299" y="312" text-anchor="middle" class="s">W1.4</text>
+<path class="a" d="M580 190 H738"/>
+<path class="a" d="M120 50 V30 H840 V48"/><text x="480" y="24" text-anchor="middle" class="s">W0.5 reports reviewed by the operator</text>
+</svg></div>
+<figcaption>Figure 9. Phase dependencies. Arrow labels name the workstream that unblocks the next phase.</figcaption></figure>
+
+<h3 id="p0">Phase 0: safe groundwork (parallel, starts first)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-0-groundwork.png" alt="Phase 0 illustration: groundwork."><figcaption>Phase 0, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W0.1</td><td>Squad cursor traces to the Hydra project, not the pack directory.</td><td><code>hydra_core/host_bridge.py</code> (<code>_trace</code> :2178, <code>begin_squad_stage</code> :4235)</td><td>A squad cursor with a different pack cwd emits to the project trace.</td><td class="iss" data-issue="W0.1">pending</td></tr>
+<tr><td class="id">W0.2</td><td>Head registry: <code>(squad, head) → plugin:agent</code>, resolved from the <code>native_packs.py</code> override, then the <code>agent_file</code> stem, then the slug. Doctor validates files and frontmatter names.</td><td>new <code>hydra_core/head_registry.py</code>; <code>native_packs.py</code>; <code>cli.py</code> doctor. Reuse <code>squad_loader.resolve_agent_file_path</code>, <code>cli._agent_frontmatter_name</code>.</td><td>Every head in every discovered pack resolves to an existing agent file. garland and rlm-gaming fail without the stem rule.</td><td class="iss" data-issue="W0.2">pending</td></tr>
+<tr><td class="id">W0.3</td><td>In-repo catalogs derived from server registries; advertise the seven missing tools.</td><td><code>hydra_core/toolshed.py</code>; <code>mcp_servers/hydra_control/server.py</code>; <code>mcp_servers/hydra_memory/server.py</code>; update <code>tests/test_hydra_control_schema_parity.py</code></td><td>Registry equals catalog. An uncatalogued handler fails the test.</td><td class="iss" data-issue="W0.3">pending</td></tr>
+<tr><td class="id">W0.4</td><td>Fix hook matchers: gateway-prefixed tool names, <code>Agent</code> not <code>Task</code>.</td><td><code>plugins/hydra/hooks/hooks.json</code>, <code>iolaus_check.py</code>, <code>iolaus_log.py</code></td><td>Every matcher matches at least one real tool name.</td><td class="iss" data-issue="W0.4">pending</td></tr>
+<tr><td class="id">W0.5</td><td>Sibling-repo investigations, read-only: ExecutiveSuite, Senate, MarketBliss, RLM-Creative, RLM-Gaming, Xenia, pair-programmer, AgentSmith, TheEights.</td><td>new <code>plugins/hydra/workflows/sibling-audit.js</code> (a gate-free dynamic workflow)</td><td>Nine reports, each with findings, root causes and an alignment plan. No repo changed.</td><td class="iss" data-issue="W0.5">pending</td></tr>
+</table></div>
+
+<h3 id="p1">Phase 1: seams, in audit mode</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-1-governance-seam.png" alt="Phase 1 illustration: the governance seam."><figcaption>Phase 1, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W1.1</td><td>Lift redaction, RBAC and venom checks to module functions; add a strict RBAC mode.</td><td><code>hydra_core/supervisor.py:704</code>; <code>dispatcher.py:268-484</code>; new <code>hydra_core/boundary.py</code></td><td>Existing suites unchanged. Strict mode denies an unknown squad.</td><td class="iss" data-issue="W1.1">pending</td></tr>
+<tr><td class="id">W1.2</td><td>Dispatch seam and ticket at <code>step</code>.</td><td>new <code>hydra_core/dispatch_seam.py</code>; <code>cli.py:4661-4741</code>. Reuse <code>governance.should_block_for_budget</code>, <code>redact_for_squad_boundary</code>, <code>tool_scope.build_tool_scope_directive</code>.</td><td>The squad prompt is redacted and carries the scope directive. Over budget returns <code>budget_blocked</code> with no cursor.</td><td class="iss" data-issue="W1.2">pending</td></tr>
+<tr><td class="id">W1.3</td><td>Agent hooks: log would-deny, replace prompt from ticket, capture usage.</td><td>new <code>plugins/hydra/hooks/hydra_hook.py</code>; <code>hooks.json</code></td><td>Hook unit tests on recorded payloads.</td><td class="iss" data-issue="W1.3">pending</td></tr>
+<tr><td class="id">W1.4</td><td>Pack-emitted engineering queues as an attended task (status <code>queued_attended</code>) instead of running inline.</td><td><code>hydra_core/ingest.py:852-910</code>; <code>cli.py:5626-5760</code></td><td>After submit, an engineering task is pending and <code>step</code> returns <code>engineer</code>. <code>pp_harness.start_run</code> is not called during submit.</td><td class="iss" data-issue="W1.4">pending</td></tr>
+<tr><td class="id">W1.5</td><td>Explicit <code>execution_mode</code> on <code>build_supervisor</code>; attended no longer auto-sets <code>drive_pp_loop</code>. Lands with or after W1.4.</td><td><code>supervisor.py:597-677</code>, <code>:2866</code>; <code>cli.py:3545</code></td><td>An attended supervisor defers an engineering task at <code>node_dispatch</code>.</td><td class="iss" data-issue="W1.5">pending</td></tr>
+</table></div>
+
+<h3 id="p2">Phase 2: per-head dispatch (needs W0.2, W1.2)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-2-per-head-dispatch.png" alt="Phase 2 illustration: per-head dispatch."><figcaption>Phase 2, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W2.1</td><td>One cursor per head leg (<code>run_id = task.head</code>), then a lead-synthesis leg. <code>TaskState.heads</code> (empty means lead-only, unchanged behavior). Head results go in a merge-reducer channel.</td><td><code>host_bridge.py:4235</code>; <code>cli.py</code> step and submit; <code>state.py</code></td><td>Three heads plus lead give four cursors and four charges. The task completes only after the lead. A duplicate submit is not re-charged.</td><td class="iss" data-issue="W2.1">pending</td></tr>
+<tr><td class="id">W2.2</td><td>Head dissents always reach the DECISION_RECORD.</td><td><code>cli.py:_materialize_attended_results</code>. Reuse <code>hydra_core/deliberation.py</code>.</td><td>A head dissent appears even when the lead omits it.</td><td class="iss" data-issue="W2.2">pending</td></tr>
+<tr><td class="id">W2.3</td><td><code>PlanStep.heads</code>, validated against the registry at PLAN ingest.</td><td><code>schemas.py:332</code>; <code>supervisor.py</code> <code>materialise_plan_steps</code>; <code>ingest.py</code></td><td>An unknown head rejects the plan.</td><td class="iss" data-issue="W2.3">pending</td></tr>
+<tr><td class="id">W2.4</td><td>Parallel <code>host_actions</code> in the step response.</td><td><code>cli.py</code> step</td><td>Out-of-order submits converge.</td><td class="iss" data-issue="W2.4">pending</td></tr>
+<tr><td class="id">W2.5</td><td>Delete the eight dead agents; drop plan-critic and plan-scribe from the planning roster; generate <code>hydra.md</code> <code>tools: Agent(...)</code> from the registry.</td><td><code>plugins/hydra/agents/*</code>; <code>squads/planning/squad.yaml</code>; <code>skills/plan/SKILL.md</code>; <code>hydra.md</code></td><td>Doctor: every plugin agent is in the registry or an engine <code>agent_type</code> set.</td><td class="iss" data-issue="W2.5">pending</td></tr>
+</table></div>
+<p>The clearing gotcha from earlier work applies to W2.1: clearing a plain <code>HydraState</code> field durably needs <code>update[key]=&lt;empty&gt;</code> in the node patch, and tests must model replay as a channel merge.</p>
+
+<h3 id="p3">Phase 3: gateway governance and CLI mirror (needs W1.1)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-3-gateway-cli.png" alt="Phase 3 illustration: gateway governance and CLI."><figcaption>Phase 3, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W3.1</td><td><code>governed_call</code>; fallback route restricted to the catalog.</td><td>new <code>hydra_core/gateway_runtime.py</code>; <code>mcp_servers/hydra_gateway/server.py</code>; update <code>tests/test_fable_audit2_phase5.py</code></td><td>Gateway and CLI return identical payloads for RBAC-deny, venom-refuse and no-daemons.</td><td class="iss" data-issue="W3.1">pending</td></tr>
+<tr><td class="id">W3.2</td><td>Caller identity stamp (<code>_hydra_ctx</code>) on gateway calls: audit, add baseline grants for each pack's own shim and read-only memory, then enforce.</td><td><code>hydra_hook.py</code>; gateway</td><td>A missing stamp is denied. A ticket bound to another agent is denied.</td><td class="iss" data-issue="W3.2">pending</td></tr>
+<tr><td class="id">W3.3</td><td><code>hydra tool list|describe|call</code> over a loopback broker.</td><td><code>cli.py:8171</code>; <code>gateway_runtime.py</code>; new <code>plugins/hydra/bin/hydra</code></td><td>No stdio spawn when the broker is present.</td><td class="iss" data-issue="W3.3">pending</td></tr>
+<tr><td class="id">W3.4</td><td>Curated verbs for the CLI gaps. Gate-clearing tools require operator capability. Deny gate-clearing commands from the agent's Bash. Move the operator key out of ambient env.</td><td><code>cli.py</code>. Reuse <code>hydra_core/auth/capability.py</code>.</td><td>Any tool named approve, resolve, release, reset, unlock or commit must be classified.</td><td class="iss" data-issue="W3.4">pending</td></tr>
+<tr><td class="id">W3.5</td><td>Attended verbs use the broker (BrokerDispatcher): one pp daemon per session.</td><td><code>cli.py:3545</code></td><td>One pp daemon across step, submit and finalize (<code>live_daemon</code> mark).</td><td class="iss" data-issue="W3.5">pending</td></tr>
+</table></div>
+
+<h3 id="p4">Phase 4: consult tier (needs phases 1 and 3)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-4-consult-tier.png" alt="Phase 4 illustration: the consult tier."><figcaption>Phase 4, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W4.1</td><td><code>hydra consult open|close|list</code>, session ledger, <code>ConsultNote</code> envelope.</td><td>new <code>hydra_core/consult.py</code>; <code>schemas.py</code>; <code>cli.py</code>; <code>hydra_control/server.py</code></td><td>A double close charges once. One test per escalation trigger.</td><td class="iss" data-issue="W4.1">pending</td></tr>
+<tr><td class="id">W4.2</td><td>Consult hooks: open on an unticketed eligible head, deny writes.</td><td><code>hydra_hook.py</code></td><td>A write inside a consult agent is denied.</td><td class="iss" data-issue="W4.2">pending</td></tr>
+</table></div>
+
+<h3 id="p5">Phase 5: one policy (needs W1.4)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-5-one-policy.png" alt="Phase 5 illustration: one policy."><figcaption>Phase 5, illustrative.</figcaption></figure>
+<div class="scroll"><table>
+<tr><th>ID</th><th>Change</th><th>Files and reuse</th><th>Acceptance</th><th>Issue</th></tr>
+<tr><td class="id">W5.1</td><td>Engine-level detached gate. Fleet defined structurally via <code>repo_registry.parse_repos_arg</code>. Remove the goal-text regex.</td><td>new <code>hydra_core/detached_policy.py</code>; <code>cli.py:712</code>; <code>hydra_control/server.py:287-319</code>, <code>:647</code></td><td><code>cli run --live</code> without authorization is refused.</td><td class="iss" data-issue="W5.1">pending</td></tr>
+<tr><td class="id">W5.2</td><td>Detached runs no longer force trivial plan rigor.</td><td><code>cli.py:737</code>; <code>supervisor.py:1633</code></td><td>A detached non-trivial run without an approved plan surfaces <code>plan_required</code>.</td><td class="iss" data-issue="W5.2">pending</td></tr>
+<tr><td class="id">W5.3</td><td>Attended finalize runs the per-squad judge; one shared <code>drive_tail</code> that never passes a pending gate.</td><td><code>cli.py:6494-6509</code></td><td>A squad record gets a verdict row.</td><td class="iss" data-issue="W5.3">pending</td></tr>
+<tr><td class="id">W5.4</td><td>Cockpit launch goes through the gated path.</td><td><code>web/server/launch.ts</code></td><td>Launch handles engine refusal.</td><td class="iss" data-issue="W5.4">pending</td></tr>
+</table></div>
+
+<h3 id="p6">Phase 6: packaging (after the W0.5 reports are reviewed)</h3>
+<figure><img src="assets/hydra-unified-orchestration/phase-6-packaging.png" alt="Phase 6 illustration: packaging."><figcaption>Phase 6, illustrative.</figcaption></figure>
+<p>The per-repo alignment plans decide the detail. Expected: plugin manifests for Xenia, pair-programmer and AgentSmith; the Hydra plugin ships <code>.mcp.json</code> and <code>bin/</code> and declares dependencies; one marketplace. Gateway tool names change prefix (to <code>mcp__plugin_&lt;plugin&gt;_&lt;server&gt;__&lt;tool&gt;</code>), so every matcher, agent file and doc must accept both prefixes before the switch. The bare-name collision on <code>engineer</code> and the judges is resolved here. Issue: <span data-issue="P6">pending</span>.</p>
+
+<h3 id="docs">Runbooks and docs (alongside the phase that makes them true)</h3>
+<ul>
+<li>Merge <code>skills/drive</code> into <code>skills/run</code>; rewrite <code>skills/campaign</code> to match.</li>
+<li>Fix the text in <code>hydra-route-directive.ps1</code> and <code>hydra-session-contract.ps1</code>.</li>
+<li>Update the <code>AGENTS.md</code> squad table, <code>ARCHITECTURE.md</code>, <code>HYDRA.md</code>, <code>CONTRIBUTING-SQUADS.md</code>, <code>docs/MCP_SETUP.md</code>.</li>
+<li>Follow <code>.claude/rules/documentation.md</code>: describe Claude Code features as host-interface capabilities, name the Hydra component that stays authoritative, mark experimental features, cite sources.</li>
+</ul>
+<p>Issue: <span data-issue="DOCS">pending</span>.</p>
+
+<h2 id="s6">6. Needs operator sign-off when reached</h2>
+<ul>
+<li><code>AGENTS.md</code> rule 9 cites <code>plugins/hydra/agents/hydra-supervisor.md</code> § Engineering Execution Contract. Deleting that agent needs the citation and the contract text moved (W2.5).</li>
+<li><code>CLAUDE.md</code> says "ALL productive work MUST flow through Hydra". The consult tier needs wording there (W4.1).</li>
+<li>Rule 3 (no raw blobs across squads) is only partly protected in a consult: the orchestrator holds the raw answer. Mitigations are redaction, a returned MemoryRef, and escalation on a second squad.</li>
+<li>Detached fleet runs that work today will park until planned (W5.2).</li>
+</ul>
+<div class="warnbox"><code>CONSTITUTION.md</code> is not touched by any workstream. A change that appears to need it stops as a HITL with reason <code>constitution_breach</code>.</div>
+
+<h2 id="s7">7. Assumptions and unverified points</h2>
+<ul>
+<li><code>CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS</code> is set to <code>0</code> for Hydra sessions by default and turned on per deliberation step. It is currently <code>1</code> in user settings.</li>
+<li>Unverified, to test before building on them:
+  <ul>
+  <li>whether plugin hooks fire for workflow <code>agent()</code> spawns;</li>
+  <li>the <code>PostToolUse</code> payload shape for teammates;</li>
+  <li>which <code>engineer</code> definition a bare name resolves to today.</li>
+  </ul></li>
+<li>Subagent nesting depth was reported inconsistently during research. W2.1 does not depend on nesting: every head is spawned by <code>hydra:hydra</code> directly.</li>
+</ul>
+
+<h2 id="s8">8. Verification</h2>
+<ul>
+<li>Per workstream: the acceptance test in its row, plus its negative (revert the change, the test fails), then the full <code>pytest</code> suite (hermetic, <code>HYDRA_TEST_NO_DAEMONS=1</code>).</li>
+<li>End to end after phase 2: <code>/hydra:run</code> an executive goal naming three heads. Expect three visible <code>executive-suite:*</code> subagents, then <code>boardroom</code>, four charges in the ledger, dissents in the <code>DECISION_RECORD</code>, and the trace under <code>&lt;Hydra&gt;/.hydra/&lt;wf&gt;/</code>.</li>
+<li>After phase 1: a pack-emitted DEV_TASK shows a visible <code>engineer</code> and judge.</li>
+<li>After phase 3: <code>hydra tool call hydra_control hydra.squad.list</code> and the MCP tool return the same payload; a squad subagent calling a tool outside its <code>squad.yaml</code> allow-list is denied; <code>hydra doctor</code> reports no catalog drift.</li>
+<li>After phase 4: "ask the CFO ..." returns an answer with one consult charge and no workflow; a consult that tries to write is denied and escalates.</li>
+<li>After phase 5: <code>python -m hydra_core.cli run --live "&lt;goal&gt;"</code> is refused without automation authorization; a two-repo fleet run produces a <code>DECISION_RECORD</code> with per-squad verdicts.</li>
+</ul>
+
+<h2 id="s9">9. How to implement</h2>
+<ol>
+<li>Work from the GitHub issues; each one restates its row here with dependencies by issue number.</li>
+<li>Route every workstream through <code>/hydra:run</code> with the issue title and number as the goal. Engineering is the attended cursor: the engine returns the agent type, the host spawns only that type. Do not hand-write engine source and do not invoke <code>/pp:*</code> directly.</li>
+<li>Start phase 0 workstreams in any order; they do not depend on each other. W0.5 is a read-only dynamic workflow and can run alongside.</li>
+<li>Phase 1 lands in audit mode: hooks log what they would deny. Switch to enforcement per seam only after a clean audit window.</li>
+<li>Respect the edges in figure 9. W1.5 lands with or after W1.4. Phase 4 waits for phases 1 and 3. Phase 6 waits for the operator's review of the W0.5 reports.</li>
+<li>For every change: write the acceptance test, show it fail with the change reverted, then run the full suite. Report with the test output, trace state and artifact paths.</li>
+<li>Stop at every HITL gate and at each item in section 6.</li>
+</ol>
+<p>Known environment constraints: in attended-run worktrees the permission layer blocks <code>python</code> and <code>pytest</code> (verify by static trace and hand the operator the command); <code>codex exec</code> hangs as a background task (run it in the foreground with a timeout); the pp <code>enforce-active-run</code> hook blocks ad-hoc Write/Edit.</p>
+
+<h2 id="s10">10. Sources</h2>
+<ul>
+<li>Repo investigation: file and line references in section 2 are from <code>lebobo88/Hydra</code>, branch <code>fix/known-issues-2026-09-25</code> at <code>b2c85b3</code>. Line numbers drift; search by symbol name.</li>
+<li>Claude Code documentation (host-interface behavior): <a href="https://code.claude.com/docs/en/sub-agents">sub-agents</a>, <a href="https://code.claude.com/docs/en/hooks">hooks</a>, <a href="https://code.claude.com/docs/en/plugins-reference">plugins reference</a>, <a href="https://code.claude.com/docs/en/agent-teams">agent teams (experimental)</a>, <a href="https://code.claude.com/docs/en/mcp">MCP</a>. Read during planning on 2026-11-14; re-check before relying on a detail.</li>
+<li>Contract: <code>AGENTS.md</code>, <code>CLAUDE.md</code>, <code>.claude/rules/*</code>, <code>CONSTITUTION.md</code> (read-only).</li>
+</ul>
+
+</main>
+<script>
+// Issue numbers for each workstream. Filled in after filing.
+const REPO = "https://github.com/lebobo88/Hydra/issues/";
+const ISSUES = {};
+document.querySelectorAll("[data-issue]").forEach(function (el) {
+  const n = ISSUES[el.getAttribute("data-issue")];
+  if (!n) return;
+  el.textContent = "";
+  const a = document.createElement("a");
+  a.href = REPO + n; a.textContent = "#" + n;
+  el.appendChild(a);
+});
+</script>
+</body>
+</html>
