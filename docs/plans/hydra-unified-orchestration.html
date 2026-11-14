@@ -562,9 +562,18 @@ td.iss{white-space:nowrap}
 
 </main>
 <script>
-// Issue numbers for each workstream. Filled in after filing.
+// Issue numbers for each workstream, filed 2026-11-14 (lebobo88/Hydra #78 to #106).
 const REPO = "https://github.com/lebobo88/Hydra/issues/";
-const ISSUES = {};
+const ISSUES = {
+  "EPIC": 78,
+  "W0.1": 79, "W0.2": 80, "W0.3": 81, "W0.4": 82, "W0.5": 83,
+  "W1.1": 84, "W1.2": 85, "W1.3": 86, "W1.4": 87, "W1.5": 88,
+  "W2.1": 89, "W2.2": 90, "W2.3": 91, "W2.4": 92, "W2.5": 93,
+  "W3.1": 94, "W3.2": 95, "W3.3": 96, "W3.4": 97, "W3.5": 98,
+  "W4.1": 99, "W4.2": 100,
+  "W5.1": 101, "W5.2": 102, "W5.3": 103, "W5.4": 104,
+  "P6": 105, "DOCS": 106
+};
 document.querySelectorAll("[data-issue]").forEach(function (el) {
   const n = ISSUES[el.getAttribute("data-issue")];
   if (!n) return;
