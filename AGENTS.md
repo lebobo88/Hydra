@@ -4,7 +4,7 @@ This file is the single source of truth for any AI agent (Claude Code, Codex, Ge
 
 ## What Hydra Is
 
-A central LangGraph supervisor + Claude Code plugin that routes work across heterogeneous AI agent squads (executive, engineering, garland, plus stubs). Hydra does NOT do the squads' work; it routes, governs, and synthesizes.
+A central LangGraph supervisor + Claude Code plugin that routes work across heterogeneous AI agent squads (executive, engineering, creative, legal, marketing, game development, customer support, plus stubs). Hydra does NOT do the squads' work; it routes, governs, and synthesizes.
 
 See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
@@ -12,25 +12,32 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 
 | Slug | Source pack | Entrypoint |
 |---|---|---|
-| executive | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | agent-impersonation |
+| executive | [`ExecutiveSuite`](https://github.com/lebobo88/ExecutiveSuite) | claude-native |
 | engineering | [`pair-programmer`](https://github.com/lebobo88/pair-programmer) | mcp |
-| garland | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | claude-skill |
-| marketing-strategy | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| marketing-creative | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| marketing-research | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| marketing-production | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| marketing-ops | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-skill |
-| legal-compliance | [`Senate`](https://github.com/lebobo88/Senate) | claude-skill |
+| garland | [`RLM-Creative`](https://github.com/lebobo88/RLM-Creative) | claude-native |
+| marketing-strategy | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-native |
+| marketing-creative | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-native |
+| marketing-research | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-native |
+| marketing-production | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-native |
+| marketing-ops | [`MarketBliss`](https://github.com/lebobo88/MarketBliss) | claude-native |
+| legal-compliance | [`Senate`](https://github.com/lebobo88/Senate) | claude-native |
+| rlm-gaming | [`RLM-Gaming`](https://github.com/lebobo88/RLM-Gaming) | claude-native |
+| planning | this repo (agents generated from `covenant/plan-*.cov`) | claude-native |
 | customer-support | [`Xenia`](https://github.com/lebobo88/Xenia-Support) | claude-skill |
-| rlm-gaming | [`RLM-Gaming`](https://github.com/lebobo88/RLM-Gaming) | claude-skill |
 | healthcare | (stub) | stub |
 | sales-gtm | (stub) | stub |
 | research-ds | (stub) | stub |
 
-**14 squads: 11 active, 3 stubs (healthcare, sales-gtm, research-ds).** The five
+**15 squads: 12 active, 3 stubs (healthcare, sales-gtm, research-ds).**
+`claude-native` squads run as a plugin-scoped Claude Code subagent through the
+attended host cursor; only each squad's lead agent is mapped today
+(`hydra_core/native_packs.py`). `planning` authors the typed PLAN before any
+other squad is dispatched and cannot be selected by the router or `--squad`.
+The plan agents under `plugins/hydra/.claude/agents/` are generated: edit
+`covenant/plan-*.cov` and rebuild, never the generated files. The five
 `marketing-*` packs are filesystem symlinks into the MarketBliss checkout.
 `rlm-gaming` is the **Arcade Crown** — RLM-Gaming's 20-agent game-development
-studio squad (claude-skill entrypoint).
+studio squad.
 `legal-compliance` is the **Curia** — Senate's Law-of-Citations council (9 jurists:
 Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian, +
 consilium Paulus/Modestinus/Janus); it deliberates by majority with Papinian's
@@ -64,7 +71,7 @@ and approval-gated execution, with server-side WS-AUTH capability enforcement on
 
 - PII / PHI / financial data is redacted at squad boundaries (`governance.redact_for_squad_boundary`) unless the receiving squad's `squad.yaml` has explicit allow-list.
 - The healthcare squad's `phi-redactor` agent runs FIRST on every inbound envelope.
-- MCP tools are namespaced and whitelisted per-squad. The dispatcher enforces RBAC at runtime; agents do not self-check.
+- MCP tools are namespaced and whitelisted per-squad. The dispatcher (`MCPStdioDispatcher`) enforces RBAC at runtime on the engine path; agents do not self-check. The gateway itself is a flat passthrough today (tracked in Hydra#94, #95).
 - In gateway mode, all MCP tools are proxied through `hydra_gateway`. Tool names follow the pattern `mcp__hydra_gateway__{server}__{tool}`. Backend specs live in `~/.hydra/backends.json`, not `~/.claude.json`.
 - Each connected system (pair-programmer, TheEights, AgentSmith, ExecutiveSuite, RLM-Creative) can also run independently without Hydra by registering its MCP server directly.
 
@@ -76,4 +83,5 @@ and approval-gated execution, with server-side WS-AUTH capability enforcement on
 - `HYDRA.md` — top-level architecture
 - `ARCHITECTURE.md` — engineer-facing detailed design
 - `CONTRIBUTING-SQUADS.md` — how to add a squad pack
+- `docs/plans/hydra-unified-orchestration.html` — approved plan for one orchestrator and one engine policy (epic Hydra#78); not yet implemented
 - `Enterprise Master AI Orchestration System Architecture.md` — upstream research doc grounding the design

@@ -2,111 +2,37 @@
 
 > *Many heads. One Spirit. The covenant holds.*
 
-A LangGraph supervisor that routes work across specialized AI agent squads — executive strategy, software engineering, creative production — under constitutional governance with human-in-the-loop gates, budget enforcement, and cross-model judging.
+Hydra is a **Claude Code plugin plus a Python supervisor** (LangGraph when installed) that routes work across specialized AI agent squads under one constitution, with human-in-the-loop gates, a budget ledger, and judged output. Hydra does not do the squads' work. It routes, governs, and synthesizes.
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Roadmap Complete](https://img.shields.io/badge/roadmap-all%206%20stages%20complete-teal?style=flat-square)
+![Roadmap](https://img.shields.io/badge/roadmap-stages%201--5%20shipped-teal?style=flat-square)
 ![Constitution](https://img.shields.io/badge/constitution-SHA--256%20attested-C0392B?style=flat-square)
 
-Hydra is a **Claude Code plugin + Python LangGraph supervisor** that routes work across a constellation of heterogeneous AI agent squads — Executive (C-suite strategy), Forge (engineering), Garland (creative), plus marketing operations and a roster of governance-ready stubs. It is **Pentecost, not Legion**: many distinct agents under one cryptographically-anchored covenant (`CONSTITUTION.md`), routed via typed envelopes, audited by [AgentSmith](https://github.com/lebobo88/AgentSmith), and tagged with the eight-cell I Ching vocabulary backed by the optional [TheEights](https://github.com/lebobo88/TheEights) memory daemon as a shared cross-project substrate.
-
-Hydra does not re-implement the squads' work. It sits above them: classifying goals, decomposing them into typed cross-squad envelopes, dispatching subgraphs in parallel, synthesizing the result into a single decision record, and enforcing the constitutional rule of faith on every step.
-
----
-
 <p align="center">
-  <img src="docs/constellation/constellation.svg" alt="Hydra Constellation — Pentecost flower sigil with Immortal Red CONSTITUTION.md at the centre, three Crown Teal petals (Executive, Forge, Garland), two active non-crown petals (legal-compliance/Curia, customer-support/Xenia Hearth), three Trigram Amber stub petals (healthcare, sales-gtm, research-ds), an outer ring of eight I Ching trigrams (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui), an AgentSmith warden ring (N1–N10 fail-closed), and a memory lemniscate looping episodic and semantic stores." width="780">
+  <img src="docs/constellation/constellation.svg" alt="The Hydra constellation sigil: CONSTITUTION.md at the centre, squad petals around it, and an outer ring of the eight trigram memory cells." width="780">
 </p>
 
-<p align="center"><em>The Pentecost flower sigil — central immortal head, three crown petals, eight-cell substrate. See <a href="docs/constellation/HYDRA-CONSTELLATION.md">docs/constellation/</a> for the full layered presentation, the <a href="docs/constellation/deck.html">reveal.js cinematic deck</a>, and <a href="docs/constellation/exec-memos/">executive memos</a>.</em></p>
+<p align="center"><em>The sigil is brand artwork, not a current architecture diagram. For the presentation bundle see <a href="docs/constellation/">docs/constellation/</a>.</em></p>
 
----
-
-## The Ecosystem
-
-Hydra is one node in a mesh of **nine sibling AI systems bound together by a tenth layer, [AgentMesh](https://github.com/lebobo88/AgentMesh)**. Each system is independently shippable; together they form a unified AI operating system. Several of the siblings below — ExecutiveSuite, RLM-Creative, MarketBliss, [Senate](https://github.com/lebobo88/Senate), and [Xenia](https://github.com/lebobo88/Xenia-Support) — are also Hydra *squads* (see [Squad topology](#what-hydra-is)); they appear here as ecosystem members in their own right.
-
-```mermaid
-graph TD
-    subgraph MESH["🕸️ AgentMesh — binding control plane (the tenth layer)"]
-      direction TB
-      HYDRA["🐍 Hydra<br/><em>Supervisor · Router · Synthesizer</em>"]
-
-      ES["👔 ExecutiveSuite<br/><em>20 C-suite agents · 4 orchestrators</em>"]
-      PP["⚙️ pair-programmer<br/><em>Best-of-N harness · 39 sub-agents</em>"]
-      RLM["🎨 RLM-Creative<br/><em>8 Garland Heads · Helios sub-crew</em>"]
-      MB["📣 MarketBliss<br/><em>5 marketing squads</em>"]
-      SENATE["⚖️ Senate<br/><em>12-jurist Curia · legal-compliance</em>"]
-      XENIA["🔥 Xenia<br/><em>11-agent Hearth · customer-support</em>"]
-
-      SMITH["🛡️ AgentSmith<br/><em>Meta-governance · N1–N10 invariants</em>"]
-      EIGHTS["∞ TheEights<br/><em>Root of trust · memory · self-evolution</em>"]
-    end
-
-    HYDRA -->|"CSuiteDecisionPacket"| ES
-    HYDRA -->|"PRD · DevTask"| PP
-    HYDRA -->|"CreativeBrief · ShotList"| RLM
-    HYDRA -->|"CreativeBrief"| MB
-    HYDRA -->|"LegalReview"| SENATE
-    HYDRA -->|"SupportTask"| XENIA
-
-    ES -->|"DecisionRecord"| HYDRA
-    PP -->|"DecisionRecord"| HYDRA
-    RLM -->|"DecisionRecord"| HYDRA
-    SENATE -->|"DecisionRecord"| HYDRA
-    XENIA -->|"DecisionRecord"| HYDRA
-
-    SMITH -.->|"validates"| HYDRA
-    SMITH -.->|"validates"| ES
-    SMITH -.->|"validates"| PP
-    SMITH -.->|"validates"| RLM
-
-    EIGHTS -.->|"root of trust · MemoryRef"| SMITH
-    EIGHTS -.->|"MemoryRef handles"| HYDRA
-    EIGHTS -.->|"memory"| ES
-    EIGHTS -.->|"memory"| PP
-    EIGHTS -.->|"memory"| RLM
-
-    MESH -.->|"enroll · route · observe (no governance of its own)"| EIGHTS
-
-    click ES "https://github.com/lebobo88/ExecutiveSuite"
-    click PP "https://github.com/lebobo88/pair-programmer"
-    click RLM "https://github.com/lebobo88/RLM-Creative"
-    click MB "https://github.com/lebobo88/MarketBliss"
-    click SENATE "https://github.com/lebobo88/Senate"
-    click XENIA "https://github.com/lebobo88/Xenia-Support"
-    click SMITH "https://github.com/lebobo88/AgentSmith"
-    click EIGHTS "https://github.com/lebobo88/TheEights"
-```
-
-**AgentMesh — binding control plane.** The tenth layer, [AgentMesh](https://github.com/lebobo88/AgentMesh), is the thin, governed control plane that binds the nine systems into one mesh: ONE registry (SQLite `~/.agentmesh/state.db`; sole writer of `~/.hydra/backends.json`), ONE lifecycle supervisor (Win32 Job Objects + crash-loop breaker + health probes), ONE observability plane (OTEL + structured logs), ONE federated read-only audit timeline (stitched from TheEights / AgentSmith / Hydra chains), ONE external protocol edge (A2A, REST, MCP-over-HTTP), and ONE operator web console. Systems **enroll** by installing a root `mesh-manifest.yaml` validated against AgentMesh's `mesh-manifest.schema.json` — fail-closed: JSON-Schema validation + constitution attestation (via TheEights) + AgentSmith structural inspection must all pass. AgentMesh **enforces no governance of its own**; authority stays with TheEights → AgentSmith → Hydra (precedence order). It routes and observes; it does not arbitrate. Hydra ships its own `mesh-manifest.yaml` at the repo root (enrolling the `hydra_memory` surface).
-
-| Project | Role | Link |
-|---|---|---|
-| **Hydra** | Supervisor — routes, governs, synthesizes | *this repo* |
-| **[ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite)** | Strategic decision support — 20 C-suite agents + boardroom/M&A/crisis/capital orchestrators | [GitHub](https://github.com/lebobo88/ExecutiveSuite) |
-| **[pair-programmer](https://github.com/lebobo88/pair-programmer)** | Engineering harness — best-of-N, cross-vendor judging, 39 sub-agents, 16 profiles | [GitHub](https://github.com/lebobo88/pair-programmer) |
-| **[RLM-Creative](https://github.com/lebobo88/RLM-Creative)** | Eight Garland Heads studio — 8 Muses + Helios photo/cinema sub-crew | [GitHub](https://github.com/lebobo88/RLM-Creative) |
-| **[MarketBliss](https://github.com/lebobo88/MarketBliss)** | Marketing operations — 5 squads (strategy, creative, research, production, ops) | [GitHub](https://github.com/lebobo88/MarketBliss) |
-| **[Senate](https://github.com/lebobo88/Senate)** | Legal wing — "the Curia": 12 jurists under the Twelve Tables, Law of Citations + Tribune's Veto (HITL); Hydra's **legal-compliance** squad | [GitHub](https://github.com/lebobo88/Senate) |
-| **[Xenia](https://github.com/lebobo88/Xenia-Support)** | Customer-support "Hearth" — 11-agent crew for triage, recommendation, VoC, approval-gated execution with WS-AUTH; Hydra's **customer-support** squad | [GitHub](https://github.com/lebobo88/Xenia-Support) |
-| **[AgentSmith](https://github.com/lebobo88/AgentSmith)** | Meta-governance daemon — Factory / Inspector / Sentinel / Archivist, N1–N10 invariants | [GitHub](https://github.com/lebobo88/AgentSmith) |
-| **[TheEights](https://github.com/lebobo88/TheEights)** | Root of trust — persistent hybrid memory + governance + gated self-evolution substrate (optional) | [GitHub](https://github.com/lebobo88/TheEights) |
-| **[AgentMesh](https://github.com/lebobo88/AgentMesh)** | Binding control plane (the tenth layer) — one registry, lifecycle supervisor, observability, federated audit, protocol edge, operator console; enforces no governance of its own | [GitHub](https://github.com/lebobo88/AgentMesh) |
+> **Status, 2026-11-14.** This README describes what is in the repository today. A redesign toward one orchestrator and one engine policy is approved and not yet started: see the [plan](docs/plans/hydra-unified-orchestration.html) and the tracking issue [#78](https://github.com/lebobo88/Hydra/issues/78). Gaps that the plan closes are listed under [Known gaps](#known-gaps).
 
 ---
 
 ## Contents
 
 - [What Hydra is](#what-hydra-is)
-- [The Three Crowns](#the-three-crowns)
-- [The Immortal Head, AgentSmith, and TheEights](#the-immortal-head-agentsmith-and-theeights)
+- [The ecosystem](#the-ecosystem)
+- [Squads](#squads)
+- [How a workflow runs](#how-a-workflow-runs)
+- [Governance](#governance)
+- [Memory and TheEights](#memory-and-theeights)
 - [MCP topology](#mcp-topology)
 - [Prerequisites](#prerequisites)
 - [Install](#install)
 - [Slash commands](#slash-commands)
-- [End-to-end example](#end-to-end-example)
+- [CLI](#cli)
+- [Known gaps](#known-gaps)
 - [Repository map](#repository-map)
 - [What Hydra is not](#what-hydra-is-not)
 - [Where to learn more](#where-to-learn-more)
@@ -115,268 +41,189 @@ graph TD
 
 ## What Hydra is
 
-1. A **LangGraph supervisor graph** running an 8-node state machine: `intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck`. Checkpointed via SQLite (`~/.hydra/checkpoints.db`); long workflows survive restarts.
-2. A **squad registry** — every squad is described by `squads/<slug>/squad.yaml` and auto-discovered. Adding a squad is a config change, not a Hydra-core change.
-3. A **typed cross-squad message bus** with ten Pydantic schemas: `CSuiteDecisionPacket`, `PRD`, `ArchRFC`, `DevTask`, `CreativeBrief`, `ShotList`, `AssetJob`, `DecisionRecord`, `HITLRequest`, `Handoff`. Validated fail-closed at every squad boundary (`hydra_core.schemas.validate_envelope`).
-4. An **MCP host** that fans out to each squad's tool surface as an isolated MCP client session. Five MCP servers ship in this repo (see [§ MCP topology](#mcp-topology)).
-5. A **local-first memory fabric** with three tiers — ephemeral (in-prompt), episodic (SQLite, `~/.hydra/episodic.db`), semantic (Chroma vector store, `~/.hydra/vectors/`) — provided by the in-repo `hydra-memory` MCP server. Cross-squad reads go through `MemoryRef` handles only. Optionally federates with the [TheEights](https://github.com/lebobo88/TheEights) daemon for cross-project hybrid memory + audit graph + governed self-evolution (see [§ TheEights — the optional substrate](#theeights--the-vocabulary-the-substrate-the-optional-federation)).
-6. A **governance plane** — `CONSTITUTION.md` as immortal head (SHA-256 pinned per session, never edited inline), AgentSmith four-pillar enforcement (Factory / Inspector / Sentinel / Archivist) with ten fail-closed invariants (N1–N10), HITL gates, budget tripwires (80% downgrade / 100% HITL), loop ceilings, circuit breaker, redaction at squad boundaries, OTEL trace per workflow.
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> Intake
-    Intake --> Planner : routed_goal
-    Planner --> Approval : CSuiteDecisionPacket
-    Planner --> Dispatch : no_approval_needed
-    Approval --> Dispatch : approved
-    Approval --> Intake : revise
-    Dispatch --> JudgePerSquad : envelopes_fanned_out
-    JudgePerSquad --> Synthesis : all_verdicts_in
-    JudgePerSquad --> Approval : circuit_breaker_tripped
-    Synthesis --> JudgeSynthesis : DecisionRecord
-    JudgeSynthesis --> Postcheck : passed
-    JudgeSynthesis --> Approval : HITL_required
-    Postcheck --> [*] : passed
-    Postcheck --> Approval : HITL_required
-    note right of Approval
-        HITL gate.
-        Resume only via
-        /hydra:approve or /hydra:resume.
-    end note
-    note left of JudgePerSquad
-        Cross-vendor judge per squad.
-        Reflexion ×1 retry on revise.
-    end note
-    note left of Postcheck
-        Loop ceiling, budget,
-        missability checks.
-    end note
-```
-
-For the mythopoetic frame and the engineering deep-dive, see [`HYDRA — A Manifesto for a Many-Headed, One-Souled Intelligence.md`](HYDRA%20%E2%80%94%20A%20Manifesto%20for%20a%20Many-Headed%2C%20One-Souled%20Intelligence.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md). For the upstream research, see [`Enterprise Master AI Orchestration System Architecture.md`](Enterprise%20Master%20AI%20Orchestration%20System%20Architecture.md).
+1. **A supervisor graph** in `hydra_core/supervisor.py` with twelve nodes: `intake`, `planner`, `plan_judge`, `plan_gate`, `approval`, `dispatch`, `hitl_gate_dispatch`, `hitl_gate_judge`, `judge_per_squad`, `synthesis`, `judge_synthesis`, `postcheck`. With the `langgraph` extra installed it runs on LangGraph and checkpoints to SQLite (`~/.hydra/checkpoints.db`). Without it, a pure-Python runner executes the same nodes step by step; the attended (plan/step/submit/finalize) path and replay need the LangGraph checkpoint path.
+2. **A squad registry.** Every squad is declared in `squads/<slug>/squad.yaml` and discovered at startup. Adding a squad is a configuration change.
+3. **Typed cross-squad envelopes.** Fourteen Pydantic types are registered in `hydra_core/schemas.py` (`SCHEMA_REGISTRY`): `C_SUITE_DECISION_PACKET`, `PRD`, `ARCH_RFC`, `DEV_TASK`, `CREATIVE_BRIEF`, `SHOT_LIST`, `ASSET_JOB`, `HITL_REQUEST`, `DECISION_RECORD`, `HANDOFF`, `PLAN`, `SUPPORT_TICKET`, `PORTABLE_CONTEXT`, `VOC_REPORT`. `validate_envelope` rejects anything else, apart from a small set of internal audit event types that never cross a squad boundary.
+4. **An MCP gateway** (`mcp_servers/hydra_gateway/`) that puts every backend server behind one MCP registration. See [MCP topology](#mcp-topology).
+5. **Local memory**: an episodic SQLite log (`~/.hydra/episodic.db`) served by the in-repo `hydra_memory` MCP server, tagged with an eight-cell vocabulary. See [Memory and TheEights](#memory-and-theeights).
+6. **A governance plane**: `CONSTITUTION.md` as the immortal head, HITL gates, budget tripwires, a circuit breaker, boundary redaction, a venom-class capability registry, and a per-workflow trace. See [Governance](#governance).
+7. **A Claude Code plugin** (`plugins/hydra/`) that provides the `hydra:hydra` orchestrator agent, the slash commands, the engineer and judge agents for attended engineering, and the hooks that keep work routed through the engine.
 
 ---
 
-## The Three Crowns
+## The ecosystem
 
-The active squads are organized into three crowns, each optimized for a different objective function:
+Hydra is one of a set of sibling projects. Each is its own repository and runs without Hydra. Several are also Hydra squads.
 
 ```mermaid
 graph TD
-    USER([User Goal])
-    HYDRA{{"Hydra Supervisor<br/>LangGraph 8-node"}}
-    IMMORTAL[/"CONSTITUTION.md<br/>SHA-256 attested"/]
+    HYDRA["Hydra<br/><em>routes · governs · synthesizes</em>"]
 
-    subgraph EXEC["Executive Crown — ExecutiveSuite"]
-        direction LR
-        E1(CEO) --- E2(CFO) --- E3(CTO) --- E4(CMO)
-        E5["boardroom · M&A · crisis · capital"]
-    end
+    ES["ExecutiveSuite<br/><em>executive squad</em>"]
+    PP["pair-programmer<br/><em>engineering squad</em>"]
+    RLM["RLM-Creative<br/><em>garland squad</em>"]
+    GAME["RLM-Gaming<br/><em>rlm-gaming squad</em>"]
+    MB["MarketBliss<br/><em>five marketing squads</em>"]
+    SENATE["Senate<br/><em>legal-compliance squad</em>"]
+    XENIA["Xenia<br/><em>customer-support squad</em>"]
 
-    subgraph FORGE["Forge Crown — pair-programmer"]
-        direction LR
-        F1(architect) --- F2(engineer) --- F3(reviewer)
-        F4(test-strategist) --- F5(security-reviewer)
-    end
+    SMITH["AgentSmith<br/><em>meta-governance daemon</em>"]
+    EIGHTS["TheEights<br/><em>memory · governance · evolution daemon</em>"]
+    MESH["AgentMesh<br/><em>registry · lifecycle · observability</em>"]
 
-    subgraph GARLAND["Garland Crown — RLM-Creative"]
-        direction LR
-        G1(Calliope) --- G2(Erato) --- G3(Polyhymnia)
-        G4(Helios) --- G5["+ 5 sub-agents"]
-    end
+    HYDRA -->|typed envelopes| ES
+    HYDRA -->|typed envelopes| PP
+    HYDRA -->|typed envelopes| RLM
+    HYDRA -->|typed envelopes| GAME
+    HYDRA -->|typed envelopes| MB
+    HYDRA -->|typed envelopes| SENATE
+    HYDRA -->|typed envelopes| XENIA
 
-    USER --> HYDRA
-    HYDRA -.->|reads| IMMORTAL
-    HYDRA ==>|"CSuiteDecisionPacket"| EXEC
-    HYDRA ==>|"PRD · ArchRFC · DevTask"| FORGE
-    HYDRA ==>|"CreativeBrief · ShotList · AssetJob"| GARLAND
-    EXEC ==>|"DecisionRecord"| HYDRA
-    FORGE ==>|"DecisionRecord"| HYDRA
-    GARLAND ==>|"DecisionRecord"| HYDRA
+    HYDRA -.->|gateway backend| SMITH
+    HYDRA -.->|gateway backend| EIGHTS
+    MESH -.->|enrolls via mesh-manifest.yaml| HYDRA
 ```
 
-| Crown | Squad slug | Source pack | Entrypoint | Optimized for |
-|---|---|---|---|---|
-| **Executive** | `executive` | [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) | agent-impersonation | judgment under ambiguity — 20 C-suite agents + 4 orchestrators (boardroom, M&A cockpit, crisis war-room, capital allocation) |
-| **Forge** | `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | mcp | verifiable correctness — best-of-N harness with 7 forge heads (Daedalus/Prometheus/Argus/Hygeia/Cerberus/Charon/Mnemosyne), 16 built-in profiles |
-| **Garland** | `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | claude-skill | divergent ideation — 8 Muses (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) + Helios sub-crew (video-synth, audio-foley, music-score, dialogue-mix, governance-c2pa) |
-| **Curia** | `legal-compliance` | [Senate](https://github.com/lebobo88/Senate) | claude-skill | binding judgment under law — 9 jurists of the Law of Citations (Papinian, Gaius, Ulpian, Angerona, Minerva, Scaevola, Cicero, Cato, Tribonian) + consilium (Paulus, Modestinus, Janus); deliberates by majority with Papinian's tiebreak, halts at the Tribune's Veto |
-| **Arcade** | `rlm-gaming` | [RLM-Gaming](https://github.com/lebobo88/RLM-Gaming) | claude-skill | game development — 20-agent studio squad (game-director, producer, tech-director, systems/narrative/level/encounter/economy designers, game-ai, netcode, art/audio/animation direction, QA-balance, liveops, compliance-cert, security gate) |
+| Project | Role for Hydra | Link |
+|---|---|---|
+| **Hydra** | Supervisor: routes, governs, synthesizes | *this repo* |
+| **ExecutiveSuite** | `executive` squad: 20 C-suite agents and 4 orchestrators (boardroom, capital allocation, crisis war-room, M&A cockpit) | [GitHub](https://github.com/lebobo88/ExecutiveSuite) |
+| **pair-programmer** | `engineering` squad: the harness that writes and judges code (stage protocol, cross-vendor judging, optional best-of-N) | [GitHub](https://github.com/lebobo88/pair-programmer) |
+| **RLM-Creative** | `garland` squad: eight creative heads plus Helios's production sub-crew | [GitHub](https://github.com/lebobo88/RLM-Creative) |
+| **RLM-Gaming** | `rlm-gaming` squad: 20-agent game-development studio | [GitHub](https://github.com/lebobo88/RLM-Gaming) |
+| **MarketBliss** | Five `marketing-*` squads | [GitHub](https://github.com/lebobo88/MarketBliss) |
+| **Senate** | `legal-compliance` squad, "the Curia": 12 jurists | [GitHub](https://github.com/lebobo88/Senate) |
+| **Xenia** | `customer-support` squad, "the Hearth": 11 agents | [GitHub](https://github.com/lebobo88/Xenia-Support) |
+| **AgentSmith** | Meta-governance daemon with ten invariants (N1–N10); a gateway backend | [GitHub](https://github.com/lebobo88/AgentSmith) |
+| **TheEights** | Memory, governance and gated self-evolution daemon; a gateway backend | [GitHub](https://github.com/lebobo88/TheEights) |
+| **AgentMesh** | Control plane over the sibling systems: registry, lifecycle supervisor, observability, read-only federated audit, external protocol edge, operator console | [GitHub](https://github.com/lebobo88/AgentMesh) |
 
-Plus a **Marketing crown** sourced from [MarketBliss](https://github.com/lebobo88/MarketBliss):
-
-| Squad slug | Source | Entrypoint | Domain |
-|---|---|---|---|
-| `marketing-strategy` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | campaign strategy, KPI architecture |
-| `marketing-creative` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | brand voice, copy, art direction |
-| `marketing-research` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | audience, competitive, market sizing |
-| `marketing-production` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | asset production pipelines |
-| `marketing-ops` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | claude-skill | MarTech wiring, attribution, automation |
-
-Plus the **Xenia Hearth** customer-support squad (`customer-support`, sourced
-from the Xenia pack, claude-skill entrypoint).
-
-And **three stub squads** — registered under the same covenant, awaiting activation:
-
-| Slug | Industry tags |
-|---|---|
-| `healthcare` | healthcare, clinical, life-sciences |
-| `sales-gtm` | sales, GTM, revops |
-| `research-ds` | research, data-science |
-
-Every squad declares in its `squad.yaml`:
-- `agents:` roster (slugs + role + authority bounds)
-- `tools:` MCP server endpoints + privilege scope
-- `accepts:` envelope types it consumes
-- `emits:` envelope types it produces
-- `gates:` rubrics + HITL checkpoints
-- `entrypoint:` how Hydra invokes it (`mcp` | `subprocess` | `agent-impersonation` | `claude-skill` | `stub`)
-- `industries:` keyword tags used by the router
+Hydra ships a `mesh-manifest.yaml` at the repo root that enrolls its `hydra_memory` server with AgentMesh. For what each sibling does internally, read that project's own README; this file only states how Hydra uses it.
 
 ---
 
-## The Immortal Head, AgentSmith, and TheEights
+## Squads
 
-Three foundations sit beneath every squad:
+`python -m hydra_core.cli doctor` discovers **15 squads: 12 active and 3 stubs**.
 
-### CONSTITUTION.md — the immortal head
-A cryptographically hashed document at the repo root. Carries a SHA-256 verified at every session boundary. **No agent modifies it**. Amendments route through TheEights with mandatory human approval. Hash drift aborts the session under AgentSmith invariant **N8**. The constitution is the rule of faith; everything downstream depends on the hash matching.
+| Slug | Source pack | Entrypoint | Agents | Domain |
+|---|---|---|---|---|
+| `executive` | [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) | `claude-native` | 24 | Strategy, budgets, risk, M&A, executive decisions |
+| `engineering` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | `mcp` | 5 | Code changes through the pair-programmer stage protocol |
+| `garland` | [RLM-Creative](https://github.com/lebobo88/RLM-Creative) | `claude-native` | 15 | Brand, copy, content, social, paid, PR, SEO, photo and cinema, 3D, C2PA |
+| `legal-compliance` | [Senate](https://github.com/lebobo88/Senate) | `claude-native` | 12 | Legal review with citation verification and a human veto |
+| `rlm-gaming` | [RLM-Gaming](https://github.com/lebobo88/RLM-Gaming) | `claude-native` | 20 | Game design, production, QA, live-ops, certification |
+| `marketing-strategy` | [MarketBliss](https://github.com/lebobo88/MarketBliss) | `claude-native` | 3 | Campaign strategy and experimentation |
+| `marketing-creative` | MarketBliss | `claude-native` | 4 | Copy, brand narrative, brand safety |
+| `marketing-research` | MarketBliss | `claude-native` | 4 | Market intelligence, personas, SEO |
+| `marketing-production` | MarketBliss | `claude-native` | 5 | Production planning, shot lists, talent and IP clearance |
+| `marketing-ops` | MarketBliss | `claude-native` | 4 | Media buying, lifecycle CRM, analytics |
+| `customer-support` | [Xenia](https://github.com/lebobo88/Xenia-Support) | `claude-skill` | 11 | Ticket triage, recommendation, approval-gated execution |
+| `planning` | this repo (`plugins/hydra/.claude/agents/plan-*.md`, generated from `covenant/plan-*.cov`) | `claude-native` | 3 | Authors the typed PLAN before any squad is dispatched |
+| `healthcare` | stub | `stub` | 6 | Registered, not active |
+| `sales-gtm` | stub | `stub` | 5 | Registered, not active |
+| `research-ds` | stub | `stub` | 6 | Registered, not active |
 
-### AgentSmith — the meta-governance daemon
-A separate sibling project ([AgentSmith](https://github.com/lebobo88/AgentSmith)) registered as the `agentsmith` MCP server. Four pillars:
+The five `marketing-*` squad directories are filesystem symlinks into the MarketBliss checkout; `scripts/setup.ps1` and `scripts/setup.sh` regenerate them.
 
-- **Factory** — scaffolds new agents/skills/commands/hooks/squads/rubrics from templates
-- **Inspector** — schema + invariant validation, fail-closed
-- **Sentinel** — anomaly detection, replication-capped at 4 clones per scope (N5)
-- **Archivist** — append-only decision log, audit chain, constitution attestation
+**Entrypoints.**
 
-Ten fail-closed invariants:
+- `claude-native`: the squad runs as a plugin-scoped Claude Code subagent. Today only each squad's lead agent is mapped (`hydra_core/native_packs.py`); the lead adopts the other heads' perspectives in-process.
+- `mcp`: the engineering squad. Hydra drives pair-programmer's stage protocol; it never fans out raw engineer subagents.
+- `claude-skill`: the squad is driven through its pack's skill. `customer-support` has no plugin yet, so its work runs in a general-purpose subagent.
+- `stub`: declared so the router and governance know the squad; it does no work.
 
-| # | Invariant |
-|---|---|
-| N1 | Smith cannot modify its own core policies |
-| N2 | Smith cannot generate venom-class capabilities |
-| N3 | Smith cannot bypass TheEights HITL queue |
-| N4 | Smith cannot push without a TheEights `evolution.commit` verdict |
-| N5 | Replication capped at 4 clones per scope |
-| N6 | Every Smith decision is logged with rationale |
-| N7 | Schema compliance is fail-closed |
-| N8 | Constitution hash mismatch aborts the session |
-| N9 | Smith cannot create new tools |
-| N10 | Quarantine releases require TheEights HITL approval |
+**Head names.** Squads carry a mythic naming overlay in `squads/<slug>/heads.yaml` (roster code: `hydra_core/heads.py`). Engineering's overlay names eight heads (Daedalus, Prometheus, Argus, Hygeia, Cerberus, Charon, Mnemosyne, Asclepius). Garland's names eight (Calliope, Erato, Polyhymnia, Terpsichore, Euterpe, Clio, Urania, Helios) plus seven Helios sub-crew roles (video-synth, audio-foley, music-score, dialogue-mix, blender-model, blender-rig, governance-c2pa). Mythic names are for prose; slugs are what envelopes, schemas and logs use (`docs/BRAND.md`).
 
-Appeals route through the `cerberus-bridge` protocol.
+Every `squad.yaml` declares its `agents`, `tools` (MCP servers and scope), the envelope types it `accepts` and `emits`, its `gates`, its `entrypoint`, and the `industries` keywords the router uses.
 
-### TheEights — the vocabulary, the substrate, the optional federation
+---
 
-TheEights has two distinct parts: an **in-repo vocabulary** that Hydra owns outright, and an **optional sibling project** that Hydra federates with when present. The vocabulary is the user-facing API; the daemon is the persistence behind it.
+## How a workflow runs
 
-#### Part 1 — The eight-cell vocabulary (lives in Hydra, always on)
+All productive work enters through `/hydra:run` (or `/hydra:campaign` for multi-squad or multi-repo work). The Python engine owns workflow state, the budget ledger, judge routing and the gates. Claude Code is the host interface.
 
-The vocabulary is **eight I Ching trigrams** used as memory cells / faceting tags. It lives in `hydra_core/eights/` and is owned by Hydra. Every memory write Hydra makes — episodic or semantic — can be tagged with one or more cells, and recall can filter by them.
+**Attended (the default for interactive sessions).** The host session drives the lifecycle in-context so the operator can follow along:
+
+1. `hydra.workflow.plan` runs intake and the planner and returns the plan without dispatching.
+2. `hydra.workflow.step` opens the next stage and returns a `host_action` naming the agent type to spawn.
+3. The host spawns exactly that agent (a squad lead, or `engineer` and then a judge for engineering) and passes the result back with `hydra.workflow.submit_host_result`.
+4. Steps 2 and 3 repeat until no stage is left; `hydra.workflow.finalize` then drives synthesis, the synthesis judge and postcheck, and returns the `DECISION_RECORD`.
+
+Attended engineering is single-stream and runs in an isolated git worktree outside the repository.
+
+**Detached.** `hydra.workflow.launch` starts `hydra run --live` headlessly. It is for automation and the cross-repo fleet, and the launch verb is gated by `HYDRA_ALLOW_DETACHED=1`. `/hydra:campaign "goal --repos a,b,c"` runs a parallel engineering fleet across two or more repos registered in `~/.hydra/repos.json`; the budget is split equally per repo and results merge in submission order into one `DECISION_RECORD`. Raw paths are rejected; only registered repo ids resolve.
+
+**Gates.** When the engine pauses (plan approval, synthesis or postcheck gate, budget at 100%, `constitution_breach`, unknown repo id), the workflow stays paused until `/hydra:approve` or `/hydra:resume`. Nothing else clears a gate.
+
+The per-workflow trace is written to `<project>/.hydra/<workflow_id>/trace.jsonl`.
+
+---
+
+## Governance
+
+- **`CONSTITUTION.md`, the immortal head.** Agents read it and never edit it. Its SHA-256 is checked by `hydra doctor` and at session start (`hydra_core/immortal_head.py`). A proposed edit surfaces as a HITL request with reason `constitution_breach`.
+- **HITL.** A paused workflow resumes only through `/hydra:approve` or `/hydra:resume` (`plugins/hydra/skills/hitl-protocol`).
+- **Budget.** `hydra_core/governance.py` downgrades the model tier at 80% of budget and blocks for HITL at 100%.
+- **Circuit breaker.** Three consecutive failures at a node trip it.
+- **Judging.** Engineering stages are judged inside the pair-programmer protocol (cross-vendor where the gate requires it). The graph has `judge_per_squad` and `judge_synthesis` nodes. Rubrics are versioned in `hydra_core/judge/registry.py`; a published `@N` body is never modified.
+- **Envelope validation and redaction.** `validate_envelope` is applied at squad boundaries, and PII, PHI and financial data are redacted by `governance.redact_for_squad_boundary` unless the receiving squad's `squad.yaml` allow-lists it. Cross-squad references use `MemoryRef` handles, not raw content.
+- **Venom-class capabilities.** Eleven are registered (for example `deploy.production`, `git.force_push`, `payment.charge`, `shell.destructive`); they pass through `governance.enforce_constitution` before execution. See [`docs/VENOM.md`](docs/VENOM.md).
+- **Tool RBAC.** `MCPStdioDispatcher` checks each MCP call against the calling squad's `squad.yaml` allow-list. This applies on the engine's dispatcher path only; see [Known gaps](#known-gaps).
+- **Routing guards.** The plugin's hooks block direct edits to engine source, shell write idioms that target engine source, and direct `/pp:*` invocation, so code is written by the pair-programmer harness inside a workflow.
+- **Trace.** `hydra_core/telemetry.py` writes a JSONL trace with OTEL-style spans per workflow. It is not an OpenTelemetry exporter.
+- **AgentSmith.** When its daemon is connected as a gateway backend, AgentSmith provides artifact inspection, audit and quarantine under its ten invariants (N1–N10, defined in [its README](https://github.com/lebobo88/AgentSmith)).
+
+---
+
+## Memory and TheEights
+
+**In-repo memory.** The `hydra_memory` MCP server (`mcp_servers/hydra_memory/`) is a Python shim over a local SQLite episodic log at `~/.hydra/episodic.db`. `hydra-mem.semantic_search` is a full-text `LIKE` search over stored payloads, kinds and keys. No vector database ships with Hydra: `hydra_core/memory.py` contains an in-memory cosine index as a fallback and a seam for plugging in a vector store.
+
+**The eight-cell vocabulary.** Memory writes can be tagged with one or more of eight cells, and recall can filter by them (`hydra_core/eights/`). The cells are a tag vocabulary over the store, not a storage partition.
 
 | ☰ Qian | ☷ Kun | ☳ Zhen | ☴ Xun | ☵ Kan | ☲ Li | ☶ Gen | ☱ Dui |
 |---|---|---|---|---|---|---|---|
 | Vision | Context | Triggers | Influence | Risk | Focus | Constraints | Delight |
 
-Constitutional ground truth lives in Qian; current attention in Li; guardrails in Gen; and so on. *Dui is first-class* — most agent systems forget what worked; Hydra remembers victories so future routing is hope-shaped, not just risk-shaped. The cells are a **tag/facet vocabulary** over the underlying stores, not a hard storage partition — per the Stage-3 locked decision in [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md).
+**TheEights, the sibling daemon.** [TheEights](https://github.com/lebobo88/TheEights) is a separate project and is not installed by Hydra. When it is connected as the `eights` gateway backend:
 
-#### Part 2 — The memory substrate (in-repo default; TheEights optional)
+- `hydra-mem.semantic_search` can add TheEights hybrid-search hits to the local results (opt-in via `HYDRA_MEM_FEDERATE_EIGHTS`); if the daemon is unreachable the local result is returned and flagged as degraded.
+- Hydra records envelopes and HITL requests to it. Calls that cannot be delivered are spooled and retried with `hydra eights-drain`.
 
-The default memory backend is the in-repo `hydra-memory` MCP server (`mcp_servers/hydra_memory/`): a Python shim over a local SQLite episodic log (`~/.hydra/episodic.db`). `hydra-mem.semantic_search` runs an honest full-text search (LIKE across stored payloads, kinds, and keys) over that log. A vector/embedding layer (Chroma-pluggable) and TheEights federation are optional add-ons on top — the default install is pure SQLite, single-machine, single-project, with zero external dependencies.
-
-#### Part 3 — TheEights, the separate sibling project
-
-[**TheEights**](https://github.com/lebobo88/TheEights) is a separate Node.js daemon + MCP server. It is **not** part of the Hydra repo and **not** installed automatically. Per its own README, it provides:
-
-- **Hybrid memory** — vectors (sqlite-vec), graph (LadybugDB / Kuzu), episodic SQL — behind one MCP surface
-- **Governance plane** — SSGM consistency/decay/access gates, LASM defense-in-depth, boundary redaction
-- **Gated self-evolution** — Autogenesis RSPL/SEPL: every prompt, team, rubric, workflow is versioned; low-risk changes auto-commit, the rest queue for HITL
-- **Auditable** — append-only event log + CycloneDX ML-BOM v1.7 export of every read, write, and mutation
-
-It is **not** an orchestrator, **not** an agent framework. It is the substrate orchestrators like Hydra plug into.
-
-#### How Hydra works *without* TheEights (default)
-
-Hydra is fully functional without TheEights installed:
-
-- The in-repo `hydra-memory` MCP server provides episodic + semantic memory. Workflows write and read normally.
-- The eight-cell vocabulary (Hydra-owned) tags every write.
-- `validate_envelope`, the constitution hash gate, HITL gates, budget tripwires, and the AgentSmith governance plane all function exactly as documented.
-- Cost: zero. Latency: local SQLite + local Chroma.
-- **Limits:** memory is local to one machine and (effectively) one project. There is no cross-project hybrid graph, no governed self-evolution loop, no audit-graph export beyond the per-workflow JSONL trace. The in-repo episodic store is append-only; the in-repo vector store has no versioning.
-
-#### How Hydra works *with* TheEights (optional)
-
-TheEights is complete and ready to integrate. To enable the federation layer:
-
-1. Install TheEights ([github.com/lebobo88/TheEights](https://github.com/lebobo88/TheEights)) — `cd TheEights/daemon && npm install && npm run build`.
-2. Register the daemon as the `theeights` MCP server (`claude mcp add theeights …`).
-3. Hydra's `hydra-memory` MCP server detects the TheEights daemon at startup and switches mode: writes go to the local stores *and* federate into TheEights' hybrid memory; reads can query the federated graph (cross-project recall, audit lineage, evolution proposals).
-4. The autogenesis loop becomes available: low-risk rubric/team/workflow updates auto-commit; the rest queue for HITL via TheEights' governance plane — gated by AgentSmith invariants N3 (no bypassing TheEights HITL) and N4 (no push without `evolution.commit` verdict).
-
-In other words: **TheEights is the production-grade upgrade path for Hydra's memory and self-evolution layer.** Hydra does not require it to run, but is designed to compose with it when it is present.
-
-For the canonical roadmap, see [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md) (Hydra side) and TheEights' own [`ROADMAP.md`](https://github.com/lebobo88/TheEights/blob/main/ROADMAP.md).
+Hydra runs without TheEights; memory is then local to one machine.
 
 ---
 
 ## MCP topology
 
-Hydra ships five in-repo MCP servers under `mcp_servers/`:
+In-repo MCP servers under `mcp_servers/`:
 
-| Server | Location | Purpose |
-|---|---|---|
-| `hydra_memory` | `mcp_servers/hydra_memory/` | Episodic SQLite + semantic Chroma + eight-cell tagging (`write_episodic`, `semantic_search`, `query_eights`, `tag_memory`, …). Federates with [TheEights](https://github.com/lebobo88/TheEights) when the daemon is registered. |
-| `executive_suite` | `mcp_servers/executive_suite/` | Thin MCP over the [ExecutiveSuite](https://github.com/lebobo88/ExecutiveSuite) pack (roster, skills, commands, output persistence) |
-| `rlm_creative` | `mcp_servers/rlm_creative/` | Thin MCP over [RLM-Creative](https://github.com/lebobo88/RLM-Creative) (skills, commands, agents, output persistence) |
-| `hydra_toolshed` | `mcp_servers/hydra_toolshed/` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
-| `hydra_gateway` | `mcp_servers/hydra_gateway/` | Unified proxy — consolidates all backend servers behind a single MCP registration (see [§ Gateway consolidation](#gateway-consolidation)) |
+| Server | Purpose |
+|---|---|
+| `hydra_gateway` | The single MCP registration. Proxies to the backends listed in `~/.hydra/backends.json`. |
+| `hydra_control` | Workflow verbs: `hydra.workflow.plan`, `step`, `submit_host_result`, `finalize`, `launch`, `resume`, `submit_envelopes`, `budget`; plus `hydra.squad.list`, `hydra.repo.list`, `hydra.repo.resolve`, `hydra.telemetry.tail`, `hydra.envelope.record`, `hydra.venom.cross_check`, `hydra.cockpit.audit`, `hydra.worktree.sweep_status`, `hydra.control.ping`. |
+| `hydra_memory` | `hydra-mem.*`: episodic read and write, `semantic_search`, `query_eights`, `tag_memory`, workflow listing and status. |
+| `hydra_toolshed` | Search, describe and execute meta-tools over large tool catalogs. |
+| `executive_suite`, `senate`, `marketbliss`, `rlm_creative`, `rlm_gaming`, `xenia` | Thin read-and-persist shims over each squad pack (agents or roster, skills, commands, output read and write). |
+| `xenia_kb`, `xenia_tickets` | Customer-support knowledge base and ticket operations. |
 
-Plus **externally registered servers** from sibling projects (operator must install):
+`scripts/backends.template.json` defines **16 gateway backends**: the in-repo servers `hydra_control`, `hydra_memory`, `executive_suite`, `senate`, `marketbliss`, `rlm_creative`, `rlm_gaming`, `xenia`, `xenia_kb`, `xenia_tickets`, and the external ones `pp_harness`, `pp_codex`, `pp_agy` (pair-programmer), `agentsmith`, `eights`, and `blender`. External backends work only when the operator has installed that project.
 
-| Server | Source | Purpose |
-|---|---|---|
-| `pp_harness` | [pair-programmer](https://github.com/lebobo88/pair-programmer) | Engineering harness daemon (~42 tools) |
-| `pp_codex` | pair-programmer | Cross-vendor judge plane — Codex critiques |
-| `pp_agy` | pair-programmer | Cross-vendor judge plane — Antigravity (agy) critiques |
-| `agentsmith` | [AgentSmith](https://github.com/lebobo88/AgentSmith) | Meta-governance — N1–N10 invariants |
-| `eights` | [TheEights](https://github.com/lebobo88/TheEights) | Cross-project hybrid memory + audit graph + autogenesis loop |
-
-### Gateway consolidation
-
-In **gateway mode**, all 8 servers are consolidated behind a single `hydra_gateway` MCP registration. Claude Code sees one server; the gateway proxies to backends discovered from `~/.hydra/backends.json`. Each connected system still works independently without Hydra — you pick and choose which to install.
-
-```bash
-# Migrate from 8 servers to 1 gateway:
-python -m hydra_core.cli gateway-backup
-python -m hydra_core.cli gateway-export-backends
-python -m hydra_core.cli gateway-migrate-hooks
-# Then register hydra_gateway via /mcp and remove old entries
-```
-
-See [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md) for full setup and migration instructions.
-
-Tool names are namespaced. The dispatcher enforces RBAC: a squad requesting an out-of-scope tool gets a typed refusal envelope, not a silent failure. **Blast radius equals namespace.**
-
-For the public per-crown surface, see [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CROWN.md).
+In gateway mode, tool names are `mcp__hydra_gateway__<server>__<tool>`. Each connected system can also be registered directly, without the gateway. Setup, migration and rollback are in [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md); the per-squad tool surface is in [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CROWN.md).
 
 ---
 
 ## Prerequisites
 
 - **Python 3.11+**
-- **Node.js 20+** (Claude Code CLI runtime)
-- **Claude Code CLI** installed and authenticated
-- Optional: `langgraph` (`pip install langgraph`) — without it, Hydra falls back to a pure-Python supervisor runner with the same state contract
-- Optional: `chromadb` for the semantic memory tier (default vector store)
+- **Claude Code** installed and authenticated
+- Runtime dependencies are `pydantic` and `PyYAML`. Optional extras: `langgraph` (LangGraph plus the SQLite checkpointer; needed for attended execution and replay), `mcp` (the MCP servers), `dev` (`pytest`, `pytest-asyncio`, `ruff`).
+- Each sibling project you want as a squad or backend, installed per its own README.
 
 ---
 
 ## Install
-
-Hydra ships as a Claude Code plugin distributed via a local marketplace that lives in the repo itself (`.claude-plugin/marketplace.json`). Installation is two steps: install the Python runtime, then register the plugin with Claude Code so its slash commands, agents, skills, and hooks are available in any project session. The MCP gateway remains a separate machine-local registration, as documented in [MCP setup](docs/MCP_SETUP.md).
 
 ### 1. Clone and install the Python runtime
 
@@ -384,19 +231,23 @@ Hydra ships as a Claude Code plugin distributed via a local marketplace that liv
 git clone https://github.com/lebobo88/Hydra.git
 cd Hydra
 
-# Windows (PowerShell):
+# Windows (PowerShell): installs with the langgraph extra, then runs doctor
 .\scripts\install.ps1
 
 # macOS / Linux:
-pip install -e .
+pip install -e ".[langgraph,mcp]"
 python -m hydra_core.cli doctor
 ```
 
-This pip-installs `hydra-core` in editable mode and runs `python -m hydra_core.cli doctor` to confirm squads are discovered and the constitution loads cleanly.
+`doctor` confirms the constitution loads and lists the discovered squads.
 
-### 2. Register the plugin with Claude Code (user scope)
+### 2. Resolve sibling repos and generate backends
 
-Inside any Claude Code session, from the repo directory:
+`scripts/setup.ps1` (Windows) and `scripts/setup.sh` (POSIX) locate the sibling checkouts through the `AIAPP_BASE` convention, regenerate the `marketing-*` symlinks, and write `~/.hydra/backends.json` from `scripts/backends.template.json`. See [`docs/PORTABILITY.md`](docs/PORTABILITY.md).
+
+### 3. Register the plugin with Claude Code
+
+The repo is its own local marketplace (`.claude-plugin/marketplace.json`, plugin source `plugins/hydra`). From the repo directory, inside Claude Code:
 
 ```
 /plugin marketplace add .
@@ -404,98 +255,100 @@ Inside any Claude Code session, from the repo directory:
 /reload-plugins
 ```
 
-This registers the local marketplace, copies the plugin into `~/.claude/plugins/cache/hydra-local/hydra/<version>/`, and enables it in `~/.claude/settings.json`. Slash commands are now available in every Claude Code session, not just sessions opened from the Hydra repo.
+The plugin sets `hydra:hydra` as the session's main agent (`plugins/hydra/settings.json`).
 
-### Activation contexts
+### 4. Register the gateway
 
-Use the installed Hydra plugin in **consumer projects**. When working inside the
-Hydra repository itself, use its checked-in project configuration (`CLAUDE.md`,
-`.claude/rules/`, and `.claude/settings.json`) as the native host surface;
-avoid also enabling the installed Hydra plugin in that same source-repository
-session. Both contexts intentionally carry the same fail-closed routing guards,
-so loading both would duplicate lifecycle notifications without adding
-authority. This does not affect AgentSmith, TheEights, or any squad pack: they
-remain connected through Hydra's declared gateway and typed-envelope contract.
+The MCP gateway is a separate, machine-local registration and is not shipped by the plugin. Follow [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md).
 
-Verify:
+### Verify
 
 ```
-/mcp                   # in gateway mode: expect hydra_gateway connected; standalone: expect individual servers
-/hydra:squads          # expect 14 squads (11 active: 3 crowns + Arcade Crown + Curia + Xenia Hearth + 5 marketing; 3 stubs)
-/doctor                # expect 0 plugin errors
+/mcp              # expect hydra_gateway connected
+/hydra:squads     # expect 15 squads: 12 active, 3 stubs
 ```
 
-### Updating after edits
+### Updating the plugin
 
-After bumping the `version` field in `.claude-plugin/plugin.json`:
+Claude Code does not reinstall a plugin whose `version` is unchanged. After editing files under `plugins/hydra/`, bump `version` in `plugins/hydra/.claude-plugin/plugin.json`, then:
 
 ```
 /plugin marketplace update hydra-local
-/plugin install hydra@hydra-local       # or /plugin update hydra@hydra-local
+/plugin install hydra@hydra-local
 /reload-plugins
 ```
 
-For active plugin development with live edits, launch Claude Code with
-`--plugin-dir` from a consumer test project (rather than the Hydra source
-repository, whose project hooks are already active):
+For live plugin development, start Claude Code with `claude --plugin-dir ./plugins/hydra`.
 
-```bash
-claude --plugin-dir .
-```
+### Activation contexts
+
+Use the installed Hydra plugin in **consumer projects**. Inside the Hydra repository itself, the checked-in project configuration (`CLAUDE.md`, `.claude/rules/`, `.claude/settings.json`) is the host surface; avoid also enabling the installed plugin in that same session. Both carry the same fail-closed routing guards, so loading both duplicates lifecycle notifications without adding authority.
+
+The checked-in `.claude/settings.json` sets `HYDRA_ENFORCE_ROUTING=1` and `HYDRA_DISABLE_CLAUDE_ENGINEER=1`. With routing enforced, the plugin hooks block direct writes to engine source; changes go through `/hydra:run`. The contract for agents working here is `AGENTS.md`, `CLAUDE.md` and `.claude/rules/`.
 
 ---
 
 ## Slash commands
 
-Available in any Claude Code session once the plugin is registered:
-
 | Command | Purpose |
 |---|---|
-| `/hydra:run "<goal>"` | Start a new workflow. Routes through intake → planner → approval → dispatch → judge_per_squad → synthesis → judge_synthesis → postcheck. |
-| `/hydra:drive "<goal>"` | Attended host-bridged execution — drive the lifecycle in-context with visible engineer/judge subagents (the Python engine stays authoritative). |
-| `/hydra:status [<workflow_id>]` | List recent workflows or dump the trace for one. |
-| `/hydra:squads` | Show the discovered squad registry (slugs, entrypoints, accepts/emits, industries). |
-| `/hydra:approve <workflow_id>` | Resume a workflow paused at the HITL approval gate. |
-| `/hydra:resume <workflow_id>` | Resume from the last checkpoint (e.g. after a crash). |
-| `/hydra:budget [<workflow_id>]` | Show the budget ledger — USD spent, tokens, per-squad share, downgrade events. |
-| `/hydra:campaign <name>` | Open or attach a long-running multi-workflow campaign (shared episodic memory). |
-| `/hydra:replay <workflow_id>` | Reconstruct prompts, model versions, and artifact hashes for deterministic replay. |
-| `/hydra:add-squad <slug>` | Scaffold a new `squads/<slug>/squad.yaml` from the stub template. |
+| `/hydra:run "<goal>"` | Primary entry point. Routes the goal to one or more squads and drives the attended lifecycle. |
+| `/hydra:drive "<goal>"` | The same attended lifecycle, stated explicitly: visible engineer and judge subagents, engine authoritative. |
+| `/hydra:campaign "<goal>"` | Multi-squad campaign with dependency wiring. `--repos id,id,...` launches the cross-repo engineering fleet. Also accepts `--launch-date` and `--budget`. |
+| `/hydra:status [<workflow_id>]` | List workflows, or show one workflow's state. |
+| `/hydra:squads` | Show the discovered squad registry. |
+| `/hydra:approve <workflow_id>` | Approve a workflow paused at a HITL gate. |
+| `/hydra:resume <workflow_id>` | Resume a paused workflow with a non-approval action: `--reject`, `--modify-budget <usd>`, `--force-dispatch`, `--squads <a,b>`. |
+| `/hydra:budget [<workflow_id>]` | Show or set the budget ledger. |
+| `/hydra:replay <workflow_id>` | Replay a workflow from a checkpoint. |
+| `/hydra:add-squad <slug>` | Scaffold a new `squads/<slug>/squad.yaml`. |
 
-Headless CLI mirrors a subset:
-
-```bash
-python -m hydra_core.cli run "Refactor billing service auth" --squad engineering
-python -m hydra_core.cli status
-python -m hydra_core.cli trace 7f3c…
-python -m hydra_core.cli doctor
-python -m hydra_core.cli eights-drain   # drain the pending eights spool (--limit N, default 500)
-python -m hydra_core.cli eights-hitl-reconcile          # dry-run: pending HITL rows vs workflow state
-python -m hydra_core.cli eights-hitl-reconcile --apply  # resolve rows whose workflow is terminal/unknown
-```
-
-`doctor` surfaces four additional probes beyond the basic squad/constitution checks:
-- **eights spool depth** — warns when the pending spool exceeds `HYDRA_EIGHTS_SPOOL_WARN` (default 100); suggests `hydra eights-drain` when over threshold.
-- **eights HITL backlog** — warns when pending `hydra_gate` requests in TheEights exceed `HYDRA_HITL_PENDING_THRESHOLD` (default 25); suggests `hydra eights-hitl-reconcile`. Distinct from the spool line: the spool counts undelivered calls, this counts gates the shared ledger still holds open.
-- **AgentSmith venom back-channel** — probes `agentsmith.venom.cross_check` and surfaces the smith→hydra back-channel state (rationale field); `hydra-mcp-unavailable` means the gateway is not wired into backends.json.
-- **WS-AUTH operator key** — checks whether `HYDRA_OPERATOR_KEY` is provisioned (env or any backend spec's `env` block in `~/.hydra/backends.json`); unprovisioned means `xenia send_response` / `execute_approved` reject all tokens fail-closed.
+The plugin also ships reference skills that are not entry points: `plan`, `hitl-protocol`, `cross-squad-message`, `memory-handles`, `squad-registry-discovery`, `budget-control`, `workflow-recovery`, `claude-native-review`, `evidence-citation-review`, `legal-summary-intake`.
 
 ---
 
-## End-to-end example
+## CLI
 
-> *"Launch a Q3 campaign for the new billing microservice — needs a press kit, in-app announcement, and pricing-page update."*
+`pip install -e .` provides the `hydra` command (equivalent to `python -m hydra_core.cli`). `--project` sets the project root; it defaults to the current directory.
 
-1. `/hydra:run "..."` invokes intake. The router (`hydra_core/router.py`) keyword-matches `campaign`, `press kit`, `pricing`, `microservice` and selects `executive` + `engineering` + `garland`.
-2. The planner emits a `CSuiteDecisionPacket`. ExecutiveSuite's `boardroom` pattern (CEO + CFO + CMO impersonation) produces a `DecisionRecord` with a per-squad budget split.
-3. The approval gate triggers an HITL interrupt. The user runs `/hydra:approve <workflow_id>` after reviewing the budget.
-4. The dispatcher fans out in parallel:
-   - `garland` receives a `CreativeBrief`, invokes RLM skills (`/creative-campaign`, `/photo-direction`) — emits `AssetJob` results.
-   - `engineering` receives a `PRD`, invokes pair-programmer (`/pp:team feature-team`) — emits a PR URL plus smoke-test pass.
-   - `executive/cfo` parks a dependency to re-validate pricing once both squads finish.
-5. The synthesizer consolidates into a `DecisionRecord v2` with a go-live runbook, appends to episodic memory, tags the entry with the appropriate trigram cells (Li for hot path, Dui for brand delight, Zhen for the campaign launch trigger), and patches `PROJECT_MASTER.md`.
+| Group | Subcommands |
+|---|---|
+| Health and registry | `doctor`, `verify`, `squads` |
+| Workflow | `run`, `status`, `trace`, `approve`, `resume`, `replay`, `budget`, `ingest` |
+| Attended lifecycle | `plan`, `step`, `submit-host-result`, `finalize` |
+| Maintenance | `reap`, `sweep-worktrees` |
+| TheEights | `eights-drain`, `eights-hitl-reconcile` |
+| Gateway | `gateway-setup`, `gateway-backup`, `gateway-export-backends`, `gateway-migrate-hooks`, `gateway-remove-old-backends`, `gateway-rollback` |
+| Memory and repos | `memory`, `repo` (administers `~/.hydra/repos.json`) |
 
-The full trace lives at `<project>/.hydra/<workflow_id>/trace.jsonl` and is replayable via `/hydra:replay`. Every Smith decision in the run is sealed into the archivist ledger; the constitution hash is attested at the start and end.
+```bash
+hydra doctor
+hydra squads
+hydra status
+hydra eights-drain                 # drain the pending eights spool in a bounded batch
+hydra eights-hitl-reconcile        # dry run; add --apply to resolve stale rows
+hydra sweep-worktrees              # dry run by default; never deletes a branch
+```
+
+Besides the constitution and squad checks, `doctor` reports the episodic database, the venom registry, the eights spool depth (warns above `HYDRA_EIGHTS_SPOOL_WARN`, default 100), the eights dead-letter depth, and the pending HITL backlog in TheEights (warns above `HYDRA_HITL_PENDING_THRESHOLD`, default 25).
+
+The MCP verbs `plan`, `step`, `submit_host_result`, `finalize` and `budget` run this same CLI, so both surfaces share one code path. There is no CLI route to arbitrary gateway tools yet.
+
+---
+
+## Known gaps
+
+These are verified against the code and tracked in the [unified orchestration plan](docs/plans/hydra-unified-orchestration.html) (epic [#78](https://github.com/lebobo88/Hydra/issues/78)).
+
+- **Four engine paths apply different controls**: the attended cursor, detached `run --live`, detached `ingest --live` behind `submit_envelopes`, and the web cockpit launch. The detached gate is checked on the `launch` verb only ([#101](https://github.com/lebobo88/Hydra/issues/101)); detached runs force trivial plan rigor ([#102](https://github.com/lebobo88/Hydra/issues/102)); attended finalize skips the per-squad judge ([#103](https://github.com/lebobo88/Hydra/issues/103)).
+- **Only squad leads are dispatchable.** Other heads have no plugin-agent mapping ([#80](https://github.com/lebobo88/Hydra/issues/80), [#89](https://github.com/lebobo88/Hydra/issues/89)).
+- **The attended squad path lacks controls the in-graph path has**: per-squad RBAC, redaction of the outbound prompt, the tool-scope directive and a pre-dispatch budget check; subagent cost is self-reported ([#85](https://github.com/lebobo88/Hydra/issues/85), [#86](https://github.com/lebobo88/Hydra/issues/86)).
+- **The gateway enforces no RBAC or venom gate and emits no telemetry**, and its fallback route proxies tools that are not in its catalog. RBAC fails open when the calling squad is unknown ([#84](https://github.com/lebobo88/Hydra/issues/84), [#94](https://github.com/lebobo88/Hydra/issues/94), [#95](https://github.com/lebobo88/Hydra/issues/95)).
+- **Seven in-repo tools are not advertised by the gateway catalog**, and several plugin hook matchers use outdated tool names and never fire ([#81](https://github.com/lebobo88/Hydra/issues/81), [#82](https://github.com/lebobo88/Hydra/issues/82)).
+- **Engineering emitted by a squad pack runs headless**, not through the visible engineer and judge ([#87](https://github.com/lebobo88/Hydra/issues/87)).
+- **Eight plugin agents are never spawned** (`hydra-supervisor`, `hydra-router`, `hydra-planner`, `hydra-synthesizer`, `hydra-hitl-gate`, `hydra-cfo-gate`, `plan-critic`, `plan-scribe`); the engine does their work in Python. The two plan agents are generated from `covenant/plan-*.cov`, and the flow in `covenant/plan.cov` that would run them is not called by the engine (`docs/covenant-pilot.md`) ([#93](https://github.com/lebobo88/Hydra/issues/93)).
+- **Packaging is manual.** The gateway is hand-registered, and Xenia, pair-programmer, AgentSmith and TheEights have no plugin manifest ([#105](https://github.com/lebobo88/Hydra/issues/105)).
+- **Some documents lag the code**, including the squad table in `AGENTS.md` ([#106](https://github.com/lebobo88/Hydra/issues/106)).
 
 ---
 
@@ -503,81 +356,73 @@ The full trace lives at `<project>/.hydra/<workflow_id>/trace.jsonl` and is repl
 
 ```
 Hydra/
-├── README.md                         ← you are here
-├── CONSTITUTION.md                   ← the immortal head (SHA-256 pinned per session)
-├── HYDRA.md                          ← top-level architecture spec
-├── ARCHITECTURE.md                   ← engineering deep-dive (state machine, schemas, memory tiers, failure modes)
-├── AGENTS.md                         ← cross-tool behavioral contract (imported by CLAUDE.md)
-├── CLAUDE.md                         ← Claude-Code-specific import shim — @AGENTS.md
-├── CONTRIBUTING-SQUADS.md            ← how to scaffold and activate a new squad
+├── README.md
+├── CONSTITUTION.md              the immortal head (read-only for agents)
+├── AGENTS.md                    cross-tool behavioral contract
+├── CLAUDE.md                    Claude Code contract; imports AGENTS.md
+├── HYDRA.md                     top-level architecture spec
+├── ARCHITECTURE.md              engineering design
+├── CONTRIBUTING-SQUADS.md       how to add a squad pack
 ├── CHANGELOG.md
-├── HYDRA — A Manifesto for a Many-Headed, One-Souled Intelligence.md
-├── Enterprise Master AI Orchestration System Architecture.md   ← upstream research
-├── docs/
-│   ├── MANIFESTO.md                  ← Pentecost-not-Legion frame, Three Crowns lore, TheEights vocabulary
-│   ├── ROADMAP-MANIFESTO.md          ← six-stage ingestion roadmap
-│   ├── MCP-PER-CROWN.md              ← public per-crown MCP surface
-│   ├── BRAND.md / PRICING.md / LAUNCH-CHECKLIST.md / TRADEMARK-CLEARANCE.md / VENOM.md
-│   └── constellation/               ← the Hydra Constellation presentation bundle
-│       ├── HYDRA-CONSTELLATION.md    ← canonical Mermaid-in-markdown deck
-│       ├── HYDRA-CONSTELLATION.html  ← double-click viewer (Mermaid rendered)
-│       ├── deck.html                 ← 24-slide reveal.js cinematic deck
-│       ├── constellation.svg         ← the poster (Pentecost flower + lemniscate + constellation overlay)
-│       ├── exec-memos/               ← CSO / CTO / CAIO memos (Act III voice)
-│       ├── garland/                  ← Garland-crown cinematic treatment
-│       └── assets/diagrams/          ← Mermaid sources D2–D9
-├── hydra_core/                       ← Python: supervisor, router, planner, dispatcher, synthesizer, governance, memory, judge
-├── mcp_servers/                      ← Python MCP servers (hydra_memory, executive_suite, rlm_creative, hydra_toolshed, hydra_gateway)
-├── squads/<slug>/squad.yaml          ← squad declarations (active + stub)
-├── scripts/install.ps1               ← Python runtime installer
-├── scripts/hydra.ps1                 ← convenience wrapper around `python -m hydra_core.cli`
-├── .claude-plugin/                   ← Claude Code plugin manifest + hooks
-│   ├── plugin.json                   ← metadata + Claude Code component paths
-│   ├── marketplace.json              ← local marketplace metadata
-│   └── hooks.json                    ← SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop
-├── templates/                        ← squad / agent / hook templates
-└── tests/                            ← pytest suite
+├── mesh-manifest.yaml           AgentMesh enrollment for hydra_memory
+├── pyproject.toml               package hydra-core; console script `hydra`
+├── .claude-plugin/marketplace.json   local marketplace "hydra-local"
+├── .claude/                     project settings and rules
+├── plugins/hydra/               the Claude Code plugin
+│   ├── .claude-plugin/plugin.json
+│   ├── settings.json            sets the main agent to hydra:hydra
+│   ├── agents/                  hydra, hydra-plaza, engineer, judges, and unused persona agents
+│   ├── .claude/agents/          plan-author, plan-critic, plan-scribe (generated; do not edit)
+│   ├── skills/                  slash commands and reference skills
+│   └── hooks/                   hooks.json and the routing-guard scripts
+├── covenant/                    Covenant sources (plan-*.cov, plan.cov) and the vendored cov CLI that builds the plan agents
+├── hydra_core/                  supervisor, router, dispatcher, host bridge, governance, memory, judge, CLI
+├── mcp_servers/                 gateway, control, memory, toolshed, and squad-pack shims
+├── squads/<slug>/squad.yaml     squad declarations (plus heads.yaml overlays)
+├── scripts/                     install.ps1, setup.ps1, setup.sh, hydra.ps1, backends.template.json
+├── templates/squad.yaml.tpl     squad scaffold template
+├── web/                         Hydra Cockpit, a standalone operator UI
+├── tests/                       pytest suite (hermetic; no daemons, network or LLM calls)
+└── docs/
+    ├── MCP_SETUP.md, MCP-PER-CROWN.md, PORTABILITY.md, VENOM.md, BRAND.md
+    ├── MANIFESTO.md, ROADMAP-MANIFESTO.md
+    ├── covenant-pilot.md        what the Covenant pilot generates and what the engine does not use
+    ├── audits/                  audit ledgers
+    ├── plans/                   plans, including hydra-unified-orchestration.html
+    └── constellation/           presentation bundle
 ```
 
 ---
 
 ## What Hydra is not
 
-- **Not a code generator.** Hydra delegates code work to the Forge crown ([pair-programmer](https://github.com/lebobo88/pair-programmer)).
-- **Not a model gateway.** Per-task model choice is the squad's decision (e.g. Forge's tier-aware router; the cross-vendor judge plane via `pp-codex` and `pp-gemini`).
-- **Not a vendor lock-in.** Any squad can swap its LLM provider behind its MCP server without Hydra noticing.
-- **Not a competitor to TheEights, ExecutiveSuite, pair-programmer, RLM-Creative, MarketBliss, or AgentSmith.** Hydra *uses* them. They remain independently shippable.
-
-It is a routing layer with strong typing, checkpointed state, human-in-the-loop interrupts, a budget ledger, and a constitutional governance anchor. Nothing more — but, by the discipline of "Pentecost, not Legion," nothing less.
+- **Not a code generator.** Code is written by the pair-programmer harness, dispatched through the engineering squad.
+- **Not a model gateway.** Model choice belongs to the squad.
+- **Not a replacement for the sibling projects.** Hydra uses them; each remains independently shippable.
 
 ---
 
 ## Where to learn more
 
-| Document | What's in it |
+| Document | What is in it |
 |---|---|
-| [`HYDRA.md`](HYDRA.md) | Top-level architecture spec — squads, state graph, schemas, MCP host, memory, governance, CLI surface, non-goals. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Engineering deep-dive — runtime layers, LangGraph phases, state machine, memory tiers, MCP topology, governance plane, failure modes. |
 | [`CONSTITUTION.md`](CONSTITUTION.md) | The immortal head. Read this first. |
-| [`docs/MANIFESTO.md`](docs/MANIFESTO.md) | The Hydra Manifesto — Pentecost-not-Legion, the Hydra myth inverted, the Three Crowns, TheEights vocabulary, the sigil design. |
-| [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md) | Six-stage ingestion roadmap (all stages complete). |
-| [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CROWN.md) | Public-facing MCP server inventory and tool naming per crown. |
+| [`AGENTS.md`](AGENTS.md) | The behavioral contract for any AI agent working in this repo. |
+| [`HYDRA.md`](HYDRA.md) | Top-level architecture spec. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Engineering design, including the cross-repo fleet. |
+| [`docs/plans/hydra-unified-orchestration.html`](docs/plans/hydra-unified-orchestration.html) | The approved plan for one orchestrator and one engine policy, with diagrams and workstreams. |
+| [`docs/MCP_SETUP.md`](docs/MCP_SETUP.md) | Gateway setup, migration and rollback. |
+| [`docs/MCP-PER-CROWN.md`](docs/MCP-PER-CROWN.md) | MCP tool surface per squad. |
+| [`docs/PORTABILITY.md`](docs/PORTABILITY.md) | The `AIAPP_BASE` convention for locating sibling repos. |
 | [`docs/VENOM.md`](docs/VENOM.md) | The venom-class capability registry and refusal protocol. |
-| [`docs/constellation/`](docs/constellation/) | The layered presentation — markdown deck, HTML viewer, reveal.js cinematic deck, SVG poster, executive memos, Garland creative treatment. |
+| [`docs/MANIFESTO.md`](docs/MANIFESTO.md) | The Hydra Manifesto. |
+| [`docs/ROADMAP-MANIFESTO.md`](docs/ROADMAP-MANIFESTO.md) | Six-stage roadmap: stages 1 to 5 shipped; stage 6 documents shipped, public launch still gated. |
+| [`docs/audits/`](docs/audits/) | Audit ledgers (route audit, micro-usage audit, end-to-end trace, routing audit). |
 | [`CONTRIBUTING-SQUADS.md`](CONTRIBUTING-SQUADS.md) | How to scaffold and activate a new squad pack. |
-| [TheEights](https://github.com/lebobo88/TheEights) (sibling repo) | Persistent hybrid memory + governance + autogenesis daemon. Optional. The substrate Hydra federates with when present. Complete and ready to integrate. |
-| [AgentSmith](https://github.com/lebobo88/AgentSmith) (sibling repo) | Meta-governance daemon — Factory / Inspector / Sentinel / Archivist. Enforces N1–N10 invariants. Registered separately as the `agentsmith` MCP server. |
-| [`Enterprise Master AI Orchestration System Architecture.md`](Enterprise%20Master%20AI%20Orchestration%20System%20Architecture.md) | The upstream research doc Hydra implements. |
-| `squads/<slug>/squad.yaml` | Canonical declaration of every active or stub squad. |
-| `hydra_core/` | Supervisor, router, governance plane, memory fabric — in Python. |
+| [`docs/constellation/`](docs/constellation/) | Presentation bundle: deck, poster, executive memos. |
 
-### Verification
-
-Route-audit findings and fixes from the 2026-07-05 cohort are recorded in:
-
-- [`docs/audits/ROUTE-AUDIT-2026-07-05.md`](docs/audits/ROUTE-AUDIT-2026-07-05.md) — route-audit ledger (RA-1 through RA-11 findings, fixes, and smoke results; untracked in the worktree, present in the main checkout)
-- [`docs/audits/MU-MICRO-USAGE-2026-07-05.md`](docs/audits/MU-MICRO-USAGE-2026-07-05.md) — MU micro-usage audit ledger (MU1–MU15, all resolved)
+Some of these documents predate the current code and may lag it; where one disagrees with this README or with the code, the code is authoritative. Bringing them up to date is tracked in [#106](https://github.com/lebobo88/Hydra/issues/106).
 
 ---
 
-*Filed under the covenant. SHA-256 attested. Pentecost, not Legion.*
+*Filed under the covenant. Pentecost, not Legion.*

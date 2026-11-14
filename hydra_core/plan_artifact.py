@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,80 @@ __all__ = [
     "render_plan_html",
     "render_plan_json",
 ]
+
+#: Monkeypatchable-by-env override for the "no resolved target repo" default
+#: root every `plan_artifact_repo_root` caller falls back to. In production
+#: that default legitimately IS the Hydra checkout (a workflow with no
+#: engineering target still needs somewhere to put its plan), so it is
+#: derived from each caller's own dispatcher.project_root / project_root --
+#: but a wide swath of the test suite hardcodes the checkout root it happens
+#: to run from as that same value, which meant a PLAN write with no target
+#: repo landed a real .html file under the OPERATOR's real checkout's
+#: tracked docs/plans/. Resolving the override HERE -- the one place every
+#: caller's default_root argument passes through -- covers every existing
+#: and future call site without patching each test's fixtures individually.
+#:
+#: The override is gated by BOTH this env var AND a SECOND env var naming
+#: the test sandbox's own root (`tests/conftest.py`'s `.tmp-pytest`):
+#: the default-root var alone is NOT enough to redirect a production write
+#: -- a single leaked/forged env var must not be able to retarget where a
+#: real PLAN artifact lands. Only when BOTH vars are set does a
+#: `default_root` that resolves OUTSIDE the named sandbox (i.e. a real,
+#: persistent checkout path such as `Path(__file__).resolve().parents[1]`)
+#: get redirected to the override. A `default_root` that already resolves
+#: INSIDE that sandbox is left untouched (many tests deliberately pass a
+#: specific tmp_path subdirectory and assert the resolver returns exactly
+#: that path -- overriding it unconditionally would break those
+#: legitimate, already-isolated cases). A caller missing either env var
+#: (including production, where neither is set) is unaffected.
+#:
+#: This same scoping is ALSO applied to a write root resolved via
+#: `repo_registry.resolve_repo_path(target_repo_id)` (branch 3b of
+#: `plan_artifact_repo_root`, below) -- not just to the "no target repo"
+#: `default_root` fallback. Root cause (found by a coordinator host
+#: review): a test that sets `target_repo_id` to a BUILTIN repo id (e.g.
+#: "hydra") -- the common case for any test exercising `hydra plan --repo
+#: hydra` or a DEV_TASK step with `target_repo_id: "hydra"` -- resolves
+#: through `repo_registry.resolve_repo_path`, which is a COMPLETELY
+#: DIFFERENT function from `repo_registry.resolve_repo_project_path` (the
+#: one several tests monkeypatch, believing that covers every repo-root
+#: resolution). `resolve_repo_path` ignores `HYDRA_REPO_BASE`-independent
+#: test redirects entirely and, absent an `HYDRA_REPO_BASE` override,
+#: resolves the builtin "hydra" id to the OPERATOR'S REAL on-disk
+#: checkout even when the suite is running from an isolated worktree --
+#: so an unpatched (or partially-patched) test's PLAN write landed a real
+#: `.html` file under the operator's tracked `docs/plans/`. Scoping every
+#: write-purpose root (not just the "no target repo" default) through the
+#: same two-env-var sandbox check closes that gap centrally, in the one
+#: place every plan-artifact WRITE passes through, rather than requiring
+#: each test to separately monkeypatch `resolve_repo_path` too.
+_ENV_VAR_PREFIX = "HYDRA_PLAN_ARTIFACT_"
+_DEFAULT_ROOT_ENV_VAR = _ENV_VAR_PREFIX + "DEFAULT_ROOT"
+_SANDBOX_ROOT_ENV_VAR = _ENV_VAR_PREFIX + "SANDBOX_ROOT"
+
+
+def _resolve_default_root(explicit_default: Path | str) -> Path:
+    """Scope any write-purpose candidate root to the test sandbox.
+
+    Despite the name (kept for the "no target repo" default_root call
+    site, its original and still primary caller), this is also called on
+    a `repo_registry.resolve_repo_path`-derived root in branch 3b of
+    `plan_artifact_repo_root` below -- see the module-level comment above
+    for why a builtin/registered repo id needs the exact same scoping."""
+    override = os.environ.get(_DEFAULT_ROOT_ENV_VAR)
+    sandbox_root = os.environ.get(_SANDBOX_ROOT_ENV_VAR)
+    if not override or not sandbox_root:
+        # Both vars are required; either one missing means the override is
+        # not honoured at all (see module-level comment above).
+        return Path(explicit_default)
+
+    explicit = Path(explicit_default)
+    try:
+        if explicit.resolve().is_relative_to(Path(sandbox_root).resolve()):
+            return explicit
+    except OSError:  # noqa: BLE001 -- an unresolvable path is never "inside"
+        pass
+    return Path(override)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +233,7 @@ def plan_artifact_repo_root(
     ``hydra_core.repo_registry`` id (or the previously recorded one) on
     success, ``None`` whenever ``root`` is ``default_root``.
     """
-    default_root = Path(default_root)
+    default_root = _resolve_default_root(default_root)
 
     recorded_root = _get_field(state_or_values, "plan_artifact_root")
     if recorded_root:
@@ -220,6 +295,12 @@ def plan_artifact_repo_root(
             except Exception:  # noqa: BLE001 -- tracing must never break resolution
                 pass
         return default_root, None
+    # Same two-env-var sandbox scoping as `default_root` above -- see the
+    # module-level comment on `_resolve_default_root`. Without this, a
+    # `target_repo_id` resolving to a BUILTIN repo id (e.g. "hydra")
+    # bypasses the default-root-only sandbox check entirely and can land a
+    # real write under the operator's actual checkout.
+    root = _resolve_default_root(root)
     return root, str(target_repo_id)
 
 

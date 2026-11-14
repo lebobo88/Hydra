@@ -16,12 +16,13 @@ modes a contributor should expect.
 +----------------------------+---------------------------------+
                              |
 +----------------------------v---------------------------------+
-|  Hydra Claude Code plugin (.claude-plugin/)                  |
-|     - agents: hydra-supervisor, hydra-router, hydra-planner, |
-|       hydra-synthesizer, hydra-hitl-gate, hydra-cfo-gate     |
-|     - skills: cross-squad-message, hitl-protocol,            |
-|       budget-control, squad-registry-discovery,              |
-|       memory-handles                                         |
+|  Hydra Claude Code plugin (plugins/hydra/)                   |
+|     - main agent: hydra:hydra                                |
+|     - engine-spawned agents: engineer, judge-cross-vendor,   |
+|       judge-same-vendor, plan-author                         |
+|     - skills: run, drive, campaign, plan, hitl-protocol,     |
+|       cross-squad-message, budget-control, memory-handles,   |
+|       squad-registry-discovery, workflow-recovery            |
 +----------------------------+---------------------------------+
                              |  (subprocess + JSON-RPC)
 +----------------------------v---------------------------------+
@@ -30,9 +31,9 @@ modes a contributor should expect.
 |     supervisor.py  -> build_supervisor() compiles the graph  |
 |     router.py      -> deterministic + LLM-fallback intent    |
 |     squad_loader.py-> auto-discovers squads/<slug>/squad.yaml|
-|     squad_node.py  -> 5 entrypoint adapters                  |
+|     squad_node.py  -> 6 entrypoint branches                  |
 |     governance.py  -> budget, loops, circuit break, redact   |
-|     memory.py      -> episodic SQLite + semantic Chroma      |
+|     memory.py      -> episodic SQLite + in-memory semantic   |
 |     telemetry.py   -> OTEL spans + JSONL trace               |
 +----------------------------+---------------------------------+
                              |
@@ -40,45 +41,58 @@ modes a contributor should expect.
         |                    |                    |
 +-------v------+    +--------v-------+   +--------v-------+
 | Squad packs  |    | MCP host       |   | Memory fabric  |
-| (14 today)   |    | per-squad      |   | episodic + vec |
+| (15 today)   |    | per-squad      |   | episodic       |
 |              |    | client session |   |                |
 | executive    |    | hydra_memory   |   | ~/.hydra/      |
 | engineering  |    | executive_suite|   |   episodic.db  |
-| garland      |    | rlm_creative   |   |   vectors/     |
-| legal/Curia  |    | hydra_control  |   |   checkpoints  |
+| garland      |    | rlm_creative   |   |   checkpoints  |
+| legal/Curia  |    | hydra_control  |   |                |
 | customer-sup |    | xenia_tickets  |   |                |
 | rlm-gaming   |    | rlm_gaming     |   |                |
 | 5 marketing  |    | hydra_toolshed |   |                |
-| 3 stubs      |    | hydra_gateway  |   |                |
+| planning     |    | hydra_gateway  |   |                |
+| 3 stubs      |    |                |   |                |
 +--------------+    +----------------+   +----------------+
 ```
 
-Squad census: **14 packs, 11 active** (executive, engineering, garland,
+Squad census: **15 packs, 12 active** (executive, engineering, garland,
 legal-compliance/Curia, customer-support/Xenia Hearth, rlm-gaming/Arcade Crown,
-and the 5 `marketing-*` packs — the latter are filesystem symlinks into the
-MarketBliss checkout) **and 3 stubs** (healthcare, sales-gtm, research-ds).
+the 5 `marketing-*` packs — filesystem symlinks into the MarketBliss
+checkout — and the `planning` meta-squad) **and 3 stubs** (healthcare,
+sales-gtm, research-ds).
 
-A Claude Code session loads the plugin. The plugin's hooks initialize the
-registry and start the supervisor on `/hydra:run`. The supervisor compiles
-a LangGraph state machine (or a pure-python fallback runner when LangGraph
-is absent), dispatches each squad through one of five adapters, persists
-state to LangGraph's `SqliteSaver` at `~/.hydra/checkpoints.db`, and emits
-OTEL spans plus a JSONL trace at `<project>/.hydra/<workflow_id>/trace.jsonl`.
+A Claude Code session loads the plugin. `/hydra:run` drives the supervisor
+through the `hydra_control` MCP verbs, each of which runs
+`python -m hydra_core.cli`. The supervisor compiles a LangGraph state machine
+(or a pure-python fallback runner when LangGraph is absent), dispatches each
+squad through the entrypoint branch its `squad.yaml` declares
+(`squad_node.py`: `mcp`, `subprocess`, `agent-impersonation`, `claude-skill`,
+`claude-native`, `stub`), persists state to LangGraph's `SqliteSaver` at
+`~/.hydra/checkpoints.db`, and emits OTEL-style spans to a JSONL trace at
+`<project>/.hydra/<workflow_id>/trace.jsonl`.
+
+The approved redesign toward one orchestrator and one engine policy is
+`docs/plans/hydra-unified-orchestration.html` (epic Hydra#78). It is not yet
+implemented; this file describes the code as it is.
 
 ## 2. LangGraph state machine
 
-The supervisor graph has eight explicit nodes, mirroring `HYDRA.md` §2:
+The supervisor graph has twelve nodes. The eight below are the main path; the
+plan phase adds `plan_judge` and `plan_gate` (§2a), and `hitl_gate_dispatch` /
+`hitl_gate_judge` hold a HITL pause raised during dispatch or by a verdict.
+Each node is a Python function in `hydra_core/supervisor.py`; no plugin agent
+performs a node's work.
 
-| Phase | Node | Purpose |
+| Phase | Implemented by | Purpose |
 |---|---|---|
-| `intake` | `hydra-router` | Classify goal -> 1+ squad slugs (deterministic keywords first, LLM fallback). Establish `Constraints` (budget, deadline, risk_tolerance, industries). |
-| `planner` | `hydra-planner` | Decompose into typed `TaskState` entries, build a small DAG, populate `selected_squads`, draft a `CSuiteDecisionPacket`. |
-| `approval` | `hydra-hitl-gate` | `interrupt_before` checkpoint. Sets `pending_hitl`; supervisor halts until `/hydra:approve` resumes the thread. |
-| `dispatch` | `dispatcher` | Fan out to squad subgraphs in parallel via one of five adapters (mcp / subprocess / agent-impersonation / claude-skill / stub), materialize one envelope per task, produce a `SquadResult` per squad. |
+| `intake` | `node_intake` (`router.classify_intent`) | Classify goal -> 1+ squad slugs (deterministic keywords first, LLM fallback). Establish `Constraints` (budget, deadline, risk_tolerance, industries). |
+| `planner` | `node_planner` | Triage plan rigor; seed typed `TaskState` entries (or a planning task), populate `selected_squads`. |
+| `approval` | `node_approval` | `interrupt_before` checkpoint. Sets `pending_hitl`; supervisor halts until `/hydra:approve` resumes the thread. |
+| `dispatch` | `node_dispatch` | Run each task through its squad's entrypoint branch (mcp / subprocess / agent-impersonation / claude-skill / claude-native / stub), produce a `SquadResult` per squad. `claude-native` tasks are always deferred to the attended host cursor. |
 | `judge_per_squad` | cross-vendor judge | Per-squad rubric evaluation via `pp_codex` / `pp_agy`. Reflexion ×1 retry on `revise`. Skips host-pickup envelopes. |
-| `synthesis` | `hydra-synthesizer` | Merge all `SquadResult`s into a single `DECISION_RECORD`, post artifacts to episodic memory, append a master-plan patch. |
+| `synthesis` | `node_synthesis` | Merge all `SquadResult`s into a single `DECISION_RECORD`, post artifacts to episodic memory, append a master-plan patch. |
 | `judge_synthesis` | cross-vendor judge | Judge the merged `DecisionRecord` against synthesis-level rubrics. HITL escalation on policy breach. |
-| `postcheck` | `hydra-cfo-gate` | Re-evaluate budget, loop ceiling, residual risk. May surface back to HITL or to `done`. |
+| `postcheck` | `node_postcheck` | Re-evaluate budget, loop ceiling, residual risk. May surface back to HITL or to `done`. |
 
 Conditional edges from `postcheck` route to `done`, back to `dispatch`
 (if a missed dependency was discovered), or to `surfaced` (a terminal
@@ -292,7 +306,7 @@ handle:
 |---|---|---|---|
 | Ephemeral | rolling prompt window | one node invocation | n/a (inline) |
 | Episodic | SQLite, `~/.hydra/episodic.db` | append-only, full retention | `ep://wf/<workflow_id>/<task_id>/<seq>` |
-| Semantic | Chroma, `~/.hydra/vectors/<index>/` | indefinite, indexed | `sem://<index>/<doc_id>` |
+| Semantic | none shipped: `hydra-mem.semantic_search` is a SQLite `LIKE` search over the episodic log; `SemanticIndex` is an in-memory fallback and the seam for a vector store | process lifetime | `sem://<index>/<doc_id>` |
 
 `hydra_core/memory.py` provides `append_episodic`, `resolve_episodic`,
 `list_episodic`, and `SemanticIndex` with per-squad read scoping. Agents
@@ -314,18 +328,18 @@ The servers fall into three categories:
 | `rlm_creative` | `mcp_servers/rlm_creative/server.py` | Read-only introspection of the RLM-Creative plugin under `plugins/rlm-creative/` |
 | `hydra_toolshed` | `mcp_servers/hydra_toolshed/server.py` | Search-describe-execute meta-tools over large tool catalogs (Speakeasy Dynamic Toolsets pattern) |
 | `hydra_gateway` | `mcp_servers/hydra_gateway/server.py` | Unified proxy — consolidates all backend servers behind a single MCP registration with static tool catalog and on-demand backend connections |
-| `hydra_control` | `mcp_servers/hydra_control/server.py` | Workflow-resume gate + cockpit audit filing. 3 tools: `hydra.control.ping`, `hydra.workflow.resume` (launches the CLI resume path for a paused HITL gate — approve/reject/modify-budget/force-dispatch), `hydra.cockpit.audit` (files a `cockpit_write` audit envelope through the attestor for actions taken from the mesh console) |
+| `hydra_control` | `mcp_servers/hydra_control/server.py` | Engine control surface. 17 tools, including the attended verbs `hydra.workflow.plan` / `.step` / `.submit_host_result` / `.finalize` (each runs `python -m hydra_core.cli`), `hydra.workflow.launch`, `hydra.workflow.submit_envelopes`, `hydra.squad.list`, `hydra.repo.list` / `.resolve`, `hydra.control.ping`, `hydra.workflow.resume` (launches the CLI resume path for a paused HITL gate — approve/reject/modify-budget/force-dispatch), `hydra.cockpit.audit` (files a `cockpit_write` audit envelope through the attestor for actions taken from the mesh console) |
 | `xenia_tickets` | `mcp_servers/xenia_tickets/server.py` | Customer-support ticket filing for the Xenia Hearth squad. 9 tools: `xenia-tickets.create`, `.get`, `.list`, `.comment`, `.update_fields`, `.recommend`, `.send_response`, `.execute_approved`, `.ping`. Mutating tools (`send_response`, `execute_approved`) verify a server-side WS-AUTH operator/agent capability token (`mint_for_tool.py` + `clearance.py`) before acting — actor identity is taken from the dispatcher binding, never self-reported |
 
 (Other shipped pack-shim servers — `xenia`, `xenia_kb`, `senate`,
-`marketbliss` — follow the same read-only-introspection pattern as
-`executive_suite`/`rlm_creative`.)
+`marketbliss`, `rlm_gaming` — follow the same read-only-introspection pattern
+as `executive_suite`/`rlm_creative`.)
 
 These are pack-shim servers that read filesystem state from sibling
 projects. They are **not** the primary execution path for their
 respective squads — `executive_suite` and `rlm_creative` provide
 enrichment data (live roster, skill catalogue) while the actual work
-flows through `agent-impersonation` and `claude-skill` entrypoints.
+flows through the squad's `claude-native` entrypoint.
 `hydra_control` and `xenia_tickets` are the exception: they perform
 real side-effecting writes (workflow resume, audit filing, ticket
 mutation) and therefore enforce HITL-capability / WS-AUTH gating.
@@ -348,9 +362,12 @@ gateway proxies them — see §6e.
 
 | Squad | Entrypoint | Mechanism |
 |-------|-----------|-----------|
-| Executive | `agent-impersonation` | `dispatcher.emit_claude_prompt()` → host-pickup envelope; Claude Code impersonates the persona in-process |
-| Garland | `claude-skill` | `dispatcher.invoke_claude_skill()` → host-pickup envelope; Claude Code invokes the skill |
+| Executive, Garland, Legal, RLM-Gaming, 5 marketing-*, Planning | `claude-native` | `node_dispatch` defers the task to the attended host cursor; `hydra.workflow.step` returns a `host_action` naming the squad's lead agent (`hydra_core/native_packs.py`), which the host spawns as a plugin-scoped subagent. No in-graph path. |
+| Customer Support | `claude-skill` | `dispatcher.invoke_claude_skill()` → host-pickup envelope; Claude Code invokes the pack's skill |
 | Stubs | `stub` | Returns a placeholder `DecisionRecord` |
+
+The loader also accepts `agent-impersonation` and `subprocess`; no squad
+declares either today.
 
 Only the Engineering squad uses MCP as its primary execution path.
 
@@ -480,7 +497,8 @@ rejects unauthorized access with a telemetry event. Cross-squad tool
 delegation is supported via `Handoff` envelopes carrying explicit
 `granted_tools` lists with expiration timestamps.
 
-**RA-3 — claude-skill shim auto-authorization.** Each `claude-skill` squad is
+**RA-3 — pack shim auto-authorization.** Each pack-backed squad (the
+`claude-skill` and `claude-native` squads listed below) is
 automatically authorized for its own MCP shim pair without a `squad.yaml#tools`
 entry — `garland` → `rlm_creative`, `legal-compliance` → `senate`,
 `customer-support` → `xenia`, `rlm-gaming` → `rlm_gaming`,
@@ -667,26 +685,23 @@ Behaviour:
 **Pair-programmer (engineering).** Entrypoint is `mcp`. Hydra opens an
 MCP client session against the local `pp-daemon` and invokes
 `pp.harness.start_run`, `pp.harness.start_stage`, `pp.codex.generate`,
-`pp.gemini.critique`, and `pp.harness.archive_artifact`. The squad
+`pp.codex.critique` / `pp.agy.critique`, and `pp.harness.archive_artifact`. The squad
 yaml's `invoke.mode` selects between `pp_run`, `pp_team`, `pp_best_of`,
 and `pp_review`; `default_team` is `feature-team`, `forum_for_review`
 is `change-advisory-board`. Engineering produces `PRD`, `ARCH_RFC`,
 `DEV_TASK`, and `DECISION_RECORD` envelopes. See
 `squads/engineering/squad.yaml` for the full surface.
 
-**ExecutiveSuite (executive).** Entrypoint is `agent-impersonation` —
-ES is a Claude Code sub-agent pack, not a subprocess. Hydra emits a
-Claude prompt naming the desired persona (`/board-meeting`,
-`/capital-decision`, `/crisis-mode`, `/mna-review`, etc.) and ES's
-sub-agents take over the conversation turn within the same Claude
-session. The 20+ C-level personas plus 4 orchestrators (`boardroom`,
-`capital-allocation`, `crisis-warroom`, `mna-cockpit`) emit a
-`CSuiteDecisionPacket` which the planner converts to per-squad tasks.
+**ExecutiveSuite (executive).** Entrypoint is `claude-native` — ES is a
+Claude Code plugin (`executive-suite`). On the attended path
+`hydra.workflow.step` returns a `host_action` for the squad's lead agent
+(`executive-suite:boardroom`), which the host spawns as a subagent. Only
+the lead is mapped today (`hydra_core/native_packs.py`); the other heads
+are reached through the lead, not dispatched by the engine (Hydra#89
+changes this). The squad emits a `CSuiteDecisionPacket`.
 
-**RLM-Creative (garland).** Entrypoint is `claude-skill`. Hydra
-invokes `/rlm-team` (or fallbacks `/creative-campaign`,
-`/photo-direction`, `/brand-refresh`)
-through the Claude Code skill mechanism. The garland squad emits
+**RLM-Creative (garland).** Entrypoint is `claude-native`; the lead agent
+is `rlm-creative:calliope`, dispatched the same way. The garland squad emits
 `SHOT_LIST`, `ASSET_JOB`, and `DECISION_RECORD`. Outputs land under
 `RLM/output/{phase}/{topic}-{date}.md` per the squad yaml.
 
