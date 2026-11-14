@@ -280,7 +280,9 @@ Claude Code does not reinstall a plugin whose `version` is unchanged. After edit
 
 For live plugin development, start Claude Code with `claude --plugin-dir ./plugins/hydra`.
 
-### Working inside this repository
+### Activation contexts
+
+Use the installed Hydra plugin in **consumer projects**. Inside the Hydra repository itself, the checked-in project configuration (`CLAUDE.md`, `.claude/rules/`, `.claude/settings.json`) is the host surface; avoid also enabling the installed plugin in that same session. Both carry the same fail-closed routing guards, so loading both duplicates lifecycle notifications without adding authority.
 
 The checked-in `.claude/settings.json` sets `HYDRA_ENFORCE_ROUTING=1` and `HYDRA_DISABLE_CLAUDE_ENGINEER=1`. With routing enforced, the plugin hooks block direct writes to engine source; changes go through `/hydra:run`. The contract for agents working here is `AGENTS.md`, `CLAUDE.md` and `.claude/rules/`.
 
