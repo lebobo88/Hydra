@@ -119,7 +119,7 @@ Hydra ships a `mesh-manifest.yaml` at the repo root that enrolls its `hydra_memo
 | `marketing-production` | MarketBliss | `claude-native` | 5 | Production planning, shot lists, talent and IP clearance |
 | `marketing-ops` | MarketBliss | `claude-native` | 4 | Media buying, lifecycle CRM, analytics |
 | `customer-support` | [Xenia](https://github.com/lebobo88/Xenia-Support) | `claude-skill` | 11 | Ticket triage, recommendation, approval-gated execution |
-| `planning` | this repo (`plugins/hydra/agents/plan-*.md`) | `claude-native` | 3 | Authors the typed PLAN before any squad is dispatched |
+| `planning` | this repo (`plugins/hydra/.claude/agents/plan-*.md`, generated from `covenant/plan-*.cov`) | `claude-native` | 3 | Authors the typed PLAN before any squad is dispatched |
 | `healthcare` | stub | `stub` | 6 | Registered, not active |
 | `sales-gtm` | stub | `stub` | 5 | Registered, not active |
 | `research-ds` | stub | `stub` | 6 | Registered, not active |
@@ -344,7 +344,7 @@ These are verified against the code and tracked in the [unified orchestration pl
 - **The gateway enforces no RBAC or venom gate and emits no telemetry**, and its fallback route proxies tools that are not in its catalog. RBAC fails open when the calling squad is unknown ([#84](https://github.com/lebobo88/Hydra/issues/84), [#94](https://github.com/lebobo88/Hydra/issues/94), [#95](https://github.com/lebobo88/Hydra/issues/95)).
 - **Seven in-repo tools are not advertised by the gateway catalog**, and several plugin hook matchers use outdated tool names and never fire ([#81](https://github.com/lebobo88/Hydra/issues/81), [#82](https://github.com/lebobo88/Hydra/issues/82)).
 - **Engineering emitted by a squad pack runs headless**, not through the visible engineer and judge ([#87](https://github.com/lebobo88/Hydra/issues/87)).
-- **Eight plugin agents are never spawned** (`hydra-supervisor`, `hydra-router`, `hydra-planner`, `hydra-synthesizer`, `hydra-hitl-gate`, `hydra-cfo-gate`, `plan-critic`, `plan-scribe`); the engine does their work in Python ([#93](https://github.com/lebobo88/Hydra/issues/93)).
+- **Eight plugin agents are never spawned** (`hydra-supervisor`, `hydra-router`, `hydra-planner`, `hydra-synthesizer`, `hydra-hitl-gate`, `hydra-cfo-gate`, `plan-critic`, `plan-scribe`); the engine does their work in Python. The two plan agents are generated from `covenant/plan-*.cov`, and the flow in `covenant/plan.cov` that would run them is not called by the engine (`docs/covenant-pilot.md`) ([#93](https://github.com/lebobo88/Hydra/issues/93)).
 - **Packaging is manual.** The gateway is hand-registered, and Xenia, pair-programmer, AgentSmith and TheEights have no plugin manifest ([#105](https://github.com/lebobo88/Hydra/issues/105)).
 - **Some documents lag the code**, including the squad table in `AGENTS.md` ([#106](https://github.com/lebobo88/Hydra/issues/106)).
 
@@ -369,9 +369,11 @@ Hydra/
 ├── plugins/hydra/               the Claude Code plugin
 │   ├── .claude-plugin/plugin.json
 │   ├── settings.json            sets the main agent to hydra:hydra
-│   ├── agents/                  hydra, hydra-plaza, engineer, judges, plan-*, and unused persona agents
+│   ├── agents/                  hydra, hydra-plaza, engineer, judges, and unused persona agents
+│   ├── .claude/agents/          plan-author, plan-critic, plan-scribe (generated; do not edit)
 │   ├── skills/                  slash commands and reference skills
 │   └── hooks/                   hooks.json and the routing-guard scripts
+├── covenant/                    Covenant sources (plan-*.cov, plan.cov) and the vendored cov CLI that builds the plan agents
 ├── hydra_core/                  supervisor, router, dispatcher, host bridge, governance, memory, judge, CLI
 ├── mcp_servers/                 gateway, control, memory, toolshed, and squad-pack shims
 ├── squads/<slug>/squad.yaml     squad declarations (plus heads.yaml overlays)
@@ -382,6 +384,7 @@ Hydra/
 └── docs/
     ├── MCP_SETUP.md, MCP-PER-CROWN.md, PORTABILITY.md, VENOM.md, BRAND.md
     ├── MANIFESTO.md, ROADMAP-MANIFESTO.md
+    ├── covenant-pilot.md        what the Covenant pilot generates and what the engine does not use
     ├── audits/                  audit ledgers
     ├── plans/                   plans, including hydra-unified-orchestration.html
     └── constellation/           presentation bundle
