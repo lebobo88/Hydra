@@ -545,6 +545,7 @@ class _PollutionGuardPlugin:
         self._before_repos: str | None = None
         self.violations: list[str] = []
         self.warnings: list[str] = []
+        self.escalated_warnings: list[str] = []
 
     def pytest_sessionstart(self, session) -> None:
         if hasattr(session.config, "workerinput"):  # xdist worker
@@ -575,14 +576,28 @@ class _PollutionGuardPlugin:
             )
         )
         self.violations, self.warnings = violations, warns
+        self.escalated_warnings = []
         for text in warns:
-            session.config.issue_config_time_warning(
-                ConcurrentPlanWriterWarning(text), stacklevel=2
-            )
+            try:
+                session.config.issue_config_time_warning(
+                    ConcurrentPlanWriterWarning(text), stacklevel=2
+                )
+            except ConcurrentPlanWriterWarning:
+                # A warning filter (``-W error`` / ``filterwarnings = error``)
+                # escalated the notice to an exception. It must stay
+                # non-fatal: keep the text and print it in the terminal
+                # summary instead. Only this class is caught.
+                self.escalated_warnings.append(text)
         if violations and session.exitstatus == pytest.ExitCode.OK:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
     def pytest_terminal_summary(self, terminalreporter) -> None:
+        for text in self.escalated_warnings:
+            terminalreporter.write_line(
+                f"ConcurrentPlanWriterWarning (non-fatal; escalated by a "
+                f"warning filter): {text}",
+                yellow=True,
+            )
         if not self.violations:
             return
         terminalreporter.write_sep(

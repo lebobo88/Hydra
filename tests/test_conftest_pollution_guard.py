@@ -392,7 +392,9 @@ def test_writes():
 """
 
 
-def _run_session(pytester, plans_dir, repos_json, target_name, body, session_ids=()):
+def _run_session(
+    pytester, plans_dir, repos_json, target_name, body, session_ids=(), extra_args=()
+):
     plugin = _PollutionGuardPlugin(
         plans_dirs=lambda: [plans_dir],
         repos_json=repos_json,
@@ -402,7 +404,9 @@ def _run_session(pytester, plans_dir, repos_json, target_name, body, session_ids
     pytester.makepyfile(
         test_writer=_WRITER.format(target=str(plans_dir / target_name), body=body)
     )
-    return pytester.runpytest_inprocess("-p", "no:cacheprovider", plugins=[plugin])
+    return pytester.runpytest_inprocess(
+        "-p", "no:cacheprovider", *extra_args, plugins=[plugin]
+    )
 
 
 def test_session_violation_yields_nonzero_exit_and_report(pytester, tmp_path):
@@ -427,3 +431,27 @@ def test_session_foreign_only_change_exits_zero_with_warning(pytester, tmp_path)
     assert FOREIGN_ID in out
     assert "HERMETIC BOUNDARY VIOLATION" not in out
     assert issubclass(ConcurrentPlanWriterWarning, Warning)
+
+
+def test_session_foreign_only_change_under_w_error_still_exits_zero(pytester, tmp_path):
+    plans_dir, repos_json = _setup(tmp_path)
+    result = _run_session(
+        pytester, plans_dir, repos_json, "other.html", _plan_html(FOREIGN_ID),
+        extra_args=("-W", "error"),
+    )
+    assert result.ret == 0
+    out = result.stdout.str()
+    assert "other.html" in out
+    assert FOREIGN_ID in out
+    assert "concurrent writer outside the test session" in out
+    assert "HERMETIC BOUNDARY VIOLATION" not in out
+
+
+def test_session_violation_under_w_error_still_exits_nonzero(pytester, tmp_path):
+    plans_dir, repos_json = _setup(tmp_path)
+    result = _run_session(
+        pytester, plans_dir, repos_json, "leak.html", _plan_html(None),
+        extra_args=("-W", "error"),
+    )
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*HERMETIC BOUNDARY VIOLATION*"])
