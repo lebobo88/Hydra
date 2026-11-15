@@ -119,7 +119,7 @@ Hydra ships a `mesh-manifest.yaml` at the repo root that enrolls its `hydra_memo
 | `marketing-production` | MarketBliss | `claude-native` | 5 | Production planning, shot lists, talent and IP clearance |
 | `marketing-ops` | MarketBliss | `claude-native` | 4 | Media buying, lifecycle CRM, analytics |
 | `customer-support` | [Xenia](https://github.com/lebobo88/Xenia-Support) | `claude-skill` | 11 | Ticket triage, recommendation, approval-gated execution |
-| `planning` | this repo (`plugins/hydra/.claude/agents/plan-*.md`, generated from `covenant/plan-*.cov`) | `claude-native` | 3 | Authors the typed PLAN before any squad is dispatched |
+| `planning` | this repo (`plugins/hydra/agents/plan-*.md`, generated from `covenant/plan-*.cov`) | `claude-native` | 3 | Authors the typed PLAN before any squad is dispatched |
 | `healthcare` | stub | `stub` | 6 | Registered, not active |
 | `sales-gtm` | stub | `stub` | 5 | Registered, not active |
 | `research-ds` | stub | `stub` | 6 | Registered, not active |
@@ -371,8 +371,7 @@ Hydra/
 ├── plugins/hydra/               the Claude Code plugin
 │   ├── .claude-plugin/plugin.json
 │   ├── settings.json            sets the main agent to hydra:hydra
-│   ├── agents/                  hydra, hydra-plaza, engineer, judges, and unused persona agents
-│   ├── .claude/agents/          plan-author, plan-critic, plan-scribe (generated; do not edit)
+│   ├── agents/                  hydra, hydra-plaza, engineer, judges, unused persona agents, and the generated plan-author, plan-critic, plan-scribe
 │   ├── skills/                  slash commands and reference skills
 │   └── hooks/                   hooks.json and the routing-guard scripts
 ├── covenant/                    Covenant sources (plan-*.cov, plan.cov) and the vendored cov CLI that builds the plan agents
