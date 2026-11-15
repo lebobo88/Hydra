@@ -47,8 +47,8 @@ def _begin(tmp_path: Path, wf: str, *, slug: str = "customer-support") -> dict[s
 
 
 def _trace_kinds(tmp_path: Path, wf: str) -> list[str]:
-    """Trace lands under the cursor's project_path (the pack cwd for squads)."""
-    path = tmp_path / "pack" / ".hydra" / wf / "trace.jsonl"
+    """Squad trace lands under the Hydra project root (not the pack cwd)."""
+    path = tmp_path / ".hydra" / wf / "trace.jsonl"
     if not path.exists():
         return []
     return [json.loads(line)["kind"] for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
