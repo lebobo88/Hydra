@@ -216,7 +216,12 @@ def _hermetic_hydra_env(request, monkeypatch, tmp_path):
 #   * `_REAL_HOME_REPOS_JSON` is derived from `Path.home()`, which reads
 #     `HOME`/`USERPROFILE` -- never `HYDRA_HOME` -- so it is unaffected by
 #     the redirect above no matter the import order.
+import functools as _functools
 import hashlib as _hashlib
+import html as _html
+import re as _re
+import uuid as _uuid
+from collections.abc import Callable, Collection
 
 _REAL_CHECKOUT_DOCS_PLANS = Path(__file__).resolve().parent.parent / "docs" / "plans"
 _REAL_HOME_REPOS_JSON = Path.home() / ".hydra" / "repos.json"
@@ -254,41 +259,117 @@ def _snapshot_repos_json_sha256(repos_json: Path) -> str | None:
     return _hashlib.sha256(repos_json.read_bytes()).hexdigest()
 
 
+_UUID_LI_RE = _re.compile(r"<li>\s*workflow_id:\s*([^<]*?)\s*</li>")
+_PROVENANCE_HEADING = "<h2>Provenance</h2>"
+
+
+def _canonical_uuid(value: object) -> str | None:
+    """Canonical lowercase hyphenated UUID string, or ``None`` if ``value`` is
+    not exactly that form."""
+    text = str(value).strip().lower()
+    try:
+        parsed = _uuid.UUID(text)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return text if str(parsed) == text else None
+
+
+def _read_plan_workflow_id(path: Path) -> str | None:
+    """Return the workflow_id a plan artifact claims, or ``None``.
+
+    ``.html``: the ``<li>workflow_id: ...</li>`` line that
+    ``hydra_core.plan_artifact.render_plan_html`` emits under
+    ``<h2>Provenance</h2>`` (html-unescaped). ``.json``: a top-level
+    ``workflow_id`` key. ``None`` for an unreadable file, a missing line/key,
+    or a value that is not a canonical UUID. READ-ONLY: only ``read_bytes``.
+    """
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, dict) and "workflow_id" in data:
+            return _canonical_uuid(data["workflow_id"])
+        return None
+    idx = text.rfind(_PROVENANCE_HEADING)
+    if idx < 0:
+        return None
+    match = _UUID_LI_RE.search(text, idx)
+    if match is None:
+        return None
+    return _canonical_uuid(_html.unescape(match.group(1)))
+
+
+class ConcurrentPlanWriterWarning(pytest.PytestWarning):
+    """A new plan artifact with a workflow_id this session did not create
+    appeared in a watched plans dir (an operator/other process writing
+    concurrently). Reported, never fatal."""
+
+
+def _classify_plans_dir_changes(
+    plans_dir: Path,
+    before_plans: dict[str, str],
+    after_plans: dict[str, str],
+    session_workflow_ids: Collection[str] = frozenset(),
+    read_workflow_id: Callable[[Path], str | None] = _read_plan_workflow_id,
+) -> tuple[list[str], list[str]]:
+    """Pure classifier of one watched plans-dir snapshot pair.
+
+    Returns ``(violations, warnings)``. Per file:
+
+    * added, no readable workflow_id -> violation (fail closed)
+    * added, workflow_id in ``session_workflow_ids`` -> violation
+    * added, any other (foreign) workflow_id -> warning only
+    * removed -> violation
+    * modified pre-existing file -> violation, even with a foreign id
+    """
+    session_ids = {_canonical_uuid(i) or str(i) for i in session_workflow_ids}
+    violations: list[str] = []
+    warnings_: list[str] = []
+    for name in sorted(set(after_plans) - set(before_plans)):
+        path = plans_dir / name
+        wid = read_workflow_id(path)
+        if wid is None:
+            violations.append(f"{path}: new file, no readable workflow_id")
+        elif (_canonical_uuid(wid) or wid) in session_ids:
+            violations.append(
+                f"{path}: new file, workflow_id {wid} created by this test session"
+            )
+        else:
+            warnings_.append(
+                f"{path}: new file with workflow_id {wid} -- "
+                "concurrent writer outside the test session"
+            )
+    for name in sorted(set(before_plans) - set(after_plans)):
+        violations.append(
+            f"{plans_dir / name}: file disappeared from the watched plans dir (removed)"
+        )
+    for name in sorted(
+        n for n in set(before_plans) & set(after_plans) if before_plans[n] != after_plans[n]
+    ):
+        violations.append(
+            f"{plans_dir / name}: pre-existing file was overwritten (modified)"
+        )
+    return violations, warnings_
+
+
 def _diff_plans_dir(
     plans_dir: Path,
     before_plans: dict[str, str],
     after_plans: dict[str, str],
+    session_workflow_ids: Collection[str] = frozenset(),
+    read_workflow_id: Callable[[Path], str | None] = _read_plan_workflow_id,
 ) -> list[str]:
-    """Pure comparison of a single watched plans-dir snapshot pair. Split out
-    of ``_diff_pollution_guard_snapshots`` so the fixture below can run the
-    same added/removed/modified comparison against MULTIPLE watched plans
-    dirs (the checkout the suite runs from, plus -- in a worktree run -- the
-    operator's actual main checkout) without duplicating the repos.json
-    check per dir."""
-    added = sorted(set(after_plans) - set(before_plans))
-    removed = sorted(set(before_plans) - set(after_plans))
-    modified = sorted(
-        name
-        for name in set(before_plans) & set(after_plans)
-        if before_plans[name] != after_plans[name]
-    )
-    problems: list[str] = []
-    if added:
-        problems.append(
-            "new file(s) appeared under the watched plans dir "
-            f"({plans_dir}): {added!r}"
-        )
-    if removed:
-        problems.append(
-            "file(s) disappeared from the watched plans dir "
-            f"({plans_dir}): {removed!r}"
-        )
-    if modified:
-        problems.append(
-            "file(s) were overwritten under the watched plans dir "
-            f"({plans_dir}): {modified!r}"
-        )
-    return problems
+    """Violations-only view of ``_classify_plans_dir_changes`` (the original
+    list[str] contract); foreign-id warnings are dropped here -- callers that
+    want them use the classifier directly."""
+    return _classify_plans_dir_changes(
+        plans_dir, before_plans, after_plans, session_workflow_ids, read_workflow_id
+    )[0]
 
 
 def _diff_repos_json(
@@ -313,17 +394,22 @@ def _diff_pollution_guard_snapshots(
     before_repos_sha: str | None,
     after_plans: dict[str, str],
     after_repos_sha: str | None,
+    session_workflow_ids: Collection[str] = frozenset(),
+    read_workflow_id: Callable[[Path], str | None] = _read_plan_workflow_id,
+    warnings_out: list[str] | None = None,
 ) -> list[str]:
     """Pure comparison: given a before/after snapshot pair (already taken by
-    the caller), return the list of human-readable problem strings -- empty
-    if nothing changed. Takes no filesystem action itself. Thin orchestrator
-    over ``_diff_plans_dir``/``_diff_repos_json`` above -- kept as its own
-    function (rather than inlined at each call site) because it is the
-    signature the existing unit tests in
-    ``test_conftest_pollution_guard.py`` exercise directly."""
-    return _diff_plans_dir(plans_dir, before_plans, after_plans) + _diff_repos_json(
-        repos_json, before_repos_sha, after_repos_sha
+    the caller), return the list of human-readable violation strings -- empty
+    if nothing (fatal) changed. Takes no filesystem action itself beyond the
+    injected ``read_workflow_id``. Concurrent-writer warnings are appended to
+    ``warnings_out`` when given. The original keyword arguments are unchanged;
+    the three new ones are optional."""
+    violations, warns = _classify_plans_dir_changes(
+        plans_dir, before_plans, after_plans, session_workflow_ids, read_workflow_id
     )
+    if warnings_out is not None:
+        warnings_out.extend(warns)
+    return violations + _diff_repos_json(repos_json, before_repos_sha, after_repos_sha)
 
 
 def _resolve_main_checkout_plans_dir() -> Path | None:
@@ -387,50 +473,129 @@ def _snapshot_real_repos_json_sha256() -> str | None:
     return _snapshot_repos_json_sha256(_REAL_HOME_REPOS_JSON)
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _real_hydra_home_pollution_guard():
-    """Fail the session if any test wrote into a REAL checkout's tracked
-    ``docs/plans/`` (the suite's own checkout AND -- when a worktree run
-    resolves it differently -- the operator's actual main checkout; see
-    ``_resolve_main_checkout_plans_dir``) or mutated the operator's REAL
-    ``~/.hydra/repos.json``.
+# --------------------------------------------------------------------------
+# Provenance: which workflow ids did THIS session create?
+# --------------------------------------------------------------------------
+#
+# Every in-process plan-artifact HTML is produced by
+# ``hydra_core.plan_artifact.render_plan_html``. ingest.py and supervisor.py
+# each reach it through a FUNCTION-LOCAL ``from .plan_artifact import
+# render_plan_html`` (re-reads the module attribute at call time), so wrapping
+# the module attribute once is seen by both. The wrapper is installed in
+# ``pytest_sessionstart`` (before collection, so test modules importing the
+# name at module top also bind the wrapper) and records ``plan.workflow_id``
+# of every call. The set only grows.
+# Blind spots: subprocess writers (separate interpreter, unwrapped); anything
+# that bound the original function before session start; hand-written
+# artifacts that never go through render_plan_html (their id looks foreign ->
+# warning, not violation, if they carry a valid UUID).
+_SESSION_WORKFLOW_IDS: set[str] = set()
 
-    READ-ONLY by construction: every call this fixture makes against the
-    watched real paths is ``.is_dir()``, ``.is_file()``, ``.iterdir()``, or
-    ``.read_bytes()`` -- never a write, ``unlink``, ``rename``, or
-    ``mkdir`` -- plus the local, no-network ``git rev-parse
-    --show-toplevel`` that ``resolve_repo_path`` runs to find the main
-    checkout. Pre-existing litter (files already present before the session
-    started) is never flagged or touched; only NEW files / a CHANGED hash /
-    a REMOVED file trips this guard. The actual snapshot/compare logic
-    lives in ``_snapshot_plans_dir``/``_snapshot_repos_json_sha256``/
-    ``_diff_pollution_guard_snapshots``/``_diff_plans_dir`` above, which are
-    unit tested against tmp_path stand-ins in
-    ``test_conftest_pollution_guard.py`` -- this fixture only supplies the
-    real paths and the before/after timing.
+
+def _install_workflow_id_capture(sink: set[str] = _SESSION_WORKFLOW_IDS) -> bool:
+    """Wrap ``plan_artifact.render_plan_html`` to record workflow ids into
+    ``sink``. Idempotent. Returns True if a wrapper was installed now."""
+    from hydra_core import plan_artifact
+
+    original = plan_artifact.render_plan_html
+    if getattr(original, "_hermetic_workflow_id_capture", False):
+        return False
+
+    @_functools.wraps(original)
+    def _capturing_render_plan_html(plan, *args, **kwargs):
+        wid = getattr(plan, "workflow_id", None)
+        if wid is not None:
+            sink.add(_canonical_uuid(wid) or str(wid))
+        return original(plan, *args, **kwargs)
+
+    setattr(_capturing_render_plan_html, "_hermetic_workflow_id_capture", True)
+    plan_artifact.render_plan_html = _capturing_render_plan_html
+    return True
+
+
+class _PollutionGuardPlugin:
+    """Session-level read-only guard over the real ``docs/plans`` dir(s) (the
+    suite's own checkout AND, in a worktree run, the main checkout -- see
+    ``_resolve_main_checkout_plans_dir``) and the real ``~/.hydra/repos.json``.
+
+    ``pytest_sessionstart`` snapshots; ``pytest_sessionfinish`` classifies,
+    emits non-fatal ``ConcurrentPlanWriterWarning``s and, on violations,
+    forces a non-zero exit status; ``pytest_terminal_summary`` prints the
+    per-file report. READ-ONLY against watched paths: only ``is_dir``,
+    ``is_file``, ``iterdir``, ``read_bytes`` (plus the local no-network
+    ``git rev-parse`` inside ``_watched_plans_dirs``). Pre-existing litter is
+    never flagged. The report does not claim which test wrote a file.
     """
-    watched_plans_dirs = _watched_plans_dirs()
-    before_plans_by_dir = {d: _snapshot_plans_dir(d) for d in watched_plans_dirs}
-    before_repos_sha = _snapshot_real_repos_json_sha256()
-    yield
-    after_plans_by_dir = {d: _snapshot_plans_dir(d) for d in watched_plans_dirs}
-    after_repos_sha = _snapshot_real_repos_json_sha256()
 
-    problems: list[str] = []
-    for plans_dir in watched_plans_dirs:
-        problems.extend(
-            _diff_plans_dir(
-                plans_dir,
-                before_plans_by_dir[plans_dir],
-                after_plans_by_dir[plans_dir],
+    def __init__(
+        self,
+        *,
+        plans_dirs: Callable[[], list[Path]] = _watched_plans_dirs,
+        repos_json: Path = _REAL_HOME_REPOS_JSON,
+        session_workflow_ids: Collection[str] = _SESSION_WORKFLOW_IDS,
+        install_capture: bool = True,
+    ) -> None:
+        self._plans_dirs_fn = plans_dirs
+        self._repos_json = repos_json
+        self._session_ids = session_workflow_ids
+        self._install_capture = install_capture
+        self._started = False
+        self._dirs: list[Path] = []
+        self._before_plans: dict[Path, dict[str, str]] = {}
+        self._before_repos: str | None = None
+        self.violations: list[str] = []
+        self.warnings: list[str] = []
+
+    def pytest_sessionstart(self, session) -> None:
+        if hasattr(session.config, "workerinput"):  # xdist worker
+            return
+        if self._install_capture:
+            _install_workflow_id_capture()
+        self._dirs = self._plans_dirs_fn()
+        self._before_plans = {d: _snapshot_plans_dir(d) for d in self._dirs}
+        self._before_repos = _snapshot_repos_json_sha256(self._repos_json)
+        self._started = True
+
+    def pytest_sessionfinish(self, session, exitstatus) -> None:
+        if not self._started:
+            return
+        violations: list[str] = []
+        warns: list[str] = []
+        for d in self._dirs:
+            v, w = _classify_plans_dir_changes(
+                d, self._before_plans[d], _snapshot_plans_dir(d), self._session_ids
+            )
+            violations.extend(v)
+            warns.extend(w)
+        violations.extend(
+            _diff_repos_json(
+                self._repos_json,
+                self._before_repos,
+                _snapshot_repos_json_sha256(self._repos_json),
             )
         )
-    problems.extend(
-        _diff_repos_json(_REAL_HOME_REPOS_JSON, before_repos_sha, after_repos_sha)
-    )
-    if problems:
-        pytest.fail(
-            "HERMETIC BOUNDARY VIOLATION -- a test wrote outside the "
-            "sandbox: " + "; ".join(problems),
-            pytrace=False,
+        self.violations, self.warnings = violations, warns
+        for text in warns:
+            session.config.issue_config_time_warning(
+                ConcurrentPlanWriterWarning(text), stacklevel=2
+            )
+        if violations and session.exitstatus == pytest.ExitCode.OK:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+    def pytest_terminal_summary(self, terminalreporter) -> None:
+        if not self.violations:
+            return
+        terminalreporter.write_sep(
+            "=",
+            "HERMETIC BOUNDARY VIOLATION -- a watched path changed during the "
+            "test session",
+            red=True,
         )
+        for line in self.violations:
+            terminalreporter.write_line(f"  - {line}", red=True)
+
+
+def pytest_configure(config) -> None:
+    if hasattr(config, "workerinput"):
+        return
+    config.pluginmanager.register(_PollutionGuardPlugin(), "hermetic-pollution-guard")
