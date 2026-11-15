@@ -33,7 +33,7 @@ See `HYDRA.md` for the master spec and `ARCHITECTURE.md` for the layered design.
 attended host cursor; only each squad's lead agent is mapped today
 (`hydra_core/native_packs.py`). `planning` authors the typed PLAN before any
 other squad is dispatched and cannot be selected by the router or `--squad`.
-The plan agents under `plugins/hydra/.claude/agents/` are generated: edit
+The plan agents under `plugins/hydra/agents/` are generated: edit
 `covenant/plan-*.cov` and rebuild, never the generated files. The five
 `marketing-*` packs are filesystem symlinks into the MarketBliss checkout.
 `rlm-gaming` is the **Arcade Crown** — RLM-Gaming's 20-agent game-development

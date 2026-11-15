@@ -37,7 +37,7 @@ This file describes the system as it is in the repository. The approved redesign
 
 **15 squads: 12 active and 3 stubs.** The five `marketing-*` packs are filesystem symlinks into the MarketBliss checkout (`squads/marketing-* → MarketBliss/squads/marketing-*`), so they share that pack's source of truth.
 
-The `planning` squad is a meta-squad: it authors the typed `PLAN` before any other squad is dispatched. The router and `--squad` cannot select it. Its three agents (`plan-author`, `plan-critic`, `plan-scribe`) are generated into `plugins/hydra/.claude/agents/` from `covenant/plan-*.cov`; see [`docs/covenant-pilot.md`](docs/covenant-pilot.md).
+The `planning` squad is a meta-squad: it authors the typed `PLAN` before any other squad is dispatched. The router and `--squad` cannot select it. Its three agents (`plan-author`, `plan-critic`, `plan-scribe`) are generated into `plugins/hydra/agents/` from `covenant/plan-*.cov`; see [`docs/covenant-pilot.md`](docs/covenant-pilot.md).
 
 Every squad declares — in its `squad.yaml`:
 - `agents:` the roster (slugs + role description + authority bounds)
