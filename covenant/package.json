@@ -8,6 +8,7 @@
   },
   "scripts": {
     "cov": "cov",
-    "test": "cov check --emitted --target claude --out ../plugins/hydra"
+    "build": "node scripts/sync-agents.mjs build",
+    "test": "node scripts/sync-agents.mjs check"
   }
 }

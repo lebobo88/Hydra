@@ -2,7 +2,7 @@
 description: "Multi-squad campaign template: routes executive + creative + engineering in one workflow with explicit dependency wiring. With the plan phase on, a campaign's dependency chain becomes a judged PLAN with real depends_on rather than prose."
 argument-hint: "<campaign goal> [--launch-date YYYY-MM-DD] [--budget <usd>] [--repos id,id,...]"
 model: opus
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # /hydra:campaign

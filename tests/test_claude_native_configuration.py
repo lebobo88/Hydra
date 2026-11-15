@@ -195,9 +195,11 @@ def test_operator_skills_use_canonical_namespace_without_project_duplicates() ->
         f"namespace, but found entries: {offenders}"
     )
     # commit 88a451b allowed model invocation for `run` and `drive` so the
-    # engine can invoke them directly; every other operator skill still
-    # requires an explicit human invocation.
-    MODEL_INVOCABLE_SKILLS = {"run", "drive"}
+    # engine can invoke them directly; commit 1895d53 also allowed model
+    # invocation for `approve`, `resume` and `campaign` (operator decision:
+    # the orchestrator may invoke them). Every other operator skill still
+    # requires explicit human invocation ('disable-model-invocation: true').
+    MODEL_INVOCABLE_SKILLS = {"run", "drive", "approve", "resume", "campaign"}
     assert MODEL_INVOCABLE_SKILLS <= expected
     for skill in expected:
         body = (PLUGIN_ROOT / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")

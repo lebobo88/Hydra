@@ -2,7 +2,7 @@
 description: "Approve a paused HITL gate and resume the supervisor graph."
 argument-hint: "<workflow_id> [--note '...']"
 model: sonnet
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # /hydra:approve

@@ -2,6 +2,8 @@
 
 Every number below comes from a command run on branch `claude/project-thread-o9s6s4`. "Original" means the files at Hydra `main` 397e34c. "Before" and "after" in the cost section are the measured runs described there.
 
+> **Layout update.** The three plan agents now live in `plugins/hydra/agents/` (`plan-author.md`, `plan-critic.md`, `plan-scribe.md`), where Claude Code registers them as `hydra:plan-author`, `hydra:plan-critic` and `hydra:plan-scribe`; a live session did not register them under `plugins/hydra/.claude/agents/`. They were moved with `git mv`, byte for byte. The Covenant Claude target fixes its output at `<out>/.claude/agents/` and has no setting for it, so `covenant/scripts/sync-agents.mjs` adapts it. `npm run build` in `covenant/` runs `cov build --target claude` into the git-ignored `covenant/.staging/` and copies the three emitted files byte for byte to `plugins/hydra/agents/`. `npm test` regenerates into staging and exits 1 if any installed `plan-*.md` is missing or differs from the emitted bytes (CRLF in a Windows checkout is normalised to LF before comparing, which is what git stores). The vendored `cov` is unchanged. The sections below are the dated record of the pilot and keep the paths as they were then.
+
 ## Squad and scope
 
 - Squad `planning`: Pyrrha (`plan-author`), Momus (`plan-critic`), Theseus (`plan-scribe`). It is the only Hydra squad whose agents (`plugins/hydra/agents/plan-*.md`) and pipeline (`plugins/hydra/skills/plan/SKILL.md`, "The three-head pipeline") live in this repository. Every other squad's agents live in its source pack.
@@ -79,7 +81,7 @@ What a maintainer edits by hand for this squad's agents and pipeline (`wc -l -c`
 
 The after rows are counted after the read-only follow-up (below). At 50893a2 the three sources were 82 lines and 4051 bytes, 71 and 3198, and 71 and 3340, and the after total was 321 lines and 15411 bytes. This report gave 15440 then, because it counted `plan.cov` at 3273 bytes, its size at 73b27d8, not the 3244 bytes it has had since 42a18ab (`git show <commit>:covenant/plan.cov | wc -c`).
 
-Generated, not edited by hand (counted separately): `plugins/hydra/.claude/agents/plan-author.md` 105 lines and 4453 bytes, `plan-critic.md` 96 and 3628, `plan-scribe.md` 96 and 3766, for a total of 297 lines and 11847 bytes (252 lines and 11022 bytes at 50893a2). Also `covenant/package-lock.json` (521 lines, 17921 bytes, written by npm) and the vendored tarball and its `.sha256`.
+Generated, not edited by hand (counted separately): `plugins/hydra/agents/plan-author.md` 105 lines and 4453 bytes, `plan-critic.md` 96 and 3628, `plan-scribe.md` 96 and 3766, for a total of 297 lines and 11847 bytes (252 lines and 11022 bytes at 50893a2). Also `covenant/package-lock.json` (521 lines, 17921 bytes, written by npm) and the vendored tarball and its `.sha256`.
 
 Port alone, without the flow (commit 6a6a143): the three `.cov` sources are 217 lines and 10249 bytes against the originals' 199 lines and 8744 bytes, which is 1505 bytes (17.2%) larger. Each source adds the import comment line, an empty `covenant` block, the two `TODO(import)` lines, the `under` clause and the `extra claude` line. After the follow-up the three sources are 227 lines and 11213 bytes, 2469 bytes (28.2%) larger than the originals: the `extra claude` line and the rules `TODO(import)` are gone, and each covenant gains a comment and two invariants. The SKILL.md pipeline prose stays because it documents Hydra's engine path, which does not run the flow.
 
