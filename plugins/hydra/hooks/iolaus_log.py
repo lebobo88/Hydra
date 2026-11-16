@@ -31,7 +31,11 @@ def main() -> int:
     except json.JSONDecodeError:
         return 0  # never fail the post-hook
 
+    if not isinstance(payload, dict):
+        return 0
     tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return 0
     target = (
         tool_input.get("subagent_type")
         or tool_input.get("agent")
@@ -48,6 +52,7 @@ def main() -> int:
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "post_dispatch_session",
         "target": target,
+        "description": str(tool_input.get("description") or "")[:200],
         "tool": payload.get("tool_name"),
         "status": payload.get("status", "unknown"),
     }
