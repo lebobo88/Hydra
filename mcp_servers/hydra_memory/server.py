@@ -20,6 +20,7 @@ makes Hydra usable without external dependencies during early bootstrap.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from hydra_core.memory import (  # noqa: E402
     resolve_episodic, search_episodic, tag_episodic,
 )
 from hydra_core.eights import ALL_CELLS  # noqa: E402
+from hydra_core.inproc_tool_catalog import HYDRA_MEMORY_TOOL_SPECS  # noqa: E402
 
 
 # ---------- workflow status surface (campaign mesh-console-unification C2) ----
@@ -435,129 +437,10 @@ def _tool_handlers() -> dict[str, callable]:
 # Real advertised schemas. An empty `{"type":"object"}` strips param types and
 # makes callers (incl. the gateway) mangle nested objects / numeric args; these
 # give every memory tool a typed surface.
+# Advertised schemas live in hydra_core/inproc_tool_catalog.py (single source
+# of truth shared with hydra_core.toolshed; Hydra#81). Derived, never hand-written.
 _CELL_ENUM = sorted(ALL_CELLS)
-_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
-    "hydra-mem.write_episodic": {
-        "description": "Append a payload to episodic memory; returns a MemoryRef key.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "kind": {"type": "string", "default": "note"},
-                "payload": {"type": "object"},
-                "key": {"type": "string"},
-                "cells": {"type": "array", "items": {"type": "string",
-                                                     "enum": _CELL_ENUM}},
-                "origin_squad": {"type": "string"},
-            },
-            "required": ["workflow_id"],
-        },
-    },
-    "hydra-mem.read_episodic": {
-        "description": "Resolve an episodic key to its full row.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"key": {"type": "string"}},
-            "required": ["key"],
-        },
-    },
-    "hydra-mem.list_workflow": {
-        "description": "List every episodic row for a workflow_id.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"workflow_id": {"type": "string"}},
-            "required": ["workflow_id"],
-        },
-    },
-    "hydra-mem.semantic_search": {
-        "description": ("Full-text search over episodic memory by query "
-                        "(LIKE across payload/kind/key). Optional workflow_id "
-                        "and cell narrow the scan."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "k": {"type": "integer", "minimum": 1, "maximum": 50,
-                      "default": 5},
-                "workflow_id": {"type": "string"},
-                "cell": {"type": "string", "enum": _CELL_ENUM},
-                "index": {"type": "string"},
-                "embedding": {"type": "array", "items": {"type": "number"}},
-            },
-        },
-    },
-    "hydra-mem.query_eights": {
-        "description": "Query episodic rows tagged with a TheEights cell.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "cell": {"type": "string", "enum": _CELL_ENUM},
-                "limit": {"type": "integer", "minimum": 1, "default": 50},
-                "workflow_id": {"type": "string"},
-            },
-            "required": ["cell"],
-        },
-    },
-    "hydra-mem.tag_memory": {
-        "description": "Attach TheEights cells to an existing episodic row.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string"},
-                "cells": {"type": "array", "items": {"type": "string",
-                                                     "enum": _CELL_ENUM}},
-                "replace": {"type": "boolean", "default": False},
-            },
-            "required": ["key"],
-        },
-    },
-    "hydra-mem.ping": {
-        "description": ("No-arg liveness probe: returns ok + episodic DB path. "
-                        "Used by AgentMesh's mcp-tool-call healthProbe."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-    "hydra-mem.workflows_list": {
-        "description": ("Read-only list of workflows from the LangGraph "
-                        "checkpoint store (phase, squads, pending-HITL flag), "
-                        "newest first."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200,
-                          "default": 50},
-            },
-        },
-    },
-    "hydra-mem.workflow_status": {
-        "description": ("Read-only live state of one workflow: phase, budget, "
-                        "tasks, pending_hitl, envelope/verdict counts."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"workflow_id": {"type": "string"}},
-            "required": ["workflow_id"],
-        },
-    },
-    "hydra-mem.squad_list": {
-        "description": ("Read-only discovered squad packs: roster, gates, "
-                        "accepts/emits envelope types, best_of_n."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-    "hydra-mem.hitl_pending": {
-        "description": ("Read-only pending HITL gates across all workflows "
-                        "(workflow_id + gate_node + the HITL payload). The "
-                        "live-truth complement to TheEights' hitl_queue."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-}
+_TOOL_SCHEMAS: dict[str, dict[str, Any]] = copy.deepcopy(HYDRA_MEMORY_TOOL_SPECS)
 
 
 # ---------- optional TheEights federation (opt-in) ----------
