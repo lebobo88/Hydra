@@ -213,6 +213,97 @@ def _hitl_backlog_line(rows: list | None, threshold: int) -> str:
     return f"OK:   eights HITL pending={len(rows)} (threshold={threshold})"
 
 
+def _doctor_head_lines(
+    packs,
+    *,
+    resolve_all: Callable[..., Any] | None = None,
+    native_packs: Any = None,
+) -> tuple[list[str], int]:
+    """Head-registry diagnostics for ``doctor``: ``(lines, fail_count)``.
+
+    Pure: prints nothing.  ``fail_count`` is the number of real failure lines;
+    the trailing summary line is NOT counted (it restates them).  Reads only
+    each record's ``frontmatter_name`` -- it never re-reads an agent file.
+    """
+    lines: list[str] = []
+    fails = 0
+    warns = 0
+    heads = 0
+    unavailable = "pack checkout unavailable:"
+
+    def fail(text: str) -> None:
+        nonlocal fails
+        fails += 1
+        lines.append(f"FAIL: {text}")
+
+    def warn(text: str) -> None:
+        nonlocal warns
+        warns += 1
+        lines.append(f"WARN: {text}")
+
+    native_slugs: list[str] = []
+    try:
+        # Lazy imports keep ``cli`` free of a module-level head_registry
+        # import (head_registry itself imports ``cli`` lazily).  They sit
+        # inside the guard so an import failure is a visible FAIL.
+        if resolve_all is None:
+            from .head_registry import resolve_all_heads as resolve_all
+        if native_packs is None:
+            from .native_packs import NATIVE_PACKS as native_packs
+        for slug, pack in packs.items():
+            try:
+                if getattr(pack, "entrypoint", None) == "claude-native":
+                    native_slugs.append(slug)
+                    if slug not in native_packs:
+                        fail(f"pack {slug}: claude-native pack has no "
+                             f"NATIVE_PACKS entry")
+            except Exception as e:  # noqa: BLE001 -- doctor must show bugs
+                fail(f"head registry check raised {type(e).__name__}: {e} "
+                     f"(squad={slug})")
+        records = list(resolve_all(packs))
+        heads = len(records)
+        by_squad: dict[str, list[Any]] = {}
+        for rec in records:
+            by_squad.setdefault(rec.squad, []).append(rec)
+        for squad, recs in by_squad.items():
+            try:
+                reported_pack = False
+                for rec in recs:
+                    err = rec.error or ""
+                    who = f"{rec.squad}/{rec.head}"
+                    if rec.rule == "unresolved" and err.startswith(unavailable):
+                        if not reported_pack:
+                            reported_pack = True
+                            msg = err[len(unavailable):].strip()
+                            warn(f"pack {squad}: checkout unavailable — {msg}")
+                        continue
+                    if rec.rule == "unresolved":
+                        fail(f"head {who}: no agent file resolved")
+                    elif (rec.agent_path is not None
+                          and isinstance(rec.frontmatter_name, str)
+                          and rec.frontmatter_name
+                          and rec.frontmatter_name != rec.agent_name):
+                        fail(f"head {who}: frontmatter name "
+                             f"'{rec.frontmatter_name}' != resolved agent "
+                             f"'{rec.agent_name}'")
+                    if rec.rule != "unresolved":
+                        if rec.stale_agent_file:
+                            warn(f"head {who}: declared agent_file does not "
+                                 f"resolve ({rec.stale_agent_file})")
+                        if err:
+                            warn(f"head {who}: {err}")
+            except Exception as e:  # noqa: BLE001 -- doctor must show bugs
+                fail(f"head registry check raised {type(e).__name__}: {e} "
+                     f"(squad={squad})")
+    except Exception as e:  # noqa: BLE001 -- doctor must show bugs
+        fail(f"head registry check raised {type(e).__name__}: {e} (squad=*)")
+
+    summary = (f"head registry  packs={len(native_slugs)} heads={heads} "
+               f"fail={fails} warn={warns}")
+    lines.append(("OK:   " if fails == 0 else "FAIL: ") + summary)
+    return lines, fails
+
+
 def _cmd_doctor(args) -> int:
     project = Path(args.project) if args.project else Path.cwd()
     fail_count = 0
@@ -331,6 +422,12 @@ def _cmd_doctor(args) -> int:
     # honest — a real FAIL above still returns non-zero.
     if getattr(args, "quick", False):
         return 0 if fail_count == 0 else 1
+
+    # --- head registry (full doctor only; --quick runs on every hook) -------
+    _head_lines, _head_fails = _doctor_head_lines(packs)
+    for _line in _head_lines:
+        print(_line)
+    fail_count += _head_fails
 
     # --- runtime deps -------------------------------------------------------
     try:
@@ -3717,20 +3814,32 @@ def _skill_pack_checkout(pack) -> Path | None:
         return None
 
 
-def _agent_frontmatter_name(agent_path: Path) -> str | None:
-    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+def _read_agent_frontmatter(agent_path: Path) -> tuple[str | None, str | None]:
+    """Read an agent file once; return ``(name, error)``.
+
+    ``name`` is the top-level ``name:`` of the YAML frontmatter, or ``None``.
+    ``error`` is ``"<ExcType>: <msg>"`` when the single read raised ``OSError``
+    (or a subclass), else ``None``.  Decoding cannot raise ``UnicodeError``
+    because ``errors="replace"`` substitutes U+FFFD.  Any non-``OSError`` (for
+    example ``ValueError`` for a path with a NUL byte) propagates.
+    """
     try:
         text = agent_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
     if not text.startswith("---"):
-        return None
+        return None, None
     end = text.find("\n---", 3)
     block = text[3:end] if end != -1 else text[3:]
     for line in block.splitlines():
         if line.startswith("name:"):  # top-level key only (no indent)
-            return line[len("name:"):].strip().strip("\"'") or None
-    return None
+            return (line[len("name:"):].strip().strip("\"'") or None), None
+    return None, None
+
+
+def _agent_frontmatter_name(agent_path: Path) -> str | None:
+    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+    return _read_agent_frontmatter(agent_path)[0]
 
 
 def _resolve_claude_skill_host_action(pack) -> dict:
