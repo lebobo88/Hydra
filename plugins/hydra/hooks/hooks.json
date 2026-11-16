@@ -64,7 +64,7 @@
         ]
       },
       {
-        "matcher": "Task",
+        "matcher": "Agent",
         "hooks": [
           {
             "type": "command",
@@ -74,7 +74,7 @@
         ]
       },
       {
-        "matcher": "mcp__hydra_memory__.*",
+        "matcher": "^mcp__(hydra_gateway__)?hydra_memory__.+$",
         "hooks": [
           {
             "type": "command",
@@ -84,7 +84,7 @@
         ]
       },
       {
-        "matcher": "mcp__executive_suite__.*",
+        "matcher": "^mcp__(hydra_gateway__)?executive_suite__.+$",
         "hooks": [
           {
             "type": "command",
@@ -94,7 +94,7 @@
         ]
       },
       {
-        "matcher": "mcp__rlm_creative__.*",
+        "matcher": "^mcp__(hydra_gateway__)?rlm_creative__.+$",
         "hooks": [
           {
             "type": "command",
@@ -116,7 +116,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Task",
+        "matcher": "Agent",
         "hooks": [
           {
             "type": "command",
@@ -126,7 +126,7 @@
         ]
       },
       {
-        "matcher": "mcp__hydra_memory__write.*",
+        "matcher": "^mcp__(hydra_gateway__)?hydra_memory__hydra-mem_write_.+$",
         "hooks": [
           {
             "type": "command",
@@ -136,7 +136,7 @@
         ]
       },
       {
-        "matcher": "mcp__(executive_suite|rlm_creative|senate)__.*output\\.write.*",
+        "matcher": "^mcp__(hydra_gateway__)?(executive_suite__es|rlm_creative__rlm|senate__senate)_output_write$",
         "hooks": [
           {
             "type": "command",

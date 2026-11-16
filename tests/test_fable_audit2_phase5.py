@@ -656,26 +656,26 @@ def test_plugin_uses_standard_hooks_directory():
 
 
 def test_hooks_json_has_task_pretooluse():
-    """Plugin hooks.json must have a Task PreToolUse entry (iolaus_check)."""
+    """Plugin hooks.json must have a Agent PreToolUse entry (iolaus_check)."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     pre = cfg.get("hooks", {}).get("PreToolUse", [])
-    task_groups = [g for g in pre if g.get("matcher") == "Task"]
-    assert task_groups, "No Task PreToolUse entry in plugin hooks.json"
+    task_groups = [g for g in pre if g.get("matcher") == "Agent"]
+    assert task_groups, "No Agent PreToolUse entry in plugin hooks.json"
     commands = [h.get("command", "") for g in task_groups for h in g.get("hooks", [])]
     assert any("iolaus_check" in cmd for cmd in commands), (
-        f"iolaus_check not found in Task PreToolUse hooks: {commands}"
+        f"iolaus_check not found in Agent PreToolUse hooks: {commands}"
     )
 
 
 def test_hooks_json_has_task_posttooluse():
-    """Plugin hooks.json must have a Task PostToolUse entry (iolaus_log)."""
+    """Plugin hooks.json must have a Agent PostToolUse entry (iolaus_log)."""
     cfg = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
     post = cfg.get("hooks", {}).get("PostToolUse", [])
-    task_groups = [g for g in post if g.get("matcher") == "Task"]
-    assert task_groups, "No Task PostToolUse entry in plugin hooks.json"
+    task_groups = [g for g in post if g.get("matcher") == "Agent"]
+    assert task_groups, "No Agent PostToolUse entry in plugin hooks.json"
     commands = [h.get("command", "") for g in task_groups for h in g.get("hooks", [])]
     assert any("iolaus_log" in cmd for cmd in commands), (
-        f"iolaus_log not found in Task PostToolUse hooks: {commands}"
+        f"iolaus_log not found in Agent PostToolUse hooks: {commands}"
     )
 
 
