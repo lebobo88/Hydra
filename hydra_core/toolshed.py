@@ -16,9 +16,12 @@ Usage from squad_node or supervisor::
 """
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from .inproc_tool_catalog import HYDRA_CONTROL_TOOL_SPECS, HYDRA_MEMORY_TOOL_SPECS
 
 
 @dataclass
@@ -361,11 +364,8 @@ AGENTSMITH_TOOLS = [
 ]
 
 
-HYDRA_MEMORY_TOOLS = [
-    "hydra-mem.write_episodic", "hydra-mem.read_episodic",
-    "hydra-mem.list_workflow", "hydra-mem.semantic_search",
-    "hydra-mem.query_eights", "hydra-mem.tag_memory",
-]
+# Derived from the shared in-process catalog (Hydra#81).
+HYDRA_MEMORY_TOOLS = list(HYDRA_MEMORY_TOOL_SPECS)
 
 EXECUTIVE_SUITE_TOOLS = [
     "es.roster.list", "es.agent.get", "es.skill.list", "es.skill.get",
@@ -417,22 +417,9 @@ XENIA_TICKETS_TOOLS = [
     "xenia-tickets.execute_approved", "xenia-tickets.ping",
 ]
 
-HYDRA_CONTROL_TOOLS = [
-    "hydra.control.ping", "hydra.workflow.launch", "hydra.workflow.plan",
-    "hydra.workflow.step", "hydra.workflow.submit_host_result",
-    "hydra.workflow.finalize",
-    "hydra.workflow.resume", "hydra.workflow.submit_envelopes",
-    "hydra.cockpit.audit",
-    # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
-    "hydra.venom.cross_check",
-    "hydra.squad.list",
-    # WS1-C: read-only repo allow-list tools. register/unregister are
-    # CLI-only (`hydra repo register`) and deliberately NOT listed here.
-    "hydra.repo.list",
-    "hydra.repo.resolve",
-    "hydra.envelope.record",
-    "hydra.telemetry.tail",
-]
+# Derived from the shared in-process catalog (Hydra#81). repo register/unregister are
+# CLI-only (`hydra repo register`) and deliberately NOT in the catalog.
+HYDRA_CONTROL_TOOLS = list(HYDRA_CONTROL_TOOL_SPECS)
 
 # Optional / 3rd-party: blender-mcp (uvx blender-mcp; socket :9876 / MCP bridge
 # :7700).  Declared by garland/engineering/rlm-gaming squad.yaml RBAC; the
@@ -659,356 +646,15 @@ SCHEMA_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "required": ["envelope", "query"],
         },
     },
+    # Derived from the shared in-process catalog (Hydra#81): server schemas are canonical.
     "hydra_memory": {
-        "hydra-mem.write_episodic": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "kind": {"type": "string"},
-                "payload": {"type": "object"},
-                "key": {"type": "string"},
-                "cells": {"type": "array", "items": {"type": "string"}},
-                "origin_squad": {"type": "string"},
-            },
-            "required": ["workflow_id"],
-        },
-        "hydra-mem.semantic_search": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string",
-                          "description": "Full-text query over episodic memory."},
-                "k": {"type": "integer", "minimum": 1, "maximum": 50},
-                "workflow_id": {"type": "string"},
-                "cell": {"type": "string"},
-                "index": {"type": "string"},
-                "embedding": {"type": "array", "items": {"type": "number"}},
-            },
-        },
+        name: copy.deepcopy(spec["inputSchema"])
+        for name, spec in HYDRA_MEMORY_TOOL_SPECS.items()
     },
+    # Derived from the shared in-process catalog (Hydra#81): server schemas are canonical.
     "hydra_control": {
-        "hydra.control.ping": {
-            "type": "object",
-            "properties": {},
-        },
-        "hydra.workflow.resume": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "approve",
-                        "reject",
-                        "modify-budget",
-                        "force-dispatch",
-                        "change-squads",
-                        "recover-stalled-stage",
-                        "modify-plan",
-                    ],
-                },
-                "option": {"type": "string"},
-                "critique_ref": {
-                    "type": "string",
-                    "description": (
-                        "modify-plan only: a file path or repo:artifact:<path> "
-                        "MemoryRef key naming the operator's revision critique. "
-                        "The critique text itself must never be passed via "
-                        "'option' -- that field is character- and length-bounded."
-                    ),
-                },
-            },
-            "required": ["workflow_id", "action"],
-        },
-        "hydra.workflow.launch": {
-            "type": "object",
-            "properties": {
-                "goal": {"type": "string"},
-                "squad": {
-                    "type": "string",
-                    "description": "Comma-separated squad slugs to force-select (optional).",
-                },
-                "budget": {
-                    "type": "number",
-                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
-                },
-                "workflow_id": {
-                    "type": "string",
-                    "description": "Pre-allocated workflow id (optional).",
-                },
-                "risk": {
-                    "type": "string",
-                    "enum": ["low", "medium", "high"],
-                    "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
-                },
-                "repo": {
-                    "type": "string",
-                    "description": (
-                        "Single allow-listed repo id for engineering targeting "
-                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
-                        "validated at intake). Mutually exclusive with repos."
-                    ),
-                },
-                "repos": {
-                    "type": "string",
-                    "description": (
-                        "Comma-separated allow-listed repo ids for fleet mode, "
-                        ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo."
-                    ),
-                },
-                "repo_subpath": {
-                    "type": "string",
-                    "description": "Repo-relative engineering target under repo/repos (forwarded as --subdir).",
-                },
-            },
-            "required": ["goal"],
-        },
-        "hydra.workflow.plan": {
-            "type": "object",
-            "properties": {
-                "goal": {"type": "string"},
-                "squad": {
-                    "type": "string",
-                    "description": "Comma-separated squad slugs to force-select (optional).",
-                },
-                "budget": {
-                    "type": "number",
-                    "description": "Budget cap in USD (optional). Must be finite: NaN/Infinity are rejected.",
-                },
-                "workflow_id": {
-                    "type": "string",
-                    "description": "Pre-allocated workflow id (optional).",
-                },
-                "risk": {
-                    "type": "string",
-                    "enum": ["low", "medium", "high"],
-                    "description": "Operator risk tolerance hint forwarded as --risk to the CLI (optional).",
-                },
-                "rigor": {
-                    "type": "string",
-                    "enum": ["trivial", "standard", "major"],
-                    "description": (
-                        "Operator override of node_planner's computed plan_rigor, "
-                        "forwarded as --rigor to the CLI (optional). Wins over the "
-                        "computed value; a downgrade from the computed value is "
-                        "recorded as a hitl_history event."
-                    ),
-                },
-                "repo": {
-                    "type": "string",
-                    "description": (
-                        "Single allow-listed repo id for engineering targeting "
-                        "(forwarded as --repo; pre-seeded onto HydraState.target_repo_id, "
-                        "validated at intake). Mutually exclusive with repos."
-                    ),
-                },
-                "repos": {
-                    "type": "string",
-                    "description": (
-                        "Comma-separated allow-listed repo ids for fleet mode, "
-                        ">=2 distinct ids (forwarded as --repos). Mutually exclusive with repo."
-                    ),
-                },
-                "repo_subpath": {
-                    "type": "string",
-                    "description": "Repo-relative engineering target under repo/repos (forwarded as --subdir).",
-                },
-            },
-            "required": ["goal"],
-        },
-        "hydra.workflow.step": {
-            "type": "object",
-            "properties": {"workflow_id": {"type": "string"}},
-            "required": ["workflow_id"],
-        },
-        "hydra.workflow.finalize": {
-            "type": "object",
-            "properties": {"workflow_id": {"type": "string"}},
-            "required": ["workflow_id"],
-        },
-        "hydra.repo.list": {
-            "type": "object",
-            "properties": {},
-        },
-        "hydra.repo.resolve": {
-            "type": "object",
-            "properties": {
-                "repo_id": {"type": "string", "description": "Allow-listed repo id to resolve."},
-            },
-            "required": ["repo_id"],
-        },
-        "hydra.workflow.submit_host_result": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "run_id": {"type": "string"},
-                "call_key": {"type": "string",
-                             "description": "The host_action.call_key being fulfilled."},
-                "result": {"type": "object",
-                           "description": "The host subagent's result object."},
-            },
-            "required": ["workflow_id", "run_id", "call_key", "result"],
-        },
-        "hydra.workflow.submit_envelopes": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "envelopes": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": (
-                        "Typed Hydra envelopes the host-run skill emitted "
-                        "(each with id/type/origin_squad/workflow_id, e.g. a "
-                        "DEV_TASK with instructions/repo/pp_team)."
-                    ),
-                },
-            },
-            "required": ["workflow_id", "envelopes"],
-        },
-        "hydra.cockpit.audit": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "description": "The cockpit write action (e.g. launch, approve, reject).",
-                },
-                "actor": {
-                    "type": "string",
-                    "description": "Fixed server-side actor identity (e.g. 'hydra-cockpit').",
-                },
-                "project": {
-                    "type": "string",
-                    "description": "Fixed server-side project (e.g. 'Hydra').",
-                },
-                "trace_id": {
-                    "type": "string",
-                    "description": "Per-action trace id for audit lineage (fresh per write).",
-                },
-                "workflow_id": {
-                    "type": "string",
-                    "description": (
-                        "Hydra workflow id (optional — present for resume/launch actions). "
-                        "Validated with _WORKFLOW_ID_RE when supplied."
-                    ),
-                },
-                "option": {
-                    "type": "string",
-                    "description": "Optional action option (e.g. budget amount, squad list).",
-                },
-                "detail": {
-                    "type": "string",
-                    "description": "Optional human-readable detail for the audit ledger.",
-                },
-            },
-            "required": ["action", "actor", "project", "trace_id"],
-        },
-        # F32-H: governance-federation tools (AgentSmith HydraBridge contract).
-        "hydra.venom.cross_check": {
-            "type": "object",
-            "properties": {
-                "capability": {
-                    "type": "string",
-                    "description": "Registered venom capability name (e.g. 'shell.destructive').",
-                },
-                "context": {
-                    "type": "object",
-                    "description": "Proposed invocation context / args (optional).",
-                },
-                "args": {
-                    "type": "object",
-                    "description": "Alias for context (bridge compatibility).",
-                },
-            },
-            "required": ["capability"],
-        },
-        "hydra.squad.list": {
-            "type": "object",
-            "properties": {},
-        },
-        "hydra.envelope.record": {
-            "type": "object",
-            "additionalProperties": True,
-            "description": (
-                "Additional properties beyond the base fields are forwarded "
-                "to the envelope via a per-type allow-list; reserved outer "
-                "fields (id, type, origin_squad, target_squad, workflow_id, "
-                "created_at, parent_id) are always set from base args and can "
-                "never be overwritten by additional properties."),
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "description": "Envelope type / kind (bridge field; use 'type' for Hydra-native).",
-                },
-                "type": {
-                    "type": "string",
-                    "description": "Envelope type (Hydra-native; alias for kind).",
-                },
-                "from_squad": {
-                    "type": "string",
-                    "description": "Origin squad (bridge field).",
-                },
-                "origin_squad": {
-                    "type": "string",
-                    "description": "Origin squad (Hydra-native; alias for from_squad).",
-                },
-                "to_squad": {
-                    "type": "string",
-                    "description": "Target squad (optional).",
-                },
-                "workflow_id": {
-                    "type": "string",
-                    "description": "Workflow id for audit lineage.",
-                },
-                "payload": {
-                    "description": (
-                        "Envelope payload blob (any). For typed envelopes, "
-                        "type-specific required fields may be nested here "
-                        "and will be promoted to the envelope top level. "
-                        "Keys 'workflow_id' and 'type' inside payload are "
-                        "never promoted (anti-shadow guard)."),
-                },
-                "decision": {
-                    "type": "string",
-                    "description": "DECISION_RECORD: decision text (required for that type).",
-                },
-                "rationale": {
-                    "type": "string",
-                    "description": "DECISION_RECORD: rationale text (required for that type).",
-                },
-                "payload_envelope_id": {
-                    "type": "string",
-                    "description": "HANDOFF: UUID of the artifact being handed off (required for that type).",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "HITL_REQUEST: reason literal (required for that type).",
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "HITL_REQUEST: summary text (required for that type).",
-                },
-                "options": {
-                    "type": "array",
-                    "description": "HITL_REQUEST: option strings (required for that type).",
-                },
-            },
-        },
-        "hydra.telemetry.tail": {
-            "type": "object",
-            "properties": {
-                "workflow_id": {
-                    "type": "string",
-                    "description": "Workflow id to tail (optional — tails recent workflows if absent).",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max events to return (default 50, max 500).",
-                },
-                "since": {
-                    "type": "string",
-                    "description": "Cursor from a prior tail call — returns only events after this.",
-                },
-            },
-        },
+        name: copy.deepcopy(spec["inputSchema"])
+        for name, spec in HYDRA_CONTROL_TOOL_SPECS.items()
     },
     # E2-39: the cross-vendor judge/generator tools take a REQUIRED `cwd`.
     # Without a hand-seed the gateway advertised them parameterless whenever
