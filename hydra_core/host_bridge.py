@@ -2180,7 +2180,12 @@ def _trace(cursor: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
     if not wf:
         return
     try:
-        _telemetry.emit(Path(cursor["project_path"]), wf, kind,
+        # Squad cursors point project_path at the pack dir (subagent cwd); their
+        # telemetry belongs in the Hydra project, recorded as project_root.
+        trace_root = cursor["project_path"]
+        if cursor.get("kind") == "squad" and cursor.get("project_root"):
+            trace_root = cursor["project_root"]
+        _telemetry.emit(Path(trace_root), wf, kind,
                         {"run_id": cursor.get("run_id"), **payload})
     except Exception:  # noqa: BLE001 — never crash the driver on a trace write
         pass
@@ -4305,6 +4310,7 @@ def begin_squad_stage(
         "squad_slug": squad_slug,
         "entrypoint": entrypoint,
         "project_path": pack_cwd,
+        "project_root": str(project_root),
         "request_text": request_text,
         "state": "await_squad_agent",
         "cost_usd": 0.0,
