@@ -583,6 +583,62 @@ def test_squad_stage_duplicate_submit_is_exactly_once(tmp_path):
     assert r2["cost_usd"] == pytest.approx(0.05)
 
 
+def _trace_events(root, wf):
+    f = Path(root) / ".hydra" / wf / "trace.jsonl"
+    assert f.exists(), f"missing trace file {f}"
+    return [json.loads(line)["kind"] for line in
+            f.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_squad_cursor_trace_goes_to_project_root_not_pack(tmp_path):
+    project = tmp_path / "hydra_project"
+    pack = tmp_path / "pack"
+    project.mkdir()
+    pack.mkdir()
+    before = sorted(pack.rglob("*"))
+    disp = FakeDispatcher()
+    res = host_bridge.begin_squad_stage(
+        workflow_id="wf-trace", task_id="task-tr", squad_slug="marketing-strategy",
+        entrypoint="claude-skill", lead_agent="brand-strategist",
+        pack_cwd=str(pack), request_text="draft the brand brief",
+        project_root=str(project))
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="squad-task-tr-0",
+        result={"text": "brief", "cost_usd": 0.01})
+    kinds = _trace_events(project, "wf-trace")
+    assert "attended.squad_stage_started" in kinds
+    assert "attended.squad_result_applied" in kinds
+    assert not (pack / ".hydra").exists()
+    assert sorted(pack.rglob("*")) == before
+    # The subagent still runs in the pack directory.
+    begin = host_bridge.begin_squad_stage(
+        workflow_id="wf-trace2", task_id="task-tr2", squad_slug="marketing-strategy",
+        entrypoint="claude-skill", lead_agent="brand-strategist",
+        pack_cwd=str(pack), request_text="x", project_root=str(project))
+    assert begin["host_action"]["cwd"] == str(pack)
+
+
+def test_squad_cursor_without_project_root_falls_back_to_project_path(tmp_path):
+    a = tmp_path / "a"
+    a.mkdir()
+    cursor = {"kind": "squad", "workflow_id": "wf-legacy", "run_id": "r",
+              "project_path": str(a)}
+    host_bridge._trace(cursor, "attended.legacy", {})
+    assert _trace_events(a, "wf-legacy") == ["attended.legacy"]
+
+
+def test_engineering_cursor_trace_root_unchanged(tmp_path):
+    a = tmp_path / "A"
+    b = tmp_path / "B"
+    a.mkdir()
+    b.mkdir()
+    cursor = {"workflow_id": "wf-eng", "run_id": "r",
+              "project_path": str(a), "project_root": str(b)}
+    host_bridge._trace(cursor, "attended.eng_event", {})
+    assert _trace_events(a, "wf-eng") == ["attended.eng_event"]
+    assert not (b / ".hydra").exists()
+
+
 # --------------------------------------------------------------------------- #
 # Fix-1b: idempotency markers (verdict_recorded_for / smoke_result_for)       #
 # --------------------------------------------------------------------------- #
