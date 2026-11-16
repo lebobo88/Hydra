@@ -44,5 +44,10 @@ squads/marketing-research
 squads/marketing-strategy
 .tmp-pytest/
 
+# Engine-written plan artifacts (docs/plans/<goal-slug>-<8 hex>.html, one per
+# workflow plan revision). They are the plan record for their workflow and stay
+# on disk; hand-authored plans in docs/plans/ have no hex suffix and are tracked.
+docs/plans/*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].html
+
 # Ephemeral scratch artifacts (never track)
 .scratch/
