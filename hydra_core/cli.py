@@ -3717,20 +3717,32 @@ def _skill_pack_checkout(pack) -> Path | None:
         return None
 
 
-def _agent_frontmatter_name(agent_path: Path) -> str | None:
-    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+def _read_agent_frontmatter(agent_path: Path) -> tuple[str | None, str | None]:
+    """Read an agent file once; return ``(name, error)``.
+
+    ``name`` is the top-level ``name:`` of the YAML frontmatter, or ``None``.
+    ``error`` is ``"<ExcType>: <msg>"`` when the single read raised ``OSError``
+    (or a subclass), else ``None``.  Decoding cannot raise ``UnicodeError``
+    because ``errors="replace"`` substitutes U+FFFD.  Any non-``OSError`` (for
+    example ``ValueError`` for a path with a NUL byte) propagates.
+    """
     try:
         text = agent_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
     if not text.startswith("---"):
-        return None
+        return None, None
     end = text.find("\n---", 3)
     block = text[3:end] if end != -1 else text[3:]
     for line in block.splitlines():
         if line.startswith("name:"):  # top-level key only (no indent)
-            return line[len("name:"):].strip().strip("\"'") or None
-    return None
+            return (line[len("name:"):].strip().strip("\"'") or None), None
+    return None, None
+
+
+def _agent_frontmatter_name(agent_path: Path) -> str | None:
+    """Top-level ``name:`` from a Claude Code agent file's YAML frontmatter."""
+    return _read_agent_frontmatter(agent_path)[0]
 
 
 def _resolve_claude_skill_host_action(pack) -> dict:
