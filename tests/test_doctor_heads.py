@@ -170,6 +170,60 @@ def test_doctor_heads_per_pack_exception_is_visible_fail():
     assert fails >= 1
 
 
+def _assert_visible_fail(lines, fails, exc_name):
+    assert any(ln.startswith("FAIL: head registry check raised ")
+               and exc_name in ln for ln in lines)
+    assert lines[-1].startswith("FAIL: head registry  packs=")
+    assert fails >= 1
+
+
+def test_doctor_heads_registry_import_failure_is_visible_fail(monkeypatch):
+    import sys
+    import types
+
+    # A module without ``resolve_all_heads`` makes the lazy import raise
+    # ImportError; resolve_all is deliberately NOT injected.
+    monkeypatch.setitem(sys.modules, "hydra_core.head_registry",
+                        types.ModuleType("hydra_core.head_registry"))
+    lines, fails = cli._doctor_head_lines(
+        _packs("sq"), native_packs={"sq": object()})
+    _assert_visible_fail(lines, fails, "ImportError")
+
+
+def test_doctor_heads_native_packs_import_failure_is_visible_fail(monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "hydra_core.native_packs",
+                        types.ModuleType("hydra_core.native_packs"))
+    lines, fails = cli._doctor_head_lines(
+        _packs("sq"), resolve_all=lambda p: [])
+    _assert_visible_fail(lines, fails, "ImportError")
+
+
+def test_doctor_heads_packs_iteration_raising_is_visible_fail():
+    class BadPacks:
+        def items(self):
+            raise OSError("cannot iterate")
+
+    lines, fails = cli._doctor_head_lines(
+        BadPacks(), resolve_all=lambda p: [], native_packs={})
+    _assert_visible_fail(lines, fails, "OSError")
+
+
+def test_doctor_heads_pack_attribute_access_raising_is_visible_fail():
+    class BadPack:
+        @property
+        def entrypoint(self):
+            raise ValueError("bad pack")
+
+    lines, fails = cli._doctor_head_lines(
+        {"sq": BadPack()}, resolve_all=lambda p: [], native_packs={})
+    assert any("ValueError" in ln and "(squad=sq)" in ln for ln in lines)
+    assert lines[-1].startswith("FAIL: head registry  packs=")
+    assert fails >= 1
+
+
 def test_doctor_heads_keyboard_interrupt_not_caught():
     def interrupt(_packs):
         raise KeyboardInterrupt
@@ -215,11 +269,10 @@ def test_doctor_full_invokes_helper_exactly_once(monkeypatch, tmp_path):
 
     def recorder(packs, **kw):
         calls.append(packs)
-        raise _Stop
+        return ["OK:   head registry  stub"], 0
 
     monkeypatch.setattr(cli, "_doctor_head_lines", recorder)
-    with pytest.raises(_Stop):
-        cli._cmd_doctor(_doctor_args(False))
+    cli._cmd_doctor(_doctor_args(False))
     assert len(calls) == 1
 
 

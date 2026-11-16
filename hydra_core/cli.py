@@ -225,13 +225,6 @@ def _doctor_head_lines(
     the trailing summary line is NOT counted (it restates them).  Reads only
     each record's ``frontmatter_name`` -- it never re-reads an agent file.
     """
-    # Lazy imports keep ``cli`` free of a module-level head_registry import
-    # (head_registry itself imports ``cli`` lazily).
-    if resolve_all is None:
-        from .head_registry import resolve_all_heads as resolve_all
-    if native_packs is None:
-        from .native_packs import NATIVE_PACKS as native_packs
-
     lines: list[str] = []
     fails = 0
     warns = 0
@@ -250,6 +243,13 @@ def _doctor_head_lines(
 
     native_slugs: list[str] = []
     try:
+        # Lazy imports keep ``cli`` free of a module-level head_registry
+        # import (head_registry itself imports ``cli`` lazily).  They sit
+        # inside the guard so an import failure is a visible FAIL.
+        if resolve_all is None:
+            from .head_registry import resolve_all_heads as resolve_all
+        if native_packs is None:
+            from .native_packs import NATIVE_PACKS as native_packs
         for slug, pack in packs.items():
             try:
                 if getattr(pack, "entrypoint", None) == "claude-native":
