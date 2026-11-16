@@ -1,13 +1,15 @@
 """WS1-A: schema parity between hydra_core.toolshed.SCHEMA_OVERRIDES["hydra_control"]
 and mcp_servers/hydra_control/server.py's own ``_TOOL_SCHEMAS``.
 
-hydra_core/ must stay runtime-agnostic (AGENTS.md "Engineering Standards"):
-mcp_servers/hydra_control/server.py is the runtime binding (it never imports
-hydra_core at module scope; it shells out to `python -m hydra_core.cli`), so
-hydra_core importing FROM it would invert the intended dependency direction.
-The chosen fix is therefore a hand-duplicated schema plus this test, which
-fails loudly the moment the two copies drift -- exactly the failure mode that
-let `risk` go missing from the toolshed copy in the first place (WS1-A).
+hydra_core/ must stay runtime-agnostic (AGENTS.md "Engineering Standards"),
+so the server is the runtime binding and hydra_core never imports FROM
+mcp_servers/. Since Hydra#81 both sides derive from one data-only module,
+hydra_core/inproc_tool_catalog.py: the server imports it (at module scope,
+after its sys.path bootstrap) to build ``_TOOL_SCHEMAS``, and
+hydra_core.toolshed derives its tool list and SCHEMA_OVERRIDES from it. This
+test remains as a guard that the two views stay identical -- the failure mode
+that let `risk` go missing from the toolshed copy in the first place (WS1-A).
+tests/test_inproc_tool_catalog_parity.py covers the handler-registry side.
 
 This test file is offline: it imports mcp_servers/hydra_control/server.py by
 path (no MCP transport, no subprocess, no network).
