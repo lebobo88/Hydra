@@ -134,6 +134,7 @@ function buildAuditPrompt(repo) {
     "",
     "For the inventory collisions, compare every agent, skill, command and hook name against Hydra's engineer, judge-same-vendor and judge-cross-vendor agents and list each name that collides.",
     "Every finding MUST cite a file and a line number, as file:line. Do not report a finding you cannot cite.",
+    "Finding ids must be unique within the report: give every finding its own id.",
     "Work autonomously and return the structured report. If something cannot be determined, record that as a finding instead of guessing."
   ].join("\n");
 }
@@ -151,6 +152,7 @@ function buildVerifyPrompt(repo, report) {
     "NO SECRETS RULE: " + NO_SECRETS_RULE,
     "",
     "TASK. Below is the audit report as data. For every finding, re-open the cited file at the cited line in the repository and check the evidence yourself.",
+    "Each finding carries an id assigned for this verification; answer per that id, exactly as written. The original auditor id is kept in audit_id and must not be used to answer.",
     "Give each finding id exactly one status: confirmed when the cited line proves the finding, refuted when it does not, unverified when you could not check it.",
     "Add recheck_evidence that quotes what you saw at the cited location, and cite it as file:line. Do not add new findings and do not skip any finding id.",
     "Work autonomously and return one entry per finding id.",
@@ -178,6 +180,15 @@ function withFindings(report, findings) {
   return Object.assign({}, report, {findings: findings});
 }
 
+// Gives every finding a correlation id the script controls, unique by position.
+// The auditor's own id moves to audit_id and is never used to match verdicts.
+function tagFindings(findings) {
+  return findings.map(function (f, index) {
+    const base = f !== null && typeof f === "object" ? f : {};
+    return Object.assign({}, base, {id: "F" + (index + 1), audit_id: base.id === undefined ? null : base.id});
+  });
+}
+
 async function auditStage(_, repo) {
   phase("Audit");
   const report = await agent(buildAuditPrompt(repo), {schema: AUDIT_REPORT_SCHEMA, phase: "Audit", label: "audit " + repo.id});
@@ -195,10 +206,10 @@ async function verifyStage(prev, repo) {
     return prev;
   }
   phase("Verify");
-  const findings = Array.isArray(prev.report.findings) ? prev.report.findings : [];
-  const v = await agent(buildVerifyPrompt(repo, prev.report), {schema: VERIFY_SCHEMA, phase: "Verify", label: "verify " + repo.id});
+  const tagged = tagFindings(Array.isArray(prev.report.findings) ? prev.report.findings : []);
+  const v = await agent(buildVerifyPrompt(repo, withFindings(prev.report, tagged)), {schema: VERIFY_SCHEMA, phase: "Verify", label: "verify " + repo.id});
   if (v === null || v === undefined) {
-    const unverified = findings.map(function (f) {
+    const unverified = tagged.map(function (f) {
       return Object.assign({}, f, {status: "unverified", recheck_evidence: null});
     });
     return {repo_id: repo.id, status: "failed", stage: "verify", report: withFindings(prev.report, unverified)};
@@ -206,22 +217,33 @@ async function verifyStage(prev, repo) {
   const entries = Array.isArray(v.verified_findings) ? v.verified_findings : [];
   const byId = new Map();
   for (const entry of entries) {
-    if (entry !== null && typeof entry === "object" && typeof entry.finding_id === "string" && !byId.has(entry.finding_id)) {
-      byId.set(entry.finding_id, entry);
+    if (entry !== null && typeof entry === "object" && typeof entry.finding_id === "string") {
+      if (!byId.has(entry.finding_id)) {
+        byId.set(entry.finding_id, []);
+      }
+      byId.get(entry.finding_id).push(entry);
     }
   }
-  const known = new Set(findings.map(function (f) { return f.id; }));
+  const known = new Set(tagged.map(function (f) { return f.id; }));
   for (const id of byId.keys()) {
     if (!known.has(id)) {
       log("sibling-audit: repo " + repo.id + " verifier returned unknown finding id " + id + "; ignored");
     }
   }
-  const merged = findings.map(function (f) {
-    const hit = byId.get(f.id);
-    return Object.assign({}, f, {
-      status: hit ? hit.status : "unverified",
-      recheck_evidence: hit && hit.recheck_evidence !== undefined ? hit.recheck_evidence : null
-    });
+  const merged = tagged.map(function (f) {
+    const hits = byId.get(f.id) || [];
+    let status = "unverified";
+    let evidence = null;
+    if (hits.length > 0) {
+      const agree = hits.every(function (h) { return h.status === hits[0].status; });
+      if (agree) {
+        status = hits[0].status;
+        evidence = hits[0].recheck_evidence !== undefined ? hits[0].recheck_evidence : null;
+      } else {
+        log("sibling-audit: repo " + repo.id + " verifier returned conflicting statuses for finding id " + f.id + "; left unverified");
+      }
+    }
+    return Object.assign({}, f, {status: status, recheck_evidence: evidence});
   });
   return {repo_id: repo.id, status: "verified", report: withFindings(prev.report, merged)};
 }

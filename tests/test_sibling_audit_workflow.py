@@ -169,9 +169,9 @@ def test_no_hardcoded_repo_paths() -> None:
 
 
 FORBIDDEN = [
-    r"Date\.now", r"Math\.random", r"new Date\(\s*\)", r"\brequire\(",
-    r"^\s*import\b", r"\bimport\s*\(", r"\bprocess\.", r"\bfs\.", r"child_process",
-    r"\bfetch\(", r"__dirname", r"\bgate\(", r"\bagentType\b",
+    r"Date\s*\.\s*now", r"Math\s*\.\s*random", r"new Date\s*\(\s*\)", r"\brequire\s*\(",
+    r"^\s*import\b", r"\bimport\s*\(", r"\bprocess\s*\.", r"\bfs\s*\.", r"child_process",
+    r"\bfetch\s*\(", r"__dirname", r"\bgate\s*\(", r"\bagentType\b",
     r"wait(?:ing)? for (?:the )?(?:user|operator|human)", r"\buser input\b",
     r"\breadline\b", r"\bstdin\b", r"\bAskUserQuestion\b",
 ]
@@ -202,8 +202,9 @@ def test_every_agent_call_uses_a_rule_carrying_builder() -> None:
     assert len(re.findall(r"\bagent\(", text)) == 2
     builders = re.findall(r"\bagent\(\s*(build\w*Prompt)\(", text)
     assert len(builders) == 2 and len(set(builders)) == 2
+    code = "".join(c for _, c, _s in _scan(text))  # comments removed
     for b in builders:
-        body = _function_body(text, b)
+        body = _function_body(code, b)
         for rule in RULE_NAMES:
             assert rule in body, (b, rule)
     assert not re.search(r"=\s*agent\b", text)
@@ -466,7 +467,9 @@ def test_every_finding_preserved(tmp_path: Path) -> None:
     entry = _by_id(out)["repo-1"]
     assert entry["status"] == "verified"
     findings = entry["report"]["findings"]
+    # ids are now the script's correlation ids; the auditor's own ids are kept in audit_id
     assert [f["id"] for f in findings] == ["F1", "F2", "F3"]
+    assert [f["audit_id"] for f in findings] == ["F1", "F2", "F3"]
     assert [f["status"] for f in findings] == ["confirmed", "refuted", "unverified"]
     assert findings[0]["recheck_evidence"] == "seen 1"
     assert findings[2]["recheck_evidence"] is None
@@ -529,3 +532,66 @@ def test_failures_logged(tmp_path: Path) -> None:
         hits = [m for m in out["log_calls"] if repo_id in m]
         assert len(hits) == 1, repo_id
         assert stage in hits[0]
+
+
+def _dup_report() -> dict[str, Any]:
+    """Two findings sharing one auditor id at different lines, plus one with no id."""
+    return {"repo_id": "report-says", "findings": [
+        {"id": "DUP", "title": "first", "file": "a.txt", "line": 10, "evidence": "e1", "severity": "low"},
+        {"id": "DUP", "title": "second", "file": "b.txt", "line": 20, "evidence": "e2", "severity": "high"},
+        {"title": "third", "file": "c.txt", "line": 30, "evidence": "e3", "severity": "low"},
+    ]}
+
+
+@needs_node
+def test_duplicate_audit_ids_do_not_share_a_verdict(tmp_path: Path) -> None:
+    verdicts = {"verified_findings": [
+        {"finding_id": "F1", "status": "confirmed", "recheck_evidence": "seen at a.txt:10"},
+    ]}
+    out = _run(tmp_path, _scenario(
+        audit={"/stub/repo-1": _dup_report()}, verify={"/stub/repo-1": verdicts},
+    ))
+    entry = _by_id(out)["repo-1"]
+    assert entry["status"] == "verified"
+    findings = entry["report"]["findings"]
+    assert len(findings) == 3
+    assert [f["id"] for f in findings] == ["F1", "F2", "F3"]
+    assert len({f["id"] for f in findings}) == 3
+    assert [f["status"] for f in findings] == ["confirmed", "unverified", "unverified"]
+    assert [f["recheck_evidence"] for f in findings] == ["seen at a.txt:10", None, None]
+    assert [f["audit_id"] for f in findings] == ["DUP", "DUP", None]
+    assert [(f["file"], f["line"]) for f in findings] == [("a.txt", 10), ("b.txt", 20), ("c.txt", 30)]
+
+
+@needs_node
+def test_conflicting_verifier_entries_are_unverified(tmp_path: Path) -> None:
+    verdicts = {"verified_findings": [
+        {"finding_id": "F1", "status": "confirmed", "recheck_evidence": "yes"},
+        {"finding_id": "F1", "status": "refuted", "recheck_evidence": "no"},
+        {"finding_id": "F2", "status": "confirmed", "recheck_evidence": "first"},
+        {"finding_id": "F2", "status": "confirmed", "recheck_evidence": "again"},
+    ]}
+    out = _run(tmp_path, _scenario(verify={"/stub/repo-1": verdicts}))
+    findings = _by_id(out)["repo-1"]["report"]["findings"]
+    assert [f["id"] for f in findings] == ["F1", "F2", "F3"]
+    assert findings[0]["status"] == "unverified" and findings[0]["recheck_evidence"] is None
+    assert findings[1]["status"] == "confirmed" and findings[1]["recheck_evidence"] == "first"
+    assert findings[2]["status"] == "unverified"
+    assert len(out["log_calls"]) == 1
+    assert "repo-1" in out["log_calls"][0] and "F1" in out["log_calls"][0]
+
+
+@needs_node
+def test_verifier_sees_correlation_ids(tmp_path: Path) -> None:
+    out = _run(tmp_path, _scenario(audit={"/stub/repo-1": _dup_report()}))
+    calls = _phase_calls(out, "Verify", REPOS[0])
+    assert len(calls) == 1
+    prompt = calls[0]["prompt"]
+    marker = "AUDIT REPORT (data):\n"
+    report = json.loads(prompt[prompt.index(marker) + len(marker):])
+    ids = [f["id"] for f in report["findings"]]
+    assert ids == ["F1", "F2", "F3"]
+    assert len(set(ids)) == len(ids)
+    assert [f["audit_id"] for f in report["findings"]] == ["DUP", "DUP", None]
+    for cid in ids:
+        assert f'"{cid}"' in prompt
