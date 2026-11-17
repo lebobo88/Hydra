@@ -29,7 +29,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 _CONSTITUTION_FILENAME = "CONSTITUTION.md"
@@ -134,9 +134,40 @@ _BREACH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+_CONSTITUTION_FILE_PATTERN_NAME = "rewrite_constitution"
+
+# Negators accepted within three words before the verb (opt-in negation).
+_NEGATOR_RE = re.compile(
+    r"(?<![\w'])(?:do not|don't|does not|never|must not|should not|shall not"
+    r"|cannot|can't|without|no|not)(?![\w'])",
+    re.IGNORECASE,
+)
+_CLAUSE_BOUNDARY_CHARS = ".;:!?\n"
+
+
+def _constitution_file_breach_negation_aware(pat: re.Pattern[str], text: str) -> bool:
+    """True when ``text`` holds an un-negated occurrence of the constitution-file
+    pattern. Every verb occurrence is checked (overlaps included) via a
+    lookahead derived from ``pat`` so it can never drift from the real regex.
+    """
+    probe = re.compile("(?=" + pat.pattern + ")", pat.flags)
+    for m in probe.finditer(text):
+        start = m.start()
+        boundary = max(text.rfind(ch, 0, start) for ch in _CLAUSE_BOUNDARY_CHARS)
+        prefix = text[boundary + 1:start].replace("’", "'")
+        words = prefix.split()
+        tail = " ".join(words[-3:])
+        if not _NEGATOR_RE.search(tail):
+            return True
+    return False
+
+
 def verify_intent(
     payload: str | dict | object,
     snapshot: Optional[ConstitutionSnapshot] = None,
+    *,
+    negation_aware: bool = False,
+    constitution_scan_payload: Any = None,
 ) -> AlignmentVerdict:
     """Check a proposed action (envelope dict, free text, or anything with str())
     against the constitution's refusal patterns.
@@ -152,10 +183,21 @@ def verify_intent(
     """
     snap = snapshot or load_constitution()
     text = _stringify(payload)
+    file_text = (
+        text if constitution_scan_payload is None
+        else _stringify(constitution_scan_payload)
+    )
 
     breached: list[str] = []
     for name, pat in _BREACH_PATTERNS:
-        if pat.search(text):
+        if name == _CONSTITUTION_FILE_PATTERN_NAME:
+            if negation_aware:
+                hit = _constitution_file_breach_negation_aware(pat, file_text)
+            else:
+                hit = bool(pat.search(file_text))
+        else:
+            hit = bool(pat.search(text))
+        if hit:
             breached.append(name)
 
     if breached:

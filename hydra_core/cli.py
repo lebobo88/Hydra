@@ -4103,6 +4103,12 @@ def _attended_result_record(state: HydraState, res: dict) -> dict | None:
         "summary": (str(res.get("stage_outcome") or "") or None),
         "changed_paths": list(res.get("changed_paths") or [])[:50],
         "cost_usd": float(res.get("cost_usd") or 0.0),
+        # Hydra#163: durable "the code landed" flag for the postcheck factual
+        # check. Either the nested cursor merge or the recovery-shaped result.
+        "merged": bool(
+            (res.get("merge") or {}).get("merged") is True
+            or res.get("merged") is True
+        ),
     }
     if isinstance(res.get("artifact_ref"), dict):
         record["artifact_ref"] = res["artifact_ref"]
