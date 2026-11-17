@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from . import boundary as _boundary
 from .backends_env import expand_spec_env
 from .proc import run_text
 
@@ -281,50 +282,9 @@ class MCPStdioDispatcher:
         from schemas/state/iolaus, dispatcher imports nothing from squad_node
         at module level, so the lazy load is safe.
         """
-        if squad_id is None:
-            return None
-        pack = self._squad_packs.get(squad_id)
-        if pack is None:
-            return None
-
-        # RA-3: auto-authorize each claude-skill squad's own shim tool pair.
-        if getattr(pack, "entrypoint", None) == "claude-skill":
-            # Lazy import to avoid a circular-import if the import graph changes.
-            try:
-                from .squad_node import _SKILL_PACK_SHIMS  # noqa: PLC0415
-                shim = _SKILL_PACK_SHIMS.get(squad_id)
-                if shim is not None:
-                    shim_server = shim["server"]
-                    shim_prefix = shim["prefix"]
-                    if server == shim_server and tool in (
-                        f"{shim_prefix}.command.list",
-                        f"{shim_prefix}.output.write",
-                    ):
-                        return None  # authorized: this squad's own shim pair
-            except ImportError:
-                pass  # fail-open on import error; fall through to declared-tools check
-
-        declared_tools = getattr(pack, "tools", ())
-        tool_key = f"{server}.{tool}" if server else tool
-        for t in declared_tools:
-            t_name = getattr(t, "name", t) if not isinstance(t, str) else t
-            t_server = getattr(t, "mcp_server", None)
-            if t_name == tool_key:
-                return None
-            if t_name == tool and (t_server is None or t_server == server):
-                return None
-        now = datetime.now(timezone.utc)
-        for h in self._active_handoffs:
-            if h["squad_id"] != squad_id:
-                continue
-            if h["expires_at"] and h["expires_at"] < now:
-                continue
-            if tool_key in h["granted_tools"] or tool in h["granted_tools"]:
-                return None
-        return (
-            f"RBAC: squad {squad_id!r} is not authorized for tool "
-            f"{tool!r} on server {server!r}. Declared tools: "
-            f"{[getattr(t, 'name', t) for t in declared_tools]}"
+        return _boundary.check_tool_rbac(
+            server, tool, squad_id,
+            packs=self._squad_packs, handoffs=self._active_handoffs,
         )
 
     # --- sync facade matching the squad_node.Dispatcher Protocol ---
@@ -416,72 +376,9 @@ class MCPStdioDispatcher:
         Fail-CLOSED on an explicit VenomRefused / requires_human AND on a
         gate-internal error (a matched venom whose gate errored must not slip
         through). Only a missing venom MODULE (ImportError) fails open."""
-        try:
-            from .venom import gate_runtime_action, VenomRefused
-        except Exception:  # noqa: BLE001 — venom module optional
-            return None
-        # F35: inject AgentSmith cross-check when HYDRA_VENOM_CROSS_CHECK=1.
-        # The callable wraps self.call_mcp so venom.py stays runtime-agnostic
-        # (no provider SDK imports in venom.py — only a plain Callable here).
-        _xc_fn = None
-        if os.environ.get("HYDRA_VENOM_CROSS_CHECK") == "1":
-            _self = self  # capture for closure
-
-            def _agentsmith_cross_check(cap: str, xargs: Any) -> Optional[dict]:
-                try:
-                    result = _self.call_mcp(
-                        "agentsmith",
-                        "agentsmith.hydra.venom_cross_check",
-                        {"capability": cap, "context": xargs if isinstance(xargs, dict) else {}},
-                    )
-                    if isinstance(result, dict):
-                        inner = result.get("result", result)
-                        if isinstance(inner, dict):
-                            return inner
-                except Exception:  # noqa: BLE001 — fail-open on transport error
-                    pass
-                return None
-
-            _xc_fn = _agentsmith_cross_check
-        try:
-            verdicts = gate_runtime_action(
-                server=server, tool=tool, args=args, cmd=cmd, raise_on_refuse=True,
-                cross_check_fn=_xc_fn,
-            )
-        except VenomRefused as vr:
-            # A venom-class action is BLOCKED pending human review (the constitution's
-            # `unguarded_venom` refusal means "requires HITL review", not a silent
-            # hard-deny). Surface it so the supervisor routes a constitution_breach
-            # HITL; the human approves or denies. Autonomous execution stops here.
-            logger.warning("Cerberus blocked %s (HITL): %s", vr.capability, "; ".join(vr.reasons))
-            return {"status": "rejected", "error": str(vr),
-                    "venom_refused": True, "hitl_required": True,
-                    "capability": vr.capability, "reasons": list(vr.reasons),
-                    "audit_key": vr.audit_key}
-        except Exception as exc:  # noqa: BLE001
-            # FAIL-CLOSED. This branch is reached ONLY when a venom signature
-            # already matched (gate_runtime_action calls require_cerberus_pass for
-            # a registered capability) and the gate itself errored — e.g. a
-            # degraded/locked episodic audit store throwing inside the gate. A
-            # venom-class action whose gate could not complete must NOT proceed
-            # unchecked (the old fail-open silently converted a pending refusal
-            # into an allow). Block + route to HITL. Non-venom actions never reach
-            # here, so this cannot wedge ordinary dispatch.
-            logger.warning("venom gate internal error (fail-CLOSED → HITL): %r", exc)
-            return {"status": "rejected",
-                    "error": f"venom gate internal error: {exc}",
-                    "hitl_required": True, "gate_error": True}
-        # Defensive: a capability configured to PASS-with-requires_human (no
-        # constitution breach) also blocks autonomously and routes to HITL.
-        hil = [v for v in verdicts if getattr(v, "requires_human", False)]
-        if hil:
-            action = ".".join(c for c in (server, tool) if c) or "subprocess"
-            logger.warning("Cerberus requires human approval for venom-class action %s", action)
-            return {"status": "rejected",
-                    "error": "venom-class action requires human approval",
-                    "hitl_required": True,
-                    "audit_keys": [v.audit_key for v in hil]}
-        return None
+        return _boundary.venom_gate(
+            server=server, tool=tool, args=args, cmd=cmd, call_mcp=self.call_mcp,
+        )
 
     def spawn_subprocess(self, cmd: list[str], env: dict[str, str] | None = None) -> dict[str, Any]:
         venom_block = self._venom_gate(cmd=cmd)
