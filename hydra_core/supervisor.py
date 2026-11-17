@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from . import boundary as _boundary
 from .eights.attestation import EightsAttestor
 from .governance import (
     charge_and_gate,
@@ -713,32 +714,15 @@ def build_supervisor(
         Invalid envelopes raise ValueError — caller decides whether to fail the
         task or surface to HITL.
         """
-        try:
-            validate_envelope(env_dict)
-        except (ValueError, Exception) as exc:
-            emit_trace(judge_trace_root, "boundary", "envelope_validation_failed", {
-                "envelope_id": env_dict.get("id"),
-                "envelope_type": env_dict.get("type"),
-                "direction": direction,
-                "squad_id": squad_id,
-                "error": str(exc),
-            })
-            raise
-
-        redacted = dict(env_dict)
-        for text_field in ("objective", "summary", "instructions", "decision",
-                           "rationale", "risk_assessment", "rollout_plan"):
-            if text_field in redacted and isinstance(redacted[text_field], str):
-                redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
-
-        emit_trace(judge_trace_root, env_dict.get("workflow_id", "boundary"),
-                   "squad_boundary_crossing", {
-                       "envelope_id": env_dict.get("id"),
-                       "envelope_type": env_dict.get("type"),
-                       "direction": direction,
-                       "squad_id": squad_id,
-                   })
-        return redacted
+        return _boundary.validate_and_redact_envelope(
+            env_dict,
+            direction=direction,
+            squad_id=squad_id,
+            trace_root=judge_trace_root,
+            validate_fn=validate_envelope,
+            redact_fn=redact_for_squad_boundary,
+            emit_fn=emit_trace,
+        )
 
     # ----- node implementations -----
 
@@ -3934,12 +3918,9 @@ def build_supervisor(
                 # in `_validate_and_redact_envelope` propagates instead of
                 # being silently swallowed here.
                 try:
-                    redacted = dict(env)
-                    for text_field in ("objective", "summary", "instructions",
-                                       "decision", "rationale",
-                                       "risk_assessment", "rollout_plan"):
-                        if text_field in redacted and isinstance(redacted[text_field], str):
-                            redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
+                    redacted = _boundary.redact_envelope_text_fields(
+                        env, redact_fn=redact_for_squad_boundary,
+                    )
                     emit_trace(judge_trace_root, "boundary",
                                "envelope_validation_failed_redacted_fallback", {
                                    "envelope_id": env.get("id"),
