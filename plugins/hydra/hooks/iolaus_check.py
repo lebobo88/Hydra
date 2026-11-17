@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code session-level Iolaus check.
 
-Wired by `.claude-plugin/hooks.json` as PreToolUse on the Task tool. Reads the
+Wired by `plugins/hydra/hooks/hooks.json` as PreToolUse on the Agent tool. Reads the
 project's squad registry and refuses to spawn a sub-agent whose `subagent_type`
 matches a squad slug past its `deprecated_after` date.
 
@@ -70,8 +70,15 @@ def _read_payload() -> dict:
 
 def main() -> int:
     payload = _read_payload()
+    if not isinstance(payload, dict):
+        return 0
+    tool_name = payload.get("tool_name")
+    if tool_name is not None and tool_name not in ("Agent", "Task"):
+        return 0
     tool_input = payload.get("tool_input") or payload.get("input") or {}
-    # The Task tool carries `subagent_type` in its input. Other tools we leave alone.
+    if not isinstance(tool_input, dict):
+        return 0
+    # The Agent tool carries `subagent_type` in its input. Other tools we leave alone.
     target = (
         tool_input.get("subagent_type")
         or tool_input.get("agent")
