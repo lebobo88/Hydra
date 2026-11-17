@@ -7,11 +7,13 @@ that — constitution check runs first.
 """
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from .immortal_head import (
+    _CONSTITUTION_FILENAME,
     AlignmentVerdict,
     ConstitutionSnapshot,
     load_constitution,
@@ -224,6 +226,9 @@ def redact_for_squad_boundary(
 def enforce_constitution(
     payload: str | dict | object,
     snapshot: Optional[ConstitutionSnapshot] = None,
+    *,
+    negation_aware: bool = False,
+    constitution_scan_payload: Any = None,
 ) -> AlignmentVerdict:
     """Run a proposed action or envelope through the immortal-head gate.
 
@@ -233,7 +238,12 @@ def enforce_constitution(
       - executing a venom-class capability,
       - finalizing a workflow's postcheck.
     """
-    return verify_intent(payload, snapshot=snapshot)
+    return verify_intent(
+        payload,
+        snapshot=snapshot,
+        negation_aware=negation_aware,
+        constitution_scan_payload=constitution_scan_payload,
+    )
 
 
 # --------- postcheck verdict ---------
@@ -242,6 +252,45 @@ def enforce_constitution(
 class GovernanceVerdict:
     surfaced: bool
     reason: str
+
+
+# Constraint-bearing fields excluded from the constitution-file text scan.
+_CONSTRAINT_KEYS: frozenset[str] = frozenset({
+    "non_goals", "do_not_touch", "risks", "open_questions",
+    "acceptance_criteria", "test_plan",
+})
+
+
+def _strip_constraint_fields(obj: Any) -> Any:
+    """Return a copy of ``obj`` with constraint keys removed from dicts (and
+    from dicts nested in lists, i.e. inside ``steps`` items). Operates on
+    structure, never on a joined string."""
+    if isinstance(obj, dict):
+        return {k: _strip_constraint_fields(v) for k, v in obj.items()
+                if k not in _CONSTRAINT_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_constraint_fields(v) for v in obj]
+    return obj
+
+
+def _normalise_changed_path(p: Any) -> str:
+    s = str(p).replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s.lower()
+
+
+def _merged_constitution_path(state: HydraState) -> Optional[str]:
+    """Factual check: a record that landed (merged is strictly True) touching
+    the immortal-head file. Returns the offending path, else None."""
+    target = _CONSTITUTION_FILENAME.lower()
+    for r in (getattr(state, "attended_results", None) or []):
+        if not isinstance(r, dict) or r.get("merged") is not True:
+            continue
+        for p in (r.get("changed_paths") or []):
+            if _normalise_changed_path(p) == target:
+                return str(p)
+    return None
 
 
 def enforce_governance(
@@ -261,12 +310,27 @@ def enforce_governance(
       5. Surfaced tasks (stub / HITL).
     """
     snap = constitution or load_constitution()
+    _hit = _merged_constitution_path(state)
+    if _hit is not None:
+        return GovernanceVerdict(
+            surfaced=True,
+            reason=(
+                f"constitution_breach: merged change touched {_CONSTITUTION_FILENAME} "
+                f"(path {_hit!r}); Constitution {snap.sha256[:12]} requires HITL review."
+            ),
+        )
     constitution_payload = {
         "goal": state.root_goal,
         "envelopes": state.envelopes,
         "last_event": state.last_event or "",
     }
-    verdict = enforce_constitution(constitution_payload, snapshot=snap)
+    verdict = enforce_constitution(
+        constitution_payload,
+        snapshot=snap,
+        negation_aware=True,
+        constitution_scan_payload=_strip_constraint_fields(
+            copy.deepcopy(constitution_payload)),
+    )
     if not verdict.aligned:
         return GovernanceVerdict(
             surfaced=True,
