@@ -80,6 +80,7 @@ sys.path.insert(0, str(_HERE.parents[2]))
 
 _HYDRA_ROOT = Path(os.environ.get("HYDRA_ROOT") or _HERE.parents[2])
 
+from hydra_core.control_plane_timeouts import FINALIZE_TIMEOUT_DEFAULT_S, FINALIZE_TIMEOUT_ENV  # noqa: E402
 from hydra_core.inproc_tool_catalog import HYDRA_CONTROL_TOOL_SPECS  # noqa: E402
 from hydra_core.proc import no_window_creationflags  # noqa: E402 — needs sys.path.insert above
 
@@ -725,7 +726,7 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
 _PLAN_TIMEOUT_S = int(os.environ.get("HYDRA_PLAN_TIMEOUT_S", "180"))
 _STEP_TIMEOUT_S = int(os.environ.get("HYDRA_STEP_TIMEOUT_S", "900"))
 _SUBMIT_TIMEOUT_S = int(os.environ.get("HYDRA_SUBMIT_TIMEOUT_S", "1800"))
-_FINALIZE_TIMEOUT_S = int(os.environ.get("HYDRA_FINALIZE_TIMEOUT_S", "600"))
+_FINALIZE_TIMEOUT_S = int(os.environ.get(FINALIZE_TIMEOUT_ENV, str(FINALIZE_TIMEOUT_DEFAULT_S)))
 
 
 def _run_cli_json(cli_args: list[str], *, timeout_s: int,

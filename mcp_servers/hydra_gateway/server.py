@@ -34,6 +34,11 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 
 from hydra_core.backends_env import expand_spec_env  # noqa: E402
+from hydra_core.control_plane_timeouts import (  # noqa: E402
+    GATEWAY_MARGIN_S,
+    HYDRA_CONTROL_LONG_VERBS,
+    finalize_timeout_s,
+)
 from hydra_core.dispatcher import BACKEND_REGISTRY, _load_backend_registry, _strip_comments  # noqa: E402
 from hydra_core.toolshed import build_default_shed, ProgressiveDisclosureTree  # noqa: E402
 from hydra_core.squad_loader import discover_squads  # noqa: E402
@@ -314,8 +319,8 @@ class AsyncBackendPool:
     # genuinely hung in-flight call occupies that backend's shared session until
     # the cap fires (call_tool then tears the backend down).
     _DEFAULT_TOOL_TIMEOUT = 120.0
-    # Raised from 1800 → 3000 to exceed the new HYDRA_SUBMIT_TIMEOUT_S default
-    # (2700 s) so the hydra_control in-band timeout always fires before the
+    # Raised from 1800 → 3000 to exceed the HYDRA_SUBMIT_TIMEOUT_S default
+    # (1800 s) so the hydra_control in-band timeout always fires before the
     # gateway hard-preempts and tears down the backend.
     _DEFAULT_LONG_TOOL_TIMEOUT = 3000.0
     _DEFAULT_MAX_TOOL_TIMEOUT = 3600.0
@@ -330,7 +335,7 @@ class AsyncBackendPool:
 
     # Control-plane workflow tools proxied to hydra_control run a synchronous
     # `python -m hydra_core.cli` subprocess whose OWN cap is generous
-    # (HYDRA_PLAN_TIMEOUT_S=180 / STEP=300 / SUBMIT=2700). Those subprocess caps
+    # (HYDRA_PLAN_TIMEOUT_S=180 / STEP=900 / SUBMIT=1800 / FINALIZE=600). Those subprocess caps
     # return a clean in-band {ok:false, error:*_timeout}; the gateway must NOT
     # preempt them with its short 120s default (which instead returns a hard
     # `failed` AND tears the backend down — the observed 4/4 planner timeouts).
@@ -338,6 +343,10 @@ class AsyncBackendPool:
     # 3000s ceiling) always exceeds the subprocess cap. Names come from
     # hydra_control's tool table: "hydra.workflow.plan|step|submit_host_result|
     # submit_envelopes|launch|resume" → final segments below.
+    # Four more hydra_control verbs get the long class by FULL tool name (see
+    # hydra_core.control_plane_timeouts.HYDRA_CONTROL_LONG_VERBS): finalize,
+    # repo.resolve, cockpit.audit, envelope.record. They are not listed here
+    # because "resolve" etc. would wrongly lengthen other backends' tools.
     _CONTROL_PLANE_FINAL_SEGMENTS: frozenset[str] = frozenset({
         "plan", "step", "submit_host_result", "submit_envelopes",
         "launch", "resume",
@@ -410,6 +419,11 @@ class AsyncBackendPool:
         the base, and the result is clamped to the env-overridable hard max (and
         floored at the short default so a misconfigured long<short env can't drop
         a call below the ordinary cap).
+
+        The four hydra_control verbs in HYDRA_CONTROL_LONG_VERBS are matched by
+        FULL tool name and get at least the long class; ``hydra.workflow.finalize``
+        also gets at least ``finalize_timeout_s() + GATEWAY_MARGIN_S`` (read
+        live), so the hydra_control in-band cap fires first.
         """
         final = tool.lower().split(".")[-1]
         short = _env_float("HYDRA_GATEWAY_TOOL_TIMEOUT_S",
@@ -421,6 +435,12 @@ class AsyncBackendPool:
         base = (long if final in self._LONG_TOOL_FINAL_SEGMENTS
                 or final in self._CONTROL_PLANE_FINAL_SEGMENTS
                 else short)
+        # Full-name rule for hydra_control verbs (not final-segment based).
+        full = tool.lower()
+        if full in HYDRA_CONTROL_LONG_VERBS:
+            base = max(base, long)
+            if full == "hydra.workflow.finalize":
+                base = max(base, finalize_timeout_s() + GATEWAY_MARGIN_S)
 
         override: float | None = None
         if isinstance(args, dict):
