@@ -4339,6 +4339,26 @@ def build_supervisor(
         verdict = enforce_governance(state, packs, constitution=constitution)
         if verdict.surfaced:
             state.phase = "surfaced"
+            # Hydra#163: a constitution breach is a real, resolvable HITL gate
+            # (approve_override / reject), not a bare governance string. Filed
+            # BEFORE the open_pp_runs drain so an undrained-lock gate still
+            # becomes the active gate and keeps this one under prior_gate.
+            # Every other governance surface (loop/envelope/mcp/budget/failed
+            # tasks) deliberately files no gate.
+            if verdict.reason.startswith("constitution_breach"):
+                _breach_hitl = HITLRequest(
+                    workflow_id=state.workflow_id,
+                    origin_squad="hydra-governance",
+                    target_squad="human",
+                    reason="constitution_breach",
+                    summary=verdict.reason,
+                    options=["approve_override", "reject"],
+                    default_option="reject",
+                )
+                _breach_dict = _breach_hitl.model_dump(mode="json")
+                _breach_dict["gate_node"] = "postcheck"
+                eights.hitl_request(_breach_dict, gate_node="postcheck")
+                state.pending_hitl = _breach_dict
             # B7 — release pp-harness locks for any open runs this workflow
             # started. On a clean "done" path we intentionally leave the
             # entries in place (pp owns those runs from start_run onward),

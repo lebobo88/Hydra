@@ -3081,6 +3081,16 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # `gate_node == "plan_gate"` exactly as it always was (state.py's
     # `_PLAN_BARRIER_STATES` comment): an unscoped write here would raise
     # the plan barrier for every OTHER gate's reject too.
+    # Hydra#163: approving a postcheck constitution_breach gate is the operator
+    # overriding the governance surface -- the workflow is done. Reject (and
+    # abort) keep the generic terminal path below (phase "surfaced").
+    _postcheck_breach_approve = (
+        action == "approve" and not _plan_terminal_option
+        and resolution.get("gate_node") == "postcheck"
+        and _gate_reason == "constitution_breach"
+    )
+    if _postcheck_breach_approve:
+        patch["phase"] = "done"
     if _plan_terminal_option or action == "reject":
         patch["phase"] = "surfaced"
         if action == "reject" and resolution.get("gate_node") == "plan_gate":
@@ -3126,7 +3136,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # itself is now gate-agnostic.
     _gate_terminal = _plan_terminal_option or action == "reject"
     if (gate_only and action == "approve" and not _plan_terminal_option
-            and resolution.get("gate_node") == "plan_gate") or _gate_terminal:
+            and resolution.get("gate_node") == "plan_gate") or _gate_terminal \
+            or _postcheck_breach_approve:
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
         # the generic (node-context-less) write below. `postcheck`'s only
         # outgoing edge is `after_postcheck` -> END unconditionally, so this
