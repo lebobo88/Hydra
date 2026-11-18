@@ -1541,20 +1541,24 @@ class TestM7FailSoftProperty:
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events if e["kind"] == "dispatch.cursor_exists_check_failed"]
 
-    def test_squad_step_recovery_cursor_load_fault_falls_through_like_missing_cursor(
+    def test_t5_recovery_cursor_load_fault_returns_cursor_unreadable_and_begins_no_stage(
             self, tmp_path, monkeypatch, capsys):
-        """t5 (load fault). Required change (3), CORRECTED (plan review):
-        the open-cursor RECOVERY lookup in `_cmd_attended_step` (distinct
-        from the persist-path exists check tested above) has its own
-        `Path.exists()` and `load_cursor` calls. Earlier behaviour (this
-        test's own name, kept verbatim per the no-rename rule) let either
-        fault fall through to `begin_squad_stage` like a genuinely missing
-        cursor -- the judge found that itself unsafe: a fault means this
-        lookup cannot even TELL whether an open cursor exists, so falling
-        through risks a SECOND cursor underneath an unconfirmed first one.
-        Required change (3) closes that: a load fault now returns the
-        dedicated `dispatch_seam_cursor_unreadable` result and
-        `begin_squad_stage` is never reached."""
+        """t5 (load fault). Formerly
+        test_squad_step_recovery_cursor_load_fault_falls_through_like_missing_cursor;
+        renamed when fix (3) changed the behaviour from fall-through to
+        fail-closed.
+
+        Required change (3): the open-cursor RECOVERY lookup in
+        `_cmd_attended_step` (distinct from the persist-path exists check
+        tested above) has its own `Path.exists()` and `load_cursor`
+        calls. Earlier behaviour let either fault fall through to
+        `begin_squad_stage` like a genuinely missing cursor -- the judge
+        found that itself unsafe: a fault means this lookup cannot even
+        TELL whether an open cursor exists, so falling through risks a
+        SECOND cursor underneath an unconfirmed first one. Required
+        change (3) closes that: a load fault now returns the dedicated
+        `dispatch_seam_cursor_unreadable` result and `begin_squad_stage`
+        is never reached."""
         task = TaskState(owner_squad="executive", description="brief the board")
         state = HydraState(root_goal="brief", tasks=[task])
         wf = str(state.workflow_id)
@@ -1610,12 +1614,16 @@ class TestM7FailSoftProperty:
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events if e["kind"] == "dispatch.recovery_cursor_load_failed"]
 
-    def test_squad_step_recovery_cursor_exists_fault_falls_through_like_missing_cursor(
+    def test_t5_recovery_cursor_exists_fault_returns_cursor_unreadable_and_begins_no_stage(
             self, tmp_path, monkeypatch, capsys):
-        """t5 (existence-check fault). Same correction as above (required
-        change (3)), but for the recovery lookup's `Path.exists()` itself
-        faulting (e.g. a PermissionError) rather than the subsequent
-        `load_cursor`."""
+        """t5 (existence-check fault). Formerly
+        test_squad_step_recovery_cursor_exists_fault_falls_through_like_missing_cursor;
+        renamed when fix (3) changed the behaviour from fall-through to
+        fail-closed.
+
+        Same correction as above (required change (3)), but for the
+        recovery lookup's `Path.exists()` itself faulting (e.g. a
+        PermissionError) rather than the subsequent `load_cursor`."""
         task = TaskState(owner_squad="executive", description="brief the board")
         state = HydraState(root_goal="brief", tasks=[task])
         wf = str(state.workflow_id)
