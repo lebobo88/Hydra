@@ -4359,18 +4359,46 @@ def _apply_dispatch_seam(
     original = res.get("host_action")
     if not isinstance(original, dict):
         return None
-    prepared, changed = dispatch_seam.prepare_host_action(
-        original, kind=kind, pack=pack)  # type: ignore[arg-type]
+    # Items 15/17 of the W1.2 fault inventory (Hydra#85 cross-vendor retry
+    # 2): `prepare_host_action` calls `build_tool_scope_directive` and
+    # `host_bridge._outbound_text`, neither of which is guarded at its own
+    # call site. Fail-soft here per the required-changes note: serve the
+    # ORIGINAL action unchanged (never alter it, never block) and still try
+    # the ticket -- the fault itself is reported via the one guarded helper.
+    try:
+        prepared, changed = dispatch_seam.prepare_host_action(
+            original, kind=kind, pack=pack)  # type: ignore[arg-type]
+    except Exception as e:  # noqa: BLE001
+        dispatch_seam.safe_emit(project, wf, "dispatch.prepare_host_action_failed",
+                                 {"kind": kind, "error": type(e).__name__})
+        prepared, changed = original, False
     cursor_file = res.get("cursor_path")
-    if changed and cursor_file and Path(cursor_file).exists():
+    # Item 18: `Path(cursor_file).exists()` can itself raise (PermissionError
+    # / OSError on some platforms). Treat a failed existence check the same
+    # as "cursor file not found" -- skip the persist attempt rather than
+    # letting the exception escape.
+    cursor_exists = False
+    if cursor_file:
+        try:
+            cursor_exists = Path(cursor_file).exists()
+        except Exception as e:  # noqa: BLE001
+            dispatch_seam.safe_emit(project, wf, "dispatch.cursor_exists_check_failed",
+                                     {"cursor_path": str(cursor_file),
+                                      "error": type(e).__name__})
+            cursor_exists = False
+    if changed and cursor_file and cursor_exists:
         from . import host_bridge
         try:
             cursor = host_bridge.load_cursor(cursor_file)
             cursor["pending_action"] = prepared
             dispatch_seam._persist_cursor(cursor_file, cursor)
         except Exception as e:  # noqa: BLE001
-            emit(project, wf, "dispatch.cursor_save_failed",
-                 {"error": type(e).__name__})
+            # Item 20 / JUDGE GAP (a): this emit must not itself be able to
+            # escape -- when both the cursor save AND the trace write fail,
+            # the defined `dispatch_seam_persist_failed` result below must
+            # still be the one thing that happens.
+            dispatch_seam.safe_emit(project, wf, "dispatch.cursor_save_failed",
+                                     {"error": type(e).__name__})
             return {
                 "ok": False,
                 "status": "dispatch_seam_persist_failed",
@@ -4756,7 +4784,9 @@ def _cmd_attended_step(args) -> int:
             if _blocked is not None:
                 _blocked.update({"task_id": str(task.task_id),
                                  "squad_slug": "engineering"})
-                emit(project, wf, "attended.budget_blocked", _blocked)
+                # Item 22: a trace-write failure here must not turn a
+                # budget_blocked response into a crash.
+                _dispatch_seam.safe_emit(project, wf, "attended.budget_blocked", _blocked)
                 print(_cli_json_dumps(_blocked, indent=2, default=str))
                 return 0
 
@@ -4963,7 +4993,9 @@ def _cmd_attended_step(args) -> int:
                 _blocked = _dispatch_seam.budget_gate(state)
                 if _blocked is not None:
                     _blocked.update({"task_id": task_id, "squad_slug": ne_pack.slug})
-                    emit(project, wf, "attended.budget_blocked", _blocked)
+                    # Item 22: a trace-write failure here must not turn a
+                    # budget_blocked response into a crash.
+                    _dispatch_seam.safe_emit(project, wf, "attended.budget_blocked", _blocked)
                     print(_cli_json_dumps(_blocked, indent=2, default=str))
                     return 0
 

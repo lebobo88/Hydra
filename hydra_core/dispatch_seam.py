@@ -20,6 +20,51 @@ Audit mode: nothing here refuses a dispatch except the budget gate; a ticket
 write failure is fail-soft -- the host_action is still returned, with
 ``dispatch_ticket`` set to ``None``. Runtime-agnostic: no provider SDK
 imports.
+
+FAIL-SOFT CONTRACT (R3-tail-style property, Hydra#85 cross-vendor retry 2).
+No exception raised by file I/O, an ``os`` call (``makedirs``/``open``/
+``link``/``remove``/``path.exists``), a telemetry ``emit``, JSON encode or
+decode, text encoding (``str.encode``), hashing, datetime arithmetic, or env
+parsing -- while on an audit-mode path -- may escape to the CLI caller
+(``hydra_core.cli``). "Audit-mode path" means: :func:`write_dispatch_ticket`
+and everything it calls; :func:`prepare_host_action` and everything it
+calls; ``cli._apply_dispatch_seam`` and the two ``attended.budget_blocked``
+emit sites in ``cli.py``.
+
+Three defined results:
+
+1. A ticket problem (invalid identity, a write/publish/cleanup fault, an
+   unreadable or mismatched existing file) -- ``dispatch_ticket`` is
+   ``None``; ``host_action`` is still returned unchanged.
+2. A cursor-save failure, but only when the prepared action actually
+   differs from what is on disk (the squad tool-scope directive changed
+   it) -- exactly
+   ``{"ok": False, "status": "dispatch_seam_persist_failed",
+   "cursor_path": <path>, "retryable": True}``, even when the telemetry
+   emit for this case ALSO fails.
+3. A telemetry failure (anywhere on an audit-mode path) never changes the
+   response -- it is silently absorbed by :func:`safe_emit`, the one
+   guarded helper every emit on these paths goes through.
+
+DELIBERATE EXCEPTIONS (the only raises this module condones on an
+audit-mode path):
+
+* E1 -- an invalid ``workflow_id`` (``ticket_path`` raising ``ValueError``):
+  :func:`write_dispatch_ticket` returns ``None`` with NO
+  ``dispatch.ticket_write_failed`` telemetry, because emitting would itself
+  join the unsanitised ``workflow_id`` into a trace path. Tested by
+  ``TestM1TicketIdentity.test_invalid_workflow_id_writes_no_file_anywhere``
+  and ``TestM7FailSoftProperty::test_e1_invalid_workflow_id_no_telemetry``.
+* E2 -- the budget gate's ``budget_blocked`` refusal (:func:`budget_gate`
+  returning non-``None``) is the ONE intended refusal in this module;
+  exceptions from ``governance.should_block_for_budget`` or the caller's
+  ``state`` object are caller-state errors, out of scope for this contract.
+  Tested by ``TestM7FailSoftProperty::test_e2_budget_gate_state_error_is_out_of_scope``.
+* E3 -- programming errors in the caller's own arguments (a non-``dict``
+  ``host_action`` passed directly to :func:`write_dispatch_ticket`, or a
+  ``kind`` outside ``{"squad", "engineer", "judge"}``) are out of scope and
+  may raise. Tested by
+  ``TestM7FailSoftProperty::test_e3_programming_error_in_callers_argument_may_raise``.
 """
 from __future__ import annotations
 
@@ -95,11 +140,19 @@ def _expires_at(created: datetime, ttl_seconds: int) -> datetime:
     bound missed, ``timedelta``/``datetime`` arithmetic raising
     ``OverflowError`` or ``ValueError`` here falls back to the default TTL
     rather than escaping `write_dispatch_ticket` -- audit mode is fail-soft
-    end to end, not just at the env-parsing boundary."""
+    end to end, not just at the env-parsing boundary.
+
+    The fallback add is defended a THIRD time: if ``created`` itself is
+    already close enough to ``datetime.max`` that even the default 3600s
+    TTL overflows, fall back to ``created`` unchanged -- an already-expired
+    ticket (fail closed) rather than an exception escaping this helper."""
     try:
         return created + timedelta(seconds=ttl_seconds)
     except (OverflowError, ValueError):
-        return created + timedelta(seconds=DISPATCH_TICKET_TTL_SECONDS)
+        try:
+            return created + timedelta(seconds=DISPATCH_TICKET_TTL_SECONDS)
+        except (OverflowError, ValueError):
+            return created
 
 
 def budget_gate(state: "HydraState") -> dict[str, Any] | None:
@@ -136,7 +189,17 @@ def _safe_call(call_key: str) -> str:
 
 
 def _length_prefixed(s: str) -> bytes:
-    b = str(s).encode("utf-8")
+    # errors="surrogatepass": a lone surrogate in `workflow_id`/`run_id`/
+    # `call_key` (W1.2 fail-soft property, Hydra#85 cross-vendor retry 2)
+    # must not raise `UnicodeEncodeError` here -- that exception subclasses
+    # `ValueError`, which `ticket_path` otherwise catches ONLY for a
+    # genuinely invalid `workflow_id`, so an unguarded plain `.encode("utf-8")`
+    # would misreport a lone surrogate in `run_id`/`call_key` as an invalid
+    # `workflow_id` (and silently drop its telemetry -- see E1). surrogatepass
+    # is lossless (unlike "replace") and deterministic/injective over `str`,
+    # so the ticket identity stays exact for the one input an auditor would
+    # most want recorded precisely.
+    b = str(s).encode("utf-8", errors="surrogatepass")
     return str(len(b)).encode("ascii") + b":" + b
 
 
@@ -309,16 +372,35 @@ def _long_path(p: str | Path) -> str:
     return _extended_length(s)
 
 
+def safe_emit(
+    project_root: str | Path, workflow_id: str, event: str, payload: dict[str, Any],
+) -> None:
+    """The single guarded telemetry call for the whole dispatch seam --
+    every emit in this module, plus (by explicit import) ``cli.py``'s
+    ``_apply_dispatch_seam`` and its two ``attended.budget_blocked`` sites,
+    goes through this function rather than calling ``telemetry.emit``
+    directly. Catches every exception the underlying ``emit`` can raise
+    (trace-path construction, ``open``/``write`` on the trace file, JSON
+    encoding of ``payload``) and never raises.
+
+    This is the ONLY silent ``except Exception: pass`` the fail-soft
+    contract allows: a failing emit cannot itself report its own failure.
+    Every OTHER caller on an audit-mode path that can still emit a failure
+    event is expected to route it through here, not to swallow its own
+    fault with a private bare catch."""
+    try:
+        emit(Path(project_root), workflow_id, event, payload)
+    except Exception:  # noqa: BLE001 -- the one sanctioned silent catch; see docstring
+        pass
+
+
 def _emit_write_failed(
     project_root: str | Path, workflow_id: str, call_key: str, agent_type: str,
     kind: str, reason: str,
 ) -> None:
-    try:
-        emit(Path(project_root), workflow_id, "dispatch.ticket_write_failed",
-             {"call_key": call_key, "ticket_kind": kind, "agent_type": agent_type,
-              "reason": reason})
-    except Exception:  # noqa: BLE001
-        pass
+    safe_emit(project_root, workflow_id, "dispatch.ticket_write_failed",
+              {"call_key": call_key, "ticket_kind": kind, "agent_type": agent_type,
+               "reason": reason})
 
 
 def write_dispatch_ticket(
@@ -373,39 +455,51 @@ def write_dispatch_ticket(
                             kind, reuse)
         return None
 
-    tid = compute_ticket_id(workflow_id_s, run_id_s, call_key)
-    created = now or datetime.now(timezone.utc)
-    artifact = host_action.get("artifact_text")
-    ticket: dict[str, Any] = {
-        "schema": TICKET_SCHEMA,
-        "mode": "audit",
-        "workflow_id": workflow_id_s,
-        "run_id": run_id_s,
-        "call_key": call_key,
-        "ticket_id": tid,
-        "kind": kind,
-        "agent_type": agent_type,
-        "squad_slug": squad_slug,
-        "head": _head_for(kind, agent_type),
-        "prompt_sha256": hashlib.sha256(
-            canonical_prompt_text(host_action).encode("utf-8")).hexdigest(),
-        "budget_usd": budget_usd,
-        "budget_remaining_usd": budget_remaining_usd,
-        "created_at": created.isoformat(),
-        "expires_at": _expires_at(created, ticket_ttl_seconds()).isoformat(),
-    }
-    if kind == "judge":
-        ticket["artifact_sha256"] = (
-            hashlib.sha256(artifact.encode("utf-8")).hexdigest()
-            if isinstance(artifact, str) else None)
-
-    # Short temp name in the same dir: keeps the temp path no longer than the
-    # final path, which still matters on Windows even with the
-    # extended-length prefix below (some win32 calls underneath
-    # `os.link`/`open` are themselves happier with a shorter source).
-    tmp = path.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
+    # Everything from here down -- ticket-id/hash computation, the temp
+    # name, datetime arithmetic, and the write/publish/cleanup sequence --
+    # is inside ONE outer try: any exception reaching the handler below
+    # gives a fail-soft null ticket (items 3, 4, 5, 7-fallback, 8, 9 of the
+    # W1.2 fault inventory; Hydra#85 cross-vendor retry 2).
+    tmp: Path | None = None
     tmp_created = False
     try:
+        tid = compute_ticket_id(workflow_id_s, run_id_s, call_key)
+        created = now or datetime.now(timezone.utc)
+        artifact = host_action.get("artifact_text")
+        ticket: dict[str, Any] = {
+            "schema": TICKET_SCHEMA,
+            "mode": "audit",
+            "workflow_id": workflow_id_s,
+            "run_id": run_id_s,
+            "call_key": call_key,
+            "ticket_id": tid,
+            "kind": kind,
+            "agent_type": agent_type,
+            "squad_slug": squad_slug,
+            "head": _head_for(kind, agent_type),
+            # errors="surrogatepass" -- see `_length_prefixed`: a lone
+            # surrogate in the prompt/instructions/artifact_text must not
+            # raise here either; the ticket is still written with a
+            # deterministic hash over the exact (lossless) bytes.
+            "prompt_sha256": hashlib.sha256(
+                canonical_prompt_text(host_action).encode(
+                    "utf-8", errors="surrogatepass")).hexdigest(),
+            "budget_usd": budget_usd,
+            "budget_remaining_usd": budget_remaining_usd,
+            "created_at": created.isoformat(),
+            "expires_at": _expires_at(created, ticket_ttl_seconds()).isoformat(),
+        }
+        if kind == "judge":
+            ticket["artifact_sha256"] = (
+                hashlib.sha256(
+                    artifact.encode("utf-8", errors="surrogatepass")).hexdigest()
+                if isinstance(artifact, str) else None)
+
+        # Short temp name in the same dir: keeps the temp path no longer than
+        # the final path, which still matters on Windows even with the
+        # extended-length prefix below (some win32 calls underneath
+        # `os.link`/`open` are themselves happier with a shorter source).
+        tmp = path.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
         try:
             os.makedirs(_long_path(path.parent), exist_ok=True)
             # `tmp_created = True` goes right before `open`, not after: a
@@ -430,14 +524,29 @@ def write_dispatch_ticket(
             # Runs on EVERY exit from the block above -- successful publish,
             # a caught FileExistsError race, or an uncaught exception from
             # `os.makedirs`/`open`/`f.write`/`os.link` alike. No partial temp
-            # file is ever left behind, regardless of which step failed.
-            if tmp_created:
-                try:
-                    os.remove(_long_path(tmp))
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
+            # file is ever left behind, regardless of which step failed --
+            # EXCEPT the one case where the cleanup call itself keeps
+            # failing (see below): that row trades "no temp file" for "never
+            # null a response that `os.link` already published."
+            #
+            # Up to two attempts, and the broad `except Exception` (not just
+            # `OSError`) is deliberate: a non-OSError from this cleanup
+            # (e.g. a RuntimeError injected by a faulty monitoring hook)
+            # must not propagate past this `finally` and reach the outer
+            # `except` below -- which would null a response that `os.link`
+            # may have ALREADY published as the final file. A one-shot
+            # transient fault (first attempt raises, second succeeds) still
+            # leaves no temp file; a persistent fault leaves the temp file
+            # behind but never raises and never nulls an already-published
+            # ticket.
+            if tmp_created and tmp is not None:
+                for _cleanup_attempt in range(2):
+                    try:
+                        os.remove(_long_path(tmp))
+                        break
+                    except Exception:  # noqa: BLE001 -- see comment above
+                        if _cleanup_attempt == 1:
+                            pass  # persistent cleanup fault: give up silently
         if not published:
             reuse2 = _check_reuse(path, workflow_id_s, run_id_s, call_key)
             if reuse2 == "ok":
@@ -450,16 +559,13 @@ def write_dispatch_ticket(
                             kind, type(exc).__name__)
         return None
 
-    # `emit` is fail-soft everywhere else this module calls it
-    # (`_emit_write_failed`); this success-path telemetry call must be no
-    # less so -- the ticket itself already published successfully by this
-    # point, so a trace-write failure here (e.g. a disk-full `open('a')` in
-    # `telemetry._write`) must not turn a successful dispatch into an
-    # uncaught exception.
-    try:
-        emit(Path(project_root), workflow_id_s, "dispatch.ticket_written",
-             {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
-              "ticket_kind": kind, "agent_type": agent_type})
-    except Exception:  # noqa: BLE001 -- audit mode is fail-soft
-        pass
+    # `safe_emit` absorbs its own failure (see its docstring); this
+    # success-path telemetry call must be no less fail-soft than
+    # `_emit_write_failed` -- the ticket itself already published
+    # successfully by this point, so a trace-write failure here (e.g. a
+    # disk-full `open('a')` in `telemetry._write`) must not turn a
+    # successful dispatch into an uncaught exception.
+    safe_emit(project_root, workflow_id_s, "dispatch.ticket_written",
+              {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
+               "ticket_kind": kind, "agent_type": agent_type})
     return path
