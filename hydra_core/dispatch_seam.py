@@ -21,6 +21,24 @@ write failure is fail-soft -- the host_action is still returned, with
 ``dispatch_ticket`` set to ``None``. Runtime-agnostic: no provider SDK
 imports.
 
+CONTRACT BOUNDARY. The fail-soft contract below covers exactly:
+
+(a) :func:`write_dispatch_ticket` and everything it calls;
+(b) :func:`safe_emit`;
+(c) ``cli._apply_dispatch_seam``, from its first statement to its return;
+(d) the two ``attended.budget_blocked`` emit sites in ``cli.py``.
+
+It does NOT cover cursor reads, cursor saves or telemetry done by the
+surrounding step, poll, self-heal or submit code before or after
+``_apply_dispatch_seam`` is called -- in particular the open-cursor
+RECOVERY re-serve lookup in ``cli._cmd_attended_step`` (its
+``Path.exists``/``load_cursor`` step). That code keeps its behaviour at
+base ``ebf9376`` -- a fault there is reported via :func:`safe_emit` and
+answered with the dedicated ``dispatch_seam_cursor_unreadable`` result
+rather than silently falling through to ``begin_squad_stage`` -- and is
+out of scope for the fail-soft guarantee itself (a follow-up issue tracks
+unifying the two).
+
 FAIL-SOFT CONTRACT (R3-tail-style property, Hydra#85 cross-vendor retry 2,
 tightened cross-vendor retry 3). No exception raised by file I/O, an ``os``
 call (``makedirs``/``open``/``link``/``remove``/``path.exists``), a
@@ -31,10 +49,9 @@ means: :func:`write_dispatch_ticket` and everything it calls (including
 :func:`ticket_path`'s identity hash and the FIRST :func:`_check_reuse` call
 -- both now INSIDE the function's single outer guard, not ahead of it; see
 cross-vendor retry 3 findings 1-2); :func:`prepare_host_action` and
-everything it calls; ``cli._apply_dispatch_seam`` and the two
-``attended.budget_blocked`` emit sites in ``cli.py`` (including its own
-cursor-existence check -- see result 2 below -- and the CLI's recovery
-re-serve ``Path.exists``/cursor-load step, guarded the same way).
+everything it calls; ``cli._apply_dispatch_seam`` (now wrapped end to end
+in a single outer ``try/except Exception``, per the contract boundary
+above) and the two ``attended.budget_blocked`` emit sites in ``cli.py``.
 
 In :func:`write_dispatch_ticket` the ONLY code outside the single outer
 ``try/except Exception`` is the validation of ``workflow_id`` (a pure

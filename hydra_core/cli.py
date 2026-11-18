@@ -4333,6 +4333,27 @@ class MissingEngineeringTargetError(RuntimeError):
     gate existed reaching `hydra attended step` directly."""
 
 
+def _seam_failure_response(
+    changed_unsaved: bool, cursor_file: str | None,
+) -> dict | None:
+    """Pure decision helper for ``_apply_dispatch_seam``: the exact
+    ``dispatch_seam_persist_failed`` dict when ``changed_unsaved`` is
+    ``True`` (a changed action whose cursor save is not yet confirmed),
+    else ``None`` (nothing to report -- the caller leaves ``host_action``
+    as it already is and nulls ``dispatch_ticket``). Used both by the
+    function's own early-return branches and by its outer exception
+    handler (required change (1)), so the two can never drift on what
+    "unsaved" means."""
+    if not changed_unsaved:
+        return None
+    return {
+        "ok": False,
+        "status": "dispatch_seam_persist_failed",
+        "cursor_path": str(cursor_file) if cursor_file else None,
+        "retryable": True,
+    }
+
+
 def _apply_dispatch_seam(
     project: Path, wf: str, res: dict, *, kind: str, pack: object,
     squad_slug: str | None, budget_usd: float | None,
@@ -4356,86 +4377,119 @@ def _apply_dispatch_seam(
     retry 3 finding 3): ``res`` is left untouched and NO ticket is written,
     so cursor, response and ticket never disagree. The caller must print
     the error dict instead of ``res`` and return non-zero.
+
+    The WHOLE body below (after this docstring) runs inside one outer
+    ``try/except Exception`` -- the fail-soft contract's item (c) now holds
+    literally, from this function's first statement to its return. Only two
+    plain local defaults the outer handler needs are declared ahead of the
+    guard (``changed_unsaved``, ``cursor_file``); both are expressions that
+    cannot raise. ``changed_unsaved`` is ``True`` from the moment
+    ``prepare_host_action`` reports a CHANGED action until the cursor save
+    for it succeeds (or the function returns early because it can't be
+    saved) -- it is the single bit the outer handler needs to decide
+    whether an unexpected fault anywhere in this function may still answer
+    with a served-but-unsaved action (never) or must leave an
+    already-settled response alone (always).
     """
     from . import dispatch_seam
-    original = res.get("host_action")
-    if not isinstance(original, dict):
-        return None
-    # Items 15/17 of the W1.2 fault inventory (Hydra#85 cross-vendor retry
-    # 2): `prepare_host_action` calls `build_tool_scope_directive` and
-    # `host_bridge._outbound_text`, neither of which is guarded at its own
-    # call site. Fail-soft here per the required-changes note: serve the
-    # ORIGINAL action unchanged (never alter it, never block) and still try
-    # the ticket -- the fault itself is reported via the one guarded helper.
+    changed_unsaved = False
+    cursor_file = None
     try:
-        prepared, changed = dispatch_seam.prepare_host_action(
-            original, kind=kind, pack=pack)  # type: ignore[arg-type]
-    except Exception as e:  # noqa: BLE001
-        # "seam_kind", not "kind" -- `telemetry.emit` always sets the
-        # top-level "kind" field to the EVENT NAME; a payload key also
-        # named "kind" would silently clobber it (dict-literal key order
-        # in `emit`'s `**payload` spread), turning
-        # "dispatch.prepare_host_action_failed" into "squad"/"engineer" in
-        # the trace.
-        dispatch_seam.safe_emit(project, wf, "dispatch.prepare_host_action_failed",
-                                 {"seam_kind": kind, "error": type(e).__name__})
-        prepared, changed = original, False
-    cursor_file = res.get("cursor_path")
-    # Item 18: `Path(cursor_file).exists()` can itself raise (PermissionError
-    # / OSError on some platforms). An UNCHANGED action tolerates treating
-    # this the same as "cursor file not found" (there is nothing to
-    # reconcile -- the served action already agrees with whatever the
-    # cursor holds). A CHANGED action does NOT tolerate that: silently
-    # skipping the persist attempt would serve and ticket the changed
-    # action while the on-disk cursor keeps the original, so cursor and
-    # response permanently disagree (cross-vendor retry 3 finding 3). When
-    # the action changed and this check cannot even tell whether a cursor
-    # exists to persist into, treat it exactly like a cursor-save failure:
-    # return `dispatch_seam_persist_failed` and write NO ticket.
-    cursor_exists = False
-    cursor_exists_check_failed = False
-    if cursor_file:
+        original = res.get("host_action")
+        if not isinstance(original, dict):
+            return None
+        # Items 15/17 of the W1.2 fault inventory (Hydra#85 cross-vendor
+        # retry 2): `prepare_host_action` calls `build_tool_scope_directive`
+        # and `host_bridge._outbound_text`, neither of which is guarded at
+        # its own call site. Fail-soft here per the required-changes note:
+        # serve the ORIGINAL action unchanged (never alter it, never block)
+        # and still try the ticket -- the fault itself is reported via the
+        # one guarded helper.
         try:
-            cursor_exists = Path(cursor_file).exists()
+            prepared, changed = dispatch_seam.prepare_host_action(
+                original, kind=kind, pack=pack)  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001
-            dispatch_seam.safe_emit(project, wf, "dispatch.cursor_exists_check_failed",
-                                     {"cursor_path": str(cursor_file),
-                                      "error": type(e).__name__})
-            cursor_exists = False
-            cursor_exists_check_failed = True
-    if changed and cursor_file and cursor_exists_check_failed:
-        return {
-            "ok": False,
-            "status": "dispatch_seam_persist_failed",
-            "cursor_path": str(cursor_file),
-            "retryable": True,
-        }
-    if changed and cursor_file and cursor_exists:
-        from . import host_bridge
-        try:
-            cursor = host_bridge.load_cursor(cursor_file)
-            cursor["pending_action"] = prepared
-            dispatch_seam._persist_cursor(cursor_file, cursor)
-        except Exception as e:  # noqa: BLE001
-            # Item 20 / JUDGE GAP (a): this emit must not itself be able to
-            # escape -- when both the cursor save AND the trace write fail,
-            # the defined `dispatch_seam_persist_failed` result below must
-            # still be the one thing that happens.
-            dispatch_seam.safe_emit(project, wf, "dispatch.cursor_save_failed",
-                                     {"error": type(e).__name__})
-            return {
-                "ok": False,
-                "status": "dispatch_seam_persist_failed",
-                "cursor_path": str(cursor_file),
-                "retryable": True,
-            }
-    ticket = dispatch_seam.write_dispatch_ticket(
-        project, wf, res.get("run_id"), prepared, kind=kind,  # type: ignore[arg-type]
-        squad_slug=squad_slug, budget_usd=budget_usd,
-        budget_remaining_usd=budget_remaining_usd)
-    res["host_action"] = prepared
-    res["dispatch_ticket"] = str(ticket) if ticket is not None else None
-    return None
+            # "seam_kind", not "kind" -- `telemetry.emit` always sets the
+            # top-level "kind" field to the EVENT NAME; a payload key also
+            # named "kind" would silently clobber it (dict-literal key order
+            # in `emit`'s `**payload` spread), turning
+            # "dispatch.prepare_host_action_failed" into "squad"/"engineer"
+            # in the trace.
+            dispatch_seam.safe_emit(project, wf, "dispatch.prepare_host_action_failed",
+                                     {"seam_kind": kind, "error": type(e).__name__})
+            prepared, changed = original, False
+
+        cursor_file = res.get("cursor_path")
+        # Item 18: `Path(cursor_file).exists()` can itself raise
+        # (PermissionError / OSError on some platforms). An UNCHANGED action
+        # tolerates treating this the same as "cursor file not found" (there
+        # is nothing to reconcile -- the served action already agrees with
+        # whatever the cursor holds). A CHANGED action does NOT tolerate
+        # that: silently skipping the persist attempt would serve and ticket
+        # the changed action while the on-disk cursor keeps the original, so
+        # cursor and response permanently disagree (cross-vendor retry 3
+        # finding 3). When the action changed and this check cannot even
+        # tell whether a cursor exists to persist into, treat it exactly
+        # like a cursor-save failure: return `dispatch_seam_persist_failed`
+        # and write NO ticket.
+        cursor_exists = False
+        cursor_exists_check_failed = False
+        if cursor_file:
+            try:
+                cursor_exists = Path(cursor_file).exists()
+            except Exception as e:  # noqa: BLE001
+                dispatch_seam.safe_emit(project, wf, "dispatch.cursor_exists_check_failed",
+                                         {"cursor_path": str(cursor_file),
+                                          "error": type(e).__name__})
+                cursor_exists = False
+                cursor_exists_check_failed = True
+
+        if changed:
+            changed_unsaved = True
+            # Required change (2): a changed squad action is NEVER served
+            # unless it was saved. This covers all three ways "saved" can
+            # fail to be true: no cursor path to save into at all, the
+            # existence check itself faulted (handled above), or the check
+            # succeeded and plainly says the cursor file is not there.
+            if not cursor_file or cursor_exists_check_failed or not cursor_exists:
+                return _seam_failure_response(changed_unsaved, cursor_file)
+            from . import host_bridge
+            try:
+                cursor = host_bridge.load_cursor(cursor_file)
+                cursor["pending_action"] = prepared
+                dispatch_seam._persist_cursor(cursor_file, cursor)
+            except Exception as e:  # noqa: BLE001
+                # Item 20 / JUDGE GAP (a): this emit must not itself be able
+                # to escape -- when both the cursor save AND the trace write
+                # fail, the defined `dispatch_seam_persist_failed` result
+                # below must still be the one thing that happens.
+                dispatch_seam.safe_emit(project, wf, "dispatch.cursor_save_failed",
+                                         {"error": type(e).__name__})
+                return _seam_failure_response(changed_unsaved, cursor_file)
+            # Saved: the changed action now durably agrees with the on-disk
+            # cursor, so it is safe to serve regardless of what happens to
+            # the (best-effort, fail-soft) ticket write next.
+            changed_unsaved = False
+
+        # Set `host_action` on `res` now -- either the action never changed,
+        # or it changed and was just durably saved above. A fault in the
+        # ticket write that follows must never roll this back (fix 1's
+        # flag-false branch leaves `host_action` exactly as it is here).
+        res["host_action"] = prepared
+        ticket = dispatch_seam.write_dispatch_ticket(
+            project, wf, res.get("run_id"), prepared, kind=kind,  # type: ignore[arg-type]
+            squad_slug=squad_slug, budget_usd=budget_usd,
+            budget_remaining_usd=budget_remaining_usd)
+        res["dispatch_ticket"] = str(ticket) if ticket is not None else None
+        return None
+    except Exception as exc:  # noqa: BLE001 -- the outer guard, required change (1)
+        dispatch_seam.safe_emit(project, wf, "dispatch.seam_unexpected_failure",
+                                 {"seam_kind": kind, "error": type(exc).__name__})
+        _resp = _seam_failure_response(changed_unsaved, cursor_file)
+        if _resp is not None:
+            return _resp
+        res["dispatch_ticket"] = None
+        return None
 
 
 def _cmd_attended_step(args) -> int:
@@ -5000,14 +5054,16 @@ def _cmd_attended_step(args) -> int:
             # exhausted. A cursor whose attempt differs (a re-issued
             # planning attempt, Hydra#69 defect C) falls through to
             # begin_squad_stage exactly as on base.
-            # Finding 6 (cross-vendor retry 3): the `Path.exists()` guard
-            # below, and the `load_cursor` it gates, must not be able to
-            # escape to the CLI caller either. Either fault is reported via
-            # `safe_emit` and falls all the way through to the
-            # non-recovery `begin_squad_stage` behaviour below -- exactly
-            # as a genuinely missing cursor already does -- rather than
-            # risking a re-served action against a cursor state that could
-            # not be confirmed.
+            # Required change (3): the `Path.exists()` guard below, and the
+            # `load_cursor` it gates, must not be able to escape to the CLI
+            # caller -- but, unlike a genuinely absent cursor (which legitimately
+            # falls through to `begin_squad_stage` below), a fault that means
+            # this lookup cannot even TELL whether an open cursor exists must
+            # never fall through: a second cursor opened underneath an
+            # unconfirmed first one is exactly the double-dispatch this
+            # recovery lookup exists to prevent. Report via `safe_emit` and
+            # return the dedicated `dispatch_seam_cursor_unreadable` result
+            # instead -- `begin_squad_stage` is not reached.
             _existing_squad_res = None
             _ex_cfile = host_bridge.cursor_path(project, wf, task_id)
             try:
@@ -5016,7 +5072,13 @@ def _cmd_attended_step(args) -> int:
                 _dispatch_seam.safe_emit(
                     project, wf, "dispatch.recovery_cursor_exists_check_failed",
                     {"task_id": task_id, "error": type(_e).__name__})
-                _ex_cfile_exists = False
+                print(_cli_json_dumps({
+                    "ok": False,
+                    "status": "dispatch_seam_cursor_unreadable",
+                    "cursor_path": str(_ex_cfile),
+                    "retryable": True,
+                }, indent=2, default=str))
+                return 1
             if _ex_cfile_exists:
                 try:
                     _ex_cursor = host_bridge.load_cursor(_ex_cfile)
@@ -5024,7 +5086,13 @@ def _cmd_attended_step(args) -> int:
                     _dispatch_seam.safe_emit(
                         project, wf, "dispatch.recovery_cursor_load_failed",
                         {"task_id": task_id, "error": type(_e).__name__})
-                    _ex_cursor = None
+                    print(_cli_json_dumps({
+                        "ok": False,
+                        "status": "dispatch_seam_cursor_unreadable",
+                        "cursor_path": str(_ex_cfile),
+                        "retryable": True,
+                    }, indent=2, default=str))
+                    return 1
                 if (isinstance(_ex_cursor, dict)
                         and _ex_cursor.get("state") not in host_bridge._TERMINAL
                         and isinstance(_ex_cursor.get("pending_action"), dict)
@@ -6540,8 +6608,18 @@ def _cmd_attended_submit(args) -> int:
                 _seam_budget = float(_b["budget_usd"])
                 _seam_remaining = max(
                     _seam_budget - float(_b.get("spent_usd") or 0.0), 0.0)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as _e:  # noqa: BLE001
+                # Required change (4): this used to swallow the fault with
+                # no report at all. Still fail-soft (the ticket's
+                # budget_usd/budget_remaining_usd fields are simply absent
+                # -- see `write_dispatch_ticket`, where both stay `None` in
+                # the ticket dict), but now reported through `safe_emit` so
+                # the derivation failure is observable instead of silent.
+                _dispatch_seam.safe_emit(
+                    project, wf, "dispatch.ticket_budget_derivation_failed",
+                    {"error": type(_e).__name__})
+                _seam_budget = None
+                _seam_remaining = None
             _seam_err = _apply_dispatch_seam(
                 project, wf, res, kind=_seam_kind, pack=None,
                 squad_slug=res.get("squad_slug") or "engineering",

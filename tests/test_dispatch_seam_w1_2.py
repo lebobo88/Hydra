@@ -1543,14 +1543,18 @@ class TestM7FailSoftProperty:
 
     def test_squad_step_recovery_cursor_load_fault_falls_through_like_missing_cursor(
             self, tmp_path, monkeypatch, capsys):
-        """Item 24 / cross-vendor retry 3 finding 6: the open-cursor
-        RECOVERY lookup in `_cmd_attended_step` (distinct from the
-        persist-path exists check tested above) has its own
-        `Path.exists()` and `load_cursor` calls, previously unguarded and
-        silently swallowed respectively. Either fault must fall through
-        to the SAME behaviour as a genuinely missing cursor -- never
-        escape, never silently re-serve against an unconfirmed cursor
-        state."""
+        """t5 (load fault). Required change (3), CORRECTED (plan review):
+        the open-cursor RECOVERY lookup in `_cmd_attended_step` (distinct
+        from the persist-path exists check tested above) has its own
+        `Path.exists()` and `load_cursor` calls. Earlier behaviour (this
+        test's own name, kept verbatim per the no-rename rule) let either
+        fault fall through to `begin_squad_stage` like a genuinely missing
+        cursor -- the judge found that itself unsafe: a fault means this
+        lookup cannot even TELL whether an open cursor exists, so falling
+        through risks a SECOND cursor underneath an unconfirmed first one.
+        Required change (3) closes that: a load fault now returns the
+        dedicated `dispatch_seam_cursor_unreadable` result and
+        `begin_squad_stage` is never reached."""
         task = TaskState(owner_squad="executive", description="brief the board")
         state = HydraState(root_goal="brief", tasks=[task])
         wf = str(state.workflow_id)
@@ -1561,6 +1565,7 @@ class TestM7FailSoftProperty:
 
         first = _run_step(tmp_path, wf, capsys)
         assert first["ok"] is True
+        cursor_bytes_before = Path(cursor_file).read_bytes()
 
         # Gated to the FIRST matching call only: within one
         # `_cmd_attended_step` invocation `load_cursor`/`Path.exists` for
@@ -1582,19 +1587,35 @@ class TestM7FailSoftProperty:
             return real_load(path)
         monkeypatch.setattr(host_bridge, "load_cursor", _flaky_load)
 
-        second = _run_step(tmp_path, wf, capsys)
+        begin_calls = {"n": 0}
+        real_begin = host_bridge.begin_squad_stage
 
-        assert second["ok"] is True  # (1)+(2): no exception, a defined response
+        def _counting_begin(*a, **kw):
+            begin_calls["n"] += 1
+            return real_begin(*a, **kw)
+        monkeypatch.setattr(host_bridge, "begin_squad_stage", _counting_begin)
+
+        second = _run_step_expect(tmp_path, wf, capsys, 1)
+
+        assert second == {
+            "ok": False,
+            "status": "dispatch_seam_cursor_unreadable",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
         assert fired["n"] > 0
+        assert begin_calls["n"] == 0
+        assert Path(cursor_file).read_bytes() == cursor_bytes_before
         trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events if e["kind"] == "dispatch.recovery_cursor_load_failed"]
 
     def test_squad_step_recovery_cursor_exists_fault_falls_through_like_missing_cursor(
             self, tmp_path, monkeypatch, capsys):
-        """Same as above, but for the recovery lookup's `Path.exists()`
-        itself faulting (e.g. a PermissionError) rather than the
-        subsequent `load_cursor`."""
+        """t5 (existence-check fault). Same correction as above (required
+        change (3)), but for the recovery lookup's `Path.exists()` itself
+        faulting (e.g. a PermissionError) rather than the subsequent
+        `load_cursor`."""
         task = TaskState(owner_squad="executive", description="brief the board")
         state = HydraState(root_goal="brief", tasks=[task])
         wf = str(state.workflow_id)
@@ -1605,6 +1626,7 @@ class TestM7FailSoftProperty:
 
         first = _run_step(tmp_path, wf, capsys)
         assert first["ok"] is True
+        cursor_bytes_before = Path(cursor_file).read_bytes()
 
         # Gated to the FIRST matching call only: `Path.exists()` for this
         # exact cursor path is called once by the RECOVERY lookup (which
@@ -1626,10 +1648,25 @@ class TestM7FailSoftProperty:
             return real_exists(self)
         monkeypatch.setattr(Path, "exists", _flaky_exists)
 
-        second = _run_step(tmp_path, wf, capsys)
+        begin_calls = {"n": 0}
+        real_begin = host_bridge.begin_squad_stage
 
-        assert second["ok"] is True  # (1)+(2)
+        def _counting_begin(*a, **kw):
+            begin_calls["n"] += 1
+            return real_begin(*a, **kw)
+        monkeypatch.setattr(host_bridge, "begin_squad_stage", _counting_begin)
+
+        second = _run_step_expect(tmp_path, wf, capsys, 1)
+
+        assert second == {
+            "ok": False,
+            "status": "dispatch_seam_cursor_unreadable",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
         assert fired["n"] > 0
+        assert begin_calls["n"] == 0
+        assert Path(cursor_file).read_bytes() == cursor_bytes_before
         trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events
@@ -1848,6 +1885,276 @@ class TestM7FailSoftProperty:
         assert res["squad_slug"] == "executive"
         assert fired["n"] > 0
         assert not (tmp_path / ".hydra" / wf / "attended").exists()  # (3)
+
+    # ----------------------------------------------------------------- #
+    # Required change (1): outer guard around _apply_dispatch_seam      #
+    # ----------------------------------------------------------------- #
+
+    def test_t1_unexpected_ticket_write_fault_after_unchanged_action_is_fail_soft(
+            self, tmp_path, monkeypatch, capsys):
+        """t1: write_dispatch_ticket itself replaced with a bare
+        RuntimeError (not its own internal fail-soft path -- the patch
+        replaces the whole function), raised after an UNCHANGED
+        (engineer) action. Caught by the new outer guard in
+        `_apply_dispatch_seam` (required change (1)): `host_action` is
+        unchanged, `dispatch_ticket` is `None`, the exit code equals the
+        no-fault engineer-step case, and exactly one
+        `dispatch.seam_unexpected_failure` event is emitted."""
+        state, task = _eng_state("add a feature")
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("injected unexpected ticket fault")
+        monkeypatch.setattr(dispatch_seam, "write_dispatch_ticket", _raiser)
+
+        res = _run_step(root, wf, capsys)  # asserts rc == 0, the no-fault exit code
+
+        assert res["ok"] is True
+        assert res["host_action"]["call_key"] == "generate-0"
+        assert res["dispatch_ticket"] is None
+        trace = (root / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        unexpected = [e for e in events if e["kind"] == "dispatch.seam_unexpected_failure"]
+        assert len(unexpected) == 1
+        assert unexpected[0]["error"] == "RuntimeError"
+
+    def test_t2a_outer_handler_decision_while_changed_unsaved_is_true(self):
+        """t2a. Honest finding for the report: at dc5e874 (after fix (2)),
+        every failure of the changed-squad-action cursor existence check,
+        load and save inside `_apply_dispatch_seam`'s "if changed:" branch
+        is caught by that branch's OWN inner handling and returns
+        `persist_failed` directly -- there is no statement that runs
+        while `changed_unsaved` is `True` that is both (a) not already
+        inside that inner try/early-return and (b) a real call this test
+        could patch to raise. The flag-true path of the OUTER handler is
+        therefore defence in depth with no natural trigger in the current
+        code shape, not a reachable path a fault-injection test can hit
+        honestly. Per the plan's own fallback: this is a DIRECT unit test
+        of the outer handler's decision helper, `_seam_failure_response`,
+        for both flag values -- the exact thing the outer `except` branch
+        in `_apply_dispatch_seam` calls to decide its response."""
+        cursor_file = "/some/cursor.json"
+
+        assert cli._seam_failure_response(True, cursor_file) == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": cursor_file,
+            "retryable": True,
+        }
+        assert cli._seam_failure_response(True, None) == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": None,
+            "retryable": True,
+        }
+        assert cli._seam_failure_response(False, cursor_file) is None
+        assert cli._seam_failure_response(False, None) is None
+
+    def test_t2b_ticket_write_fault_after_changed_action_cursor_already_saved(
+            self, tmp_path, monkeypatch):
+        """t2b: a changed squad action whose cursor save SUCCEEDS, then
+        `dispatch_seam.write_dispatch_ticket` raises RuntimeError. Expect
+        the changed `host_action` returned, equal to the action stored in
+        the cursor file; `dispatch_ticket` is `None`; the call succeeds
+        (no error dict -- the no-fault "exit code", i.e. `_apply_dispatch_seam`
+        itself returns `None` here just as it does with no fault at all);
+        and exactly one `dispatch.seam_unexpected_failure` event."""
+        wf = "wf-t2b"
+        run_id = "run-1"
+        call_key = "k"
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, run_id)
+        original_action = {"call_key": call_key, "agent_type": "p:boardroom",
+                            "prompt": "brief"}
+        host_bridge.save_cursor(cursor_file, {
+            "schema": host_bridge.CURSOR_SCHEMA, "pending_action": original_action})
+        pack = _ScopedPack()
+        res = {"host_action": original_action, "cursor_path": str(cursor_file),
+               "run_id": run_id}
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("injected unexpected ticket fault")
+        monkeypatch.setattr(dispatch_seam, "write_dispatch_ticket", _raiser)
+
+        err = cli._apply_dispatch_seam(
+            tmp_path, wf, res, kind="squad", pack=pack, squad_slug="executive",
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert err is None
+        saved_cursor = host_bridge.load_cursor(cursor_file)
+        assert res["host_action"] == saved_cursor["pending_action"]
+        assert res["host_action"] != original_action  # the directive was appended
+        assert res["dispatch_ticket"] is None
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        unexpected = [e for e in events if e["kind"] == "dispatch.seam_unexpected_failure"]
+        assert len(unexpected) == 1
+        assert unexpected[0]["error"] == "RuntimeError"
+
+    # ----------------------------------------------------------------- #
+    # Required change (2): a changed action is never served unsaved     #
+    # ----------------------------------------------------------------- #
+
+    def test_t3_changed_action_cursor_file_missing_returns_persist_failed_no_ticket(
+            self, tmp_path):
+        """t3: a changed squad action whose `res['cursor_path']` names a
+        cursor file that genuinely does not exist -- `Path.exists()`
+        returns `False`, it never raises. This is the exact gap required
+        change (2) closes: at dc5e874 this fell through the existing
+        exists-check-failed/exists-check-succeeded branches untouched and
+        was served, ticketed, and returned as if saved. Now returns
+        exactly the `persist_failed` dict and writes no ticket."""
+        wf = "wf-t3"
+        cursor_file = tmp_path / ".hydra" / wf / "attended" / "nope.json"
+        pack = _ScopedPack()
+        action = {"call_key": "k", "agent_type": "p:boardroom", "prompt": "brief"}
+        res = {"host_action": action, "cursor_path": str(cursor_file), "run_id": "run-1"}
+
+        err = cli._apply_dispatch_seam(
+            tmp_path, wf, res, kind="squad", pack=pack, squad_slug="executive",
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert err == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
+        assert res["host_action"] is action  # left untouched
+        assert "dispatch_ticket" not in res
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert not tickets_dir.exists()
+
+    def test_t4_changed_action_saved_cursor_matches_and_ticket_name_recomputed(
+            self, tmp_path):
+        """t4: a changed squad action whose cursor save succeeds. The
+        response action equals the action stored in the cursor file,
+        byte-for-byte after JSON load, and the ticket file name equals
+        the name recomputed from workflow_id/run_id/call_key."""
+        wf = "wf-t4"
+        run_id = "run-1"
+        call_key = "k"
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, run_id)
+        original_action = {"call_key": call_key, "agent_type": "p:boardroom",
+                            "prompt": "brief"}
+        host_bridge.save_cursor(cursor_file, {
+            "schema": host_bridge.CURSOR_SCHEMA, "pending_action": original_action})
+        pack = _ScopedPack()
+        res = {"host_action": original_action, "cursor_path": str(cursor_file),
+               "run_id": run_id}
+
+        err = cli._apply_dispatch_seam(
+            tmp_path, wf, res, kind="squad", pack=pack, squad_slug="executive",
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert err is None
+        saved_cursor = host_bridge.load_cursor(cursor_file)
+        assert res["host_action"] == saved_cursor["pending_action"]
+        expected_ticket_path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        assert res["dispatch_ticket"] == str(expected_ticket_path)
+        assert Path(res["dispatch_ticket"]).name == expected_ticket_path.name
+
+    # ----------------------------------------------------------------- #
+    # Finding (C): ordinary persist-path cursor-load OSError (distinct  #
+    # from both the recovery lookup's load and the save/_persist_cursor #
+    # path, which already has coverage via                              #
+    # test_cursor_persist_failure_returns_exact_status in TestM3)       #
+    # ----------------------------------------------------------------- #
+
+    def test_c_i_ordinary_cursor_load_raises_oserror_returns_persist_failed(
+            self, tmp_path, monkeypatch, capsys):
+        """(C)(i): no equivalent exists at dc5e874 -- the only load-fault
+        test there (`test_squad_step_recovery_cursor_load_fault_...`)
+        exercises the separate RECOVERY lookup's `load_cursor` call, not
+        this one (`_apply_dispatch_seam`'s own `host_bridge.load_cursor`
+        on the ordinary persist path, reached once the existence check
+        has already confirmed the cursor file is there). Exact
+        `persist_failed` dict, exit code 1, no ticket file."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+        task_id = str(task.task_id)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        def _raiser(path):
+            if str(path) == str(cursor_file):
+                raise OSError("disk error on cursor load")
+            raise AssertionError("unexpected load_cursor call in this test")
+        monkeypatch.setattr(host_bridge, "load_cursor", _raiser)
+
+        rc = cli._cmd_attended_step(argparse.Namespace(
+            project=str(tmp_path), workflow_id=wf, verbose=False))
+        out = capsys.readouterr().out
+
+        assert rc == 1
+        assert "Traceback" not in out
+        result = json.loads(out)
+        assert result == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert not tickets_dir.exists()
+
+    # (C)(ii) -- cursor SAVE raising OSError: an equivalent test already
+    # exists at dc5e874, `TestM3SquadDirective.
+    # test_cursor_persist_failure_returns_exact_status`, which patches
+    # `dispatch_seam._persist_cursor` to raise `OSError` and already
+    # asserts the exact dict, exit code 1, and no ticket file -- see the
+    # report. Nothing is missing from it, so nothing is added here (no
+    # placeholder test that can't fail on its own).
+
+    # ----------------------------------------------------------------- #
+    # Required change (4): budget-field derivation failure in submit    #
+    # ----------------------------------------------------------------- #
+
+    def test_t6_submit_budget_derivation_fault_still_writes_ticket(
+            self, tmp_path, monkeypatch, capsys):
+        """t6: a fault in `_cmd_attended_submit`'s budget-field derivation
+        -- `float(_b["budget_usd"])` raising because the checkpointed
+        budget snapshot's `budget_usd` is not numeric -- is reported
+        through safe_emit as `dispatch.ticket_budget_derivation_failed`,
+        emitted exactly once, and the ticket file is still written --
+        with `budget_usd` and `budget_remaining_usd` absent from the
+        ticket dict (the keys are present but `None`, exactly as
+        `write_dispatch_ticket` always defines "fields absent": it
+        assigns `budget_usd`/`budget_remaining_usd` unconditionally from
+        its own parameters, which default to `None` when not supplied --
+        there is no "omit the key" branch in that function)."""
+        state, task = _eng_state()
+        wf = str(state.workflow_id)
+        _disp, sup = _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+        step = _run_step(root, wf, capsys)
+        gen = {"text": "edited foo.py", "cost_usd": 0.05, "tokens_in": 5,
+               "tokens_out": 5, "model": "claude-sonnet-4-6"}
+
+        # Fault injection: the submit path's own `_pre_sup.get_state(...)`
+        # re-reads the SAME checkpoint `sup` holds, so poisoning its
+        # `budget.budget_usd` with a non-numeric value makes
+        # `float(_b["budget_usd"])` raise `ValueError` exactly where the
+        # required change (4) derivation lives -- no monkeypatching of
+        # `float` itself (which would also break every OTHER float
+        # conversion `_cmd_attended_submit` performs in the same call).
+        sup.values["budget"]["budget_usd"] = "not-a-number"
+
+        res = _run_submit(root, wf, step["run_id"], "generate-0", gen, capsys)
+
+        assert res["state"] == "await_judge"
+        assert res["dispatch_ticket"] is not None
+        ticket = _ticket(root, wf, res["run_id"], res["host_action"]["call_key"])
+        assert "budget_usd" in ticket and ticket["budget_usd"] is None
+        assert "budget_remaining_usd" in ticket and ticket["budget_remaining_usd"] is None
+        trace = (root / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        derivation_failed = [
+            e for e in events if e["kind"] == "dispatch.ticket_budget_derivation_failed"]
+        assert len(derivation_failed) == 1
 
     # ----------------------------------------------------------------- #
     # Deliberate exceptions E1-E3 (module docstring)                    #
