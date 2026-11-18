@@ -280,3 +280,381 @@ def test_clean_inputs_are_byte_identical(
         entrypoint="claude-skill", lead_agent="planner",
         pack_cwd=str(tmp_path), project_root=str(tmp_path), **pk)
     assert pres["host_action"]["prompt"] == host_bridge._build_squad_prompt(**pk)
+
+
+# =========================================================================== #
+# Retry additions: recovery / smoke / judge-artifact / identifier coverage.   #
+# =========================================================================== #
+
+SHA_MERGE: str = "a" * 40
+SHA_BASE: str = "b" * 40
+# A call_key that CONTAINS a PII-shaped substring (phone pattern). It is an
+# identifier: it must stay byte-for-byte verbatim wherever it is compared or
+# used to derive deterministic job paths.
+PII_SHAPED_KEY: str = "judge-run-555-123-4567-0"
+
+
+class _OverrideDispatcher(FakeDispatcher):
+    """FakeDispatcher whose named tools return canned responses."""
+
+    def __init__(self, overrides: dict[str, dict[str, Any]] | None = None,
+                 **kw: Any) -> None:
+        super().__init__(**kw)
+        self._overrides: dict[str, dict[str, Any]] = dict(overrides or {})
+
+    def call_mcp(self, server: str, tool: str, args: dict[str, Any],
+                 squad_id: str | None = None) -> dict[str, Any]:
+        if tool in self._overrides:
+            self.calls.append((server, tool, dict(args), squad_id))
+            return self._overrides[tool]
+        return super().call_mcp(server, tool, args, squad_id=squad_id)
+
+
+def _write_cursor(tmp_path: Path, **over: Any) -> Path:
+    payload: dict[str, Any] = {
+        "attempt_id": "att-1", "outcome": "pass",
+        "judge_producer": "codex", "judge_model_id": "codex-default",
+        "critique_md": "looks good", "score_json": {},
+        "rubric_id": "rfc-2119-normative", "idempotency_token": "judge-0",
+    }
+    cursor: dict[str, Any] = {
+        "schema": host_bridge.CURSOR_SCHEMA, "kind": "engineering",
+        "workflow_id": "wf-rec", "run_id": "run-rec", "stage_id": "stage-1",
+        "attempt_id": "att-1", "project_path": str(tmp_path),
+        "project_root": str(tmp_path), "repo_root": str(tmp_path),
+        "branch": "attended/rec", "preserved_branch": "attended/rec",
+        "state": "surfaced", "outcome": "pass", "final_status": "surfaced",
+        "cost_usd": 0.1, "tokens_in": 1, "tokens_out": 1,
+        "smoke_status": None, "finalized": True, "charged": True,
+        "verdict_recorded_for": "judge-0",
+        "pending_verdict_payload": payload,
+    }
+    cursor.update(over)
+    cfile = tmp_path / ".hydra" / "wf-rec" / "attended" / "run-rec.json"
+    host_bridge.save_cursor(cfile, cursor)
+    return cfile
+
+
+def _all_clean(samples: list[str], *texts: str) -> None:
+    for t in texts:
+        _assert_clean(t, samples)
+
+
+# R1 ------------------------------------------------------------------------
+def test_recovery_merge_failure_diagnostics_redacted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfile = _write_cursor(tmp_path)
+    monkeypatch.setattr(
+        host_bridge, "_merge_branch_back",
+        lambda repo, branch: {"merged": False, "sha": None, "base": None,
+                              "error": f"merge_failed: Author: {EMAIL}"})
+    disp = _OverrideDispatcher()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec["ok"] is False
+    assert rec["merge"]["merged"] is False
+    assert rec["error"].startswith("recovery merge failed: merge_failed:")
+    assert MARKER in rec["error"] and MARKER in rec["merge"]["error"]
+    _all_clean([EMAIL], rec["error"], repr(rec), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"), repr(disp.calls))
+    assert "attended.recovery.merge" in _trace_text(tmp_path, "wf-rec")
+
+
+# R2 ------------------------------------------------------------------------
+def test_recovery_revert_smoke_and_finalize_diagnostics_redacted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfile = _write_cursor(tmp_path)
+    monkeypatch.setattr(
+        host_bridge, "_merge_branch_back",
+        lambda repo, branch: {"merged": True, "sha": SHA_MERGE,
+                              "base": SHA_BASE, "error": None})
+    monkeypatch.setattr(
+        host_bridge, "_run_smoke",
+        lambda *a, **k: ("fail", f"pytest output mailed to {EMAIL}"))
+    monkeypatch.setattr(
+        host_bridge, "_revert_merge_commit",
+        lambda repo, sha, *, expected_base: {
+            "reverted": False, "sha": None, "abort_failed": False,
+            "abort_state": "clean", "error": f"revert_failed: by {PHONE}"})
+    disp = _OverrideDispatcher({
+        "finalize_stage": {"status": "failed", "error": f"stage db {EMAIL2}"},
+        "finalize_run": {"status": "failed", "error": f"run db {SSN2}"},
+    })
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    samples = [EMAIL, PHONE, EMAIL2, SSN2]
+    assert rec["ok"] is True
+    cur = host_bridge.load_cursor(cfile)
+    # status / identifiers / booleans are untouched ...
+    assert cur["smoke_status"] == "fail"
+    assert cur["merge"]["merged"] is True
+    assert cur["merge"]["sha"] == SHA_MERGE and cur["merge"]["base"] == SHA_BASE
+    assert cur["merge"]["reverted"] is False
+    assert cur["final_status"] == "surfaced"
+    # ... the descriptive text is scrubbed everywhere it is stored/traced/sent.
+    assert MARKER in cur["smoke_reason"]
+    assert "revert_failed" in cur["error"] and MARKER in cur["error"]
+    assert "recovery finalize_stage failed" in cur["error"]
+    assert "recovery finalize_run did not report success" in cur["error"]
+    _all_clean(samples, repr(rec), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"), repr(disp.calls))
+    smoke_call = next(a for _s, t, a, _q in disp.calls
+                      if t == "record_smoke_status")
+    assert smoke_call["status"] == "fail" and MARKER in smoke_call["reason"]
+
+
+# R3 ------------------------------------------------------------------------
+def test_recovery_record_verdict_failure_redacted(tmp_path: Path) -> None:
+    cfile = _write_cursor(tmp_path, state="stalled_infra",
+                          verdict_recorded_for=None)
+    disp = _OverrideDispatcher({"record_verdict": {
+        "status": "rejected", "error": f"bad verdict for {EMAIL}"}})
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec["ok"] is False
+    assert rec["error"].startswith("record_verdict recovery failed:")
+    assert MARKER in rec["error"]
+    _all_clean([EMAIL], repr(rec), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"))
+    assert "attended.recovery.verdict_failed" in _trace_text(tmp_path, "wf-rec")
+
+
+# R4 ------------------------------------------------------------------------
+def test_recovery_sync_smoke_reason_redacted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfile = _write_cursor(tmp_path, state="stalled_infra")
+    monkeypatch.setattr(
+        host_bridge, "_run_smoke",
+        lambda *a, **k: ("fail", f"smoke blew up near {EMAIL} / {PHONE}"))
+    disp = _OverrideDispatcher()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec["ok"] is True
+    cur = host_bridge.load_cursor(cfile)
+    assert cur["smoke_status"] == "fail" and MARKER in cur["smoke_reason"]
+    _all_clean([EMAIL, PHONE], repr(rec), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"), repr(disp.calls))
+
+
+# R5 (async: NOT forced synchronous) ----------------------------------------
+def test_recovery_async_spawn_failure_reason_redacted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from hydra_core import smoke_job
+    monkeypatch.delenv("HYDRA_ATTENDED_SMOKE_MODE", raising=False)
+    assert host_bridge._attended_smoke_mode() == "async"
+    monkeypatch.setattr(
+        smoke_job, "start_job",
+        lambda cursor_file, *, project_path, stage_id, call_key,
+        launch_token=None: {"call_key": call_key,
+                            "spawn_error": f"cannot spawn: {EMAIL} {SSN}"})
+    cfile = _write_cursor(tmp_path, state="stalled_infra",
+                          pending_action={"call_key": "judge-0"})
+    disp = _OverrideDispatcher()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec["ok"] is True
+    cur = host_bridge.load_cursor(cfile)
+    assert cur["smoke_status"] == "infra_error"
+    assert MARKER in cur["smoke_reason"]
+    assert cur.get("smoke_job") is None
+    _all_clean([EMAIL, SSN], repr(rec), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"), repr(disp.calls))
+    assert "attended.recovery.smoke_job_spawn_failed" in \
+        _trace_text(tmp_path, "wf-rec")
+
+
+# R6 identifiers stay verbatim (async job identity) --------------------------
+def test_recovery_call_key_identifier_is_verbatim_and_adoptable(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    import time
+
+    from hydra_core import smoke_job
+    monkeypatch.delenv("HYDRA_ATTENDED_SMOKE_MODE", raising=False)
+    # Sanity: the key really is PII-shaped, so a helper pass WOULD change it.
+    assert governance.redact_for_squad_boundary(
+        PII_SHAPED_KEY, scan_mcp_attacks=False) != PII_SHAPED_KEY
+    started: list[str] = []
+
+    def _start(cursor_file: Any, *, project_path: str, stage_id: str,
+               call_key: str, launch_token: str | None = None
+               ) -> dict[str, Any]:
+        started.append(call_key)
+        return {"pid": 4242, "call_key": call_key, "launch_token": launch_token,
+                **smoke_job.job_paths(cursor_file, call_key)}
+
+    monkeypatch.setattr(smoke_job, "start_job", _start)
+    cfile = _write_cursor(tmp_path, state="stalled_infra",
+                          pending_action={"call_key": PII_SHAPED_KEY})
+    disp = _OverrideDispatcher()
+    rec = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec["state"] == "await_smoke"
+    assert started == [PII_SHAPED_KEY]
+    cur = host_bridge.load_cursor(cfile)
+    assert cur["pending_action"]["call_key"] == PII_SHAPED_KEY
+    assert cur["smoke_job"]["call_key"] == PII_SHAPED_KEY
+    assert host_bridge.step_result(cur, cfile)["host_action"]["call_key"] \
+        == PII_SHAPED_KEY
+    assert MARKER not in _cursor_text(cfile)
+
+    # Crash-recovery adoption keys on call_key equality + deterministic paths:
+    # a persisted "launching" reservation whose result already landed must be
+    # adopted (no second worker), which only works if the key is verbatim.
+    paths = smoke_job.job_paths(cfile, PII_SHAPED_KEY)
+    Path(paths["result_path"]).write_text(json.dumps(
+        {"status": "pass", "reason": "ok", "launch_token": "tok-1"}),
+        encoding="utf-8")
+    cur["state"] = "stalled_infra"
+    cur["smoke_job"] = {"call_key": PII_SHAPED_KEY, "state": "launching",
+                        "reserved_at": time.time(), "launch_token": "tok-1",
+                        **paths}
+    host_bridge.save_cursor(cfile, cur)
+    rec2 = host_bridge.recover_stalled_stage(disp, cursor_file=cfile)
+    assert rec2["state"] == "await_smoke"
+    assert started == [PII_SHAPED_KEY], "adoption must not spawn a second worker"
+    assert "attended.smoke_job_adopted" in _trace_text(tmp_path, "wf-rec")
+
+
+# R7 smoke reason on the NORMAL async poll path -------------------------------
+def test_poll_smoke_job_result_reason_redacted(tmp_path: Path) -> None:
+    import json
+    cfile = _write_cursor(tmp_path, state="await_smoke", finalized=False,
+                          pending_action={"call_key": "judge-0"})
+    result_path = tmp_path / "job.result.json"
+    result_path.write_text(json.dumps(
+        {"status": "fail", "reason": f"exit=1 :: see {EMAIL} ssn {SSN}"}),
+        encoding="utf-8")
+    cur = host_bridge.load_cursor(cfile)
+    cur["smoke_job"] = {"call_key": "judge-0", "pid": 4242,
+                        "result_path": str(result_path)}
+    host_bridge.save_cursor(cfile, cur)
+    disp = _OverrideDispatcher()
+    host_bridge.poll_smoke_job(disp, cur, cursor_file=cfile)
+    host_bridge.save_cursor(cfile, cur)
+    assert cur["smoke_status"] == "fail" and MARKER in cur["smoke_reason"]
+    assert MARKER in cur["smoke_result_for"]["reason"]
+    _all_clean([EMAIL, SSN], _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-rec"), repr(disp.calls))
+
+
+# J1 / J2 judge artifact + failover note, direct -------------------------------
+def _judge_action(**over: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        call_key="judge-1", judge_agent="judge-cross-vendor",
+        gate_rubric="rfc-2119-normative", rubric_fallback=False,
+        required_cross=True, judge_text="clean diff", rubric_body="RUBRIC",
+        work_path="/w", allowed_models={"codex": ["m1"]},
+        judge_producer="codex")
+    kwargs.update(over)
+    return host_bridge._judge_pending_action(**kwargs)
+
+
+def test_judge_pending_action_redacts_artifact_text_and_failover_note() -> None:
+    act = _judge_action(
+        judge_text=f"+ contact = '{EMAIL}'\n+ ssn = '{SSN}'\n{ATTACK}",
+        failover_note=f"Prior judge failed for {PHONE} / {EMAIL2}.")
+    samples = [EMAIL, SSN, PHONE, EMAIL2]
+    _all_clean(samples, act["artifact_text"], act["instructions"], repr(act))
+    assert MARKER in act["artifact_text"]
+    assert MARKER in act["instructions"] and "Prior judge failed" in \
+        act["instructions"]
+    # judge kind: PII only, no MCP-attack scan; identifiers/registry untouched.
+    assert ATTACK in act["artifact_text"]
+    assert act["call_key"] == "judge-1" and act["rubric_md"] == "RUBRIC"
+
+
+def test_judge_pending_action_clean_input_unchanged() -> None:
+    act = _judge_action(failover_note="")
+    assert act["artifact_text"] == "clean diff"
+    assert "[REDACTED" not in repr(act)
+
+
+def test_generate_to_judge_artifact_pii_never_reaches_cursor_or_trace(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(host_bridge, "_judge_artifact_text",
+                        lambda *a, **k: f"diff touches {EMAIL} and {SSN}")
+    disp = FakeDispatcher()
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1", project_path=str(tmp_path),
+        request_text="implement", project_root=str(tmp_path))
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=res["cursor_path"], call_key="generate-0",
+        result={"text": f"summary for {EMAIL}", "cost_usd": 0.05, "model": "m"})
+    assert MARKER in res["host_action"]["artifact_text"]
+    _all_clean([EMAIL, SSN], repr(res), _cursor_text(res["cursor_path"]),
+               _trace_text(tmp_path, "wf-1"))
+
+
+# S1 judge-authored structures + pp rejection text ----------------------------
+def test_judge_score_notes_and_rpc_failure_redacted(tmp_path: Path) -> None:
+    disp = _OverrideDispatcher(
+        {"record_verdict": {"status": "failed",
+                            "error": f"validation: rejected for {EMAIL2}"}},
+        required_cross_vendor=True)
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1", project_path=str(tmp_path),
+        request_text="implement", project_root=str(tmp_path))
+    cfile = res["cursor_path"]
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.05, "model": "m"})
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=res["host_action"]["call_key"],
+        result={"outcome": "pass", "judge_producer": "codex",
+                "cost_usd": 0.02, "critique_md": "fine",
+                "score_json": {"clarity": 4, "notes": f"ask {EMAIL} {PHONE}"}})
+    cur = host_bridge.load_cursor(cfile)
+    pay = cur["pending_verdict_payload"]
+    assert pay["score_json"]["clarity"] == 4
+    assert pay["score_json"]["_cross_vendor"] is True
+    assert MARKER in pay["score_json"]["notes"]
+    assert "record_verdict RPC failed" in cur["error"]
+    assert MARKER in cur["error"]
+    _all_clean([EMAIL, PHONE, EMAIL2], repr(res), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-1"))
+
+
+# G1 record_attempt failure ---------------------------------------------------
+def test_record_attempt_failure_redacted(tmp_path: Path) -> None:
+    disp = _OverrideDispatcher(
+        {"record_attempt": {"status": "failed",
+                            "error": f"ledger refused {EMAIL}"}})
+    res = host_bridge.begin_stage(
+        disp, workflow_id="wf-1", run_id="run-1", project_path=str(tmp_path),
+        request_text="implement", project_root=str(tmp_path))
+    cfile = res["cursor_path"]
+    res = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key="generate-0",
+        result={"text": "edited foo.py", "cost_usd": 0.05, "model": "m"})
+    assert res["status"] == "surfaced"
+    assert "record_attempt RPC failed" in res["error"]
+    _all_clean([EMAIL], repr(res), _cursor_text(cfile),
+               _trace_text(tmp_path, "wf-1"), repr(disp.calls))
+
+
+# A1 abort --------------------------------------------------------------------
+def test_abort_stage_reason_redacted_and_clean_reason_verbatim(
+        tmp_path: Path) -> None:
+    cfile = _write_cursor(tmp_path, state="await_generate", finalized=False,
+                          pending_action={"call_key": "generate-0"})
+    disp = _OverrideDispatcher()
+    out = host_bridge.abort_stage(
+        disp, cursor_file=cfile, reason=f"operator {EMAIL} aborted")
+    assert out["status"] == "aborted" and MARKER in out["error"]
+    _all_clean([EMAIL], repr(out), _cursor_text(cfile), repr(disp.calls))
+
+    cfile2 = _write_cursor(tmp_path, state="await_generate", finalized=False,
+                           pending_action={"call_key": "generate-0"})
+    out2 = host_bridge.abort_stage(disp, cursor_file=cfile2)
+    assert out2["error"] == "operator_abort"
+
+
+# E1 rejected envelopes -------------------------------------------------------
+def test_record_rejected_envelopes_redacts_detail_keeps_identifiers(
+        tmp_path: Path) -> None:
+    cfile = _write_cursor(tmp_path, state="complete")
+    host_bridge.record_rejected_envelopes(cfile, [{
+        "envelope_id": "11111111-2222-3333-4444-555555555555",
+        "status": "failed", "detail": f"bad field {EMAIL}",
+        "errors": [{"loc": ["x"], "msg": f"got {SSN}", "type": "value_error"}]}])
+    cur = host_bridge.load_cursor(cfile)
+    item = cur["rejected_envelopes"][0]
+    assert item["envelope_id"] == "11111111-2222-3333-4444-555555555555"
+    assert item["status"] == "failed" and item["errors"][0]["loc"] == ["x"]
+    assert MARKER in item["detail"] and MARKER in item["errors"][0]["msg"]
+    _all_clean([EMAIL, SSN], _cursor_text(cfile))
