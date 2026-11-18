@@ -41,6 +41,7 @@ from typing import Any, Optional, Sequence
 
 import re as _re
 
+from . import governance as _governance
 from . import telemetry as _telemetry
 from .judge_vendor import (
     _base_judge_vendor,
@@ -460,6 +461,66 @@ _MAX_JUDGE_MODEL_CORRECTIONS = 2
 _JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
 
 
+def _outbound_text(text: str, *, kind: str, allow_pii: bool = False) -> str:
+    """W1.2 redact-at-build: scrub host-visible text before it is persisted to
+    the cursor / trace or handed to a host subagent. Returns ``text`` itself
+    (same object) when falsy; ``redact_for_squad_boundary`` also returns the
+    identical string when nothing matches. ``kind`` is 'engineer', 'judge' or
+    'squad'; only 'squad' text additionally gets the MCP-attack scan."""
+    if not text:
+        return text
+    return _governance.redact_for_squad_boundary(
+        text, allow_pii=allow_pii, scan_mcp_attacks=(kind == "squad"))
+
+
+def _outbound_value(value: Any, *, kind: str) -> Any:
+    """``_outbound_text`` for a value that may or may not be a string: a str
+    is redacted, anything else (None, int, bool, ...) is returned as-is."""
+    return _outbound_text(value, kind=kind) if isinstance(value, str) else value
+
+
+def _outbound_fields(mapping: dict[str, Any], keys: Sequence[str], *,
+                     kind: str) -> dict[str, Any]:
+    """Shallow copy of ``mapping`` whose named FREE-TEXT string fields are
+    redacted; every other key (booleans, status enums, shas, branch names,
+    numbers) is carried over untouched, so status comparisons on the result
+    behave exactly as on the original. Clean text comes back identical."""
+    out = dict(mapping)
+    for k in keys:
+        if k in out:
+            out[k] = _outbound_value(out[k], kind=kind)
+    return out
+
+
+def _outbound_deep(value: Any, *, kind: str) -> Any:
+    """Redact every string found in a nested structure (used for judge- or
+    validator-authored structures whose strings are all descriptive text).
+
+    Recurses into dict KEYS as well as values (a pydantic ``ValidationError
+    .errors()`` entry's ``loc`` can itself be used as a dict key downstream,
+    and an attacker-controlled key is exactly as host-visible as a value),
+    and into list/tuple/set/frozenset elements, preserving the container
+    type (``loc`` is a tuple; a set/frozenset round-trips as the same type).
+    Plain strings go through ``_outbound_text``; anything else (int, bool,
+    None, already-redacted-elsewhere Pydantic models passed in as str via
+    their own serialization) is returned unchanged."""
+    if isinstance(value, str):
+        return _outbound_text(value, kind=kind)
+    if isinstance(value, dict):
+        return {_outbound_deep(k, kind=kind): _outbound_deep(v, kind=kind)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        mapped = [_outbound_deep(v, kind=kind) for v in value]
+        if isinstance(value, tuple):
+            return tuple(mapped)
+        if isinstance(value, set):
+            return set(mapped)
+        if isinstance(value, frozenset):
+            return frozenset(mapped)
+        return mapped
+    return value
+
+
 def _judge_pending_action(*, call_key: str, judge_agent: str, gate_rubric: str,
                           rubric_fallback: bool, required_cross: bool,
                           judge_text: str, rubric_body: str, work_path: Any,
@@ -473,6 +534,10 @@ def _judge_pending_action(*, call_key: str, judge_agent: str, gate_rubric: str,
     both paths hand the host an identically-shaped instruction.
     """
     preferred_models = allowed_models.get(judge_producer, [])
+    # W1.2: artifact_text (diff) and failover_note (judge-tool reason) are
+    # host-visible and may carry PII; rubric_md is registry text, untouched.
+    judge_text = _outbound_text(judge_text, kind="judge")
+    failover_note = _outbound_text(failover_note, kind="judge")
     return {
         "call_key": call_key,
         "agent_type": judge_agent,
@@ -1499,12 +1564,15 @@ def _sweep_one_root(
                 # should not have to re-derive that by hand.
                 report["errors"].append({
                     "worktree": str(entry), "run_id": run_id,
-                    "error": result.get("error") or "removal_failed",
+                    # W1.2: git's own stderr (free text) is redacted.
+                    "error": _outbound_value(
+                        result.get("error"), kind="engineer") or "removal_failed",
                     "root": root_label, "cursor_state": state,
                 })
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the sweep
             report["errors"].append({
-                "worktree": str(entry), "run_id": run_id, "error": str(exc)[:300],
+                "worktree": str(entry), "run_id": run_id,
+                "error": _outbound_text(str(exc), kind="engineer")[:300],
                 "root": root_label, "cursor_state": state,
             })
 
@@ -1745,7 +1813,8 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
             except OSError as exc:  # noqa: BLE001 — record and move on
                 skipped_manifest.append({
                     "path": str(rel), "size": None,
-                    "reason": f"stat_failed: {exc!r}"[:200],
+                    "reason": _outbound_text(
+                        f"stat_failed: {exc!r}", kind="engineer")[:200],
                 })
                 continue
             if size > per_file_max:
@@ -1767,7 +1836,8 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
             except Exception as exc:  # noqa: BLE001 — best-effort per-item
                 skipped_manifest.append({
                     "path": str(rel), "size": size,
-                    "reason": f"copy_failed: {exc!r}"[:200],
+                    "reason": _outbound_text(
+                        f"copy_failed: {exc!r}", kind="engineer")[:200],
                 })
                 continue
             copied_total += size
@@ -1792,7 +1862,8 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
             )
         except Exception as exc:  # noqa: BLE001 — the copies themselves still stand
             _trace(cursor, "attended.evidence_manifest_write_failed",
-                   {"run_id": run_id, "error": str(exc)[:200]})
+                   {"run_id": run_id,
+                    "error": _outbound_text(str(exc), kind="engineer")[:200]})
         cursor["preserved_evidence_path"] = str(dest_root)
         _trace(cursor, "attended.evidence_preserved", {
             "run_id": run_id, "path": str(dest_root),
@@ -1803,7 +1874,8 @@ def _preserve_worktree_evidence(cursor: dict[str, Any], worktree_path: str,
         return str(dest_root)
     except Exception as exc:  # noqa: BLE001 — never block finalize
         _trace(cursor, "attended.evidence_preserve_failed",
-               {"run_id": run_id, "error": str(exc)[:200]})
+               {"run_id": run_id,
+                "error": _outbound_text(str(exc), kind="engineer")[:200]})
         return None
 
 
@@ -1843,7 +1915,8 @@ def _preserve_non_complete_work(cursor: dict[str, Any], worktree_path: str,
         _trace(cursor, "attended.preserved", {"branch": branch, "run_id": run_id})
     except Exception as exc:  # noqa: BLE001
         _trace(cursor, "attended.preserve_failed",
-               {"run_id": run_id, "error": str(exc)[:200]})
+               {"run_id": run_id,
+                "error": _outbound_text(str(exc), kind="engineer")[:200]})
 
 
 # --------------------------------------------------------------------------- #
@@ -2345,6 +2418,11 @@ def begin_stage(
     gate_type = _pp_gate_type("code", gate_type)
     judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     cm = dispatcher.call_mcp
+    # W1.2 redact-at-build: everything below that is persisted or host-visible
+    # derives from these redacted values.
+    request_text = _outbound_text(request_text, kind="engineer")
+    hydra_context_block = _outbound_text(
+        hydra_context_block or "", kind="engineer") or None
 
     st = _raise_on_error_payload(
         cm("pp_harness", "start_stage",
@@ -2354,7 +2432,9 @@ def begin_stage(
     )
     stage_id = _pp_inner(st).get("stage_id")
     if not stage_id:
-        raise RuntimeError(f"start_stage returned no stage_id: {st!r}")
+        raise RuntimeError(
+            "start_stage returned no stage_id: "
+            f"{_outbound_text(repr(st), kind='engineer')}")
 
     # Write-safety: isolate the engineer into a hook-allowed worktree.
     work_path = project_path
@@ -2507,7 +2587,8 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     gen_idx = cursor.get("generate_index", 0)
 
     if gen_fail:
-        cursor["error"] = gen_fail
+        # W1.2: the failure reason can quote host / generator text.
+        cursor["error"] = _outbound_text(gen_fail, kind="engineer")
         cursor["outcome"] = "error"
         try:
             _raise_on_error_payload(
@@ -2581,7 +2662,9 @@ def _apply_generate(dispatcher: Dispatcher, cursor: dict[str, Any],
     except Exception as _ra_exc:  # noqa: BLE001
         # record_attempt RPC failed — surface the stage immediately rather than
         # crashing. The engineer's work is generated but cannot be tracked.
-        cursor["error"] = f"record_attempt RPC failed: {_ra_exc!r}"
+        cursor["error"] = (
+            "record_attempt RPC failed: "
+            f"{_outbound_text(repr(_ra_exc), kind='engineer')}")
         _finalize(dispatcher, cursor, passed=False, gen_failed=False,
                  workflow_terminal=workflow_terminal)
         return
@@ -2799,6 +2882,11 @@ def _apply_smoke_and_finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     """
     smoke_status, smoke_reason = _apply_smoke_baseline_excuse(
         cursor, work_path, smoke_status, smoke_reason)
+    # W1.2: the smoke reason is raw command output / exception text. Redact it
+    # once, here, so the pp record_smoke_status call, the ``smoke_result_for``
+    # marker and ``cursor["smoke_reason"]`` all carry the same scrubbed value.
+    # ``smoke_status`` (an enum compared below) is deliberately untouched.
+    smoke_reason = _outbound_text(smoke_reason, kind="engineer")
     try:
         _raise_on_error_payload(
             dispatcher.call_mcp("pp_harness", "record_smoke_status", {
@@ -2880,7 +2968,8 @@ def _finalize_immediate_smoke_spawn_failure(
     except Exception as exc:  # noqa: BLE001 — see docstring: last-resort trace + re-raise
         _trace(cursor, "attended.smoke_job_terminal_persist_failed", {
             "stage_id": cursor.get("stage_id"), "call_key": call_key,
-            "spawn_reason": reason, "persist_error": repr(exc),
+            "spawn_reason": _outbound_text(reason, kind="engineer"),
+            "persist_error": _outbound_text(repr(exc), kind="engineer"),
         })
         raise
 
@@ -3234,6 +3323,10 @@ def _adopt_or_launch_smoke_job(
     job = _smoke_job.start_job(
         cursor_file, project_path=work_path, stage_id=stage_id, call_key=call_key,
         launch_token=launch_token)
+    if job.get("spawn_error"):
+        # W1.2: spawn_error is exception text from the worker launch; it is
+        # persisted on the cursor (``smoke_job``) and traced by every caller.
+        job = _outbound_fields(job, ("spawn_error",), kind="engineer")
     return job
 
 
@@ -3380,6 +3473,9 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         idx = int(cursor.get("judge_vendor_chain_idx") or 0)
         stage_id = cursor.get("stage_id")
         failed_vendor = chain[idx] if idx < len(chain) else result.get("vendor")
+        # W1.2: the judge tool's reason is free text from the host; redact it
+        # once and use the same value in instructions, trace and error.
+        reason = _outbound_text(str(result.get("reason") or ""), kind="judge")
         next_idx = idx + 1
         if next_idx < len(chain):
             next_vendor = chain[next_idx]
@@ -3391,7 +3487,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             pending["allowed_judge_model_ids"] = allowed_models
             pending["instructions"] = (
                 f"FAILOVER: judge_producer {failed_vendor!r} reported "
-                f"judge_tool_failed ({result.get('reason')!r}). Spawn the "
+                f"judge_tool_failed ({reason!r}). Spawn the "
                 f"visible judge subagent AGAIN for the SAME call_key, this "
                 f"time with judge_producer={next_vendor!r} "
                 f"(preferred_models={allowed_models.get(next_vendor, [])!r}). "
@@ -3403,7 +3499,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             _trace(cursor, "attended.judge_vendor_failover", {
                 "stage_id": stage_id, "call_key": call_key,
                 "from_producer": failed_vendor, "to_producer": next_vendor,
-                "reason": result.get("reason"),
+                "reason": reason,
             })
             if cursor_file is not None:
                 save_cursor(cursor_file, cursor)
@@ -3412,7 +3508,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "retryable": True,
                 "error": (
                     f"judge vendor {failed_vendor!r} reported judge_tool_failed "
-                    f"({result.get('reason')!r}); resubmit the SAME call_key "
+                    f"({reason!r}); resubmit the SAME call_key "
                     f"with judge_producer={next_vendor!r}"),
                 "judge_producer": next_vendor,
             }
@@ -3420,10 +3516,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         # code defect, so it must surface immediately rather than loop.
         cursor["error"] = (
             f"all judge vendors exhausted after judge_tool_failed from "
-            f"{failed_vendor!r}: {result.get('reason')}")
+            f"{failed_vendor!r}: {reason}")
         _trace(cursor, "attended.judge_vendor_failover_exhausted", {
             "stage_id": stage_id, "call_key": call_key,
-            "chain": chain, "reason": result.get("reason"),
+            "chain": chain, "reason": reason,
         })
         _finalize(dispatcher, cursor, passed=False, gen_failed=False,
                  workflow_terminal=workflow_terminal)
@@ -3515,7 +3611,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     outcome = result.get("outcome") or result.get("verdict") or "revise"
     if outcome not in {"pass", "revise", "fail"}:
         outcome = "revise"
-    critique_md = str(result.get("critique_md") or result.get("critique") or "")
+    # W1.2 (d): redact once at intake -- this value feeds the persisted
+    # pending_verdict_payload, the suspicious-critique trace head, the
+    # Reflexion cursor field and the generate-1 prompt.
+    critique_md = _outbound_text(
+        str(result.get("critique_md") or result.get("critique") or ""),
+        kind="judge")
     judge_producer = str(result.get("judge_producer")
                          or ("codex" if required_cross else "claude"))
     cross_vendor = judge_producer != producer
@@ -3530,7 +3631,11 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     if not required_cross and judge_producer == producer:
         judge_producer = f"{producer}-same-vendor-host"
 
-    score_json = dict(result.get("score_json") or result.get("score") or {})
+    # W1.2: a judge-authored score dict may carry free-text notes; the engine
+    # keys added below are ids/flags and are never passed through the helper.
+    score_json = dict(_outbound_deep(
+        dict(result.get("score_json") or result.get("score") or {}),
+        kind="judge"))
     score_json["_cross_vendor"] = cross_vendor
     score_json["_judge_tier"] = "cross_vendor" if required_cross else "same_vendor"
     score_json["_attended"] = True
@@ -3575,6 +3680,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         dispatcher, judge_vendor=_judge_vendor, judge_model_id=judge_model_id,
         result=result, allowed_models=allowed_models,
     )
+    # W1.2: ``judge_override_reason`` is host-authored free text (the source
+    # and model-id fields are enums / identifiers and stay verbatim).
+    _verdict_provenance = _outbound_fields(
+        _verdict_provenance, ("judge_override_reason",), kind="judge")
 
     # Finding 2: track whether the outcome change is an infra failure (F31 /
     # F26+M8) vs a genuine artifact defect.  Infra failures must surface
@@ -3672,7 +3781,9 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     _is_pin_error = _is_judge_pin_error(_record_verdict_exc)
     _is_provenance_error = _is_judge_provenance_error(_record_verdict_exc)
     if not _record_verdict_ok and (_is_pin_error or _is_provenance_error):
-        _pin_reason = str(_record_verdict_exc)
+        # W1.2: pp's rejection text is redacted once; classification above
+        # already ran on the raw exception.
+        _pin_reason = _outbound_text(str(_record_verdict_exc), kind="judge")
         if _judge_correction_budget_left(cursor, call_key):
             n = _record_judge_correction(cursor, call_key)
             _trace_event = ("attended.judge_provenance_rejected" if _is_provenance_error
@@ -3707,7 +3818,9 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         })
 
     if outcome == "pass" and not _record_verdict_ok:
-        _rv_reason = str(_record_verdict_exc) if _record_verdict_exc is not None else "unknown error"
+        _rv_reason = _outbound_text(
+            str(_record_verdict_exc) if _record_verdict_exc is not None
+            else "unknown error", kind="judge")
         _rv_kind = _classify_infra_failure(_record_verdict_exc)
         cursor["error"] = (cursor.get("error") or "") + \
             f" record_verdict RPC failed ({_rv_kind}): {_rv_reason}"
@@ -3856,11 +3969,13 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             # into await_smoke to poll a job that never started.
             _trace(cursor, "attended.smoke_job_spawn_failed", {
                 "stage_id": cursor.get("stage_id"), "call_key": call_key,
-                "reason": job["spawn_error"],
+                "reason": _outbound_text(
+                    str(job["spawn_error"]), kind="engineer"),
             })
             _finalize_immediate_smoke_spawn_failure(
                 dispatcher, cursor, cursor_file=cursor_file, call_key=call_key,
-                work_path=work_path, reason=job["spawn_error"],
+                work_path=work_path,
+                reason=_outbound_text(str(job["spawn_error"]), kind="engineer"),
                 workflow_terminal=workflow_terminal)
             return None
         cursor["smoke_job"] = job
@@ -3957,7 +4072,11 @@ def _finalize(dispatcher: Dispatcher, cursor: dict[str, Any], *,
     branch = cursor.get("branch")
     if worktree_path and repo_root and branch:
         if passed and not workflow_terminal:
-            merge = _merge_worktree_back(repo_root, worktree_path, branch)
+            # W1.2: ``error`` carries git stderr / exception text; ``merged``,
+            # ``sha`` and the error literals compared elsewhere stay verbatim.
+            merge = _outbound_fields(
+                _merge_worktree_back(repo_root, worktree_path, branch),
+                ("error",), kind="engineer")
             cursor["merge"] = merge
             if not merge.get("merged"):
                 # Merge failed — surface the run so the operator knows code
@@ -4260,6 +4379,7 @@ def begin_squad_stage(
     plan_revision: int | None = None,
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
+    allow_pii: bool = False,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -4284,6 +4404,10 @@ def begin_squad_stage(
     match instead of silently matching the new cursor.
     """
     call_key = f"squad-{task_id}-{int(attempt)}"
+    # W1.2 redact-at-build: PII + MCP-attack scan on everything host-visible.
+    # ``allow_pii`` defaults to False == the pre-W1.2 caller behaviour of
+    # scrubbing PII at the squad boundary (governance's own default).
+    request_text = _outbound_text(request_text, kind="squad", allow_pii=allow_pii)
     prompt = _build_squad_prompt(
         workflow_id=workflow_id,
         task_id=task_id,
@@ -4301,6 +4425,7 @@ def begin_squad_stage(
         plan_critique=plan_critique,
         supersedes_plan_envelope_id=supersedes_plan_envelope_id,
     )
+    prompt = _outbound_text(prompt, kind="squad", allow_pii=allow_pii)
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "kind": "squad",
@@ -4320,6 +4445,11 @@ def begin_squad_stage(
         "error": None,
         "finalized": False,
         "attempt": int(attempt),
+        # W1.2 step B: carried so _apply_squad_result can redact the squad's
+        # own returned artifact text the same way its request_text/prompt
+        # were redacted here (the raw submission is never re-derived from
+        # this flag at submit time -- only whether to KEEP PII in it).
+        "allow_pii": bool(allow_pii),
         "pending_action": {
             "call_key": call_key,
             "agent_type": lead_agent,
@@ -4333,8 +4463,10 @@ def begin_squad_stage(
     # slash command + MCP tool scope so the host can drive them via
     # general-purpose; `lead_agent_file` is informational.
     if action_extras:
-        cursor["pending_action"].update(
-            {k: v for k, v in action_extras.items() if k != "agent_type"})
+        cursor["pending_action"].update({
+            k: (_outbound_text(v, kind="squad", allow_pii=allow_pii)
+                if isinstance(v, str) else v)
+            for k, v in action_extras.items() if k != "agent_type"})
     cfile = cursor_path(project_root, workflow_id, task_id)
     save_cursor(cfile, cursor)
     _trace(cursor, "attended.squad_stage_started", {
@@ -4360,6 +4492,7 @@ def _has_native_pack(slug: str) -> bool:
 def _persist_attended_squad_artifact(
     dispatcher: Dispatcher,
     cursor: dict[str, Any],
+    text: str,
     *,
     cursor_file: str | Path,
 ) -> tuple[dict[str, Any] | None, str | None, list[str]]:
@@ -4378,10 +4511,14 @@ def _persist_attended_squad_artifact(
     2. when the squad has a claude-skill shim, ``<prefix>.output.write`` as
        well, so the pack's own on-disk store stays in sync.
 
+    ``text`` is the RAW squad-submitted artifact (W1.2 step A): the caller
+    passes it explicitly rather than this function reading
+    ``cursor["artifact_text"]``, because that cursor field now holds the
+    REDACTED copy returned to the host after this persist completes.
+
     Returns ``(artifact_ref | None, via | None, errors)``. The caller downgrades
     the outcome to ``complete_unpersisted`` only when BOTH legs failed.
     """
-    text = str(cursor.get("artifact_text") or "")
     slug = str(cursor.get("squad_slug") or "")
     wf = str(cursor.get("workflow_id") or "")
     raw_task = str(cursor.get("task_id") or cursor.get("run_id") or "task")
@@ -4400,7 +4537,8 @@ def _persist_attended_squad_artifact(
         ref = mref.model_dump(mode="json")
         via.append("generic")
     except Exception as exc:  # noqa: BLE001 — fail-soft; the shim leg may still land
-        errors.append(f"generic store: {exc}")
+        errors.append(
+            f"generic store: {_outbound_text(str(exc), kind='engineer')}")
 
     shim = _resolve_skill_shim(slug) if slug else None
     if shim:
@@ -4425,7 +4563,7 @@ def _persist_attended_squad_artifact(
                     summary=str(rel),
                 ).model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001 — pack store is best-effort
-            errors.append(f"{tool}: {exc}")
+            errors.append(f"{tool}: {_outbound_text(str(exc), kind='engineer')}")
 
     return ref, ("+".join(via) or None), errors
 
@@ -4452,22 +4590,50 @@ def _apply_squad_result(
                            + coerce_untrusted_count(result.get("tokens_in")))
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
                             + coerce_untrusted_count(result.get("tokens_out")))
-    cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
+    # W1.2 step A: the raw squad submission stays in this local only. It is
+    # handed to the persist path (as an argument, never read back off the
+    # cursor) and then, once the canonical write has happened, the cursor's
+    # own ``artifact_text`` is overwritten with a redacted copy -- the only
+    # shape ``_step_result``/the host/the trace/the DECISION_RECORD ever see.
+    raw_artifact_text = str(result.get("text") or result.get("artifact") or "")
     # Native pack results may delegate typed work to another squad.  Keep the
     # raw list in the cursor so the CLI can validate/redact/ingest it under the
     # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
     emitted = result.get("emitted_envelopes", result.get("envelopes", []))
     cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
 
-    # E2-35: a squad with no native pack still gets its artifact persisted --
-    # generically, and (when it has one) through its claude-skill shim too.
-    # Native packs are left to the CLI's `write_native_artifact` path, which
-    # already returns a `<plugin>:output:...` ref for them.
+    # E2-35 / W1.2 step A: a squad with no native pack gets its artifact
+    # persisted generically (and, when it has one, through its claude-skill
+    # shim too). A native pack is now ALSO persisted in-process, here --
+    # `write_native_artifact` through the pack's declared output root --
+    # instead of leaving that write to the CLI's post-submit block, so the
+    # raw text never has to round-trip through the cursor to reach cli.py.
     slug = str(cursor.get("squad_slug") or "")
+    allow_pii = bool(cursor.get("allow_pii", False))
     final_status = "complete"
-    if cursor["artifact_text"] and not _has_native_pack(slug):
+    if raw_artifact_text and _has_native_pack(slug):
+        task_id = str(cursor.get("task_id") or cursor.get("run_id") or "")
+        try:
+            from .artifact_store import write_native_artifact
+            ref = write_native_artifact(
+                slug, f"attended/{task_id}.md", raw_artifact_text)
+            cursor["artifact_ref"] = ref.model_dump(mode="json")
+            cursor["artifact_persisted_via"] = "native"
+            _trace(cursor, "attended.native_artifact_persisted", {
+                "squad_slug": slug, "memory_ref": ref.key,
+            })
+        except (ValueError, OSError) as exc:
+            # W1.2: the exception text may echo the raw artifact (e.g. a
+            # "not text" message); never let it carry PII onto the cursor.
+            cursor["artifact_persist_error"] = _outbound_text(
+                str(exc), kind="engineer")
+            _trace(cursor, "attended.native_artifact_persist_failed", {
+                "squad_slug": slug, "error": cursor["artifact_persist_error"],
+            })
+            final_status = "complete_unpersisted"
+    elif raw_artifact_text:
         ref, via, errors = _persist_attended_squad_artifact(
-            dispatcher, cursor, cursor_file=cursor_file)
+            dispatcher, cursor, raw_artifact_text, cursor_file=cursor_file)
         if ref is not None:
             cursor["artifact_ref"] = ref
             cursor["artifact_persisted_via"] = via
@@ -4485,6 +4651,15 @@ def _apply_squad_result(
             _trace(cursor, "attended.skill_artifact_persist_failed", {
                 "squad": slug, "error": cursor["artifact_persist_error"],
             })
+
+    # W1.2 step A: the canonical write (above) always used the RAW text; the
+    # cursor field every downstream reader (host_action echo, trace,
+    # DECISION_RECORD) sees is the redacted copy, unless the squad is
+    # explicitly PII-allow-listed. `_outbound_text` still neutralizes
+    # MCP-attack shapes even when `allow_pii` is True (kind="squad" always
+    # scans for them), matching `begin_squad_stage`'s own outbound text.
+    cursor["artifact_text"] = _outbound_text(
+        raw_artifact_text, kind="squad", allow_pii=allow_pii)
 
     cursor["final_status"] = final_status
     cursor["state"] = final_status
@@ -4638,10 +4813,14 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
                 "record_verdict",
             )
         except Exception as exc:  # noqa: BLE001
+            # W1.2: exception text is engine-derived free text.
+            _exc_text = _outbound_text(str(exc), kind="engineer")
             _trace(cursor, "attended.recovery.verdict_failed", {
-                "stage_id": stage_id, "attempt_id": attempt_id, "reason": str(exc),
+                "stage_id": stage_id, "attempt_id": attempt_id,
+                "reason": _exc_text,
             })
-            return {"ok": False, "error": f"record_verdict recovery failed: {exc}"}
+            return {"ok": False,
+                    "error": f"record_verdict recovery failed: {_exc_text}"}
         cursor["verdict_recorded_for"] = payload.get("idempotency_token") or "recovery"
         _trace(cursor, "attended.recovery.verdict_recorded", {
             "stage_id": stage_id, "attempt_id": attempt_id,
@@ -4665,6 +4844,8 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # inline for a prompt recovery result.
         if outcome == "pass" and attempt_id and _attended_smoke_mode() != "sync":
             work_path = cursor.get("work_path") or cursor["project_path"]
+            # Identifier: used for equality checks and the deterministic smoke
+            # job paths in `_adopt_or_launch_smoke_job` -- kept verbatim.
             _recovery_call_key = (cursor.get("pending_action") or {}).get(
                 "call_key") or f"recovery-{stage_id}"
             # P2-3: reserve the await_smoke transition BEFORE ever spawning
@@ -4677,12 +4858,16 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
                 # synchronously as an infra smoke failure instead of parking
                 # into await_smoke to poll a job that never started.
                 _trace(cursor, "attended.recovery.smoke_job_spawn_failed", {
-                    "stage_id": stage_id, "reason": job["spawn_error"],
+                    "stage_id": stage_id,
+                    "reason": _outbound_text(
+                        str(job["spawn_error"]), kind="engineer"),
                 })
                 _finalize_immediate_smoke_spawn_failure(
                     dispatcher, cursor, cursor_file=cursor_file,
                     call_key=_recovery_call_key, work_path=work_path,
-                    reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+                    reason=_outbound_text(
+                        str(job["spawn_error"]), kind="engineer"),
+                    workflow_terminal=workflow_terminal)
                 # _apply_smoke_and_finalize's own internal save_cursor (Fix-1b)
                 # runs BEFORE it stamps the final smoke_status/outcome fields
                 # onto the in-memory cursor -- persist the fully-finalized
@@ -4714,6 +4899,8 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
             work_path = cursor.get("work_path") or cursor["project_path"]
             smoke_status, smoke_reason = _run_smoke(
                 dispatcher, project_path=work_path, stage_id=stage_id)
+            # W1.2: smoke output is free text; the status enum is not touched.
+            smoke_reason = _outbound_text(smoke_reason, kind="engineer")
             cursor["smoke_status"] = smoke_status
             cursor["smoke_reason"] = smoke_reason
             try:
@@ -4753,7 +4940,11 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # pickup instead.
         merge = {"merged": False, "error": "workflow_terminal"}
     else:
-        merge = _merge_branch_back(repo_root, branch)
+        # W1.2: redact only the free-text ``error`` (git diagnostics can carry
+        # an author email); ``merged`` / ``sha`` / ``base`` and the literal
+        # markers compared below (``already_merged`` ...) stay verbatim.
+        merge = _outbound_fields(
+            _merge_branch_back(repo_root, branch), ("error",), kind="engineer")
     cursor["merge"] = merge
     _trace(cursor, "attended.recovery.merge", {
         "stage_id": stage_id, "branch": branch, "merged": merge.get("merged"),
@@ -4792,6 +4983,7 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     if outcome == "pass" and cursor.get("smoke_status") not in ("pass", "fail"):
         smoke_status, smoke_reason = _run_smoke(
             dispatcher, project_path=repo_root, stage_id=stage_id)
+        smoke_reason = _outbound_text(smoke_reason, kind="engineer")
         cursor["smoke_status"] = smoke_status
         cursor["smoke_reason"] = smoke_reason
         try:
@@ -4827,8 +5019,12 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     # clean revert happened.
     revert: dict[str, Any] | None = None
     if not passed and merge.get("merged") and merge.get("sha"):
-        revert = _revert_merge_commit(
-            repo_root, merge["sha"], expected_base=merge.get("base"))
+        # W1.2: ``error`` carries git stderr; the booleans, ``sha`` and
+        # ``abort_state`` enum are left alone.
+        revert = _outbound_fields(
+            _revert_merge_commit(
+                repo_root, merge["sha"], expected_base=merge.get("base")),
+            ("error",), kind="engineer")
         cursor["merge"]["reverted"] = bool(revert.get("reverted"))
         if revert.get("reverted"):
             cursor["merge"]["revert_sha"] = revert.get("sha")
@@ -4887,7 +5083,9 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         fin_stage_ok = True
     except Exception as exc:  # noqa: BLE001
         fin_stage_ok = False
-        cursor["error"] = (cursor.get("error") or "") + f"; recovery finalize_stage failed: {exc}"
+        cursor["error"] = (cursor.get("error") or "") + (
+            f"; recovery finalize_stage failed: "
+            f"{_outbound_text(str(exc), kind='engineer')}")
     if passed and not fin_stage_ok:
         passed = False
 
@@ -4941,8 +5139,9 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
     fin_downgraded = bool(fin_inner.get("downgraded"))
     fin_run_ok = _pp_ok(fin)
     if not fin_run_ok:
-        cursor["error"] = (cursor.get("error") or "") + \
-            f"; recovery finalize_run did not report success: {fin!r}"
+        cursor["error"] = (cursor.get("error") or "") + (
+            "; recovery finalize_run did not report success: "
+            f"{_outbound_text(repr(fin), kind='engineer')}")
 
     # Never claim "complete" on the cursor unless pp's run-level record
     # actually agrees -- if finalize_run failed outright, or pp itself
@@ -5137,7 +5336,13 @@ def record_rejected_envelopes(cursor_file: str | Path,
         return
     try:
         cursor = load_cursor(cursor_file)
-        cursor["rejected_envelopes"] = list(rejected)
+        # W1.2: ``detail`` and the pydantic ``errors`` echo host-supplied
+        # envelope content; ids, types and statuses stay verbatim.
+        cursor["rejected_envelopes"] = [
+            {**it, **{k: _outbound_deep(it[k], kind="engineer")
+                      for k in ("detail", "errors") if k in it}}
+            if isinstance(it, dict) else it
+            for it in rejected]
         save_cursor(cursor_file, cursor)
         _trace(cursor, "attended.envelopes_rejected", {
             "task_id": cursor.get("task_id"),
@@ -5152,10 +5357,14 @@ def abort_stage(dispatcher: Dispatcher, *, cursor_file: str | Path,
                 reason: str = "operator_abort") -> dict[str, Any]:
     """Best-effort abort: finalize the pp run ``aborted`` to release the lock and
     mark the cursor terminal. Never raises."""
+    # W1.2: the operator-supplied reason is free text; it is stored on the
+    # cursor and sent to pp inside summary_md.
+    reason = _outbound_text(reason, kind="engineer")
     try:
         cursor = load_cursor(cursor_file)
     except Exception as e:  # noqa: BLE001
-        return {"status": "aborted", "error": f"cursor_unreadable: {e}"}
+        return {"status": "aborted", "error": (
+            f"cursor_unreadable: {_outbound_text(str(e), kind='engineer')}")}
     if cursor.get("state") in _TERMINAL:
         return _step_result(cursor, cursor_file)
     try:
