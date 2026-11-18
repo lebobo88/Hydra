@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from . import boundary as _boundary
 from .eights.attestation import EightsAttestor
 from .governance import (
     charge_and_gate,
@@ -713,32 +714,15 @@ def build_supervisor(
         Invalid envelopes raise ValueError — caller decides whether to fail the
         task or surface to HITL.
         """
-        try:
-            validate_envelope(env_dict)
-        except (ValueError, Exception) as exc:
-            emit_trace(judge_trace_root, "boundary", "envelope_validation_failed", {
-                "envelope_id": env_dict.get("id"),
-                "envelope_type": env_dict.get("type"),
-                "direction": direction,
-                "squad_id": squad_id,
-                "error": str(exc),
-            })
-            raise
-
-        redacted = dict(env_dict)
-        for text_field in ("objective", "summary", "instructions", "decision",
-                           "rationale", "risk_assessment", "rollout_plan"):
-            if text_field in redacted and isinstance(redacted[text_field], str):
-                redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
-
-        emit_trace(judge_trace_root, env_dict.get("workflow_id", "boundary"),
-                   "squad_boundary_crossing", {
-                       "envelope_id": env_dict.get("id"),
-                       "envelope_type": env_dict.get("type"),
-                       "direction": direction,
-                       "squad_id": squad_id,
-                   })
-        return redacted
+        return _boundary.validate_and_redact_envelope(
+            env_dict,
+            direction=direction,
+            squad_id=squad_id,
+            trace_root=judge_trace_root,
+            validate_fn=validate_envelope,
+            redact_fn=redact_for_squad_boundary,
+            emit_fn=emit_trace,
+        )
 
     # ----- node implementations -----
 
@@ -3934,12 +3918,9 @@ def build_supervisor(
                 # in `_validate_and_redact_envelope` propagates instead of
                 # being silently swallowed here.
                 try:
-                    redacted = dict(env)
-                    for text_field in ("objective", "summary", "instructions",
-                                       "decision", "rationale",
-                                       "risk_assessment", "rollout_plan"):
-                        if text_field in redacted and isinstance(redacted[text_field], str):
-                            redacted[text_field] = redact_for_squad_boundary(redacted[text_field])
+                    redacted = _boundary.redact_envelope_text_fields(
+                        env, redact_fn=redact_for_squad_boundary,
+                    )
                     emit_trace(judge_trace_root, "boundary",
                                "envelope_validation_failed_redacted_fallback", {
                                    "envelope_id": env.get("id"),
@@ -4358,6 +4339,26 @@ def build_supervisor(
         verdict = enforce_governance(state, packs, constitution=constitution)
         if verdict.surfaced:
             state.phase = "surfaced"
+            # Hydra#163: a constitution breach is a real, resolvable HITL gate
+            # (approve_override / reject), not a bare governance string. Filed
+            # BEFORE the open_pp_runs drain so an undrained-lock gate still
+            # becomes the active gate and keeps this one under prior_gate.
+            # Every other governance surface (loop/envelope/mcp/budget/failed
+            # tasks) deliberately files no gate.
+            if verdict.reason.startswith("constitution_breach"):
+                _breach_hitl = HITLRequest(
+                    workflow_id=state.workflow_id,
+                    origin_squad="hydra-governance",
+                    target_squad="human",
+                    reason="constitution_breach",
+                    summary=verdict.reason,
+                    options=["approve_override", "reject"],
+                    default_option="reject",
+                )
+                _breach_dict = _breach_hitl.model_dump(mode="json")
+                _breach_dict["gate_node"] = "postcheck"
+                eights.hitl_request(_breach_dict, gate_node="postcheck")
+                state.pending_hitl = _breach_dict
             # B7 — release pp-harness locks for any open runs this workflow
             # started. On a clean "done" path we intentionally leave the
             # entries in place (pp owns those runs from start_run onward),

@@ -3081,6 +3081,16 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # `gate_node == "plan_gate"` exactly as it always was (state.py's
     # `_PLAN_BARRIER_STATES` comment): an unscoped write here would raise
     # the plan barrier for every OTHER gate's reject too.
+    # Hydra#163: approving a postcheck constitution_breach gate is the operator
+    # overriding the governance surface -- the workflow is done. Reject (and
+    # abort) keep the generic terminal path below (phase "surfaced").
+    _postcheck_breach_approve = (
+        action == "approve" and not _plan_terminal_option
+        and resolution.get("gate_node") == "postcheck"
+        and _gate_reason == "constitution_breach"
+    )
+    if _postcheck_breach_approve:
+        patch["phase"] = "done"
     if _plan_terminal_option or action == "reject":
         patch["phase"] = "surfaced"
         if action == "reject" and resolution.get("gate_node") == "plan_gate":
@@ -3126,7 +3136,8 @@ def _cmd_resume_locked(args, project: Path, wf: str, action: str, option) -> int
     # itself is now gate-agnostic.
     _gate_terminal = _plan_terminal_option or action == "reject"
     if (gate_only and action == "approve" and not _plan_terminal_option
-            and resolution.get("gate_node") == "plan_gate") or _gate_terminal:
+            and resolution.get("gate_node") == "plan_gate") or _gate_terminal \
+            or _postcheck_breach_approve:
         # RESOLVE-GATE-ONLY (defect A): write as_node="postcheck" instead of
         # the generic (node-context-less) write below. `postcheck`'s only
         # outgoing edge is `after_postcheck` -> END unconditionally, so this
@@ -4103,6 +4114,12 @@ def _attended_result_record(state: HydraState, res: dict) -> dict | None:
         "summary": (str(res.get("stage_outcome") or "") or None),
         "changed_paths": list(res.get("changed_paths") or [])[:50],
         "cost_usd": float(res.get("cost_usd") or 0.0),
+        # Hydra#163: durable "the code landed" flag for the postcheck factual
+        # check. Either the nested cursor merge or the recovery-shaped result.
+        "merged": bool(
+            (res.get("merge") or {}).get("merged") is True
+            or res.get("merged") is True
+        ),
     }
     if isinstance(res.get("artifact_ref"), dict):
         record["artifact_ref"] = res["artifact_ref"]
@@ -5454,8 +5471,15 @@ def _reconcile_attended_terminal_checkpoint(
         artifact_text = str(res.get("artifact_text") or "")
         # E2-35: host_bridge already persisted non-native squad artifacts
         # (generic store + claude-skill shim) and recorded the outcome on
-        # the cursor. Only squads it left alone — the native packs — reach
-        # the native output-root writer here.
+        # the cursor. Native packs are ALSO now (W1.2 step A, Hydra#85)
+        # persisted in-process by host_bridge._apply_squad_result -- it
+        # calls write_native_artifact itself and sets artifact_ref /
+        # artifact_persist_error on the cursor before this ever runs, using
+        # the RAW submitted text (res["artifact_text"] below is already the
+        # REDACTED copy host_bridge hands back). This block is therefore a
+        # dead-but-safe fallback kept for a legacy cursor minted before this
+        # change (no artifact_ref/artifact_persist_error set yet): it never
+        # overwrites an artifact_ref host_bridge already produced.
         already_handled = (res.get("artifact_ref") is not None
                            or res.get("artifact_persist_error") is not None)
         if squad_slug and artifact_text and not already_handled:
