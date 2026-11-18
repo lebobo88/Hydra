@@ -1488,7 +1488,15 @@ class TestM7FailSoftProperty:
         def _flaky_emit(*a, **kw):
             raise RuntimeError("trace write also failed")
         monkeypatch.setattr(dispatch_seam, "_persist_cursor", _flaky_persist)
+        # Both bindings: `cli.py`'s own `from .telemetry import emit` (what
+        # the persist-failure handler at ~4406 actually calls through
+        # `dispatch_seam.safe_emit`, which in turn calls `dispatch_seam`'s
+        # own `emit` binding) AND `dispatch_seam.emit` -- the two modules
+        # each bind their own local name for the same underlying
+        # `telemetry.emit` function, so a single patch target is not
+        # enough to be revert-proof here.
         monkeypatch.setattr(dispatch_seam, "emit", _flaky_emit)
+        monkeypatch.setattr(cli, "emit", _flaky_emit)
 
         rc = cli._cmd_attended_step(argparse.Namespace(
             project=str(tmp_path), workflow_id=wf, verbose=False))
