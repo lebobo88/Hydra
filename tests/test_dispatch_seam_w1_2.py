@@ -316,6 +316,116 @@ class TestM1TicketIdentity:
         failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
         assert len(failed) == 1 and failed[0]["reason"] == "existing_unreadable"
 
+    # ----------------------------------------------------------------- #
+    # Finding 1 (BLOCKING, cross-vendor judge round 2): _check_reuse's   #
+    # str(data.get(...)) coercion let a missing/null field match the    #
+    # literal string "None", and let a stored NUMBER match its string   #
+    # form. Fixed to require each stored field be present, a `str`,     #
+    # and equal with no coercion on either side.                        #
+    # ----------------------------------------------------------------- #
+
+    def test_reuse_stored_empty_dict_never_matches_none_identity_strings(
+            self, tmp_path):
+        """Judge's exact repro: an existing ticket file containing only
+        `{}` must never be treated as a match for workflow_id/run_id/
+        call_key all equal to the literal string "None" --
+        `str(data.get(...))` used to turn a MISSING field into exactly
+        that string. "None" is itself a valid workflow_id under
+        WORKFLOW_ID_RE (all-alnum), so all three identity components are
+        set to it here, matching the judge's repro literally."""
+        wf = run_id = call_key = "None"
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        before = path.read_bytes()
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, {"call_key": call_key, "agent_type": "engineer",
+                                   "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+
+        assert result is None
+        assert path.read_bytes() == before
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+        assert len(failed) == 1 and failed[0]["reason"] == "identity_mismatch"
+
+    def test_reuse_stored_null_field_is_identity_mismatch_not_match(self, tmp_path):
+        """A stored identity field that is explicitly JSON `null` (not
+        merely missing) must not match a requested value equal to its
+        `str()` form (`str(None) == "None"`) either."""
+        wf, run_id, call_key = "wf-reuse-null", "run-1", "generate-0"
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        planted = {"workflow_id": wf, "run_id": None, "call_key": call_key}
+        path.write_text(json.dumps(planted), encoding="utf-8")
+        before = path.read_bytes()
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, {"call_key": call_key, "agent_type": "engineer",
+                                   "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+
+        assert result is None
+        assert path.read_bytes() == before
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+        assert len(failed) == 1 and failed[0]["reason"] == "identity_mismatch"
+
+    def test_reuse_stored_missing_field_is_identity_mismatch_not_match(
+            self, tmp_path):
+        """A stored identity field that is entirely ABSENT from the
+        ticket dict (not just null) must not match either."""
+        wf, run_id, call_key = "wf-reuse-missing", "run-1", "generate-0"
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        planted = {"workflow_id": wf, "call_key": call_key}  # run_id entirely absent
+        path.write_text(json.dumps(planted), encoding="utf-8")
+        before = path.read_bytes()
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, {"call_key": call_key, "agent_type": "engineer",
+                                   "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+
+        assert result is None
+        assert path.read_bytes() == before
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+        assert len(failed) == 1 and failed[0]["reason"] == "identity_mismatch"
+
+    def test_reuse_stored_numeric_field_never_matches_its_string_form(
+            self, tmp_path):
+        """A stored `run_id` of the NUMBER `123` must not match a
+        requested `run_id` of the STRING `"123"` --
+        `str(123) == "123"` used to let this through."""
+        wf, call_key = "wf-reuse-numeric", "generate-0"
+        run_id = "123"
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        planted = {"workflow_id": wf, "run_id": 123, "call_key": call_key}
+        path.write_text(json.dumps(planted), encoding="utf-8")
+        before = path.read_bytes()
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, {"call_key": call_key, "agent_type": "engineer",
+                                   "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+
+        assert result is None
+        assert path.read_bytes() == before
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+        assert len(failed) == 1 and failed[0]["reason"] == "identity_mismatch"
+
     def test_concurrent_writer_race_keeps_winner_and_reuses(self, tmp_path, monkeypatch):
         """Simulates the final file appearing BETWEEN the writer's pre-check
         and its exclusive publish: the first writer's bytes win, the second
@@ -1905,7 +2015,9 @@ class TestM7FailSoftProperty:
         replaces the whole function), raised after an UNCHANGED
         (engineer) action. Caught by the new outer guard in
         `_apply_dispatch_seam` (required change (1)): `host_action` is
-        unchanged, `dispatch_ticket` is `None`, the exit code equals the
+        FULLY unchanged (byte-for-byte equal to the action `begin_stage`
+        originally wrote to the cursor -- not just a couple of selected
+        fields), `dispatch_ticket` is `None`, the exit code equals the
         no-fault engineer-step case, and exactly one
         `dispatch.seam_unexpected_failure` event is emitted."""
         state, task = _eng_state("add a feature")
@@ -1920,7 +2032,8 @@ class TestM7FailSoftProperty:
         res = _run_step(root, wf, capsys)  # asserts rc == 0, the no-fault exit code
 
         assert res["ok"] is True
-        assert res["host_action"]["call_key"] == "generate-0"
+        original_action = host_bridge.load_cursor(res["cursor_path"])["pending_action"]
+        assert res["host_action"] == original_action
         assert res["dispatch_ticket"] is None
         trace = (root / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
@@ -1928,21 +2041,12 @@ class TestM7FailSoftProperty:
         assert len(unexpected) == 1
         assert unexpected[0]["error"] == "RuntimeError"
 
-    def test_t2a_outer_handler_decision_while_changed_unsaved_is_true(self):
-        """t2a. Honest finding for the report: at dc5e874 (after fix (2)),
-        every failure of the changed-squad-action cursor existence check,
-        load and save inside `_apply_dispatch_seam`'s "if changed:" branch
-        is caught by that branch's OWN inner handling and returns
-        `persist_failed` directly -- there is no statement that runs
-        while `changed_unsaved` is `True` that is both (a) not already
-        inside that inner try/early-return and (b) a real call this test
-        could patch to raise. The flag-true path of the OUTER handler is
-        therefore defence in depth with no natural trigger in the current
-        code shape, not a reachable path a fault-injection test can hit
-        honestly. Per the plan's own fallback: this is a DIRECT unit test
-        of the outer handler's decision helper, `_seam_failure_response`,
-        for both flag values -- the exact thing the outer `except` branch
-        in `_apply_dispatch_seam` calls to decide its response."""
+    def test_seam_failure_response_decision_table(self):
+        """Direct unit test of the outer handler's decision helper,
+        `_seam_failure_response`, for both flag values -- the exact thing
+        the outer `except` branch in `_apply_dispatch_seam` calls to
+        decide its response. Kept alongside the real fault-injection test
+        below (t2a) rather than instead of it."""
         cursor_file = "/some/cursor.json"
 
         assert cli._seam_failure_response(True, cursor_file) == {
@@ -1959,6 +2063,69 @@ class TestM7FailSoftProperty:
         }
         assert cli._seam_failure_response(False, cursor_file) is None
         assert cli._seam_failure_response(False, None) is None
+
+    def test_t2a_host_bridge_import_fault_while_changed_action_unsaved_reaches_outer_handler(
+            self, tmp_path, monkeypatch, capsys):
+        """t2a (corrected, cross-vendor judge round 2 finding 3): the
+        `host_bridge` import inside `_apply_dispatch_seam`'s "if changed:"
+        branch -- right after `changed_unsaved = True`, and OUTSIDE the
+        inner load/save `try` -- IS reachable while the flag is `True`.
+        The judge injected a fault at exactly that import and the outer
+        handler behaved correctly; this reproduces that through the real
+        CLI entry point so the exit code is a genuine process exit code,
+        not a stand-in.
+
+        `builtins.__import__` is patched rather than the shared
+        `hydra_core.host_bridge` package attribute, and the patch only
+        raises when BOTH the fromlist is `('host_bridge',)` (a relative
+        `from . import host_bridge`) AND the immediate caller frame is
+        `_apply_dispatch_seam` itself -- `_cmd_attended_step`'s own
+        top-level `from . import host_bridge`, `prepare_host_action`'s,
+        and `dispatch_seam._persist_cursor`'s all also do
+        `from . import host_bridge`, and a non-scoped patch would falsely
+        trip on those too (or on every OTHER caller of `host_bridge`
+        anywhere in the process during this test, since `__import__` is
+        a process-global builtin)."""
+        import builtins
+        import sys as _sys
+        real_import = builtins.__import__
+
+        def _raising_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if fromlist and "host_bridge" in fromlist:
+                frame = _sys._getframe(1)
+                if frame.f_code.co_name == "_apply_dispatch_seam":
+                    raise OSError("injected host_bridge import fault")
+            return real_import(name, globals, locals, fromlist, level)
+
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+        task_id = str(task.task_id)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        monkeypatch.setattr(builtins, "__import__", _raising_import)
+
+        rc = cli._cmd_attended_step(argparse.Namespace(
+            project=str(tmp_path), workflow_id=wf, verbose=False))
+        out = capsys.readouterr().out
+
+        assert rc == 1
+        assert "Traceback" not in out
+        result = json.loads(out)
+        assert result == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert not tickets_dir.exists()
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        unexpected = [e for e in events if e["kind"] == "dispatch.seam_unexpected_failure"]
+        assert len(unexpected) == 1
 
     def test_t2b_ticket_write_fault_after_changed_action_cursor_already_saved(
             self, tmp_path, monkeypatch):
