@@ -4369,8 +4369,14 @@ def _apply_dispatch_seam(
         prepared, changed = dispatch_seam.prepare_host_action(
             original, kind=kind, pack=pack)  # type: ignore[arg-type]
     except Exception as e:  # noqa: BLE001
+        # "seam_kind", not "kind" -- `telemetry.emit` always sets the
+        # top-level "kind" field to the EVENT NAME; a payload key also
+        # named "kind" would silently clobber it (dict-literal key order
+        # in `emit`'s `**payload` spread), turning
+        # "dispatch.prepare_host_action_failed" into "squad"/"engineer" in
+        # the trace.
         dispatch_seam.safe_emit(project, wf, "dispatch.prepare_host_action_failed",
-                                 {"kind": kind, "error": type(e).__name__})
+                                 {"seam_kind": kind, "error": type(e).__name__})
         prepared, changed = original, False
     cursor_file = res.get("cursor_path")
     # Item 18: `Path(cursor_file).exists()` can itself raise (PermissionError

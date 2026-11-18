@@ -1039,3 +1039,533 @@ class TestM6PersistRecovery:
         assert len(matching) == 1
         assert json.loads(_ticket_text(matching[0]))["call_key"] == \
             recovered["host_action"]["call_key"]
+
+
+# =========================================================================== #
+# M7 -- fail-soft as a tested PROPERTY (Hydra#85 cross-vendor retry 2)       #
+# =========================================================================== #
+
+class TestM7FailSoftProperty:
+    """No exception raised by file I/O, an os call, a telemetry emit, JSON
+    encode/decode, text encoding, hashing, datetime arithmetic, or env
+    parsing on an audit-mode path may escape to the CLI caller -- see the
+    ``hydra_core.dispatch_seam`` module docstring for the full contract,
+    the three defined results, and the named deliberate exceptions
+    (E1-E3).
+
+    Matrix over (entry point x injected dependency x fault class). The
+    seven entry points named in the goal: write_dispatch_ticket (direct),
+    squad step, engineer step, judge action from submit, await_smoke poll,
+    the persist-failure handler, and the budget-blocked step. Fault
+    classes include OSError and at least one non-OSError (RuntimeError /
+    UnicodeEncodeError via a lone surrogate).
+
+    Every row asserts: (1) no exception propagates; (2) the path's defined
+    response; (3) no ``*.tmp`` file and no partial final file in the
+    tickets dir -- EXCEPT the one row (persistent cleanup fault) where the
+    cleanup call itself fails every time, which instead asserts "no
+    exception propagates, and a ticket already published by os.link is
+    still returned (not nulled)"; (4) a pre-existing ticket's bytes are
+    unchanged where one was seeded.
+
+    Patches are scoped narrowly (gated on the faulting path or a call
+    counter) so each row injects exactly the intended fault without
+    disturbing ``begin_stage``/``begin_squad_stage`` or unrelated os
+    calls.
+    """
+
+    # ----------------------------------------------------------------- #
+    # Entry point 1: write_dispatch_ticket (direct)                     #
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize("dep,exc_cls", [
+        ("makedirs", OSError),
+        ("makedirs", RuntimeError),
+        ("open_temp_write", OSError),
+        ("link", OSError),
+        ("link", RuntimeError),
+        ("dumps_strict", RuntimeError),
+    ], ids=["makedirs-OSError", "makedirs-RuntimeError", "open_temp_write-OSError",
+            "link-OSError", "link-RuntimeError", "dumps_strict-RuntimeError"])
+    def test_write_dispatch_ticket_direct_fault_matrix(
+            self, tmp_path, monkeypatch, dep, exc_cls):
+        """Items 10 (makedirs/open/dumps_strict/link, already guarded by the
+        outer except at b24cc36) re-verified as a property: whichever of
+        these raises, whatever the exception class, the result is a clean
+        fail-soft null with no exception and no file left behind."""
+        wf, run_id, call_key = f"wf-m7-direct-{dep}-{exc_cls.__name__}", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+
+        if dep == "makedirs":
+            def _raiser(*a, **kw):
+                raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam.os, "makedirs", _raiser)
+        elif dep == "open_temp_write":
+            real_open = open
+
+            def _fake_open(file, mode="r", *a, **kw):
+                if str(file).endswith(".tmp") and "w" in mode:
+                    raise exc_cls("injected")
+                return real_open(file, mode, *a, **kw)
+            monkeypatch.setattr("builtins.open", _fake_open)
+        elif dep == "link":
+            def _raiser(*a, **kw):
+                raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam.os, "link", _raiser)
+        elif dep == "dumps_strict":
+            def _raiser(*a, **kw):
+                raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam, "dumps_strict", _raiser)
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert result is None  # (1) no exception reached here; (2) defined response
+        assert not path.exists()
+        tickets_dir = path.parent
+        assert not tickets_dir.exists() or list(tickets_dir.iterdir()) == []  # (3)
+
+    @pytest.mark.parametrize("exc_cls", [OSError, RuntimeError])
+    def test_write_dispatch_ticket_direct_success_path_emit_fault_still_returns_ticket(
+            self, tmp_path, monkeypatch, exc_cls):
+        """The success-path ``dispatch.ticket_written`` emit (item 14)
+        going through ``safe_emit``: emit is patched to raise, the helper
+        absorbs it, and the already-published ticket is still returned --
+        proving the helper itself never raises (acceptance criterion)."""
+        wf, run_id, call_key = f"wf-m7-emit-{exc_cls.__name__}", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+
+        def _raiser(*a, **kw):
+            raise exc_cls("injected")
+        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert result is not None
+        assert json.loads(result.read_text(encoding="utf-8"))["call_key"] == call_key
+        assert list(result.parent.glob("*.tmp")) == []
+
+    def test_write_dispatch_ticket_cleanup_persistent_non_oserror_does_not_null_published_ticket(
+            self, tmp_path, monkeypatch):
+        """Item 11: the ONE named exception to the 'no *.tmp left behind'
+        invariant. Once ``os.link`` has published the final file, a
+        persistently failing, non-OSError cleanup of the temp file (e.g. a
+        RuntimeError from a faulty monitoring hook wrapping os.remove)
+        must not raise and must not null the already-published ticket --
+        the temp file is left behind in this one row only."""
+        wf, run_id, call_key = "wf-m7-cleanup-persist", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("injected persistent cleanup fault")
+        monkeypatch.setattr(dispatch_seam.os, "remove", _raiser)
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert result is not None
+        assert result.exists()
+        # The documented exception to the no-tmp invariant: the persistent
+        # cleanup fault leaves exactly one temp file behind, but a ticket
+        # already published by os.link is never nulled.
+        assert len(list(result.parent.glob("*.tmp"))) == 1
+
+    def test_write_dispatch_ticket_cleanup_one_shot_fault_retries_and_leaves_no_temp_file(
+            self, tmp_path, monkeypatch):
+        """A single TRANSIENT cleanup fault (the first os.remove raises,
+        the retry succeeds) leaves no temp file behind at all -- unlike
+        the persistent-fault row above, which is the only row allowed to
+        leave one."""
+        wf, run_id, call_key = "wf-m7-cleanup-oneshot", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+        real_remove = os.remove
+        calls = {"n": 0}
+
+        def _flaky(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("transient")
+            return real_remove(*a, **kw)
+        monkeypatch.setattr(dispatch_seam.os, "remove", _flaky)
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert result is not None
+        assert result.exists()
+        assert list(result.parent.glob("*.tmp")) == []
+        assert calls["n"] == 2
+
+    def test_preexisting_ticket_bytes_unchanged_when_reuse_check_emit_faults(
+            self, tmp_path, monkeypatch):
+        """Property (4): a pre-existing ticket's bytes are unchanged even
+        when a dependency on the (idempotent) re-write path faults."""
+        wf, run_id, call_key = "wf-m7-reuse", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+        first = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+        assert first is not None
+        before = first.read_bytes()
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("trace write failed")
+        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+
+        second = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert second == first
+        assert first.read_bytes() == before
+        assert list(first.parent.glob("*.tmp")) == []
+
+    # ----------------------------------------------------------------- #
+    # Lone-surrogate hashing (fix 1b) -- prompt, artifact_text, run_id,  #
+    # call_key                                                          #
+    # ----------------------------------------------------------------- #
+
+    def test_lone_surrogate_in_prompt_writes_ticket_with_64_hex_hash(self, tmp_path):
+        action = {"call_key": "k1", "agent_type": "engineer",
+                   "prompt": "hi \ud800 there"}
+        path = dispatch_seam.write_dispatch_ticket(
+            tmp_path, "wf-surrogate-prompt", "run-1", action, kind="engineer",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path is not None
+        t = json.loads(path.read_text(encoding="utf-8"))
+        assert len(t["prompt_sha256"]) == 64
+        int(t["prompt_sha256"], 16)  # valid hex, raises ValueError otherwise
+
+    def test_lone_surrogate_in_artifact_text_writes_judge_ticket(self, tmp_path):
+        action = {"call_key": "judge-0", "agent_type": "judge-cross-vendor",
+                   "artifact_text": "diff \udc00 here"}
+        path = dispatch_seam.write_dispatch_ticket(
+            tmp_path, "wf-surrogate-artifact", "run-1", action, kind="judge",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path is not None
+        t = json.loads(path.read_text(encoding="utf-8"))
+        assert len(t["artifact_sha256"]) == 64
+        int(t["artifact_sha256"], 16)
+
+    def test_lone_surrogate_in_run_id_is_not_misreported_as_invalid_workflow_id(
+            self, tmp_path):
+        wf = "wf-surrogate-runid"
+        action = {"call_key": "k1", "agent_type": "engineer", "prompt": "p"}
+        path = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, "run-\ud800-1", action, kind="engineer",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path is not None
+        trace = tmp_path / ".hydra" / wf / "trace.jsonl"
+        if trace.exists():
+            events = [json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()
+                      if ln.strip()]
+            assert not [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+
+    def test_lone_surrogate_in_call_key_is_not_misreported_as_invalid_workflow_id(
+            self, tmp_path):
+        wf = "wf-surrogate-callkey"
+        action = {"call_key": "call-\udfff-0", "agent_type": "engineer", "prompt": "p"}
+        path = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, "run-1", action, kind="engineer",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path is not None
+        trace = tmp_path / ".hydra" / wf / "trace.jsonl"
+        if trace.exists():
+            events = [json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()
+                      if ln.strip()]
+            assert not [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+
+    # ----------------------------------------------------------------- #
+    # Entry point 2: squad step                                         #
+    # ----------------------------------------------------------------- #
+
+    def test_squad_step_prepare_host_action_fault_serves_original_action_unchanged(
+            self, tmp_path, monkeypatch, capsys):
+        """Items 15/17: prepare_host_action's own dependency
+        (build_tool_scope_directive) faults. Fail-soft per required change
+        (2): serve the ORIGINAL action unchanged and still try the
+        ticket."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("injected directive fault")
+        monkeypatch.setattr(dispatch_seam, "build_tool_scope_directive", _raiser)
+
+        res = _run_step(tmp_path, wf, capsys)
+
+        assert res["ok"] is True and res["status"] == "awaiting_host"  # (1)+(2)
+        assert PII not in res["host_action"].get("prompt", "")
+        assert res["dispatch_ticket"] is not None
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert list(tickets_dir.glob("*.tmp")) == []  # (3)
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        assert [e for e in events if e["kind"] == "dispatch.prepare_host_action_failed"]
+
+    def test_squad_step_cursor_exists_check_fault_serves_action_and_still_tickets(
+            self, tmp_path, monkeypatch, capsys):
+        """Item 18: ``Path(cursor_file).exists()`` itself faults (e.g. a
+        PermissionError). Gated by a call counter on the exact cursor path
+        so only the SECOND check (inside _apply_dispatch_seam, after
+        begin_squad_stage already wrote the cursor) is faulted -- the
+        FIRST check (the open-cursor recovery lookup, unguarded and out of
+        scope per the goal) must see its normal (false) answer."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+        task_id = str(task.task_id)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        real_exists = Path.exists
+        calls = {"n": 0}
+
+        def _flaky_exists(self):
+            if str(self) == str(cursor_file):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise PermissionError("injected")
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", _flaky_exists)
+
+        res = _run_step(tmp_path, wf, capsys)
+
+        assert res["ok"] is True and res["status"] == "awaiting_host"  # (1)+(2)
+        directive = dispatch_seam.build_tool_scope_directive(pack)
+        red = host_bridge._outbound_text(directive, kind="squad")
+        assert res["host_action"]["prompt"].endswith(red)
+        assert res["dispatch_ticket"] is not None
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert list(tickets_dir.glob("*.tmp")) == []  # (3)
+        # Degraded half of this fail-soft path: the on-disk cursor was NOT
+        # updated with the directive, because the persist attempt was
+        # skipped once the exists() check faulted.
+        cursor = host_bridge.load_cursor(cursor_file)
+        assert not cursor["pending_action"]["prompt"].endswith(red)
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        assert [e for e in events if e["kind"] == "dispatch.cursor_exists_check_failed"]
+
+    # ----------------------------------------------------------------- #
+    # Entry point 3: engineer step (+ named combined-failure case 2)    #
+    # ----------------------------------------------------------------- #
+
+    def test_engineer_step_ticket_write_fault_still_returns_host_action(
+            self, tmp_path, monkeypatch, capsys):
+        state, task = _eng_state("add a feature")
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+
+        def _raiser(*a, **kw):
+            raise OSError("disk full")
+        monkeypatch.setattr(dispatch_seam.os, "makedirs", _raiser)
+
+        res = _run_step(root, wf, capsys)
+
+        assert res["ok"] is True  # (1)+(2)
+        assert res["host_action"]["call_key"] == "generate-0"
+        assert res["dispatch_ticket"] is None
+        tickets_dir = root / ".hydra" / wf / "attended" / "tickets"
+        assert not tickets_dir.exists() or list(tickets_dir.iterdir()) == []  # (3)
+
+    def test_combined_ticket_write_and_telemetry_emit_both_fail_host_action_still_returned(
+            self, tmp_path, monkeypatch, capsys):
+        """Named combined-failure case (required change / acceptance
+        criterion): the ticket write faults (os.makedirs) AND the
+        telemetry emit faults (dispatch_seam.emit) at the same time.
+        dispatch_ticket must be None, host_action must still be returned,
+        and the CLI exit status must be unchanged (0) from the no-fault
+        engineer-step case."""
+        state, task = _eng_state("add a feature")
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+
+        def _raise_os(*a, **kw):
+            raise OSError("disk full")
+
+        def _raise_emit(*a, **kw):
+            raise RuntimeError("trace write failed")
+        monkeypatch.setattr(dispatch_seam.os, "makedirs", _raise_os)
+        monkeypatch.setattr(dispatch_seam, "emit", _raise_emit)
+
+        res = _run_step_expect(root, wf, capsys, want_rc=0)
+
+        assert res["ok"] is True
+        assert res["host_action"]["call_key"] == "generate-0"
+        assert res["dispatch_ticket"] is None
+
+    # ----------------------------------------------------------------- #
+    # Entry point 4: judge action from submit                           #
+    # ----------------------------------------------------------------- #
+
+    def test_judge_action_from_submit_ticket_write_fault_still_returns_action(
+            self, tmp_path, monkeypatch, capsys):
+        state, task = _eng_state()
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+        step = _run_step(root, wf, capsys)
+        gen = {"text": "edited foo.py", "cost_usd": 0.05, "tokens_in": 5,
+               "tokens_out": 5, "model": "claude-sonnet-4-6"}
+
+        def _raiser(*a, **kw):
+            raise OSError("disk full")
+        monkeypatch.setattr(dispatch_seam.os, "link", _raiser)
+
+        res = _run_submit(root, wf, step["run_id"], "generate-0", gen, capsys)
+
+        assert res["state"] == "await_judge"  # (1)+(2)
+        assert res["host_action"]["agent_type"]
+        assert res["dispatch_ticket"] is None
+        tickets_dir = root / ".hydra" / wf / "attended" / "tickets"
+        assert list(tickets_dir.glob("*.tmp")) == []  # (3)
+
+    # ----------------------------------------------------------------- #
+    # Entry point 5: await_smoke poll                                   #
+    # ----------------------------------------------------------------- #
+
+    def test_await_smoke_poll_telemetry_emit_fault_still_returns_action_idempotently(
+            self, tmp_path, monkeypatch, capsys):
+        state, _task = _eng_state()
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+        step = _run_step(root, wf, capsys)
+        cfile = step["cursor_path"]
+        cursor = host_bridge.load_cursor(cfile)
+        cursor["state"] = "await_smoke"
+        cursor["pending_action"] = {
+            "call_key": "judge-0", "action": "poll_smoke", "poll": True,
+            "instructions": "Smoke is running; poll again."}
+        host_bridge.save_cursor(cfile, cursor)
+        monkeypatch.setattr(host_bridge, "poll_smoke_job", lambda *a, **k: None)
+
+        def _raiser(*a, **kw):
+            raise RuntimeError("trace write failed")
+        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+
+        first = _run_step(root, wf, capsys)
+        second = _run_step(root, wf, capsys)
+
+        assert first["host_action"]["action"] == "poll_smoke"  # (1)+(2)
+        assert first["dispatch_ticket"] == second["dispatch_ticket"]
+        ticket_file = dispatch_seam.ticket_path(root, wf, first["run_id"], "judge-0")
+        assert ticket_file.exists()
+        assert list(ticket_file.parent.glob("*.tmp")) == []  # (3)
+
+    # ----------------------------------------------------------------- #
+    # Entry point 6: persist-failure handler (+ named combined case 1)  #
+    # ----------------------------------------------------------------- #
+
+    def test_combined_cursor_persist_and_telemetry_emit_both_fail_exact_response(
+            self, tmp_path, monkeypatch, capsys):
+        """Named combined-failure case (required change / acceptance
+        criterion): _persist_cursor raises AND the telemetry emit for
+        dispatch.cursor_save_failed also raises. The response must still
+        be EXACTLY the defined dispatch_seam_persist_failed dict, and the
+        CLI must return 1 without a traceback."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {"executive": _ScopedPack()})
+
+        def _flaky_persist(path, cursor):
+            raise OSError("disk full")
+
+        def _flaky_emit(*a, **kw):
+            raise RuntimeError("trace write also failed")
+        monkeypatch.setattr(dispatch_seam, "_persist_cursor", _flaky_persist)
+        monkeypatch.setattr(dispatch_seam, "emit", _flaky_emit)
+
+        rc = cli._cmd_attended_step(argparse.Namespace(
+            project=str(tmp_path), workflow_id=wf, verbose=False))
+        out = capsys.readouterr().out
+
+        assert rc == 1  # (1)+(2)
+        assert "Traceback" not in out
+        result = json.loads(out)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, str(task.task_id))
+        assert result == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
+        assert not (tmp_path / ".hydra" / wf / "attended" / "tickets").exists()  # (3)
+
+    # ----------------------------------------------------------------- #
+    # Entry point 7: budget-blocked step                                 #
+    # ----------------------------------------------------------------- #
+
+    def test_budget_blocked_step_telemetry_emit_fault_response_unaffected(
+            self, tmp_path, monkeypatch, capsys):
+        """Item 22: a trace-write failure on the attended.budget_blocked
+        emit must not turn a budget_blocked response into a crash."""
+        state, task = _eng_state()
+        state.budget.spent_usd = state.budget.budget_usd
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+
+        def _raiser(*a, **kw):
+            raise OSError("trace write failed")
+        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+
+        res = _run_step(root, wf, capsys)
+
+        assert res["status"] == "budget_blocked" and res["ok"] is False  # (1)+(2)
+        assert res["task_id"] == str(task.task_id)
+        assert not (root / ".hydra" / wf / "attended").exists()  # (3)
+
+    # ----------------------------------------------------------------- #
+    # Deliberate exceptions E1-E3 (module docstring)                    #
+    # ----------------------------------------------------------------- #
+
+    def test_e1_invalid_workflow_id_no_telemetry(self, tmp_path):
+        """E1: an invalid workflow_id returns None with NO
+        dispatch.ticket_write_failed telemetry -- emitting would itself
+        join the unsanitised id into a trace path."""
+        bad_wf = "../escape"
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, bad_wf, "run-1",
+            {"call_key": "k", "agent_type": "a", "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+        assert result is None
+        assert not (tmp_path / ".hydra").exists()
+
+    def test_e2_budget_gate_dependency_error_is_out_of_scope(self, monkeypatch):
+        """E2: an exception from governance.should_block_for_budget is a
+        caller-state error, out of scope for the fail-soft contract, and
+        is allowed to raise."""
+        state, _task = _eng_state()
+
+        def _raiser(_state):
+            raise RuntimeError("governance error")
+        monkeypatch.setattr(dispatch_seam.governance, "should_block_for_budget", _raiser)
+
+        with pytest.raises(RuntimeError):
+            dispatch_seam.budget_gate(state)
+
+    def test_e3_programming_error_in_callers_argument_may_raise(self, tmp_path):
+        """E3: a non-dict host_action passed directly to
+        write_dispatch_ticket is a programming error in the caller's own
+        argument, out of scope, and is allowed to raise."""
+        with pytest.raises(AttributeError):
+            dispatch_seam.write_dispatch_ticket(
+                tmp_path, "wf-e3", "run-1", ["not", "a", "dict"],  # type: ignore[arg-type]
+                kind="engineer", squad_slug=None, budget_usd=None,
+                budget_remaining_usd=None)
