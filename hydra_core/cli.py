@@ -5471,8 +5471,15 @@ def _reconcile_attended_terminal_checkpoint(
         artifact_text = str(res.get("artifact_text") or "")
         # E2-35: host_bridge already persisted non-native squad artifacts
         # (generic store + claude-skill shim) and recorded the outcome on
-        # the cursor. Only squads it left alone — the native packs — reach
-        # the native output-root writer here.
+        # the cursor. Native packs are ALSO now (W1.2 step A, Hydra#85)
+        # persisted in-process by host_bridge._apply_squad_result -- it
+        # calls write_native_artifact itself and sets artifact_ref /
+        # artifact_persist_error on the cursor before this ever runs, using
+        # the RAW submitted text (res["artifact_text"] below is already the
+        # REDACTED copy host_bridge hands back). This block is therefore a
+        # dead-but-safe fallback kept for a legacy cursor minted before this
+        # change (no artifact_ref/artifact_persist_error set yet): it never
+        # overwrites an artifact_ref host_bridge already produced.
         already_handled = (res.get("artifact_ref") is not None
                            or res.get("artifact_persist_error") is not None)
         if squad_slug and artifact_text and not already_handled:

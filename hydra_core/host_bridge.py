@@ -493,14 +493,31 @@ def _outbound_fields(mapping: dict[str, Any], keys: Sequence[str], *,
 
 
 def _outbound_deep(value: Any, *, kind: str) -> Any:
-    """Redact every string found in a nested dict/list (used for judge- or
-    validator-authored structures whose strings are all descriptive text)."""
+    """Redact every string found in a nested structure (used for judge- or
+    validator-authored structures whose strings are all descriptive text).
+
+    Recurses into dict KEYS as well as values (a pydantic ``ValidationError
+    .errors()`` entry's ``loc`` can itself be used as a dict key downstream,
+    and an attacker-controlled key is exactly as host-visible as a value),
+    and into list/tuple/set/frozenset elements, preserving the container
+    type (``loc`` is a tuple; a set/frozenset round-trips as the same type).
+    Plain strings go through ``_outbound_text``; anything else (int, bool,
+    None, already-redacted-elsewhere Pydantic models passed in as str via
+    their own serialization) is returned unchanged."""
     if isinstance(value, str):
         return _outbound_text(value, kind=kind)
     if isinstance(value, dict):
-        return {k: _outbound_deep(v, kind=kind) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_outbound_deep(v, kind=kind) for v in value]
+        return {_outbound_deep(k, kind=kind): _outbound_deep(v, kind=kind)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        mapped = [_outbound_deep(v, kind=kind) for v in value]
+        if isinstance(value, tuple):
+            return tuple(mapped)
+        if isinstance(value, set):
+            return set(mapped)
+        if isinstance(value, frozenset):
+            return frozenset(mapped)
+        return mapped
     return value
 
 
@@ -4428,6 +4445,11 @@ def begin_squad_stage(
         "error": None,
         "finalized": False,
         "attempt": int(attempt),
+        # W1.2 step B: carried so _apply_squad_result can redact the squad's
+        # own returned artifact text the same way its request_text/prompt
+        # were redacted here (the raw submission is never re-derived from
+        # this flag at submit time -- only whether to KEEP PII in it).
+        "allow_pii": bool(allow_pii),
         "pending_action": {
             "call_key": call_key,
             "agent_type": lead_agent,
@@ -4470,6 +4492,7 @@ def _has_native_pack(slug: str) -> bool:
 def _persist_attended_squad_artifact(
     dispatcher: Dispatcher,
     cursor: dict[str, Any],
+    text: str,
     *,
     cursor_file: str | Path,
 ) -> tuple[dict[str, Any] | None, str | None, list[str]]:
@@ -4488,10 +4511,14 @@ def _persist_attended_squad_artifact(
     2. when the squad has a claude-skill shim, ``<prefix>.output.write`` as
        well, so the pack's own on-disk store stays in sync.
 
+    ``text`` is the RAW squad-submitted artifact (W1.2 step A): the caller
+    passes it explicitly rather than this function reading
+    ``cursor["artifact_text"]``, because that cursor field now holds the
+    REDACTED copy returned to the host after this persist completes.
+
     Returns ``(artifact_ref | None, via | None, errors)``. The caller downgrades
     the outcome to ``complete_unpersisted`` only when BOTH legs failed.
     """
-    text = str(cursor.get("artifact_text") or "")
     slug = str(cursor.get("squad_slug") or "")
     wf = str(cursor.get("workflow_id") or "")
     raw_task = str(cursor.get("task_id") or cursor.get("run_id") or "task")
@@ -4563,22 +4590,50 @@ def _apply_squad_result(
                            + coerce_untrusted_count(result.get("tokens_in")))
     cursor["tokens_out"] = (int(cursor.get("tokens_out") or 0)
                             + coerce_untrusted_count(result.get("tokens_out")))
-    cursor["artifact_text"] = str(result.get("text") or result.get("artifact") or "")
+    # W1.2 step A: the raw squad submission stays in this local only. It is
+    # handed to the persist path (as an argument, never read back off the
+    # cursor) and then, once the canonical write has happened, the cursor's
+    # own ``artifact_text`` is overwritten with a redacted copy -- the only
+    # shape ``_step_result``/the host/the trace/the DECISION_RECORD ever see.
+    raw_artifact_text = str(result.get("text") or result.get("artifact") or "")
     # Native pack results may delegate typed work to another squad.  Keep the
     # raw list in the cursor so the CLI can validate/redact/ingest it under the
     # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
     emitted = result.get("emitted_envelopes", result.get("envelopes", []))
     cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
 
-    # E2-35: a squad with no native pack still gets its artifact persisted --
-    # generically, and (when it has one) through its claude-skill shim too.
-    # Native packs are left to the CLI's `write_native_artifact` path, which
-    # already returns a `<plugin>:output:...` ref for them.
+    # E2-35 / W1.2 step A: a squad with no native pack gets its artifact
+    # persisted generically (and, when it has one, through its claude-skill
+    # shim too). A native pack is now ALSO persisted in-process, here --
+    # `write_native_artifact` through the pack's declared output root --
+    # instead of leaving that write to the CLI's post-submit block, so the
+    # raw text never has to round-trip through the cursor to reach cli.py.
     slug = str(cursor.get("squad_slug") or "")
+    allow_pii = bool(cursor.get("allow_pii", False))
     final_status = "complete"
-    if cursor["artifact_text"] and not _has_native_pack(slug):
+    if raw_artifact_text and _has_native_pack(slug):
+        task_id = str(cursor.get("task_id") or cursor.get("run_id") or "")
+        try:
+            from .artifact_store import write_native_artifact
+            ref = write_native_artifact(
+                slug, f"attended/{task_id}.md", raw_artifact_text)
+            cursor["artifact_ref"] = ref.model_dump(mode="json")
+            cursor["artifact_persisted_via"] = "native"
+            _trace(cursor, "attended.native_artifact_persisted", {
+                "squad_slug": slug, "memory_ref": ref.key,
+            })
+        except (ValueError, OSError) as exc:
+            # W1.2: the exception text may echo the raw artifact (e.g. a
+            # "not text" message); never let it carry PII onto the cursor.
+            cursor["artifact_persist_error"] = _outbound_text(
+                str(exc), kind="engineer")
+            _trace(cursor, "attended.native_artifact_persist_failed", {
+                "squad_slug": slug, "error": cursor["artifact_persist_error"],
+            })
+            final_status = "complete_unpersisted"
+    elif raw_artifact_text:
         ref, via, errors = _persist_attended_squad_artifact(
-            dispatcher, cursor, cursor_file=cursor_file)
+            dispatcher, cursor, raw_artifact_text, cursor_file=cursor_file)
         if ref is not None:
             cursor["artifact_ref"] = ref
             cursor["artifact_persisted_via"] = via
@@ -4596,6 +4651,15 @@ def _apply_squad_result(
             _trace(cursor, "attended.skill_artifact_persist_failed", {
                 "squad": slug, "error": cursor["artifact_persist_error"],
             })
+
+    # W1.2 step A: the canonical write (above) always used the RAW text; the
+    # cursor field every downstream reader (host_action echo, trace,
+    # DECISION_RECORD) sees is the redacted copy, unless the squad is
+    # explicitly PII-allow-listed. `_outbound_text` still neutralizes
+    # MCP-attack shapes even when `allow_pii` is True (kind="squad" always
+    # scans for them), matching `begin_squad_stage`'s own outbound text.
+    cursor["artifact_text"] = _outbound_text(
+        raw_artifact_text, kind="squad", allow_pii=allow_pii)
 
     cursor["final_status"] = final_status
     cursor["state"] = final_status
