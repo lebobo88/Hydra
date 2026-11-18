@@ -161,21 +161,54 @@ def test_begin_squad_stage_sentinel_absent_everywhere(tmp_path: Path) -> None:
     assert MARKER in res["host_action"]["prompt"]
 
 
-def test_begin_squad_stage_allow_pii_keeps_sentinel_in_outbound_prompt(
+def test_begin_squad_stage_pii_opt_out_kwarg_removed(tmp_path: Path) -> None:
+    """The PII-opt-out kwarg this squad-stage entry point used to accept is
+    gone entirely (Hydra engine-wide removal): redaction at the squad
+    boundary is unconditional, so the old kwarg now raises TypeError
+    instead of being silently honoured."""
+    with pytest.raises(TypeError):
+        host_bridge.begin_squad_stage(  # type: ignore[call-arg]
+            workflow_id="wf-begin-squad-allow", task_id="task-1",
+            squad_slug="marketing-strategy", entrypoint="claude-skill",
+            lead_agent="brand-strategist", pack_cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            request_text=_free_text("allow-pii-request"), allow_pii=True)
+
+
+def test_stale_cursor_pii_opt_out_key_ignored_everywhere(
         tmp_path: Path) -> None:
-    """allow_pii=True is a deliberate opt-out of PII scrubbing for THIS
-    squad's own outbound prompt -- confirms the opt-out still works post-fix,
-    not merely that the default-False path redacts."""
-    wf = "wf-begin-squad-allow"
+    """A cursor persisted by a pre-fix build of Hydra may still carry a
+    legacy ``'allow_pii': True`` key. Injecting that key into an
+    already-built cursor must change nothing: the squad prompt stays
+    redacted (it was redacted before the key could ever be read) and the
+    artifact text produced on submit is redacted too, even though the
+    stale cursor still says 'allow_pii': True."""
+    wf = "wf-begin-squad-stale"
     res = host_bridge.begin_squad_stage(
         workflow_id=wf, task_id="task-1", squad_slug="marketing-strategy",
         entrypoint="claude-skill", lead_agent="brand-strategist",
         pack_cwd=str(tmp_path), project_root=str(tmp_path),
-        request_text=_free_text("allow-pii-request"), allow_pii=True)
-    ha = res["host_action"]
-    for part in SENTINEL_PARTS:
-        assert part in ha["prompt"], f"{part!r} missing from allow_pii prompt"
-        assert part in ha["task_description"]
+        request_text=_free_text("stale-cursor-request"))
+    cfile = res["cursor_path"]
+    cur = host_bridge.load_cursor(cfile)
+    assert "allow_pii" not in cur, "a freshly built cursor must not carry it"
+    cur["allow_pii"] = True
+    save_cursor(cfile, cur)
+
+    reread = host_bridge.load_cursor(cfile)
+    reserved = host_bridge.step_result(reread, cfile)
+    _assert_clean(reserved["host_action"]["prompt"], "re-served prompt")
+    assert MARKER in reserved["host_action"]["prompt"]
+
+    disp = FakeDispatcher()
+    call_key = reread["pending_action"]["call_key"]
+    raw_artifact = _free_text("stale-cursor-artifact")
+    host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=call_key,
+        result={"text": raw_artifact})
+    cur2 = host_bridge.load_cursor(cfile)
+    _assert_clean(cur2["artifact_text"], "artifact_text after stale submit")
+    assert MARKER in cur2["artifact_text"]
 
 
 # =========================================================================== #

@@ -185,16 +185,76 @@ def test_begin_squad_stage_redacts_pii_and_mcp_attack(tmp_path: Path) -> None:
     assert ATTACK not in trace
 
 
-def test_begin_squad_stage_allow_pii_keeps_pii_but_still_scans_attacks(
+def test_begin_squad_stage_pii_opt_out_kwarg_rejected() -> None:
+    """Redaction is unconditional (Hydra engine-wide PII-opt-out removal):
+    the squad-stage entry point no longer accepts a PII opt-out kwarg at
+    all, so passing one is a TypeError, not a silently-honoured flag."""
+    with pytest.raises(TypeError):
+        host_bridge.begin_squad_stage(  # type: ignore[call-arg]
+            workflow_id="wf-s", task_id="task-1",
+            squad_slug="marketing-strategy", entrypoint="claude-skill",
+            lead_agent="brand-strategist", pack_cwd="/tmp/pack",
+            project_root="/tmp", request_text=f"brief for {EMAIL}",
+            allow_pii=True)
+
+
+def test_redact_for_squad_boundary_pii_opt_out_kwarg_rejected() -> None:
+    with pytest.raises(TypeError):
+        governance.redact_for_squad_boundary(  # type: ignore[call-arg]
+            f"brief for {EMAIL}", allow_pii=True)
+
+
+def test_stale_cursor_pii_opt_out_key_ignored_prompt_and_artifact_text(
         tmp_path: Path) -> None:
+    """A cursor file persisted by an older build of Hydra may still carry a
+    legacy ``'allow_pii': True`` key. The engine must never read or honour
+    it: the squad's outbound prompt stays redacted (it was redacted at
+    build time, before the stale key could ever matter) and the artifact
+    text produced by the squad is redacted on submit, regardless of what
+    the stale cursor key says."""
+    pack = tmp_path / "pack"
+    pack.mkdir()
     res = host_bridge.begin_squad_stage(
-        workflow_id="wf-s", task_id="task-1", squad_slug="marketing-strategy",
-        entrypoint="claude-skill", lead_agent="brand-strategist",
-        pack_cwd=str(tmp_path), project_root=str(tmp_path),
-        request_text=f"brief for {EMAIL}. {ATTACK}", allow_pii=True)
-    ha = res["host_action"]
-    assert EMAIL in ha["prompt"] and EMAIL in ha["task_description"]
-    assert ATTACK not in ha["prompt"]
+        workflow_id="wf-stale", task_id="task-1",
+        squad_slug="marketing-strategy", entrypoint="claude-skill",
+        lead_agent="brand-strategist", pack_cwd=str(pack),
+        project_root=str(tmp_path),
+        request_text=f"brief for {EMAIL}, ssn {SSN}")
+    cfile = res["cursor_path"]
+
+    # Inject the legacy opt-out key directly into the persisted cursor --
+    # simulating a cursor written by a pre-fix build of Hydra.
+    cur = host_bridge.load_cursor(cfile)
+    assert "allow_pii" not in cur, "a freshly built cursor must not carry it"
+    cur["allow_pii"] = True
+    host_bridge.save_cursor(cfile, cur)
+
+    # (b1) Re-read the cursor and re-serve its pending action (the path the
+    # host/CLI uses to re-surface an already-built prompt): the prompt
+    # must still be the redacted copy baked in at build time -- the stale
+    # key is never consulted to re-derive or un-redact it.
+    reread = host_bridge.load_cursor(cfile)
+    reserved = host_bridge.step_result(reread, cfile)
+    samples = [EMAIL, SSN]
+    _assert_clean(reserved["host_action"]["prompt"], samples)
+    assert MARKER in reserved["host_action"]["prompt"]
+    _assert_clean(reread["request_text"], samples)
+
+    # (b2) Submit a PII-bearing artifact for this squad task: the cursor's
+    # artifact_text must be redacted even though the stale cursor still
+    # carries 'allow_pii': True.
+    disp = FakeDispatcher()
+    raw_artifact = f"findings: {EMAIL2}, tel {PHONE}"
+    call_key = reread["pending_action"]["call_key"]
+    res2 = host_bridge.submit_host_result(
+        disp, cursor_file=cfile, call_key=call_key,
+        result={"text": raw_artifact})
+    cur2 = host_bridge.load_cursor(cfile)
+    _assert_clean(cur2["artifact_text"], [EMAIL2, PHONE])
+    assert MARKER in cur2["artifact_text"]
+    # The canonical store still received the RAW deliverable (642c2b2
+    # behaviour preserved) -- not asserted redacted.
+    assert res2["status"] in ("complete", "complete_unpersisted")
 
 
 # 5 -------------------------------------------------------------------------

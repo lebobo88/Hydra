@@ -69,7 +69,7 @@ and approval-gated execution, with server-side WS-AUTH capability enforcement on
 
 ## Security
 
-- PII / PHI / financial data is redacted at squad boundaries (`governance.redact_for_squad_boundary`) unless the receiving squad's `squad.yaml` has explicit allow-list.
+- PII / PHI / financial data is redacted at every squad boundary (`governance.redact_for_squad_boundary`), unconditionally.
 - The healthcare squad's `phi-redactor` agent runs FIRST on every inbound envelope.
 - MCP tools are namespaced and whitelisted per-squad. The dispatcher (`MCPStdioDispatcher`) enforces RBAC at runtime on the engine path; agents do not self-check. The gateway itself is a flat passthrough today (tracked in Hydra#94, #95).
 - In gateway mode, all MCP tools are proxied through `hydra_gateway`. Tool names follow the pattern `mcp__hydra_gateway__{server}__{tool}`. Backend specs live in `~/.hydra/backends.json`, not `~/.claude.json`.

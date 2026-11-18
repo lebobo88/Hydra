@@ -608,7 +608,7 @@ record_cost(state, usd, tokens)            # increments BudgetLedger
 should_downgrade_model(state, threshold=0.8)
 should_block_for_budget(state)
 should_circuit_break(state, node, max_consecutive=3)
-redact_for_squad_boundary(text, *, allow_pii=False)
+redact_for_squad_boundary(text)
 enforce_governance(state, ...) -> GovernanceVerdict
 ```
 
@@ -855,8 +855,8 @@ When you add or activate a squad, instrument its execution as follows:
    task_id, payload)` and return the resulting handle in
    `state.episodic_refs`.
 4. **Redaction.** Wrap any text crossing a squad boundary in
-   `governance.redact_for_squad_boundary(text, allow_pii=...)`. Default
-   is `allow_pii=False`.
+   `governance.redact_for_squad_boundary(text)`. Redaction is
+   unconditional; there is no opt-out parameter.
 5. **Circuit breaker.** When you catch and swallow an exception from a
    downstream tool, increment `state.error_counters[node]` before
    continuing — otherwise the breaker can't see consecutive failures.

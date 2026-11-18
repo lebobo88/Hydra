@@ -461,16 +461,17 @@ _MAX_JUDGE_MODEL_CORRECTIONS = 2
 _JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
 
 
-def _outbound_text(text: str, *, kind: str, allow_pii: bool = False) -> str:
+def _outbound_text(text: str, *, kind: str) -> str:
     """W1.2 redact-at-build: scrub host-visible text before it is persisted to
     the cursor / trace or handed to a host subagent. Returns ``text`` itself
     (same object) when falsy; ``redact_for_squad_boundary`` also returns the
     identical string when nothing matches. ``kind`` is 'engineer', 'judge' or
-    'squad'; only 'squad' text additionally gets the MCP-attack scan."""
+    'squad'; only 'squad' text additionally gets the MCP-attack scan.
+    Redaction is unconditional: there is no PII opt-out parameter."""
     if not text:
         return text
     return _governance.redact_for_squad_boundary(
-        text, allow_pii=allow_pii, scan_mcp_attacks=(kind == "squad"))
+        text, scan_mcp_attacks=(kind == "squad"))
 
 
 def _outbound_value(value: Any, *, kind: str) -> Any:
@@ -4379,7 +4380,6 @@ def begin_squad_stage(
     plan_revision: int | None = None,
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
-    allow_pii: bool = False,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -4405,9 +4405,8 @@ def begin_squad_stage(
     """
     call_key = f"squad-{task_id}-{int(attempt)}"
     # W1.2 redact-at-build: PII + MCP-attack scan on everything host-visible.
-    # ``allow_pii`` defaults to False == the pre-W1.2 caller behaviour of
-    # scrubbing PII at the squad boundary (governance's own default).
-    request_text = _outbound_text(request_text, kind="squad", allow_pii=allow_pii)
+    # Redaction is unconditional -- there is no PII opt-out parameter.
+    request_text = _outbound_text(request_text, kind="squad")
     prompt = _build_squad_prompt(
         workflow_id=workflow_id,
         task_id=task_id,
@@ -4425,7 +4424,7 @@ def begin_squad_stage(
         plan_critique=plan_critique,
         supersedes_plan_envelope_id=supersedes_plan_envelope_id,
     )
-    prompt = _outbound_text(prompt, kind="squad", allow_pii=allow_pii)
+    prompt = _outbound_text(prompt, kind="squad")
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "kind": "squad",
@@ -4445,11 +4444,6 @@ def begin_squad_stage(
         "error": None,
         "finalized": False,
         "attempt": int(attempt),
-        # W1.2 step B: carried so _apply_squad_result can redact the squad's
-        # own returned artifact text the same way its request_text/prompt
-        # were redacted here (the raw submission is never re-derived from
-        # this flag at submit time -- only whether to KEEP PII in it).
-        "allow_pii": bool(allow_pii),
         "pending_action": {
             "call_key": call_key,
             "agent_type": lead_agent,
@@ -4464,7 +4458,7 @@ def begin_squad_stage(
     # general-purpose; `lead_agent_file` is informational.
     if action_extras:
         cursor["pending_action"].update({
-            k: (_outbound_text(v, kind="squad", allow_pii=allow_pii)
+            k: (_outbound_text(v, kind="squad")
                 if isinstance(v, str) else v)
             for k, v in action_extras.items() if k != "agent_type"})
     cfile = cursor_path(project_root, workflow_id, task_id)
@@ -4609,7 +4603,6 @@ def _apply_squad_result(
     # instead of leaving that write to the CLI's post-submit block, so the
     # raw text never has to round-trip through the cursor to reach cli.py.
     slug = str(cursor.get("squad_slug") or "")
-    allow_pii = bool(cursor.get("allow_pii", False))
     final_status = "complete"
     if raw_artifact_text and _has_native_pack(slug):
         task_id = str(cursor.get("task_id") or cursor.get("run_id") or "")
@@ -4654,12 +4647,13 @@ def _apply_squad_result(
 
     # W1.2 step A: the canonical write (above) always used the RAW text; the
     # cursor field every downstream reader (host_action echo, trace,
-    # DECISION_RECORD) sees is the redacted copy, unless the squad is
-    # explicitly PII-allow-listed. `_outbound_text` still neutralizes
-    # MCP-attack shapes even when `allow_pii` is True (kind="squad" always
-    # scans for them), matching `begin_squad_stage`'s own outbound text.
-    cursor["artifact_text"] = _outbound_text(
-        raw_artifact_text, kind="squad", allow_pii=allow_pii)
+    # DECISION_RECORD) sees is the redacted copy. Redaction is unconditional
+    # -- there is no PII opt-out parameter, and a stale cursor from an older
+    # run that still carries a legacy PII-opt-out key is never read or
+    # honoured. `_outbound_text` also neutralizes MCP-attack shapes
+    # (kind="squad" always scans for them), matching `begin_squad_stage`'s
+    # own outbound text.
+    cursor["artifact_text"] = _outbound_text(raw_artifact_text, kind="squad")
 
     cursor["final_status"] = final_status
     cursor["state"] = final_status
