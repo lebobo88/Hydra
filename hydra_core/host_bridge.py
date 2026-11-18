@@ -41,6 +41,7 @@ from typing import Any, Optional, Sequence
 
 import re as _re
 
+from . import governance as _governance
 from . import telemetry as _telemetry
 from .judge_vendor import (
     _base_judge_vendor,
@@ -460,6 +461,18 @@ _MAX_JUDGE_MODEL_CORRECTIONS = 2
 _JUDGE_MODEL_PIN_CACHE: dict[str, tuple[str, ...]] | None = None
 
 
+def _outbound_text(text: str, *, kind: str, allow_pii: bool = False) -> str:
+    """W1.2 redact-at-build: scrub host-visible text before it is persisted to
+    the cursor / trace or handed to a host subagent. Returns ``text`` itself
+    (same object) when falsy; ``redact_for_squad_boundary`` also returns the
+    identical string when nothing matches. ``kind`` is 'engineer', 'judge' or
+    'squad'; only 'squad' text additionally gets the MCP-attack scan."""
+    if not text:
+        return text
+    return _governance.redact_for_squad_boundary(
+        text, allow_pii=allow_pii, scan_mcp_attacks=(kind == "squad"))
+
+
 def _judge_pending_action(*, call_key: str, judge_agent: str, gate_rubric: str,
                           rubric_fallback: bool, required_cross: bool,
                           judge_text: str, rubric_body: str, work_path: Any,
@@ -473,6 +486,10 @@ def _judge_pending_action(*, call_key: str, judge_agent: str, gate_rubric: str,
     both paths hand the host an identically-shaped instruction.
     """
     preferred_models = allowed_models.get(judge_producer, [])
+    # W1.2: artifact_text (diff) and failover_note (judge-tool reason) are
+    # host-visible and may carry PII; rubric_md is registry text, untouched.
+    judge_text = _outbound_text(judge_text, kind="judge")
+    failover_note = _outbound_text(failover_note, kind="judge")
     return {
         "call_key": call_key,
         "agent_type": judge_agent,
@@ -2345,6 +2362,11 @@ def begin_stage(
     gate_type = _pp_gate_type("code", gate_type)
     judge_rubric_id = judge_rubric_id or _default_rubric_id(gate_type)
     cm = dispatcher.call_mcp
+    # W1.2 redact-at-build: everything below that is persisted or host-visible
+    # derives from these redacted values.
+    request_text = _outbound_text(request_text, kind="engineer")
+    hydra_context_block = _outbound_text(
+        hydra_context_block or "", kind="engineer") or None
 
     st = _raise_on_error_payload(
         cm("pp_harness", "start_stage",
@@ -3380,6 +3402,9 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         idx = int(cursor.get("judge_vendor_chain_idx") or 0)
         stage_id = cursor.get("stage_id")
         failed_vendor = chain[idx] if idx < len(chain) else result.get("vendor")
+        # W1.2: the judge tool's reason is free text from the host; redact it
+        # once and use the same value in instructions, trace and error.
+        reason = _outbound_text(str(result.get("reason") or ""), kind="judge")
         next_idx = idx + 1
         if next_idx < len(chain):
             next_vendor = chain[next_idx]
@@ -3391,7 +3416,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             pending["allowed_judge_model_ids"] = allowed_models
             pending["instructions"] = (
                 f"FAILOVER: judge_producer {failed_vendor!r} reported "
-                f"judge_tool_failed ({result.get('reason')!r}). Spawn the "
+                f"judge_tool_failed ({reason!r}). Spawn the "
                 f"visible judge subagent AGAIN for the SAME call_key, this "
                 f"time with judge_producer={next_vendor!r} "
                 f"(preferred_models={allowed_models.get(next_vendor, [])!r}). "
@@ -3403,7 +3428,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
             _trace(cursor, "attended.judge_vendor_failover", {
                 "stage_id": stage_id, "call_key": call_key,
                 "from_producer": failed_vendor, "to_producer": next_vendor,
-                "reason": result.get("reason"),
+                "reason": reason,
             })
             if cursor_file is not None:
                 save_cursor(cursor_file, cursor)
@@ -3412,7 +3437,7 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
                 "retryable": True,
                 "error": (
                     f"judge vendor {failed_vendor!r} reported judge_tool_failed "
-                    f"({result.get('reason')!r}); resubmit the SAME call_key "
+                    f"({reason!r}); resubmit the SAME call_key "
                     f"with judge_producer={next_vendor!r}"),
                 "judge_producer": next_vendor,
             }
@@ -3420,10 +3445,10 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
         # code defect, so it must surface immediately rather than loop.
         cursor["error"] = (
             f"all judge vendors exhausted after judge_tool_failed from "
-            f"{failed_vendor!r}: {result.get('reason')}")
+            f"{failed_vendor!r}: {reason}")
         _trace(cursor, "attended.judge_vendor_failover_exhausted", {
             "stage_id": stage_id, "call_key": call_key,
-            "chain": chain, "reason": result.get("reason"),
+            "chain": chain, "reason": reason,
         })
         _finalize(dispatcher, cursor, passed=False, gen_failed=False,
                  workflow_terminal=workflow_terminal)
@@ -3515,7 +3540,12 @@ def _apply_judge(dispatcher: Dispatcher, cursor: dict[str, Any],
     outcome = result.get("outcome") or result.get("verdict") or "revise"
     if outcome not in {"pass", "revise", "fail"}:
         outcome = "revise"
-    critique_md = str(result.get("critique_md") or result.get("critique") or "")
+    # W1.2 (d): redact once at intake -- this value feeds the persisted
+    # pending_verdict_payload, the suspicious-critique trace head, the
+    # Reflexion cursor field and the generate-1 prompt.
+    critique_md = _outbound_text(
+        str(result.get("critique_md") or result.get("critique") or ""),
+        kind="judge")
     judge_producer = str(result.get("judge_producer")
                          or ("codex" if required_cross else "claude"))
     cross_vendor = judge_producer != producer
@@ -4260,6 +4290,7 @@ def begin_squad_stage(
     plan_revision: int | None = None,
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
+    allow_pii: bool = False,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -4284,6 +4315,10 @@ def begin_squad_stage(
     match instead of silently matching the new cursor.
     """
     call_key = f"squad-{task_id}-{int(attempt)}"
+    # W1.2 redact-at-build: PII + MCP-attack scan on everything host-visible.
+    # ``allow_pii`` defaults to False == the pre-W1.2 caller behaviour of
+    # scrubbing PII at the squad boundary (governance's own default).
+    request_text = _outbound_text(request_text, kind="squad", allow_pii=allow_pii)
     prompt = _build_squad_prompt(
         workflow_id=workflow_id,
         task_id=task_id,
@@ -4301,6 +4336,7 @@ def begin_squad_stage(
         plan_critique=plan_critique,
         supersedes_plan_envelope_id=supersedes_plan_envelope_id,
     )
+    prompt = _outbound_text(prompt, kind="squad", allow_pii=allow_pii)
     cursor: dict[str, Any] = {
         "schema": CURSOR_SCHEMA,
         "kind": "squad",
@@ -4333,8 +4369,10 @@ def begin_squad_stage(
     # slash command + MCP tool scope so the host can drive them via
     # general-purpose; `lead_agent_file` is informational.
     if action_extras:
-        cursor["pending_action"].update(
-            {k: v for k, v in action_extras.items() if k != "agent_type"})
+        cursor["pending_action"].update({
+            k: (_outbound_text(v, kind="squad", allow_pii=allow_pii)
+                if isinstance(v, str) else v)
+            for k, v in action_extras.items() if k != "agent_type"})
     cfile = cursor_path(project_root, workflow_id, task_id)
     save_cursor(cfile, cursor)
     _trace(cursor, "attended.squad_stage_started", {
@@ -4638,10 +4676,14 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
                 "record_verdict",
             )
         except Exception as exc:  # noqa: BLE001
+            # W1.2: exception text is engine-derived free text.
+            _exc_text = _outbound_text(str(exc), kind="engineer")
             _trace(cursor, "attended.recovery.verdict_failed", {
-                "stage_id": stage_id, "attempt_id": attempt_id, "reason": str(exc),
+                "stage_id": stage_id, "attempt_id": attempt_id,
+                "reason": _exc_text,
             })
-            return {"ok": False, "error": f"record_verdict recovery failed: {exc}"}
+            return {"ok": False,
+                    "error": f"record_verdict recovery failed: {_exc_text}"}
         cursor["verdict_recorded_for"] = payload.get("idempotency_token") or "recovery"
         _trace(cursor, "attended.recovery.verdict_recorded", {
             "stage_id": stage_id, "attempt_id": attempt_id,
@@ -4665,8 +4707,9 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
         # inline for a prompt recovery result.
         if outcome == "pass" and attempt_id and _attended_smoke_mode() != "sync":
             work_path = cursor.get("work_path") or cursor["project_path"]
-            _recovery_call_key = (cursor.get("pending_action") or {}).get(
-                "call_key") or f"recovery-{stage_id}"
+            _recovery_call_key = _outbound_text(str(
+                (cursor.get("pending_action") or {}).get("call_key")
+                or f"recovery-{stage_id}"), kind="engineer")
             # P2-3: reserve the await_smoke transition BEFORE ever spawning
             # the worker -- see `_adopt_or_launch_smoke_job`'s docstring.
             job = _adopt_or_launch_smoke_job(
@@ -4677,12 +4720,16 @@ def recover_stalled_stage(dispatcher: Dispatcher, *,
                 # synchronously as an infra smoke failure instead of parking
                 # into await_smoke to poll a job that never started.
                 _trace(cursor, "attended.recovery.smoke_job_spawn_failed", {
-                    "stage_id": stage_id, "reason": job["spawn_error"],
+                    "stage_id": stage_id,
+                    "reason": _outbound_text(
+                        str(job["spawn_error"]), kind="engineer"),
                 })
                 _finalize_immediate_smoke_spawn_failure(
                     dispatcher, cursor, cursor_file=cursor_file,
                     call_key=_recovery_call_key, work_path=work_path,
-                    reason=job["spawn_error"], workflow_terminal=workflow_terminal)
+                    reason=_outbound_text(
+                        str(job["spawn_error"]), kind="engineer"),
+                    workflow_terminal=workflow_terminal)
                 # _apply_smoke_and_finalize's own internal save_cursor (Fix-1b)
                 # runs BEFORE it stamps the final smoke_status/outcome fields
                 # onto the in-memory cursor -- persist the fully-finalized
