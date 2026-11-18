@@ -126,6 +126,30 @@ def test_redact_returns_none_when_daemon_silent():
     assert out is None  # caller falls back to local redaction
 
 
+def test_redact_for_squad_rejects_pii_opt_out_kwarg():
+    """Redaction is unconditional (Hydra engine-wide PII-opt-out removal):
+    the wrapper no longer accepts a PII opt-out kwarg at all."""
+    d = _RecordingDispatcher()
+    a = EightsAttestor(dispatcher=d)
+    import pytest
+    with pytest.raises(TypeError):
+        a.redact_for_squad(  # type: ignore[call-arg]
+            text="hi", from_squad="a", to_squad="b", allow_pii=True)
+
+
+def test_redact_for_squad_daemon_payload_has_no_pii_opt_out_key():
+    """A read-only grep of the TheEights checkout found no PII-opt-out
+    field in the daemon's redact schema, so Hydra never sends one."""
+    d = _RecordingDispatcher(scripted={
+        "eights.governance.redact_for_squad": {"redacted": "ssn [REDACTED]"},
+    })
+    a = EightsAttestor(dispatcher=d)
+    a.redact_for_squad(text="ssn 123-45-6789", from_squad="executive", to_squad="garland")
+    payload = d.calls[0]["args"]["payload"]
+    assert "allow_pii" not in payload
+    assert payload == {"text": "ssn 123-45-6789", "from_squad": "executive"}
+
+
 def test_prompt_get_returns_text():
     d = _RecordingDispatcher(scripted={
         "eights.prompt.get": {"text": "You are the boardroom facilitator."},

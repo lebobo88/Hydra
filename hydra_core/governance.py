@@ -204,17 +204,16 @@ _MCP_ATTACK_PATTERNS = [
 def redact_for_squad_boundary(
     text: str,
     *,
-    allow_pii: bool = False,
     scan_mcp_attacks: bool = True,
 ) -> str:
     """Redact PII and optionally neutralize MCP-attack shapes from a string
     crossing a squad boundary. PII is replaced with `[REDACTED]`; MCP-attack
     patterns are replaced with `[REDACTED-INJECTION]` so the attempt itself
-    is visible in audit but the payload is defanged."""
+    is visible in audit but the payload is defanged. Redaction is
+    unconditional: there is no opt-out, no squad or caller may skip it."""
     out = text
-    if not allow_pii:
-        for p in _PII_PATTERNS:
-            out = p.sub("[REDACTED]", out)
+    for p in _PII_PATTERNS:
+        out = p.sub("[REDACTED]", out)
     if scan_mcp_attacks:
         for p in _MCP_ATTACK_PATTERNS:
             out = p.sub("[REDACTED-INJECTION]", out)

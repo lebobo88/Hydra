@@ -824,17 +824,21 @@ class EightsAttestor:
         text: str,
         from_squad: str,
         to_squad: str,
-        allow_pii: bool = False,
     ) -> Optional[str]:
         """Daemon-side redaction. When unavailable, callers should fall back
         to `governance.redact_for_squad_boundary` (already in place).
+
+        Redaction is unconditional: there is no PII opt-out parameter. A
+        read-only grep of the TheEights checkout found no PII-opt-out
+        field (snake_case or camelCase) in the daemon's schema, so none
+        is sent.
 
         Returns the redacted text, or None when the daemon didn't service the
         call (so the caller knows to use the local fallback).
         """
         out = self._call("eights.governance.redact_for_squad", {
             "target_squad": to_squad,
-            "payload": {"text": text, "from_squad": from_squad, "allow_pii": allow_pii},
+            "payload": {"text": text, "from_squad": from_squad},
         })
         if isinstance(out, dict) and isinstance(out.get("redacted"), str):
             return out["redacted"]
