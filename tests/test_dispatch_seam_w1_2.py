@@ -355,8 +355,11 @@ class TestM1TicketIdentity:
     def test_reuse_stored_null_field_is_identity_mismatch_not_match(self, tmp_path):
         """A stored identity field that is explicitly JSON `null` (not
         merely missing) must not match a requested value equal to its
-        `str()` form (`str(None) == "None"`) either."""
-        wf, run_id, call_key = "wf-reuse-null", "run-1", "generate-0"
+        `str()` form -- `str(None) == "None"`, so the requested `run_id`
+        here is the literal string `"None"`, the exact value the old
+        `str(data.get(...))` coercion would have produced from this
+        stored `null`."""
+        wf, run_id, call_key = "wf-reuse-null", "None", "generate-0"
         path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         planted = {"workflow_id": wf, "run_id": None, "call_key": call_key}
@@ -379,8 +382,10 @@ class TestM1TicketIdentity:
     def test_reuse_stored_missing_field_is_identity_mismatch_not_match(
             self, tmp_path):
         """A stored identity field that is entirely ABSENT from the
-        ticket dict (not just null) must not match either."""
-        wf, run_id, call_key = "wf-reuse-missing", "run-1", "generate-0"
+        ticket dict (not just null) must not match either -- same
+        `str(None) == "None"` reasoning as the null-field test above, so
+        the requested `run_id` is again the literal string `"None"`."""
+        wf, run_id, call_key = "wf-reuse-missing", "None", "generate-0"
         path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
         path.parent.mkdir(parents=True, exist_ok=True)
         planted = {"workflow_id": wf, "call_key": call_key}  # run_id entirely absent
@@ -2040,6 +2045,46 @@ class TestM7FailSoftProperty:
         unexpected = [e for e in events if e["kind"] == "dispatch.seam_unexpected_failure"]
         assert len(unexpected) == 1
         assert unexpected[0]["error"] == "RuntimeError"
+
+    def test_dispatch_seam_import_itself_faulting_is_caught_by_outer_guard(
+            self, tmp_path, monkeypatch, capsys):
+        """Finding 2 (BLOCKING): the `from . import dispatch_seam`
+        statement is now the FIRST statement INSIDE `_apply_dispatch_seam`'s
+        outer `try` -- an exception raised by that import itself must not
+        escape to the caller.
+
+        `builtins.__import__` is patched (not the shared
+        `hydra_core.dispatch_seam` package attribute / `sys.modules`
+        entry): `cli.py` does `from . import dispatch_seam` at several
+        OTHER call sites too (the engineer-step budget gate, the squad
+        recovery lookup, the submit seam call), all of which run before
+        `_apply_dispatch_seam` on this code path and would raise first if
+        the fault were global, testing the wrong statement entirely. The
+        patch only raises when BOTH the fromlist is `('dispatch_seam',)`
+        AND the immediate caller frame is `_apply_dispatch_seam` itself."""
+        import builtins
+        import sys as _sys
+        real_import = builtins.__import__
+
+        def _raising_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if fromlist and "dispatch_seam" in fromlist:
+                frame = _sys._getframe(1)
+                if frame.f_code.co_name == "_apply_dispatch_seam":
+                    raise OSError("injected dispatch_seam import fault")
+            return real_import(name, globals, locals, fromlist, level)
+
+        state, task = _eng_state("add a feature")
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {})
+        root, _target = _eng_env(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(builtins, "__import__", _raising_import)
+
+        res = _run_step(root, wf, capsys)  # asserts rc == 0, the no-fault exit code
+
+        assert res["ok"] is True
+        assert res["host_action"]["call_key"] == "generate-0"
+        assert res["dispatch_ticket"] is None
 
     def test_seam_failure_response_decision_table(self):
         """Direct unit test of the outer handler's decision helper,
