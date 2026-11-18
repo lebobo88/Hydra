@@ -4351,9 +4351,11 @@ def _apply_dispatch_seam(
 
     Returns ``None`` on success, or a recoverable error dict
     (``status='dispatch_seam_persist_failed'``) when the prepared action
-    changed and could not be saved: ``res`` is left untouched and NO ticket
-    is written, so cursor, response and ticket never disagree. The caller
-    must print the error dict instead of ``res`` and return non-zero.
+    changed and could not be saved OR could not even be verified against
+    the on-disk cursor (the existence check itself faulted, cross-vendor
+    retry 3 finding 3): ``res`` is left untouched and NO ticket is written,
+    so cursor, response and ticket never disagree. The caller must print
+    the error dict instead of ``res`` and return non-zero.
     """
     from . import dispatch_seam
     original = res.get("host_action")
@@ -4380,10 +4382,18 @@ def _apply_dispatch_seam(
         prepared, changed = original, False
     cursor_file = res.get("cursor_path")
     # Item 18: `Path(cursor_file).exists()` can itself raise (PermissionError
-    # / OSError on some platforms). Treat a failed existence check the same
-    # as "cursor file not found" -- skip the persist attempt rather than
-    # letting the exception escape.
+    # / OSError on some platforms). An UNCHANGED action tolerates treating
+    # this the same as "cursor file not found" (there is nothing to
+    # reconcile -- the served action already agrees with whatever the
+    # cursor holds). A CHANGED action does NOT tolerate that: silently
+    # skipping the persist attempt would serve and ticket the changed
+    # action while the on-disk cursor keeps the original, so cursor and
+    # response permanently disagree (cross-vendor retry 3 finding 3). When
+    # the action changed and this check cannot even tell whether a cursor
+    # exists to persist into, treat it exactly like a cursor-save failure:
+    # return `dispatch_seam_persist_failed` and write NO ticket.
     cursor_exists = False
+    cursor_exists_check_failed = False
     if cursor_file:
         try:
             cursor_exists = Path(cursor_file).exists()
@@ -4392,6 +4402,14 @@ def _apply_dispatch_seam(
                                      {"cursor_path": str(cursor_file),
                                       "error": type(e).__name__})
             cursor_exists = False
+            cursor_exists_check_failed = True
+    if changed and cursor_file and cursor_exists_check_failed:
+        return {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
     if changed and cursor_file and cursor_exists:
         from . import host_bridge
         try:
@@ -4982,12 +5000,30 @@ def _cmd_attended_step(args) -> int:
             # exhausted. A cursor whose attempt differs (a re-issued
             # planning attempt, Hydra#69 defect C) falls through to
             # begin_squad_stage exactly as on base.
+            # Finding 6 (cross-vendor retry 3): the `Path.exists()` guard
+            # below, and the `load_cursor` it gates, must not be able to
+            # escape to the CLI caller either. Either fault is reported via
+            # `safe_emit` and falls all the way through to the
+            # non-recovery `begin_squad_stage` behaviour below -- exactly
+            # as a genuinely missing cursor already does -- rather than
+            # risking a re-served action against a cursor state that could
+            # not be confirmed.
             _existing_squad_res = None
             _ex_cfile = host_bridge.cursor_path(project, wf, task_id)
-            if Path(_ex_cfile).exists():
+            try:
+                _ex_cfile_exists = Path(_ex_cfile).exists()
+            except Exception as _e:  # noqa: BLE001
+                _dispatch_seam.safe_emit(
+                    project, wf, "dispatch.recovery_cursor_exists_check_failed",
+                    {"task_id": task_id, "error": type(_e).__name__})
+                _ex_cfile_exists = False
+            if _ex_cfile_exists:
                 try:
                     _ex_cursor = host_bridge.load_cursor(_ex_cfile)
-                except Exception:  # noqa: BLE001
+                except Exception as _e:  # noqa: BLE001
+                    _dispatch_seam.safe_emit(
+                        project, wf, "dispatch.recovery_cursor_load_failed",
+                        {"task_id": task_id, "error": type(_e).__name__})
                     _ex_cursor = None
                 if (isinstance(_ex_cursor, dict)
                         and _ex_cursor.get("state") not in host_bridge._TERMINAL

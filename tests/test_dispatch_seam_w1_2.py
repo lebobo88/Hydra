@@ -1060,13 +1060,32 @@ class TestM7FailSoftProperty:
     classes include OSError and at least one non-OSError (RuntimeError /
     UnicodeEncodeError via a lone surrogate).
 
+    Cross-vendor retry 3 gap-fill (finding 5): the direct-writer row
+    ("write_dispatch_ticket direct fault matrix") now also covers the
+    identity-hash step (``hashlib.sha256`` inside ``ticket_path`` /
+    ``compute_ticket_id``), the FIRST reuse-existence check
+    (``os.path.exists``), env access (``ticket_ttl_seconds``'s
+    ``os.environ.get``), the uuid temp-name step, and the clock
+    (``datetime.now`` when the caller supplies no ``now=``) -- 16
+    parametrized rows in that one test alone. A dedicated reuse
+    read/decode-fault row proves its fault actually fires (the prior
+    version of that row patched telemetry on a path that returns BEFORE
+    telemetry is ever called -- a no-op fault, corrected this retry). The
+    squad-step entry point gained its own budget-blocked-telemetry row
+    (previously only the engineer-step site was covered) and two
+    recovery-lookup rows (the open-cursor re-serve's own
+    ``Path.exists``/``load_cursor``, distinct from the persist-path check
+    inside ``_apply_dispatch_seam``).
+
     Every row asserts: (1) no exception propagates; (2) the path's defined
     response; (3) no ``*.tmp`` file and no partial final file in the
     tickets dir -- EXCEPT the one row (persistent cleanup fault) where the
     cleanup call itself fails every time, which instead asserts "no
     exception propagates, and a ticket already published by os.link is
-    still returned (not nulled)"; (4) a pre-existing ticket's bytes are
-    unchanged where one was seeded.
+    still returned (not nulled), AND the cleanup failure is itself
+    reported via `safe_emit`"; (4) a pre-existing ticket's bytes are
+    unchanged where one was seeded. Every row that injects a fault also
+    proves the fault fired, via a call counter asserted > 0.
 
     Patches are scoped narrowly (gated on the faulting path or a call
     counter) so each row injects exactly the intended fault without
@@ -1085,20 +1104,47 @@ class TestM7FailSoftProperty:
         ("link", OSError),
         ("link", RuntimeError),
         ("dumps_strict", RuntimeError),
+        ("identity_hash", OSError),
+        ("identity_hash", RuntimeError),
+        ("initial_reuse_exists", OSError),
+        ("initial_reuse_exists", RuntimeError),
+        ("ttl_env", OSError),
+        ("ttl_env", RuntimeError),
+        ("uuid4", OSError),
+        ("uuid4", RuntimeError),
+        ("datetime_now", OSError),
+        ("datetime_now", RuntimeError),
     ], ids=["makedirs-OSError", "makedirs-RuntimeError", "open_temp_write-OSError",
-            "link-OSError", "link-RuntimeError", "dumps_strict-RuntimeError"])
+            "link-OSError", "link-RuntimeError", "dumps_strict-RuntimeError",
+            "identity_hash-OSError", "identity_hash-RuntimeError",
+            "initial_reuse_exists-OSError", "initial_reuse_exists-RuntimeError",
+            "ttl_env-OSError", "ttl_env-RuntimeError",
+            "uuid4-OSError", "uuid4-RuntimeError",
+            "datetime_now-OSError", "datetime_now-RuntimeError"])
     def test_write_dispatch_ticket_direct_fault_matrix(
             self, tmp_path, monkeypatch, dep, exc_cls):
         """Items 10 (makedirs/open/dumps_strict/link, already guarded by the
-        outer except at b24cc36) re-verified as a property: whichever of
-        these raises, whatever the exception class, the result is a clean
-        fail-soft null with no exception and no file left behind."""
+        outer except at b24cc36) PLUS the cross-vendor retry 3 gap-fill
+        rows -- identity-hash faults (item 1, finding 1: ``ticket_path``'s
+        ``compute_ticket_id`` -> ``hashlib.sha256``, now INSIDE the single
+        outer guard rather than only catching ``ValueError``), the initial
+        reuse existence check (item 2, finding 2: the FIRST
+        ``_check_reuse`` call's ``os.path.exists``, now also inside the
+        guard), env access (item 6: ``ticket_ttl_seconds``'s
+        ``os.environ.get``), uuid (item 9: ``uuid.uuid4()``), and the
+        clock (item 4: ``datetime.now`` when the caller supplies no
+        ``now=``) -- re-verified as a property: whichever of these raises,
+        whatever the exception class, the result is a clean fail-soft null
+        with no exception and no file left behind, AND the injected fault
+        is proven to have actually fired (a call counter, asserted > 0)."""
         wf, run_id, call_key = f"wf-m7-direct-{dep}-{exc_cls.__name__}", "run-1", "generate-0"
         action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
         path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        fired = {"n": 0}
 
         if dep == "makedirs":
             def _raiser(*a, **kw):
+                fired["n"] += 1
                 raise exc_cls("injected")
             monkeypatch.setattr(dispatch_seam.os, "makedirs", _raiser)
         elif dep == "open_temp_write":
@@ -1106,23 +1152,66 @@ class TestM7FailSoftProperty:
 
             def _fake_open(file, mode="r", *a, **kw):
                 if str(file).endswith(".tmp") and "w" in mode:
+                    fired["n"] += 1
                     raise exc_cls("injected")
                 return real_open(file, mode, *a, **kw)
             monkeypatch.setattr("builtins.open", _fake_open)
         elif dep == "link":
             def _raiser(*a, **kw):
+                fired["n"] += 1
                 raise exc_cls("injected")
             monkeypatch.setattr(dispatch_seam.os, "link", _raiser)
         elif dep == "dumps_strict":
             def _raiser(*a, **kw):
+                fired["n"] += 1
                 raise exc_cls("injected")
             monkeypatch.setattr(dispatch_seam, "dumps_strict", _raiser)
+        elif dep == "identity_hash":
+            real_sha256 = hashlib.sha256
+
+            def _raiser(*a, **kw):
+                fired["n"] += 1
+                raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam.hashlib, "sha256", _raiser)
+            # Keep the real function reachable so other, unrelated hashing
+            # in the same process (e.g. pytest's own internals) is
+            # unaffected -- the patch targets only `dispatch_seam.hashlib`.
+            assert real_sha256 is not None
+        elif dep == "initial_reuse_exists":
+            real_exists = os.path.exists
+
+            def _raiser(p, *a, **kw):
+                if str(p) == dispatch_seam._long_path(path):
+                    fired["n"] += 1
+                    raise exc_cls("injected")
+                return real_exists(p, *a, **kw)
+            monkeypatch.setattr(dispatch_seam.os.path, "exists", _raiser)
+        elif dep == "ttl_env":
+            class _RaisingEnviron(dict):
+                def get(self, *a, **kw):
+                    fired["n"] += 1
+                    raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam.os, "environ",
+                                 _RaisingEnviron(os.environ))
+        elif dep == "uuid4":
+            def _raiser(*a, **kw):
+                fired["n"] += 1
+                raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam.uuid, "uuid4", _raiser)
+        elif dep == "datetime_now":
+            class _FakeDatetime:
+                @staticmethod
+                def now(tz=None):
+                    fired["n"] += 1
+                    raise exc_cls("injected")
+            monkeypatch.setattr(dispatch_seam, "datetime", _FakeDatetime)
 
         result = dispatch_seam.write_dispatch_ticket(
             tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
             budget_usd=None, budget_remaining_usd=None)
 
         assert result is None  # (1) no exception reached here; (2) defined response
+        assert fired["n"] > 0  # the injected fault actually fired
         assert not path.exists()
         tickets_dir = path.parent
         assert not tickets_dir.exists() or list(tickets_dir.iterdir()) == []  # (3)
@@ -1156,7 +1245,11 @@ class TestM7FailSoftProperty:
         persistently failing, non-OSError cleanup of the temp file (e.g. a
         RuntimeError from a faulty monitoring hook wrapping os.remove)
         must not raise and must not null the already-published ticket --
-        the temp file is left behind in this one row only."""
+        the temp file is left behind in this one row only. Cross-vendor
+        retry 3 finding 4: unlike before, this is NOT silently swallowed
+        -- `dispatch.ticket_tmp_cleanup_failed` is reported via
+        `safe_emit` with the exception type and the temp file's bare name
+        (no path)."""
         wf, run_id, call_key = "wf-m7-cleanup-persist", "run-1", "generate-0"
         action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
 
@@ -1173,7 +1266,20 @@ class TestM7FailSoftProperty:
         # The documented exception to the no-tmp invariant: the persistent
         # cleanup fault leaves exactly one temp file behind, but a ticket
         # already published by os.link is never nulled.
-        assert len(list(result.parent.glob("*.tmp"))) == 1
+        tmp_files = list(result.parent.glob("*.tmp"))
+        assert len(tmp_files) == 1
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        cleanup_failed = [e for e in events
+                           if e["kind"] == "dispatch.ticket_tmp_cleanup_failed"]
+        assert len(cleanup_failed) == 1
+        assert cleanup_failed[0]["error"] == "RuntimeError"
+        assert cleanup_failed[0]["tmp_name"] == tmp_files[0].name
+        # No path beyond the bare file name.
+        assert "\\" not in cleanup_failed[0]["tmp_name"]
+        assert "/" not in cleanup_failed[0]["tmp_name"]
+        written = [e for e in events if e["kind"] == "dispatch.ticket_written"]
+        assert len(written) == 1  # the response itself is still a success
 
     def test_write_dispatch_ticket_cleanup_one_shot_fault_retries_and_leaves_no_temp_file(
             self, tmp_path, monkeypatch):
@@ -1202,10 +1308,20 @@ class TestM7FailSoftProperty:
         assert list(result.parent.glob("*.tmp")) == []
         assert calls["n"] == 2
 
-    def test_preexisting_ticket_bytes_unchanged_when_reuse_check_emit_faults(
+    def test_preexisting_ticket_bytes_unchanged_when_successful_reuse_emit_never_called(
             self, tmp_path, monkeypatch):
-        """Property (4): a pre-existing ticket's bytes are unchanged even
-        when a dependency on the (idempotent) re-write path faults."""
+        """Property (4): a pre-existing ticket's bytes are unchanged on a
+        clean, successful reuse. NOTE on a test CORRECTED this retry
+        (cross-vendor retry 3 finding 5): the prior version of this test
+        patched `dispatch_seam.emit` and claimed to prove the reuse path
+        is fail-soft against a telemetry fault -- but a successful
+        ('ok') reuse returns BEFORE any telemetry call is made, so that
+        patch was never exercised (a no-op fault, not a real row). This
+        version asserts that directly: `emit` is proven NOT called on the
+        successful-reuse path, and the real fault-bearing row for this
+        entry point is
+        `test_preexisting_ticket_bytes_unchanged_when_reuse_read_fault_and_telemetry_both_fault`
+        below, where the fault actually fires."""
         wf, run_id, call_key = "wf-m7-reuse", "run-1", "generate-0"
         action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
         first = dispatch_seam.write_dispatch_ticket(
@@ -1214,9 +1330,12 @@ class TestM7FailSoftProperty:
         assert first is not None
         before = first.read_bytes()
 
-        def _raiser(*a, **kw):
-            raise RuntimeError("trace write failed")
-        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+        emit_calls = {"n": 0}
+
+        def _counting_emit(*a, **kw):
+            emit_calls["n"] += 1
+            return None
+        monkeypatch.setattr(dispatch_seam, "emit", _counting_emit)
 
         second = dispatch_seam.write_dispatch_ticket(
             tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
@@ -1225,6 +1344,51 @@ class TestM7FailSoftProperty:
         assert second == first
         assert first.read_bytes() == before
         assert list(first.parent.glob("*.tmp")) == []
+        assert emit_calls["n"] == 0  # the reuse-ok path never reaches telemetry
+
+    def test_preexisting_ticket_bytes_unchanged_when_reuse_read_fault_and_telemetry_both_fault(
+            self, tmp_path, monkeypatch):
+        """Reuse read/decode fault (item 2; cross-vendor retry 3 finding 5
+        gap-fill) that ACTUALLY fires, unlike the emit patch replaced
+        above. The SECOND write's `_check_reuse` read of the existing
+        ticket is faulted (`open()` in read mode on that exact file),
+        which routes through `_emit_write_failed` -> `safe_emit` ->
+        `emit` -- also faulted. Both faults are proven to have fired via
+        counters; the pre-existing ticket's bytes stay untouched."""
+        wf, run_id, call_key = "wf-m7-reuse-read-fault", "run-1", "generate-0"
+        action = {"call_key": call_key, "agent_type": "engineer", "prompt": "p"}
+        first = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+        assert first is not None
+        before = first.read_bytes()
+
+        real_open = open
+        read_fired = {"n": 0}
+
+        def _fake_open(file, mode="r", *a, **kw):
+            if "r" in mode and str(file).endswith(first.name):
+                read_fired["n"] += 1
+                raise OSError("injected read fault")
+            return real_open(file, mode, *a, **kw)
+        monkeypatch.setattr("builtins.open", _fake_open)
+
+        emit_fired = {"n": 0}
+
+        def _raise_emit(*a, **kw):
+            emit_fired["n"] += 1
+            raise RuntimeError("trace write failed")
+        monkeypatch.setattr(dispatch_seam, "emit", _raise_emit)
+
+        second = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id, action, kind="engineer", squad_slug=None,
+            budget_usd=None, budget_remaining_usd=None)
+
+        assert second is None  # (1)+(2): unreadable existing file -> fail-soft null
+        assert read_fired["n"] > 0
+        assert emit_fired["n"] > 0
+        assert first.read_bytes() == before  # (4)
+        assert list(first.parent.glob("*.tmp")) == []  # (3)
 
     # ----------------------------------------------------------------- #
     # Lone-surrogate hashing (fix 1b) -- prompt, artifact_text, run_id,  #
@@ -1312,14 +1476,23 @@ class TestM7FailSoftProperty:
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events if e["kind"] == "dispatch.prepare_host_action_failed"]
 
-    def test_squad_step_cursor_exists_check_fault_serves_action_and_still_tickets(
+    def test_squad_step_cursor_exists_check_fault_returns_persist_failed_not_ticketed(
             self, tmp_path, monkeypatch, capsys):
-        """Item 18: ``Path(cursor_file).exists()`` itself faults (e.g. a
-        PermissionError). Gated by a call counter on the exact cursor path
-        so only the SECOND check (inside _apply_dispatch_seam, after
-        begin_squad_stage already wrote the cursor) is faulted -- the
-        FIRST check (the open-cursor recovery lookup, unguarded and out of
-        scope per the goal) must see its normal (false) answer."""
+        """Item 18, CORRECTED (cross-vendor retry 3 finding 3): this test
+        was added in retry 1 asserting the OPPOSITE of the defined
+        contract -- that a changed, ticketed action could be served while
+        the on-disk cursor silently kept the original (permanent cursor/
+        response disagreement). The judge found that disagreement itself
+        is the bug: when ``Path(cursor_file).exists()`` faults (e.g. a
+        PermissionError) and the prepared action actually CHANGED, the
+        action cannot be verified against (or saved to) the cursor, so the
+        seam must return the SAME `dispatch_seam_persist_failed` result as
+        an outright save failure -- not serve-and-ticket. Gated by a call
+        counter on the exact cursor path so only the SECOND check (inside
+        _apply_dispatch_seam, after begin_squad_stage already wrote the
+        cursor) is faulted -- the FIRST check (the open-cursor recovery
+        lookup, unguarded and out of scope per the goal) still sees its
+        normal (false) answer."""
         task = TaskState(owner_squad="executive", description="brief the board")
         state = HydraState(root_goal="brief", tasks=[task])
         wf = str(state.workflow_id)
@@ -1339,23 +1512,128 @@ class TestM7FailSoftProperty:
             return real_exists(self)
         monkeypatch.setattr(Path, "exists", _flaky_exists)
 
-        res = _run_step(tmp_path, wf, capsys)
+        rc = cli._cmd_attended_step(argparse.Namespace(
+            project=str(tmp_path), workflow_id=wf, verbose=False))
+        out = capsys.readouterr().out
 
-        assert res["ok"] is True and res["status"] == "awaiting_host"  # (1)+(2)
+        assert rc == 1  # (1)+(2): no exception, the defined response
+        assert "Traceback" not in out
+        result = json.loads(out)
+        assert result == {
+            "ok": False,
+            "status": "dispatch_seam_persist_failed",
+            "cursor_path": str(cursor_file),
+            "retryable": True,
+        }
+        # No ticket is written for a changed action that could not be
+        # verified/persisted -- cursor, response and ticket must never
+        # disagree.
+        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
+        assert not tickets_dir.exists() or list(tickets_dir.glob("*.tmp")) == []  # (3)
+        assert not tickets_dir.exists() or list(tickets_dir.iterdir()) == []
+        # The on-disk cursor still holds the ORIGINAL (undirectived)
+        # action -- it was never ticketed as if it had changed.
         directive = dispatch_seam.build_tool_scope_directive(pack)
         red = host_bridge._outbound_text(directive, kind="squad")
-        assert res["host_action"]["prompt"].endswith(red)
-        assert res["dispatch_ticket"] is not None
-        tickets_dir = tmp_path / ".hydra" / wf / "attended" / "tickets"
-        assert list(tickets_dir.glob("*.tmp")) == []  # (3)
-        # Degraded half of this fail-soft path: the on-disk cursor was NOT
-        # updated with the directive, because the persist attempt was
-        # skipped once the exists() check faulted.
         cursor = host_bridge.load_cursor(cursor_file)
         assert not cursor["pending_action"]["prompt"].endswith(red)
         trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
         events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
         assert [e for e in events if e["kind"] == "dispatch.cursor_exists_check_failed"]
+
+    def test_squad_step_recovery_cursor_load_fault_falls_through_like_missing_cursor(
+            self, tmp_path, monkeypatch, capsys):
+        """Item 24 / cross-vendor retry 3 finding 6: the open-cursor
+        RECOVERY lookup in `_cmd_attended_step` (distinct from the
+        persist-path exists check tested above) has its own
+        `Path.exists()` and `load_cursor` calls, previously unguarded and
+        silently swallowed respectively. Either fault must fall through
+        to the SAME behaviour as a genuinely missing cursor -- never
+        escape, never silently re-serve against an unconfirmed cursor
+        state."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+        task_id = str(task.task_id)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        first = _run_step(tmp_path, wf, capsys)
+        assert first["ok"] is True
+
+        # Gated to the FIRST matching call only: within one
+        # `_cmd_attended_step` invocation `load_cursor`/`Path.exists` for
+        # this exact cursor path is called once by the RECOVERY lookup
+        # (which this row targets) and again, separately, by
+        # `_apply_dispatch_seam`'s own persist-path check -- which must
+        # see its normal answer so this row isolates the recovery call
+        # alone.
+        real_load = host_bridge.load_cursor
+        calls = {"n": 0}
+        fired = {"n": 0}
+
+        def _flaky_load(path):
+            if str(path) == str(cursor_file):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    fired["n"] += 1
+                    raise OSError("injected recovery load fault")
+            return real_load(path)
+        monkeypatch.setattr(host_bridge, "load_cursor", _flaky_load)
+
+        second = _run_step(tmp_path, wf, capsys)
+
+        assert second["ok"] is True  # (1)+(2): no exception, a defined response
+        assert fired["n"] > 0
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        assert [e for e in events if e["kind"] == "dispatch.recovery_cursor_load_failed"]
+
+    def test_squad_step_recovery_cursor_exists_fault_falls_through_like_missing_cursor(
+            self, tmp_path, monkeypatch, capsys):
+        """Same as above, but for the recovery lookup's `Path.exists()`
+        itself faulting (e.g. a PermissionError) rather than the
+        subsequent `load_cursor`."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        wf = str(state.workflow_id)
+        pack = _ScopedPack()
+        _install(monkeypatch, state, {"executive": pack})
+        task_id = str(task.task_id)
+        cursor_file = host_bridge.cursor_path(tmp_path, wf, task_id)
+
+        first = _run_step(tmp_path, wf, capsys)
+        assert first["ok"] is True
+
+        # Gated to the FIRST matching call only: `Path.exists()` for this
+        # exact cursor path is called once by the RECOVERY lookup (which
+        # this row targets) and again, separately, by
+        # `_apply_dispatch_seam`'s own persist-path check (unconditional,
+        # run before the `changed` branch is even evaluated) -- which
+        # must see its normal (true) answer so this row isolates the
+        # recovery call alone.
+        real_exists = Path.exists
+        calls = {"n": 0}
+        fired = {"n": 0}
+
+        def _flaky_exists(self):
+            if str(self) == str(cursor_file):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    fired["n"] += 1
+                    raise PermissionError("injected recovery exists fault")
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", _flaky_exists)
+
+        second = _run_step(tmp_path, wf, capsys)
+
+        assert second["ok"] is True  # (1)+(2)
+        assert fired["n"] > 0
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        assert [e for e in events
+                if e["kind"] == "dispatch.recovery_cursor_exists_check_failed"]
 
     # ----------------------------------------------------------------- #
     # Entry point 3: engineer step (+ named combined-failure case 2)    #
@@ -1528,7 +1806,10 @@ class TestM7FailSoftProperty:
         _install(monkeypatch, state, {})
         root, _target = _eng_env(monkeypatch, tmp_path)
 
+        fired = {"n": 0}
+
         def _raiser(*a, **kw):
+            fired["n"] += 1
             raise OSError("trace write failed")
         monkeypatch.setattr(dispatch_seam, "emit", _raiser)
 
@@ -1536,7 +1817,37 @@ class TestM7FailSoftProperty:
 
         assert res["status"] == "budget_blocked" and res["ok"] is False  # (1)+(2)
         assert res["task_id"] == str(task.task_id)
+        assert fired["n"] > 0
         assert not (root / ".hydra" / wf / "attended").exists()  # (3)
+
+    def test_squad_budget_blocked_step_telemetry_emit_fault_response_unaffected(
+            self, tmp_path, monkeypatch, capsys):
+        """Item 22, squad branch (cross-vendor retry 3 finding 5 gap-fill):
+        the engineer-step variant above exercises the engineer-step
+        `attended.budget_blocked` emit site; this exercises the SEPARATE
+        squad-step site (the recovery/`begin_squad_stage` branch) with the
+        same fault, proving both sites -- not just one -- are routed
+        through `safe_emit`."""
+        task = TaskState(owner_squad="executive", description="brief the board")
+        state = HydraState(root_goal="brief", tasks=[task])
+        state.budget.spent_usd = state.budget.budget_usd
+        wf = str(state.workflow_id)
+        _install(monkeypatch, state, {"executive": _ScopedPack()})
+
+        fired = {"n": 0}
+
+        def _raiser(*a, **kw):
+            fired["n"] += 1
+            raise OSError("trace write failed")
+        monkeypatch.setattr(dispatch_seam, "emit", _raiser)
+
+        res = _run_step(tmp_path, wf, capsys)
+
+        assert res["status"] == "budget_blocked" and res["ok"] is False  # (1)+(2)
+        assert res["task_id"] == str(task.task_id)
+        assert res["squad_slug"] == "executive"
+        assert fired["n"] > 0
+        assert not (tmp_path / ".hydra" / wf / "attended").exists()  # (3)
 
     # ----------------------------------------------------------------- #
     # Deliberate exceptions E1-E3 (module docstring)                    #
@@ -1577,3 +1888,135 @@ class TestM7FailSoftProperty:
                 tmp_path, "wf-e3", "run-1", ["not", "a", "dict"],  # type: ignore[arg-type]
                 kind="engineer", squad_slug=None, budget_usd=None,
                 budget_remaining_usd=None)
+
+
+# =============================================================================== #
+# M8 -- static structural guard (cross-vendor retry 3, requirement D)             #
+# =============================================================================== #
+
+class TestM8StructuralGuard:
+    """Keeps the fail-soft SHAPE from regressing by inspecting the actual
+    AST of ``hydra_core/dispatch_seam.py`` rather than re-testing
+    behaviour: (1) in ``write_dispatch_ticket`` every statement after the
+    ``workflow_id`` validation (E1) lies inside the single outer ``Try``
+    node; (2) no function in the module other than ``safe_emit`` calls
+    telemetry ``emit`` directly."""
+
+    @staticmethod
+    def _module_ast() -> "ast.Module":
+        import ast as _ast
+        src_path = Path(dispatch_seam.__file__)
+        return _ast.parse(src_path.read_text(encoding="utf-8"), filename=str(src_path))
+
+    def _write_dispatch_ticket_def(self):
+        import ast as _ast
+        mod = self._module_ast()
+        for node in mod.body:
+            if isinstance(node, _ast.FunctionDef) and node.name == "write_dispatch_ticket":
+                return node
+        raise AssertionError("write_dispatch_ticket not found in module AST")
+
+    def test_only_workflow_id_validation_is_outside_the_outer_try(self):
+        import ast as _ast
+        fn = self._write_dispatch_ticket_def()
+        body = list(fn.body)
+        # Skip the docstring (an ast.Expr wrapping an ast.Constant str).
+        if (body and isinstance(body[0], _ast.Expr)
+                and isinstance(getattr(body[0], "value", None), _ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]
+
+        # Find the E1 guard: `if not WORKFLOW_ID_RE.match(...): return None`.
+        e1_index = None
+        for i, stmt in enumerate(body):
+            if isinstance(stmt, _ast.If):
+                test = stmt.test
+                if (isinstance(test, _ast.UnaryOp) and isinstance(test.op, _ast.Not)
+                        and isinstance(test.operand, _ast.Call)):
+                    call = test.operand
+                    if (isinstance(call.func, _ast.Attribute)
+                            and call.func.attr == "match"
+                            and isinstance(call.func.value, _ast.Name)
+                            and call.func.value.id == "WORKFLOW_ID_RE"):
+                        e1_index = i
+                        break
+        assert e1_index is not None, (
+            "E1 workflow_id validation (`if not WORKFLOW_ID_RE.match(...)`) "
+            "not found as a top-level statement in write_dispatch_ticket")
+
+        after_e1 = body[e1_index + 1:]
+        assert after_e1, "nothing follows the E1 guard"
+        # Everything after E1 that is itself a top-level statement in the
+        # function body must be either: (a) a simple local variable
+        # initialisation that cannot raise (`tmp = None`, `tmp_created =
+        # False` -- plain Name targets with a Constant or None-literal
+        # value), or (b) the single outer `Try` node. No OTHER kind of
+        # top-level statement -- and no second `Try` -- may appear at this
+        # level, and nothing may follow the `Try`.
+        seen_try = False
+        for stmt in after_e1:
+            assert not seen_try, (
+                f"statement {_ast.dump(stmt)[:80]!r} follows the outer Try "
+                "node at the top level of write_dispatch_ticket -- every "
+                "statement after the E1 guard must be INSIDE that Try")
+            if isinstance(stmt, _ast.Try):
+                seen_try = True
+                continue
+            # A bare, non-raising local assignment (AnnAssign or Assign)
+            # whose value is a Constant (True/False/None) or a type
+            # annotation-only default is tolerated as preparation that
+            # precedes the guard; anything else fails closed.
+            is_simple_assign = (
+                isinstance(stmt, (_ast.Assign, _ast.AnnAssign))
+                and (stmt.value is None or isinstance(stmt.value, _ast.Constant)))
+            assert is_simple_assign, (
+                f"statement {_ast.dump(stmt)[:120]!r} after the E1 guard is "
+                "neither a trivial constant assignment nor the outer Try -- "
+                "it can potentially raise OUTSIDE the fail-soft guard")
+        assert seen_try, "the outer Try node was never found after the E1 guard"
+
+    def test_only_safe_emit_calls_telemetry_emit_directly(self):
+        """Grep-equivalent, done structurally: walk every function in the
+        module and assert that a bare call to the name ``emit`` (the
+        ``from .telemetry import emit`` binding) appears ONLY inside
+        ``safe_emit`` itself."""
+        import ast as _ast
+        mod = self._module_ast()
+        offending: list[str] = []
+        for node in _ast.walk(mod):
+            if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            if node.name == "safe_emit":
+                continue
+            for inner in _ast.walk(node):
+                if (isinstance(inner, _ast.Call)
+                        and isinstance(inner.func, _ast.Name)
+                        and inner.func.id == "emit"):
+                    offending.append(node.name)
+        assert offending == [], (
+            f"direct `emit(...)` call(s) found outside safe_emit, in: {offending}")
+
+    def test_cli_seam_sites_call_the_helper_not_emit_directly(self):
+        """Mirrors the grep check the acceptance criteria name for
+        ``cli.py``: ``_apply_dispatch_seam`` and the two
+        ``attended.budget_blocked`` call sites must route through
+        ``dispatch_seam.safe_emit`` / the local ``_dispatch_seam`` alias,
+        never call the raw ``emit(`` binding directly."""
+        from hydra_core import cli as _cli
+        import ast as _ast
+        src_path = Path(_cli.__file__)
+        mod = _ast.parse(src_path.read_text(encoding="utf-8"), filename=str(src_path))
+        fn = None
+        for node in mod.body:
+            if isinstance(node, _ast.FunctionDef) and node.name == "_apply_dispatch_seam":
+                fn = node
+                break
+        assert fn is not None, "_apply_dispatch_seam not found in cli.py AST"
+        offending = []
+        for inner in _ast.walk(fn):
+            if (isinstance(inner, _ast.Call)
+                    and isinstance(inner.func, _ast.Name)
+                    and inner.func.id == "emit"):
+                offending.append("_apply_dispatch_seam")
+        assert offending == [], (
+            f"_apply_dispatch_seam calls the raw `emit(` binding directly: {offending}")

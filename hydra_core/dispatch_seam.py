@@ -21,15 +21,33 @@ write failure is fail-soft -- the host_action is still returned, with
 ``dispatch_ticket`` set to ``None``. Runtime-agnostic: no provider SDK
 imports.
 
-FAIL-SOFT CONTRACT (R3-tail-style property, Hydra#85 cross-vendor retry 2).
-No exception raised by file I/O, an ``os`` call (``makedirs``/``open``/
-``link``/``remove``/``path.exists``), a telemetry ``emit``, JSON encode or
-decode, text encoding (``str.encode``), hashing, datetime arithmetic, or env
-parsing -- while on an audit-mode path -- may escape to the CLI caller
-(``hydra_core.cli``). "Audit-mode path" means: :func:`write_dispatch_ticket`
-and everything it calls; :func:`prepare_host_action` and everything it
-calls; ``cli._apply_dispatch_seam`` and the two ``attended.budget_blocked``
-emit sites in ``cli.py``.
+FAIL-SOFT CONTRACT (R3-tail-style property, Hydra#85 cross-vendor retry 2,
+tightened cross-vendor retry 3). No exception raised by file I/O, an ``os``
+call (``makedirs``/``open``/``link``/``remove``/``path.exists``), a
+telemetry ``emit``, JSON encode or decode, text encoding (``str.encode``),
+hashing, datetime arithmetic, or env parsing -- while on an audit-mode path
+-- may escape to the CLI caller (``hydra_core.cli``). "Audit-mode path"
+means: :func:`write_dispatch_ticket` and everything it calls (including
+:func:`ticket_path`'s identity hash and the FIRST :func:`_check_reuse` call
+-- both now INSIDE the function's single outer guard, not ahead of it; see
+cross-vendor retry 3 findings 1-2); :func:`prepare_host_action` and
+everything it calls; ``cli._apply_dispatch_seam`` and the two
+``attended.budget_blocked`` emit sites in ``cli.py`` (including its own
+cursor-existence check -- see result 2 below -- and the CLI's recovery
+re-serve ``Path.exists``/cursor-load step, guarded the same way).
+
+In :func:`write_dispatch_ticket` the ONLY code outside the single outer
+``try/except Exception`` is the validation of ``workflow_id`` (a pure
+regex match -- deliberate exception E1 below) and the unpacking of
+``call_key``/``agent_type``/``workflow_id``/``run_id`` out of the caller's
+arguments, none of which can raise. Everything else -- the identity hash,
+the ticket path, both reuse checks, the clock, the uuid, the write/publish/
+cleanup sequence and its own temp-file cleanup retries -- runs inside that
+one guard. A cleanup fault that persists after both attempts (``os.remove``
+on the temp file) never nulls a response that ``os.link`` already
+published, but it is reported through :func:`safe_emit` as
+``dispatch.ticket_tmp_cleanup_failed`` (exception type name and the temp
+file's bare name only -- no path) rather than swallowed silently.
 
 Three defined results:
 
@@ -41,7 +59,15 @@ Three defined results:
    it) -- exactly
    ``{"ok": False, "status": "dispatch_seam_persist_failed",
    "cursor_path": <path>, "retryable": True}``, even when the telemetry
-   emit for this case ALSO fails.
+   emit for this case ALSO fails. The SAME result applies when the action
+   changed but ``cli.py`` cannot even VERIFY the on-disk cursor (its
+   ``Path.exists`` check itself raises): an unverifiable cursor must never
+   be left disagreeing with a changed, ticketed action, so a changed
+   action is served (and ticketed) ONLY when it truly agrees with the
+   cursor -- either because the cursor was read and successfully updated,
+   or because the action is provably unchanged from what the cursor
+   already holds (a ``prepare_host_action`` fault serves the ORIGINAL
+   action, which by construction still agrees).
 3. A telemetry failure (anywhere on an audit-mode path) never changes the
    response -- it is silently absorbed by :func:`safe_emit`, the one
    guarded helper every emit on these paths goes through.
@@ -440,29 +466,42 @@ def write_dispatch_ticket(
     agent_type = str(host_action.get("agent_type") or "")
     workflow_id_s = str(workflow_id)
     run_id_s = str(run_id)
-    try:
-        path = ticket_path(project_root, workflow_id_s, run_id_s, call_key)
-    except ValueError:
-        # Invalid workflow_id: refuse silently -- emitting telemetry would
-        # itself join the same unsanitised workflow_id into a trace path.
+
+    # E1 -- the ONLY code in this function outside the single outer
+    # try/except below. A pure regex match: it cannot itself raise (unlike
+    # `ticket_path`, which also computes the identity hash -- see the
+    # "misclassified" note just below). Checking the workflow_id on its own
+    # here, BEFORE anything that touches a hash/file/clock, is what keeps
+    # E1 ("invalid workflow_id, no telemetry") distinct from every other
+    # exception that can happen while preparing or writing a ticket: those
+    # all go through the guard and get a reported `dispatch_ticket_write_failed`
+    # (cross-vendor retry 2 finding 1 -- `ticket_path` used to be the ONLY
+    # guard, catching just `ValueError`, so a `RuntimeError` out of
+    # `hashlib.sha256` inside `compute_ticket_id` escaped all the way to the
+    # CLI caller).
+    if not WORKFLOW_ID_RE.match(workflow_id_s):
         return None
 
-    reuse = _check_reuse(path, workflow_id_s, run_id_s, call_key)
-    if reuse == "ok":
-        return path
-    if reuse:
-        _emit_write_failed(project_root, workflow_id_s, call_key, agent_type,
-                            kind, reuse)
-        return None
-
-    # Everything from here down -- ticket-id/hash computation, the temp
-    # name, datetime arithmetic, and the write/publish/cleanup sequence --
-    # is inside ONE outer try: any exception reaching the handler below
-    # gives a fail-soft null ticket (items 3, 4, 5, 7-fallback, 8, 9 of the
-    # W1.2 fault inventory; Hydra#85 cross-vendor retry 2).
+    # Everything else -- building the path (which hashes the identity),
+    # the FIRST reuse check (including its `os.path.exists` call), the
+    # ticket-id/hash computation, the temp name, datetime arithmetic, and
+    # the write/publish/cleanup sequence -- is inside ONE outer try: any
+    # exception reaching the handler below gives a fail-soft null ticket
+    # (items 1/3/4/5/7-fallback/8/9/2 of the W1.2 fault inventory;
+    # Hydra#85 cross-vendor retry 2).
     tmp: Path | None = None
     tmp_created = False
     try:
+        path = ticket_path(project_root, workflow_id_s, run_id_s, call_key)
+
+        reuse = _check_reuse(path, workflow_id_s, run_id_s, call_key)
+        if reuse == "ok":
+            return path
+        if reuse:
+            _emit_write_failed(project_root, workflow_id_s, call_key, agent_type,
+                                kind, reuse)
+            return None
+
         tid = compute_ticket_id(workflow_id_s, run_id_s, call_key)
         created = now or datetime.now(timezone.utc)
         artifact = host_action.get("artifact_text")
@@ -544,9 +583,24 @@ def write_dispatch_ticket(
                     try:
                         os.remove(_long_path(tmp))
                         break
-                    except Exception:  # noqa: BLE001 -- see comment above
+                    except Exception as _cleanup_exc:  # noqa: BLE001 -- see comment above
                         if _cleanup_attempt == 1:
-                            pass  # persistent cleanup fault: give up silently
+                            # Persistent cleanup fault: give up on removing
+                            # the temp file, but this is NOT a silent
+                            # swallow -- a failure event can still be
+                            # reported even though the response itself
+                            # (whatever `published` ends up being) must
+                            # not be nulled by it. No path beyond the file
+                            # name: the temp file's own name carries no
+                            # secret, but the full path could join other
+                            # directory contents into a trace.
+                            safe_emit(
+                                project_root, workflow_id_s,
+                                "dispatch.ticket_tmp_cleanup_failed",
+                                {"call_key": call_key, "ticket_kind": kind,
+                                 "agent_type": agent_type,
+                                 "tmp_name": tmp.name,
+                                 "error": type(_cleanup_exc).__name__})
         if not published:
             reuse2 = _check_reuse(path, workflow_id_s, run_id_s, call_key)
             if reuse2 == "ok":
@@ -554,18 +608,21 @@ def write_dispatch_ticket(
             _emit_write_failed(project_root, workflow_id_s, call_key, agent_type,
                                 kind, reuse2 or "existing_unreadable")
             return None
+
+        # `safe_emit` absorbs its own failure (see its docstring); this
+        # success-path telemetry call must be no less fail-soft than
+        # `_emit_write_failed` -- the ticket itself already published
+        # successfully by this point, so a trace-write failure here (e.g.
+        # a disk-full `open('a')` in `telemetry._write`) must not turn a
+        # successful dispatch into an uncaught exception. Kept INSIDE the
+        # single outer try (cross-vendor retry 3, requirement D): this
+        # function has exactly one statement outside the guard (the E1
+        # workflow_id check above), and a static test pins that.
+        safe_emit(project_root, workflow_id_s, "dispatch.ticket_written",
+                  {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
+                   "ticket_kind": kind, "agent_type": agent_type})
+        return path
     except Exception as exc:  # noqa: BLE001 -- audit mode is fail-soft
         _emit_write_failed(project_root, workflow_id_s, call_key, agent_type,
                             kind, type(exc).__name__)
         return None
-
-    # `safe_emit` absorbs its own failure (see its docstring); this
-    # success-path telemetry call must be no less fail-soft than
-    # `_emit_write_failed` -- the ticket itself already published
-    # successfully by this point, so a trace-write failure here (e.g. a
-    # disk-full `open('a')` in `telemetry._write`) must not turn a
-    # successful dispatch into an uncaught exception.
-    safe_emit(project_root, workflow_id_s, "dispatch.ticket_written",
-              {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
-               "ticket_kind": kind, "agent_type": agent_type})
-    return path
