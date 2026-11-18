@@ -461,6 +461,134 @@ class TestM1TicketIdentity:
         assert not (tmp_path / ".hydra").exists()
         assert list(tmp_path.parent.glob("escape*")) == []
 
+    # ----------------------------------------------------------------- #
+    # Reflexion retry 1: three judge-flagged defects (Hydra#85)          #
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize("fault", ["write", "close"])
+    def test_temp_file_fault_leaves_no_partial_file(
+            self, tmp_path, monkeypatch, fault):
+        """A failure while writing (or closing/flushing) the temp file --
+        e.g. an ENOSPC -- must not leave the temp file (or any final file)
+        behind: cleanup is not conditional on the write having succeeded."""
+        wf, run_id, call_key = f"wf-fault-{fault}", "run-1", "generate-0"
+        path = dispatch_seam.ticket_path(tmp_path, wf, run_id, call_key)
+        real_open = open
+
+        class _FaultFile:
+            """Wraps a REAL file handle (``open(..., 'w')`` truncates/creates
+            the file on disk immediately, before any ``write()`` call) so
+            the fault happens after a real temp file already exists --
+            exactly the scenario where cleanup must not be conditional on
+            the write having succeeded."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._inner.close()
+                if fault == "close":
+                    raise OSError(28, "No space left on device")
+                return False
+
+            def write(self, data):
+                if fault == "write":
+                    raise OSError(28, "No space left on device")
+                return self._inner.write(data)
+
+        def _fake_open(file, mode="r", *a, **kw):
+            if str(file).endswith(".tmp") and "w" in mode:
+                return _FaultFile(real_open(file, mode, *a, **kw))
+            return real_open(file, mode, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", _fake_open)
+
+        result = dispatch_seam.write_dispatch_ticket(
+            tmp_path, wf, run_id,
+            {"call_key": call_key, "agent_type": "engineer", "prompt": "p"},
+            kind="engineer", squad_slug=None, budget_usd=None,
+            budget_remaining_usd=None)
+
+        assert result is None
+        assert not path.exists()
+        tickets_dir = path.parent
+        assert not tickets_dir.exists() or list(tickets_dir.iterdir()) == []
+        trace = (tmp_path / ".hydra" / wf / "trace.jsonl").read_text(
+            encoding="utf-8")
+        events = [json.loads(ln) for ln in trace.splitlines() if ln.strip()]
+        failed = [e for e in events if e["kind"] == "dispatch.ticket_write_failed"]
+        assert len(failed) == 1
+
+    def test_ticket_ttl_seconds_rejects_oversized_value(self, monkeypatch):
+        """``HYDRA_DISPATCH_TICKET_TTL_S=999999999999999999999`` parses as a
+        positive int but is not representable in `timedelta` arithmetic --
+        the parser itself must reject it (fall back to 3600) rather than
+        hand it on to crash later. A large-but-valid override is honoured."""
+        monkeypatch.setenv(dispatch_seam.TICKET_TTL_ENV,
+                            "999999999999999999999")
+        assert dispatch_seam.ticket_ttl_seconds() == 3600
+
+        monkeypatch.setenv(dispatch_seam.TICKET_TTL_ENV, "86400")
+        assert dispatch_seam.ticket_ttl_seconds() == 86400
+
+    def test_oversized_ttl_does_not_crash_dispatch_large_valid_honoured(
+            self, tmp_path, monkeypatch):
+        """End to end through ``write_dispatch_ticket``: the oversized value
+        must not raise (the old bug surfaced as an uncaught `OverflowError`
+        from `timedelta`), and still produces a ticket with the 3600 s
+        default; a large-but-valid TTL is honoured exactly."""
+        action = {"call_key": "k-ttl", "agent_type": "engineer", "prompt": "p"}
+
+        monkeypatch.setenv(dispatch_seam.TICKET_TTL_ENV,
+                            "999999999999999999999")
+        path = dispatch_seam.write_dispatch_ticket(
+            tmp_path, "wf-ttl-huge", "run-1", action, kind="engineer",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path is not None
+        t = json.loads(path.read_text(encoding="utf-8"))
+        assert (datetime.fromisoformat(t["expires_at"])
+                - datetime.fromisoformat(t["created_at"])).total_seconds() == 3600
+
+        monkeypatch.setenv(dispatch_seam.TICKET_TTL_ENV, "86400")
+        path2 = dispatch_seam.write_dispatch_ticket(
+            tmp_path, "wf-ttl-day", "run-1", action, kind="engineer",
+            squad_slug=None, budget_usd=None, budget_remaining_usd=None)
+        assert path2 is not None
+        t2 = json.loads(path2.read_text(encoding="utf-8"))
+        assert (datetime.fromisoformat(t2["expires_at"])
+                - datetime.fromisoformat(t2["created_at"])).total_seconds() == 86400
+
+    def test_extended_length_path_transform_is_pure(self):
+        """``_extended_length`` is a pure string function, parameterised
+        here so the Windows cases are covered on any OS (no platform
+        check, no filesystem access inside the function itself)."""
+        ext = dispatch_seam._extended_length
+        assert ext(r"C:\foo\bar") == r"\\?\C:\foo\bar"
+        assert ext(r"\\server\share\dir\file") == r"\\?\UNC\server\share\dir\file"
+        assert ext(r"\\?\C:\foo\bar") == r"\\?\C:\foo\bar"
+        assert ext(r"\\?\UNC\server\share\dir") == r"\\?\UNC\server\share\dir"
+        assert ext("relative\\path") == "relative\\path"
+        assert ext("relative/path") == "relative/path"
+
+    def test_long_path_unc_drive_relative_and_posix(self, monkeypatch):
+        """``_long_path`` with the platform check patched: a drive-absolute
+        path, a UNC path, an already-prefixed path and a relative path on
+        a patched-Windows run, then the POSIX no-op."""
+        monkeypatch.setattr(dispatch_seam.os, "name", "nt")
+        assert dispatch_seam._long_path(r"C:\foo\bar") == r"\\?\C:\foo\bar"
+        assert (dispatch_seam._long_path(r"\\server\share\dir")
+                == r"\\?\UNC\server\share\dir")
+        assert dispatch_seam._long_path(r"\\?\C:\foo") == r"\\?\C:\foo"
+        assert dispatch_seam._long_path("relative\\path") == "relative\\path"
+
+        monkeypatch.setattr(dispatch_seam.os, "name", "posix")
+        assert (dispatch_seam._long_path(r"\\server\share\dir")
+                == r"\\server\share\dir")
+        assert dispatch_seam._long_path(r"C:\foo\bar") == r"C:\foo\bar"
+
 
 # =========================================================================== #
 # M2 -- budget_gate unit behaviour                                            #

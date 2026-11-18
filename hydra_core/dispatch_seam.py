@@ -45,6 +45,14 @@ TICKET_SCHEMA: int = 1
 TICKET_TTL_ENV: str = "HYDRA_DISPATCH_TICKET_TTL_S"
 DISPATCH_TICKET_TTL_SECONDS: int = 3600
 
+# Upper bound for an env-supplied TTL override: 10 years. Anything beyond
+# this is rejected (falls back to the default) rather than handed to
+# `timedelta`/`datetime` arithmetic, which raises `OverflowError` for an
+# astronomically large `seconds=` value -- e.g.
+# `HYDRA_DISPATCH_TICKET_TTL_S=999999999999999999999` parses fine as a
+# positive `int` but is not a usable TTL.
+_TICKET_TTL_MAX_SECONDS: int = 10 * 365 * 24 * 3600
+
 # Cursor states whose pending_action is a judge action (await_smoke and
 # stalled_infra keep the judge's pending_action/call_key while they wait).
 JUDGE_PENDING_STATES: frozenset[str] = frozenset(
@@ -59,8 +67,16 @@ WORKFLOW_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,63}$
 
 
 def ticket_ttl_seconds() -> int:
-    """TTL in seconds: the env override when it parses as a positive int,
-    else :data:`DISPATCH_TICKET_TTL_SECONDS`."""
+    """TTL in seconds: the env override when it parses as a positive int AND
+    is representable in `timedelta`/`datetime` arithmetic (<=
+    :data:`_TICKET_TTL_MAX_SECONDS`), else :data:`DISPATCH_TICKET_TTL_SECONDS`.
+
+    A value like ``999999999999999999999`` parses fine as a positive
+    ``int`` but raises ``OverflowError`` once used as
+    ``timedelta(seconds=...)`` -- that arithmetic happens at the ticket's
+    ``created_at``/``expires_at`` computation, outside any fail-soft
+    handler, so dispatch would crash instead of degrading. Reject it here,
+    before it ever reaches that arithmetic."""
     raw = os.environ.get(TICKET_TTL_ENV)
     if raw is None:
         return DISPATCH_TICKET_TTL_SECONDS
@@ -68,7 +84,22 @@ def ticket_ttl_seconds() -> int:
         val = int(str(raw).strip())
     except (ValueError, AttributeError):
         return DISPATCH_TICKET_TTL_SECONDS
-    return val if val > 0 else DISPATCH_TICKET_TTL_SECONDS
+    if val <= 0 or val > _TICKET_TTL_MAX_SECONDS:
+        return DISPATCH_TICKET_TTL_SECONDS
+    return val
+
+
+def _expires_at(created: datetime, ttl_seconds: int) -> datetime:
+    """``created + timedelta(seconds=ttl_seconds)``, defended a second time:
+    even if ``ttl_seconds`` were ever something ``ticket_ttl_seconds``'s own
+    bound missed, ``timedelta``/``datetime`` arithmetic raising
+    ``OverflowError`` or ``ValueError`` here falls back to the default TTL
+    rather than escaping `write_dispatch_ticket` -- audit mode is fail-soft
+    end to end, not just at the env-parsing boundary."""
+    try:
+        return created + timedelta(seconds=ttl_seconds)
+    except (OverflowError, ValueError):
+        return created + timedelta(seconds=DISPATCH_TICKET_TTL_SECONDS)
 
 
 def budget_gate(state: "HydraState") -> dict[str, Any] | None:
@@ -234,20 +265,48 @@ def _check_reuse(path: Path, workflow_id: str, run_id: str, call_key: str) -> st
     return "identity_mismatch"
 
 
+_DRIVE_ABSOLUTE_RE: re.Pattern[str] = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _extended_length(s: str) -> str:
+    """Pure string transform (no filesystem access, no platform check --
+    the caller is responsible for both): the extended-length (``\\\\?\\``)
+    form of a Windows absolute path.
+
+    * Already-prefixed (``\\\\?\\...``) input is returned unchanged
+      (idempotent).
+    * A UNC path (``\\\\server\\share\\...``) becomes
+      ``\\\\?\\UNC\\server\\share\\...`` -- the distinct extended-length UNC
+      form -- never ``\\\\?\\\\\\server\\share\\...``, which is what naively
+      prepending ``\\\\?\\`` to a UNC path produces and which Windows does
+      not accept.
+    * A drive-absolute path (``C:\\...``) becomes ``\\\\?\\C:\\...``.
+    * Anything else (a relative path) is returned unchanged -- this helper
+      does not resolve relative input to absolute; the caller passes an
+      already-absolute path when the extended-length form is actually
+      needed."""
+    if s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s.lstrip("\\")
+    if _DRIVE_ABSOLUTE_RE.match(s):
+        return "\\\\?\\" + s
+    return s
+
+
 def _long_path(p: str | Path) -> str:
     """Extended-length form of an absolute path on Windows (bypasses the
     260-char ``MAX_PATH`` that ``os.link``/``open`` otherwise hit for a
     ticket path nested a few directories deep under a long project root --
     the 40+40+32-character ticket filename this module's identity scheme
-    produces is exactly the kind of name that trips it). A no-op on POSIX,
-    and a no-op for a path that is already prefixed or a UNC share (``\\\\
-    host\\share\\...``, which uses the distinct ``\\\\?\\UNC\\`` form this
-    helper does not need to produce for our own-filesystem ticket paths)."""
+    produces is exactly the kind of name that trips it). A no-op on POSIX
+    and a no-op for relative input; see :func:`_extended_length` for the
+    Windows string transform itself, which is kept as a separate pure
+    function so it can be unit-tested without a real NT filesystem."""
     s = str(p)
-    if os.name != "nt" or s.startswith("\\\\?\\"):
+    if os.name != "nt":
         return s
-    s = os.path.abspath(s)
-    return s if s.startswith("\\\\?\\") else "\\\\?\\" + s
+    return _extended_length(s)
 
 
 def _emit_write_failed(
@@ -333,38 +392,52 @@ def write_dispatch_ticket(
         "budget_usd": budget_usd,
         "budget_remaining_usd": budget_remaining_usd,
         "created_at": created.isoformat(),
-        "expires_at": (created + timedelta(seconds=ticket_ttl_seconds())).isoformat(),
+        "expires_at": _expires_at(created, ticket_ttl_seconds()).isoformat(),
     }
     if kind == "judge":
         ticket["artifact_sha256"] = (
             hashlib.sha256(artifact.encode("utf-8")).hexdigest()
             if isinstance(artifact, str) else None)
 
+    # Short temp name in the same dir: keeps the temp path no longer than the
+    # final path, which still matters on Windows even with the
+    # extended-length prefix below (some win32 calls underneath
+    # `os.link`/`open` are themselves happier with a shorter source).
+    tmp = path.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
+    tmp_created = False
     try:
-        os.makedirs(_long_path(path.parent), exist_ok=True)
-        # Short temp name in the same dir: keeps the temp path no longer than
-        # the final path, which still matters on Windows even with the
-        # extended-length prefix below (some win32 calls underneath
-        # `os.link`/`open` are themselves happier with a shorter source).
-        tmp = path.with_name(f".{uuid.uuid4().hex[:8]}.tmp")
-        with open(_long_path(tmp), "w", encoding="utf-8") as f:
-            f.write(dumps_strict(ticket, label="dispatch ticket", indent=2))
-        published = False
         try:
-            os.link(_long_path(tmp), _long_path(path))
-            published = True
-        except FileExistsError:
-            # Race: a concurrent writer published between our existence
-            # check above and now. Never fall back to check-then-os.replace
-            # over it -- resolve against whatever actually landed first.
+            os.makedirs(_long_path(path.parent), exist_ok=True)
+            # `tmp_created = True` goes right before `open`, not after: a
+            # failure during the write/flush/close that follows (e.g. an
+            # ENOSPC on `f.write`) must still reach the `finally` below and
+            # remove whatever partial bytes `open` left on disk -- cleanup
+            # must not depend on the write having succeeded.
+            tmp_created = True
+            with open(_long_path(tmp), "w", encoding="utf-8") as f:
+                f.write(dumps_strict(ticket, label="dispatch ticket", indent=2))
             published = False
-        finally:
             try:
-                os.remove(_long_path(tmp))
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+                os.link(_long_path(tmp), _long_path(path))
+                published = True
+            except FileExistsError:
+                # Race: a concurrent writer published between our existence
+                # check above and now. Never fall back to check-then-
+                # os.replace over it -- resolve against whatever actually
+                # landed first.
+                published = False
+        finally:
+            # Runs on EVERY exit from the block above -- successful publish,
+            # a caught FileExistsError race, or an uncaught exception from
+            # `os.makedirs`/`open`/`f.write`/`os.link` alike. No partial temp
+            # file is ever left behind, regardless of which step failed.
+            if tmp_created:
+                try:
+                    os.remove(_long_path(tmp))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
         if not published:
             reuse2 = _check_reuse(path, workflow_id_s, run_id_s, call_key)
             if reuse2 == "ok":
@@ -377,7 +450,16 @@ def write_dispatch_ticket(
                             kind, type(exc).__name__)
         return None
 
-    emit(Path(project_root), workflow_id_s, "dispatch.ticket_written",
-         {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
-          "ticket_kind": kind, "agent_type": agent_type})
+    # `emit` is fail-soft everywhere else this module calls it
+    # (`_emit_write_failed`); this success-path telemetry call must be no
+    # less so -- the ticket itself already published successfully by this
+    # point, so a trace-write failure here (e.g. a disk-full `open('a')` in
+    # `telemetry._write`) must not turn a successful dispatch into an
+    # uncaught exception.
+    try:
+        emit(Path(project_root), workflow_id_s, "dispatch.ticket_written",
+             {"call_key": call_key, "run_id": run_id_s, "ticket_id": tid,
+              "ticket_kind": kind, "agent_type": agent_type})
+    except Exception:  # noqa: BLE001 -- audit mode is fail-soft
+        pass
     return path
