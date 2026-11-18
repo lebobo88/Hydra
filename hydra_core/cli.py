@@ -4333,6 +4333,59 @@ class MissingEngineeringTargetError(RuntimeError):
     gate existed reaching `hydra attended step` directly."""
 
 
+def _apply_dispatch_seam(
+    project: Path, wf: str, res: dict, *, kind: str, pack: object,
+    squad_slug: str | None, budget_usd: float | None,
+    budget_remaining_usd: float | None,
+) -> dict | None:
+    """W1.2 step B dispatch seam for an attended step/submit/poll response.
+
+    For ``kind='squad'`` only, appends the pack's tool-scope directive to the
+    host_action's prompt (idempotent); ``engineer``/``judge`` actions are
+    returned byte-identical (host_bridge already redacted them at build
+    time -- this seam adds nothing to their text). When the prepared action
+    differs from what the cursor has on disk, persists it back via
+    ``dispatch_seam._persist_cursor`` so a later re-read returns exactly what
+    the host was given. Writes the dispatch ticket (hashes only, fail-soft)
+    and sets ``res['host_action']``/``res['dispatch_ticket']``.
+
+    Returns ``None`` on success, or a recoverable error dict
+    (``status='dispatch_seam_persist_failed'``) when the prepared action
+    changed and could not be saved: ``res`` is left untouched and NO ticket
+    is written, so cursor, response and ticket never disagree. The caller
+    must print the error dict instead of ``res`` and return non-zero.
+    """
+    from . import dispatch_seam
+    original = res.get("host_action")
+    if not isinstance(original, dict):
+        return None
+    prepared, changed = dispatch_seam.prepare_host_action(
+        original, kind=kind, pack=pack)  # type: ignore[arg-type]
+    cursor_file = res.get("cursor_path")
+    if changed and cursor_file and Path(cursor_file).exists():
+        from . import host_bridge
+        try:
+            cursor = host_bridge.load_cursor(cursor_file)
+            cursor["pending_action"] = prepared
+            dispatch_seam._persist_cursor(cursor_file, cursor)
+        except Exception as e:  # noqa: BLE001
+            emit(project, wf, "dispatch.cursor_save_failed",
+                 {"error": type(e).__name__})
+            return {
+                "ok": False,
+                "status": "dispatch_seam_persist_failed",
+                "cursor_path": str(cursor_file),
+                "retryable": True,
+            }
+    ticket = dispatch_seam.write_dispatch_ticket(
+        project, wf, res.get("run_id"), prepared, kind=kind,  # type: ignore[arg-type]
+        squad_slug=squad_slug, budget_usd=budget_usd,
+        budget_remaining_usd=budget_remaining_usd)
+    res["host_action"] = prepared
+    res["dispatch_ticket"] = str(ticket) if ticket is not None else None
+    return None
+
+
 def _cmd_attended_step(args) -> int:
     """Attended (host-bridged) execution: open the next pending task stage and
     PAUSE for a visible host subagent (engineer for mcp squads; pack lead agent
@@ -4585,6 +4638,22 @@ def _cmd_attended_step(args) -> int:
                     **res,
                 }, indent=2, default=str))
                 return 1
+            # W1.2 step B: a poll response that still carries a host_action
+            # (the `poll_smoke` action) crosses the same seam: ticketed
+            # idempotently under the judge's call_key -- the ticket's
+            # identity (workflow_id, run_id, call_key) is unchanged across
+            # re-polls, so the existing ticket is reused, never rewritten.
+            # No budget check: polls stay ahead of the gate.
+            if res.get("status") == "awaiting_host" and isinstance(
+                    res.get("host_action"), dict):
+                _seam_err = _apply_dispatch_seam(
+                    project, wf, res, kind="judge", pack=None,
+                    squad_slug=res.get("squad_slug") or "engineering",
+                    budget_usd=state.budget.budget_usd,
+                    budget_remaining_usd=state.budget.usd_remaining)
+                if _seam_err is not None:
+                    print(_cli_json_dumps(_seam_err, indent=2, default=str))
+                    return 1
             print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
@@ -4678,6 +4747,19 @@ def _cmd_attended_step(args) -> int:
                 }), file=sys.stderr)
                 return 1
 
+            # W1.2 step B: the budget gate applies only when a NEW stage would
+            # open -- here, before start_run / begin_stage are ever called, so
+            # an exhausted budget creates nothing: no pp run, no open_pp_runs
+            # entry, no cursor, no ticket.
+            from . import dispatch_seam as _dispatch_seam
+            _blocked = _dispatch_seam.budget_gate(state)
+            if _blocked is not None:
+                _blocked.update({"task_id": str(task.task_id),
+                                 "squad_slug": "engineering"})
+                emit(project, wf, "attended.budget_blocked", _blocked)
+                print(_cli_json_dumps(_blocked, indent=2, default=str))
+                return 0
+
             # RA-12b (attended path): thread Hydra provenance into pp's start_run
             # so every attended run row carries hydra_workflow_id for cost
             # attribution (MU16 gate) and eights provenance writes.  Mirrors
@@ -4744,6 +4826,14 @@ def _cmd_attended_step(args) -> int:
                 # envelope, not a hardcoded literal.
                 gate_type=_attended_task_gate_type(task, state))
 
+            # W1.2 step B: engineer actions are never altered (host_bridge
+            # already redacted them at build time) -- the seam only writes
+            # the dispatch ticket here.
+            _seam_err = _apply_dispatch_seam(
+                project, wf, res, kind="engineer", pack=packs.get("engineering"),
+                squad_slug="engineering", budget_usd=state.budget.budget_usd,
+                budget_remaining_usd=state.budget.usd_remaining)
+
             try:
                 # Only open_pp_runs (replace channel) is persisted — NOT `tasks`
                 # (append reducer would duplicate). Completion is recorded via
@@ -4751,6 +4841,10 @@ def _cmd_attended_step(args) -> int:
                 sup.update_state(config, {"open_pp_runs": state.open_pp_runs})
             except Exception as e:  # noqa: BLE001
                 emit(project, wf, "attended.persist_failed", {"error": str(e)})
+
+            if _seam_err is not None:
+                print(_cli_json_dumps(_seam_err, indent=2, default=str))
+                return 1
 
             emit(project, wf, "attended.step", {"run_id": str(run_id),
                                                 "task_id": str(task.task_id),
@@ -4840,31 +4934,73 @@ def _cmd_attended_step(args) -> int:
                 _plan_critique = getattr(ne_task, "plan_critique", None)
                 _plan_supersedes = getattr(ne_task, "supersedes_plan_envelope_id", None)
 
-            res = host_bridge.begin_squad_stage(
-                action_extras=action_extras,
-                workflow_id=wf,
-                task_id=task_id,
-                squad_slug=ne_pack.slug,
-                entrypoint=ne_pack.entrypoint,
-                lead_agent=lead_agent,
-                pack_cwd=pack_cwd,
-                request_text=request_text,
-                project_root=project,
-                goal=state.root_goal,
-                envelope_id=(str(ne_task.envelope_id)
-                             if getattr(ne_task, "envelope_id", None) else None),
-                upstream_refs=_upstream_refs,
-                budget_usd=state.budget.budget_usd,
-                budget_remaining_usd=state.budget.usd_remaining,
-                risk=("high" if getattr(state, "requires_human_approval", False)
-                      else "normal"),
-                priority=getattr(ne_task, "priority", None),
-                acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
-                attempt=_attempt,
-                plan_revision=_plan_revision,
-                plan_critique=_plan_critique,
-                supersedes_plan_envelope_id=_plan_supersedes,
+            from . import dispatch_seam as _dispatch_seam
+
+            # W1.2 step B recovery (M4/M6): an already-open, non-terminal
+            # cursor for THIS task_id, at the SAME attempt just computed
+            # above, is re-served through the seam instead of opening a
+            # second cursor via begin_squad_stage -- this is what makes a
+            # `dispatch_seam_persist_failed` retry idempotent (no second
+            # cursor, no second pp run) and is checked BEFORE the budget
+            # gate so an open cursor is re-served even when the budget is
+            # exhausted. A cursor whose attempt differs (a re-issued
+            # planning attempt, Hydra#69 defect C) falls through to
+            # begin_squad_stage exactly as on base.
+            _existing_squad_res = None
+            _ex_cfile = host_bridge.cursor_path(project, wf, task_id)
+            if Path(_ex_cfile).exists():
+                try:
+                    _ex_cursor = host_bridge.load_cursor(_ex_cfile)
+                except Exception:  # noqa: BLE001
+                    _ex_cursor = None
+                if (isinstance(_ex_cursor, dict)
+                        and _ex_cursor.get("state") not in host_bridge._TERMINAL
+                        and isinstance(_ex_cursor.get("pending_action"), dict)
+                        and _ex_cursor.get("attempt") == _attempt):
+                    _existing_squad_res = host_bridge.step_result(_ex_cursor, _ex_cfile)
+
+            if _existing_squad_res is None:
+                _blocked = _dispatch_seam.budget_gate(state)
+                if _blocked is not None:
+                    _blocked.update({"task_id": task_id, "squad_slug": ne_pack.slug})
+                    emit(project, wf, "attended.budget_blocked", _blocked)
+                    print(_cli_json_dumps(_blocked, indent=2, default=str))
+                    return 0
+
+            res = _existing_squad_res if _existing_squad_res is not None else (
+                host_bridge.begin_squad_stage(
+                    action_extras=action_extras,
+                    workflow_id=wf,
+                    task_id=task_id,
+                    squad_slug=ne_pack.slug,
+                    entrypoint=ne_pack.entrypoint,
+                    lead_agent=lead_agent,
+                    pack_cwd=pack_cwd,
+                    request_text=request_text,
+                    project_root=project,
+                    goal=state.root_goal,
+                    envelope_id=(str(ne_task.envelope_id)
+                                 if getattr(ne_task, "envelope_id", None) else None),
+                    upstream_refs=_upstream_refs,
+                    budget_usd=state.budget.budget_usd,
+                    budget_remaining_usd=state.budget.usd_remaining,
+                    risk=("high" if getattr(state, "requires_human_approval", False)
+                          else "normal"),
+                    priority=getattr(ne_task, "priority", None),
+                    acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
+                    attempt=_attempt,
+                    plan_revision=_plan_revision,
+                    plan_critique=_plan_critique,
+                    supersedes_plan_envelope_id=_plan_supersedes,
+                )
             )
+            _seam_err = _apply_dispatch_seam(
+                project, wf, res, kind="squad", pack=ne_pack,
+                squad_slug=ne_pack.slug, budget_usd=state.budget.budget_usd,
+                budget_remaining_usd=state.budget.usd_remaining)
+            if _seam_err is not None:
+                print(_cli_json_dumps(_seam_err, indent=2, default=str))
+                return 1
             emit(project, wf, "attended.step", {
                 "run_id": task_id,
                 "task_id": task_id,
@@ -6279,6 +6415,7 @@ def _cmd_attended_submit(args) -> int:
         # of silently continuing a terminal workflow.
         from .supervisor import build_supervisor as _pre_bs, _PurePythonRunner as _pre_ppr
         _pre_terminal = None
+        _pre_snap = None
         _pre_sup = _pre_bs(project_root=project, dispatcher=dispatcher)
         if not isinstance(_pre_sup, _pre_ppr):
             _pre_config = {"configurable": {"thread_id": wf}}
@@ -6309,6 +6446,35 @@ def _cmd_attended_submit(args) -> int:
             print(_cli_json_dumps({"ok": False, "error": "stale_call_key", **res},
                                   indent=2, default=str))
             return 1
+        # W1.2 step B dispatch seam: a response that hands the host a NEW
+        # action (next judge/engineer step, a Reflexion retry, or a
+        # re-returned pending action) is ticketed. No budget check here --
+        # the gate only applies when a brand-new stage would open, which is
+        # the step path's concern, not submit's.
+        if res.get("status") == "awaiting_host" and isinstance(
+                res.get("host_action"), dict):
+            from . import dispatch_seam as _dispatch_seam
+            _seam_state = res.get("state")
+            _seam_kind = ("judge" if _seam_state in
+                          _dispatch_seam.JUDGE_PENDING_STATES else
+                          "squad" if _seam_state == "await_squad_agent"
+                          else "engineer")
+            _seam_budget: float | None = None
+            _seam_remaining: float | None = None
+            try:
+                _b = ((getattr(_pre_snap, "values", None) or {}).get("budget") or {})
+                _seam_budget = float(_b["budget_usd"])
+                _seam_remaining = max(
+                    _seam_budget - float(_b.get("spent_usd") or 0.0), 0.0)
+            except Exception:  # noqa: BLE001
+                pass
+            _seam_err = _apply_dispatch_seam(
+                project, wf, res, kind=_seam_kind, pack=None,
+                squad_slug=res.get("squad_slug") or "engineering",
+                budget_usd=_seam_budget, budget_remaining_usd=_seam_remaining)
+            if _seam_err is not None:
+                print(_cli_json_dumps(_seam_err, indent=2, default=str))
+                return 1
         # Hydra#69 follow-up defect 3 (HIGH, part 2): every checkpoint write
         # below this point was fallible but only ever emitted telemetry on
         # failure -- the final response still reported `ok: True`, so a
