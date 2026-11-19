@@ -524,9 +524,13 @@ def _launch_resume(workflow_id: str, action: str, option: str | None,
     creationflags = 0
     start_new_session = False
     if os.name == "nt":
+        # Hydra#170: deliberately WITHOUT DETACHED_PROCESS — Windows ignores
+        # CREATE_NO_WINDOW when combined with DETACHED_PROCESS, so a console-
+        # subsystem grandchild this detached process later starts (git,
+        # python, ...) would otherwise allocate its own visible console
+        # window. See hydra_core.proc.detached_popen_kwargs's docstring.
         creationflags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
@@ -614,9 +618,13 @@ def _launch_ingest(workflow_id: str, envelopes: list[dict[str, Any]]) -> dict[st
     creationflags = 0
     start_new_session = False
     if os.name == "nt":
+        # Hydra#170: deliberately WITHOUT DETACHED_PROCESS — Windows ignores
+        # CREATE_NO_WINDOW when combined with DETACHED_PROCESS, so a console-
+        # subsystem grandchild this detached process later starts (git,
+        # python, ...) would otherwise allocate its own visible console
+        # window. See hydra_core.proc.detached_popen_kwargs's docstring.
         creationflags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
@@ -695,9 +703,13 @@ def _launch_run(goal: str, *, squad: str | None, budget: float | None,
     creationflags = 0
     start_new_session = False
     if os.name == "nt":
+        # Hydra#170: deliberately WITHOUT DETACHED_PROCESS — Windows ignores
+        # CREATE_NO_WINDOW when combined with DETACHED_PROCESS, so a console-
+        # subsystem grandchild this detached process later starts (git,
+        # python, ...) would otherwise allocate its own visible console
+        # window. See hydra_core.proc.detached_popen_kwargs's docstring.
         creationflags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | no_window_creationflags()
         )
     else:  # pragma: no cover — Windows-first deployment
