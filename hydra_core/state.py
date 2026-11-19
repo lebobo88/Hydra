@@ -6,11 +6,12 @@ for collections (tasks, messages, artifacts) and replace-by-default for scalars.
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def _append(left: list, right: list) -> list:
@@ -20,6 +21,36 @@ def _append(left: list, right: list) -> list:
 
 def _merge_dict(left: dict, right: dict) -> dict:
     return {**left, **right}
+
+
+_HEAD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_HEAD_SEP = "--"
+
+
+def _check_head_slug(head: str) -> str:
+    """Validate a head slug; ``--`` is reserved as the run-id separator."""
+    if not isinstance(head, str) or not _HEAD_SLUG_RE.fullmatch(head):
+        raise ValueError(f"invalid head slug: {head!r}")
+    if _HEAD_SEP in head:
+        raise ValueError(f"head slug must not contain {_HEAD_SEP!r}: {head!r}")
+    return head
+
+
+def head_leg_run_id(task_id: str, head: str) -> str:
+    """Run id for one head leg of a task: ``<task_id>--<head>``.
+
+    Unambiguous: neither ``task_id`` nor ``head`` may contain ``--``, so the
+    pair is recoverable by splitting on the first ``--``.
+    """
+    _check_head_slug(head)
+    if not task_id or _HEAD_SEP in task_id:
+        raise ValueError(f"invalid task_id for head leg run id: {task_id!r}")
+    return f"{task_id}{_HEAD_SEP}{head}"
+
+
+def head_result_key(task_id: str, head: str) -> str:
+    """Key into ``HydraState.attended_head_results``: ``<task_id>:<head>``."""
+    return f"{task_id}:{head}"
 
 
 class BudgetLedger(BaseModel):
@@ -203,6 +234,18 @@ class TaskState(BaseModel):
     # produced. None for tasks that predate planning or were not
     # materialised from a PlanStep.
     envelope_type: Optional[str] = None
+    # Hydra#89: optional per-task "heads" (parallel attended legs). Slugs only,
+    # no duplicates, no ``--`` (reserved run-id separator). Empty = no legs.
+    heads: list[str] = Field(default_factory=list)
+
+    @field_validator("heads")
+    @classmethod
+    def _validate_heads(cls, v: list[str]) -> list[str]:
+        for h in v:
+            _check_head_slug(h)
+        if len(set(v)) != len(v):
+            raise ValueError("heads must not contain duplicates")
+        return v
 
 
 class HydraState(BaseModel):
@@ -374,6 +417,11 @@ class HydraState(BaseModel):
     # grow it (the same reason attended_completed_task_ids is not appended).
     # Shape: {task_id, owner_squad, run_id, status, artifact_ref?, summary}.
     attended_results: list[dict[str, Any]] = Field(default_factory=list)
+
+    # Hydra#89: per-head leg results keyed by ``head_result_key(task_id, head)``.
+    # _merge_dict reducer so independent leg writes each carrying only their
+    # own key both survive.
+    attended_head_results: Annotated[dict[str, dict[str, Any]], _merge_dict] = Field(default_factory=dict)
 
     # E2-30 idempotency marker: the DECISION_RECORD id `hydra finalize` produced
     # for this workflow. Set once the attended synthesis leg has run; a second
