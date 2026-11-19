@@ -1,0 +1,84 @@
+{
+  "artifacts": [
+    {
+      "kind": "attended_squad_artifact",
+      "ref": "mem:brief",
+      "squad": "executive",
+      "status": "complete",
+      "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    },
+    {
+      "kind": "attended_pp_run",
+      "ref": "run_pp1",
+      "squad": "engineering",
+      "status": "complete",
+      "task_id": "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    }
+  ],
+  "envelopes": [
+    {
+      "_attended": true,
+      "_task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "artifacts": [
+        {
+          "cells": [],
+          "key": "mem:brief",
+          "summary": "attended_squad_artifact",
+          "tier": "episodic"
+        }
+      ],
+      "constraints": {
+        "budget_usd": null,
+        "deadline_ts": null,
+        "industries": [],
+        "priority": "P2",
+        "risk_tolerance": "medium",
+        "token_limit": null
+      },
+      "context_refs": [],
+      "decision": "Attended executive task aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee finished: complete",
+      "dissenting_opinions": [],
+      "do_not_touch": [],
+      "external_id": null,
+      "origin_squad": "executive",
+      "parent_id": null,
+      "rationale": "Driven in-context by the attended host loop (run run-x). outcome=complete; artifact=mem:brief; detail=brief done",
+      "sealed": true,
+      "target_squad": "hydra",
+      "type": "DECISION_RECORD",
+      "workflow_id": "11111111-2222-4333-8444-555555555555"
+    },
+    {
+      "_attended": true,
+      "_task_id": "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "artifacts": [
+        {
+          "cells": [],
+          "key": "run_pp1",
+          "summary": "attended_pp_run",
+          "tier": "episodic"
+        }
+      ],
+      "constraints": {
+        "budget_usd": null,
+        "deadline_ts": null,
+        "industries": [],
+        "priority": "P2",
+        "risk_tolerance": "medium",
+        "token_limit": null
+      },
+      "context_refs": [],
+      "decision": "Attended engineering task bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee finished: complete",
+      "dissenting_opinions": [],
+      "do_not_touch": [],
+      "external_id": null,
+      "origin_squad": "engineering",
+      "parent_id": null,
+      "rationale": "Driven in-context by the attended host loop (run run_pp1). outcome=complete; artifact=run_pp1; detail=built",
+      "sealed": true,
+      "target_squad": "hydra",
+      "type": "DECISION_RECORD",
+      "workflow_id": "11111111-2222-4333-8444-555555555555"
+    }
+  ]
+}
