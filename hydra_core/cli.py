@@ -5989,6 +5989,10 @@ def _reconcile_attended_terminal_checkpoint(
                     if _head_record is not None:
                         _head_record["head"] = str(res.get("head"))
                         _head_record["leg"] = "head"
+                        # Hydra#90: retained dissents (already bounded and
+                        # redacted by host_bridge); head-less never gains this.
+                        if isinstance(res.get("dissents"), list) and res["dissents"]:
+                            _head_record["dissents"] = list(res["dissents"])[:10]
                     # Same atomic patch as the charge + its marker (merge-dict
                     # reducer): no completed/done ids, no attended_results.
                     _patch = {
@@ -6041,6 +6045,11 @@ def _reconcile_attended_terminal_checkpoint(
                                         for s in _head_statuses.values())
                         if _result_record is not None:
                             _result_record["heads"] = _head_statuses
+                            # Hydra#90: lead-leg dissents (bounded upstream).
+                            if (isinstance(res.get("dissents"), list)
+                                    and res["dissents"]):
+                                _result_record["dissents"] = list(
+                                    res["dissents"])[:10]
                     if (res.get("status") == "complete"
                             and _heads_ok
                             and tid is not None
