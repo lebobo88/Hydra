@@ -2236,6 +2236,9 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
             res["status"] = "envelopes_rejected"
         if cursor.get("artifact_text"):
             res["artifact_text"] = cursor["artifact_text"]
+        # Hydra#90: retained head/lead dissents (absent unless the cursor has them).
+        if "dissents" in cursor:
+            res["dissents"] = cursor["dissents"]
         # E2-35: surface where (or whether) the squad artifact landed so the
         # CLI does not re-attempt a native persist over a ref that already
         # exists, and so an operator sees an unpersisted result as such.
@@ -4275,6 +4278,28 @@ def _plan_envelope_schema_doc() -> str:
     return "\n".join(lines)
 
 
+# Hydra#90: the dissent input contract published to head and lead legs. The
+# host reads the agent's '## Dissents' bullets and passes them as
+# ``result.dissents``; that list is the only channel the engine reads.
+_LEG_DISSENT_CONTRACT = (
+    "## Dissents\n"
+    "If you disagree with any part of this task's outcome, end your reply "
+    "with a '## Dissents' section, one '- ' bullet per dissent, written as "
+    "'<statement>' or '<statement> -- <rationale>'. Omit the section when "
+    "you have none. The host passes each bullet as one {statement, "
+    "rationale} object in the submit result's 'dissents' list. That list is "
+    "the only channel: dissents written elsewhere in the reply or inside an "
+    "emitted envelope are not recorded, and envelopes emitted from a head "
+    "leg are rejected (head_leg_cannot_delegate)."
+)
+
+_LEG_DISSENT_INSTRUCTIONS = (
+    " Pass the agent's '## Dissents' bullets as result.dissents, a list of "
+    "{statement, rationale?}; omit the field when there are none. Dissents "
+    "in the artifact text are not read."
+)
+
+
 def _build_squad_prompt(
     *,
     workflow_id: str,
@@ -4293,11 +4318,16 @@ def _build_squad_prompt(
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
     head: str | None = None,
+    leg: str | None = None,
 ) -> str:
     """E2-28: build the non-engineering squad host_action prompt.
 
     Hydra#89: ``head`` (default ``None``) adds one ``## Head`` section naming
     the head this leg runs; a head-less prompt is byte-for-byte unchanged.
+
+    Hydra#90: when ``head`` is set or ``leg == "lead"`` the prompt also ends
+    its ``## Head`` section with ``_LEG_DISSENT_CONTRACT``; with ``leg=None``
+    and ``head=None`` nothing is added.
 
     Mirrors the engineering path's ``## Hydra context`` block so a squad leg is
     reproducible from the trace alone: workflow/task identity, the root goal,
@@ -4351,6 +4381,10 @@ def _build_squad_prompt(
         lines.append("")
         lines.append("## Head")
         lines.append(f"head: {head}")
+
+    if head is not None or leg == "lead":
+        lines.append("")
+        lines.append(_LEG_DISSENT_CONTRACT)
 
     # D1 (Hydra#69 part 3): planning-only section, schema-generated.
     if squad_slug == "planning":
@@ -4461,6 +4495,7 @@ def begin_squad_stage(
         plan_critique=plan_critique,
         supersedes_plan_envelope_id=supersedes_plan_envelope_id,
         head=head,
+        leg=("head" if head is not None else leg),
     )
     prompt = _outbound_text(prompt, kind="squad")
     cursor: dict[str, Any] = {
@@ -4499,6 +4534,12 @@ def begin_squad_stage(
             k: (_outbound_text(v, kind="squad")
                 if isinstance(v, str) else v)
             for k, v in action_extras.items() if k != "agent_type"})
+    if head is not None or leg == "lead":
+        # Hydra#90: applied AFTER action_extras so an extras 'instructions'
+        # value is extended, never replaced or lost.
+        cursor["pending_action"]["instructions"] = (
+            str(cursor["pending_action"].get("instructions") or "")
+            + _LEG_DISSENT_INSTRUCTIONS)
     if head is not None:
         cursor["head"] = head
         cursor["leg"] = "head"
@@ -4611,6 +4652,54 @@ def _persist_attended_squad_artifact(
     return ref, ("+".join(via) or None), errors
 
 
+_MAX_LEG_DISSENTS = 10
+_MAX_DISSENT_STATEMENT = 500
+_MAX_DISSENT_RATIONALE = 200
+
+
+def _bounded_leg_dissents(raw: Sequence[Any], *, plaza: str) -> list[dict[str, Any]]:
+    """Hydra#90: turn a host-supplied ``dissents`` list into bounded, redacted
+    ``deliberation.Dissent`` dicts.
+
+    Accepted entries: a ``str``, or a ``dict`` whose ``statement`` is a ``str``
+    (``rationale`` is used only when it is a ``str``). Every other entry is
+    skipped as malformed. Order per string: strip, redact
+    (``_outbound_text(..., kind='squad')``), THEN truncate (statement 500
+    chars, rationale 200), so the bounds hold on the stored string and a
+    truncation can never cut a redaction marker in half or leave a partial
+    secret. An entry whose statement is blank after redaction is dropped. The
+    cap of 10 counts KEPT entries, not raw ones. Classification is the
+    deterministic ``deliberation.classify_dissent_cell`` (no I/O).
+    """
+    from . import deliberation as _deliberation  # lazy: keep import graph unchanged
+
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if len(out) >= _MAX_LEG_DISSENTS:
+            break
+        rationale_raw: Any = ""
+        if isinstance(entry, str):
+            statement_raw = entry
+        elif isinstance(entry, dict) and isinstance(entry.get("statement"), str):
+            statement_raw = entry["statement"]
+            if isinstance(entry.get("rationale"), str):
+                rationale_raw = entry["rationale"]
+        else:
+            continue
+        statement = _outbound_text(statement_raw.strip(), kind="squad")
+        statement = statement.strip()[:_MAX_DISSENT_STATEMENT].strip()
+        if not statement:
+            continue
+        rationale = _outbound_text(str(rationale_raw).strip(), kind="squad")
+        rationale = rationale[:_MAX_DISSENT_RATIONALE]
+        out.append(_deliberation.Dissent(
+            plaza=plaza, mythic=plaza, statement=statement,
+            cell=_deliberation.classify_dissent_cell(statement),
+            rationale=rationale,
+        ).as_dict())
+    return out
+
+
 def _apply_squad_result(
     dispatcher: Dispatcher,
     cursor: dict[str, Any],
@@ -4644,6 +4733,16 @@ def _apply_squad_result(
     # workflow lock; never silently discard a DEV_TASK or CREATIVE_BRIEF.
     emitted = result.get("emitted_envelopes", result.get("envelopes", []))
     cursor["emitted_envelopes"] = emitted if isinstance(emitted, list) else []
+
+    # Hydra#90: head/lead legs only; the explicit list is the sole source (never
+    # the result text or artifact). A head-less cursor ignores the field.
+    _leg = cursor.get("leg")
+    if _leg in ("head", "lead") and isinstance(result.get("dissents"), list):
+        _kept = _bounded_leg_dissents(
+            result["dissents"],
+            plaza=str(cursor.get("head") or "lead") if _leg == "head" else "lead")
+        if _kept:
+            cursor["dissents"] = _kept
 
     # E2-35 / W1.2 step A: a squad with no native pack gets its artifact
     # persisted generically (and, when it has one, through its claude-skill
