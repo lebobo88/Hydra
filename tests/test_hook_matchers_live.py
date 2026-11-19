@@ -25,6 +25,7 @@ HOOKS_DIR = REPO / "plugins" / "hydra" / "hooks"
 HOOKS_JSON = HOOKS_DIR / "hooks.json"
 CHECK = HOOKS_DIR / "iolaus_check.py"
 LOG = HOOKS_DIR / "iolaus_log.py"
+HYDRA_HOOK = HOOKS_DIR / "hydra_hook.py"
 
 _SAN = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -65,7 +66,9 @@ def hook_fires(matcher: str, tool_name: str) -> bool:
 
 PRE_DOCTOR = 'pwsh -NoProfile -File "${CLAUDE_PLUGIN_ROOT}/hooks/hydra-doctor.ps1" doctor --quick'
 PRE_CHECK = 'python "${CLAUDE_PLUGIN_ROOT}/hooks/iolaus_check.py"'
+PRE_HYDRA = 'python "${CLAUDE_PLUGIN_ROOT}/hooks/hydra_hook.py" pre'
 POST_LOG = 'python "${CLAUDE_PLUGIN_ROOT}/hooks/iolaus_log.py"'
+POST_HYDRA = 'python "${CLAUDE_PLUGIN_ROOT}/hooks/hydra_hook.py" post'
 POST_ECHO = "echo postcheck"
 
 M_MEM = "^mcp__(hydra_gateway__)?hydra_memory__.+$"
@@ -175,6 +178,23 @@ def test_iolaus_matchers_fire_on_agent():
             )
 
 
+def test_hydra_hook_wired_for_pre_and_post_on_agent():
+    for ev in ("PreToolUse", "PostToolUse"):
+        groups = [
+            g for g in _groups(ev)
+            if any("hydra_hook.py" in h["command"] for h in g["hooks"])
+        ]
+        assert groups, f"no hydra_hook.py group in {ev}"
+        for g in groups:
+            assert hook_fires(g["matcher"], "Agent"), (
+                f"{ev} hydra_hook matcher {g['matcher']!r} does not fire on Agent"
+            )
+            assert not hook_fires(g["matcher"], "TaskCreate"), (
+                f"{ev} hydra_hook matcher {g['matcher']!r} fires on TaskCreate"
+            )
+    assert HYDRA_HOOK.is_file(), HYDRA_HOOK
+
+
 # ---------------------------------------------------------------- (d)
 
 
@@ -211,7 +231,7 @@ def test_gateway_routing_table_control_verbs(tool):
         (_gw("executive_suite", "es.output.write"), [PRE_DOCTOR], [POST_ECHO]),
         (_gw("rlm_creative", "rlm.output.write"), [PRE_DOCTOR], [POST_ECHO]),
         (_gw("senate", "senate.output.write"), [PRE_DOCTOR], [POST_ECHO]),
-        ("Agent", [PRE_CHECK], [POST_LOG]),
+        ("Agent", [PRE_CHECK, PRE_HYDRA], [POST_LOG, POST_HYDRA]),
     ],
 )
 def test_gateway_routing_table(tool, pre, post):
@@ -255,7 +275,7 @@ def test_unchanged_matchers_byte_identical():
         assert matcher in pre, matcher
         assert pre[matcher] == [{"type": "command", "command": command, "timeout": 10}], matcher
     total = sum(len(g["hooks"]) for groups in hooks.values() for g in groups)
-    assert total == 16
+    assert total == 18
     assert sum(len(groups) for groups in hooks.values()) == 14
     assert not any("plugin_" in g.get("matcher", "") for gs in hooks.values() for g in gs)
 
