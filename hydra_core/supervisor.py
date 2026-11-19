@@ -4651,6 +4651,9 @@ def build_supervisor(
                     "step_id": s.get("step_id"),
                     "description": s.get("description"),
                     "depends_on": s.get("depends_on") or [],
+                    # Hydra#91: carried only when non-empty (head-less plans
+                    # keep their exact pre-existing shape).
+                    **({"heads": list(s["heads"])} if s.get("heads") else {}),
                 }
                 for s in plan_steps if isinstance(s, dict)
             ],
