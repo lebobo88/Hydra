@@ -1,0 +1,261 @@
+# RUN THIS AT COMMIT 2c29c0d562a391a5df2f8672613cb731123363c7 (Hydra#91 step 3 start commit S),
+# BEFORE any other edit:
+#   python tests/fixtures/w2_3_headless_e2e_S2c29c0d.capture.txt
+# It writes tests/fixtures/w2_3_headless_e2e_S2c29c0d.json next to itself.
+#
+# It also defines `scenario(...)`, which tests/test_w2_3_plan_heads_e2e.py loads with
+# runpy and drives with and without heads. The scenario uses the REAL function at every
+# hop (no hand-built state between hops):
+#   1. hydra_core.ingest.dispatch_ingested_envelopes   (PLAN ingest -> plan_patch)
+#   2. node_plan_judge from build_supervisor(force_pure_python=True)  (plan_gate HITL)
+#   3. hydra_core.cli._cmd_resume_locked, gate_only approve (calls materialise_plan_steps)
+#   4. hydra_core.cli._cmd_attended_step               (the attended host_action)
+# State moves between hops only through a real SqliteSaver built with the production
+# checkpoint serde (make_checkpoint_serde); step 4 reads it through a NEW connection.
+# Stubbed: head resolution (resolve_head), SquadPack objects, the dispatcher, discovery
+# in the step, the artifact write and the shim write. No judge/LLM call is made.
+# The head-less result is recorded normalised: tmp root -> <ROOT>, task id -> <TASK_ID>,
+# wall-clock keys dropped (the same _volatile pattern tests/test_w2_1_cli_head_legs.py uses).
+import argparse
+import contextlib
+import io
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+from uuid import UUID
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+
+from hydra_core import cli, head_registry  # noqa: E402
+from hydra_core.ingest import dispatch_ingested_envelopes  # noqa: E402
+from hydra_core.squad_loader import SquadPack  # noqa: E402
+from hydra_core.state import HydraState, make_checkpoint_serde  # noqa: E402
+from tests.test_p5c_plan_operator_surfaces import _OPERATOR_ENV, _resume_args  # noqa: E402
+from tests.test_w2_1_cli_head_legs import (  # noqa: E402
+    _Disp, _Pack, _Written, _norm as _norm_root, _tid as PLAN_ENVELOPE_ID, _wf,
+)
+
+OUT = HERE / "w2_3_headless_e2e_S2c29c0d.json"
+
+
+class _IngestDisp:
+    """The only thing ingest reads from its dispatcher here is project_root."""
+
+    def __init__(self, root):
+        self.project_root = root
+
+
+def make_resolver(known):
+    """Stub resolve_head: ``known`` heads resolve to plug:<head>, others do not."""
+    def resolve(squad, head, **_kw):
+        if head in known:
+            return head_registry.HeadResolution(
+                squad=squad, head=head, plugin="plug", agent_name=head,
+                qualified_name=f"plug:{head}", agent_path=None, rule="slug")
+        return head_registry.HeadResolution(
+            squad=squad, head=head, plugin="plug", agent_name=head,
+            qualified_name=f"plug:{head}", agent_path=None, rule="unresolved",
+            error=f"head {head!r} not declared by squad {squad!r}")
+    return resolve
+
+
+def plan_dict(heads):
+    step = {"step_id": "step-a", "target_squad": "executive",
+            "envelope_type": "DEV_TASK", "description": "brief the board",
+            "estimated_budget_usd": 1.0, "rationale": "root"}
+    if heads:
+        step["heads"] = list(heads)
+    return {
+        "id": PLAN_ENVELOPE_ID, "type": "PLAN", "origin_squad": "planning",
+        "target_squad": "hydra", "workflow_id": _wf, "rigor": "standard",
+        "goal_restatement": "brief the board", "summary": "brief the board",
+        "plan_revision": 1, "steps": [step],
+    }
+
+
+def _open_sup(db):
+    """A real compiled graph over HydraState on a real SqliteSaver (production serde)."""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, StateGraph
+    g = StateGraph(HydraState)
+    g.add_node("n", lambda s: {})
+    g.add_node("postcheck", lambda s: {})
+    g.set_entry_point("n")
+    g.add_edge("n", "postcheck")
+    g.add_edge("postcheck", END)
+    conn = sqlite3.connect(str(db), check_same_thread=False)
+    return g.compile(checkpointer=SqliteSaver(conn, serde=make_checkpoint_serde())), conn
+
+
+def _run(fn, *args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fn(*args)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _json_or_none(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def scenario(work, heads, known):
+    """Drive ingest -> plan gate -> gate-only approve -> reload -> attended step.
+
+    ``work`` is an empty directory. Returns a dict of the real outputs of every hop.
+    """
+    from unittest.mock import MagicMock
+    from hydra_core.squad_node import Dispatcher
+    from hydra_core.supervisor import build_supervisor
+
+    work = Path(work)
+    root = work / "proj"
+    root.mkdir()
+    db = work / "cp.db"
+    cfg = {"configurable": {"thread_id": _wf}}
+
+    stub_disp = MagicMock(spec=Dispatcher)
+    stub_disp._tool_tracker = None
+    stub_disp.project_root = root
+    node_plan_judge = dict(build_supervisor(
+        project_root=HERE.parents[1], dispatcher=stub_disp, force_pure_python=True).steps)["plan_judge"]
+
+    pack = _Pack("claude-native")
+    packs = {"executive": SquadPack(slug="executive", name="executive",
+                                    description="executive", entrypoint="claude-native")}
+    res = {}
+    env = {**_OPERATOR_ENV, "HYDRA_PLAN_PHASE": "1",
+           "HYDRA_PLAN_ARTIFACT_DEFAULT_ROOT": str(root),
+           "HYDRA_PLAN_ARTIFACT_SANDBOX_ROOT": str(work)}
+    sup, conn = _open_sup(db)
+    sup2 = conn2 = None
+    try:
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(head_registry, "resolve_head", make_resolver(known)):
+            # hop 1: real ingest
+            state = HydraState(root_goal="brief the board", workflow_id=UUID(_wf))
+            state.budget.budget_usd = 50.0
+            sup.update_state(cfg, {"root_goal": state.root_goal,
+                                   "workflow_id": state.workflow_id,
+                                   "budget": state.budget}, as_node="n")
+            out = dispatch_ingested_envelopes(
+                state, [plan_dict(heads)], packs=packs, dispatcher=_IngestDisp(root))
+            res["ingest"] = [{"status": i.status, "detail": i.detail,
+                              "errors": i.errors} for i in out.items]
+            res["plan_patch_keys"] = sorted(out.plan_patch)
+            if out.plan_patch:
+                sup.update_state(cfg, dict(out.plan_patch), as_node="n")
+
+            # hop 2: real plan judge -> plan_gate HITL (only when a plan was accepted)
+            cur = HydraState.model_validate(sup.get_state(cfg).values)
+            res["plan_ref_present"] = bool(cur.plan_ref)
+            if cur.plan_ref:
+                jpatch = node_plan_judge(cur)
+                res["gate_pending"] = (jpatch.get("pending_hitl") or {}).get("gate_node")
+                sup.update_state(cfg, jpatch, as_node="n")
+            else:
+                res["gate_pending"] = None
+
+            # hop 3: real gate-only approve (calls materialise_plan_steps)
+            args = _resume_args(root, _wf, "approve")
+            args.gate_only = True
+            with mock.patch("hydra_core.supervisor.build_supervisor", lambda **_k: sup), \
+                    mock.patch("hydra_core.cli._prune_spooled_hitl_requests", lambda *_a: 0), \
+                    mock.patch("hydra_core.cli._resolve_eights_hitl_for_workflow",
+                               lambda *_a, **_k: {"resolved": 0}):
+                rc, out_s, err_s = _run(cli._cmd_resume_locked, args, root, _wf,
+                                        "approve", None)
+            res["resume"] = {"rc": rc, "out": _json_or_none(out_s), "err": err_s[:400]}
+
+            # reload through a NEW connection + saver (real persistence)
+            conn.close()
+            sup2, conn2 = _open_sup(db)
+            snap = sup2.get_state(cfg)
+            loaded = HydraState.model_validate(snap.values)
+            res["tasks"] = [{"task_id": str(t.task_id), "owner_squad": t.owner_squad,
+                             "description": t.description,
+                             "plan_step_id": t.plan_step_id,
+                             "plan_revision": t.plan_revision,
+                             "status": t.status, "heads": list(t.heads)}
+                            for t in loaded.tasks]
+            res["plan_status"] = loaded.plan_status
+            res["next_after_approve"] = list(snap.next or ())
+
+            # hop 4: real attended step on the reloaded checkpoint
+            sargs = argparse.Namespace(project=str(root), workflow_id=_wf, verbose=False)
+            with mock.patch.object(cli, "_attended_live_dispatcher",
+                                   lambda *a, **k: _Disp()), \
+                    mock.patch("hydra_core.supervisor.build_supervisor", lambda **_k: sup2), \
+                    mock.patch("hydra_core.squad_loader.discover_squads",
+                               lambda *a, **k: {pack.slug: pack}), \
+                    mock.patch("hydra_core.squad_node._maybe_write_claude_shim",
+                               lambda *a, **k: None), \
+                    mock.patch("hydra_core.artifact_store.write_native_artifact",
+                               lambda *a, **k: _Written()):
+                rc, out_s, err_s = _run(cli._cmd_attended_step, sargs)
+            res["step"] = {"rc": rc, "out": _json_or_none(out_s), "raw": out_s[:600],
+                           "err": err_s[:400]}
+    finally:
+        for c in (conn, conn2):
+            if c is not None:
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+    res["root"] = root
+    return res
+
+
+def normalise(res):
+    """Head-less comparison form: root -> <ROOT>, task ids -> <TASK_ID>, no wall-clock keys."""
+    root = res["root"]
+    task_ids = [t["task_id"] for t in res["tasks"]]
+    view = {
+        "ingest": [{"status": i["status"]} for i in res["ingest"]],
+        "plan_patch_keys": res["plan_patch_keys"],
+        "gate_pending": res["gate_pending"],
+        "resume_rc": res["resume"]["rc"],
+        "resume_plan_status": (res["resume"]["out"] or {}).get("plan_status"),
+        "resume_materialised": len((res["resume"]["out"] or {}).get(
+            "materialised_task_ids") or []),
+        "tasks": [{k: v for k, v in t.items() if k != "task_id"} for t in res["tasks"]],
+        "plan_status": res["plan_status"],
+        "next_after_approve": res["next_after_approve"],
+        "step_rc": res["step"]["rc"],
+        "step": res["step"]["out"],
+    }
+    text = json.dumps(_norm_root(json.loads(json.dumps(view, default=str)), root))
+    for tid in task_ids:
+        text = text.replace(tid, "<TASK_ID>")
+    # the ticket file name carries a per-run digest of the task id
+    text = re.sub(r"(tickets/<TASK_ID>)\.[^\"/]*\.json", r"\1.<TICKET>.json", text)
+    return json.loads(text)
+
+
+def capture(work):
+    return normalise(scenario(work, [], ()))
+
+
+if __name__ == "__main__":
+    tmp = Path(tempfile.mkdtemp(prefix="w2_3_e2e_capture_"))
+    os.environ.update({
+        "HYDRA_HOME": str(tmp / "home"),
+        "HYDRA_EPISODIC_DB": str(tmp / "home" / "episodic.db"),
+        "HYDRA_CHECKPOINT_DB": str(tmp / "home" / "checkpoints.db"),
+        "HYDRA_EIGHTS_SPOOL": str(tmp / "home" / "eights-pending"),
+        "HYDRA_EIGHTS_DEAD_LETTER": str(tmp / "home" / "eights-pending-dead"),
+        "HYDRA_TEST_NO_DAEMONS": "1",
+    })
+    work = tmp / "work"
+    work.mkdir()
+    OUT.write_text(json.dumps(capture(work), indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    print("wrote", OUT)
