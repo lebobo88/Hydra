@@ -1,0 +1,84 @@
+# RUN THIS AT COMMIT 66e5c292eece522b66ff731d87a764cd68de2178 (Hydra#91 step 2 start commit S),
+# BEFORE any source edit:
+#   python tests/fixtures/w2_3_headless_ingest_S66e5c29.capture.txt
+# It writes tests/fixtures/w2_3_headless_ingest_S66e5c29.json next to itself: a fixed
+# head-less PLAN ingested through dispatch_ingested_envelopes (HYDRA_PLAN_PHASE on, stub
+# dispatcher whose project_root is a temp dir). Recorded: the IngestItemResult list,
+# the HydraState plan_patch (temp root normalised to <ROOT>), plan_ref, and the
+# rendered plan HTML text as written to docs/plans/.
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import UUID
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+
+from hydra_core.ingest import dispatch_ingested_envelopes  # noqa: E402
+from hydra_core.state import HydraState  # noqa: E402
+
+OUT = HERE / "w2_3_headless_ingest_S66e5c29.json"
+_WF = UUID("11111111-2222-4333-8444-555555555555")
+_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+_AT = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class _Disp:
+    def __init__(self, root):
+        self.project_root = root
+
+
+def plan_dict() -> dict:
+    return {
+        "id": str(_ID), "type": "PLAN", "origin_squad": "planning",
+        "target_squad": "hydra", "workflow_id": str(_WF),
+        "created_at": _AT.isoformat(), "rigor": "standard",
+        "goal_restatement": "Ship the sample", "summary": "Sample plan",
+        "plan_revision": 1,
+        "steps": [
+            {"step_id": "step-a", "target_squad": "engineering",
+             "envelope_type": "DEV_TASK", "description": "first step",
+             "acceptance_criteria": ["a works"], "priority": "P1",
+             "estimated_budget_usd": 1.5, "rationale": "root"},
+            {"step_id": "step-b", "target_squad": "engineering",
+             "envelope_type": "DEV_TASK", "description": "second step",
+             "depends_on": ["step-a"], "model_tier": "sonnet"},
+        ],
+        "non_goals": ["nothing else"], "open_questions": ["why"], "risks": ["r1"],
+        "authored_by": ["planner"], "dissents": ["d1"],
+    }
+
+
+def _norm(obj, root: str):
+    text = json.dumps(obj)
+    for variant in {root, root.replace("\\", "\\\\"), root.replace("\\", "/")}:
+        text = text.replace(variant, "<ROOT>")
+    return json.loads(text)
+
+
+def capture(root: Path) -> dict:
+    os.environ["HYDRA_PLAN_PHASE"] = "1"
+    state = HydraState(root_goal="sample goal", workflow_id=_WF)
+    outcome = dispatch_ingested_envelopes(
+        state, [plan_dict()], packs={}, dispatcher=_Disp(root))
+    htmls = sorted((root / "docs" / "plans").glob("*.html"))
+    html_text = htmls[0].read_text(encoding="utf-8") if htmls else None
+    patch = dict(outcome.plan_patch)
+    rootstr = str(root)
+    return {
+        "items": _norm([vars(i) for i in outcome.items], rootstr),
+        "plan_patch": _norm(patch, rootstr),
+        "plan_ref": patch.get("plan_ref"),
+        "html": html_text,
+        "html_files": [p.name for p in htmls],
+    }
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as td:
+        data = capture(Path(td))
+    OUT.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print("wrote", OUT)

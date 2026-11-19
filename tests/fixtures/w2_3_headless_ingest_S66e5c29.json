@@ -1,0 +1,179 @@
+{
+  "html": "<title>Plan: Ship the sample</title>\n<style>\n:root {\n  --plan-bg: #fbfbfa;\n  --plan-fg: #1b1b18;\n  --plan-muted: #6b6b63;\n  --plan-border: #ddd9d0;\n  --plan-surface: #ffffff;\n  --plan-accent: #7c5cff;\n  color-scheme: light;\n}\n@media (prefers-color-scheme: dark) {\n  :root:not([data-theme=\"light\"]) {\n    --plan-bg: #17171a;\n    --plan-fg: #eceae5;\n    --plan-muted: #9a988f;\n    --plan-border: #35342f;\n    --plan-surface: #202024;\n    --plan-accent: #a78bfa;\n    color-scheme: dark;\n  }\n}\n:root[data-theme=\"dark\"] {\n  --plan-bg: #17171a;\n  --plan-fg: #eceae5;\n  --plan-muted: #9a988f;\n  --plan-border: #35342f;\n  --plan-surface: #202024;\n  --plan-accent: #a78bfa;\n  color-scheme: dark;\n}\nbody {\n  background: var(--plan-bg);\n  color: var(--plan-fg);\n  font-family: system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  padding-inline: 20px;\n  padding-block: 24px;\n  max-width: 920px;\n  margin-inline: auto;\n}\nh1, h2, h3 { color: var(--plan-fg); }\nh2 { border-bottom: 1px solid var(--plan-border); padding-bottom: 6px; margin-top: 2em; }\n.plan-meta { color: var(--plan-muted); font-size: 0.9em; }\n.plan-table-wrap { overflow-x: auto; }\ntable.plan-steps { border-collapse: collapse; width: 100%; font-size: 0.92em; }\ntable.plan-steps th, table.plan-steps td {\n  border: 1px solid var(--plan-border);\n  padding: 6px 10px;\n  text-align: left;\n  vertical-align: top;\n}\ntable.plan-steps th { background: var(--plan-surface); }\n.plan-step-detail {\n  border: 1px solid var(--plan-border);\n  border-radius: 6px;\n  padding: 12px 16px;\n  margin-block-end: 12px;\n  background: var(--plan-surface);\n}\n.plan-list { margin: 0; padding-inline-start: 1.4em; }\n.plan-figure img { max-width: 100%; border: 1px solid var(--plan-border); border-radius: 4px; }\n</style>\n<h1>Plan: Ship the sample</h1>\n<h2>Goal</h2>\n<p>Ship the sample</p>\n<h2>Rigor and Why</h2>\n<p><strong>standard</strong> &mdash; Sample plan</p>\n<h2>Non-Goals</h2>\n<ul class=\"plan-list\">\n  <li>nothing else</li>\n</ul>\n<h2>Open Questions</h2>\n<ul class=\"plan-list\">\n  <li>why</li>\n</ul>\n<h2>Assumptions / Risks</h2>\n<ul class=\"plan-list\">\n  <li>r1</li>\n</ul>\n<h2>Steps</h2>\n<div class=\"plan-table-wrap\">\n<table class=\"plan-steps\">\n<thead>\n<tr><th>step_id</th><th>title</th><th>squad</th><th>envelope</th><th>depends_on</th><th>priority</th><th>budget</th></tr>\n</thead>\n<tbody>\n<tr><td>step-a</td><td>first step</td><td>engineering</td><td>DEV_TASK</td><td>\u2014</td><td>P1</td><td>$1.50</td></tr>\n<tr><td>step-b</td><td>second step</td><td>engineering</td><td>DEV_TASK</td><td>step-a</td><td>P2</td><td>\u2014</td></tr>\n</tbody>\n</table>\n</div>\n<h2>Step Details</h2>\n<div class=\"plan-step-detail\" id=\"step-step-a\">\n<h3>step-a</h3>\n<p>first step</p>\n<p class=\"plan-meta\">squad: engineering &middot; envelope: DEV_TASK &middot; priority: P1</p>\n<p><strong>Acceptance criteria</strong></p>\n<ul class=\"plan-list\">\n  <li>a works</li>\n</ul>\n<p><strong>Rationale:</strong> root</p>\n</div>\n<div class=\"plan-step-detail\" id=\"step-step-b\">\n<h3>step-b</h3>\n<p>second step</p>\n<p class=\"plan-meta\">squad: engineering &middot; envelope: DEV_TASK &middot; priority: P2</p>\n<p><strong>Acceptance criteria</strong></p>\n<p class=\"plan-meta\">None recorded.</p>\n</div>\n<h2>Dependency Graph</h2>\n<pre class=\"mermaid\">\ngraph TD\n    n0[\"step-a: first step\"]\n    n1[\"step-b: second step\"]\n    n0 --> n1\n</pre>\n<h2>Budget Estimate</h2>\n<p>Sum of per-step estimates: $1.50 &middot; Plan-level cap: not set</p>\n<h2>Judge Verdict and Dissents</h2>\n<p>No verdict recorded yet.</p>\n<ul class=\"plan-list\">\n  <li>d1</li>\n</ul>\n<h2>Approval Record</h2>\n<p>Not yet approved.</p>\n<h2>Provenance</h2>\n<ul class=\"plan-list\">\n  <li>workflow_id: 11111111-2222-4333-8444-555555555555</li>\n  <li>plan envelope id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee</li>\n  <li>plan_revision: 1</li>\n  <li>constitution hash: not recorded</li>\n  <li>imagery: none</li>\n</ul>\n",
+  "html_files": [
+    "ship-the-sample-cf4c4732.html"
+  ],
+  "items": [
+    {
+      "detail": "plan materialised as a repo artifact; awaiting plan_judge/plan_gate",
+      "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "envelope_type": "PLAN",
+      "errors": [],
+      "run_id": null,
+      "status": "drafted",
+      "target": null
+    }
+  ],
+  "plan_patch": {
+    "plan_artifact_location": "repo:artifact:docs/plans/ship-the-sample-cf4c4732.html",
+    "plan_artifact_repo_id": null,
+    "plan_artifact_root": "<ROOT>",
+    "plan_envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "plan_ref": {
+      "artifact_path": null,
+      "authored_by": [
+        "planner"
+      ],
+      "constraints": {
+        "budget_usd": null,
+        "deadline_ts": null,
+        "industries": [],
+        "priority": "P2",
+        "risk_tolerance": "medium",
+        "token_limit": null
+      },
+      "context_refs": [],
+      "created_at": "2026-11-19T12:00:00Z",
+      "dissents": [
+        "d1"
+      ],
+      "do_not_touch": [],
+      "external_id": null,
+      "goal_restatement": "Ship the sample",
+      "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "non_goals": [
+        "nothing else"
+      ],
+      "open_questions": [
+        "why"
+      ],
+      "origin_squad": "planning",
+      "parent_id": null,
+      "plan_revision": 1,
+      "rigor": "standard",
+      "risks": [
+        "r1"
+      ],
+      "steps": [
+        {
+          "acceptance_criteria": [
+            "a works"
+          ],
+          "depends_on": [],
+          "description": "first step",
+          "envelope_type": "DEV_TASK",
+          "estimated_budget_usd": 1.5,
+          "model_tier": null,
+          "priority": "P1",
+          "rationale": "root",
+          "step_id": "step-a",
+          "target_repo_id": null,
+          "target_repo_subpath": null,
+          "target_squad": "engineering",
+          "taxonomy_section": null
+        },
+        {
+          "acceptance_criteria": [],
+          "depends_on": [
+            "step-a"
+          ],
+          "description": "second step",
+          "envelope_type": "DEV_TASK",
+          "estimated_budget_usd": null,
+          "model_tier": "sonnet",
+          "priority": "P2",
+          "rationale": null,
+          "step_id": "step-b",
+          "target_repo_id": null,
+          "target_repo_subpath": null,
+          "target_squad": "engineering",
+          "taxonomy_section": null
+        }
+      ],
+      "summary": "Sample plan",
+      "supersedes": null,
+      "target_squad": "hydra",
+      "type": "PLAN",
+      "workflow_id": "11111111-2222-4333-8444-555555555555"
+    },
+    "plan_revision": 1,
+    "plan_status": "drafted"
+  },
+  "plan_ref": {
+    "artifact_path": null,
+    "authored_by": [
+      "planner"
+    ],
+    "constraints": {
+      "budget_usd": null,
+      "deadline_ts": null,
+      "industries": [],
+      "priority": "P2",
+      "risk_tolerance": "medium",
+      "token_limit": null
+    },
+    "context_refs": [],
+    "created_at": "2026-11-19T12:00:00Z",
+    "dissents": [
+      "d1"
+    ],
+    "do_not_touch": [],
+    "external_id": null,
+    "goal_restatement": "Ship the sample",
+    "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "non_goals": [
+      "nothing else"
+    ],
+    "open_questions": [
+      "why"
+    ],
+    "origin_squad": "planning",
+    "parent_id": null,
+    "plan_revision": 1,
+    "rigor": "standard",
+    "risks": [
+      "r1"
+    ],
+    "steps": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "rationale": "root",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "rationale": null,
+        "step_id": "step-b",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      }
+    ],
+    "summary": "Sample plan",
+    "supersedes": null,
+    "target_squad": "hydra",
+    "type": "PLAN",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  }
+}
