@@ -606,6 +606,14 @@ def _step_details(steps: Sequence[PlanStep], figures_by_step: dict[str, list[Pla
             f"envelope: {_esc(step.envelope_type)} &middot; "
             f"priority: {_esc(step.priority)}"
             "</p>",
+        ]
+        if step.heads:
+            # Hydra#91: declared order; same escaping as every other step text.
+            lines.append(
+                "<p class=\"plan-meta\">heads: "
+                + ", ".join(_esc(h) for h in step.heads) + "</p>"
+            )
+        lines += [
             "<p><strong>Acceptance criteria</strong></p>",
             _list_block(step.acceptance_criteria, "None recorded."),
         ]

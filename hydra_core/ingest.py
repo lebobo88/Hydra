@@ -43,6 +43,7 @@ from typing import Any, Callable, Iterable
 from uuid import UUID, uuid4
 
 from .governance import charge_and_gate, redact_for_squad_boundary
+from .plan_heads import validate_plan_heads
 from .schemas import HydraEnvelope, validate_envelope
 from .squad_node import execute_squad
 from .state import HydraState, TaskState, plan_barrier_active
@@ -731,6 +732,24 @@ def dispatch_ingested_envelopes(
                                 f"name the prior plan envelope "
                                 f"({_expected_supersedes!r})"),
                     })
+            # Hydra#91: validate PlanStep.heads against the squad registry.
+            # THIS is the choke point: `plan_ref` is written ONLY by this
+            # branch (`outcome.plan_patch` below; pinned by an AST test,
+            # tests/test_w2_3_plan_heads_validation.py::
+            # test_plan_ref_single_writer_is_ingest). Every path that can put
+            # a PLAN in front of `materialise_plan_steps` reaches it through
+            # here: (a) a PLAN from the plan-author host submit or the
+            # hydra.workflow.submit_envelopes MCP verb, both landing in
+            # ingest; (b) approval at the gate (cli.py --gate-only, which
+            # calls materialise_plan_steps, or graph re-entry through
+            # node_plan_gate), both only READING state.plan_ref; (c)
+            # --modify-plan, which bumps plan_revision and issues a new
+            # planning task whose revised PLAN returns through (a); (d)
+            # replay, which re-reads checkpointed state whose plan_ref ingest
+            # already wrote. `packs` is this function's own squad-pack mapping
+            # (callers pass discover_squads(project)); a head-less plan never
+            # touches it. A fault reuses the rejection path just below.
+            _plan_validation_errors.extend(validate_plan_heads(plan_env, packs=packs))
             if _plan_validation_errors:
                 _detail = ("PLAN rejected: state validation failed ("
                            + "; ".join(e["msg"] for e in _plan_validation_errors) + ")")
