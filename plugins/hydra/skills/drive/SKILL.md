@@ -116,7 +116,12 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
    result: {text, cost_usd, tokens_in, tokens_out}}` — the engine records the
    artifact, charges budget exactly once (`already_charged` on duplicate
    submits), and marks the task attended-done (RA-12a: a later resume will NOT
-   re-dispatch it). If the pack emits engineering envelopes (DEV_TASK/PRD),
+   re-dispatch it). When the step result carries `leg` (`"head"` or `"lead"`),
+   the result may also add an optional `dissents: [{statement, rationale?}]`,
+   built from the bullets of the agent's `## Dissents` section (the prompt
+   explains the format). That field is the only channel: dissents left in the
+   text or in an emitted envelope are not recorded. A head-less squad result is
+   unchanged. If the pack emits engineering envelopes (DEV_TASK/PRD),
    submit them via `hydra.workflow.submit_envelopes` as before.
 5. **Synthesis — call the engine, do not improvise it.** When every task is
    attended-done, `step` returns `{status:"ready_to_finalize"}` (the legacy

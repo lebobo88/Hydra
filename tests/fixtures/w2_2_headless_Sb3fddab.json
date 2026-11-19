@@ -1,0 +1,397 @@
+{
+ "begin_squad_stage": {
+  "basic": {
+   "cursor": {
+    "attempt": 0,
+    "cost_usd": 0.0,
+    "entrypoint": "claude-skill",
+    "error": null,
+    "final_status": null,
+    "finalized": false,
+    "kind": "squad",
+    "pending_action": {
+     "agent_type": "xenia:support-lead",
+     "call_key": "squad-task-cs1-0",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-cs1\nsquad: customer-support\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\n(none)\n\n## Task\ntriage the ticket\n\n## Constraints\nbudget_usd: unknown, risk: unknown, priority: unknown\nacceptance_criteria: (none)",
+     "task_description": "triage the ticket"
+    },
+    "project_path": "PACK",
+    "project_root": "<ROOT>",
+    "request_text": "triage the ticket",
+    "run_id": "task-cs1",
+    "schema": 1,
+    "squad_slug": "customer-support",
+    "state": "await_squad_agent",
+    "task_id": "task-cs1",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "kwargs": {
+    "entrypoint": "claude-skill",
+    "lead_agent": "xenia:support-lead",
+    "pack_cwd": "PACK",
+    "request_text": "triage the ticket",
+    "squad_slug": "customer-support",
+    "task_id": "task-cs1",
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "step_result": {
+    "cost_source": "measured",
+    "cost_usd": 0.0,
+    "cursor_path": "<ROOT>/.hydra/00000000-0000-4000-8000-000000000089/attended/task-cs1.json",
+    "estimated_cost_usd": 0.0,
+    "host_action": {
+     "agent_type": "xenia:support-lead",
+     "call_key": "squad-task-cs1-0",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-cs1\nsquad: customer-support\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\n(none)\n\n## Task\ntriage the ticket\n\n## Constraints\nbudget_usd: unknown, risk: unknown, priority: unknown\nacceptance_criteria: (none)",
+     "task_description": "triage the ticket"
+    },
+    "run_id": "task-cs1",
+    "squad_slug": "customer-support",
+    "stage_id": null,
+    "state": "await_squad_agent",
+    "status": "awaiting_host",
+    "task_id": "task-cs1",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "unmeasured_count": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   }
+  },
+  "planning": {
+   "cursor": {
+    "attempt": 0,
+    "cost_usd": 0.0,
+    "entrypoint": "claude-native",
+    "error": null,
+    "final_status": null,
+    "finalized": false,
+    "kind": "squad",
+    "pending_action": {
+     "agent_type": "hydra:planner",
+     "call_key": "squad-task-plan-0",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-plan\nsquad: planning\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\ng\n\n## Task\nplan it\n\n## Constraints\nbudget_usd: unknown, risk: unknown, priority: unknown\nacceptance_criteria: (none)\n\n## Required output: PLAN envelope\n\nReturn exactly one PLAN envelope (type=\"PLAN\") inside the submit result's `emitted_envelopes` list. The field list below is generated at runtime from `hydra_core.schemas.Plan` / `PlanStep` -- it cannot drift from what the validator accepts.\n\n### Plan fields (including inherited envelope fields)\n- `id` (UUID, optional)\n- `external_id` (Union[str, NoneType], optional)\n- `type` (Literal[PLAN], optional)\n- `origin_squad` (str, required)\n- `target_squad` (Union[str, NoneType], optional)\n- `workflow_id` (UUID, required)\n- `parent_id` (Union[UUID, NoneType], optional)\n- `context_refs` (list[MemoryRef], optional)\n- `constraints` (Constraints, optional)\n- `created_at` (datetime, optional)\n- `do_not_touch` (list[str], optional)\n- `rigor` (Literal[trivial, standard, major], required)\n- `goal_restatement` (str, required)\n- `summary` (str, required)\n- `steps` (list[PlanStep], optional) -- see \"PlanStep fields\" below\n- `non_goals` (list[str], optional)\n- `open_questions` (list[str], optional)\n- `risks` (list[str], optional)\n- `artifact_path` (Union[str, NoneType], optional)\n- `plan_revision` (int, optional)\n- `supersedes` (Union[UUID, NoneType], optional)\n- `authored_by` (list[str], optional)\n- `dissents` (list[str], optional)\n\n### PlanStep fields (each entry in `steps`)\n- `step_id` (str, required)\n- `target_squad` (str, required)\n- `envelope_type` (str, required)\n- `description` (str, required)\n- `acceptance_criteria` (list[str], optional)\n- `depends_on` (list[str], optional)\n- `priority` (Literal[P0, P1, P2, P3], optional)\n- `model_tier` (Union[str, NoneType], optional)\n- `target_repo_id` (Union[str, NoneType], optional)\n- `target_repo_subpath` (Union[str, NoneType], optional)\n- `estimated_budget_usd` (Union[float, NoneType], optional)\n- `taxonomy_section` (Union[str, NoneType], optional)\n- `rationale` (Union[str, NoneType], optional)\n\n### Allowed PlanStep.envelope_type values\n<TYPES>\n\n### Plan JSON Schema (generated from hydra_core.schemas.Plan)\n{\"$defs\":{\"Constraints\":{\"properties\":{\"budget_usd\":{\"anyOf\":[{\"type\":\"number\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Budget Usd\"},\"deadline_ts\":{\"anyOf\":[{\"format\":\"date-time\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Deadline Ts\"},\"industries\":{\"items\":{\"type\":\"string\"},\"title\":\"Industries\",\"type\":\"array\"},\"priority\":{\"default\":\"P2\",\"enum\":[\"P0\",\"P1\",\"P2\",\"P3\"],\"title\":\"Priority\",\"type\":\"string\"},\"risk_tolerance\":{\"default\":\"medium\",\"enum\":[\"low\",\"medium\",\"high\"],\"title\":\"Risk Tolerance\",\"type\":\"string\"},\"token_limit\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Token Limit\"}},\"title\":\"Constraints\",\"type\":\"object\"},\"MemoryRef\":{\"description\":\"A handle, not a blob. Agents resolve via the memory MCP server./n/n`cells` is the TheEights tag vocabulary (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui)./nEmpty list means untagged /u2014 backwards compatible with pre-Stage-3 writes./nSee `hydra_core.eights` for the cell vocabulary.\",\"properties\":{\"cells\":{\"items\":{\"enum\":[\"qian\",\"kun\",\"zhen\",\"xun\",\"kan\",\"li\",\"gen\",\"dui\"],\"type\":\"string\"},\"title\":\"Cells\",\"type\":\"array\"},\"key\":{\"title\":\"Key\",\"type\":\"string\"},\"summary\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Summary\"},\"tier\":{\"enum\":[\"ephemeral\",\"episodic\",\"semantic\",\"profile\"],\"title\":\"Tier\",\"type\":\"string\"}},\"required\":[\"tier\",\"key\"],\"title\":\"MemoryRef\",\"type\":\"object\"},\"PlanStep\":{\"description\":\"One decomposed unit of work inside a `Plan`./n/n`step_id` is a readable slug (e.g. /\"wire-auth-middleware/\"), NOT a UUID /u2014/nsteps must stay stable across plan revisions so markdown diffs between/n`plan_revision`s line up on the same identifiers.\",\"properties\":{\"acceptance_criteria\":{\"items\":{\"type\":\"string\"},\"title\":\"Acceptance Criteria\",\"type\":\"array\"},\"depends_on\":{\"items\":{\"type\":\"string\"},\"title\":\"Depends On\",\"type\":\"array\"},\"description\":{\"title\":\"Description\",\"type\":\"string\"},\"envelope_type\":{\"title\":\"Envelope Type\",\"type\":\"string\"},\"estimated_budget_usd\":{\"anyOf\":[{\"type\":\"number\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Estimated Budget Usd\"},\"model_tier\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Model Tier\"},\"priority\":{\"default\":\"P2\",\"enum\":[\"P0\",\"P1\",\"P2\",\"P3\"],\"title\":\"Priority\",\"type\":\"string\"},\"rationale\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Rationale\"},\"step_id\":{\"title\":\"Step Id\",\"type\":\"string\"},\"target_repo_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Repo Id\"},\"target_repo_subpath\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Repo Subpath\"},\"target_squad\":{\"title\":\"Target Squad\",\"type\":\"string\"},\"taxonomy_section\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Taxonomy Section\"}},\"required\":[\"step_id\",\"target_squad\",\"envelope_type\",\"description\"],\"title\":\"PlanStep\",\"type\":\"object\"}},\"description\":\"A decomposition of a goal into dependency-ordered `PlanStep`s./n/nCyclic or dangling dependencies are rejected at construction time /u2014 a/ncyclic plan cannot enter the system, because `validate_envelope` is/nnothing more than a registry lookup + `model_validate`.\",\"properties\":{\"artifact_path\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Artifact Path\"},\"authored_by\":{\"items\":{\"type\":\"string\"},\"title\":\"Authored By\",\"type\":\"array\"},\"constraints\":{\"$ref\":\"#/$defs/Constraints\"},\"context_refs\":{\"items\":{\"$ref\":\"#/$defs/MemoryRef\"},\"title\":\"Context Refs\",\"type\":\"array\"},\"created_at\":{\"format\":\"date-time\",\"title\":\"Created At\",\"type\":\"string\"},\"dissents\":{\"items\":{\"type\":\"string\"},\"title\":\"Dissents\",\"type\":\"array\"},\"do_not_touch\":{\"items\":{\"type\":\"string\"},\"title\":\"Do Not Touch\",\"type\":\"array\"},\"external_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"External Id\"},\"goal_restatement\":{\"title\":\"Goal Restatement\",\"type\":\"string\"},\"id\":{\"format\":\"uuid\",\"title\":\"Id\",\"type\":\"string\"},\"non_goals\":{\"items\":{\"type\":\"string\"},\"title\":\"Non Goals\",\"type\":\"array\"},\"open_questions\":{\"items\":{\"type\":\"string\"},\"title\":\"Open Questions\",\"type\":\"array\"},\"origin_squad\":{\"title\":\"Origin Squad\",\"type\":\"string\"},\"parent_id\":{\"anyOf\":[{\"format\":\"uuid\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Parent Id\"},\"plan_revision\":{\"default\":1,\"minimum\":1,\"title\":\"Plan Revision\",\"type\":\"integer\"},\"rigor\":{\"enum\":[\"trivial\",\"standard\",\"major\"],\"title\":\"Rigor\",\"type\":\"string\"},\"risks\":{\"items\":{\"type\":\"string\"},\"title\":\"Risks\",\"type\":\"array\"},\"steps\":{\"items\":{\"$ref\":\"#/$defs/PlanStep\"},\"title\":\"Steps\",\"type\":\"array\"},\"summary\":{\"title\":\"Summary\",\"type\":\"string\"},\"supersedes\":{\"anyOf\":[{\"format\":\"uuid\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Supersedes\"},\"target_squad\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Squad\"},\"type\":{\"const\":\"PLAN\",\"default\":\"PLAN\",\"title\":\"Type\",\"type\":\"string\"},\"workflow_id\":{\"format\":\"uuid\",\"title\":\"Workflow Id\",\"type\":\"string\"}},\"required\":[\"origin_squad\",\"workflow_id\",\"rigor\",\"goal_restatement\",\"summary\"],\"title\":\"Plan\",\"type\":\"object\"}\n\nexpected plan_revision: 2\nsupersedes: env-prev (the prior plan envelope id -- set `Plan.supersedes` to this value)\n\n### Prior revision critique\ntoo vague",
+     "task_description": "plan it"
+    },
+    "project_path": "PACK",
+    "project_root": "<ROOT>",
+    "request_text": "plan it",
+    "run_id": "task-plan",
+    "schema": 1,
+    "squad_slug": "planning",
+    "state": "await_squad_agent",
+    "task_id": "task-plan",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "kwargs": {
+    "entrypoint": "claude-native",
+    "goal": "g",
+    "lead_agent": "hydra:planner",
+    "pack_cwd": "PACK",
+    "plan_critique": "too vague",
+    "plan_revision": 2,
+    "request_text": "plan it",
+    "squad_slug": "planning",
+    "supersedes_plan_envelope_id": "env-prev",
+    "task_id": "task-plan",
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "step_result": {
+    "cost_source": "measured",
+    "cost_usd": 0.0,
+    "cursor_path": "<ROOT>/.hydra/00000000-0000-4000-8000-000000000089/attended/task-plan.json",
+    "estimated_cost_usd": 0.0,
+    "host_action": {
+     "agent_type": "hydra:planner",
+     "call_key": "squad-task-plan-0",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-plan\nsquad: planning\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\ng\n\n## Task\nplan it\n\n## Constraints\nbudget_usd: unknown, risk: unknown, priority: unknown\nacceptance_criteria: (none)\n\n## Required output: PLAN envelope\n\nReturn exactly one PLAN envelope (type=\"PLAN\") inside the submit result's `emitted_envelopes` list. The field list below is generated at runtime from `hydra_core.schemas.Plan` / `PlanStep` -- it cannot drift from what the validator accepts.\n\n### Plan fields (including inherited envelope fields)\n- `id` (UUID, optional)\n- `external_id` (Union[str, NoneType], optional)\n- `type` (Literal[PLAN], optional)\n- `origin_squad` (str, required)\n- `target_squad` (Union[str, NoneType], optional)\n- `workflow_id` (UUID, required)\n- `parent_id` (Union[UUID, NoneType], optional)\n- `context_refs` (list[MemoryRef], optional)\n- `constraints` (Constraints, optional)\n- `created_at` (datetime, optional)\n- `do_not_touch` (list[str], optional)\n- `rigor` (Literal[trivial, standard, major], required)\n- `goal_restatement` (str, required)\n- `summary` (str, required)\n- `steps` (list[PlanStep], optional) -- see \"PlanStep fields\" below\n- `non_goals` (list[str], optional)\n- `open_questions` (list[str], optional)\n- `risks` (list[str], optional)\n- `artifact_path` (Union[str, NoneType], optional)\n- `plan_revision` (int, optional)\n- `supersedes` (Union[UUID, NoneType], optional)\n- `authored_by` (list[str], optional)\n- `dissents` (list[str], optional)\n\n### PlanStep fields (each entry in `steps`)\n- `step_id` (str, required)\n- `target_squad` (str, required)\n- `envelope_type` (str, required)\n- `description` (str, required)\n- `acceptance_criteria` (list[str], optional)\n- `depends_on` (list[str], optional)\n- `priority` (Literal[P0, P1, P2, P3], optional)\n- `model_tier` (Union[str, NoneType], optional)\n- `target_repo_id` (Union[str, NoneType], optional)\n- `target_repo_subpath` (Union[str, NoneType], optional)\n- `estimated_budget_usd` (Union[float, NoneType], optional)\n- `taxonomy_section` (Union[str, NoneType], optional)\n- `rationale` (Union[str, NoneType], optional)\n\n### Allowed PlanStep.envelope_type values\n<TYPES>\n\n### Plan JSON Schema (generated from hydra_core.schemas.Plan)\n{\"$defs\":{\"Constraints\":{\"properties\":{\"budget_usd\":{\"anyOf\":[{\"type\":\"number\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Budget Usd\"},\"deadline_ts\":{\"anyOf\":[{\"format\":\"date-time\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Deadline Ts\"},\"industries\":{\"items\":{\"type\":\"string\"},\"title\":\"Industries\",\"type\":\"array\"},\"priority\":{\"default\":\"P2\",\"enum\":[\"P0\",\"P1\",\"P2\",\"P3\"],\"title\":\"Priority\",\"type\":\"string\"},\"risk_tolerance\":{\"default\":\"medium\",\"enum\":[\"low\",\"medium\",\"high\"],\"title\":\"Risk Tolerance\",\"type\":\"string\"},\"token_limit\":{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Token Limit\"}},\"title\":\"Constraints\",\"type\":\"object\"},\"MemoryRef\":{\"description\":\"A handle, not a blob. Agents resolve via the memory MCP server./n/n`cells` is the TheEights tag vocabulary (Qian/Kun/Zhen/Xun/Kan/Li/Gen/Dui)./nEmpty list means untagged /u2014 backwards compatible with pre-Stage-3 writes./nSee `hydra_core.eights` for the cell vocabulary.\",\"properties\":{\"cells\":{\"items\":{\"enum\":[\"qian\",\"kun\",\"zhen\",\"xun\",\"kan\",\"li\",\"gen\",\"dui\"],\"type\":\"string\"},\"title\":\"Cells\",\"type\":\"array\"},\"key\":{\"title\":\"Key\",\"type\":\"string\"},\"summary\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Summary\"},\"tier\":{\"enum\":[\"ephemeral\",\"episodic\",\"semantic\",\"profile\"],\"title\":\"Tier\",\"type\":\"string\"}},\"required\":[\"tier\",\"key\"],\"title\":\"MemoryRef\",\"type\":\"object\"},\"PlanStep\":{\"description\":\"One decomposed unit of work inside a `Plan`./n/n`step_id` is a readable slug (e.g. /\"wire-auth-middleware/\"), NOT a UUID /u2014/nsteps must stay stable across plan revisions so markdown diffs between/n`plan_revision`s line up on the same identifiers.\",\"properties\":{\"acceptance_criteria\":{\"items\":{\"type\":\"string\"},\"title\":\"Acceptance Criteria\",\"type\":\"array\"},\"depends_on\":{\"items\":{\"type\":\"string\"},\"title\":\"Depends On\",\"type\":\"array\"},\"description\":{\"title\":\"Description\",\"type\":\"string\"},\"envelope_type\":{\"title\":\"Envelope Type\",\"type\":\"string\"},\"estimated_budget_usd\":{\"anyOf\":[{\"type\":\"number\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Estimated Budget Usd\"},\"model_tier\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Model Tier\"},\"priority\":{\"default\":\"P2\",\"enum\":[\"P0\",\"P1\",\"P2\",\"P3\"],\"title\":\"Priority\",\"type\":\"string\"},\"rationale\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Rationale\"},\"step_id\":{\"title\":\"Step Id\",\"type\":\"string\"},\"target_repo_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Repo Id\"},\"target_repo_subpath\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Repo Subpath\"},\"target_squad\":{\"title\":\"Target Squad\",\"type\":\"string\"},\"taxonomy_section\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Taxonomy Section\"}},\"required\":[\"step_id\",\"target_squad\",\"envelope_type\",\"description\"],\"title\":\"PlanStep\",\"type\":\"object\"}},\"description\":\"A decomposition of a goal into dependency-ordered `PlanStep`s./n/nCyclic or dangling dependencies are rejected at construction time /u2014 a/ncyclic plan cannot enter the system, because `validate_envelope` is/nnothing more than a registry lookup + `model_validate`.\",\"properties\":{\"artifact_path\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Artifact Path\"},\"authored_by\":{\"items\":{\"type\":\"string\"},\"title\":\"Authored By\",\"type\":\"array\"},\"constraints\":{\"$ref\":\"#/$defs/Constraints\"},\"context_refs\":{\"items\":{\"$ref\":\"#/$defs/MemoryRef\"},\"title\":\"Context Refs\",\"type\":\"array\"},\"created_at\":{\"format\":\"date-time\",\"title\":\"Created At\",\"type\":\"string\"},\"dissents\":{\"items\":{\"type\":\"string\"},\"title\":\"Dissents\",\"type\":\"array\"},\"do_not_touch\":{\"items\":{\"type\":\"string\"},\"title\":\"Do Not Touch\",\"type\":\"array\"},\"external_id\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"External Id\"},\"goal_restatement\":{\"title\":\"Goal Restatement\",\"type\":\"string\"},\"id\":{\"format\":\"uuid\",\"title\":\"Id\",\"type\":\"string\"},\"non_goals\":{\"items\":{\"type\":\"string\"},\"title\":\"Non Goals\",\"type\":\"array\"},\"open_questions\":{\"items\":{\"type\":\"string\"},\"title\":\"Open Questions\",\"type\":\"array\"},\"origin_squad\":{\"title\":\"Origin Squad\",\"type\":\"string\"},\"parent_id\":{\"anyOf\":[{\"format\":\"uuid\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Parent Id\"},\"plan_revision\":{\"default\":1,\"minimum\":1,\"title\":\"Plan Revision\",\"type\":\"integer\"},\"rigor\":{\"enum\":[\"trivial\",\"standard\",\"major\"],\"title\":\"Rigor\",\"type\":\"string\"},\"risks\":{\"items\":{\"type\":\"string\"},\"title\":\"Risks\",\"type\":\"array\"},\"steps\":{\"items\":{\"$ref\":\"#/$defs/PlanStep\"},\"title\":\"Steps\",\"type\":\"array\"},\"summary\":{\"title\":\"Summary\",\"type\":\"string\"},\"supersedes\":{\"anyOf\":[{\"format\":\"uuid\",\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Supersedes\"},\"target_squad\":{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}],\"default\":null,\"title\":\"Target Squad\"},\"type\":{\"const\":\"PLAN\",\"default\":\"PLAN\",\"title\":\"Type\",\"type\":\"string\"},\"workflow_id\":{\"format\":\"uuid\",\"title\":\"Workflow Id\",\"type\":\"string\"}},\"required\":[\"origin_squad\",\"workflow_id\",\"rigor\",\"goal_restatement\",\"summary\"],\"title\":\"Plan\",\"type\":\"object\"}\n\nexpected plan_revision: 2\nsupersedes: env-prev (the prior plan envelope id -- set `Plan.supersedes` to this value)\n\n### Prior revision critique\ntoo vague",
+     "task_description": "plan it"
+    },
+    "run_id": "task-plan",
+    "squad_slug": "planning",
+    "stage_id": null,
+    "state": "await_squad_agent",
+    "status": "awaiting_host",
+    "task_id": "task-plan",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "unmeasured_count": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   }
+  },
+  "rich": {
+   "cursor": {
+    "attempt": 2,
+    "cost_usd": 0.0,
+    "entrypoint": "claude-native",
+    "error": null,
+    "final_status": null,
+    "finalized": false,
+    "kind": "squad",
+    "pending_action": {
+     "agent_type": "garland:lead",
+     "call_key": "squad-task-rich-2",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-rich\nsquad: garland\nenvelope_id: env-1\nupstream_refs: mem://a, mem://b\n\n## Goal\nShip the campaign\n\n## Task\nwrite the brief\n\n## Constraints\nbudget_usd: 3.50 remaining of 5.00 total, risk: medium, priority: high\nacceptance_criteria: \n- be brief\n- be kind",
+     "slash_command": "/garland:run",
+     "task_description": "write the brief"
+    },
+    "project_path": "PACK",
+    "project_root": "<ROOT>",
+    "request_text": "write the brief",
+    "run_id": "task-rich",
+    "schema": 1,
+    "squad_slug": "garland",
+    "state": "await_squad_agent",
+    "task_id": "task-rich",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "kwargs": {
+    "acceptance_criteria": [
+     "be brief",
+     "be kind"
+    ],
+    "action_extras": {
+     "agent_type": "x",
+     "slash_command": "/garland:run"
+    },
+    "attempt": 2,
+    "budget_remaining_usd": 3.5,
+    "budget_usd": 5.0,
+    "entrypoint": "claude-native",
+    "envelope_id": "env-1",
+    "goal": "Ship the campaign",
+    "lead_agent": "garland:lead",
+    "pack_cwd": "PACK",
+    "priority": "high",
+    "request_text": "write the brief",
+    "risk": "medium",
+    "squad_slug": "garland",
+    "task_id": "task-rich",
+    "upstream_refs": [
+     "mem://a",
+     "mem://b"
+    ],
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   },
+   "step_result": {
+    "cost_source": "measured",
+    "cost_usd": 0.0,
+    "cursor_path": "<ROOT>/.hydra/00000000-0000-4000-8000-000000000089/attended/task-rich.json",
+    "estimated_cost_usd": 0.0,
+    "host_action": {
+     "agent_type": "garland:lead",
+     "call_key": "squad-task-rich-2",
+     "cwd": "PACK",
+     "instructions": "Run the pack agent and submit the artifact.",
+     "prompt": "## Hydra context\nworkflow_id: 00000000-0000-4000-8000-000000000089\ntask_id: task-rich\nsquad: garland\nenvelope_id: env-1\nupstream_refs: mem://a, mem://b\n\n## Goal\nShip the campaign\n\n## Task\nwrite the brief\n\n## Constraints\nbudget_usd: 3.50 remaining of 5.00 total, risk: medium, priority: high\nacceptance_criteria: \n- be brief\n- be kind",
+     "slash_command": "/garland:run",
+     "task_description": "write the brief"
+    },
+    "run_id": "task-rich",
+    "squad_slug": "garland",
+    "stage_id": null,
+    "state": "await_squad_agent",
+    "status": "awaiting_host",
+    "task_id": "task-rich",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "unmeasured_count": 0,
+    "workflow_id": "00000000-0000-4000-8000-000000000089"
+   }
+  }
+ },
+ "headless_flow": {
+  "checkpoint": {
+   "attended_charge_applied": {
+    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0": {
+     "block": false,
+     "downgrade": false
+    }
+   },
+   "attended_checkpoint_reconciled": {
+    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0": true
+   },
+   "attended_completed_task_ids": [
+    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+   ],
+   "attended_done_task_ids": [
+    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+   ],
+   "attended_head_results": {},
+   "attended_results": [
+    {
+     "artifact_ref": {
+      "key": "mem:test"
+     },
+     "changed_paths": [],
+     "cost_usd": 0.375,
+     "final_status": "complete",
+     "merged": false,
+     "owner_squad": "executive",
+     "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+     "stage_id": null,
+     "status": "complete",
+     "summary": null,
+     "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    }
+   ],
+   "budget": {
+    "budget_usd": 50.0,
+    "estimated_usd": 0.0,
+    "repo_budgets": {},
+    "repo_spend": {},
+    "spent_tokens": 10,
+    "spent_usd": 0.375,
+    "token_limit": 200000,
+    "unmeasured_stages": 0
+   },
+   "budget_downgrade_active": false,
+   "open_pp_runs": []
+  },
+  "cursor_after_step": {
+   "attempt": 0,
+   "cost_usd": 0.0,
+   "entrypoint": "claude-native",
+   "error": null,
+   "final_status": null,
+   "finalized": false,
+   "kind": "squad",
+   "pending_action": {
+    "agent_type": "executive-suite:boardroom",
+    "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+    "cwd": "C:/AiAppDeployments/ExecutiveSuite",
+    "instructions": "Run the pack agent and submit the artifact.",
+    "prompt": "## Hydra context\nworkflow_id: 11111111-2222-4333-8444-555555555555\ntask_id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\nsquad: executive\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\nbrief the board\n\n## Task\nbrief the board\n\n## Constraints\nbudget_usd: 50.00 remaining of 50.00 total, risk: normal, priority: P2\nacceptance_criteria: (none)",
+    "task_description": "brief the board"
+   },
+   "project_path": "C:/AiAppDeployments/ExecutiveSuite",
+   "project_root": "<ROOT>",
+   "request_text": "brief the board",
+   "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "schema": 1,
+   "squad_slug": "executive",
+   "state": "await_squad_agent",
+   "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "tokens_in": 0,
+   "tokens_out": 0,
+   "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "cursor_after_submit": {
+   "artifact_persisted_via": "native",
+   "artifact_ref": {
+    "key": "mem:test"
+   },
+   "artifact_text": "done",
+   "attempt": 0,
+   "charged": true,
+   "cost_source": "measured",
+   "cost_usd": 0.375,
+   "emitted_envelopes": [],
+   "entrypoint": "claude-native",
+   "error": null,
+   "final_status": "complete",
+   "finalized": true,
+   "kind": "squad",
+   "pending_action": null,
+   "project_path": "C:/AiAppDeployments/ExecutiveSuite",
+   "project_root": "<ROOT>",
+   "request_text": "brief the board",
+   "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "schema": 1,
+   "squad_slug": "executive",
+   "state": "complete",
+   "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "terminal_call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+   "tokens_in": 7,
+   "tokens_out": 3,
+   "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "step": {
+   "cost_source": "measured",
+   "cost_usd": 0.0,
+   "cursor_path": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.json",
+   "dispatch_ticket": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/tickets/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee.91be9cc8ddd765d3f99b0601bbd15300.json",
+   "estimated_cost_usd": 0.0,
+   "host_action": {
+    "agent_type": "executive-suite:boardroom",
+    "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+    "cwd": "C:/AiAppDeployments/ExecutiveSuite",
+    "instructions": "Run the pack agent and submit the artifact.",
+    "prompt": "## Hydra context\nworkflow_id: 11111111-2222-4333-8444-555555555555\ntask_id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\nsquad: executive\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\nbrief the board\n\n## Task\nbrief the board\n\n## Constraints\nbudget_usd: 50.00 remaining of 50.00 total, risk: normal, priority: P2\nacceptance_criteria: (none)",
+    "task_description": "brief the board"
+   },
+   "ok": true,
+   "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "squad_slug": "executive",
+   "stage_id": null,
+   "state": "await_squad_agent",
+   "status": "awaiting_host",
+   "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "tokens_in": 0,
+   "tokens_out": 0,
+   "unmeasured_count": 0,
+   "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "submit": {
+   "already_charged": false,
+   "artifact_persisted_via": "native",
+   "artifact_ref": {
+    "key": "mem:test"
+   },
+   "artifact_text": "done",
+   "budget_block": false,
+   "budget_downgrade": false,
+   "changed_paths": [],
+   "cost_source": "measured",
+   "cost_usd": 0.375,
+   "cursor_path": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.json",
+   "estimated_cost_usd": 0.0,
+   "final_status": "complete",
+   "ok": true,
+   "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "smoke_status": null,
+   "spent_usd": 0.375,
+   "squad_slug": "executive",
+   "stage_id": null,
+   "stage_outcome": null,
+   "state": "complete",
+   "status": "complete",
+   "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "terminal_call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+   "tokens_in": 7,
+   "tokens_out": 3,
+   "unmeasured_count": 0,
+   "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "ticket": {
+   "agent_type": "executive-suite:boardroom",
+   "budget_remaining_usd": 50.0,
+   "budget_usd": 50.0,
+   "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+   "head": "boardroom",
+   "kind": "squad",
+   "mode": "audit",
+   "prompt_sha256": "8103cb93d2b539d69e53f2192602b00ebcca36cb3b58655686e148e5df308fe4",
+   "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+   "schema": 1,
+   "squad_slug": "executive",
+   "ticket_id": "91be9cc8ddd765d3f99b0601bbd153009ecb02d61d2d954660cac55e22255e47",
+   "workflow_id": "11111111-2222-4333-8444-555555555555"
+  }
+ }
+}
