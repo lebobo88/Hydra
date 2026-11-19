@@ -1,0 +1,301 @@
+# RUN THIS AT COMMIT 8ad24e5 (Hydra#92 W2.4 step 1 start commit S), BEFORE any other edit:
+#   python tests/fixtures/w2_4_attended_step_baseline_S8ad24e5.capture.txt
+# It writes, next to itself:
+#   tests/fixtures/w2_4_attended_step_baseline_S8ad24e5.json   (identity fixture)
+#   tests/fixtures/w2_4_three_head_serial_S8ad24e5.json        (characterization fixture)
+#
+# It is also loaded with runpy by tests/test_w2_4_baseline.py, which calls
+# `capture_identity(work)` and `capture_three_head_serial(work)` again and compares.
+#
+# Every scenario drives the REAL cli._cmd_attended_step and cli._cmd_attended_submit
+# against a real SqliteSaver file under `work` built with the production checkpoint serde
+# (make_checkpoint_serde); each verb call reads the checkpoint through a fresh connection.
+# Stubbed (the same set tests/test_w2_3_plan_heads_e2e.py stubs): head resolution
+# (resolve_head), SquadPack objects, the dispatcher, pack discovery in the step, the
+# artifact write and the shim write. Engineering additionally stubs the target project
+# path (as tests/test_dispatch_seam_w1_2.py does). No judge or LLM call is made.
+#
+# Normalisation (Hydra#194): the tmp root -> '<root>', the resolved pack directory ->
+# '<pack_dir>', wall-clock values -> '<TS>', ticket digests -> '<TICKET>'.
+import argparse
+import contextlib
+import io
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+from pathlib import Path
+from unittest import mock
+from uuid import UUID
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+
+from hydra_core import cli, head_registry  # noqa: E402
+from hydra_core.state import (  # noqa: E402
+    HydraState, TaskState, head_result_key, make_checkpoint_serde,
+)
+from tests.test_w2_1_cli_head_legs import _Disp, _Pack, _Written, _tid, _wf  # noqa: E402
+
+OUT_IDENTITY = HERE / "w2_4_attended_step_baseline_S8ad24e5.json"
+OUT_SERIAL = HERE / "w2_4_three_head_serial_S8ad24e5.json"
+
+_VOLATILE = re.compile(r"(_at$|^ts$|timestamp|^time$|elapsed|^created$|^updated$)")
+_TICKET = re.compile(r"\.[0-9a-f]{32}\.json")
+_HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
+
+
+def _eng_task_id():
+    return UUID("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff")
+
+
+def _seeded_h1():
+    return {"text": "seeded h1 result", "head": "h1", "leg": "head"}
+
+
+class _EngDisp(_Disp):
+    """Answers the pp calls the attended engineering path makes (as test_dispatch_seam_w1_2)."""
+
+    def call_mcp(self, server, tool, args, squad_id=None, **_kw):
+        self.calls.append((server, tool))
+        if tool == "start_run":
+            return {"status": "done", "result": {"run_id": "run-e1"}}
+        if tool == "start_stage":
+            return {"status": "done", "result": {"stage_id": "stage-1"}}
+        if tool == "gate_eligible_judges":
+            return {"status": "done", "result": {
+                "required_cross_vendor": False, "rubric_id": "rfc-2119-normative"}}
+        return {"status": "done", "result": {}}
+
+
+def _resolver(squad, head, **_kw):
+    return head_registry.HeadResolution(
+        squad=squad, head=head, plugin="plug", agent_name=head,
+        qualified_name=f"plug:{head}", agent_path=None, rule="slug")
+
+
+def _open_sup(db):
+    """A real compiled graph over HydraState on a real SqliteSaver (production serde)."""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, StateGraph
+    g = StateGraph(HydraState)
+    g.add_node("n", lambda s: {})
+    g.add_node("postcheck", lambda s: {})
+    g.set_entry_point("n")
+    g.add_edge("n", "postcheck")
+    g.add_edge("postcheck", END)
+    conn = sqlite3.connect(str(db), check_same_thread=False)
+    return g.compile(checkpointer=SqliteSaver(conn, serde=make_checkpoint_serde())), conn
+
+
+def _run(fn, *args):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = fn(*args)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _scrub(obj):
+    if isinstance(obj, dict):
+        return {k: ("<TS>" if _VOLATILE.search(k) else _scrub(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    return obj
+
+
+class _Flow:
+    """One scenario's project root, checkpoint file and verb drivers."""
+
+    def __init__(self, work, name, *, engineering=False):
+        self.base = Path(work).resolve()
+        self.dir = self.base / name
+        self.dir.mkdir()
+        self.root = self.dir / "proj"
+        self.root.mkdir()
+        self.db = self.dir / "cp.db"
+        self.cfg = {"configurable": {"thread_id": _wf}}
+        self.engineering = engineering
+        self.pack = _Pack("claude-native")
+        self.target = self.dir / "target"
+        if engineering:
+            agents = self.root / "plugins" / "hydra" / "agents"
+            agents.mkdir(parents=True)
+            for n in ("engineer.md", "judge-cross-vendor.md", "judge-same-vendor.md"):
+                (agents / n).write_text("# stub\n", encoding="utf-8")
+            self.target.mkdir()
+        self.pack_dir = cli._resolve_pack_cwd(self.pack, self.root)
+
+    def seed(self, task, head_results=None):
+        sup, conn = _open_sup(self.db)
+        try:
+            st = HydraState(root_goal="brief the board", workflow_id=UUID(_wf))
+            st.budget.budget_usd = 50.0
+            patch = {"root_goal": st.root_goal, "workflow_id": st.workflow_id,
+                     "budget": st.budget, "tasks": [task]}
+            if head_results:
+                patch["attended_head_results"] = head_results
+            sup.update_state(self.cfg, patch, as_node="n")
+        finally:
+            conn.close()
+
+    @contextlib.contextmanager
+    def _patched(self, sup):
+        disp = _EngDisp() if self.engineering else _Disp()
+        packs = {} if self.engineering else {self.pack.slug: self.pack}
+        with contextlib.ExitStack() as es:
+            es.enter_context(mock.patch.object(head_registry, "resolve_head", _resolver))
+            es.enter_context(mock.patch.object(
+                cli, "_attended_live_dispatcher", lambda *a, **k: disp))
+            es.enter_context(mock.patch("hydra_core.supervisor.build_supervisor",
+                                        lambda **_k: sup))
+            es.enter_context(mock.patch("hydra_core.squad_loader.discover_squads",
+                                        lambda *a, **k: packs))
+            es.enter_context(mock.patch("hydra_core.squad_node._maybe_write_claude_shim",
+                                        lambda *a, **k: None))
+            es.enter_context(mock.patch("hydra_core.artifact_store.write_native_artifact",
+                                        lambda *a, **k: _Written()))
+            if self.engineering:
+                es.enter_context(mock.patch.object(
+                    cli, "_resolve_task_project_path", lambda *a, **k: str(self.target)))
+                es.enter_context(mock.patch.dict(
+                    os.environ, {"HYDRA_ATTENDED_SMOKE_MODE": "sync"}))
+            yield
+
+    def _call(self, fn, args):
+        sup, conn = _open_sup(self.db)
+        try:
+            with self._patched(sup):
+                rc, out, err = _run(fn, args)
+        finally:
+            conn.close()
+        assert rc == 0, (out or err)[:800]
+        return json.loads(out)
+
+    def step(self):
+        return self._call(cli._cmd_attended_step, argparse.Namespace(
+            project=str(self.root), workflow_id=_wf, verbose=False))
+
+    def submit(self, resp, *, cost, text):
+        run_id, call_key = resp["run_id"], resp["host_action"]["call_key"]
+        rf = self.dir / f"result-{run_id}-{call_key}.json"
+        rf.write_text(json.dumps({"text": text, "cost_usd": cost, "tokens_in": 10,
+                                  "tokens_out": 5, "model": "m"}), encoding="utf-8")
+        return self._call(cli._cmd_attended_submit, argparse.Namespace(
+            project=str(self.root), workflow_id=_wf, run_id=run_id,
+            call_key=call_key, result=str(rf), verbose=False))
+
+    def head_results(self):
+        sup, conn = _open_sup(self.db)
+        try:
+            vals = sup.get_state(self.cfg).values
+        finally:
+            conn.close()
+        return HydraState.model_validate(vals).attended_head_results
+
+    def norm(self, obj):
+        text = json.dumps(_scrub(json.loads(json.dumps(obj, default=str))), sort_keys=True)
+        # the engineering step's host_action.cwd is the (stubbed) target repo, not a
+        # pack directory; it is normalised to the same placeholder.
+        dirs = [str(self.pack_dir)] + ([str(self.target)] if self.engineering else [])
+        for pd in dirs:
+            for form in (pd.replace("\\", "\\\\"), pd, Path(pd).as_posix()):
+                text = text.replace(form, "<pack_dir>")
+        b = self.base
+        for form in (str(b).replace("\\", "\\\\"), str(b), b.as_posix()):
+            text = text.replace(form, "<root>")
+        text = text.replace("\\\\", "/")
+        text = _TICKET.sub(".<TICKET>.json", text)
+        text = _HEX64.sub("<HASH64>", text)
+        return json.loads(text)
+
+
+def _squad_task(heads):
+    return TaskState(task_id=UUID(_tid), owner_squad="executive",
+                     description="brief the board", heads=heads)
+
+
+def _scenario_zero_head(work):
+    f = _Flow(work, "zero_head")
+    f.seed(_squad_task([]))
+    s1 = f.step()
+    sub = f.submit(s1, cost=0.25, text="done")
+    s2 = f.step()
+    return f.norm({"step_1": s1, "submit": sub, "step_2": s2})
+
+
+def _scenario_one_head(work):
+    f = _Flow(work, "one_head")
+    f.seed(_squad_task(["h1"]))
+    s1 = f.step()
+    sub1 = f.submit(s1, cost=0.25, text="head 1 output")
+    s2 = f.step()
+    sub2 = f.submit(s2, cost=0.5, text="lead synthesis")
+    return f.norm({"step_head": s1, "submit_head": sub1,
+                   "step_lead": s2, "submit_lead": sub2})
+
+
+def _scenario_one_ready_of_two_heads(work):
+    f = _Flow(work, "one_ready_of_two_heads")
+    f.seed(_squad_task(["h1", "h2"]),
+           head_results={head_result_key(_tid, "h1"): _seeded_h1()})
+    return f.norm({"step": f.step()})
+
+
+def _scenario_engineering(work):
+    f = _Flow(work, "engineering", engineering=True)
+    f.seed(TaskState(task_id=_eng_task_id(), owner_squad="engineering",
+                     description="add a feature", target_repo_id="hydra"))
+    return f.norm({"step": f.step()})
+
+
+def capture_identity(work):
+    work = Path(work)
+    return {
+        "zero_head": _scenario_zero_head(work),
+        "one_head": _scenario_one_head(work),
+        "one_ready_of_two_heads": _scenario_one_ready_of_two_heads(work),
+        "engineering": _scenario_engineering(work),
+    }
+
+
+def capture_three_head_serial(work):
+    f = _Flow(Path(work), "three_head_serial")
+    f.seed(_squad_task(["h1", "h2", "h3"]))
+    steps, submits = [], []
+    for h in ("h1", "h2", "h3"):
+        s = f.step()
+        steps.append(s)
+        submits.append(f.submit(s, cost=0.0, text=f"head {h} output"))
+    lead = f.step()
+    return f.norm({
+        "steps": steps,
+        "submits": submits,
+        "lead_step": lead,
+        "lead_prompt": lead["host_action"]["prompt"],
+        "attended_head_results": f.head_results(),
+    })
+
+
+if __name__ == "__main__":
+    tmp = Path(tempfile.mkdtemp(prefix="w2_4_baseline_capture_"))
+    home = tmp / "home"
+    for key, val in (
+            ("HYDRA_HOME", home),
+            ("HYDRA_EPISODIC_DB", home / "episodic.db"),
+            ("HYDRA_CHECKPOINT_DB", home / "checkpoints.db"),
+            ("HYDRA_EIGHTS_SPOOL", home / "eights-pending"),
+            ("HYDRA_EIGHTS_DEAD_LETTER", home / "eights-pending-dead")):
+        os.environ[key] = str(val)
+    os.environ["HYDRA_TEST_NO_DAEMONS"] = "1"
+    w1 = tmp / "w1"
+    w1.mkdir()
+    w2 = tmp / "w2"
+    w2.mkdir()
+    OUT_IDENTITY.write_text(json.dumps(capture_identity(w1), indent=2, sort_keys=True)
+                            + "\n", encoding="utf-8")
+    OUT_SERIAL.write_text(json.dumps(capture_three_head_serial(w2), indent=2,
+                                     sort_keys=True) + "\n", encoding="utf-8")
+    print("wrote", OUT_IDENTITY)
+    print("wrote", OUT_SERIAL)
