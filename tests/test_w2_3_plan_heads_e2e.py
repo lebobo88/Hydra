@@ -71,14 +71,15 @@ def test_e2e_plan_heads_ingest_approve_step_returns_first_declared_head_leg(
     assert step["run_id"] == head_leg_run_id(task["task_id"], "h3")
     assert step["host_action"]["agent_type"] == "plug:h3"
     assert step["host_action"]["call_key"] == f"squad-{step['run_id']}-0"
-    # no lead leg, and no other head's cursor, was opened first
+    # no lead leg was opened; the step opened all three head legs (W2.4), the
+    # first declared one being the top-level leg
     for other in ("h1", "h2"):
         assert step["run_id"] != head_leg_run_id(task["task_id"], other)
         assert step["host_action"]["agent_type"] != f"plug:{other}"
     assert step["run_id"] != task["task_id"]
     attended = Path(step["cursor_path"]).parent
-    assert sorted(p.name for p in attended.glob("*.json")) == [
-        f"{step['run_id']}.json"]
+    assert sorted(p.name for p in attended.glob("*.json")) == sorted(
+        f"{head_leg_run_id(task['task_id'], h)}.json" for h in _ORDER)
 
 
 def test_e2e_unknown_head_plan_never_reaches_attended_head_leg(cap, tmp_path):

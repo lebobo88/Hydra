@@ -346,7 +346,7 @@ class TestHeadLegs:
 
         assert again["run_id"] == first["run_id"] == head_leg_run_id(_tid, "h1")
         assert again["host_action"]["call_key"] == first["host_action"]["call_key"]
-        assert len(_cursor_files(tmp_path)) == 1
+        assert len(_cursor_files(tmp_path)) == 2
 
     def test_unreadable_head_cursor_refused(self, tmp_path, monkeypatch, capsys):
         _install(monkeypatch, _state(_task(["h1"])))
