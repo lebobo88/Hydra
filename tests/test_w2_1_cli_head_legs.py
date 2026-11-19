@@ -270,7 +270,9 @@ class TestHeadLegs:
         lead = _step(tmp_path, capsys)
 
         assert lead["run_id"] == _tid
-        assert "head" not in lead and "leg" not in lead
+        # Hydra#89 step 4: the lead cursor is the task_id cursor and is
+        # stamped leg="lead" (a head-less cursor still has no "leg" key).
+        assert "head" not in lead and lead["leg"] == "lead"
         assert lead["host_action"]["call_key"] == f"squad-{_tid}-0"
         assert not lead["host_action"]["agent_type"].startswith("plug:")
         assert Path(lead["cursor_path"]) == Path(

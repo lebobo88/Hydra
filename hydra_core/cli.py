@@ -5020,6 +5020,8 @@ def _cmd_attended_step(args) -> int:
             _head: str | None = None
             _cursor_run_id = task_id
             _head_lead_agent: str | None = None
+            _lead_leg = False
+            _lead_head_refs: list[str] = []
             if getattr(ne_task, "heads", None) and ne_task.owner_squad != "planning":
                 if ne_pack.entrypoint != "claude-native":
                     print(_cli_json_dumps({
@@ -5054,6 +5056,18 @@ def _cmd_attended_step(args) -> int:
                         }, indent=2, default=str))
                         return 1
                     _head_lead_agent = _head_res.qualified_name
+                else:
+                    # Every head has a recorded result (any status): this
+                    # step opens the lead leg on the single task_id cursor.
+                    _lead_leg = True
+                    for _h in ne_task.heads:
+                        _hrec = _recorded_heads.get(_head_result_key(task_id, _h)) or {}
+                        _hstatus = str(_hrec.get("status") or "unknown")
+                        _href = _hrec.get("artifact_ref")
+                        _hkey = _href.get("key") if isinstance(_href, dict) else None
+                        _lead_head_refs.append(
+                            f"head:{_h} {_hkey} ({_hstatus})" if _hkey
+                            else f"head:{_h} (no artifact, {_hstatus})")
             action_extras = None
             if _head_lead_agent is not None:
                 lead_agent = _head_lead_agent
@@ -5076,6 +5090,9 @@ def _cmd_attended_step(args) -> int:
                     _upstream_refs.append(f"envelope:{_rid} ({_t.owner_squad})")
             _upstream_refs.extend(
                 f"episodic:{k}" for k in (getattr(state, "episodic_refs", []) or []))
+            # Hydra#89: the lead sees one handle per head (declared order),
+            # never the head artifact text.
+            _upstream_refs.extend(_lead_head_refs)
 
             # Hydra#69 defect C: a `planning`-owned task can stay open across
             # multiple re-issued cursors (a rejected PLAN leaves the task
@@ -5200,6 +5217,7 @@ def _cmd_attended_step(args) -> int:
                     plan_critique=_plan_critique,
                     supersedes_plan_envelope_id=_plan_supersedes,
                     **({"head": _head} if _head is not None else {}),
+                    **({"leg": "lead"} if _lead_leg else {}),
                 )
             )
             _seam_err = _apply_dispatch_seam(
@@ -6003,7 +6021,28 @@ def _reconcile_attended_terminal_checkpoint(
                     # outcomes intentionally stay out so governance still
                     # surfaces those.
                     done_ids = list(getattr(state, "attended_done_task_ids", []) or [])
+                    _result_record = _attended_result_record(state, res)
+                    _heads_ok = True
+                    if res.get("leg") == "lead" and tid is not None:
+                        # Hydra#89: a lead leg is "done" only when EVERY head
+                        # also completed. The record carries {head: status}
+                        # (absent for a head-less task, so its record is
+                        # unchanged).
+                        from .state import head_result_key as _hrk
+                        _task_heads = next(
+                            (list(t.heads) for t in getattr(state, "tasks", [])
+                             if str(t.task_id) == str(tid)), [])
+                        _hres = getattr(state, "attended_head_results", None) or {}
+                        _head_statuses = {
+                            h: str((_hres.get(_hrk(str(tid), h)) or {}).get("status")
+                                   or "missing")
+                            for h in _task_heads}
+                        _heads_ok = all(s == "complete"
+                                        for s in _head_statuses.values())
+                        if _result_record is not None:
+                            _result_record["heads"] = _head_statuses
                     if (res.get("status") == "complete"
+                            and _heads_ok
                             and tid is not None
                             and str(tid) not in done_ids):
                         done_ids.append(str(tid))
@@ -6011,7 +6050,7 @@ def _reconcile_attended_terminal_checkpoint(
                     # can materialise it into a squad result envelope for
                     # node_synthesis (the in-graph dispatch never ran here).
                     attended_results = _merge_attended_result(
-                        state.attended_results, _attended_result_record(state, res))
+                        state.attended_results, _result_record)
                     _patch = {
                         "attended_completed_task_ids": completed,
                         "attended_done_task_ids": done_ids,

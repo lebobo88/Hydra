@@ -105,6 +105,18 @@ def test_run_id_is_unambiguous():
     print(f"accepted={accepted} rejected={rejected}")
 
 
+@pytest.mark.parametrize("task_id,head", [
+    ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "research"),
+    ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "h1"),
+    ("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "market-research"),
+    ("11111111-2222-4333-8444-555555555555", "head-2-b"),
+    ("00000000-0000-0000-0000-000000000000", "a1"),
+])
+def test_valid_pairs_are_accepted(task_id, head):
+    rid = head_leg_run_id(task_id, head)
+    assert rid.split("--", 1) == [task_id, head]
+
+
 def test_channel_merge_replay_keeps_both_head_keys():
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import END, START, StateGraph
