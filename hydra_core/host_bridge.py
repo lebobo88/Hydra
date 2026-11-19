@@ -2177,6 +2177,11 @@ def _step_result(cursor: dict[str, Any], cursor_file: str | Path) -> dict[str, A
         # inferring it from the collapsed "cost_source" label.
         "estimated_cost_usd": float(cursor.get("estimated_cost_usd") or 0.0),
     }
+    # Hydra#89: per-head squad legs expose their head; head-less results are
+    # unchanged (keys absent).
+    for _head_key in ("head", "leg"):
+        if cursor.get(_head_key) is not None:
+            res[_head_key] = cursor[_head_key]
     if status == "awaiting_host":
         res["host_action"] = _host_action(cursor)
         if state == "stalled_infra":
@@ -4287,8 +4292,12 @@ def _build_squad_prompt(
     plan_revision: int | None = None,
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
+    head: str | None = None,
 ) -> str:
     """E2-28: build the non-engineering squad host_action prompt.
+
+    Hydra#89: ``head`` (default ``None``) adds one ``## Head`` section naming
+    the head this leg runs; a head-less prompt is byte-for-byte unchanged.
 
     Mirrors the engineering path's ``## Hydra context`` block so a squad leg is
     reproducible from the trace alone: workflow/task identity, the root goal,
@@ -4338,6 +4347,11 @@ def _build_squad_prompt(
     ]
     lines.extend(f"- {c}" for c in crit)
 
+    if head is not None:
+        lines.append("")
+        lines.append("## Head")
+        lines.append(f"head: {head}")
+
     # D1 (Hydra#69 part 3): planning-only section, schema-generated.
     if squad_slug == "planning":
         lines.append("")
@@ -4380,6 +4394,7 @@ def begin_squad_stage(
     plan_revision: int | None = None,
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
+    head: str | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -4402,8 +4417,22 @@ def begin_squad_stage(
     stays open) never reuses the prior attempt's call_key -- a late/duplicate
     submit under the stale key is refused by `submit_host_result`'s call_key
     match instead of silently matching the new cursor.
+
+    Hydra#89: ``head`` (keyword-only, default ``None``) makes this one head leg
+    of ``task_id``. The cursor then carries ``run_id =
+    state.head_leg_run_id(task_id, head)``, ``head`` and ``leg="head"``, lives
+    at ``cursor_path(project_root, workflow_id, run_id)`` and keys its
+    ``call_key`` by that run_id, so legs never collide with each other or with
+    the head-less cursor. An invalid ``head``/``task_id`` raises ``ValueError``
+    from ``head_leg_run_id`` before anything is written. ``head=None`` is
+    byte-identical to the pre-#89 behaviour.
     """
-    call_key = f"squad-{task_id}-{int(attempt)}"
+    if head is None:
+        run_id = task_id
+    else:
+        from . import state as _state  # lazy: keep import graph unchanged
+        run_id = _state.head_leg_run_id(task_id, head)  # ValueError -> no cursor
+    call_key = f"squad-{run_id}-{int(attempt)}"
     # W1.2 redact-at-build: PII + MCP-attack scan on everything host-visible.
     # Redaction is unconditional -- there is no PII opt-out parameter.
     request_text = _outbound_text(request_text, kind="squad")
@@ -4423,6 +4452,7 @@ def begin_squad_stage(
         plan_revision=plan_revision,
         plan_critique=plan_critique,
         supersedes_plan_envelope_id=supersedes_plan_envelope_id,
+        head=head,
     )
     prompt = _outbound_text(prompt, kind="squad")
     cursor: dict[str, Any] = {
@@ -4430,7 +4460,7 @@ def begin_squad_stage(
         "kind": "squad",
         "workflow_id": workflow_id,
         "task_id": task_id,
-        "run_id": task_id,   # mirrors engineering cursor shape for CLI compatibility
+        "run_id": run_id,    # mirrors engineering cursor shape for CLI compatibility
         "squad_slug": squad_slug,
         "entrypoint": entrypoint,
         "project_path": pack_cwd,
@@ -4461,13 +4491,20 @@ def begin_squad_stage(
             k: (_outbound_text(v, kind="squad")
                 if isinstance(v, str) else v)
             for k, v in action_extras.items() if k != "agent_type"})
-    cfile = cursor_path(project_root, workflow_id, task_id)
+    if head is not None:
+        cursor["head"] = head
+        cursor["leg"] = "head"
+    cfile = cursor_path(project_root, workflow_id, run_id)
     save_cursor(cfile, cursor)
-    _trace(cursor, "attended.squad_stage_started", {
+    started_payload: dict[str, Any] = {
         "squad_slug": squad_slug,
         "entrypoint": entrypoint,
         "task_id": task_id,
-    })
+    }
+    if head is not None:
+        started_payload["head"] = head
+        started_payload["run_id"] = run_id
+    _trace(cursor, "attended.squad_stage_started", started_payload)
     return _step_result(cursor, cfile)
 
 
@@ -4515,7 +4552,9 @@ def _persist_attended_squad_artifact(
     """
     slug = str(cursor.get("squad_slug") or "")
     wf = str(cursor.get("workflow_id") or "")
-    raw_task = str(cursor.get("task_id") or cursor.get("run_id") or "task")
+    # Hydra#89: key by the leg run_id so per-head legs of one task never share
+    # a file. Head-less squad cursors carry run_id == task_id (unchanged name).
+    raw_task = str(cursor.get("run_id") or cursor.get("task_id") or "task")
     task_id = "".join(c for c in raw_task if c.isalnum() or c in "-_") or "task"
     errors: list[str] = []
     via: list[str] = []
@@ -4605,11 +4644,12 @@ def _apply_squad_result(
     slug = str(cursor.get("squad_slug") or "")
     final_status = "complete"
     if raw_artifact_text and _has_native_pack(slug):
-        task_id = str(cursor.get("task_id") or cursor.get("run_id") or "")
+        # Hydra#89: leg run_id (== task_id for a head-less cursor).
+        run_id = str(cursor.get("run_id") or cursor.get("task_id") or "")
         try:
             from .artifact_store import write_native_artifact
             ref = write_native_artifact(
-                slug, f"attended/{task_id}.md", raw_artifact_text)
+                slug, f"attended/{run_id}.md", raw_artifact_text)
             cursor["artifact_ref"] = ref.model_dump(mode="json")
             cursor["artifact_persisted_via"] = "native"
             _trace(cursor, "attended.native_artifact_persisted", {
