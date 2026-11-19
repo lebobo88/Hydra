@@ -257,6 +257,38 @@ def _norm(obj: Any, root: str) -> Any:
     return obj
 
 
+# Hydra#91: the ``planning`` case is narrowed to exactly two insertions in each
+# generated "Plan JSON Schema" prompt section, because PlanStep.heads is new.
+_I1_ANCHOR = "- `rationale` (Union[str, NoneType], optional)"
+_I1_LINE = "- `heads` (list[str], optional)"
+_I2_ANCHOR = '"model_tier":'
+_I2_PROP = '"heads":{"items":{"type":"string"},"title":"Heads","type":"array"},'
+
+
+def _with_plan_step_heads(case_fixture: Any) -> Any:
+    """Return ``case_fixture`` with exactly the I1 and I2 insertions applied to
+    each string containing 'Plan JSON Schema' (each anchor exactly once per
+    string, exactly 2 such strings)."""
+    hits: list[str] = []
+
+    def fix(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: fix(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [fix(v) for v in obj]
+        if isinstance(obj, str) and "Plan JSON Schema" in obj:
+            assert obj.count(_I1_ANCHOR) == 1
+            assert obj.count(_I2_ANCHOR) == 1
+            hits.append(obj)
+            return (obj.replace(_I1_ANCHOR, _I1_ANCHOR + "\n" + _I1_LINE)
+                    .replace(_I2_ANCHOR, _I2_PROP + _I2_ANCHOR))
+        return obj
+
+    out = fix(case_fixture)
+    assert len(hits) == 2
+    return out
+
+
 def test_t9_headless_flow_byte_identical(tmp_path, monkeypatch, capsys):
     root = tmp_path / "proj"
     root.mkdir()
@@ -267,7 +299,14 @@ def test_t9_headless_flow_byte_identical(tmp_path, monkeypatch, capsys):
 
 @pytest.mark.parametrize("case", ["basic", "rich", "planning"])
 def test_t9_headless_begin_squad_stage_byte_identical(tmp_path, case):
+    """Hydra#91: the ``planning`` case is narrowed to exactly two insertions
+    (the ``heads`` field-list line and JSON-schema property in the generated
+    "Plan JSON Schema" section) because Hydra#91 adds ``PlanStep.heads``;
+    ``basic`` and ``rich`` are unchanged."""
     want = json.loads(_FIXTURE.read_text(encoding="utf-8"))["begin_squad_stage"][case]
+    if case == "planning":
+        # Hydra#91: narrowed to the two PlanStep.heads insertions (see helper).
+        want = _with_plan_step_heads(want)
     kw = dict(json.loads(_BEGIN_FIXTURE.read_text(encoding="utf-8"))[case]["kwargs"])
     res = host_bridge.begin_squad_stage(project_root=str(tmp_path), **kw)
     cursor = json.loads(Path(res["cursor_path"]).read_text(encoding="utf-8"))

@@ -539,6 +539,7 @@ def materialise_plan_steps(
             # type onto the materialised task.
             acceptance_criteria=_step_ac or None,
             envelope_type=step.get("envelope_type"),
+            heads=[h for h in (step.get('heads') or []) if isinstance(h, str)],
         )
 
     # Second pass: translate each PlanStep's step_id-keyed `depends_on`
