@@ -4182,6 +4182,56 @@ def _attended_pending_task_ids(state: HydraState, packs: dict | None = None) -> 
     return pending
 
 
+def _attended_task_dissents(state: HydraState, rec: dict) -> list[str]:
+    """Hydra#90: attributed dissent strings for one lead-leg attended result.
+
+    Only a record carrying a ``heads`` mapping (a lead leg) yields anything.
+    Head dissents come first, walking ``rec["heads"]`` in its declared order
+    (built from the task's declared ``heads`` list when the lead result is
+    recorded), then the lead's own. Entries are rendered ``[head:<slug>] <s>``
+    / ``[lead] <s>`` with the statement exactly as retained (bounded and
+    redacted upstream; nothing is re-truncated here). De-duplicated on the
+    whitespace-collapsed, casefolded statement; the first occurrence wins.
+    """
+    from .deliberation import Dissent
+    from .state import head_result_key
+
+    heads = rec.get("heads")
+    if not isinstance(heads, dict):
+        return []
+    tid = str(rec.get("task_id"))
+    head_results = getattr(state, "attended_head_results", None) or {}
+    sources: list[tuple[str, Any]] = []
+    for h in heads:
+        head_rec = head_results.get(head_result_key(tid, str(h)))
+        raw = head_rec.get("dissents") if isinstance(head_rec, dict) else None
+        sources.append((f"head:{h}", raw))
+    sources.append(("lead", rec.get("dissents")))
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for label, raw in sources:
+        if not isinstance(raw, list):
+            continue
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            stmt = entry.get("statement")
+            if not isinstance(stmt, str) or not stmt.strip():
+                continue
+            try:
+                d = Dissent(**{k: entry.get(k, "") for k in
+                               ("plaza", "mythic", "statement", "cell", "rationale")})
+            except (TypeError, ValueError):
+                continue
+            key = " ".join(d.statement.split()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"[{label}] {d.statement}")
+    return out
+
+
 def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[dict]]:
     """Turn attended task records into the state shape `node_synthesis` reads.
 
@@ -4218,6 +4268,10 @@ def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[d
         kind = "attended_squad_artifact" if ref_obj else "attended_pp_run"
         status = str(rec.get("final_status") or rec.get("status") or "complete")
         detail = rec.get("summary") or rec.get("error") or ""
+        _extra: dict[str, Any] = {}
+        _dissents = _attended_task_dissents(state, rec)
+        if _dissents:
+            _extra["dissenting_opinions"] = _dissents
         record = DecisionRecord(
             workflow_id=state.workflow_id,
             origin_squad=squad,
@@ -4230,6 +4284,7 @@ def _materialize_attended_results(state: HydraState) -> tuple[list[dict], list[d
             ),
             artifacts=[MemoryRef(tier="episodic", key=ref_key, summary=kind)],
             sealed=(status == "complete"),
+            **_extra,
         )
         env = record.model_dump(mode="json")
         env["_task_id"] = tid
