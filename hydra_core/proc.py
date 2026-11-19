@@ -81,13 +81,37 @@ def detached_popen_kwargs(*, breakaway: bool = True) -> dict[str, Any]:
     """``creationflags``/``start_new_session`` kwargs for a process that must
     survive its parent's death (Hydra#70 smoke job).
 
-    Windows: ``CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW``
-    so the child is not attached to the parent's console/job object and a
+    Windows: ``CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`` (Hydra#170:
+    deliberately WITHOUT ``DETACHED_PROCESS`` — see below) so the child is
+    not attached to the parent's own process GROUP and a
     ``taskkill /T /F /PID <parent>`` (or the parent's own ``subprocess.run``
     timeout) does not reach into the child's process tree.
     POSIX: ``start_new_session=True`` (new session/process group) so the
     child is not in the parent's process group and survives a
     ``SIGTERM``/``SIGKILL`` sent to the parent alone.
+
+    Hydra#170: Windows ignores ``CREATE_NO_WINDOW`` when it is combined with
+    ``DETACHED_PROCESS`` in the same ``creationflags`` mask — the two flags
+    were mutually defeating in the previous mask
+    (``CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW``), so
+    every console-subsystem grandchild the detached child itself later
+    started (e.g. ``git``, another ``python``) allocated its OWN visible
+    console window — a full-suite smoke job doing this opened hundreds of
+    windows on the operator's desktop. A detached child must therefore use
+    ``CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`` WITHOUT
+    ``DETACHED_PROCESS`` to get a hidden console that its own console-
+    subsystem children then inherit (rather than each allocating a new
+    one). Net effect on the child itself versus the old mask: it now owns a
+    hidden console of its own (instead of none at all) — harmless for a
+    background job that never reads/writes a console directly, and the
+    mechanism by which its console-subsystem children stop popping windows.
+    ``CREATE_NEW_PROCESS_GROUP`` still applies (so the child does not
+    receive a Ctrl+C/Ctrl+Break sent to the parent's console, and still
+    disables Ctrl+C handling for the child itself, same as before). Surviving
+    the parent's own death is unaffected either way: Windows does not
+    terminate a child process merely because its parent exited (unlike job-
+    object teardown, which ``breakaway`` below separately addresses) — that
+    guarantee never depended on ``DETACHED_PROCESS``.
 
     Hydra#70 follow-up (grandchild survives the WORKER but not the HOST
     SESSION): the flags above detach the child from the direct parent's own
@@ -109,7 +133,6 @@ def detached_popen_kwargs(*, breakaway: bool = True) -> dict[str, Any]:
     if os.name == "nt":
         flags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
             | no_window_creationflags()
         )
         if breakaway:
