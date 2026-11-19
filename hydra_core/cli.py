@@ -4192,6 +4192,10 @@ def _attended_task_dissents(state: HydraState, rec: dict) -> list[str]:
     / ``[lead] <s>`` with the statement exactly as retained (bounded and
     redacted upstream; nothing is re-truncated here). De-duplicated on the
     whitespace-collapsed, casefolded statement; the first occurrence wins.
+
+    The head order relies on the checkpoint serde preserving dict insertion
+    order, pinned by ``test_checkpoint_serde_preserves_declared_head_order_attended_results``
+    and ``test_saver_round_trip_keeps_declared_order_and_attribution``.
     """
     from .deliberation import Dissent
     from .state import head_result_key

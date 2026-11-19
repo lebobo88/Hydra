@@ -395,3 +395,100 @@ def test_r9_lead_only_sourcing_fails_r1(tmp_path, monkeypatch, capsys):
     assert _exec_env(envs)["dissenting_opinions"] == []
     with pytest.raises(AssertionError):
         _assert_r1(envs)
+
+
+# --------------------------------------------------------------------------- #
+# Declared head order through the PRODUCTION checkpoint serializer            #
+# --------------------------------------------------------------------------- #
+
+_ORDER3 = ["h3", "h1", "h2"]
+# Non-sorted, longer; "a-first" sorts before everything yet is declared late.
+_ORDER6 = ["zeta", "h3", "mid", "h1", "a-first", "h2"]
+
+
+def _serde():
+    from hydra_core.state import make_checkpoint_serde
+    serde = make_checkpoint_serde()
+    if serde is None:
+        pytest.skip("langgraph not importable")
+    return serde
+
+
+def _roundtrip(serde, obj):
+    """The exact pair SqliteSaver.put / get_tuple call on the checkpoint."""
+    return serde.loads_typed(serde.dumps_typed(obj))
+
+
+def test_checkpoint_serde_preserves_declared_head_order_attended_results():
+    serde = _serde()
+    for order in (_ORDER3, _ORDER6):
+        assert order != sorted(order)
+        rec = {"task_id": "t", "heads": {h: "complete" for h in order}}
+        loaded = _roundtrip(serde, {"channel_values": {"attended_results": [rec]}})
+        assert list(loaded["channel_values"]["attended_results"][0]["heads"]) == order
+
+
+def test_checkpoint_serde_preserves_head_result_dict_order_and_dissents():
+    serde = _serde()
+    results = {
+        head_result_key("t", h): {"dissents": [_hd(f"{h} one"), _hd(f"{h} two")]}
+        for h in _ORDER6}
+    loaded = _roundtrip(serde, {"channel_values": {"attended_head_results": results}})
+    got = loaded["channel_values"]["attended_head_results"]
+    assert list(got) == list(results)
+    assert got == results
+    for h in _ORDER6:
+        assert [d["statement"] for d in got[head_result_key("t", h)]["dissents"]] \
+            == [f"{h} one", f"{h} two"]
+
+
+def test_negative_control_a_sorting_serializer_would_be_caught():
+    heads = {h: "complete" for h in _ORDER6}
+    sorted_rt = json.loads(json.dumps(heads, sort_keys=True))
+    assert list(sorted_rt) != _ORDER6
+    assert list(sorted_rt) == sorted(_ORDER6)
+    assert list(_roundtrip(_serde(), heads)) == _ORDER6
+
+
+def test_saver_round_trip_keeps_declared_order_and_attribution(tmp_path):
+    """Real SqliteSaver(serde=make_checkpoint_serde()) on a file under tmp_path,
+    a real StateGraph(HydraState) (real channel reducers), written through
+    update_state and read back through get_state."""
+    pytest.importorskip("langgraph.checkpoint.sqlite")
+    graph_mod = pytest.importorskip("langgraph.graph")
+    import sqlite3
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    serde = _serde()
+    g = graph_mod.StateGraph(HydraState)
+    g.add_node("n", lambda s: {})
+    g.set_entry_point("n")
+    g.add_edge("n", graph_mod.END)
+    conn = sqlite3.connect(str(tmp_path / "cp.db"), check_same_thread=False)
+    try:
+        sup = g.compile(checkpointer=SqliteSaver(conn, serde=serde))
+        cfg = {"configurable": {"thread_id": "wf-order"}}
+        base = _hand_state({h: "complete" for h in _ORDER6}, {})
+        head_results = {
+            head_result_key(_tid, "h1"): {"dissents": [_hd("cost unclear")]},
+            head_result_key(_tid, "h3"): {"dissents": [_hd("cost unclear", "h3")]},
+        }
+        # Two separate writes: the _merge_dict reducer must combine them.
+        sup.update_state(cfg, {
+            "root_goal": "g", "workflow_id": base.workflow_id,
+            "attended_results": base.attended_results,
+            "attended_head_results": {k: v for k, v in list(head_results.items())[:1]},
+        }, as_node="n")
+        sup.update_state(cfg, {
+            "attended_head_results": dict(list(head_results.items())[1:]),
+        }, as_node="n")
+        values = sup.get_state(cfg).values
+    finally:
+        conn.close()
+
+    rec = values["attended_results"][0]
+    assert list(rec["heads"]) == _ORDER6
+    state = HydraState.model_validate(values)
+    assert list(state.attended_results[0]["heads"]) == _ORDER6
+    # h3 is declared before h1 in _ORDER6, so it takes the shared statement.
+    assert _dissents_of(state) == ["[head:h3] cost unclear"]
