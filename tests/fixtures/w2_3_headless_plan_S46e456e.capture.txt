@@ -1,0 +1,98 @@
+# RUN THIS AT COMMIT 46e456e5afdcb9cb6153ae6eda2a782a6303187d (Hydra#91 start commit S), BEFORE any edit:
+#   git checkout 46e456e -- . (or run in a tree whose hydra_core is that commit's) then
+#   python tests/fixtures/w2_3_headless_plan_S46e456e.capture.txt
+# It writes tests/fixtures/w2_3_headless_plan_S46e456e.json next to itself: a fixed
+# head-less 3-step SAMPLE Plan dumped in every form PlanStep.heads (Hydra#91) must
+# leave byte-identical, plus the materialise_plan_steps patch for that plan.
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import UUID
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))
+
+from hydra_core.schemas import Plan  # noqa: E402
+from hydra_core.state import HydraState  # noqa: E402
+from hydra_core.supervisor import materialise_plan_steps  # noqa: E402
+
+OUT = HERE / "w2_3_headless_plan_S46e456e.json"
+_WF = UUID("11111111-2222-4333-8444-555555555555")
+_ID = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+_AT = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def sample_plan() -> Plan:
+    return Plan(
+        id=_ID, workflow_id=_WF, created_at=_AT, origin_squad="planning",
+        rigor="standard", goal_restatement="Ship the sample", summary="Sample plan",
+        steps=[
+            {"step_id": "step-a", "target_squad": "engineering",
+             "envelope_type": "DEV_TASK", "description": "first step",
+             "acceptance_criteria": ["a works"], "priority": "P1",
+             "estimated_budget_usd": 1.5, "rationale": "root"},
+            {"step_id": "step-b", "target_squad": "engineering",
+             "envelope_type": "DEV_TASK", "description": "second step",
+             "depends_on": ["step-a"], "model_tier": "sonnet",
+             "target_repo_id": "hydra", "target_repo_subpath": "sub",
+             "taxonomy_section": "7"},
+            {"step_id": "step-c", "target_squad": "executive",
+             "envelope_type": "DEV_TASK", "description": "third step",
+             "depends_on": ["step-a", "step-b"], "priority": "P3",
+             "estimated_budget_usd": 0.25},
+        ],
+        non_goals=["nothing else"], open_questions=["why"], risks=["r1"],
+        authored_by=["planner"], dissents=["d1"],
+    )
+
+
+def _norm_ids(obj, mapping):
+    text = json.dumps(obj)
+    return json.loads(_UUID_RE.sub(lambda m: mapping[m.group(0)], text))
+
+
+def capture() -> dict:
+    plan = sample_plan()
+    sel_inc = {"step_id", "estimated_budget_usd"}
+    out: dict = {
+        "a_json": plan.model_dump(mode="json"),
+        "b_python_repr": repr(plan.model_dump()),
+        "c_exclude_none": plan.model_dump(mode="json", exclude_none=True),
+        "d_by_alias": plan.model_dump(mode="json", by_alias=True),
+        "e_model_dump_json": plan.model_dump_json(),
+        "f_include": plan.model_dump(mode="json", include={
+            "steps": {"__all__": {"step_id", "estimated_budget_usd", "rationale"}}}),
+        "g_exclude": plan.model_dump(mode="json", exclude={
+            "steps": {"__all__": {"rationale"}}}),
+        "h_steps": [
+            {"json": s.model_dump(mode="json"),
+             "python_repr": repr(s.model_dump()),
+             "model_dump_json": s.model_dump_json(),
+             "include": s.model_dump(mode="json", include=sel_inc),
+             "exclude": s.model_dump(mode="json", exclude={"rationale"})}
+            for s in plan.steps],
+    }
+    state = HydraState(
+        root_goal="sample goal", workflow_id=_WF,
+        plan_ref=plan.model_dump(mode="json"), plan_status="judged",
+        plan_revision=1, phase="approval",
+        hitl_history=[{"gate_node": "plan_gate", "resolution": "approve",
+                       "plan_revision": 1}],
+    )
+    patch = materialise_plan_steps(state)
+    ids = [str(t.task_id) for t in patch.get("tasks", [])]
+    mapping = {u: f"<TASK-{i}>" for i, u in enumerate(ids)}
+    dumped = {k: ([t.model_dump(mode="json") for t in v] if k == "tasks" else v)
+              for k, v in patch.items()}
+    out["i_materialise_patch"] = _norm_ids(dumped, mapping)
+    return out
+
+
+if __name__ == "__main__":
+    OUT.write_text(json.dumps(capture(), indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    print("wrote", OUT)

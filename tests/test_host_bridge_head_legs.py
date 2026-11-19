@@ -5,6 +5,11 @@
   commit 0720869 BEFORE host_bridge.py was edited; only the temp project root
   was normalised to ``<ROOT>`` and path separators to ``/``);
 * each head leg gets its own cursor file, call_key and artifact.
+
+Hydra#91: the ``planning`` case is narrowed to exactly two insertions in the
+generated "Plan JSON Schema" section (the ``heads`` field-list line and the
+``heads`` JSON-schema property), because Hydra#91 adds ``PlanStep.heads``.
+The ``basic`` and ``rich`` cases are unchanged.
 """
 from __future__ import annotations
 
@@ -19,6 +24,37 @@ import pytest
 from hydra_core import host_bridge
 
 FIXTURE = Path(__file__).parent / "fixtures" / "begin_squad_stage_headless_S0720869.json"
+
+# Hydra#91: the ``planning`` case is narrowed to exactly two insertions in each
+# generated "Plan JSON Schema" prompt section, because PlanStep.heads is new.
+_I1_ANCHOR = "- `rationale` (Union[str, NoneType], optional)"
+_I1_LINE = "- `heads` (list[str], optional)"
+_I2_ANCHOR = '"model_tier":'
+_I2_PROP = '"heads":{"items":{"type":"string"},"title":"Heads","type":"array"},'
+
+
+def _with_plan_step_heads(case_fixture: Any) -> Any:
+    """Return ``case_fixture`` with exactly the I1 and I2 insertions applied to
+    each string containing 'Plan JSON Schema' (each anchor exactly once per
+    string, exactly 2 such strings)."""
+    hits: list[str] = []
+
+    def fix(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: fix(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [fix(v) for v in obj]
+        if isinstance(obj, str) and "Plan JSON Schema" in obj:
+            assert obj.count(_I1_ANCHOR) == 1
+            assert obj.count(_I2_ANCHOR) == 1
+            hits.append(obj)
+            return (obj.replace(_I1_ANCHOR, _I1_ANCHOR + "\n" + _I1_LINE)
+                    .replace(_I2_ANCHOR, _I2_PROP + _I2_ANCHOR))
+        return obj
+
+    out = fix(case_fixture)
+    assert len(hits) == 2
+    return out
 
 
 class _StubDispatcher:
@@ -64,6 +100,8 @@ def test_headless_begin_squad_stage_byte_identical_to_starting_commit(
     tmp_path: Path, case: str,
 ) -> None:
     fx = json.loads(FIXTURE.read_text(encoding="utf-8"))[case]
+    if case == "planning":
+        fx = _with_plan_step_heads(fx)
     kw = dict(fx["kwargs"])
     res = host_bridge.begin_squad_stage(project_root=str(tmp_path), **kw)
     root = str(tmp_path)
