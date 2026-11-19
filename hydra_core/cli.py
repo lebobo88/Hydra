@@ -5013,8 +5013,51 @@ def _cmd_attended_step(args) -> int:
             task_id = str(ne_task.task_id)
             request_text = ne_task.description or state.root_goal
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
+            # Hydra#89 per-head legs. Heads apply only to a non-planning task
+            # on a claude-native pack; with `heads` empty (every existing
+            # task) `_head` stays None and the code below is the head-less
+            # path unchanged (run_id == task_id).
+            _head: str | None = None
+            _cursor_run_id = task_id
+            _head_lead_agent: str | None = None
+            if getattr(ne_task, "heads", None) and ne_task.owner_squad != "planning":
+                if ne_pack.entrypoint != "claude-native":
+                    print(_cli_json_dumps({
+                        "ok": False, "status": "heads_unsupported_entrypoint",
+                        "task_id": task_id, "squad_slug": ne_pack.slug,
+                        "entrypoint": ne_pack.entrypoint,
+                    }, indent=2, default=str))
+                    return 1
+                from . import head_registry as _head_registry
+                from .state import head_leg_run_id as _head_leg_run_id
+                from .state import head_result_key as _head_result_key
+                _recorded_heads = getattr(state, "attended_head_results", None) or {}
+                _next_heads = [h for h in ne_task.heads
+                               if _head_result_key(task_id, h) not in _recorded_heads]
+                if _next_heads:
+                    _head = _next_heads[0]
+                    _head_res = _head_registry.resolve_head(ne_pack.slug, _head)
+                    if _head_res.rule == "unresolved":
+                        print(_cli_json_dumps({
+                            "ok": False, "status": "head_unresolved",
+                            "task_id": task_id, "head": _head,
+                            "error": _head_res.error,
+                        }, indent=2, default=str))
+                        return 1
+                    try:
+                        _cursor_run_id = _head_leg_run_id(task_id, _head)
+                    except ValueError as _e:
+                        print(_cli_json_dumps({
+                            "ok": False, "status": "head_unresolved",
+                            "task_id": task_id, "head": _head,
+                            "error": str(_e),
+                        }, indent=2, default=str))
+                        return 1
+                    _head_lead_agent = _head_res.qualified_name
             action_extras = None
-            if ne_pack.entrypoint == "claude-skill":
+            if _head_lead_agent is not None:
+                lead_agent = _head_lead_agent
+            elif ne_pack.entrypoint == "claude-skill":
                 action_extras = _resolve_claude_skill_host_action(ne_pack)
                 lead_agent = action_extras.pop("agent_type")
             else:
@@ -5087,7 +5130,7 @@ def _cmd_attended_step(args) -> int:
             # return the dedicated `dispatch_seam_cursor_unreadable` result
             # instead -- `begin_squad_stage` is not reached.
             _existing_squad_res = None
-            _ex_cfile = host_bridge.cursor_path(project, wf, task_id)
+            _ex_cfile = host_bridge.cursor_path(project, wf, _cursor_run_id)
             try:
                 _ex_cfile_exists = Path(_ex_cfile).exists()
             except Exception as _e:  # noqa: BLE001
@@ -5156,6 +5199,7 @@ def _cmd_attended_step(args) -> int:
                     plan_revision=_plan_revision,
                     plan_critique=_plan_critique,
                     supersedes_plan_envelope_id=_plan_supersedes,
+                    **({"head": _head} if _head is not None else {}),
                 )
             )
             _seam_err = _apply_dispatch_seam(
@@ -5165,12 +5209,15 @@ def _cmd_attended_step(args) -> int:
             if _seam_err is not None:
                 print(_cli_json_dumps(_seam_err, indent=2, default=str))
                 return 1
-            emit(project, wf, "attended.step", {
-                "run_id": task_id,
+            _step_payload = {
+                "run_id": _cursor_run_id,
                 "task_id": task_id,
                 "squad_slug": ne_pack.slug,
                 "state": res.get("state"),
-            })
+            }
+            if _head is not None:
+                _step_payload["head"] = _head
+            emit(project, wf, "attended.step", _step_payload)
             print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
             return 0
 
@@ -5892,6 +5939,13 @@ def _reconcile_attended_terminal_checkpoint(
                     str(t.task_id) == str(tid) and t.owner_squad == "planning"
                     for t in getattr(state, "tasks", [])
                 )
+                # Hydra#89: a per-head squad leg is neither a completed task
+                # nor a planning task -- it records ONLY its own head result
+                # (below) and leaves the task pending for the next head / the
+                # lead leg. Charging stays on the shared exactly-once path.
+                _is_head_leg = (res.get("leg") == "head"
+                                and res.get("head") is not None
+                                and tid is not None)
                 open_runs = [e for e in state.open_pp_runs
                              if e.get("run_id") != res.get("run_id")]
                 res["budget_block"] = block
@@ -5911,7 +5965,33 @@ def _reconcile_attended_terminal_checkpoint(
                 # omits `budget` entirely when set, rather than smuggling
                 # the charge through unmarked.
                 _charge_write_persist_failed = False
-                if not is_planning_task:
+                if _is_head_leg:
+                    from .state import head_result_key as _head_result_key
+                    _head_record = _attended_result_record(state, res)
+                    if _head_record is not None:
+                        _head_record["head"] = str(res.get("head"))
+                        _head_record["leg"] = "head"
+                    # Same atomic patch as the charge + its marker (merge-dict
+                    # reducer): no completed/done ids, no attended_results.
+                    _patch = {
+                        "open_pp_runs": open_runs,
+                        "budget": state.budget.model_dump(mode="json"),
+                        "budget_downgrade_active": bool(downgrade),
+                        "attended_head_results": {
+                            _head_result_key(str(tid), str(res.get("head"))): _head_record,
+                        },
+                    }
+                    if not _charge_applied or _legacy_charge_repair:
+                        _patch["attended_charge_applied"] = {
+                            _recon_key: {"block": bool(block), "downgrade": bool(downgrade)},
+                        }
+                    try:
+                        sup.update_state(config, _patch)
+                    except Exception as e:  # noqa: BLE001
+                        emit(project, wf, "attended.persist_failed", {"error": str(e)})
+                        _persist_errors.append(str(e))
+                        _charge_write_persist_failed = True
+                elif not is_planning_task:
                     completed = list(state.attended_completed_task_ids)
                     if tid is not None and str(tid) not in completed:
                         completed.append(str(tid))
@@ -6051,6 +6131,31 @@ def _reconcile_attended_terminal_checkpoint(
                             "emitted_count": len(emitted),
                             "is_planning_task": is_planning_task,
                         })
+                elif _is_head_leg:
+                    # Hydra#89: a head leg is a sub-step of a task, not a
+                    # delegating agent -- its emitted envelopes are never
+                    # ingested. Park each on the cursor through the existing
+                    # rejected-envelope path instead of dropping it silently.
+                    if emitted:
+                        _head_rejected: list[dict[str, object]] = [
+                            {"envelope_id": (str(e.get("id")) if isinstance(e, dict)
+                                             and e.get("id") is not None else "?"),
+                             "envelope_type": (e.get("type") if isinstance(e, dict)
+                                               else None),
+                             "status": "failed",
+                             "reason": "head_leg_cannot_delegate",
+                             "detail": "head_leg_cannot_delegate",
+                             "errors": [{"field": "",
+                                         "msg": "head_leg_cannot_delegate"}]}
+                            for e in emitted
+                        ]
+                        res["ingest"] = list(_head_rejected)
+                        _apply_rejected_envelopes(
+                            res, _head_rejected,
+                            record_fn=host_bridge.record_rejected_envelopes,
+                            emit_fn=emit, project=project, wf=wf,
+                            cfile=cfile, run_id=str(run_id),
+                        )
                 # Hydra#69 defect C: for a `planning` task the ingest loop
                 # must run even with an EMPTY `emitted` list — that is
                 # itself the "missing PLAN" rejection case, and the
