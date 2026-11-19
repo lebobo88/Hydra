@@ -123,6 +123,43 @@ is automation-only (cron / external callers / the cross-repo fleet), gated by
    text or in an emitted envelope are not recorded. A head-less squad result is
    unchanged. If the pack emits engineering envelopes (DEV_TASK/PRD),
    submit them via `hydra.workflow.submit_envelopes` as before.
+
+   **Parallel head legs (W2.4, Hydra#92).** A squad step response carries
+   `host_actions` only when two or more head legs are served: spawn one
+   visible `Agent` per entry, in the declared order, and submit each entry with
+   its own `run_id` and `host_action.call_key`. Exactly one served leg gives the
+   single-leg response with no `host_actions`.
+   <!-- test_three_heads_one_step_returns_three_actions_in_declared_order -->
+   The top-level `host_action` is the first entry, so a host that reads only it
+   still converges one leg at a time.
+   <!-- test_three_head_serial_characterization_matches_capture -->
+   Submits may arrive in any order and still converge.
+   <!-- test_six_submit_orders_converge -->
+   <!-- test_two_process_submits_converge -->
+   A step always returns every open leg. A step opens every unrecorded head that is not yet open unless the budget gate blocks it; it opens nothing new when every unrecorded head is already open or budget-blocked.
+   <!-- test_restep_with_all_legs_open_is_idempotent -->
+   <!-- test_restep_after_one_submit_returns_remaining_open_legs_no_lead -->
+   <!-- test_budget_block_mixed_order_reserves_open_head -->
+   `budget_blocked_heads` names the heads that were not opened because the
+   budget is exhausted; open legs are still re-served in the same response.
+   <!-- test_budget_block_mixed_order_reserves_open_head -->
+   With nothing open, the step returns `budget_blocked`.
+   <!-- test_budget_exhausted_with_nothing_open_returns_budget_blocked -->
+   If a step fails partway it returns the error. The next step re-serves the
+   legs that are open, and opens each remaining head only if that head now
+   resolves, its dispatch seam succeeds and the budget gate does not block it.
+   <!-- test_seam_failure_on_second_leg_then_restep -->
+   <!-- test_head_unresolved_on_second_leg_then_restep -->
+   The lead leg appears only after every head has a result.
+   <!-- test_lead_only_after_all_heads_submitted -->
+   `submit_host_result` may return `status: "resume_in_progress"` (another
+   submit holds the resume lock); retry the same submit. A duplicate submit is
+   reported `already_charged` and is not charged again.
+   <!-- test_submit_refused_while_resume_lock_held -->
+   <!-- test_two_process_submits_converge -->
+   <!-- test_duplicate_submit_not_recharged -->
+   Engineering stays single-stream: an engineering step never returns `host_actions`.
+   <!-- test_baseline_responses_match_capture -->
 5. **Synthesis — call the engine, do not improvise it.** When every task is
    attended-done, `step` returns `{status:"ready_to_finalize"}` (the legacy
    `no_pending_task` field is still set for older hosts). Call
