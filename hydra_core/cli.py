@@ -4573,6 +4573,106 @@ def _apply_dispatch_seam(
         return None
 
 
+def _serve_head_leg(
+    *, project: Path, wf: str, state: Any, ne_task: Any, ne_pack: Any,
+    task_id: str, cursor_run_id: str, head: str | None, lead_leg: bool,
+    lead_agent: str | None, action_extras: dict | None, request_text: str,
+    pack_cwd: Any, upstream_refs: list[str], attempt: int,
+    plan_revision: Any, plan_critique: Any, plan_supersedes: Any,
+) -> tuple[str, dict]:
+    """Serve ONE squad leg (head leg, lead leg or head-less task).
+
+    Returns ``("served", res)``, ``("blocked", budget_blocked_dict)`` or
+    ``("error", error_dict)``; the caller prints / emits. Single-leg
+    semantics are those of the pre-W2.4 inline body: an open non-terminal
+    cursor at the same attempt is re-served with NO budget check; otherwise
+    the budget gate runs and, if clear, ``begin_squad_stage`` opens the cursor
+    BEFORE ``_apply_dispatch_seam`` writes the ticket.
+    """
+    from . import dispatch_seam as _dispatch_seam
+    from . import host_bridge
+
+    # W1.2 step B recovery (M4/M6): a lookup fault that cannot TELL whether an
+    # open cursor exists must never fall through to begin_squad_stage (a second
+    # cursor under an unconfirmed first one is the double-dispatch this
+    # recovery exists to prevent).
+    _existing_squad_res = None
+    _ex_cfile = host_bridge.cursor_path(project, wf, cursor_run_id)
+    try:
+        _ex_cfile_exists = Path(_ex_cfile).exists()
+    except Exception as _e:  # noqa: BLE001
+        _dispatch_seam.safe_emit(
+            project, wf, "dispatch.recovery_cursor_exists_check_failed",
+            {"task_id": task_id, "error": type(_e).__name__})
+        return "error", {
+            "ok": False,
+            "status": "dispatch_seam_cursor_unreadable",
+            "cursor_path": str(_ex_cfile),
+            "retryable": True,
+        }
+    if _ex_cfile_exists:
+        try:
+            _ex_cursor = host_bridge.load_cursor(_ex_cfile)
+        except Exception as _e:  # noqa: BLE001
+            _dispatch_seam.safe_emit(
+                project, wf, "dispatch.recovery_cursor_load_failed",
+                {"task_id": task_id, "error": type(_e).__name__})
+            return "error", {
+                "ok": False,
+                "status": "dispatch_seam_cursor_unreadable",
+                "cursor_path": str(_ex_cfile),
+                "retryable": True,
+            }
+        if (isinstance(_ex_cursor, dict)
+                and _ex_cursor.get("state") not in host_bridge._TERMINAL
+                and isinstance(_ex_cursor.get("pending_action"), dict)
+                and _ex_cursor.get("attempt") == attempt):
+            _existing_squad_res = host_bridge.step_result(_ex_cursor, _ex_cfile)
+
+    if _existing_squad_res is None:
+        _blocked = _dispatch_seam.budget_gate(state)
+        if _blocked is not None:
+            _blocked.update({"task_id": task_id, "squad_slug": ne_pack.slug})
+            return "blocked", _blocked
+
+    res = _existing_squad_res if _existing_squad_res is not None else (
+        host_bridge.begin_squad_stage(
+            action_extras=action_extras,
+            workflow_id=wf,
+            task_id=task_id,
+            squad_slug=ne_pack.slug,
+            entrypoint=ne_pack.entrypoint,
+            lead_agent=lead_agent,
+            pack_cwd=pack_cwd,
+            request_text=request_text,
+            project_root=project,
+            goal=state.root_goal,
+            envelope_id=(str(ne_task.envelope_id)
+                         if getattr(ne_task, "envelope_id", None) else None),
+            upstream_refs=upstream_refs,
+            budget_usd=state.budget.budget_usd,
+            budget_remaining_usd=state.budget.usd_remaining,
+            risk=("high" if getattr(state, "requires_human_approval", False)
+                  else "normal"),
+            priority=getattr(ne_task, "priority", None),
+            acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
+            attempt=attempt,
+            plan_revision=plan_revision,
+            plan_critique=plan_critique,
+            supersedes_plan_envelope_id=plan_supersedes,
+            **({"head": head} if head is not None else {}),
+            **({"leg": "lead"} if lead_leg else {}),
+        )
+    )
+    _seam_err = _apply_dispatch_seam(
+        project, wf, res, kind="squad", pack=ne_pack,
+        squad_slug=ne_pack.slug, budget_usd=state.budget.budget_usd,
+        budget_remaining_usd=state.budget.usd_remaining)
+    if _seam_err is not None:
+        return "error", _seam_err
+    return "served", res
+
+
 def _cmd_attended_step(args) -> int:
     """Attended (host-bridged) execution: open the next pending task stage and
     PAUSE for a visible host subagent (engineer for mcp squads; pack lead agent
@@ -5074,13 +5174,12 @@ def _cmd_attended_step(args) -> int:
             pack_cwd = _resolve_pack_cwd(ne_pack, project)
             # Hydra#89 per-head legs. Heads apply only to a non-planning task
             # on a claude-native pack; with `heads` empty (every existing
-            # task) `_head` stays None and the code below is the head-less
+            # task) `_walk_heads` stays empty and the code below is the head-less
             # path unchanged (run_id == task_id).
-            _head: str | None = None
             _cursor_run_id = task_id
-            _head_lead_agent: str | None = None
             _lead_leg = False
             _lead_head_refs: list[str] = []
+            _walk_heads: list[str] = []
             if getattr(ne_task, "heads", None) and ne_task.owner_squad != "planning":
                 if ne_pack.entrypoint != "claude-native":
                     print(_cli_json_dumps({
@@ -5089,32 +5188,15 @@ def _cmd_attended_step(args) -> int:
                         "entrypoint": ne_pack.entrypoint,
                     }, indent=2, default=str))
                     return 1
-                from . import head_registry as _head_registry
-                from .state import head_leg_run_id as _head_leg_run_id
                 from .state import head_result_key as _head_result_key
                 _recorded_heads = getattr(state, "attended_head_results", None) or {}
                 _next_heads = [h for h in ne_task.heads
                                if _head_result_key(task_id, h) not in _recorded_heads]
                 if _next_heads:
-                    _head = _next_heads[0]
-                    _head_res = _head_registry.resolve_head(ne_pack.slug, _head)
-                    if _head_res.rule == "unresolved":
-                        print(_cli_json_dumps({
-                            "ok": False, "status": "head_unresolved",
-                            "task_id": task_id, "head": _head,
-                            "error": _head_res.error,
-                        }, indent=2, default=str))
-                        return 1
-                    try:
-                        _cursor_run_id = _head_leg_run_id(task_id, _head)
-                    except ValueError as _e:
-                        print(_cli_json_dumps({
-                            "ok": False, "status": "head_unresolved",
-                            "task_id": task_id, "head": _head,
-                            "error": str(_e),
-                        }, indent=2, default=str))
-                        return 1
-                    _head_lead_agent = _head_res.qualified_name
+                    # W2.4 (Hydra#92): every unrecorded head is walked below
+                    # in declared order; each head is resolved lazily there so
+                    # a failure on leg k leaves legs 1..k-1 open (D3).
+                    _walk_heads = list(_next_heads)
                 else:
                     # Every head has a recorded result (any status): this
                     # step opens the lead leg on the single task_id cursor.
@@ -5128,8 +5210,8 @@ def _cmd_attended_step(args) -> int:
                             f"head:{_h} {_hkey} ({_hstatus})" if _hkey
                             else f"head:{_h} (no artifact, {_hstatus})")
             action_extras = None
-            if _head_lead_agent is not None:
-                lead_agent = _head_lead_agent
+            if _walk_heads:
+                lead_agent = None  # resolved per head inside the walk
             elif ne_pack.entrypoint == "claude-skill":
                 action_extras = _resolve_claude_skill_host_action(ne_pack)
                 lead_agent = action_extras.pop("agent_type")
@@ -5205,97 +5287,90 @@ def _cmd_attended_step(args) -> int:
             # recovery lookup exists to prevent. Report via `safe_emit` and
             # return the dedicated `dispatch_seam_cursor_unreadable` result
             # instead -- `begin_squad_stage` is not reached.
-            _existing_squad_res = None
-            _ex_cfile = host_bridge.cursor_path(project, wf, _cursor_run_id)
-            try:
-                _ex_cfile_exists = Path(_ex_cfile).exists()
-            except Exception as _e:  # noqa: BLE001
-                _dispatch_seam.safe_emit(
-                    project, wf, "dispatch.recovery_cursor_exists_check_failed",
-                    {"task_id": task_id, "error": type(_e).__name__})
-                print(_cli_json_dumps({
-                    "ok": False,
-                    "status": "dispatch_seam_cursor_unreadable",
-                    "cursor_path": str(_ex_cfile),
-                    "retryable": True,
-                }, indent=2, default=str))
-                return 1
-            if _ex_cfile_exists:
-                try:
-                    _ex_cursor = host_bridge.load_cursor(_ex_cfile)
-                except Exception as _e:  # noqa: BLE001
-                    _dispatch_seam.safe_emit(
-                        project, wf, "dispatch.recovery_cursor_load_failed",
-                        {"task_id": task_id, "error": type(_e).__name__})
-                    print(_cli_json_dumps({
-                        "ok": False,
-                        "status": "dispatch_seam_cursor_unreadable",
-                        "cursor_path": str(_ex_cfile),
-                        "retryable": True,
-                    }, indent=2, default=str))
+            _leg_kwargs = dict(
+                project=project, wf=wf, state=state, ne_task=ne_task,
+                ne_pack=ne_pack, task_id=task_id, action_extras=action_extras,
+                request_text=request_text, pack_cwd=pack_cwd,
+                upstream_refs=_upstream_refs, attempt=_attempt,
+                plan_revision=_plan_revision, plan_critique=_plan_critique,
+                plan_supersedes=_plan_supersedes)
+            if not _walk_heads:
+                # Head-less task or the lead leg: single-leg path, unchanged.
+                _kind, _leg = _serve_head_leg(
+                    cursor_run_id=_cursor_run_id, head=None,
+                    lead_leg=_lead_leg, lead_agent=lead_agent, **_leg_kwargs)
+                if _kind == "error":
+                    print(_cli_json_dumps(_leg, indent=2, default=str))
                     return 1
-                if (isinstance(_ex_cursor, dict)
-                        and _ex_cursor.get("state") not in host_bridge._TERMINAL
-                        and isinstance(_ex_cursor.get("pending_action"), dict)
-                        and _ex_cursor.get("attempt") == _attempt):
-                    _existing_squad_res = host_bridge.step_result(_ex_cursor, _ex_cfile)
-
-            if _existing_squad_res is None:
-                _blocked = _dispatch_seam.budget_gate(state)
-                if _blocked is not None:
-                    _blocked.update({"task_id": task_id, "squad_slug": ne_pack.slug})
+                if _kind == "blocked":
                     # Item 22: a trace-write failure here must not turn a
                     # budget_blocked response into a crash.
-                    _dispatch_seam.safe_emit(project, wf, "attended.budget_blocked", _blocked)
-                    print(_cli_json_dumps(_blocked, indent=2, default=str))
+                    _dispatch_seam.safe_emit(project, wf, "attended.budget_blocked", _leg)
+                    print(_cli_json_dumps(_leg, indent=2, default=str))
                     return 0
+                emit(project, wf, "attended.step", {
+                    "run_id": _cursor_run_id, "task_id": task_id,
+                    "squad_slug": ne_pack.slug, "state": _leg.get("state")})
+                print(_cli_json_dumps({"ok": True, **_leg}, indent=2, default=str))
+                return 0
 
-            res = _existing_squad_res if _existing_squad_res is not None else (
-                host_bridge.begin_squad_stage(
-                    action_extras=action_extras,
-                    workflow_id=wf,
-                    task_id=task_id,
-                    squad_slug=ne_pack.slug,
-                    entrypoint=ne_pack.entrypoint,
-                    lead_agent=lead_agent,
-                    pack_cwd=pack_cwd,
-                    request_text=request_text,
-                    project_root=project,
-                    goal=state.root_goal,
-                    envelope_id=(str(ne_task.envelope_id)
-                                 if getattr(ne_task, "envelope_id", None) else None),
-                    upstream_refs=_upstream_refs,
-                    budget_usd=state.budget.budget_usd,
-                    budget_remaining_usd=state.budget.usd_remaining,
-                    risk=("high" if getattr(state, "requires_human_approval", False)
-                          else "normal"),
-                    priority=getattr(ne_task, "priority", None),
-                    acceptance_criteria=getattr(ne_task, "acceptance_criteria", None),
-                    attempt=_attempt,
-                    plan_revision=_plan_revision,
-                    plan_critique=_plan_critique,
-                    supersedes_plan_envelope_id=_plan_supersedes,
-                    **({"head": _head} if _head is not None else {}),
-                    **({"leg": "lead"} if _lead_leg else {}),
-                )
-            )
-            _seam_err = _apply_dispatch_seam(
-                project, wf, res, kind="squad", pack=ne_pack,
-                squad_slug=ne_pack.slug, budget_usd=state.budget.budget_usd,
-                budget_remaining_usd=state.budget.usd_remaining)
-            if _seam_err is not None:
-                print(_cli_json_dumps(_seam_err, indent=2, default=str))
-                return 1
-            _step_payload = {
-                "run_id": _cursor_run_id,
-                "task_id": task_id,
-                "squad_slug": ne_pack.slug,
-                "state": res.get("state"),
-            }
-            if _head is not None:
-                _step_payload["head"] = _head
-            emit(project, wf, "attended.step", _step_payload)
-            print(_cli_json_dumps({"ok": True, **res}, indent=2, default=str))
+            # W2.4 (Hydra#92) D2: walk EVERY unrecorded head in declared
+            # order. An open head is always re-served (no budget check); a
+            # not-yet-open head is opened unless the budget gate blocks it,
+            # in which case it is listed in budget_blocked_heads. A budget
+            # block never stops the walk. An error on leg k (D3) prints that
+            # error and returns 1; earlier legs stay open (no rollback).
+            from . import head_registry as _head_registry
+            from .state import head_leg_run_id as _head_leg_run_id
+            _served: list[dict] = []
+            _blocked_heads: list[str] = []
+            _first_blocked: dict | None = None
+            for _head in _walk_heads:
+                _head_res = _head_registry.resolve_head(ne_pack.slug, _head)
+                if _head_res.rule == "unresolved":
+                    print(_cli_json_dumps({
+                        "ok": False, "status": "head_unresolved",
+                        "task_id": task_id, "head": _head,
+                        "error": _head_res.error,
+                    }, indent=2, default=str))
+                    return 1
+                try:
+                    _leg_run_id = _head_leg_run_id(task_id, _head)
+                except ValueError as _e:
+                    print(_cli_json_dumps({
+                        "ok": False, "status": "head_unresolved",
+                        "task_id": task_id, "head": _head,
+                        "error": str(_e),
+                    }, indent=2, default=str))
+                    return 1
+                _kind, _leg = _serve_head_leg(
+                    cursor_run_id=_leg_run_id, head=_head, lead_leg=False,
+                    lead_agent=_head_res.qualified_name, **_leg_kwargs)
+                if _kind == "error":
+                    print(_cli_json_dumps(_leg, indent=2, default=str))
+                    return 1
+                if _kind == "blocked":
+                    _blocked_heads.append(_head)
+                    if _first_blocked is None:
+                        _first_blocked = _leg
+                    continue
+                emit(project, wf, "attended.step", {
+                    "run_id": _leg_run_id, "task_id": task_id,
+                    "squad_slug": ne_pack.slug, "state": _leg.get("state"),
+                    "head": _head})
+                _served.append(_leg)
+            if not _served:
+                # Nothing open and the budget gate blocked: today's response.
+                _dispatch_seam.safe_emit(
+                    project, wf, "attended.budget_blocked", _first_blocked)
+                print(_cli_json_dumps(_first_blocked, indent=2, default=str))
+                return 0
+            _resp: dict = {"ok": True, **_served[0]}
+            if len(_served) > 1:
+                _resp["host_actions"] = [{"ok": True, **_r} for _r in _served]
+            if _blocked_heads:
+                _resp["budget_blocked_heads"] = _blocked_heads
+            print(_cli_json_dumps(_resp, indent=2, default=str))
             return 0
 
         # P1: awaiting_plan_approval — a plan-gate HITL is open. Distinct from
