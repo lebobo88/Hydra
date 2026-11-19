@@ -4395,6 +4395,7 @@ def begin_squad_stage(
     plan_critique: str | None = None,
     supersedes_plan_envelope_id: str | None = None,
     head: str | None = None,
+    leg: str | None = None,
 ) -> dict[str, Any]:
     """Create a lightweight cursor for an attended non-engineering squad task
     (claude-skill or agent-impersonation entrypoint).
@@ -4426,7 +4427,14 @@ def begin_squad_stage(
     the head-less cursor. An invalid ``head``/``task_id`` raises ``ValueError``
     from ``head_leg_run_id`` before anything is written. ``head=None`` is
     byte-identical to the pre-#89 behaviour.
+
+    Hydra#89: ``leg="lead"`` (default ``None``) marks the lead leg of a task
+    whose heads have all reported: the cursor stays on ``run_id == task_id``
+    and gains ``leg="lead"``. It is mutually exclusive with ``head``; any
+    other value raises ``ValueError`` before anything is written.
     """
+    if leg is not None and (leg != "lead" or head is not None):
+        raise ValueError(f"invalid squad leg {leg!r} (head={head!r})")
     if head is None:
         run_id = task_id
     else:
@@ -4494,6 +4502,8 @@ def begin_squad_stage(
     if head is not None:
         cursor["head"] = head
         cursor["leg"] = "head"
+    elif leg is not None:
+        cursor["leg"] = leg
     cfile = cursor_path(project_root, workflow_id, run_id)
     save_cursor(cfile, cursor)
     started_payload: dict[str, Any] = {
