@@ -1,0 +1,179 @@
+{
+  "checkpoint": {
+    "attended_charge_applied": {
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0": {
+        "block": false,
+        "downgrade": false
+      }
+    },
+    "attended_checkpoint_reconciled": {
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee:squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0": true
+    },
+    "attended_completed_task_ids": [
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    ],
+    "attended_done_task_ids": [
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    ],
+    "attended_head_results": {},
+    "attended_results": [
+      {
+        "artifact_ref": {
+          "key": "mem:test"
+        },
+        "changed_paths": [],
+        "cost_usd": 0.375,
+        "final_status": "complete",
+        "merged": false,
+        "owner_squad": "executive",
+        "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "stage_id": null,
+        "status": "complete",
+        "summary": null,
+        "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+      }
+    ],
+    "budget": {
+      "budget_usd": 50.0,
+      "estimated_usd": 0.0,
+      "repo_budgets": {},
+      "repo_spend": {},
+      "spent_tokens": 10,
+      "spent_usd": 0.375,
+      "token_limit": 200000,
+      "unmeasured_stages": 0
+    },
+    "budget_downgrade_active": false,
+    "open_pp_runs": []
+  },
+  "cursor_after_step": {
+    "attempt": 0,
+    "cost_usd": 0.0,
+    "entrypoint": "claude-native",
+    "error": null,
+    "final_status": null,
+    "finalized": false,
+    "kind": "squad",
+    "pending_action": {
+      "agent_type": "executive-suite:boardroom",
+      "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+      "cwd": "C:/AiAppDeployments/ExecutiveSuite",
+      "instructions": "Run the pack agent and submit the artifact.",
+      "prompt": "## Hydra context\nworkflow_id: 11111111-2222-4333-8444-555555555555\ntask_id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\nsquad: executive\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\nbrief the board\n\n## Task\nbrief the board\n\n## Constraints\nbudget_usd: 50.00 remaining of 50.00 total, risk: normal, priority: P2\nacceptance_criteria: (none)",
+      "task_description": "brief the board"
+    },
+    "project_path": "C:/AiAppDeployments/ExecutiveSuite",
+    "project_root": "<ROOT>",
+    "request_text": "brief the board",
+    "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "schema": 1,
+    "squad_slug": "executive",
+    "state": "await_squad_agent",
+    "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "cursor_after_submit": {
+    "artifact_persisted_via": "native",
+    "artifact_ref": {
+      "key": "mem:test"
+    },
+    "artifact_text": "done",
+    "attempt": 0,
+    "charged": true,
+    "cost_source": "measured",
+    "cost_usd": 0.375,
+    "emitted_envelopes": [],
+    "entrypoint": "claude-native",
+    "error": null,
+    "final_status": "complete",
+    "finalized": true,
+    "kind": "squad",
+    "pending_action": null,
+    "project_path": "C:/AiAppDeployments/ExecutiveSuite",
+    "project_root": "<ROOT>",
+    "request_text": "brief the board",
+    "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "schema": 1,
+    "squad_slug": "executive",
+    "state": "complete",
+    "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "terminal_call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+    "tokens_in": 7,
+    "tokens_out": 3,
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "step": {
+    "cost_source": "measured",
+    "cost_usd": 0.0,
+    "cursor_path": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.json",
+    "dispatch_ticket": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/tickets/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee.91be9cc8ddd765d3f99b0601bbd15300.json",
+    "estimated_cost_usd": 0.0,
+    "host_action": {
+      "agent_type": "executive-suite:boardroom",
+      "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+      "cwd": "C:/AiAppDeployments/ExecutiveSuite",
+      "instructions": "Run the pack agent and submit the artifact.",
+      "prompt": "## Hydra context\nworkflow_id: 11111111-2222-4333-8444-555555555555\ntask_id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\nsquad: executive\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\nbrief the board\n\n## Task\nbrief the board\n\n## Constraints\nbudget_usd: 50.00 remaining of 50.00 total, risk: normal, priority: P2\nacceptance_criteria: (none)",
+      "task_description": "brief the board"
+    },
+    "ok": true,
+    "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "squad_slug": "executive",
+    "stage_id": null,
+    "state": "await_squad_agent",
+    "status": "awaiting_host",
+    "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "unmeasured_count": 0,
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "submit": {
+    "already_charged": false,
+    "artifact_persisted_via": "native",
+    "artifact_ref": {
+      "key": "mem:test"
+    },
+    "artifact_text": "done",
+    "budget_block": false,
+    "budget_downgrade": false,
+    "changed_paths": [],
+    "cost_source": "measured",
+    "cost_usd": 0.375,
+    "cursor_path": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.json",
+    "estimated_cost_usd": 0.0,
+    "final_status": "complete",
+    "ok": true,
+    "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "smoke_status": null,
+    "spent_usd": 0.375,
+    "squad_slug": "executive",
+    "stage_id": null,
+    "stage_outcome": null,
+    "state": "complete",
+    "status": "complete",
+    "task_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "terminal_call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+    "tokens_in": 7,
+    "tokens_out": 3,
+    "unmeasured_count": 0,
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "ticket": {
+    "agent_type": "executive-suite:boardroom",
+    "budget_remaining_usd": 50.0,
+    "budget_usd": 50.0,
+    "call_key": "squad-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-0",
+    "head": "boardroom",
+    "kind": "squad",
+    "mode": "audit",
+    "prompt_sha256": "8103cb93d2b539d69e53f2192602b00ebcca36cb3b58655686e148e5df308fe4",
+    "run_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "schema": 1,
+    "squad_slug": "executive",
+    "ticket_id": "91be9cc8ddd765d3f99b0601bbd153009ecb02d61d2d954660cac55e22255e47",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  }
+}
