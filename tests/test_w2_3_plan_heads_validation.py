@@ -318,34 +318,154 @@ def _plan_ref_writes(tree: ast.AST) -> list[tuple[int, str]]:
     return hits
 
 
-def _enclosing_def(tree: ast.Module, lineno: int) -> str | None:
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                and node.lineno <= lineno <= (node.end_lineno or node.lineno):
-            return node.name
-    return None
+def _is_plan_branch_test(test: ast.AST) -> bool:
+    """``etype == "PLAN"`` -- the test expression selecting the PLAN envelope."""
+    return (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name)
+            and test.left.id == "etype" and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq) and len(test.comparators) == 1
+            and _is_const(test.comparators[0], "PLAN"))
 
 
-# (relative path, enclosing top-level function) -> justification. EMPTY at the
-# Hydra#91 start commit: the detector found exactly one write, in ingest.py.
+def _plan_branch_violations(src: str) -> list[str]:
+    """Structural check (no line numbers baked in) over one source text.
+
+    ``src`` must define ``dispatch_ingested_envelopes`` holding exactly one
+    ``if etype == "PLAN":`` node. Returns violations (empty == accepted):
+    (a) every plan_ref write in ``src`` is lexically inside that node;
+    (b) a ``validate_plan_heads`` call is inside that node and precedes the
+    first write in source order.
+    """
+    tree = ast.parse(src)
+    fns = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+           and n.name == "dispatch_ingested_envelopes"]
+    if len(fns) != 1:
+        return ["no single dispatch_ingested_envelopes"]
+    branches = [n for n in ast.walk(fns[0])
+                if isinstance(n, ast.If) and _is_plan_branch_test(n.test)]
+    if len(branches) != 1:
+        return [f"expected exactly one PLAN branch, found {len(branches)}"]
+    branch = branches[0]
+    inside = {id(n) for stmt in branch.body for n in ast.walk(stmt)}
+    out: list[str] = []
+    writes: list[int] = []
+    # Locate write NODES (not just lines) so containment is by node identity.
+    for n in ast.walk(tree):
+        if _node_is_write(n):
+            writes.append(n.lineno)
+            if id(n) not in inside:
+                out.append(f"plan_ref write at line {n.lineno} is outside the PLAN branch")
+    calls = [n.lineno for stmt in branch.body for n in ast.walk(stmt)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "validate_plan_heads"]
+    if not calls:
+        out.append("no validate_plan_heads call inside the PLAN branch")
+    elif writes and min(calls) >= min(writes):
+        out.append("validate_plan_heads call does not precede the first plan_ref write")
+    return out
+
+
+def _node_is_write(n: ast.AST) -> bool:
+    """True when this single node is itself a plan_ref write (forms i-v)."""
+    return bool(_plan_ref_writes_at(n))
+
+
+def _plan_ref_writes_at(n: ast.AST) -> list[str]:
+    forms: list[str] = []
+    if isinstance(n, ast.Dict) and any(
+            k is not None and _is_const(k, "plan_ref") for k in n.keys):
+        forms.append("i")
+    elif isinstance(n, ast.keyword) and n.arg == "plan_ref":
+        forms.append("ii")
+    elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+        targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+        for t in targets:
+            for e in ast.walk(t):
+                if (isinstance(e, ast.Subscript) and _is_const(e.slice, "plan_ref"))                         or (isinstance(e, ast.Attribute) and e.attr == "plan_ref"):
+                    forms.append("iii/iv")
+    if isinstance(n, ast.Call):
+        f = n.func
+        if isinstance(f, ast.Attribute) and f.attr == "setdefault"                 and n.args and _is_const(n.args[0], "plan_ref"):
+            forms.append("v")
+    return forms
+
+
+# (relative path, enclosing top-level function) -> justification. EMPTY: the
+# detector finds exactly one write in hydra_core, inside ingest's PLAN branch.
 _ALLOWED_WRITES: dict[tuple[str, str], str] = {}
 
 
 def test_plan_ref_single_writer_is_ingest():
-    found: list[tuple[str, int, str, str | None]] = []
+    ingest_rel = "hydra_core/ingest.py"
+    found = 0
     for path in sorted((_ROOT / "hydra_core").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        src = path.read_text(encoding="utf-8")
         rel = path.relative_to(_ROOT).as_posix()
-        for lineno, form in _plan_ref_writes(tree):
-            found.append((rel, lineno, form, _enclosing_def(tree, lineno)))
-    assert found, "detector found no plan_ref write at all: it is broken"
-    for rel, lineno, form, fn in found:
-        if (rel, fn or "") in _ALLOWED_WRITES:
+        writes = _plan_ref_writes(ast.parse(src))
+        if rel == ingest_rel:
+            assert writes, "detector found no plan_ref write in ingest: it is broken"
+            found += len(writes)
+            assert _plan_branch_violations(src) == []
+        else:
+            for lineno, form in writes:
+                assert any(r == rel for r, _ in _ALLOWED_WRITES), (
+                    f"plan_ref written outside the ingest PLAN branch: {rel}:{lineno} "
+                    f"({form}) -- it could put an unvalidated plan in front of "
+                    "materialise_plan_steps")
+    assert found >= 1
+
+
+_WELL_FORMED = """
+def dispatch_ingested_envelopes(state, raws):
+    for raw in raws:
+        etype = raw
+        if etype != "PLAN" and other():
             continue
-        assert (rel, fn) == ("hydra_core/ingest.py", "dispatch_ingested_envelopes"), (
-            f"plan_ref written outside the ingest PLAN branch: {rel}:{lineno} "
-            f"({form}, in {fn}) -- it could put an unvalidated plan in front of "
-            "materialise_plan_steps")
+        if etype == "PLAN":
+            errs = []
+            errs.extend(validate_plan_heads(plan, packs=packs))
+            if errs:
+                continue
+            patch = {"plan_ref": plan.model_dump()}
+            continue
+        later = 1
+"""
+
+_OUTSIDE = _WELL_FORMED + """
+        stray = {"plan_ref": 2}
+"""
+
+_NL = chr(10)
+_VALIDATE_LINE = "            errs.extend(validate_plan_heads(plan, packs=packs))" + _NL
+
+_BEFORE_VALIDATE = _WELL_FORMED.replace(
+    _VALIDATE_LINE, '            patch0 = {"plan_ref": 0}' + _NL + _VALIDATE_LINE)
+
+_NO_VALIDATE = _WELL_FORMED.replace(_VALIDATE_LINE, "")
+
+_VALIDATE_OUTSIDE_BRANCH = _NO_VALIDATE.replace(
+    '        if etype == "PLAN":',
+    '        validate_plan_heads(plan)' + _NL + '        if etype == "PLAN":')
+
+
+@pytest.mark.parametrize("src,ok,needle", [
+    pytest.param(_WELL_FORMED, True, "", id="well-formed"),
+    pytest.param(_OUTSIDE, False, "outside the PLAN branch", id="write-outside-branch"),
+    pytest.param(_BEFORE_VALIDATE, False, "does not precede", id="write-before-validate"),
+    pytest.param(_NO_VALIDATE, False, "no validate_plan_heads call", id="no-validate"),
+    pytest.param(_VALIDATE_OUTSIDE_BRANCH, False, "no validate_plan_heads call",
+                 id="validate-outside-branch"),
+])
+def test_plan_branch_containment_helper_on_synthetic_sources(src, ok, needle):
+    problems = _plan_branch_violations(src)
+    if ok:
+        assert problems == []
+    else:
+        assert problems and any(needle in p for p in problems), problems
+
+
+def test_plan_branch_containment_helper_accepts_real_ingest():
+    src = (_ROOT / "hydra_core" / "ingest.py").read_text(encoding="utf-8")
+    assert _plan_branch_violations(src) == []
 
 
 @pytest.mark.parametrize("src,prefix", [
@@ -389,3 +509,114 @@ def test_render_plan_html_shows_heads_in_order():
     out = render_plan_html(evil)
     assert "<script>alert(1)</script>" not in out
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in out
+
+
+# --------------------------------------------------------------------------- #
+# per-step attribution of unexpected failures (never a bare "steps" error)
+# --------------------------------------------------------------------------- #
+
+class _RaisingPacks(dict):
+    """A packs mapping whose ``.get`` raises for one squad."""
+
+    def __init__(self, bad: str, base: dict) -> None:
+        super().__init__(base)
+        self._bad = bad
+
+    def get(self, key, default=None):  # type: ignore[override]
+        if key == self._bad:
+            raise RuntimeError("pack lookup exploded " + "y" * 400)
+        return super().get(key, default)
+
+
+def test_per_step_failure_is_attributed_and_other_steps_still_checked():
+    plan = Plan.model_validate(_plan_dict(uuid4(), [
+        _step("A", "marketing", heads=["h1", "h2"]),
+        _step("B", "executive", heads=["ghost"]),
+    ]))
+    packs = _RaisingPacks("marketing", {**_packs(), "marketing": _pack("marketing")})
+    errs = validate_plan_heads(plan, packs=packs, resolver=_resolver_known("zzz"))
+    assert [e["field"] for e in errs] == [
+        "steps[0].heads", "steps[0].heads", "steps[1].heads"]
+    for e, head in zip(errs[:2], ["h1", "h2"]):
+        assert e["msg"].startswith(
+            f"step 'A' head '{head}' could not be checked: head validation failed "
+            "(RuntimeError: pack lookup exploded")
+        assert len(e["msg"].split("RuntimeError: ")[1].rstrip(")")) <= 200
+    assert "step 'B' head 'ghost' does not resolve for squad 'executive'"         in errs[2]["msg"]
+    assert all(e["field"] != "steps" for e in errs)
+
+
+def test_slug_check_non_valueerror_is_attributed(monkeypatch):
+    def bad_slug(head):
+        if head == "b":
+            raise RuntimeError("slug check blew up")
+
+    monkeypatch.setattr("hydra_core.plan_heads._check_head_slug", bad_slug)
+    plan = Plan.model_validate(_plan_dict(uuid4(), [
+        _step("s1", heads=["a", "b"]), _step("s2", heads=["c"])]))
+    errs = validate_plan_heads(plan, packs=_packs(), resolver=_resolver_known("a", "c"))
+    msgs = [e["msg"] for e in errs]
+    assert msgs == [
+        "step 's1' head 'a' could not be checked: head validation failed "
+        "(RuntimeError: slug check blew up)",
+        "step 's1' head 'b' could not be checked: head validation failed "
+        "(RuntimeError: slug check blew up)",
+    ]
+    assert all(e["field"] == "steps[0].heads" for e in errs)
+
+
+def test_outer_handler_attributes_per_step_and_head(monkeypatch):
+    """Last-resort handler: ``_validate`` itself raising still names steps/heads."""
+    def boom(*_a, **_k):
+        raise RuntimeError("outer boom")
+
+    monkeypatch.setattr("hydra_core.plan_heads._validate", boom)
+    errs = validate_plan_heads(_plan_with_heads(), packs=_packs())
+    assert [e["field"] for e in errs] == [
+        "steps[0].heads", "steps[0].heads", "steps[1].heads"]
+    for e, (sid, head) in zip(errs, [("s1", "a"), ("s1", "b"), ("s2", "c")]):
+        assert e["msg"] == (f"step '{sid}' head '{head}' could not be checked: "
+                            "head validation failed (RuntimeError: outer boom)")
+
+
+def test_unreadable_steps_is_the_only_unattributed_case(monkeypatch):
+    class _Plan:
+        @property
+        def steps(self):
+            raise RuntimeError("steps unreadable")
+
+    errs = validate_plan_heads(_Plan())  # type: ignore[arg-type]
+    assert len(errs) == 1 and errs[0]["field"] == "steps"
+    assert "head validation failed (RuntimeError: steps unreadable)" in errs[0]["msg"]
+
+
+# --------------------------------------------------------------------------- #
+# supervisor plan_detail heads carry (drives the real node_plan_judge)
+# --------------------------------------------------------------------------- #
+
+def test_plan_detail_carries_heads_in_order_and_omits_when_empty(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from hydra_core.squad_node import Dispatcher
+    from hydra_core.supervisor import build_supervisor
+
+    monkeypatch.delenv("HYDRA_PLAN_MAX_REVISIONS", raising=False)
+    stub = MagicMock(spec=Dispatcher)
+    stub._tool_tracker = None
+    runner = build_supervisor(project_root=_ROOT, dispatcher=stub,
+                              force_pure_python=True)
+    node_plan_judge = dict(runner.steps)["plan_judge"]
+
+    wf = uuid4()
+    plan = Plan.model_validate(_plan_dict(wf, [
+        _step("with", "executive", heads=["h3", "h1", "h2"]),
+        _step("without", "executive"),
+    ]))
+    state = HydraState(root_goal="x", workflow_id=wf, plan_status="drafted",
+                       plan_revision=1, plan_ref=plan.model_dump(mode="json"))
+    detail = node_plan_judge(state)["pending_hitl"]["plan_detail"]
+    entries = {e["step_id"]: e for e in detail["steps_with_dependencies"]}
+    assert entries["with"].get("heads") ==["h3", "h1", "h2"]
+    assert "heads" not in entries["without"]
+    assert set(entries["without"]) == {"step_id", "description", "depends_on"}
+    assert set(entries["with"]) == {"step_id", "description", "depends_on", "heads"}
