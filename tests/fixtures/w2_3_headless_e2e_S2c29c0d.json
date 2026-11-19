@@ -1,0 +1,59 @@
+{
+  "gate_pending": "plan_gate",
+  "ingest": [
+    {
+      "status": "drafted"
+    }
+  ],
+  "next_after_approve": [],
+  "plan_patch_keys": [
+    "plan_artifact_location",
+    "plan_artifact_repo_id",
+    "plan_artifact_root",
+    "plan_envelope_id",
+    "plan_ref",
+    "plan_revision",
+    "plan_status"
+  ],
+  "plan_status": "approved",
+  "resume_materialised": 1,
+  "resume_plan_status": "approved",
+  "resume_rc": 0,
+  "step": {
+    "cost_source": "measured",
+    "cost_usd": 0.0,
+    "cursor_path": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/<TASK_ID>.json",
+    "dispatch_ticket": "<ROOT>/.hydra/11111111-2222-4333-8444-555555555555/attended/tickets/<TASK_ID>.<TICKET>.json",
+    "estimated_cost_usd": 0.0,
+    "host_action": {
+      "agent_type": "executive-suite:boardroom",
+      "call_key": "squad-<TASK_ID>-0",
+      "cwd": "C:/AiAppDeployments/ExecutiveSuite",
+      "instructions": "Run the pack agent and submit the artifact.",
+      "prompt": "## Hydra context\nworkflow_id: 11111111-2222-4333-8444-555555555555\ntask_id: <TASK_ID>\nsquad: executive\nenvelope_id: (none)\nupstream_refs: (none)\n\n## Goal\nbrief the board\n\n## Task\nbrief the board\n\n## Constraints\nbudget_usd: 50.00 remaining of 50.00 total, risk: normal, priority: P2\nacceptance_criteria: (none)",
+      "task_description": "brief the board"
+    },
+    "ok": true,
+    "run_id": "<TASK_ID>",
+    "squad_slug": "executive",
+    "stage_id": null,
+    "state": "await_squad_agent",
+    "status": "awaiting_host",
+    "task_id": "<TASK_ID>",
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "unmeasured_count": 0,
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "step_rc": 0,
+  "tasks": [
+    {
+      "description": "brief the board",
+      "heads": [],
+      "owner_squad": "executive",
+      "plan_revision": 1,
+      "plan_step_id": "step-a",
+      "status": "pending"
+    }
+  ]
+}
