@@ -1,6 +1,9 @@
 """Hydra#89 W2.1: TaskState.heads, HydraState.attended_head_results, helpers."""
 from __future__ import annotations
 
+import itertools
+import random
+
 import pytest
 from pydantic import ValidationError
 
@@ -59,15 +62,47 @@ def test_head_leg_run_id_rejections(task_id, head):
         head_leg_run_id(task_id, head)
 
 
+def _generated_pairs():
+    alpha = ["a", "1", "-", "_"]
+    tasks = [
+        "".join(p) for n in range(0, 5) for p in itertools.product(alpha, repeat=n)
+    ]
+    heads = [
+        "".join(p) for n in range(0, 4) for p in itertools.product(alpha, repeat=n)
+    ]
+    pairs = list(itertools.product(tasks, heads))
+    rng = random.Random(89)
+    chars = "a1-_Z. "
+    for _ in range(3000):
+        t = "".join(rng.choice(chars) for _ in range(rng.randint(0, 12)))
+        h = "".join(rng.choice(chars) for _ in range(rng.randint(0, 12)))
+        pairs.append((t, h))
+    return pairs
+
+
 def test_run_id_is_unambiguous():
-    for task_id, head in [("t", "a"), ("task-1", "gaius"), ("t_1", "a-b")]:
-        rid = head_leg_run_id(task_id, head)
-        assert rid.split("--", 1) == [task_id, head]
-    # The previously colliding pair: both forms are now rejected.
+    accepted = rejected = 0
+    for task_id, head in _generated_pairs():
+        try:
+            rid = head_leg_run_id(task_id, head)
+        except ValueError:
+            rejected += 1
+            continue
+        accepted += 1
+        assert rid.split("--", 1) == [task_id, head], (task_id, head, rid)
+    assert accepted > 0
+    assert rejected > 0
+    with pytest.raises(ValueError):
+        head_leg_run_id("t-", "a")
+    assert head_leg_run_id("t-x", "a").split("--", 1) == ["t-x", "a"]
+    assert head_leg_run_id("t_1", "a-b").split("--", 1) == ["t_1", "a-b"]
     with pytest.raises(ValueError):
         head_leg_run_id("t--a", "b")
     with pytest.raises(ValueError):
         head_leg_run_id("t", "a--b")
+    with pytest.raises(ValueError):
+        head_leg_run_id(5, "a")  # type: ignore[arg-type]
+    print(f"accepted={accepted} rejected={rejected}")
 
 
 def test_channel_merge_replay_keeps_both_head_keys():

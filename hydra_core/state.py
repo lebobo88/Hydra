@@ -39,11 +39,21 @@ def _check_head_slug(head: str) -> str:
 def head_leg_run_id(task_id: str, head: str) -> str:
     """Run id for one head leg of a task: ``<task_id>--<head>``.
 
-    Unambiguous: neither ``task_id`` nor ``head`` may contain ``--``, so the
-    pair is recoverable by splitting on the first ``--``.
+    Complete rule: ``head`` matches ``[a-z0-9][a-z0-9-]*`` and has no ``--``;
+    ``task_id`` is a non-empty ``str`` with no ``--`` that does not end in
+    ``-``. Why this suffices: ``task_id`` has no ``--`` and its last char is
+    not ``-``, so no ``--`` can straddle the end of ``task_id`` and the
+    separator; ``head`` starts with ``[a-z0-9]`` (not ``-``) and has no
+    ``--``. Hence the first ``--`` in the run id is exactly the separator and
+    ``run_id.split('--', 1) == [task_id, head]``.
     """
     _check_head_slug(head)
-    if not task_id or _HEAD_SEP in task_id:
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or _HEAD_SEP in task_id
+        or task_id.endswith("-")
+    ):
         raise ValueError(f"invalid task_id for head leg run id: {task_id!r}")
     return f"{task_id}{_HEAD_SEP}{head}"
 
