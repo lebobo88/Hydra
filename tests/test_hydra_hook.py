@@ -775,6 +775,107 @@ def test_write_confinement_hydra_dir_symlink(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Ticket identifiers follow the safe-metadata policy (Hydra#86 revision)     #
+# --------------------------------------------------------------------------- #
+
+_UNSAFE_IDENTIFIER_VARIANTS = {
+    "spaces_and_sentinel": "bad value SENTINELXYZ",
+    "oversized_200_chars": "x" * 200,
+    "trailing_newline": "valid-looking-value\n",
+}
+
+
+@pytest.mark.parametrize("field", ["ticket_id", "workflow_id", "run_id", "call_key"])
+@pytest.mark.parametrize("variant_name,variant_value", list(_UNSAFE_IDENTIFIER_VARIANTS.items()))
+def test_ticket_identifier_safe_metadata_policy(tmp_path, field, variant_name, variant_value):
+    """An identifier copied from a ticket into the audit line must go through
+    the same safe-string policy as any other copied string. The ticket
+    itself stays valid for lookup purposes (decision stays 'found'); only
+    the offending field is written as null, on both the pre and post
+    audit lines."""
+    root = tmp_path / "project"
+    root.mkdir()
+    tpath = _write_ticket(root, "wf-id", "run-id", "gen-id", "engineer")
+    data = json.loads(tpath.read_text(encoding="utf-8"))
+    data[field] = variant_value
+    tpath.write_text(json.dumps(data), encoding="utf-8")
+
+    res_pre = _run_hook("pre", _spawn_payload("engineer"), root)
+    assert res_pre.returncode == 0
+    assert res_pre.stdout == ""
+
+    res_post = _run_hook("post", _post_payload("engineer", {"status": "completed"}), root)
+    assert res_post.returncode == 0
+    assert res_post.stdout == ""
+
+    audit_text = (root / ".hydra" / "hydra_hook.audit.jsonl").read_text(encoding="utf-8")
+    assert "SENTINELXYZ" not in audit_text
+
+    lines = [json.loads(l) for l in audit_text.splitlines() if l.strip()]
+    pre_line = next(l for l in lines if l["event"] == "pre")
+    post_line = next(l for l in lines if l["event"] == "post")
+
+    assert pre_line["decision"] == "found"
+
+    if field == "ticket_id":
+        assert pre_line["ticket_id"] is None
+        assert post_line["ticket_id"] is None
+    else:
+        assert pre_line[field] is None
+        # Only `ticket_id` is carried on the post line; workflow_id/run_id/
+        # call_key corruption does not affect it.
+        assert post_line["ticket_id"] is not None
+
+    if field in ("workflow_id", "run_id"):
+        # An unsafe workflow_id/run_id must never be used to build the
+        # cursor file path -- the cursor load is skipped outright.
+        assert pre_line["prompt_check"] == "cursor_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# `$`-anchored regex + trailing newline (Hydra#86 revision)                  #
+# --------------------------------------------------------------------------- #
+
+def test_trailing_newline_metadata_rejected(tmp_path):
+    """`re.Pattern.match` with a `$`-anchored pattern accepts one trailing
+    newline; the safe-string check must use `fullmatch` so a value like
+    `'completed\\n'` is rejected, not silently copied."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _write_ticket(root, "wf-nl", "run-nl", "gen-0", "engineer")
+    tool_response = {
+        "status": "completed\n",
+        "resolvedModel": "m\n",
+        "agentId": "a\n",
+        "usage": {"input_tokens": 1},
+    }
+    res = _run_hook("post", _post_payload("engineer", tool_response), root)
+    assert res.returncode == 0
+    lines = _audit_lines(root)
+    assert lines[0]["status"] is None
+    assert lines[0]["resolved_model"] is None
+    assert lines[0]["agent_id"] is None
+
+
+def test_trailing_newline_shape_key_rejected(tmp_path):
+    """The shape recorder's key check must also use `fullmatch`, so a key
+    like `'secret\\n'` is recorded as `'<key>'`, not verbatim."""
+    root = tmp_path / "project"
+    root.mkdir()
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Agent",
+        "tool_use_id": "tu-nl",
+        "tool_input": {"subagent_type": "engineer", "prompt": "p", "secret\n": "v"},
+    }
+    res = _run_hook("pre", payload, root, extra_env={"HYDRA_HOOK_RECORD_SHAPES": "1"})
+    assert res.returncode == 0
+    shapes_text = (root / ".hydra" / "hydra_hook.shapes.jsonl").read_text(encoding="utf-8")
+    assert "<key>" in shapes_text
+    assert "secret" not in shapes_text
+
+
+# --------------------------------------------------------------------------- #
 # Pin tests                                                                  #
 # --------------------------------------------------------------------------- #
 

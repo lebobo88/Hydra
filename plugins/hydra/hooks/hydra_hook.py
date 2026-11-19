@@ -102,7 +102,7 @@ def _safe_str(v: Any) -> str | None:
         return None
     if not (1 <= len(v) <= 128):
         return None
-    if not _SAFE_STR_RE.match(v):
+    if not _SAFE_STR_RE.fullmatch(v):
         return None
     return v
 
@@ -208,7 +208,7 @@ def _shape_of(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            key_out = k if (isinstance(k, str) and _SHAPE_KEY_RE.match(k)) else "<key>"
+            key_out = k if (isinstance(k, str) and _SHAPE_KEY_RE.fullmatch(k)) else "<key>"
             if key_out in out:
                 continue
             out[key_out] = _shape_of(v)
@@ -326,9 +326,21 @@ def resolve_ticket(
 def _check_prompt(
     root: Path, ticket: dict[str, Any], tool_input: dict[str, Any],
 ) -> tuple[str, bool | None, bool, dict[str, Any] | None]:
-    """Returns ``(prompt_check, prompt_match, would_replace, pending_action)``."""
+    """Returns ``(prompt_check, prompt_match, would_replace, pending_action)``.
+
+    ``workflow_id``/``run_id`` are validated against the safe-metadata policy
+    before being used to build the cursor path. An identifier that fails the
+    policy (whitespace, oversized, or containing characters outside the safe
+    charset) is never used for path construction; the cursor load is skipped
+    entirely and this reports ``'cursor_unavailable'``, same as a missing
+    cursor file."""
+    safe_workflow_id = _safe_str(ticket.get("workflow_id"))
+    safe_run_id = _safe_str(ticket.get("run_id"))
+    if safe_workflow_id is None or safe_run_id is None:
+        return "cursor_unavailable", None, False, None
+
     try:
-        cpath = cursor_path(root, ticket.get("workflow_id", ""), ticket.get("run_id", ""))
+        cpath = cursor_path(root, safe_workflow_id, safe_run_id)
         with open(str(cpath), "r", encoding="utf-8") as f:
             cursor = json.load(f)
     except Exception:
@@ -388,10 +400,10 @@ def _handle_pre(
         "subagent_type": _safe_str(subagent_type),
         "decision": decision,
         "reason": reason,
-        "ticket_id": ticket.get("ticket_id") if ticket else None,
-        "workflow_id": ticket.get("workflow_id") if ticket else None,
-        "run_id": ticket.get("run_id") if ticket else None,
-        "call_key": ticket.get("call_key") if ticket else None,
+        "ticket_id": _safe_str(ticket.get("ticket_id")) if ticket else None,
+        "workflow_id": _safe_str(ticket.get("workflow_id")) if ticket else None,
+        "run_id": _safe_str(ticket.get("run_id")) if ticket else None,
+        "call_key": _safe_str(ticket.get("call_key")) if ticket else None,
         "live_candidates": live_candidates,
         "prompt_match": prompt_match,
         "would_replace": would_replace,
@@ -487,7 +499,7 @@ def _handle_post(
         "ts": now.isoformat(),
         "usage_scope": "final_request_only",
         "tool_use_id": _safe_str(payload.get("tool_use_id")),
-        "ticket_id": ticket.get("ticket_id") if ticket else None,
+        "ticket_id": _safe_str(ticket.get("ticket_id")) if ticket else None,
     }
     line.update(usage_line)
     _append_jsonl(root, "hydra_hook.audit.jsonl", line)
