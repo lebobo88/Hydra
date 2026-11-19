@@ -1,0 +1,592 @@
+{
+  "a_json": {
+    "artifact_path": null,
+    "authored_by": [
+      "planner"
+    ],
+    "constraints": {
+      "budget_usd": null,
+      "deadline_ts": null,
+      "industries": [],
+      "priority": "P2",
+      "risk_tolerance": "medium",
+      "token_limit": null
+    },
+    "context_refs": [],
+    "created_at": "2026-11-19T12:00:00Z",
+    "dissents": [
+      "d1"
+    ],
+    "do_not_touch": [],
+    "external_id": null,
+    "goal_restatement": "Ship the sample",
+    "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "non_goals": [
+      "nothing else"
+    ],
+    "open_questions": [
+      "why"
+    ],
+    "origin_squad": "planning",
+    "parent_id": null,
+    "plan_revision": 1,
+    "rigor": "standard",
+    "risks": [
+      "r1"
+    ],
+    "steps": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "rationale": "root",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "rationale": null,
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "model_tier": null,
+        "priority": "P3",
+        "rationale": null,
+        "step_id": "step-c",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "executive",
+        "taxonomy_section": null
+      }
+    ],
+    "summary": "Sample plan",
+    "supersedes": null,
+    "target_squad": null,
+    "type": "PLAN",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "b_python_repr": "{'id': UUID('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), 'external_id': None, 'type': 'PLAN', 'origin_squad': 'planning', 'target_squad': None, 'workflow_id': UUID('11111111-2222-4333-8444-555555555555'), 'parent_id': None, 'context_refs': [], 'constraints': {'budget_usd': None, 'token_limit': None, 'deadline_ts': None, 'risk_tolerance': 'medium', 'priority': 'P2', 'industries': []}, 'created_at': datetime.datetime(2026, 11, 19, 12, 0, tzinfo=datetime.timezone.utc), 'do_not_touch': [], 'rigor': 'standard', 'goal_restatement': 'Ship the sample', 'summary': 'Sample plan', 'steps': [{'step_id': 'step-a', 'target_squad': 'engineering', 'envelope_type': 'DEV_TASK', 'description': 'first step', 'acceptance_criteria': ['a works'], 'depends_on': [], 'priority': 'P1', 'model_tier': None, 'target_repo_id': None, 'target_repo_subpath': None, 'estimated_budget_usd': 1.5, 'taxonomy_section': None, 'rationale': 'root'}, {'step_id': 'step-b', 'target_squad': 'engineering', 'envelope_type': 'DEV_TASK', 'description': 'second step', 'acceptance_criteria': [], 'depends_on': ['step-a'], 'priority': 'P2', 'model_tier': 'sonnet', 'target_repo_id': 'hydra', 'target_repo_subpath': 'sub', 'estimated_budget_usd': None, 'taxonomy_section': '7', 'rationale': None}, {'step_id': 'step-c', 'target_squad': 'executive', 'envelope_type': 'DEV_TASK', 'description': 'third step', 'acceptance_criteria': [], 'depends_on': ['step-a', 'step-b'], 'priority': 'P3', 'model_tier': None, 'target_repo_id': None, 'target_repo_subpath': None, 'estimated_budget_usd': 0.25, 'taxonomy_section': None, 'rationale': None}], 'non_goals': ['nothing else'], 'open_questions': ['why'], 'risks': ['r1'], 'artifact_path': None, 'plan_revision': 1, 'supersedes': None, 'authored_by': ['planner'], 'dissents': ['d1']}",
+  "c_exclude_none": {
+    "authored_by": [
+      "planner"
+    ],
+    "constraints": {
+      "industries": [],
+      "priority": "P2",
+      "risk_tolerance": "medium"
+    },
+    "context_refs": [],
+    "created_at": "2026-11-19T12:00:00Z",
+    "dissents": [
+      "d1"
+    ],
+    "do_not_touch": [],
+    "goal_restatement": "Ship the sample",
+    "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "non_goals": [
+      "nothing else"
+    ],
+    "open_questions": [
+      "why"
+    ],
+    "origin_squad": "planning",
+    "plan_revision": 1,
+    "rigor": "standard",
+    "risks": [
+      "r1"
+    ],
+    "steps": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "priority": "P1",
+        "rationale": "root",
+        "step_id": "step-a",
+        "target_squad": "engineering"
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "priority": "P3",
+        "step_id": "step-c",
+        "target_squad": "executive"
+      }
+    ],
+    "summary": "Sample plan",
+    "type": "PLAN",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "d_by_alias": {
+    "artifact_path": null,
+    "authored_by": [
+      "planner"
+    ],
+    "constraints": {
+      "budget_usd": null,
+      "deadline_ts": null,
+      "industries": [],
+      "priority": "P2",
+      "risk_tolerance": "medium",
+      "token_limit": null
+    },
+    "context_refs": [],
+    "created_at": "2026-11-19T12:00:00Z",
+    "dissents": [
+      "d1"
+    ],
+    "do_not_touch": [],
+    "external_id": null,
+    "goal_restatement": "Ship the sample",
+    "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "non_goals": [
+      "nothing else"
+    ],
+    "open_questions": [
+      "why"
+    ],
+    "origin_squad": "planning",
+    "parent_id": null,
+    "plan_revision": 1,
+    "rigor": "standard",
+    "risks": [
+      "r1"
+    ],
+    "steps": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "rationale": "root",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "rationale": null,
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "model_tier": null,
+        "priority": "P3",
+        "rationale": null,
+        "step_id": "step-c",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "executive",
+        "taxonomy_section": null
+      }
+    ],
+    "summary": "Sample plan",
+    "supersedes": null,
+    "target_squad": null,
+    "type": "PLAN",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "e_model_dump_json": "{\"id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"external_id\":null,\"type\":\"PLAN\",\"origin_squad\":\"planning\",\"target_squad\":null,\"workflow_id\":\"11111111-2222-4333-8444-555555555555\",\"parent_id\":null,\"context_refs\":[],\"constraints\":{\"budget_usd\":null,\"token_limit\":null,\"deadline_ts\":null,\"risk_tolerance\":\"medium\",\"priority\":\"P2\",\"industries\":[]},\"created_at\":\"2026-11-19T12:00:00Z\",\"do_not_touch\":[],\"rigor\":\"standard\",\"goal_restatement\":\"Ship the sample\",\"summary\":\"Sample plan\",\"steps\":[{\"step_id\":\"step-a\",\"target_squad\":\"engineering\",\"envelope_type\":\"DEV_TASK\",\"description\":\"first step\",\"acceptance_criteria\":[\"a works\"],\"depends_on\":[],\"priority\":\"P1\",\"model_tier\":null,\"target_repo_id\":null,\"target_repo_subpath\":null,\"estimated_budget_usd\":1.5,\"taxonomy_section\":null,\"rationale\":\"root\"},{\"step_id\":\"step-b\",\"target_squad\":\"engineering\",\"envelope_type\":\"DEV_TASK\",\"description\":\"second step\",\"acceptance_criteria\":[],\"depends_on\":[\"step-a\"],\"priority\":\"P2\",\"model_tier\":\"sonnet\",\"target_repo_id\":\"hydra\",\"target_repo_subpath\":\"sub\",\"estimated_budget_usd\":null,\"taxonomy_section\":\"7\",\"rationale\":null},{\"step_id\":\"step-c\",\"target_squad\":\"executive\",\"envelope_type\":\"DEV_TASK\",\"description\":\"third step\",\"acceptance_criteria\":[],\"depends_on\":[\"step-a\",\"step-b\"],\"priority\":\"P3\",\"model_tier\":null,\"target_repo_id\":null,\"target_repo_subpath\":null,\"estimated_budget_usd\":0.25,\"taxonomy_section\":null,\"rationale\":null}],\"non_goals\":[\"nothing else\"],\"open_questions\":[\"why\"],\"risks\":[\"r1\"],\"artifact_path\":null,\"plan_revision\":1,\"supersedes\":null,\"authored_by\":[\"planner\"],\"dissents\":[\"d1\"]}",
+  "f_include": {
+    "steps": [
+      {
+        "estimated_budget_usd": 1.5,
+        "rationale": "root",
+        "step_id": "step-a"
+      },
+      {
+        "estimated_budget_usd": null,
+        "rationale": null,
+        "step_id": "step-b"
+      },
+      {
+        "estimated_budget_usd": 0.25,
+        "rationale": null,
+        "step_id": "step-c"
+      }
+    ]
+  },
+  "g_exclude": {
+    "artifact_path": null,
+    "authored_by": [
+      "planner"
+    ],
+    "constraints": {
+      "budget_usd": null,
+      "deadline_ts": null,
+      "industries": [],
+      "priority": "P2",
+      "risk_tolerance": "medium",
+      "token_limit": null
+    },
+    "context_refs": [],
+    "created_at": "2026-11-19T12:00:00Z",
+    "dissents": [
+      "d1"
+    ],
+    "do_not_touch": [],
+    "external_id": null,
+    "goal_restatement": "Ship the sample",
+    "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    "non_goals": [
+      "nothing else"
+    ],
+    "open_questions": [
+      "why"
+    ],
+    "origin_squad": "planning",
+    "parent_id": null,
+    "plan_revision": 1,
+    "rigor": "standard",
+    "risks": [
+      "r1"
+    ],
+    "steps": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "model_tier": null,
+        "priority": "P3",
+        "step_id": "step-c",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "executive",
+        "taxonomy_section": null
+      }
+    ],
+    "summary": "Sample plan",
+    "supersedes": null,
+    "target_squad": null,
+    "type": "PLAN",
+    "workflow_id": "11111111-2222-4333-8444-555555555555"
+  },
+  "h_steps": [
+    {
+      "exclude": {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      "include": {
+        "estimated_budget_usd": 1.5,
+        "step_id": "step-a"
+      },
+      "json": {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 1.5,
+        "model_tier": null,
+        "priority": "P1",
+        "rationale": "root",
+        "step_id": "step-a",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "engineering",
+        "taxonomy_section": null
+      },
+      "model_dump_json": "{\"step_id\":\"step-a\",\"target_squad\":\"engineering\",\"envelope_type\":\"DEV_TASK\",\"description\":\"first step\",\"acceptance_criteria\":[\"a works\"],\"depends_on\":[],\"priority\":\"P1\",\"model_tier\":null,\"target_repo_id\":null,\"target_repo_subpath\":null,\"estimated_budget_usd\":1.5,\"taxonomy_section\":null,\"rationale\":\"root\"}",
+      "python_repr": "{'step_id': 'step-a', 'target_squad': 'engineering', 'envelope_type': 'DEV_TASK', 'description': 'first step', 'acceptance_criteria': ['a works'], 'depends_on': [], 'priority': 'P1', 'model_tier': None, 'target_repo_id': None, 'target_repo_subpath': None, 'estimated_budget_usd': 1.5, 'taxonomy_section': None, 'rationale': 'root'}"
+    },
+    {
+      "exclude": {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      "include": {
+        "estimated_budget_usd": null,
+        "step_id": "step-b"
+      },
+      "json": {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a"
+        ],
+        "description": "second step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": null,
+        "model_tier": "sonnet",
+        "priority": "P2",
+        "rationale": null,
+        "step_id": "step-b",
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "target_squad": "engineering",
+        "taxonomy_section": "7"
+      },
+      "model_dump_json": "{\"step_id\":\"step-b\",\"target_squad\":\"engineering\",\"envelope_type\":\"DEV_TASK\",\"description\":\"second step\",\"acceptance_criteria\":[],\"depends_on\":[\"step-a\"],\"priority\":\"P2\",\"model_tier\":\"sonnet\",\"target_repo_id\":\"hydra\",\"target_repo_subpath\":\"sub\",\"estimated_budget_usd\":null,\"taxonomy_section\":\"7\",\"rationale\":null}",
+      "python_repr": "{'step_id': 'step-b', 'target_squad': 'engineering', 'envelope_type': 'DEV_TASK', 'description': 'second step', 'acceptance_criteria': [], 'depends_on': ['step-a'], 'priority': 'P2', 'model_tier': 'sonnet', 'target_repo_id': 'hydra', 'target_repo_subpath': 'sub', 'estimated_budget_usd': None, 'taxonomy_section': '7', 'rationale': None}"
+    },
+    {
+      "exclude": {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "model_tier": null,
+        "priority": "P3",
+        "step_id": "step-c",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "executive",
+        "taxonomy_section": null
+      },
+      "include": {
+        "estimated_budget_usd": 0.25,
+        "step_id": "step-c"
+      },
+      "json": {
+        "acceptance_criteria": [],
+        "depends_on": [
+          "step-a",
+          "step-b"
+        ],
+        "description": "third step",
+        "envelope_type": "DEV_TASK",
+        "estimated_budget_usd": 0.25,
+        "model_tier": null,
+        "priority": "P3",
+        "rationale": null,
+        "step_id": "step-c",
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "target_squad": "executive",
+        "taxonomy_section": null
+      },
+      "model_dump_json": "{\"step_id\":\"step-c\",\"target_squad\":\"executive\",\"envelope_type\":\"DEV_TASK\",\"description\":\"third step\",\"acceptance_criteria\":[],\"depends_on\":[\"step-a\",\"step-b\"],\"priority\":\"P3\",\"model_tier\":null,\"target_repo_id\":null,\"target_repo_subpath\":null,\"estimated_budget_usd\":0.25,\"taxonomy_section\":null,\"rationale\":null}",
+      "python_repr": "{'step_id': 'step-c', 'target_squad': 'executive', 'envelope_type': 'DEV_TASK', 'description': 'third step', 'acceptance_criteria': [], 'depends_on': ['step-a', 'step-b'], 'priority': 'P3', 'model_tier': None, 'target_repo_id': None, 'target_repo_subpath': None, 'estimated_budget_usd': 0.25, 'taxonomy_section': None, 'rationale': None}"
+    }
+  ],
+  "i_materialise_patch": {
+    "pending_hitl": null,
+    "phase": "dispatch",
+    "plan_status": "approved",
+    "plan_superseded_task_ids": [],
+    "tasks": [
+      {
+        "acceptance_criteria": [
+          "a works"
+        ],
+        "depends_on": [],
+        "description": "first step",
+        "envelope_id": null,
+        "envelope_type": "DEV_TASK",
+        "heads": [],
+        "model_tier": null,
+        "owner_squad": "engineering",
+        "plan_critique": null,
+        "plan_revision": 1,
+        "plan_step_id": "step-a",
+        "pp_profile": null,
+        "pp_team": null,
+        "priority": "P1",
+        "result_envelope_id": null,
+        "retries": 0,
+        "status": "pending",
+        "supersedes_plan_envelope_id": null,
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "task_id": "<TASK-0>"
+      },
+      {
+        "acceptance_criteria": null,
+        "depends_on": [
+          "<TASK-0>"
+        ],
+        "description": "second step",
+        "envelope_id": null,
+        "envelope_type": "DEV_TASK",
+        "heads": [],
+        "model_tier": "sonnet",
+        "owner_squad": "engineering",
+        "plan_critique": null,
+        "plan_revision": 1,
+        "plan_step_id": "step-b",
+        "pp_profile": null,
+        "pp_team": null,
+        "priority": "P2",
+        "result_envelope_id": null,
+        "retries": 0,
+        "status": "pending",
+        "supersedes_plan_envelope_id": null,
+        "target_repo_id": "hydra",
+        "target_repo_subpath": "sub",
+        "task_id": "<TASK-1>"
+      },
+      {
+        "acceptance_criteria": null,
+        "depends_on": [
+          "<TASK-0>",
+          "<TASK-1>"
+        ],
+        "description": "third step",
+        "envelope_id": null,
+        "envelope_type": "DEV_TASK",
+        "heads": [],
+        "model_tier": null,
+        "owner_squad": "executive",
+        "plan_critique": null,
+        "plan_revision": 1,
+        "plan_step_id": "step-c",
+        "pp_profile": null,
+        "pp_team": null,
+        "priority": "P3",
+        "result_envelope_id": null,
+        "retries": 0,
+        "status": "pending",
+        "supersedes_plan_envelope_id": null,
+        "target_repo_id": null,
+        "target_repo_subpath": null,
+        "task_id": "<TASK-2>"
+      }
+    ]
+  }
+}

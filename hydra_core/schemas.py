@@ -329,6 +329,10 @@ class Handoff(HydraEnvelope):
 
 # ---------- planning ----------
 
+def _heads_empty(value: list[str]) -> bool:
+    return not value
+
+
 class PlanStep(BaseModel):
     """One decomposed unit of work inside a `Plan`.
 
@@ -350,6 +354,7 @@ class PlanStep(BaseModel):
     estimated_budget_usd: Optional[float] = Field(default=None, allow_inf_nan=False)
     taxonomy_section: Optional[str] = None
     rationale: Optional[str] = None
+    heads: list[str] = Field(default_factory=list, exclude_if=_heads_empty)
 
     @field_validator("envelope_type")
     @classmethod
